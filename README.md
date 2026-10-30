@@ -1,91 +1,98 @@
 # mini-oled-dock
 
-A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with raw Win32 and no UI framework.
+[![CI](https://github.com/ops-software/mini-oled-dock/actions/workflows/ci.yml/badge.svg)](https://github.com/ops-software/mini-oled-dock/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/ops-software/mini-oled-dock)](https://github.com/ops-software/mini-oled-dock/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **About this fork.** The `mini-oled-dock-plus` branch is [gitgiovik/mini-oled-dock](https://github.com/gitgiovik/mini-oled-dock) with its open pull requests #1-#4 merged: Start button and quick-links menu (#1) and window previews (#2) by Desox, the multi-monitor screen choice (#3) and the AppBar position fix with clearer logs (#4). On top of that it adds its own features: the Win key brings the bar to the display under the pointer, a full Start menu written from scratch (all apps, search, its own pins) that opens with a double tap of Win or a left click on the Start button, on any display, and notifications that can be clicked, dismissed and cleared for real. It is not an official release.
+A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with raw Win32 and no UI framework.
 
 ![The bar](docs/screenshots/bar_top_icon_text.png)
 
-It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), only program names are shown in the bar (window titles appear only in the previews that open when you hover an app with several windows), tray icons of other apps are hosted in the bar, and the popups are drawn by hand. The executable is about 0.7 MB and uses roughly 10 MB of RAM (working set trimmed to under 1 MB while hidden); numbers from the author's machine.
+It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), the bar shows program names only (window titles appear in the hover previews), tray icons of other apps are hosted in the bar, and every popup is drawn by hand.
 
-*Screenshots are rendered offscreen by `dock.exe --preview` with mock data.*
+- **Tiny:** the executable is about 0.7 MB and uses roughly 10 MB of RAM, trimmed to under 1 MB while hidden (numbers from the author's machine).
+- **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
+- **Safe to try:** a watchdog process always restores the native taskbar, and `dock.exe --restore` works even when no dock is running.
+- **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it.
 
-| Notifications | Audio | Calendar |
+## Screenshots
+
+*Rendered offscreen by `dock.exe --preview` with mock data.*
+
+| Start menu | Start menu: search | Horizontal Start |
 |---|---|---|
-| ![](docs/screenshots/popup_notif.png) | ![](docs/screenshots/popup_audio.png) | ![](docs/screenshots/popup_calendar.png) |
+| ![](docs/screenshots/popup_startmenu.png) | ![](docs/screenshots/popup_startmenu_search.png) | ![](docs/screenshots/popup_startmenu_h.png) |
 
-| Power | Settings | Network |
+| Horizontal Start: all apps | Horizontal Start: power | Quick-links menu |
 |---|---|---|
-| ![](docs/screenshots/popup_power.png) | ![](docs/screenshots/popup_settings.png) | ![](docs/screenshots/popup_network.png) |
+| ![](docs/screenshots/popup_startmenu_h_all.png) | ![](docs/screenshots/popup_startmenu_h_power.png) | ![](docs/screenshots/popup_start.png) |
 
-| Tray: choose visible icons | Start menu |
-|---|---|
-| ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_start.png) |
-
-| Window previews | Settings: choose the screen |
-|---|---|
-| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_settings_screen.png) |
-
-New in this fork:
-
-| Start menu (double tap Win) | Start menu: search | Settings: follow the pointer |
+| Notifications | Audio: spatial sound and mixer | Audio: customize mode |
 |---|---|---|
-| ![](docs/screenshots/popup_startmenu.png) | ![](docs/screenshots/popup_startmenu_search.png) | ![](docs/screenshots/popup_settings_pointer.png) |
+| ![](docs/screenshots/popup_notif.png) | ![](docs/screenshots/popup_audio.png) | ![](docs/screenshots/popup_audio_customize.png) |
 
-New from [Desox's PR #1](https://github.com/Ragnatela666/mini-oled-dock/pull/1) (all optional, off by default):
-
-| Horizontal Start | Horizontal Start: all apps | Horizontal Start: power flyout |
+| Calendar | Network | Power |
 |---|---|---|
-| ![](docs/screenshots/popup_startmenu_h.png) | ![](docs/screenshots/popup_startmenu_h_all.png) | ![](docs/screenshots/popup_startmenu_h_power.png) |
+| ![](docs/screenshots/popup_calendar.png) | ![](docs/screenshots/popup_network.png) | ![](docs/screenshots/popup_power.png) |
 
-| Volume: spatial sound and mixer | Volume: customize mode | Settings in Italian |
+| Window previews | Tray: choose visible icons | Settings |
 |---|---|---|
-| ![](docs/screenshots/popup_audio.png) | ![](docs/screenshots/popup_audio_customize.png) | ![](docs/screenshots/popup_settings_it.png) |
+| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_settings.png) |
 
-| Settings: Start menu (import from Windows) |
-|---|
-| ![](docs/screenshots/popup_settings_startmenu.png) |
+| Settings: screen | Settings: follow the pointer | Settings: Start menu | Settings in Italian |
+|---|---|---|---|
+| ![](docs/screenshots/popup_settings_screen.png) | ![](docs/screenshots/popup_settings_pointer.png) | ![](docs/screenshots/popup_settings_startmenu.png) | ![](docs/screenshots/popup_settings_it.png) |
 
 ## Features
 
+### The bar
+
 - Centred bar sized to its content: pinned apps first, then open apps. An underline marks open windows (orange when an app asks for attention).
 - Display modes: icon + name, icon only, or name only.
-- Multi-monitor: the bar can sit on any connected display (Settings → **Screen**: **Main**, the display number, or **Pointer** to follow the mouse) and follows that display's DPI; a display that is disconnected falls back to the primary one.
-- Independent sizes for app icons, app names, tray icons and the system modules (the bar height follows the tallest content); background colour from dark presets or any colour through a built-in picker (pure black by default); background opacity from 0 to 100 %.
-- **Settings popup** (from the power button): every option above, auto-hide, window previews, clock seconds and the visible modules, applied live.
-- Network module: Wi-Fi signal bars or ethernet, with a small globe when the internet is reachable (an x when it is not); click for name, IPv4 and signal.
-- System metrics module (off by default): CPU and RAM usage in percent; click opens Task Manager.
+- Independent sizes for app icons, app names, tray icons and the system modules (the bar height follows the tallest content).
+- Background colour from dark presets or any colour through a built-in picker (pure black by default), background opacity from 0 to 100 %.
 - Drag and drop reordering of apps, tray icons and system modules.
-- Tray icon hosting, with an overflow popup and a view to choose which icons are visible.
-- Popups: notifications (with Do not disturb; click, X and Clear all work, see below), audio (volume, mute, output device), calendar, network, power, settings, and an app menu (new window, pin / unpin, close).
-- Window previews: hovering an app with several windows shows live DWM thumbnails with titles; click one to switch; off = no timer, no window.
-- Disabled features cost nothing: a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
-- Show desktop button.
-- Start button at the left end of the bar (before the apps): left click opens the dock's Start menu (see below), right click opens a quick-links menu like the native Win+X one (Installed apps, Device Manager, Terminal (admin), PowerShell (admin), Task Manager, Settings, File Explorer, Search, Run, Sign out, ...), in Italian when the Windows display language is Italian and in English otherwise.
-- **Win key toggles the dock** (Win+other-key shortcuts still work), including over fullscreen games.
-- **Follow the pointer** (fork): with Settings -> Screen -> "Pointer", the Win key brings the bar to the display under the mouse pointer.
-- **Start menu on any display** (fork): a quick double tap of the Win key (or a left click on the Start button) opens the dock's own Start menu next to the Start button, on the display under the pointer (the native one only opens on the primary taskbar's display). It lists every app of the native Start menu, classic programs and Store apps alike; type to search (Enter launches the first result, arrows move the selection, Esc clears), and right-click an app to pin it at the top (`start_pins` in the config, separate from the bar pins). Double tap again or Esc to close.
-- **Working notifications** (fork): a click on a notification brings the app that sent it to the front (or launches it; if the app cannot be found, the Windows notification centre opens) and removes the notification; **Clear all** and the **X** of a single notification also remove them from Windows' notification history, so they no longer come back.
-- **Win key opens Start** (Desox, off by default): one tap of Win opens the dock and the Start menu together in a single animation, the next tap closes both; with auto-hide off the dock stays and Win only toggles Start.
-- **Language** (Desox): Settings → Appearance → Language: System (default, follows Windows), English or Italian, applied at once, clock and calendar included.
-- **Horizontal Start** (Desox, off by default): Settings → Start menu → Horizontal gives a Windows 11-style layout with search on top, a 6×3 pinned grid with pages, an alphabetical "All apps" list, and a power flyout (Sleep, Lock, Restart, Shut down, Settings, Close dock) inside the menu. Both styles share the same `start_pins`. **Import from Windows Start** copies your Windows pins in the same order (it runs `Export-StartLayout` once, hidden, with a 30 s limit).
-- **Spatial sound and volume mixer** (Desox): the volume popup lists the spatial formats really available on the current output (Windows Sonic, Dolby Atmos for Headphones, ...) and one row per app playing audio (up to 8, with mute and slider), plus System sounds.
-- **Customizable volume popup** (Desox): each section (Master volume, Output, Spatial sound, Mixer) can be collapsed; the pencil enters Customize mode, where an eye hides or shows a section and dragging its header reorders it. A collapsed or hidden section loads nothing.
-- **Fixes** (Desox): tray right-click menus open centred above their icon (G HUB's panel no longer jumps to the top-left corner), apps launched from the dock open in the foreground, and the Win key keeps Start open over fullscreen games that grab the foreground back.
-- **Fixes** (VanheXen): the first click on Start (or any bar item that opens a popup) is no longer lost when another app is in front; with Screen → **Pointer**, the screen edge of any display shows the bar there (before, only the Win key moved it); the dock keeps working across Explorer restarts (apps launch again and tray icons come back to the dock within ~2 s); a double tap of Win now slides Start in together with the bar.
+- Window previews: hovering an app with several windows shows live DWM thumbnails with titles; click one to switch.
 - Auto-hide with a slide animation: the bar shows on the Win key or when the pointer touches the screen edge, and hides after 2.5 s.
+- Show desktop button.
+
+### Win key and Start menu
+
+- **Win toggles the dock** (Win+other-key shortcuts still work), including over fullscreen games.
+- **Start menu written from scratch**, on any display: a quick double tap of Win, or a left click on the Start button, opens it next to the Start button on the display under the pointer. It lists every app of the native Start menu (classic programs and Store apps); type to search, right-click an app to pin it at the top.
+- **Horizontal Start** (optional): a Windows 11-style layout with search on top, a paged 6×3 pinned grid, an alphabetical "All apps" list and a power flyout. **Import from Windows Start** copies your Windows pins in the same order.
+- **Win opens Start** (optional): one tap of Win opens the dock and Start together in a single animation.
+- **Quick-links menu** on right click of the Start button, like the native Win+X one (Installed apps, Device Manager, Terminal (admin), Task Manager, Run, Sign out, ...).
+
+### Multi-monitor
+
+- The bar can sit on any connected display (Settings → **Screen**: **Main**, the display number, or **Pointer**) and follows that display's DPI; a disconnected display falls back to the primary one.
+- With **Pointer**, the Win key or the screen edge of any display brings the bar to that display.
+
+### Popups and modules
+
+- **Notifications:** click one to switch to the app that sent it, X or **Clear all** remove them from Windows' notification history too; Do not disturb.
+- **Audio:** volume, mute, output device, spatial sound formats available on the current output (Windows Sonic, Dolby Atmos, ...) and a per-app mixer. Sections can be collapsed, hidden and reordered; a collapsed or hidden section loads nothing.
+- **Network:** Wi-Fi signal bars or ethernet, with a globe badge when the internet is reachable; click for name, IPv4 and signal.
+- **System metrics** (off by default): CPU and RAM usage; click opens Task Manager.
+- **Calendar**, **power** menu and an **app menu** (new window, pin / unpin, close).
+- **Tray icon hosting**, with an overflow popup and a view to choose which icons stay in the bar.
+
+### Settings and system
+
+- **Settings popup** (from the power button): every option, applied live and saved to a commented JSON config that also reloads on its own when edited by hand.
+- **Language:** System (follows Windows), English or Italian, applied at once, clock and calendar included.
 - Autostart without UAC prompts (scheduled task).
 - Watchdog process that always restores the native taskbar.
-- Live reload of a commented JSON config.
 
 ## Install
 
-**Download:** a ready-built `dock.exe` (with its SHA256) is attached to every [release](https://github.com/Ragnatela666/mini-oled-dock/releases/latest). Run `.\dock.exe --install` from the folder you downloaded it to (see below); to update, do the same with the newer exe. Releases are built and tested by GitHub Actions from the tagged source.
+**Download:** a ready-built `dock.exe` (with its SHA256) is attached to every [release](https://github.com/ops-software/mini-oled-dock/releases/latest). Run `.\dock.exe --install` from the folder you downloaded it to (see below); to update, do the same with the newer exe. Releases are built and tested by GitHub Actions from the tagged source.
 
 **Build from source:** requires Windows 11 and a stable Rust toolchain (1.87+, MSVC target).
 
 ```powershell
-git clone https://github.com/Ragnatela666/mini-oled-dock
+git clone https://github.com/ops-software/mini-oled-dock
 cd mini-oled-dock
 cargo build --release
 .\target\release\dock.exe
@@ -217,12 +224,40 @@ The dock runs elevated, so its data must not live where normal programs can plan
 
 To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manifest) and run `dock.exe --preview <folder>`.
 
+## Releases
+
+| Version | Date | Highlights |
+|---|---|---|
+| [1.3.0](.github/release-notes/v1.3.0.md) | 2026-10-29 | Keeps working across Explorer restarts, multi-monitor edge fix, −511 lines de-duplication |
+| [1.2.1](.github/release-notes/v1.2.1.md) | 2026-10-29 | Hotfix: the first click on a popup is no longer lost |
+| [1.2.0](.github/release-notes/v1.2.0.md) | 2026-10-29 | Horizontal Start, Win opens Start, IT/EN language, spatial sound and mixer, customizable volume popup |
+| [1.1.0](.github/release-notes/v1.1.0.md) | 2026-10-29 | Start menu from scratch, Win follows the pointer, working notifications, window previews, multi-monitor |
+| 1.0.0 | 2026-10-23 | First release |
+
+Downloads are on the [releases page](https://github.com/ops-software/mini-oled-dock/releases). A detailed Italian write-up of the 1.2.0 changes is in [docs/MODIFICHE-2026-10-29.md](docs/MODIFICHE-2026-10-29.md).
+
+## Contributing
+
+`main` is protected: work on a branch and open a pull request. CI (`.github/workflows/ci.yml`) runs on every pull request on Windows: `cargo test --locked` with `DOCK_NO_MANIFEST=1` (so tests run without a UAC prompt) and a `cargo build --release --locked`. Run the same locally before pushing, and `cargo fmt` (see `rustfmt.toml`).
+
+- Keep the default behaviour unchanged: a new feature is an option, off by default.
+- Keep the memory budget around 10 MB: load data only when needed, no new permanent timers or threads.
+- If a change touches drawing, render the previews (`dock.exe --preview <folder>`) before and after and compare them.
+
+**Releasing:** bump `version` in `Cargo.toml`, add `.github/release-notes/vX.Y.Z.md`, merge, then push the tag `vX.Y.Z`. The release workflow checks that the tag matches `Cargo.toml`, builds `dock.exe` and publishes it with its SHA256.
+
 ## Credits and license
 
+Created by [gitgiovik](https://github.com/gitgiovik). Maintained by [Ops Software](https://github.com/ops-software).
+
+Huge thanks to the contributors:
+
+- [Desox](https://github.com/Desox96): the Start button, quick-links menu and window previews; tray menu placement and foreground fixes, Win opening Start, the IT/EN language switch, spatial audio and the per-app mixer, the customizable volume popup and the horizontal Start layout.
+- [Ragnatela666](https://github.com/Ragnatela666): multi-monitor screen choice, the AppBar position fix, the Start menu written from scratch, Win following the pointer, working notifications, CI and the release workflow, releases 1.1.0 to 1.3.0.
+- [VanheXen](https://github.com/VanheXen): the lost first click fix, the multi-monitor edge fix, the de-duplication refactor (over 500 lines removed with byte-identical rendering) and the Explorer restart fix.
+
+The 1.1.0-1.3.0 work was developed in [Ragnatela666/mini-oled-dock](https://github.com/Ragnatela666/mini-oled-dock), where the pull requests linked in the release notes live.
+
 A few Windows shell protocol structures in `src/tray_host.rs` are adapted from [lightbar](https://github.com/SauerExe/lightbar) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Other shell projects were studied for protocol knowledge only; no AGPL code was copied.
-
-Huge thanks to [Desox](https://github.com/Desox96) for the excellent work on this project: the Start button, quick-links menu and window previews (PRs #1 and #2 upstream), and in this fork the tray menu placement and foreground fixes, Win opening Start, the IT/EN language switch, spatial audio and the per-app mixer, the customizable volume popup and the horizontal Start layout ([PR #1](https://github.com/Ragnatela666/mini-oled-dock/pull/1)). Clean, well-split, carefully tested contributions.
-
-Many thanks also to [VanheXen](https://github.com/VanheXen) for tracking down and fixing the lost first click on Start and the other popups when another app had the foreground ([PR #2](https://github.com/Ragnatela666/mini-oled-dock/pull/2)): a precise diagnosis from the logs and a one-line fix. And for 1.3.0: the multi-monitor edge fix ([PR #3](https://github.com/Ragnatela666/mini-oled-dock/pull/3)), the big de-duplication refactor that removed over 500 lines with byte-identical rendering ([PR #4](https://github.com/Ragnatela666/mini-oled-dock/pull/4)), and the careful investigation that kept the dock working across Explorer restarts ([PR #5](https://github.com/Ragnatela666/mini-oled-dock/pull/5)).
 
 [MIT](LICENSE) &copy; 2026 gitgiovik

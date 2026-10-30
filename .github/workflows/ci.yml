@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [mini-oled-dock-plus]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
