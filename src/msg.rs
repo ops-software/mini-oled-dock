@@ -129,6 +129,9 @@ pub const TIMER_POPUP_ANIM: usize = 30;
 /// 1 s while a popup is open: calendar clock, power popup confirmation countdown,
 /// safety timer. Off on close.
 pub const TIMER_POPUP_TICK: usize = 31;
+/// Short one-shot retries (`FOCUS_RETRY_MS`) after open while the popup did NOT get the foreground
+/// (keyboard focus: the Start menu search box). Off once it is foreground, after the last try, on close.
+pub const TIMER_POPUP_FOCUS: usize = 32;
 
 // --------------------------------------------- context menu command ids
 

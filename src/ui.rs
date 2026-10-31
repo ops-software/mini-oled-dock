@@ -69,7 +69,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
-    SetWindowPos, ShowWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HTCLIENT, HWND_TOPMOST, IDC_HAND,
+    SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HTCLIENT,
+    HWND_TOPMOST, IDC_HAND,
     MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WS_CAPTION,
@@ -3003,7 +3004,7 @@ fn restore_foreground(prev: HWND) {
 }
 
 /// true if `h` belongs to our process (dock, popups).
-fn is_own_window(h: HWND) -> bool {
+pub fn is_own_window(h: HWND) -> bool {
     let mut pid = 0u32;
     // SAFETY: `pid` is writable; `h` can be any HWND (fails with pid 0).
     unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
@@ -3141,17 +3142,22 @@ fn within_grace(now: u64, taken_at: u64, grace: u64) -> bool {
 /// "Foreground" fallback (the foreground fallback of the original design).
 /// Variant 1: AttachThreadInput to the foreground thread + SetForegroundWindow.
 /// Variant 2 (only if 1 failed): a synthetic F15 key (releases the foreground
-/// lock) and SetForegroundWindow again. The outcome of each is in the log.
+/// lock) and SetForegroundWindow again.
+/// Variant 3 (only if 2 failed): `SwitchToThisWindow`, which bypasses the lock in cases where the
+/// first two are refused (e.g. an ELEVATED app in front: UIPI blocks both the attach and the F15).
+/// A null foreground (transient, e.g. right after a window was hidden) is NOT a reason to give up:
+/// with no foreground window SetForegroundWindow is allowed.
+/// The outcome of each is in the log. Returns true if `h` is the foreground window at the end.
 /// `pub` because `popup` also uses it to activate the popup window.
-pub fn force_foreground(h: HWND) {
+pub fn force_foreground(h: HWND) -> bool {
     FG_TAKEN_AT.store(now_ms(), Relaxed);
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
-    if fg.0.is_null() {
-        return;
+    if fg == h {
+        return true;
     }
-    // SAFETY: `fg` is an HWND obtained from Windows; the out pid is optional.
-    let fg_tid = unsafe { GetWindowThreadProcessId(fg, None) };
+    // SAFETY: `fg` is an HWND obtained from Windows (or null: then the call returns 0); the out pid is optional.
+    let fg_tid = if fg.0.is_null() { 0 } else { unsafe { GetWindowThreadProcessId(fg, None) } };
     // SAFETY: no preconditions.
     let my_tid = unsafe { GetCurrentThreadId() };
     let attached = fg_tid != 0 && fg_tid != my_tid;
@@ -3168,14 +3174,33 @@ pub fn force_foreground(h: HWND) {
         // SAFETY: undoes the attach done above.
         let _ = unsafe { AttachThreadInput(my_tid, fg_tid, false) };
     }
-    log!("  foreground variant 1 (AttachThreadInput): SetForegroundWindow -> {}", ok.as_bool());
-    if ok.as_bool() {
-        return;
+    log!(
+        "  foreground variant 1 (AttachThreadInput, fg null={}): SetForegroundWindow -> {}",
+        fg.0.is_null(),
+        ok.as_bool()
+    );
+    if ok.as_bool() && is_foreground(h) {
+        return true;
     }
     let sent = send_f15();
     // SAFETY: `h` is our window.
     let ok2 = unsafe { SetForegroundWindow(h) };
     log!("  foreground variant 2 (synthetic F15, SendInput={sent}): SetForegroundWindow -> {}", ok2.as_bool());
+    if ok2.as_bool() && is_foreground(h) {
+        return true;
+    }
+    // SAFETY: `h` is our window; SwitchToThisWindow has no other preconditions.
+    unsafe { SwitchToThisWindow(h, true) };
+    let ok3 = is_foreground(h);
+    log!("  foreground variant 3 (SwitchToThisWindow): foreground -> {ok3}");
+    ok3
+}
+
+/// true if `h` is the foreground window right now.
+fn is_foreground(h: HWND) -> bool {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    fg == h
 }
 
 /// Presses and releases F15 (a key no app uses): unlocks SetForegroundWindow.
