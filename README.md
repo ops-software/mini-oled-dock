@@ -228,6 +228,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
+| [1.3.1](.github/release-notes/v1.3.1.md) | 2026-10-31 | Hotfix: the Start menu search receives typing again |
 | [1.3.0](.github/release-notes/v1.3.0.md) | 2026-10-29 | Keeps working across Explorer restarts, multi-monitor edge fix, −511 lines de-duplication |
 | [1.2.1](.github/release-notes/v1.2.1.md) | 2026-10-29 | Hotfix: the first click on a popup is no longer lost |
 | [1.2.0](.github/release-notes/v1.2.0.md) | 2026-10-29 | Horizontal Start, Win opens Start, IT/EN language, spatial sound and mixer, customizable volume popup |
@@ -254,7 +255,7 @@ Huge thanks to the contributors:
 
 - [Desox](https://github.com/Desox96): the Start button, quick-links menu and window previews; tray menu placement and foreground fixes, Win opening Start, the IT/EN language switch, spatial audio and the per-app mixer, the customizable volume popup and the horizontal Start layout.
 - [Ragnatela666](https://github.com/Ragnatela666): multi-monitor screen choice, the AppBar position fix, the Start menu written from scratch, Win following the pointer, working notifications, CI and the release workflow, releases 1.1.0 to 1.3.0.
-- [VanheXen](https://github.com/VanheXen): the lost first click fix, the multi-monitor edge fix, the de-duplication refactor (over 500 lines removed with byte-identical rendering) and the Explorer restart fix.
+- [VanheXen](https://github.com/VanheXen): the lost first click fix, the multi-monitor edge fix, the de-duplication refactor (over 500 lines removed with byte-identical rendering), the Explorer restart fix and the Start menu search focus fix.
 
 The 1.1.0-1.3.0 work was developed in [Ragnatela666/mini-oled-dock](https://github.com/Ragnatela666/mini-oled-dock), where the pull requests linked in the release notes live.
 
