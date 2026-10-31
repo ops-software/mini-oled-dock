@@ -34,7 +34,7 @@ use windows::Win32::Graphics::Gdi::{MonitorFromRect, ScreenToClient, MONITOR_DEF
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer,
@@ -56,7 +56,7 @@ pub(crate) mod popup_startmenu;
 
 use crate::audio::{OutputDevice, VolumeState};
 use crate::log;
-use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
+use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
 use crate::render::Metrics;
 use crate::surface::Surface;
 
@@ -359,7 +359,14 @@ struct Open {
     /// true once the popup has been seen as the foreground window.
     was_active: bool,
     wheel_acc: i32,
+    /// Foreground retries still allowed (`TIMER_POPUP_FOCUS`) while the popup is not foreground.
+    focus_tries: u8,
 }
+
+/// Delay between two foreground retries after open.
+const FOCUS_RETRY_MS: u32 = 80;
+/// Foreground retries after the attempt made in `open` (about 0.5 s in total).
+const FOCUS_RETRIES: u8 = 6;
 
 struct State {
     hwnd: HWND,
@@ -867,6 +874,7 @@ fn open(kind: PopupKind, anchor: Anchor) {
             fg_at_open: fg,
             was_active: false,
             wheel_acc: 0,
+            focus_tries: FOCUS_RETRIES,
         });
     });
     if installed.is_none() {
@@ -884,9 +892,14 @@ fn open(kind: PopupKind, anchor: Anchor) {
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
     store_rect(&ITEM_RECT, &anchor.item);
     install_mouse_hook();
-    crate::ui::force_foreground(hwnd);
+    let focused = crate::ui::force_foreground(hwnd);
     // SAFETY: `hwnd` is our window; the callbacks are in its wnd_proc.
     unsafe {
+        // The foreground can be refused (lock, elevated app in front, a transient null foreground):
+        // visible but without the keyboard, the Start menu search box would not receive typing.
+        if !focused && SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) == 0 {
+            log!("popup: SetTimer(focus) failed");
+        }
         if SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
             log!("popup: SetTimer(anim) failed");
         }
@@ -924,6 +937,7 @@ fn close_inner(reason: &str) {
     unsafe {
         let _ = KillTimer(Some(hwnd), TIMER_POPUP_ANIM);
         let _ = KillTimer(Some(hwnd), TIMER_POPUP_TICK);
+        let _ = KillTimer(Some(hwnd), TIMER_POPUP_FOCUS);
     }
     remove_mouse_hook();
     if o.pressed.is_some() {
@@ -1096,6 +1110,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             match wp.0 {
                 TIMER_POPUP_ANIM => on_anim(hwnd),
                 TIMER_POPUP_TICK => on_tick(hwnd),
+                TIMER_POPUP_FOCUS => on_focus_retry(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -1109,6 +1124,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
 }
 
 fn mark_active(hwnd: HWND) {
+    // WM_ACTIVATE is handled here WITHOUT DefWindowProc, which is what normally gives the keyboard
+    // focus to an activated window: without this the popup is active but has NO focus, Windows then
+    // delivers keys as WM_SYSKEYDOWN/WM_SYSCHAR and the Start menu search box receives nothing.
+    // SAFETY: `hwnd` is our window and this runs on its thread (wnd_proc).
+    // The result is ignored: it returns the PREVIOUS focus, which is legitimately null here.
+    let _ = unsafe { SetFocus(Some(hwnd)) };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     if fg == hwnd {
@@ -1325,6 +1346,43 @@ pub(crate) fn tick_soon(ms: u32) {
         // SAFETY: the window belongs to this thread; a stale handle just makes the call fail.
         unsafe {
             SetTimer(Some(HWND(h as *mut _)), TIMER_POPUP_TICK, ms.max(10), None);
+        }
+    }
+}
+
+/// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
+/// the foreground is still the window that was in front at open time (or null, or ours): if the
+/// user has meanwhile moved to another window, the popup is not pushed in front of it (the tick
+/// safety net closes it).
+fn on_focus_retry(hwnd: HWND) {
+    // SAFETY: timer of our window.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_FOCUS) };
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    let go = with(|st| {
+        let o = st.open.as_mut()?;
+        if fg == hwnd {
+            o.was_active = true;
+            return None;
+        }
+        if o.focus_tries == 0 {
+            return None;
+        }
+        let own = crate::ui::is_own_window(fg);
+        if !(fg.0.is_null() || fg == o.fg_at_open || own || crate::ui::fs_bounce_grace(fg)) {
+            return None;
+        }
+        o.focus_tries -= 1;
+        Some(o.focus_tries)
+    })
+    .flatten();
+    let Some(left) = go else { return };
+    let ok = crate::ui::force_foreground(hwnd);
+    log!("popup: foreground retry ({left} left) -> {ok}");
+    if !ok && left > 0 {
+        // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
+        if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
+            log!("popup: SetTimer(focus) failed");
         }
     }
 }
