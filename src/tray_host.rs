@@ -676,6 +676,8 @@ struct OwnerFacts<'a> {
     same_process: bool,
     /// That process runs at integrity not higher than medium.
     at_most_medium: bool,
+    /// The owner window has no `WS_CHILD` style (top-level or message-only, as real tray owners are).
+    top_level: bool,
     /// Image path recorded when the icon was registered (empty if it could not be read).
     recorded_image: &'a str,
     /// Image path of the process now (`None` if not read or unreadable).
@@ -692,6 +694,9 @@ enum Verdict {
     ElevatedNotTrusted,
     /// Elevated owner, switch on, but the callback is not an application message.
     SystemMessage,
+    /// Elevated owner, switch on, but the owner is a child window (a control, which reads
+    /// `WM_USER`-range messages as commands).
+    ChildWindow,
     /// Elevated owner, switch on, but its process no longer runs the image recorded at registration.
     ImageMismatch,
 }
@@ -711,8 +716,17 @@ fn is_app_message(callback: u32) -> bool {
 /// window and the callback message itself). Our elevated dock would then deliver attacker-chosen
 /// messages across the integrity boundary. So owners above medium (or of unknown integrity) are
 /// refused unless an administrator opted in (`trust_elevated`, HKLM registry), and even then only
-/// application messages (`is_app_message`) are sent, and only while the owner process still runs the
-/// image recorded when the icon was registered. Owners at most medium are not affected.
+/// application messages (`is_app_message`) are sent, only to a top-level or message-only owner (never
+/// a child control, which reads `WM_USER`-range messages as commands), and only while the owner process
+/// still runs the image recorded when the icon was registered. Owners at most medium are not affected.
+///
+/// Residual risk with the switch on: the recorded image is read at NIM_ADD from the process that owns
+/// the named window, so for a fake registration it is the victim's own image and the image check
+/// passes. A normal program can therefore still make the dock send an application message
+/// (`WM_USER..=0xFFFF`), with a value it partly chooses (wParam, or the high word of lParam for
+/// version 4), to a top-level window of a program running as administrator, when the user clicks or
+/// hovers an icon it registered. The image and process checks only stop a closed program's window or
+/// pid from being reused; they do not decide which elevated window can be targeted.
 fn callback_verdict(o: &OwnerFacts<'_>, callback: u32, trust_elevated: bool) -> Verdict {
     if !o.same_process {
         return Verdict::NotOwner;
@@ -725,6 +739,9 @@ fn callback_verdict(o: &OwnerFacts<'_>, callback: u32, trust_elevated: bool) -> 
     }
     if !is_app_message(callback) {
         return Verdict::SystemMessage;
+    }
+    if !o.top_level {
+        return Verdict::ChildWindow;
     }
     match o.current_image {
         Some(now) if !o.recorded_image.is_empty() && now.eq_ignore_ascii_case(o.recorded_image) => Verdict::Allowed,
@@ -845,13 +862,23 @@ fn callback_allowed(t: &Target) -> bool {
     let trust = same_process && !at_most_medium && trust_elevated_tray_icons();
     // The image is read only for an elevated owner the switch may allow.
     let current = if trust && is_app_message(t.callback) { crate::apps::exe_path_of_pid(t.pid) } else { None };
-    let facts =
-        OwnerFacts { same_process, at_most_medium, recorded_image: &t.image, current_image: current.as_deref() };
+    // SAFETY: no preconditions; returns 0 for an invalid handle (then read as top-level, but
+    // `same_process` already requires the window to exist).
+    let style = unsafe { GetWindowLongW(hwnd_of(t.owner), GWL_STYLE) } as u32;
+    let top_level = style & WS_CHILD.0 == 0;
+    let facts = OwnerFacts {
+        same_process,
+        at_most_medium,
+        top_level,
+        recorded_image: &t.image,
+        current_image: current.as_deref(),
+    };
     let why = match callback_verdict(&facts, t.callback, trust) {
         Verdict::Allowed => return true,
         Verdict::NotOwner => return false,
         Verdict::ElevatedNotTrusted => NOT_TRUSTED_HINT.to_string(),
         Verdict::SystemMessage => " and the callback is not an application message".to_string(),
+        Verdict::ChildWindow => " and the owner is a child window, not a top-level or message-only one".to_string(),
         Verdict::ImageMismatch => format!(
             " and its process image ({}) is not the one recorded at registration ({})",
             current.as_deref().unwrap_or("?"),
@@ -2751,6 +2778,7 @@ mod tests {
         let facts = |same_process, at_most_medium, recorded_image, current_image| OwnerFacts {
             same_process,
             at_most_medium,
+            top_level: true,
             recorded_image,
             current_image,
         };
@@ -2785,6 +2813,18 @@ mod tests {
         assert_eq!(callback_verdict(&facts(true, false, AB, None), 0x8001, true), Verdict::ImageMismatch);
         assert_eq!(callback_verdict(&facts(true, false, "", Some(AB)), 0x8001, true), Verdict::ImageMismatch);
         assert_eq!(callback_verdict(&facts(true, false, "", Some("")), 0x8001, true), Verdict::ImageMismatch);
+        // Switch on: the elevated owner must be top-level or message-only, never a child control.
+        let elevated_child = OwnerFacts { top_level: false, ..elevated };
+        for cb in [WM_USER + 31, 0x1000, 0x8001, 0xC123] {
+            assert_eq!(callback_verdict(&elevated_child, cb, true), Verdict::ChildWindow, "0x{cb:X}");
+        }
+        assert_eq!(callback_verdict(&elevated_child, 0x8001, false), Verdict::ElevatedNotTrusted);
+        assert_eq!(callback_verdict(&elevated, 0x8001, true), Verdict::Allowed, "elevated top-level");
+        // A child owner of a medium process is unchanged.
+        let medium_child = OwnerFacts { top_level: false, ..medium };
+        for trust in [false, true] {
+            assert_eq!(callback_verdict(&medium_child, WM_USER + 31, trust), Verdict::Allowed);
+        }
         // The refusal hint names the Settings option and the registry value.
         assert!(NOT_TRUSTED_HINT.contains("Settings > Modules > Tray"));
         assert!(NOT_TRUSTED_HINT.contains("TrustElevatedTrayIcons"));
