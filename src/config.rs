@@ -72,6 +72,63 @@ impl<'de> Deserialize<'de> for StartStyle {
     }
 }
 
+/// Battery module visibility. Written as `"auto"` / `true` / `false`; an unreadable value is `Auto`
+/// instead of rejecting the file. `Auto` shows the module only when the machine has a battery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BatteryShow {
+    /// Shown only on a machine with a battery (decided at runtime from the last sample).
+    #[default]
+    Auto,
+    /// Always shown (an icon with a slash when there is no battery).
+    On,
+    /// Never shown.
+    Off,
+}
+
+impl BatteryShow {
+    /// Whether the module is in the bar, given whether a battery was seen.
+    pub fn shown(self, battery_present: bool) -> bool {
+        match self {
+            BatteryShow::Auto => battery_present,
+            BatteryShow::On => true,
+            BatteryShow::Off => false,
+        }
+    }
+
+    fn parse_str(s: &str) -> BatteryShow {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("true") {
+            BatteryShow::On
+        } else if s.eq_ignore_ascii_case("false") {
+            BatteryShow::Off
+        } else {
+            BatteryShow::Auto
+        }
+    }
+}
+
+impl Serialize for BatteryShow {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            BatteryShow::Auto => s.serialize_str("auto"),
+            BatteryShow::On => s.serialize_bool(true),
+            BatteryShow::Off => s.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BatteryShow {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Any JSON value is accepted: a boolean is a valid setting, everything unreadable is `Auto`.
+        Ok(match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Bool(true) => BatteryShow::On,
+            serde_json::Value::Bool(false) => BatteryShow::Off,
+            serde_json::Value::String(s) => BatteryShow::parse_str(&s),
+            _ => BatteryShow::Auto,
+        })
+    }
+}
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -413,6 +470,12 @@ pub struct Config {
     pub show_network: bool,
     /// CPU / RAM usage module (`metrics`).
     pub show_metrics: bool,
+    /// Battery module: "auto" (only on a laptop) | true | false (`BatteryShow`).
+    pub show_battery: BatteryShow,
+    /// Battery module: show the charge percentage.
+    pub battery_percent: bool,
+    /// Battery module: put the percentage inside the battery body instead of beside it.
+    pub battery_percent_inside: bool,
     pub show_clock: bool,
     pub show_desktop_button: bool,
     /// Start button: fixed item at the left end of the bar (not a movable module); see `module_visible("start")`.
@@ -478,8 +541,8 @@ pub const APP_ORDER_CAP: usize = 64;
 pub const TRAY_ORDER_CAP: usize = 128;
 
 /// Default order of the system modules (names accepted by `modules_order`).
-pub const DEFAULT_MODULES_ORDER: [&str; 7] =
-    ["metrics", "notifications", "network", "volume", "clock", "show_desktop", "power"];
+pub const DEFAULT_MODULES_ORDER: [&str; 8] =
+    ["metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power"];
 
 /// GUIDs of the system tray icons hidden by default: volume, network, power, location,
 /// microphone (the dock draws/duplicates the first three).
@@ -512,6 +575,9 @@ impl Default for Config {
             show_volume: true,
             show_network: true,
             show_metrics: false,
+            show_battery: BatteryShow::Auto,
+            battery_percent: true,
+            battery_percent_inside: false,
             show_clock: true,
             show_desktop_button: true,
             show_start_button: true,
@@ -731,7 +797,7 @@ fn render(c: &Config) -> String {
   //   app_icon_size   app icons, 14-32 px (default 16)
   //   app_text_size   app names, 10-18 px (default 13)
   //   tray_icon_size  tray icons, 12-24 px (default 16)
-  //   module_size     start button, notifications, volume, network, metrics, clock, show desktop and
+  //   module_size     start button, notifications, volume, network, metrics, battery, clock, show desktop and
   //                   power, 75-150 % (default 100)
   // Logical pixels: the Windows display scaling is applied on top.
   "app_icon_size": {icon_size},
@@ -808,6 +874,17 @@ fn render(c: &Config) -> String {
   // Click to open Task Manager.
   "show_metrics": {show_metrics},
 
+  // Battery: an Apple-style icon filled in proportion to the charge, with a bolt while charging.
+  // Click for the details. Refreshed every 30 s while the bar is visible, and at once when the
+  // charger is plugged or unplugged.
+  //   show_battery            "auto" (only on a laptop) | true (always; an icon with a slash when there
+  //                           is no battery) | false
+  //   battery_percent         show the number
+  //   battery_percent_inside  put the number inside the battery body (Apple style) instead of beside it
+  "show_battery": {show_battery},
+  "battery_percent": {battery_percent},
+  "battery_percent_inside": {battery_percent_inside},
+
   "show_clock": {show_clock},
   "show_desktop_button": {show_desk},
 
@@ -847,7 +924,7 @@ fn render(c: &Config) -> String {
   "app_order": {app_order},
 
   // Order of the system buttons on the right of the bar. Normally managed by dragging them.
-  // Names: "metrics", "notifications", "network", "volume", "clock", "show_desktop", "power".
+  // Names: "metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power".
   // Missing names go back next to their default neighbour, unknown names are ignored.
   // Hiding a module (the show_* switches above) keeps its place in this list.
   "modules_order": {modules_order},
@@ -903,6 +980,9 @@ fn render(c: &Config) -> String {
         show_vol_mod = c.show_volume,
         show_network = c.show_network,
         show_metrics = c.show_metrics,
+        show_battery = js(&c.show_battery),
+        battery_percent = c.battery_percent,
+        battery_percent_inside = c.battery_percent_inside,
         show_clock = c.show_clock,
         show_desk = c.show_desktop_button,
         show_start = c.show_start_button,
@@ -1361,6 +1441,51 @@ mod tests {
     }
 
     #[test]
+    fn battery_defaults_and_roundtrip() {
+        let d = Config::default();
+        assert_eq!(d.show_battery, BatteryShow::Auto);
+        assert!(d.battery_percent && !d.battery_percent_inside);
+        assert_eq!(d.modules_order.len(), 8);
+        assert_eq!(d.modules_order[4], "battery");
+        assert!(render(&d).contains("\"show_battery\": \"auto\""));
+        let c = Config {
+            show_battery: BatteryShow::On,
+            battery_percent: false,
+            battery_percent_inside: true,
+            ..Config::default()
+        };
+        let r = render(&c);
+        assert!(r.contains("\"show_battery\": true") && r.contains("\"battery_percent\": false"));
+        assert!(r.contains("\"battery_percent_inside\": true"));
+        assert_eq!(parse(&r).unwrap(), c);
+    }
+
+    #[test]
+    fn battery_show_parses_leniently() {
+        for (text, want) in [
+            ("\"auto\"", BatteryShow::Auto),
+            ("\"AUTO\"", BatteryShow::Auto),
+            ("true", BatteryShow::On),
+            ("false", BatteryShow::Off),
+            ("\"true\"", BatteryShow::On),
+            ("\"false\"", BatteryShow::Off),
+            ("\"yes\"", BatteryShow::Auto),
+            ("1", BatteryShow::Auto),
+            ("null", BatteryShow::Auto),
+        ] {
+            let c = parse(&format!("{{ \"show_battery\": {text}, \"autohide\": false }}")).unwrap();
+            assert_eq!(c.show_battery, want, "{text}");
+            assert!(!c.autohide, "the rest of the file must survive: {text}");
+        }
+    }
+
+    #[test]
+    fn battery_show_resolves_auto_with_presence() {
+        assert!(!BatteryShow::Auto.shown(false) && BatteryShow::Auto.shown(true));
+        assert!(BatteryShow::On.shown(false) && !BatteryShow::Off.shown(true));
+    }
+
+    #[test]
     fn order_fields_roundtrip() {
         let mut c = Config::default();
         c.app_order = vec!["a".into(), "b".into()];
@@ -1369,7 +1494,7 @@ mod tests {
         let r = render(&c);
         assert!(r.contains("\"modules_order\""));
         assert_eq!(parse(&r).unwrap(), c);
-        assert_eq!(Config::default().modules_order.len(), 7);
+        assert_eq!(Config::default().modules_order.len(), 8);
     }
 
     #[test]
