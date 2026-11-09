@@ -11,7 +11,8 @@
 //! The dock only polls for the two names (`poll_step`, `LAYOUT_TIMEOUT`), never writes, renames or
 //! deletes anything in that folder and never reads the `.err` content. The JSON is untrusted input:
 //! read through `datadir::read_file` (no reparse points, single link, `MAX_JSON` cap), parsed by
-//! serde_json (`map_layout`, pure), then the pins are saved through `config::modify`. The
+//! serde_json (`map_layout`, pure; only local `.lnk` files under the Start menu folders reach the
+//! shell link loader, `link_allowed`), then the pins are saved through `config::modify`. The
 //! AppsFolder catalog (`shell_thread::enum_apps_folder`) is enumerated on that same thread and only
 //! when a `.lnk` entry needs it, so nothing stays in memory afterwards.
 //!
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use windows::core::{Interface, HSTRING, PCWSTR};
+use windows::core::{Interface, GUID, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 use windows::Win32::Security::{TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
@@ -33,7 +34,10 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
-use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, IShellLinkW, SHGetKnownFolderPath, ShellLink, KF_FLAG_DEFAULT};
+use windows::Win32::UI::Shell::{
+    FOLDERID_CommonPrograms, FOLDERID_LocalAppData, FOLDERID_Programs, IShellLinkW, SHGetKnownFolderPath, ShellLink,
+    KF_FLAG_DEFAULT,
+};
 
 use crate::log;
 use crate::shell_thread::StartApp;
@@ -182,16 +186,17 @@ fn layout_file_name(id: &[u8; 16]) -> String {
 
 /// Whole argument string for `powershell.exe`: every path is a single-quoted PowerShell literal
 /// (only the quote itself needs doubling); `-WindowStyle Hidden` because the shell starts it with
-/// `SW_SHOWNORMAL`.
+/// `SW_SHOWNORMAL`. `-LiteralPath` wherever it exists: `[` `]` are legal in profile names and are
+/// wildcards for `-Path`. `Stop` turns non-terminating errors into the `catch` (the `.err` file).
 fn export_args(dir: &str, file: &str) -> String {
     let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let (d, old, tmp, json, err) =
-        (q(dir), q(&format!("{dir}\\start-layout-*")), q(&format!("{file}.tmp")), q(file), q(&format!("{file}.err")));
+    let (d, tmp, json, err) = (q(dir), q(&format!("{file}.tmp")), q(file), q(&format!("{file}.err")));
     format!(
-        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"try {{ \
-         New-Item -ItemType Directory -Force {d} | Out-Null; \
-         Get-ChildItem {old} | Where-Object LastWriteTime -lt (Get-Date).AddHours(-1) | Remove-Item -Force; \
-         Export-StartLayout -Path {tmp}; Move-Item -Force {tmp} {json} }} catch {{ Set-Content {err} $_ }}\""
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"$ErrorActionPreference='Stop'; \
+         try {{ New-Item -ItemType Directory -Force -Path {d} | Out-Null; \
+         Get-ChildItem -LiteralPath {d} -Filter 'start-layout-*' | Where-Object LastWriteTime -lt (Get-Date).AddHours(-1) \
+         | Remove-Item -Force -ErrorAction SilentlyContinue; Export-StartLayout -LiteralPath {tmp}; Move-Item -Force -LiteralPath {tmp} -Destination {json} \
+         }} catch {{ Set-Content -LiteralPath {err} $_ }}\""
     )
 }
 
@@ -208,6 +213,11 @@ fn random_id() -> Result<[u8; 16], String> {
 /// `<LocalAppData of the user owning process explorer_pid>\mini-oled-dock`, from that process's token
 /// (the elevated dock's own profile may belong to another account and is never used).
 fn shell_user_local_appdata(explorer_pid: u32) -> Result<PathBuf, String> {
+    Ok(shell_user_folder(explorer_pid, &FOLDERID_LocalAppData)?.join("mini-oled-dock"))
+}
+
+/// Known folder `id` of the user owning process `explorer_pid`, from that process's token.
+fn shell_user_folder(explorer_pid: u32, id: &GUID) -> Result<PathBuf, String> {
     // SAFETY: query-only open of another process; the handle is owned by `_proc` below.
     let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, explorer_pid) }
         .map_err(|e| format!("OpenProcess({explorer_pid}): {e}"))?;
@@ -220,17 +230,39 @@ fn shell_user_local_appdata(explorer_pid: u32) -> Result<PathBuf, String> {
     // SAFETY: fresh valid token handle, ownership transferred (closed on every return path).
     let _token = unsafe { OwnedHandle::from_raw_handle(token.0) };
     // SAFETY: valid known-folder id and token; the returned buffer is freed below.
-    let p = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, Some(token)) }
-        .map_err(|e| format!("SHGetKnownFolderPath(LocalAppData): {e}"))?;
+    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, Some(token)) }
+        .map_err(|e| format!("SHGetKnownFolderPath({id:?}): {e}"))?;
     // SAFETY: NUL-terminated string returned by SHGetKnownFolderPath, read once.
     let base = unsafe { p.to_string() };
     // SAFETY: same pointer, allocated with CoTaskMemAlloc, not used after this line.
     unsafe { CoTaskMemFree(Some(p.0 as *const std::ffi::c_void)) };
-    let base = base.map_err(|e| format!("LocalAppData path: {e}"))?;
+    let base = base.map_err(|e| format!("known folder {id:?}: {e}"))?;
     if base.is_empty() {
-        return Err("empty LocalAppData path".into());
+        return Err(format!("empty known folder {id:?}"));
     }
-    Ok(PathBuf::from(base).join("mini-oled-dock"))
+    Ok(PathBuf::from(base))
+}
+
+/// true if the layout's `desktopAppLink` `path` may be opened by the (elevated) shell link loader:
+/// a local `X:\...` path (no `\\` UNC, `\\?\` or `\\.\` form, no `..`, no stream `:`), a `.lnk`
+/// file, strictly under one of `roots` (component-wise, case-insensitive).
+fn link_allowed(path: &str, roots: &[PathBuf]) -> bool {
+    let b = path.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\' || path[2..].contains(':') {
+        return false;
+    }
+    if !Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+        return false;
+    }
+    let parts = |s: &str| s.split(['\\', '/']).filter(|c| !c.is_empty()).map(str::to_lowercase).collect::<Vec<_>>();
+    let p = parts(path);
+    if p.iter().any(|c| c == "..") {
+        return false;
+    }
+    roots.iter().any(|r| {
+        let r = parts(&r.to_string_lossy());
+        !r.is_empty() && p.len() > r.len() && p[..r.len()] == r[..]
+    })
 }
 
 /// Uninitializes COM when `job` returns (declared first there, so dropped after every COM object).
@@ -255,6 +287,11 @@ fn job() -> Result<usize, JobError> {
         ))
     })?;
     let dir = shell_user_local_appdata(pid)?;
+    // Only shortcuts of the Start menu folders (all users + the shell user) reach the link loader.
+    let roots: Vec<PathBuf> = [FOLDERID_CommonPrograms, FOLDERID_Programs]
+        .iter()
+        .filter_map(|id| shell_user_folder(pid, id).map_err(|e| log!("start import: {e}")).ok())
+        .collect();
     let id = random_id()?;
     let file = dir.join(layout_file_name(&id));
     let mut err = file.clone().into_os_string();
@@ -292,7 +329,7 @@ fn job() -> Result<usize, JobError> {
                 })
                 .collect()
         };
-        map_layout(&text, &mut catalog, &|lnk| link.as_ref().and_then(|l| l.target(lnk)))
+        map_layout(&text, &mut catalog, &|lnk| link.as_ref().and_then(|l| l.target(lnk)), &roots)
     };
     let pins = mapped?;
     if pins.is_empty() {
@@ -370,11 +407,14 @@ fn stem(path: &str) -> &str {
 /// catalog: first an id equal to the shortcut's target (`target`), as a plain path or in its
 /// `{KnownFolder}\...` form (the `Option` next to each app, lowercase), then the shortcut's file
 /// name against the app names. `catalog` is called once, and only when a link needs it. Entries
-/// that cannot be mapped are skipped (logged). Err = not a layout file.
+/// that cannot be mapped are skipped (logged). The JSON is untrusted: a link that fails
+/// `link_allowed(link, roots)` is skipped before `target` or the file-name match see it.
+/// Err = not a layout file.
 pub(crate) fn map_layout(
     json: &str,
     catalog: &mut dyn FnMut() -> Vec<(StartApp, Option<String>)>,
     target: &dyn Fn(&str) -> Option<String>,
+    roots: &[PathBuf],
 ) -> Result<Vec<String>, String> {
     let v: serde_json::Value =
         serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("layout JSON: {e}"))?;
@@ -386,6 +426,10 @@ pub(crate) fn map_layout(
             Some(id.trim().to_string()).filter(|s| !s.is_empty())
         } else if let Some(link) = entry.get("desktopAppLink").and_then(|x| x.as_str()) {
             let link = crate::shell_thread::expand_env(link);
+            if !link_allowed(&link, roots) {
+                log!("start import: shortcut outside the Start menu folders skipped: {link}");
+                continue;
+            }
             let apps = loaded.get_or_insert_with(&mut *catalog);
             let by_target = target(&link).map(|t| norm(&crate::shell_thread::expand_env(&t))).and_then(|t| {
                 apps.iter()
@@ -453,7 +497,12 @@ mod tests {
             calls += 1;
             apps.clone()
         };
-        let got = map_layout(json, &mut cat, &target).unwrap();
+        let roots = [
+            PathBuf::from(crate::shell_thread::expand_env(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs")),
+            PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"),
+            PathBuf::from(r"C:\Links"),
+        ];
+        let got = map_layout(json, &mut cat, &target, &roots).unwrap();
         assert_eq!(
             got,
             vec![
@@ -470,11 +519,45 @@ mod tests {
     #[test]
     fn layout_without_links_never_loads_the_catalog() {
         let mut cat = || -> Vec<(StartApp, Option<String>)> { panic!("catalog not needed") };
-        let got = map_layout("\u{feff}{\"pinnedList\":[{\"packagedAppId\":\"A!B\"}]}", &mut cat, &|_| None).unwrap();
+        let got =
+            map_layout("\u{feff}{\"pinnedList\":[{\"packagedAppId\":\"A!B\"}]}", &mut cat, &|_| None, &[]).unwrap();
         assert_eq!(got, vec!["A!B".to_string()]);
-        assert!(map_layout("{}", &mut cat, &|_| None).is_err());
-        assert!(map_layout("not json", &mut cat, &|_| None).is_err());
-        assert!(map_layout("{\"pinnedList\":[]}", &mut cat, &|_| None).unwrap().is_empty());
+        assert!(map_layout("{}", &mut cat, &|_| None, &[]).is_err());
+        assert!(map_layout("not json", &mut cat, &|_| None, &[]).is_err());
+        assert!(map_layout("{\"pinnedList\":[]}", &mut cat, &|_| None, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hostile_links_never_reach_the_shell_link_loader() {
+        let roots = [PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs")];
+        let one = |link: &str| serde_json::json!({ "pinnedList": [{ "desktopAppLink": link }] }).to_string();
+        let mut cat = || vec![app("X", "x", None), app("Evil", "evil", None)];
+        let hostile = [
+            r"\\server\share\x.lnk",
+            r"\\?\C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.lnk",
+            r"\\.\pipe\x",
+            r"C:\Users\me\evil.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\..\..\evil.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.exe",
+            r"Programs\x.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.lnk:stream.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\ProgramsX\x.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs",
+        ];
+        for link in hostile {
+            assert!(!link_allowed(link, &roots), "{link}");
+            let no_target = |l: &str| -> Option<String> { panic!("target({l}) reached") };
+            let got = map_layout(&one(link), &mut cat, &no_target, &roots).unwrap();
+            assert!(got.is_empty(), "{link}: the file-name fallback used it: {got:?}");
+        }
+        let reached = std::cell::Cell::new(false);
+        let target = |_: &str| -> Option<String> {
+            reached.set(true);
+            None
+        };
+        let ok = r"c:\programdata\microsoft\windows\START MENU\Programs\Sub\X.LNK";
+        assert_eq!(map_layout(&one(ok), &mut cat, &target, &roots).unwrap(), ["X"]);
+        assert!(reached.get(), "an allowed link reaches the shell link loader");
     }
 
     #[test]
@@ -501,9 +584,15 @@ mod tests {
         assert!(a.starts_with("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \""));
         assert!(a.contains(r"'C:\Users\O''Brien\AppData\Local\mini-oled-dock'"), "apostrophe doubled: {a}");
         assert!(a.contains(
-            r"Export-StartLayout -Path 'C:\Users\O''Brien\AppData\Local\mini-oled-dock\start-layout-ab.json.tmp'"
+            r"Export-StartLayout -LiteralPath 'C:\Users\O''Brien\AppData\Local\mini-oled-dock\start-layout-ab.json.tmp'"
         ));
-        assert!(a.contains("Move-Item -Force") && a.contains(".json.err'") && a.contains("AddHours(-1)"));
+        assert!(a.contains("Move-Item -Force -LiteralPath") && a.contains(" -Destination "));
+        assert!(a.contains(
+            r"Get-ChildItem -LiteralPath 'C:\Users\O''Brien\AppData\Local\mini-oled-dock' -Filter 'start-layout-*'"
+        ));
+        assert!(a.contains("Set-Content -LiteralPath") && a.contains(".json.err'") && a.contains("AddHours(-1)"));
+        assert!(a.contains("-Command \"$ErrorActionPreference='Stop'; try {"), "{a}");
+        assert!(!a.contains(r"mini-oled-dock\start-layout-*"), "no wildcard -Path left: {a}");
         assert_eq!(a.matches('"').count(), 2, "only the -Command wrapper uses double quotes");
     }
 
@@ -522,10 +611,10 @@ mod tests {
     fn hostile_layout_json_is_rejected_or_skipped_without_panic() {
         let mut cat = || -> Vec<(StartApp, Option<String>)> { panic!("catalog not needed") };
         let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
-        assert!(map_layout(&deep, &mut cat, &|_| None).is_err(), "serde_json recursion limit");
-        assert!(map_layout(r#"{"pinnedList":"x"}"#, &mut cat, &|_| None).is_err());
+        assert!(map_layout(&deep, &mut cat, &|_| None, &[]).is_err(), "serde_json recursion limit");
+        assert!(map_layout(r#"{"pinnedList":"x"}"#, &mut cat, &|_| None, &[]).is_err());
         let odd = r#"{"pinnedList":[1,null,[],{"packagedAppId":5},{"packagedAppId":""}]}"#;
-        assert!(map_layout(odd, &mut cat, &|_| None).unwrap().is_empty());
+        assert!(map_layout(odd, &mut cat, &|_| None, &[]).unwrap().is_empty());
         assert_eq!(decode(IDLE), Status::Idle);
         assert_eq!(decode(TIMEDOUT), Status::TimedOut, "the TIMEDOUT arm precedes the Imported catch-all");
         assert_eq!(decode(DONE + 7), Status::Imported(7));
