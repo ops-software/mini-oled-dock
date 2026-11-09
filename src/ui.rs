@@ -71,9 +71,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
     SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HTCLIENT,
     HWND_TOPMOST, IDC_HAND,
-    MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WS_CAPTION,
+    MA_NOACTIVATE, SC_CLOSE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -171,8 +171,9 @@ static EDGE_SINCE: AtomicU64 = AtomicU64::new(0);
 static EDGE_ARMED: AtomicBool = AtomicBool::new(true);
 /// true if the dock was shown over a fullscreen / borderless app.
 static FS_SHOWN: AtomicBool = AtomicBool::new(false);
-/// HWND (as isize) of the fullscreen app under the dock, to give it the foreground back.
-static FS_PREV: AtomicIsize = AtomicIsize::new(0);
+/// HWND (as isize, 0 = none) that had the foreground before the dock took it (Win key, fullscreen
+/// app), to give it the foreground back when the dock hides. With `FS_SHOWN` it is the fullscreen app.
+static PREV_FG: AtomicIsize = AtomicIsize::new(0);
 /// Tick (ms) of the last `force_foreground` call (0 = never).
 static FG_TAKEN_AT: AtomicU64 = AtomicU64::new(0);
 /// Foreground re-takes after a fullscreen bounce since the dock was shown.
@@ -469,6 +470,11 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
     match msg {
         WM_TIMER => on_timer(h, wp.0),
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        // The bar can hold the foreground (Win key): Alt+F4 must not reach WM_CLOSE, which exits the dock.
+        WM_SYSCOMMAND if wp.0 & 0xFFF0 == SC_CLOSE as usize => {
+            log!("Alt+F4 / SC_CLOSE on the bar ignored");
+            Some(LRESULT(0))
+        }
         WM_DOCK_APP_MENU_CMD => {
             on_app_menu_cmd(wp.0 as u32);
             Some(LRESULT(0))
@@ -599,7 +605,7 @@ pub fn toggle() {
     if VISIBLE.load(Relaxed) && !moved {
         hide_dock("Win alone (toggle)");
     } else {
-        show_dock(if moved { "Win alone (pointer display)" } else { "Win alone (toggle)" }, SHOW_MS);
+        show_dock_win(if moved { "Win alone (pointer display)" } else { "Win alone (toggle)" });
     }
 }
 
@@ -631,7 +637,7 @@ pub fn win_double_tap() {
 fn start_with_bar() {
     if popup::current() == Some(PopupKind::StartMenu) {
         if !VISIBLE.load(Relaxed) && popup::is_linked() {
-            show_dock("Win (Start + bar, reversed)", SHOW_MS);
+            show_dock_win("Win (Start + bar, reversed)");
         } else if VISIBLE.load(Relaxed) && config::effective_autohide() {
             popup::link_to_bar();
             hide_dock("Win (Start + bar)");
@@ -645,11 +651,12 @@ fn start_with_bar() {
 
 /// Toggles the dock's Start menu on the bar, which in "pointer" mode is first brought to the display
 /// under the pointer. A hidden bar is shown and an opening menu is linked to its slide+fade.
+/// Only the Win key calls it: a hidden bar is shown with the foreground (`show_dock_win`).
 fn toggle_start_menu(reason: &str) {
     follow_pointer();
     let was_visible = VISIBLE.load(Relaxed);
     if !was_visible {
-        show_dock(reason, SHOW_MS);
+        show_dock_win(reason);
     }
     match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
         Some(a) => popup::toggle(PopupKind::StartMenu, a),
@@ -1213,6 +1220,9 @@ fn on_vis_tick(h: HWND) {
             if popup::is_linked() {
                 popup::close("bar hidden (with Start)");
             }
+            // Deferred by `hide` while the linked popup held the foreground; before the bar hides, which
+            // could hand the foreground to a third window.
+            restore_prev_foreground();
             hide_window(h);
             return;
         }
@@ -2837,6 +2847,35 @@ fn hide_window(h: HWND) {
 /// the foreground (or with `--foreground`) it also tries to bring itself to the foreground
 /// (`force_foreground`) and remembers the app to give the foreground back when it hides.
 pub fn show_dock(reason: &str, hide_after_ms: u64) {
+    show_dock_as(reason, hide_after_ms, false);
+}
+
+/// `show_dock` for the Win key: like the Windows taskbar and Start it always takes the foreground
+/// (`show_takes_foreground`), over any window, fullscreen or not.
+fn show_dock_win(reason: &str) {
+    show_dock_as(reason, SHOW_MS, true);
+}
+
+/// true if a show takes the foreground: by the Win key or over a recognised fullscreen app, unless
+/// `--no-foreground`; always with `--foreground`. The screen edge and other shows do not.
+fn show_takes_foreground(by_win: bool, fullscreen: bool, foreground_flag: bool, no_foreground: bool) -> bool {
+    foreground_flag || ((by_win || fullscreen) && !no_foreground)
+}
+
+/// Window (as isize, 0 = none) to remember on a fresh show: the fullscreen app, else the previous
+/// foreground window (not ours) if the show takes the foreground, else the one still remembered
+/// (a linked Start hide reversed before its deferred restore).
+fn prev_to_remember(fullscreen: isize, other_fg: isize, takes: bool, kept: isize) -> isize {
+    if fullscreen != 0 {
+        fullscreen
+    } else if takes && other_fg != 0 {
+        other_fg
+    } else {
+        kept
+    }
+}
+
+fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
     if GEOM.with(|g| g.get()).is_none() {
         return;
     }
@@ -2854,6 +2893,7 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     EDGE_ARMED.store(false, Relaxed);
     // The foreground must be read BEFORE showing/activating the dock (afterwards it would be the dock itself).
     let fs = if was_visible { None } else { fullscreen_window(&g.mon) };
+    let other_fg = if was_visible { HWND::default() } else { foreign_foreground() };
     let (dy, _) = vis_offset(config_top());
     show_topmost(hwnd(), &Geom { y: g.y + dy, ..g });
     HIDE_AT.store(now_ms() + hide_after_ms, Relaxed);
@@ -2868,23 +2908,40 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     } else {
         log!("SHOW ({reason}), hiding in {hide_after_ms} ms");
     }
+    let args = crate::args();
+    let fullscreen = FS_SHOWN.load(Relaxed) || fs.is_some();
+    let takes = show_takes_foreground(by_win, fullscreen, args.foreground, args.no_foreground);
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
-        FS_PREV.store(fs.map(|h| h.0 as isize).unwrap_or(0), Relaxed);
+        let fs_raw = fs.map(|h| h.0 as isize).unwrap_or(0);
+        PREV_FG.store(prev_to_remember(fs_raw, other_fg.0 as isize, takes, PREV_FG.load(Relaxed)), Relaxed);
         FS_RETAKES.store(0, Relaxed);
         CLICK_DOWN.store(mouse_buttons_down(), Relaxed);
         if let Some(h) = fs {
             log!("  fullscreen foreground window: \"{}\"", window_title(h));
+        } else if takes && !other_fg.0.is_null() {
+            log!("  previous foreground window: \"{}\"", window_title(other_fg));
         }
     }
-    let args = crate::args();
-    if args.foreground || (FS_SHOWN.load(Relaxed) && !args.no_foreground) {
-        force_foreground(hwnd());
+    if takes {
+        // An open popup (linked Start menu, Win+N) keeps the focus: it closes when it loses it.
+        force_foreground(popup::current_hwnd().unwrap_or_else(hwnd));
     }
 }
 
-/// Hides the dock. If it was over a fullscreen app and the foreground is still ours (timeout,
-/// Win key), it gives the foreground back to that app.
+/// Foreground window if it is not ours (null otherwise).
+fn foreign_foreground() -> HWND {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() || is_own_window(fg) {
+        HWND::default()
+    } else {
+        fg
+    }
+}
+
+/// Hides the dock. If the dock took the foreground (Win key, fullscreen app) and it is still ours
+/// or nobody's (timeout, Win key), it gives it back to the window that had it before.
 pub fn hide_dock(reason: &str) {
     hide(reason, false);
 }
@@ -2894,9 +2951,11 @@ fn hide(reason: &str, now: bool) {
     // Hiding over a fullscreen app is instant; otherwise slide+fade out.
     let fs = FS_SHOWN.swap(false, Relaxed);
     let instant = now || fs;
-    let prev = if fs { FS_PREV.swap(0, Relaxed) } else { 0 };
-    // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`.
-    if instant || !crate::popup::is_linked() {
+    // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`,
+    // which then gives the foreground back: taken now, the popup would close on the focus loss.
+    let linked = !instant && crate::popup::is_linked();
+    let prev = if linked { 0 } else { PREV_FG.swap(0, Relaxed) };
+    if !linked {
         crate::popup::close("dock hidden");
     }
     picker_cancel("dock hidden");
@@ -3018,6 +3077,14 @@ fn sysmon_tick() {
     }
 }
 
+/// `restore_foreground` for the remembered window (`PREV_FG`), which is then forgotten.
+fn restore_prev_foreground() {
+    let prev = PREV_FG.swap(0, Relaxed);
+    if prev != 0 {
+        restore_foreground(HWND(prev as *mut std::ffi::c_void));
+    }
+}
+
 /// Gives the foreground back to `prev` only if it now belongs to nobody else (null or ours).
 fn restore_foreground(prev: HWND) {
     // SAFETY: no preconditions.
@@ -3031,7 +3098,7 @@ fn restore_foreground(prev: HWND) {
     }
     // SAFETY: SetForegroundWindow is allowed for us: until now we are the foreground.
     let ok = unsafe { SetForegroundWindow(prev) };
-    log!("  foreground returned to the fullscreen app -> {}", ok.as_bool());
+    log!("  foreground returned to the previous window -> {}", ok.as_bool());
 }
 
 /// true if `h` belongs to our process (dock, popups).
@@ -3139,7 +3206,7 @@ fn on_foreground_changed(fg: HWND) {
     if FS_SHOWN.load(Relaxed) {
         // Closing one of our popups gives the foreground back to the game: it is not a user click.
         // A real click on the game is detected by `on_poll` anyway.
-        if fg.0 as isize == FS_PREV.load(Relaxed) && popup::closed_within(POPUP_CLOSE_GRACE_MS) {
+        if fg.0 as isize == PREV_FG.load(Relaxed) && popup::closed_within(POPUP_CLOSE_GRACE_MS) {
             log!("foreground returned to the game by closing a popup: the dock stays");
             return;
         }
@@ -3161,7 +3228,7 @@ fn on_foreground_changed(fg: HWND) {
 /// `pub` because `popup` must not close on that bounce either.
 pub fn fs_bounce_grace(fg: HWND) -> bool {
     FS_SHOWN.load(Relaxed)
-        && fg.0 as isize == FS_PREV.load(Relaxed)
+        && fg.0 as isize == PREV_FG.load(Relaxed)
         && within_grace(now_ms(), FG_TAKEN_AT.load(Relaxed), FS_BOUNCE_GRACE_MS)
 }
 
@@ -3265,7 +3332,7 @@ fn point_in(r: &RECT, p: POINT) -> bool {
 /// With `!config::effective_autohide()` the bar never hides by itself; nor does it
 /// while the context menu (popup) is open.
 fn on_poll() {
-    // Esc cancels a drag (the bar never has the keyboard focus, so the key state is polled).
+    // Esc cancels a drag (the bar has the keyboard focus only after the Win key, so the key state is polled).
     // SAFETY: GetAsyncKeyState has no preconditions; the high bit means "pressed".
     if drag_active() && unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000 != 0 {
         end_drag(true);
@@ -3363,6 +3430,28 @@ mod tests {
         assert_eq!(tray_sync_action(true,  true,   true,  false, false), Nothing);
         assert_eq!(tray_sync_action(true,  false,  true,  false, true),  Nothing, "never started while exiting");
         assert_eq!(tray_sync_action(false, true,   true,  false, true),  Stop, "stopping while exiting is allowed");
+    }
+
+    #[test]
+    fn win_show_takes_the_foreground() {
+        assert!(show_takes_foreground(true, false, false, false), "Win over a normal window or a missed game");
+        assert!(show_takes_foreground(true, true, false, false), "Win over a recognised fullscreen app");
+        assert!(show_takes_foreground(false, true, false, false), "fullscreen show: as before");
+        assert!(!show_takes_foreground(false, false, false, false), "screen edge / startup: no focus");
+        assert!(!show_takes_foreground(true, false, false, true), "--no-foreground wins over Win");
+        assert!(!show_takes_foreground(true, true, false, true), "--no-foreground wins over fullscreen");
+        assert!(show_takes_foreground(false, false, true, false), "--foreground always");
+        assert!(show_takes_foreground(false, false, true, true), "--foreground wins over --no-foreground");
+    }
+
+    #[test]
+    fn remembered_window_on_show() {
+        assert_eq!(prev_to_remember(7, 9, true, 0), 7, "the fullscreen app first");
+        assert_eq!(prev_to_remember(7, 9, false, 0), 7, "fullscreen app kept even with --no-foreground");
+        assert_eq!(prev_to_remember(0, 9, true, 0), 9, "Win over a normal window");
+        assert_eq!(prev_to_remember(0, 9, false, 0), 0, "edge show: nothing to give back");
+        assert_eq!(prev_to_remember(0, 0, true, 5), 5, "foreground ours (linked Start reversed): kept");
+        assert_eq!(prev_to_remember(0, 0, false, 0), 0);
     }
 
     #[test]
