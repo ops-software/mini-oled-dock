@@ -989,8 +989,11 @@ fn main() -> std::process::ExitCode {
         for n in notes.iter().filter(|n| !n.starts_with("data: created")) {
             logger::say(n);
         }
-        let code =
-            if args.install { autostart::run_install_cli(args.no_relaunch) } else { autostart::run_uninstall_cli() };
+        let mut code = if args.install {
+            autostart::run_install_cli(args.no_relaunch)
+        } else {
+            autostart::run_uninstall_cli(args.remove)
+        };
         if report == CliReport::LogOnly {
             // Keep the messages in the log, then keep buffering whatever is said later (nobody shows it).
             for line in logger::take_say_buffer().lines() {
@@ -999,6 +1002,18 @@ fn main() -> std::process::ExitCode {
             logger::buffer_say();
         }
         logger::stop(log_thread);
+        // `--purge-data`: only after a clean `--uninstall --remove`, and only now that `dock.log` is closed.
+        // The result is still said before the message box or console output (with `--quiet` only the exit
+        // code reports it).
+        if code == autostart::EXIT_OK && args.purge_data {
+            match datadir::purge() {
+                Ok(()) => logger::say("Data folder removed."),
+                Err(e) => {
+                    logger::say(&format!("Removing the data folder failed: {e}"));
+                    code = autostart::EXIT_FAILED;
+                }
+            }
+        }
         if report == CliReport::MessageBox {
             let text = logger::take_say_buffer();
             if !text.is_empty() {

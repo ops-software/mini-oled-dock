@@ -27,8 +27,11 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use windows::core::HSTRING;
-use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH,
+};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Threading::{GetCurrentProcessId, CREATE_NO_WINDOW};
@@ -110,6 +113,11 @@ const TASK_NAME: &str = "Dock";
 const STOP_WAIT: Duration = Duration::from_secs(35);
 /// After the stop signal, retry for at least this long even if nothing of the old instance is seen.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// Once every process running the installed exe has exited, how long a delete is retried while the
+/// kernel releases the image.
+const RELEASE_GRACE: Duration = Duration::from_secs(2);
+/// Pause between two tries of `retry_for`.
+const RETRY_STEP: Duration = Duration::from_millis(250);
 /// Maximum time for `schtasks.exe` before giving up on it.
 const SCHTASKS_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -564,23 +572,169 @@ pub fn run_install_cli(no_relaunch: bool) -> i32 {
     report.exit_code()
 }
 
-/// `--uninstall`: returns the exit code.
-pub fn run_uninstall_cli() -> i32 {
-    match disable() {
-        Ok(()) => {
-            let where_ = installed_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| INSTALL_DIR_NAME.into());
-            crate::logger::say(&format!(
-                "Automatic start removed. The installed copy {where_} is kept (it may be running); \
-                 delete its folder from an elevated prompt if you no longer need it."
-            ));
-            EXIT_OK
-        }
-        Err(e) => {
-            log!("autostart: --uninstall failed: {e}");
-            crate::logger::say(&format!("Removal failed: {e}"));
-            EXIT_FAILED
+/// Calls `f` until it succeeds or `limit` has passed since the first try, sleeping `step` in between.
+/// Returns the first success or the last error.
+fn retry_for<T, E>(limit: Duration, step: Duration, mut f: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    let t = Instant::now();
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if t.elapsed() >= limit => return Err(e),
+            Err(_) => std::thread::sleep(step),
         }
     }
+}
+
+/// Stops the running dock (`Local\DockStop`) and waits, up to `STOP_WAIT`, until neither its
+/// single-instance mutex nor any other process running `exe` is left (after a crash its watchdog
+/// may hold the exe while it restores the taskbar). Unlike `copy_self` there is no early exit:
+/// the files are deleted only once nothing runs them. This process is never counted, so the wait
+/// also ends when the uninstaller is the installed exe itself (started from Add/Remove Programs).
+fn stop_and_wait(exe: &Path) -> Result<(), InstallError> {
+    let signalled = crate::watchdog::signal_stop_to_instance();
+    log!("autostart: stop requested (instance answered: {signalled}), waiting for {}", exe.display());
+    let t = Instant::now();
+    let gone = || {
+        if crate::watchdog::instance_running() || exe_in_use_by_other(exe) {
+            Err(())
+        } else {
+            Ok(())
+        }
+    };
+    match retry_for(STOP_WAIT, RETRY_STEP, gone) {
+        Ok(()) => {
+            log!("autostart: old instance gone after {} ms", t.elapsed().as_millis());
+            Ok(())
+        }
+        Err(()) => Err(InstallError::CouldNotStop(format!(
+            "the running dock or its watchdog did not exit within {} s",
+            STOP_WAIT.as_secs()
+        ))),
+    }
+}
+
+/// The only files `--uninstall --remove` deletes from the install folder. Pure.
+fn removal_targets(install_dir: &Path) -> [PathBuf; 3] {
+    [install_dir.join("dock.exe"), install_dir.join("dock.exe.new"), install_dir.join("autostart-task.xml")]
+}
+
+/// Asks Windows to delete `path` (a file or an empty folder) at the next restart. Elevated only.
+fn delete_at_reboot(path: &Path) -> Result<(), String> {
+    let p = HSTRING::from(path.as_os_str());
+    // SAFETY: `p` is NUL-terminated and lives for the call; a null new name means "delete".
+    unsafe { MoveFileExW(&p, PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) }
+        .map_err(|e| format!("scheduling the removal of {} at restart: {e}", path.display()))
+}
+
+/// Deletes `path`: `Ok(true)` deleted now (or already gone), `Ok(false)` scheduled for the next
+/// restart (in practice only the exe of this very process, when started from Add/Remove Programs).
+fn remove_or_schedule(path: &Path) -> Result<bool, String> {
+    match retry_for(RELEASE_GRACE, RETRY_STEP, || std::fs::remove_file(path)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => {
+            log!("autostart: deleting {} failed ({e}), scheduling it at restart", path.display());
+            delete_at_reboot(path).map(|()| false)
+        }
+    }
+}
+
+/// What `--uninstall` did.
+#[derive(Debug, Default)]
+pub(crate) struct UninstallReport {
+    /// The running dock could not be stopped: nothing was touched.
+    pub stop: Option<InstallError>,
+    pub failures: Vec<String>,
+    /// Some file is deleted at the next restart.
+    pub scheduled: bool,
+}
+
+impl UninstallReport {
+    pub(crate) fn exit_code(&self) -> i32 {
+        match (&self.stop, self.failures.is_empty()) {
+            (Some(e), _) => e.exit_code(),
+            (None, false) => EXIT_FAILED,
+            (None, true) => EXIT_OK,
+        }
+    }
+}
+
+/// Deletes the install folder for `--uninstall --remove`: only `removal_targets`, then the folder if
+/// it is empty (nothing unknown is deleted). Every failure is pushed to `report.failures`.
+fn remove_install(dir: &Path, report: &mut UninstallReport) {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => return report.failures.push(format!("{}: {e}", dir.display())),
+        Ok(m) => {
+            use std::os::windows::fs::MetadataExt;
+            if !m.is_dir() || m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return report.failures.push(format!("{} is not a real folder: nothing deleted", dir.display()));
+            }
+        }
+    }
+    for p in removal_targets(dir) {
+        if std::fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        match remove_or_schedule(&p) {
+            Ok(now) => report.scheduled |= !now,
+            Err(e) => report.failures.push(e),
+        }
+    }
+    if let Err(e) = std::fs::remove_dir(dir) {
+        log!("autostart: removing {} failed ({e}), scheduling it at restart", dir.display());
+        match delete_at_reboot(dir) {
+            Ok(()) => report.scheduled = true,
+            Err(e) => report.failures.push(e),
+        }
+    }
+}
+
+/// `--uninstall`: removes the logon task and the Add/Remove Programs entry. With `remove` it first
+/// stops the dock (the same wait as `--install`), restores the taskbar, then deletes the installed
+/// files and the update staging folders. Returns the exit code.
+pub fn run_uninstall_cli(remove: bool) -> i32 {
+    let mut report = UninstallReport::default();
+    let say = crate::logger::say;
+    let dir = install_dir();
+    if remove {
+        let stopped = match &dir {
+            Ok(d) => stop_and_wait(&d.join("dock.exe")),
+            Err(e) => Err(InstallError::Failed(e.clone())),
+        };
+        if let Err(e) = stopped {
+            log!("autostart: --uninstall --remove failed: {e}");
+            say(&format!("Removal failed: {e}"));
+            report.stop = Some(e);
+            return report.exit_code();
+        }
+        crate::taskbar::restore_force_waiting(Duration::from_secs(5));
+    }
+    report.failures.extend(disable().err());
+    report.failures.extend(crate::arp::delete().err());
+    if remove {
+        if let Ok(d) = &dir {
+            remove_install(d, &mut report);
+        }
+        report.failures.extend(crate::datadir::remove_update_dir().err().map(|e| format!("update folder: {e}")));
+    }
+    for f in &report.failures {
+        log!("autostart: --uninstall: {f}");
+        say(&format!("Removal failed: {f}"));
+    }
+    let where_ = dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|_| INSTALL_DIR_NAME.into());
+    match (remove, report.failures.is_empty()) {
+        (false, true) => say(&format!(
+            "Automatic start and the Add/Remove Programs entry removed. The installed copy in {where_} is kept \
+             (it may be running); run `dock.exe --uninstall --remove` to delete it."
+        )),
+        (true, true) => say(&format!("Dock uninstalled: {where_} removed.")),
+        (_, false) => {}
+    }
+    if report.scheduled {
+        say("Some files are removed at the next restart.");
+    }
+    report.exit_code()
 }
 
 #[cfg(test)]
@@ -649,6 +803,43 @@ mod tests {
         assert!(seen, "a process running the destination exe is detected");
         assert!(!exe_in_use_by_other(&std::env::current_exe().unwrap()), "the installer itself does not count");
         assert!(!exe_in_use_by_other(Path::new(r"C:\no\such\dock.exe")));
+    }
+
+    #[test]
+    fn removal_targets_are_only_our_files() {
+        let d = Path::new(r"C:\Program Files\mini-oled-dock");
+        assert_eq!(removal_targets(d), [d.join("dock.exe"), d.join("dock.exe.new"), d.join("autostart-task.xml")]);
+    }
+
+    #[test]
+    fn uninstall_report_exit_codes() {
+        assert_eq!(UninstallReport::default().exit_code(), EXIT_OK);
+        // A file in use deleted at the next restart is still a successful uninstall.
+        assert_eq!(UninstallReport { scheduled: true, ..Default::default() }.exit_code(), EXIT_OK);
+        assert_eq!(UninstallReport { failures: vec!["ARP".into()], ..Default::default() }.exit_code(), EXIT_FAILED);
+        let stuck = UninstallReport { stop: Some(InstallError::CouldNotStop("x".into())), ..Default::default() };
+        assert_eq!(stuck.exit_code(), EXIT_STOP_FAILED);
+    }
+
+    #[test]
+    fn retry_for_retries_until_success_or_the_limit() {
+        let mut calls = 0;
+        let r = retry_for(Duration::from_secs(5), Duration::from_millis(1), || {
+            calls += 1;
+            if calls < 3 {
+                Err(calls)
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(r, Ok(3));
+        let mut calls = 0;
+        let r: Result<(), i32> = retry_for(Duration::ZERO, Duration::from_millis(1), || {
+            calls += 1;
+            Err(calls)
+        });
+        assert_eq!(r, Err(1), "past the limit: one try, the last error");
+        assert!(RELEASE_GRACE < STOP_WAIT && RETRY_STEP < RELEASE_GRACE);
     }
 
     #[test]

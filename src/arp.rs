@@ -8,10 +8,10 @@
 use std::path::Path;
 
 use windows::core::HSTRING;
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE,
+    KEY_WOW64_64KEY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 
 /// The Uninstall key under `HKEY_LOCAL_MACHINE`.
@@ -74,6 +74,17 @@ pub fn write(install_dir: &Path) -> Result<(), String> {
         let _ = RegCloseKey(key);
     }
     result
+}
+
+/// Deletes the entry (`--uninstall`). A missing key is `Ok`. Elevated only.
+pub fn delete() -> Result<(), String> {
+    // SAFETY: `ARP_KEY` becomes a NUL-terminated HSTRING for the call; the key has no subkeys.
+    let r = unsafe { RegDeleteKeyExW(HKEY_LOCAL_MACHINE, &HSTRING::from(ARP_KEY), KEY_WOW64_64KEY.0, None) };
+    if r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("deleting HKLM\\{ARP_KEY}: {}", windows::core::Error::from(r.to_hresult())))
+    }
 }
 
 fn set_value(key: HKEY, name: &str, value: &RegValue) -> Result<(), String> {
