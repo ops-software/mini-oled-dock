@@ -167,6 +167,18 @@ pub struct Args {
     pub console: bool,
     /// `--version`: print "mini-oled-dock X.Y.Z" and exit 0.
     pub version: bool,
+    /// `--quiet` (with `--install` / `--uninstall`): no message box, no console output; the exit code is the result.
+    pub quiet: bool,
+    /// `--no-relaunch` (with `--install`): do not start the dock again after installing.
+    pub no_relaunch: bool,
+    /// `--remove` (with `--uninstall`): also delete the installed files.
+    pub remove: bool,
+    /// `--purge-data` (with `--uninstall --remove`): also delete the data folder.
+    pub purge_data: bool,
+    /// `--update-check`: check for a new release, print the result and exit.
+    pub update_check: bool,
+    /// `--update-install <tag>`: install the staged release `<tag>`.
+    pub update_install: Option<String>,
 }
 
 static ARGS: OnceLock<Args> = OnceLock::new();
@@ -177,8 +189,11 @@ pub fn args() -> &'static Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args::default();
-    let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
             "--top" => a.top = Some(true),
@@ -202,11 +217,62 @@ fn parse_args() -> Result<Args, String> {
             "--autostart" => a.autostart = true,
             "--console" => a.console = true,
             "--version" => a.version = true,
+            "--quiet" => a.quiet = true,
+            "--no-relaunch" => a.no_relaunch = true,
+            "--remove" => a.remove = true,
+            "--purge-data" => a.purge_data = true,
+            "--update-check" => a.update_check = true,
+            "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    if a.install && a.uninstall {
+        return Err("--install and --uninstall cannot be combined".into());
+    }
+    if a.quiet && !(a.install || a.uninstall) {
+        return Err("--quiet requires --install or --uninstall".into());
+    }
+    if a.no_relaunch && !a.install {
+        return Err("--no-relaunch requires --install".into());
+    }
+    if a.remove && !a.uninstall {
+        return Err("--remove requires --uninstall".into());
+    }
+    if a.purge_data && !a.remove {
+        return Err("--purge-data requires --uninstall --remove".into());
+    }
     Ok(a)
+}
+
+/// Exit code for a command-line parse error: 0 for `--help` (empty message), else "bad arguments".
+fn parse_error_exit(msg: &str) -> i32 {
+    if msg.is_empty() {
+        autostart::EXIT_OK
+    } else {
+        autostart::EXIT_BAD_ARGS
+    }
+}
+
+/// Where the result of `--install` / `--uninstall` goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliReport {
+    /// Printed on the attached console.
+    Console,
+    /// No console: shown in a message box (the behaviour without `--quiet`).
+    MessageBox,
+    /// `--quiet`: log file only, the exit code carries the result.
+    LogOnly,
+}
+
+fn cli_report(quiet: bool, has_console: bool) -> CliReport {
+    if quiet {
+        CliReport::LogOnly
+    } else if has_console {
+        CliReport::Console
+    } else {
+        CliReport::MessageBox
+    }
 }
 
 // ------------------------------------------------------------------ RAM
@@ -853,7 +919,8 @@ fn usage() {
     let _ = writeln!(
         e,
         "usage: dock [--top | --bottom] [--no-autohide] [--keep-taskbar] [--diag] [--restore] \
-         [--install | --uninstall] [--autostart] [--console] \
+         [--install [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
+         [--version] [--update-check] [--update-install <tag>] [--autostart] [--console] \
          [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] [--list-apps]"
     );
 }
@@ -880,7 +947,7 @@ fn main() -> std::process::ExitCode {
                 let _ = writeln!(std::io::stderr(), "{msg}");
             }
             usage();
-            return std::process::ExitCode::from(if msg.is_empty() { 0 } else { 2 });
+            return std::process::ExitCode::from(parse_error_exit(&msg) as u8);
         }
     };
     let args = ARGS.get_or_init(|| args);
@@ -912,8 +979,8 @@ fn main() -> std::process::ExitCode {
     // --install / --uninstall mode: messages via `logger::say`, log to file only.
     if args.install || args.uninstall {
         // Without a console (UAC from a non-elevated terminal, Explorer) the result would be lost: message box.
-        let has_console = attach_console();
-        if !has_console {
+        let report = cli_report(args.quiet, !args.quiet && attach_console());
+        if report != CliReport::Console {
             logger::buffer_say();
         }
         let (log_thread, notes) = start_logging("");
@@ -922,8 +989,15 @@ fn main() -> std::process::ExitCode {
             logger::say(n);
         }
         let code = if args.install { autostart::run_install_cli() } else { autostart::run_uninstall_cli() };
+        if report == CliReport::LogOnly {
+            // Keep the messages in the log, then keep buffering whatever is said later (nobody shows it).
+            for line in logger::take_say_buffer().lines() {
+                log!("{line}");
+            }
+            logger::buffer_say();
+        }
         logger::stop(log_thread);
-        if !has_console {
+        if report == CliReport::MessageBox {
             let text = logger::take_say_buffer();
             if !text.is_empty() {
                 let wtext: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -981,6 +1055,55 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn p(a: &[&str]) -> Result<Args, String> {
+        parse_args_from(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn cli_new_flags() {
+        let a = p(&["--install", "--quiet", "--no-relaunch"]).unwrap();
+        assert!(a.install && a.quiet && a.no_relaunch);
+        let u = p(&["--uninstall", "--remove", "--purge-data", "--quiet"]).unwrap();
+        assert!(u.uninstall && u.remove && u.purge_data && u.quiet);
+        assert_eq!(p(&["--update-install", "v1.4.1"]).unwrap().update_install.as_deref(), Some("v1.4.1"));
+        assert!(p(&["--update-check"]).unwrap().update_check);
+        assert!(p(&["--version"]).unwrap().version);
+    }
+
+    #[test]
+    fn cli_rejects_bad_combinations() {
+        let bad: [&[&str]; 8] = [
+            &["--quiet"],
+            &["--no-relaunch"],
+            &["--remove"],
+            &["--uninstall", "--purge-data"],
+            &["--install", "--remove"],
+            &["--install", "--uninstall"],
+            &["--uninstall", "--no-relaunch"],
+            &["--update-install"],
+        ];
+        for b in bad {
+            assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn cli_report_quiet_never_shows_a_box() {
+        assert_eq!(cli_report(true, false), CliReport::LogOnly);
+        assert_eq!(cli_report(true, true), CliReport::LogOnly);
+        assert_eq!(cli_report(false, true), CliReport::Console);
+        assert_eq!(cli_report(false, false), CliReport::MessageBox);
+    }
+
+    #[test]
+    fn cli_exit_codes() {
+        use crate::autostart::{EXIT_BAD_ARGS, EXIT_FAILED, EXIT_OK, EXIT_STOP_FAILED};
+        assert_eq!((EXIT_OK, EXIT_FAILED, EXIT_BAD_ARGS, EXIT_STOP_FAILED), (0, 1, 2, 3));
+        assert_eq!(parse_error_exit(""), EXIT_OK);
+        assert_eq!(parse_error_exit(&p(&["--quiet"]).unwrap_err()), EXIT_BAD_ARGS);
+        assert_eq!(parse_error_exit(&p(&["--bogus"]).unwrap_err()), EXIT_BAD_ARGS);
+    }
 
     #[test]
     fn version_line_matches_cargo() {

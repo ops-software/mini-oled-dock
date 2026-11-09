@@ -34,6 +34,14 @@ use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_
 
 use crate::log;
 
+/// Exit codes of the CLI modes (`--install`, `--uninstall`, argument errors).
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAILED: i32 = 1;
+pub const EXIT_BAD_ARGS: i32 = 2;
+/// The old instance could not be stopped (used by the installer rework).
+#[allow(dead_code)]
+pub const EXIT_STOP_FAILED: i32 = 3;
+
 /// Name of the task in the scheduler.
 const TASK_NAME: &str = "Dock";
 /// Maximum wait for the old instance and its watchdog to release the exe (outlasts the watchdog's
@@ -407,7 +415,7 @@ pub fn run_install_cli() -> i32 {
         Err(e) => {
             log!("autostart: --install failed: {e}");
             crate::logger::say(&format!("Installation failed: {e}"));
-            return 1;
+            return EXIT_FAILED;
         }
     };
     match enable(true) {
@@ -418,12 +426,12 @@ pub fn run_install_cli() -> i32 {
             if stopped {
                 relaunch(&dest);
             }
-            0
+            EXIT_OK
         }
         Err(e) => {
             log!("autostart: --install failed: {e}");
             crate::logger::say(&format!("Installation failed: {e}"));
-            1
+            EXIT_FAILED
         }
     }
 }
@@ -437,12 +445,12 @@ pub fn run_uninstall_cli() -> i32 {
                 "Automatic start removed. The installed copy {where_} is kept (it may be running); \
                  delete its folder from an elevated prompt if you no longer need it."
             ));
-            0
+            EXIT_OK
         }
         Err(e) => {
             log!("autostart: --uninstall failed: {e}");
             crate::logger::say(&format!("Removal failed: {e}"));
-            1
+            EXIT_FAILED
         }
     }
 }
