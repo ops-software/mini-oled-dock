@@ -52,12 +52,22 @@ pub enum Outcome {
     None,
     UpToDate,
     Available,
-    /// `Some(code)` = GitHub answered with that HTTP status; `None` = no answer or an unusable one.
-    CouldNotCheck(Option<u16>),
+    CouldNotCheck(CheckFail),
     DownloadFailed,
     VerifyFailed,
     Ready,
     InstallFailed(i32),
+}
+
+/// Why a check gave no answer about the latest release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckFail {
+    /// GitHub answered with this HTTP status.
+    Http(u16),
+    /// No answer (DNS, TLS, timeout, oversized body).
+    NoConnection,
+    /// A 200 that is not a usable release (foreign host, captive portal, assets not uploaded yet).
+    Invalid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,13 +115,17 @@ impl UpdateStatus {
             Outcome::None => pick("Not checked yet".into(), "Non ancora verificato".into()),
             Outcome::UpToDate => pick("Up to date".into(), "Aggiornato".into()),
             Outcome::Available => pick(format!("Version {v} available"), format!("Disponibile la versione {v}")),
-            Outcome::CouldNotCheck(Some(c)) => pick(
+            Outcome::CouldNotCheck(CheckFail::Http(c)) => pick(
                 format!("Could not check for updates (HTTP {c})"),
                 format!("Impossibile cercare aggiornamenti (HTTP {c})"),
             ),
-            Outcome::CouldNotCheck(None) => pick(
+            Outcome::CouldNotCheck(CheckFail::NoConnection) => pick(
                 "Could not check for updates (no connection)".into(),
                 "Impossibile cercare aggiornamenti (nessuna connessione)".into(),
+            ),
+            Outcome::CouldNotCheck(CheckFail::Invalid) => pick(
+                "Could not check for updates (unexpected answer)".into(),
+                "Impossibile cercare aggiornamenti (risposta non valida)".into(),
             ),
             Outcome::DownloadFailed => pick("Download failed".into(), "Download non riuscito".into()),
             Outcome::VerifyFailed => {
@@ -194,8 +208,9 @@ pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>
             st.outcome = Outcome::UpToDate;
             st.last_check = rfc3339_utc(now);
         }
-        Err(CheckError::Http(c)) => st.outcome = Outcome::CouldNotCheck(Some(*c)),
-        Err(_) => st.outcome = Outcome::CouldNotCheck(None),
+        Err(CheckError::Http(c)) => st.outcome = Outcome::CouldNotCheck(CheckFail::Http(*c)),
+        Err(CheckError::Network(_)) => st.outcome = Outcome::CouldNotCheck(CheckFail::NoConnection),
+        Err(CheckError::Invalid(_)) => st.outcome = Outcome::CouldNotCheck(CheckFail::Invalid),
     }
 }
 
@@ -841,7 +856,14 @@ mod tests {
         assert_eq!(s.available.as_ref().unwrap().date, "2026-11-20");
         assert_eq!(s.last_check, "2026-11-09T12:34:56Z");
         apply_check(&mut s, &Err(CheckError::Http(403)), cur, 1_794_300_000);
-        assert_eq!(s.outcome, Outcome::CouldNotCheck(Some(403)));
+        assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::Http(403)));
+        apply_check(&mut s, &Err(CheckError::Network("timeout".into())), cur, 1_794_300_000);
+        assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::NoConnection));
+        apply_check(&mut s, &Err(CheckError::Invalid("no dock.exe asset".into())), cur, 1_794_300_000);
+        assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::Invalid));
+        if !crate::i18n::italian() {
+            assert_eq!(s.line(), "Could not check for updates (unexpected answer)");
+        }
         // a failed check changes nothing else
         assert_eq!((s.badge(), s.last_check.as_str()), (1, "2026-11-09T12:34:56Z"));
         // the staged tag survives a re-check of the same tag, not a newer one
