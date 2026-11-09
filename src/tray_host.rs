@@ -38,6 +38,10 @@ use windows::Win32::Security::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::DataExchange::{GlobalGetAtomNameW, COPYDATASTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{
+    MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, SECTION_MAP_READ,
+    SECTION_MAP_WRITE, SECTION_QUERY,
+};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
@@ -2111,75 +2115,69 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         return forward_sync(wp, lp);
     }
     let m: AppBarMsg = from_prefix(bytes);
-    let wnd_pid = if wp.0 == 0 { None } else { Some(window_pid(HWND(wp.0 as *mut c_void))) };
+    if !matches!(m.message, ABM_GETTASKBARPOS | ABM_QUERYPOS | ABM_SETPOS) {
+        return forward_sync(wp, lp);
+    }
     // SAFETY: no preconditions.
     let own = unsafe { GetCurrentProcessId() };
-    if let Some(text) = appbar_gate(&m, wnd_pid, own, pid_at_most_medium, |v, w| probe_shared_block(v, own, w)) {
-        log!("{text}");
-        return LRESULT(0);
-    }
-    match m.message {
-        ABM_GETTASKBARPOS => get_taskbar_pos(&m),
-        ABM_QUERYPOS | ABM_SETPOS => forward_with_shared(wp, m),
-        _ => forward_sync(wp, lp),
-    }
-}
-
-/// Gate for the AppBar messages that use `SHLockShared(m.shared, m.pid)` (`ABM_GETTASKBARPOS`,
-/// `ABM_QUERYPOS`, `ABM_SETPOS`): the dock maps the block they point to and writes into it, and both
-/// `m.shared` and `m.pid` are chosen by the sender. `None` = forward; `Some(text)` = reject, `text` is the
-/// log line. Every other message is not gated. First `appbar_block_allowed`; then, for a block claimed
-/// for the dock's own process (what shell32 always sends), `probe(m.shared, window pid)` must find a
-/// block that `shared_block_authentic` accepts. Pure: `medium` and `probe` are injected for tests.
-fn appbar_gate(
-    m: &AppBarMsg,
-    wnd_pid: Option<u32>,
-    own: u32,
-    medium: impl Fn(u32) -> bool,
-    probe: impl Fn(u64, u32) -> Result<SharedBlock, String>,
-) -> Option<String> {
-    if !matches!(m.message, ABM_GETTASKBARPOS | ABM_QUERYPOS | ABM_SETPOS) {
-        return None;
-    }
-    let why = if !appbar_block_allowed(m.pid, own, wnd_pid, medium) {
-        format!("window pid {} not verified", wnd_pid.map_or_else(|| "-".to_string(), |p| p.to_string()))
-    } else if m.pid != own {
-        return None;
-    } else {
-        // `appbar_block_allowed` passed for our own pid, so there is a window.
-        let w = wnd_pid.unwrap_or(0);
-        match probe(m.shared, w).and_then(|b| shared_block_authentic(&b, own, w).map_err(str::to_string)) {
-            Ok(()) => return None,
-            Err(e) => format!("shared block 0x{:X} not authentic: {e}", m.shared),
+    let elevated = crate::shell_thread::is_elevated();
+    let block = match appbar_gate(&m, own, elevated, pid_at_most_medium, resolve_shared_atom, dup_section, map_block) {
+        Ok(b) => b,
+        Err(text) => {
+            log!("{text}");
+            return LRESULT(0);
         }
     };
-    Some(format!(
-        "tray: AppBar {} rejected (block pid {}, claims_own = {}, {why})",
-        m.message,
-        m.pid,
-        m.pid == own
-    ))
-}
-
-/// Whether an AppBar shared block may be locked/written. `block_pid` is the process the block is
-/// claimed for (`m.pid`), `own` this process, `wnd_pid` the owner of the AppBar window (`None` = no window).
-/// shell32 allocates the block for the tray window's process, so for a real AppBar `block_pid == own`: then
-/// the window must exist, must not be ours, and its process must not run above medium (the block itself is
-/// checked by `shared_block_authentic`). A block claimed for another process keeps the original rule: it
-/// must be the window owner's (when a window is given) and at most medium. Pure: `medium` is injected.
-fn appbar_block_allowed(block_pid: u32, own: u32, wnd_pid: Option<u32>, medium: impl Fn(u32) -> bool) -> bool {
-    match wnd_pid {
-        _ if block_pid == own => matches!(wnd_pid, Some(w) if w != 0 && w != own && medium(w)),
-        None => medium(block_pid),
-        Some(w) => w == block_pid && medium(block_pid),
+    if m.message == ABM_GETTASKBARPOS {
+        get_taskbar_pos(&block)
+    } else {
+        forward_with_shared(wp, m, &block)
     }
 }
 
-/// What an AppBar shared-block value resolves to, probed without locking or mapping it.
+/// Gate for the AppBar messages whose shared block the dock reads and writes (`ABM_GETTASKBARPOS`,
+/// `ABM_QUERYPOS`, `ABM_SETPOS`). `Ok` = the block, mapped by the dock; `Err(text)` = reject, `text` is the
+/// log line (claimed pid, holder pid, reason). Acceptance rule: the message's `shared` value is resolved
+/// exactly once (`resolve`), as a global atom whose name decodes into a section handle and the pid of the
+/// process holding it; the holder must not be the dock itself (allowed only while the dock is not elevated,
+/// i.e. a `DOCK_NO_MANIFEST=1` developer build) and must run at most at medium integrity; that handle is
+/// duplicated once into the dock with `SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE` (`dup`), and the
+/// duplicate must be a Section with `AllocationAttributes == SEC_COMMIT` and `MaximumSize == 0x1000`; then that
+/// same duplicate is mapped (`map`) and its header must give a payload size in `0x28..=0xFF0`. The sender
+/// window (`wParam`, or the `hWnd` of the APPBARDATA, NULL for a plain `ABM_GETTASKBARPOS`) and the pid
+/// claimed in the message play no part: any process can name any window or pid, so neither authenticates the
+/// sender, while the holder rule already keeps the dock from writing into a block held by a process above
+/// medium. Pure: the Win32 steps and `medium` are injected for tests.
+fn appbar_gate<B>(
+    m: &AppBarMsg,
+    own: u32,
+    own_elevated: bool,
+    medium: impl Fn(u32) -> bool,
+    resolve: impl Fn(u64) -> Result<(u64, u32), String>,
+    dup: impl Fn(u64, u32) -> Result<(B, SharedBlock), String>,
+    map: impl Fn(B) -> Result<B, String>,
+) -> Result<B, String> {
+    let reject = |holder: Option<u32>, why: &str| {
+        let holder = holder.map_or_else(|| "-".to_string(), |p| p.to_string());
+        let (msg, pid, shared) = (m.message, m.pid, m.shared);
+        format!("tray: AppBar {msg} rejected (claimed pid {pid}, holder pid {holder}, shared 0x{shared:X}: {why})")
+    };
+    let (handle, holder) = resolve(m.shared).map_err(|e| reject(None, &e))?;
+    let fail = |why: &str| reject(Some(holder), why);
+    if holder == own && own_elevated {
+        return Err(fail("block held by the dock itself"));
+    }
+    if holder != own && !medium(holder) {
+        return Err(fail("holder runs above medium integrity or cannot be checked"));
+    }
+    let (b, shape) = dup(handle, holder).map_err(|e| fail(&e))?;
+    shared_block_authentic(&shape).map_err(fail)?;
+    map(b).map_err(|e| fail(&e))
+}
+
+/// Shape of a sender's section, read from the dock's duplicate without mapping it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SharedBlock {
-    /// Process holding the section handle (decoded from the shell32 atom).
-    owner: u32,
     /// The handle's object type is `Section`.
     is_section: bool,
     /// `SECTION_BASIC_INFORMATION.AllocationAttributes` and `.MaximumSize`.
@@ -2193,14 +2191,16 @@ const SEC_COMMIT: u32 = 0x0800_0000;
 /// shell32 sections hold a 16-byte header plus the 0x28-byte APPBARDATA, rounded up to one 4 KiB page
 /// (measured: any payload of 1..=0xFF0 bytes gives 0x1000, 0xFF1 gives 0x2000).
 const APPBAR_SECTION_SIZE: i64 = 0x1000;
+/// Header of a shell32 block, which `SHLockShared` checked and skipped: its first u32 is the payload size.
+const BLOCK_HEADER: usize = 0x10;
+/// Payload sizes accepted in that header: at least one 32-bit APPBARDATA, at most the rest of the page.
+const PAYLOAD_MIN: u32 = std::mem::size_of::<AppBarData32>() as u32;
+const PAYLOAD_MAX: u32 = APPBAR_SECTION_SIZE as u32 - BLOCK_HEADER as u32;
+const _: () = assert!(PAYLOAD_MIN == 0x28 && PAYLOAD_MAX == 0xFF0);
 
-/// Whether a probed block is what shell32 creates for an AppBar message: a section held by the dock
-/// itself or by the AppBar window's process (`wnd`, already verified as at most medium), pagefile-backed
-/// only and exactly one page long. Pure.
-fn shared_block_authentic(b: &SharedBlock, own: u32, wnd: u32) -> Result<(), &'static str> {
-    if b.owner != own && b.owner != wnd {
-        return Err("block held by neither the dock nor the window's process");
-    }
+/// Whether a section is what shell32 creates for an AppBar message: pagefile-backed only and exactly one
+/// page long. Pure.
+fn shared_block_authentic(b: &SharedBlock) -> Result<(), &'static str> {
     if !b.is_section {
         return Err("handle is not a section");
     }
@@ -2249,49 +2249,88 @@ mod nt {
     ) -> i32);
 }
 
-/// Win32 side of `appbar_gate`: resolves an AppBar shared-block value (`m.shared`) without locking or
-/// mapping it. On Windows 11 the value is a global atom (`decode_shared_atom`); anything outside the
-/// string-atom range would be taken by `SHLockShared` as a raw pointer into our own memory, so it is an
-/// error. Only a handle held by us or by the window's process (`wnd`) is examined: ours directly, the
-/// window's through a query-only duplicate that is closed again. Every failure is an `Err` (fail closed).
-fn probe_shared_block(shared: u64, own: u32, wnd: u32) -> Result<SharedBlock, String> {
+/// Win32 side of `appbar_gate`: reads the name of atom `shared` once and decodes `(section handle, holder
+/// pid)` from it. On Windows 11 the value is a global atom (`decode_shared_atom`); anything outside the
+/// string-atom range would be taken by `SHLockShared` as a raw pointer, so it is an error (fail closed).
+fn resolve_shared_atom(shared: u64) -> Result<(u64, u32), String> {
     if !(0xC000..=0xFFFF).contains(&shared) {
         return Err(format!("value 0x{shared:X} is not a shell shared-memory atom"));
     }
     let mut name = [0u16; 64];
     // SAFETY: `name` is writable for its whole length; an unknown atom returns 0.
     let n = unsafe { GlobalGetAtomNameW(shared as u16, &mut name) } as usize;
-    let Some((handle, owner)) = decode_shared_atom(&name[..n.min(name.len())]) else {
-        return Err(format!("atom 0x{shared:X} is not a shell shared block"));
-    };
-    if owner != own && owner != wnd {
-        // Rejected by `shared_block_authentic`; nothing of another process is opened.
-        return Ok(SharedBlock { owner, is_section: false, attrs: 0, size: 0 });
+    decode_shared_atom(&name[..n.min(name.len())])
+        .ok_or_else(|| format!("atom 0x{shared:X} is not a shell shared block"))
+}
+
+/// A sender's AppBar block as the dock holds it: its own duplicate of the holder's section handle and, once
+/// mapped (`map_block`), its own view of that same duplicate. Both are released on drop, on every path.
+struct SenderBlock {
+    dup: HANDLE,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+}
+
+impl SenderBlock {
+    /// The 32-bit APPBARDATA at the start of the payload. Only valid once `map_block` has accepted the view:
+    /// `BLOCK_HEADER + PAYLOAD_MIN <= APPBAR_SECTION_SIZE`, the length of the view.
+    fn payload(&self) -> *mut AppBarData32 {
+        // SAFETY: offset `BLOCK_HEADER` lies inside the mapped page (checked by `map_block` before it returns).
+        unsafe { self.view.Value.cast::<u8>().add(BLOCK_HEADER).cast::<AppBarData32>() }
     }
-    let held = HANDLE(handle as usize as *mut c_void);
-    if owner == own {
-        return query_section(held).map(|(is_section, attrs, size)| SharedBlock { owner, is_section, attrs, size });
+}
+
+impl Drop for SenderBlock {
+    fn drop(&mut self) {
+        if !self.view.Value.is_null() {
+            // SAFETY: view mapped by `map_block`, unmapped exactly once.
+            let _ = unsafe { UnmapViewOfFile(self.view) };
+        }
+        // SAFETY: duplicate created by `dup_section`, closed exactly once.
+        let _ = unsafe { CloseHandle(self.dup) };
     }
+}
+
+/// Win32 side of `appbar_gate`: duplicates section handle `handle` of process `holder` into the dock with
+/// `SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE` (never `DUPLICATE_SAME_ACCESS`) and reads the shape
+/// of that duplicate without mapping it. Every failure is an `Err`; the duplicate is closed on drop.
+fn dup_section(handle: u64, holder: u32) -> Result<(SenderBlock, SharedBlock), String> {
     // SAFETY: no preconditions; failure is an Err.
-    let proc_h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, owner) }
-        .map_err(|e| format!("window process {owner} not opened: {e}"))?;
+    let proc_h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, holder) }
+        .map_err(|e| format!("holder process not opened: {e}"))?;
+    let access = (SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE).0;
     let mut local = HANDLE::default();
-    // SAFETY: `proc_h` opened above; `local` writable. Query-only access: the duplicate cannot be mapped.
+    // SAFETY: `proc_h` opened above; `local` writable; explicit access, so nothing beyond these three rights.
     let dup = unsafe {
-        let me = GetCurrentProcess();
-        DuplicateHandle(proc_h, held, me, &mut local, SECTION_QUERY, false, DUPLICATE_HANDLE_OPTIONS(0))
+        let src = HANDLE(handle as usize as *mut c_void);
+        DuplicateHandle(proc_h, src, GetCurrentProcess(), &mut local, access, false, DUPLICATE_HANDLE_OPTIONS(0))
     };
     // SAFETY: handle opened above, closed exactly once.
     let _ = unsafe { CloseHandle(proc_h) };
-    dup.map_err(|e| format!("handle 0x{handle:X} of process {owner} not duplicated: {e}"))?;
-    let res = query_section(local);
-    // SAFETY: duplicate created above, closed exactly once.
-    let _ = unsafe { CloseHandle(local) };
-    res.map(|(is_section, attrs, size)| SharedBlock { owner, is_section, attrs, size })
+    dup.map_err(|e| format!("handle 0x{handle:X} not duplicated: {e}"))?;
+    let b = SenderBlock { dup: local, view: MEMORY_MAPPED_VIEW_ADDRESS::default() };
+    let (is_section, attrs, size) = query_section(b.dup)?;
+    Ok((b, SharedBlock { is_section, attrs, size }))
 }
 
-/// `SECTION_QUERY` access right.
-const SECTION_QUERY: u32 = 0x0001;
+/// Win32 side of `appbar_gate`: maps the duplicate that passed the shape check (the same handle, no new
+/// lookup) for one page and checks its header as `SHLockShared` did: the payload size at offset 0 must be in
+/// `PAYLOAD_MIN..=PAYLOAD_MAX`, so the payload (from offset `BLOCK_HEADER`) lies inside the view.
+fn map_block(mut b: SenderBlock) -> Result<SenderBlock, String> {
+    #[cfg(test)]
+    SENDER_MAPS.with(|c| c.set(c.get() + 1));
+    // SAFETY: `b.dup` is a one-page section handle with map read/write access; the view is unmapped on drop.
+    b.view = unsafe { MapViewOfFile(b.dup, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, APPBAR_SECTION_SIZE as usize) };
+    if b.view.Value.is_null() {
+        return Err(format!("section not mapped: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: the view is page-aligned and APPBAR_SECTION_SIZE bytes long, so offset 0 holds a readable u32;
+    // volatile because the sender can change it, and it is read only once.
+    let n = unsafe { b.view.Value.cast::<u32>().read_volatile() };
+    if !(PAYLOAD_MIN..=PAYLOAD_MAX).contains(&n) {
+        return Err(format!("payload size 0x{n:X} in the block header is out of range"));
+    }
+    Ok(b)
+}
 
 /// `(is a section, AllocationAttributes, MaximumSize)` of a handle of ours, from its object type and
 /// `NtQuerySection(SectionBasicInformation)`; neither maps the object. Errors are `Err`.
@@ -2336,61 +2375,43 @@ fn query_section(h: HANDLE) -> Result<(bool, u32, i64), String> {
     Ok((true, info.attrs, info.size))
 }
 
-// Test probe: counts `SHLockShared` calls on a sender-supplied handle, per thread (tests run in parallel).
+// Test probe: counts maps of a sender's section (`map_block`), per thread (tests run in parallel).
 #[cfg(test)]
 thread_local! {
-    static SENDER_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SENDER_MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `ABM_GETTASKBARPOS`: answers with the dock's tray area and edge, in our own shared block.
-fn get_taskbar_pos(m: &AppBarMsg) -> LRESULT {
-    if m.shared == 0 {
-        return LRESULT(0);
-    }
+/// `ABM_GETTASKBARPOS`: answers with the dock's tray area and edge, written into the sender's block.
+fn get_taskbar_pos(b: &SenderBlock) -> LRESULT {
     let g = state().geom;
     let a = area_rect(&g);
-    #[cfg(test)]
-    SENDER_LOCKS.with(|c| c.set(c.get() + 1));
-    // SAFETY: the shared block was allocated by the sender for our process (`m.pid`).
-    let p = unsafe { SHLockShared(HANDLE(m.shared as usize as *mut c_void), m.pid) };
-    if p.is_null() {
-        log!("tray: GETTASKBARPOS, SHLockShared failed");
-        return LRESULT(0);
-    }
-    let abd = p.cast::<AppBarData32>();
-    // SAFETY: the block holds at least one 32-bit APPBARDATA (0x28 bytes); it is updated in place.
+    let p = b.payload();
+    // SAFETY: `p` is the APPBARDATA inside the dock's own mapped view (`SenderBlock::payload`); volatile writes
+    // to memory the sender shares, updated in place.
     unsafe {
-        (*abd).rc = [a.left, a.top, a.right, a.bottom];
-        (*abd).edge = g.edge;
-    }
-    // SAFETY: `p` obtained from SHLockShared above, released exactly once.
-    if let Err(e) = unsafe { SHUnlockShared(p) } {
-        log!("tray: SHUnlockShared failed: {e}");
+        std::ptr::addr_of_mut!((*p).rc).write_volatile([a.left, a.top, a.right, a.bottom]);
+        std::ptr::addr_of_mut!((*p).edge).write_volatile(g.edge);
     }
     LRESULT(1)
 }
 
-/// `ABM_QUERYPOS`/`ABM_SETPOS`: recreates the shared block for Explorer's PID and forwards.
-fn forward_with_shared(wp: WPARAM, m: AppBarMsg) -> LRESULT {
+/// `ABM_QUERYPOS`/`ABM_SETPOS`: copies the sender's APPBARDATA into a block of the dock's own for Explorer's
+/// PID, forwards, and copies Explorer's answer back into the sender's block.
+fn forward_with_shared(wp: WPARAM, m: AppBarMsg, b: &SenderBlock) -> LRESULT {
     let Some(ex) = find_explorer_tray() else { return LRESULT(0) };
     let ex_pid = window_pid(ex);
-    if ex_pid == 0 || m.shared == 0 {
+    if ex_pid == 0 {
         return LRESULT(0);
     }
-    #[cfg(test)]
-    SENDER_LOCKS.with(|c| c.set(c.get() + 1));
-    // SAFETY: block allocated by the sender for our process (`m.pid`).
-    let old = unsafe { SHLockShared(HANDLE(m.shared as usize as *mut c_void), m.pid) };
-    if old.is_null() {
-        log!("tray: AppBar, SHLockShared(old) failed");
-        return LRESULT(0);
-    }
-    // SAFETY: `old` points to at least one 32-bit APPBARDATA; the copy is destined for Explorer.
-    let new_h = unsafe { SHAllocShared(Some(old.cast_const()), std::mem::size_of::<AppBarData32>() as u32, ex_pid) };
+    let old = b.payload();
+    // SAFETY: `old` is the APPBARDATA inside the dock's own mapped view; read once into a local copy.
+    let copy = unsafe { old.read_volatile() };
+    // SAFETY: `copy` is a local 32-bit APPBARDATA of the declared size; the new block is destined for Explorer.
+    let new_h = unsafe {
+        SHAllocShared(Some((&copy as *const AppBarData32).cast()), std::mem::size_of::<AppBarData32>() as u32, ex_pid)
+    };
     if new_h.is_invalid() {
         log!("tray: AppBar, SHAllocShared failed");
-        // SAFETY: `old` obtained from SHLockShared above.
-        let _ = unsafe { SHUnlockShared(old) };
         return LRESULT(0);
     }
     let mut m2 = m;
@@ -2416,13 +2437,11 @@ fn forward_with_shared(wp: WPARAM, m: AppBarMsg) -> LRESULT {
     };
     let ok = sent.0 != 0;
     if ok {
-        // SAFETY: block created above for Explorer's PID.
+        // SAFETY: block created above by the dock for Explorer's PID (not a value received from outside).
         let back = unsafe { SHLockShared(new_h, ex_pid) };
         if !back.is_null() {
-            // SAFETY: both blocks contain a 32-bit APPBARDATA (0x28 bytes), non-overlapping.
-            unsafe {
-                std::ptr::copy_nonoverlapping(back.cast::<AppBarData32>().cast_const(), old.cast::<AppBarData32>(), 1)
-            };
+            // SAFETY: `back` holds the 32-bit APPBARDATA allocated above; `old` lies inside the dock's view.
+            unsafe { old.write_volatile(back.cast::<AppBarData32>().read_unaligned()) };
             // SAFETY: `back` obtained from SHLockShared above.
             let _ = unsafe { SHUnlockShared(back) };
         }
@@ -2431,8 +2450,6 @@ fn forward_with_shared(wp: WPARAM, m: AppBarMsg) -> LRESULT {
     } else {
         log!("tray: AppBar, forwarding to Explorer failed (block left in place, it may still be needed)");
     }
-    // SAFETY: `old` obtained from SHLockShared above.
-    let _ = unsafe { SHUnlockShared(old) };
     if ok {
         LRESULT(res as isize)
     } else {
@@ -2695,109 +2712,147 @@ mod tests {
         (!h.0.is_null() && pid != 0).then_some((WPARAM(h.0 as usize), pid))
     }
 
+    /// Inverse of `decode_shared_atom`: the atom name shell32 builds for `handle` held by process `pid`.
+    fn shell_atom_name(sig: &[u8; 4], handle: u64, pid: u64) -> Vec<u16> {
+        let mut b = sig.to_vec();
+        b.extend([0u8; 4].iter().chain(&handle.to_le_bytes()).chain(&pid.to_le_bytes()));
+        b.chunks(3)
+            .flat_map(|t| {
+                let v = u32::from(t[0]) | u32::from(t[1]) << 8 | u32::from(t[2]) << 16;
+                (0..4).map(move |j| match (v >> (6 * j)) & 63 {
+                    0 => u16::from(b'`'),
+                    c => c as u16 + 0x20,
+                })
+            })
+            .collect()
+    }
+
+    /// Registers a shell32-style atom naming `handle` held by `pid`; the caller deletes it.
+    fn add_shell_atom(handle: u64, pid: u32) -> u16 {
+        let mut name = shell_atom_name(b"MARC", handle, u64::from(pid));
+        name.push(0);
+        // SAFETY: `name` is NUL-terminated and outlives the call.
+        let atom = unsafe { windows::Win32::System::DataExchange::GlobalAddAtomW(PCWSTR(name.as_ptr())) };
+        assert_ne!(atom, 0);
+        atom
+    }
+
+    // Entry-point tests use only ABM_GETTASKBARPOS: an accepted ABM_QUERYPOS / ABM_SETPOS would be forwarded to
+    // Explorer's tray window, which tests must never do. The pure table covers all three messages.
     #[test]
-    fn crafted_appbar_message_with_the_dock_pid_is_rejected() {
+    fn forged_appbar_values_never_reach_the_map() {
         // SAFETY: no preconditions.
         let own = unsafe { GetCurrentProcessId() };
-        let medium = |_: u32| true;
-        let never = |_: u64, _: u32| -> Result<SharedBlock, String> { panic!("probed without a verified window") };
-        // A real window of another (medium) process, so the forged blocks get as far as the handle check.
-        let shell = shell_window();
         // SAFETY: the name is a valid NUL-terminated string; the atom is deleted below.
         let foreign_atom = unsafe { windows::Win32::System::DataExchange::GlobalAddAtomW(w!("dock-test-not-shell")) };
         assert_ne!(foreign_atom, 0);
-        for msg in [ABM_GETTASKBARPOS, ABM_QUERYPOS, ABM_SETPOS] {
-            let m = crafted(msg, own);
-            let why = appbar_gate(&m, None, own, medium, never).expect("own pid without a window is rejected");
-            assert!(why.contains(&format!("block pid {own}")) && why.contains("claims_own = true"), "{why}");
-            // The real entry point rejects the same bytes before any SHLockShared on the sender's handle:
-            // no window; a raw value (SHLockShared would take it as a pointer); an atom that is not shell32's.
-            let mut cases = vec![(WPARAM(0), m.shared)];
-            if let Some((wp, _)) = shell {
-                cases.extend([(wp, m.shared), (wp, u64::from(foreign_atom))]);
-            } else {
-                eprintln!("no shell window: forged handles behind a real window not exercised");
-            }
-            for (wp, shared) in cases {
-                let locks = SENDER_LOCKS.with(|c| c.get());
+        // Decodes, but names a handle this process does not have.
+        let dangling = add_shell_atom(0x7FFF_FFFC, own);
+        // A real window of another process: a window must not be what lets a value through.
+        let mut wps = vec![WPARAM(0)];
+        match shell_window() {
+            Some((wp, _)) => wps.push(wp),
+            None => eprintln!("no shell window: forged values behind a real window not exercised"),
+        }
+        let m = crafted(ABM_GETTASKBARPOS, own);
+        for wp in wps {
+            // A raw value (SHLockShared would take it as a pointer), none, a foreign atom, a dangling handle.
+            for shared in [m.shared, 0, u64::from(foreign_atom), u64::from(dangling)] {
+                let maps = SENDER_MAPS.with(|c| c.get());
                 let bytes = appbar_bytes(&AppBarMsg { shared, ..m });
-                assert_eq!(handle_appbar(wp, LPARAM(0), &bytes).0, 0);
-                assert_eq!(SENDER_LOCKS.with(|c| c.get()), locks, "AppBar {msg} 0x{shared:X} reached SHLockShared");
+                assert_eq!(handle_appbar(wp, LPARAM(0), &bytes).0, 0, "0x{shared:X}");
+                assert_eq!(SENDER_MAPS.with(|c| c.get()), maps, "0x{shared:X} reached the map");
             }
         }
-        // SAFETY: atom added above.
-        unsafe { windows::Win32::System::DataExchange::GlobalDeleteAtom(foreign_atom) };
-        // A legitimate medium sender passes the gate; a message that is not gated is never rejected by it.
-        assert!(appbar_gate(&crafted(ABM_SETPOS, 8120), Some(8120), own, medium, never).is_none());
-        assert!(appbar_gate(&crafted(4 /* ABM_GETSTATE */, own), None, own, medium, never).is_none());
+        // SAFETY: atoms added above.
+        unsafe {
+            windows::Win32::System::DataExchange::GlobalDeleteAtom(foreign_atom);
+            windows::Win32::System::DataExchange::GlobalDeleteAtom(dangling);
+        }
     }
 
     #[test]
-    fn appbar_gate_authenticates_own_pid_blocks() {
+    fn appbar_gate_rule_table() {
         const OWN: u32 = 100;
         const APP: u32 = 8120;
-        let medium = |p: u32| p != 0 && p != 666; // 666 = elevated process
-        let real = SharedBlock { owner: APP, is_section: true, attrs: SEC_COMMIT, size: APPBAR_SECTION_SIZE };
-        let probed = std::cell::Cell::new(0);
-        let gate = |wnd: Option<u32>, block: Result<SharedBlock, String>| {
-            let probe = |shared: u64, w: u32| {
-                probed.set(probed.get() + 1);
-                assert_eq!((shared, w), (0x1234, wnd.unwrap_or(0)));
-                block.clone()
-            };
-            appbar_gate(&crafted(ABM_QUERYPOS, OWN), wnd, OWN, medium, probe)
-        };
-        // Real case: block for us, window of a medium app, authentic section (held by the app or by us).
-        assert_eq!(gate(Some(APP), Ok(real)), None);
-        assert_eq!(gate(Some(APP), Ok(SharedBlock { owner: OWN, ..real })), None);
-        assert_eq!(probed.get(), 2);
-        // Block for us but not authentic -> rejected, with the reason in the log line.
-        for (b, why) in [
-            (Err("value 0x1234 is not a shell shared-memory atom".to_string()), "not a shell shared-memory atom"),
-            (Ok(SharedBlock { owner: 9000, ..real }), "neither the dock nor the window's process"),
-            (Ok(SharedBlock { is_section: false, ..real }), "not a section"),
-            (Ok(SharedBlock { attrs: 0x0100_0000 | SEC_COMMIT, ..real }), "not plain pagefile-backed"),
-            (Ok(SharedBlock { attrs: 0x0080_0000, ..real }), "not plain pagefile-backed"),
-            (Ok(SharedBlock { size: 0x2000, ..real }), "size is not that of an AppBar block"),
-        ] {
-            let text = gate(Some(APP), b).expect("a block that is not authentic is rejected");
-            assert!(text.contains(why) && text.contains("block pid 100") && text.contains("0x1234"), "{text}");
+        const ELEV: u32 = 666;
+        let medium = |p: u32| p != 0 && p != ELEV;
+        let good = SharedBlock { is_section: true, attrs: SEC_COMMIT, size: APPBAR_SECTION_SIZE };
+        // (holder, dock elevated, section shape, with a window, None = accept / Some(reason))
+        let rows = [
+            (OWN, true, good, true, Some("held by the dock itself")),
+            (OWN, true, good, false, Some("held by the dock itself")),
+            (OWN, false, good, false, None), // unelevated developer build (DOCK_NO_MANIFEST=1)
+            (ELEV, true, good, true, Some("above medium")),
+            (ELEV, true, good, false, Some("above medium")),
+            (APP, true, good, true, None),
+            (APP, true, good, false, None),
+            (APP, true, SharedBlock { is_section: false, ..good }, true, Some("not a section")),
+            (APP, true, SharedBlock { attrs: 0x0100_0000 | SEC_COMMIT, ..good }, true, Some("not plain pagefile")),
+            (APP, true, SharedBlock { attrs: 0x0080_0000, ..good }, false, Some("not plain pagefile")),
+            (APP, true, SharedBlock { size: 0x2000, ..good }, true, Some("size is not that of an AppBar block")),
+        ];
+        for msg in [ABM_GETTASKBARPOS, ABM_QUERYPOS, ABM_SETPOS] {
+            for (holder, elevated, shape, window, want) in rows {
+                let mut m = crafted(msg, OWN);
+                if window {
+                    m.abd.hwnd = 0x1_0010;
+                }
+                let (dups, maps) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+                let got = appbar_gate(
+                    &m,
+                    OWN,
+                    elevated,
+                    medium,
+                    |s| {
+                        assert_eq!(s, 0x1234, "the value received is resolved, and only once");
+                        Ok((0x9B0, holder))
+                    },
+                    |h, p| {
+                        assert_eq!((h, p), (0x9B0, holder), "the decoded handle and holder are duplicated");
+                        dups.set(dups.get() + 1);
+                        Ok((7u8, shape))
+                    },
+                    |b| {
+                        maps.set(maps.get() + 1);
+                        Ok(b)
+                    },
+                );
+                let row = format!("msg {msg}, holder {holder}, elevated {elevated}, window {window}");
+                match want {
+                    None => {
+                        assert_eq!(got, Ok(7), "{row}");
+                        assert_eq!((dups.get(), maps.get()), (1, 1), "{row}");
+                    }
+                    Some(why) => {
+                        let text = got.expect_err(&row);
+                        assert!(text.contains(why), "{row}: {text}");
+                        let pids = text.contains("claimed pid 100") && text.contains(&format!("holder pid {holder}"));
+                        assert!(pids, "{text}");
+                        assert_eq!(maps.get(), 0, "{row}: rejected blocks are never mapped");
+                        let holder_rule = why.contains("dock itself") || why.contains("medium");
+                        assert_eq!(dups.get(), usize::from(!holder_rule), "{row}: holder checked before duplicating");
+                    }
+                }
+            }
         }
-        // No window, a dead window, our own window, an elevated window -> rejected before any probe.
-        let before = probed.get();
-        for wnd in [None, Some(0), Some(OWN), Some(666)] {
-            assert!(gate(wnd, Ok(real)).is_some(), "window {wnd:?}");
-        }
-        assert_eq!(probed.get(), before, "the handle is probed only behind a verified window");
-        // A block claimed for another process keeps the pre-existing rule and is not probed.
-        let other = |pid: u32, wnd: Option<u32>| {
-            appbar_gate(&crafted(ABM_SETPOS, pid), wnd, OWN, medium, |_, _| -> Result<SharedBlock, String> {
-                panic!("other-pid blocks are not probed")
-            })
-        };
-        assert!(other(APP, Some(APP)).is_none());
-        assert!(other(APP, None).is_none());
-        assert!(other(666, Some(666)).is_some());
-        assert!(other(APP, Some(9000)).is_some());
+        // Every failed Win32 step rejects, with the holder pid once it is known.
+        let m = crafted(ABM_GETTASKBARPOS, OWN);
+        let ok_resolve = |_: u64| Ok((0x9B0, APP));
+        let ok_dup = |_: u64, _: u32| Ok((7u8, good));
+        let ok_map = |b: u8| Ok(b);
+        let text = appbar_gate(&m, OWN, true, medium, |_| Err("no atom".to_string()), ok_dup, ok_map).unwrap_err();
+        assert!(text.contains("holder pid -") && text.contains("no atom"), "{text}");
+        let text = appbar_gate(&m, OWN, true, medium, ok_resolve, |_, _| Err::<(u8, _), _>("no dup".into()), ok_map);
+        assert!(text.as_ref().is_err_and(|t| t.contains("holder pid 8120") && t.contains("no dup")), "{text:?}");
+        let text = appbar_gate(&m, OWN, true, medium, ok_resolve, ok_dup, |_| Err("bad header".into())).unwrap_err();
+        assert!(text.contains("holder pid 8120") && text.contains("bad header"), "{text}");
     }
 
     #[test]
     fn shell_shared_atom_names_decode() {
         let u = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
-        // Inverse of the decoder, to build names from fields.
-        let enc = |sig: &[u8; 4], handle: u64, pid: u64| -> Vec<u16> {
-            let mut b = sig.to_vec();
-            b.extend([0u8; 4].iter().chain(&handle.to_le_bytes()).chain(&pid.to_le_bytes()));
-            b.chunks(3)
-                .flat_map(|t| {
-                    let v = u32::from(t[0]) | u32::from(t[1]) << 8 | u32::from(t[2]) << 16;
-                    (0..4).map(move |j| match (v >> (6 * j)) & 63 {
-                        0 => u16::from(b'`'),
-                        c => c as u16 + 0x20,
-                    })
-                })
-                .collect()
-        };
+        let enc = shell_atom_name;
         // Captured on Windows 11: a medium sender's block for a medium receiver 0x8F0C, and one for Explorer.
         assert_eq!(decode_shared_atom(&u("-%D4#!`````L)````````PPC````````")), Some((0x9B0, 0x8F0C)));
         assert_eq!(decode_shared_atom(&u("-%D4#!`````9J!```````0Q2````````")), Some((0x6A64, 0x4B14)));
@@ -2812,54 +2867,140 @@ mod tests {
     }
 
     #[test]
-    fn shell32_blocks_are_authentic_and_pointers_are_not() {
+    fn shell32_blocks_are_mapped_through_the_duplicate_and_pointers_are_not() {
         // SAFETY: no preconditions.
         let own = unsafe { GetCurrentProcessId() };
         // Within one process SHAllocShared returns a heap pointer: never a shell atom.
         let data = [0u8; 0x28];
         // SAFETY: `data` is readable for the declared size; the block is freed right after.
         let local = unsafe { SHAllocShared(Some(data.as_ptr().cast()), data.len() as u32, own) };
-        assert!(probe_shared_block(local.0 as usize as u64, own, 0).is_err());
+        assert!(resolve_shared_atom(local.0 as usize as u64).is_err());
         // SAFETY: block allocated above for our pid, freed once.
         let _ = unsafe { SHFreeShared(local, own) };
         let Some((_, ex)) = shell_window() else {
             eprintln!("no shell window: real cross-process block not exercised");
             return;
         };
-        // A block for Explorer, as an AppBar app would send it: probed (not locked) and accepted as the
-        // window's; a bigger one is a section too, but not an AppBar block.
+        // A block for Explorer, as an AppBar app would send it: resolved, duplicated with explicit access and
+        // accepted; a bigger one is a section too, but not an AppBar block (and is not mapped).
         for (n, ok) in [(0x28usize, true), (0x2000, false)] {
-            let buf = vec![0u8; n];
+            let buf: Vec<u8> = (0..n).map(|i| (i as u8) ^ 0x5A).collect();
             // SAFETY: `buf` is readable for `n` bytes; the block is freed right after.
             let h = unsafe { SHAllocShared(Some(buf.as_ptr().cast()), n as u32, ex) };
             assert!(!h.is_invalid());
-            let b = probe_shared_block(h.0 as usize as u64, own, ex).expect("a shell32 block is probed");
-            assert_eq!((b.owner, b.is_section, b.attrs), (ex, true, SEC_COMMIT), "n = {n:#X}");
-            assert_eq!(shared_block_authentic(&b, own, ex).is_ok(), ok, "n = {n:#X}: {b:?}");
-            assert!(probe_shared_block(h.0 as usize as u64, own, 9).is_ok_and(|b| !b.is_section), "not opened");
+            let (handle, holder) = resolve_shared_atom(h.0 as usize as u64).expect("a shell32 block is an atom");
+            assert_eq!(holder, ex, "n = {n:#X}");
+            let (b, shape) = dup_section(handle, holder).expect("duplicated with explicit access");
+            assert_eq!((shape.is_section, shape.attrs), (true, SEC_COMMIT), "n = {n:#X}");
+            assert_eq!(shared_block_authentic(&shape).is_ok(), ok, "n = {n:#X}: {shape:?}");
+            if ok {
+                let b = map_block(b).expect("a real shell32 header is accepted");
+                // Layout of the real block: payload size at offset 0, payload from BLOCK_HEADER.
+                // SAFETY: the view is one page long (`map_block`); both ranges lie inside it.
+                let (size, payload) = unsafe {
+                    let base = b.view.Value.cast::<u8>();
+                    (base.cast::<u32>().read(), std::slice::from_raw_parts(base.add(BLOCK_HEADER), n).to_vec())
+                };
+                assert_eq!((size, payload), (n as u32, buf), "header and payload of a real shell32 block");
+            }
             // SAFETY: block allocated above for Explorer's pid, freed once.
             let _ = unsafe { SHFreeShared(h, ex) };
         }
     }
 
+    /// A pagefile-backed section of this process (`size` bytes, `PAGE_READWRITE | flags`).
+    fn own_section(size: u32, flags: windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS) -> HANDLE {
+        use windows::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
+        // SAFETY: page-file backed (INVALID_HANDLE_VALUE), unnamed, default security; closed by the caller.
+        unsafe {
+            CreateFileMappingW(
+                windows::Win32::Foundation::INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE | flags,
+                0,
+                size,
+                PCWSTR::null(),
+            )
+        }
+        .expect("section created")
+    }
+
     #[test]
-    fn appbar_block_allowed_rules() {
-        const OWN: u32 = 100;
-        let medium = |p: u32| p != 0 && p != 666; // 666 = elevated process
-        // Block for us (what shell32 sends): the window must exist, not be ours and be at most medium.
-        assert!(appbar_block_allowed(OWN, OWN, Some(8120), medium));
-        assert!(!appbar_block_allowed(OWN, OWN, Some(666), medium));
-        assert!(!appbar_block_allowed(OWN, OWN, Some(0), medium), "dead window");
-        assert!(!appbar_block_allowed(OWN, OWN, Some(OWN), |_| true));
-        assert!(!appbar_block_allowed(OWN, OWN, None, |_| true), "no window + own pid is rejected");
-        // Unchanged: the block lives in the window owner's process and that process is at most medium.
-        assert!(appbar_block_allowed(8120, OWN, Some(8120), medium));
-        assert!(!appbar_block_allowed(666, OWN, Some(8120), medium));
-        assert!(!appbar_block_allowed(666, OWN, Some(666), medium));
-        assert!(!appbar_block_allowed(8120, OWN, Some(9000), medium), "block pid must be the window owner's");
-        assert!(appbar_block_allowed(8120, OWN, None, medium));
-        assert!(!appbar_block_allowed(666, OWN, None, medium));
-        assert!(!appbar_block_allowed(0, OWN, None, medium));
+    fn sections_of_this_process_through_the_entry_point() {
+        use windows::Win32::System::Memory::{SEC_COMMIT as COMMIT, SEC_RESERVE};
+        // SAFETY: no preconditions.
+        let own = unsafe { GetCurrentProcessId() };
+        // A block held by this process is allowed only while it is not elevated (developer build rule).
+        let holder_ok = !crate::shell_thread::is_elevated();
+        let mut wps = vec![WPARAM(0)];
+        match shell_window() {
+            Some((wp, _)) => wps.push(wp),
+            None => eprintln!("no shell window: the entry point not exercised with a window"),
+        }
+        let sentinel = AppBarData32 { cb_size: 0x28, hwnd: 0x10, callback: 0x20, edge: 0xEE, rc: [-7; 4], lparam: 9 };
+        // (section size, flags, header size field, accepted, mapped)
+        let cases = [
+            (0x1000, COMMIT, Some(0x28), true, true),
+            (0x1000, COMMIT, Some(0xFF0), true, true),
+            (0x1000, COMMIT, Some(0x27), false, true),
+            (0x1000, COMMIT, Some(0xFF1), false, true),
+            (0x1000, COMMIT, Some(0), false, true),
+            (0x2000, COMMIT, Some(0x28), false, false),
+            (0x1000, SEC_RESERVE, None, false, false),
+        ];
+        for wp in wps {
+            for (size, flags, header, accepted, mapped) in cases {
+                let row = format!("size {size:#X}, flags {:#X}, header {header:?}, wp {:#X}", flags.0, wp.0);
+                let h = own_section(size, flags);
+                // SAFETY: `h` is our own section of at least one page; the view is unmapped below.
+                let view = unsafe { MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0x1000) };
+                assert!(!view.Value.is_null(), "{row}");
+                let p = view.Value.cast::<u8>();
+                if let Some(n) = header {
+                    // SAFETY: committed one-page view: offset 0 and the payload at BLOCK_HEADER lie inside it.
+                    unsafe {
+                        p.cast::<u32>().write(n);
+                        p.add(BLOCK_HEADER).cast::<AppBarData32>().write(sentinel);
+                    }
+                }
+                let atom = add_shell_atom(h.0 as usize as u64, own);
+                let maps = SENDER_MAPS.with(|c| c.get());
+                let bytes = appbar_bytes(&AppBarMsg { shared: u64::from(atom), ..crafted(ABM_GETTASKBARPOS, own) });
+                let ret = handle_appbar(wp, LPARAM(0), &bytes).0;
+                assert_eq!(ret, isize::from(accepted && holder_ok), "{row}");
+                assert_eq!(SENDER_MAPS.with(|c| c.get()) - maps, usize::from(mapped && holder_ok), "{row}");
+                if header.is_some() {
+                    // SAFETY: as above.
+                    let got = unsafe { p.add(BLOCK_HEADER).cast::<AppBarData32>().read() };
+                    let g = state().geom;
+                    let a = area_rect(&g);
+                    let written = ([a.left, a.top, a.right, a.bottom], g.edge);
+                    let (rc, edge) = if ret == 1 { written } else { ([-7; 4], 0xEE) };
+                    assert_eq!((got.rc, got.edge), (rc, edge), "{row}: only an accepted block is written");
+                    assert_eq!((got.cb_size, got.hwnd, got.callback, got.lparam), (0x28, 0x10, 0x20, 9), "{row}");
+                }
+                // SAFETY: atom, view and section created above, released once.
+                unsafe {
+                    windows::Win32::System::DataExchange::GlobalDeleteAtom(atom);
+                    let _ = UnmapViewOfFile(view);
+                    let _ = CloseHandle(h);
+                }
+            }
+        }
+        // A handle that is not a section: rejected before any map.
+        // SAFETY: no preconditions; the event is closed below.
+        let ev = unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, PCWSTR::null()) }
+            .expect("event created");
+        let atom = add_shell_atom(ev.0 as usize as u64, own);
+        let maps = SENDER_MAPS.with(|c| c.get());
+        let bytes = appbar_bytes(&AppBarMsg { shared: u64::from(atom), ..crafted(ABM_GETTASKBARPOS, own) });
+        assert_eq!(handle_appbar(WPARAM(0), LPARAM(0), &bytes).0, 0);
+        assert_eq!(SENDER_MAPS.with(|c| c.get()), maps, "an event is never mapped");
+        // SAFETY: atom and event created above, released once.
+        unsafe {
+            windows::Win32::System::DataExchange::GlobalDeleteAtom(atom);
+            let _ = CloseHandle(ev);
+        }
     }
 
     #[test]
