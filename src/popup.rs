@@ -1,4 +1,4 @@
-//! Mini OLED popup (notifications, audio, calendar, power, settings, tray overflow, network): a layered window
+//! Mini OLED popup (notifications, audio, calendar, power, tray overflow, network, battery, start menu): a layered window
 //! SEPARATE from the bar, only one open at a time.
 //!
 //! WINDOW: class `DockPopup`, `WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`
@@ -56,7 +56,7 @@ pub(crate) mod popup_startmenu;
 
 use crate::audio::{OutputDevice, VolumeState};
 use crate::log;
-use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
+use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
 use crate::render::Metrics;
 use crate::surface::Surface;
 
@@ -86,11 +86,13 @@ pub enum PopupKind {
     TrayOverflow = 5,
     AppMenu = 6,
     Network = 7,
-    Settings = 8,
+    // 8 was Settings (removed in 1.4.0; the Settings window is `settings_window`).
     /// Quick-links menu of the Start button (right click).
     Start = 9,
     /// Full Start menu (all apps, search, pins) opened by the Win double tap (`popup_startmenu`).
     StartMenu = 10,
+    /// Battery details of the BATTERY module (`popup_battery`).
+    Battery = 11,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -158,12 +160,6 @@ pub fn open_app_menu(anchor: Anchor, info: AppMenuInfo) {
     open(PopupKind::AppMenu, anchor);
 }
 
-/// The next tray popup opens directly in the "choose visible icons" mode (the Settings popup sets it
-/// and then replies `Reply::Switch(PopupKind::TrayOverflow)`).
-pub(crate) fn next_tray_chooser() {
-    TRAY_CHOOSER.store(true, Ordering::Relaxed);
-}
-
 /// Key of the app chosen last in the context menu (consumes it). UI thread.
 pub fn take_app_menu_key() -> Option<String> {
     APP_CHOSEN_KEY.with(|k| k.try_borrow_mut().ok().and_then(|mut g| g.take()))
@@ -182,9 +178,6 @@ pub(crate) fn set_app_menu_key(key: String) {
         }
     });
 }
-
-/// The next `TrayOverflow` content opens in chooser mode (consumed by `make_content`).
-static TRAY_CHOOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// Key of the item for which the app menu is (or was) open.
@@ -208,8 +201,6 @@ pub(crate) enum Reply {
     Relayout,
     /// Close the popup (action performed).
     Close,
-    /// Close this popup and open `kind` at the same anchor (power -> settings -> tray chooser).
-    Switch(PopupKind),
 }
 
 impl Reply {
@@ -221,7 +212,6 @@ impl Reply {
                 Reply::Redraw => 1,
                 Reply::Relayout => 2,
                 Reply::Close => 3,
-                Reply::Switch(_) => 4,
             }
         }
         if rank(other) > rank(self) {
@@ -251,6 +241,7 @@ pub(crate) enum DataEvent {
     NotifChanged,
     TrayChanged,
     Network(crate::net::NetInfo),
+    Battery(crate::battery::BatteryStatus),
     /// The Start menu catalog or some of its icons arrived (`popup_startmenu` store updated).
     StartMenuChanged,
 }
@@ -262,6 +253,9 @@ pub(crate) trait Content {
     /// Computes (and caches) the layout given the surface's metrics/fonts; returns the
     /// desired size (physical px).
     fn size(&mut self, s: &Surface) -> (i32, i32);
+    /// Largest size (physical px) the popup may take: the work area minus the margins. Contents with a
+    /// long list lay themselves out inside it; the others are only clipped by `fit_to_work`.
+    fn limit(&mut self, _max: (i32, i32)) {}
     /// Draws everything (panel included).
     fn paint(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>);
     /// Control under the point.
@@ -379,6 +373,8 @@ struct State {
     last_volume: VolumeState,
     /// Last network status received (initial data of the network popup; empty while the module is off).
     last_net: crate::net::NetInfo,
+    /// Last battery sample received (initial data of the battery popup).
+    last_battery: crate::battery::BatteryStatus,
 }
 
 thread_local! {
@@ -390,6 +386,7 @@ thread_local! {
         last_inactive: None,
         last_volume: VolumeState::default(),
         last_net: crate::net::NetInfo::default(),
+        last_battery: crate::battery::BatteryStatus::NONE,
     });
 }
 
@@ -460,8 +457,7 @@ pub fn toggle(kind: PopupKind, anchor: Anchor) {
             return Plan::Skip;
         }
         let open = st.open.as_ref().map(|o| o.kind);
-        // Settings is opened from the power popup and shares its item: the power button closes it too.
-        if open == Some(kind) || (kind == PopupKind::Power && open == Some(PopupKind::Settings)) {
+        if open == Some(kind) {
             return Plan::Close;
         }
         if let Some((k, t)) = st.last_inactive {
@@ -607,6 +603,18 @@ pub fn on_network(info: crate::net::NetInfo) {
     }
 }
 
+/// A new battery sample reached the UI: remembered for the next battery popup and forwarded to the
+/// open one. Called by `ui`.
+pub fn on_battery(status: crate::battery::BatteryStatus) {
+    let open = with(|s| {
+        s.last_battery = status;
+        s.open.as_ref().is_some_and(|o| o.kind == PopupKind::Battery)
+    });
+    if open == Some(true) {
+        dispatch(DataEvent::Battery(status));
+    }
+}
+
 /// `WM_DOCK_NOTIF`: re-reads `notif::snapshot()` if the notifications popup is open. Called by `main`.
 pub fn on_notif_changed() {
     dispatch(DataEvent::NotifChanged);
@@ -636,6 +644,10 @@ pub fn on_start_icons(icon_px: u32, icons: Vec<(String, Option<crate::icons::Ico
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {
     close_inner("shutdown");
+    if let Some(h) = with(|st| st.hwnd).filter(|h| !h.0.is_null()) {
+        // SAFETY: our window.
+        let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
+    }
     let Some((hwnd, registered)) = with(|st| {
         let r = (st.hwnd, st.registered);
         st.hwnd = HWND::default();
@@ -746,22 +758,21 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
 // ------------------------------------------------------------------ open / close
 
 /// Builds the content for `kind`.
-fn make_content(kind: PopupKind, volume: VolumeState, net: crate::net::NetInfo) -> Box<dyn Content> {
+fn make_content(
+    kind: PopupKind,
+    volume: VolumeState,
+    net: crate::net::NetInfo,
+    battery: crate::battery::BatteryStatus,
+) -> Box<dyn Content> {
     match kind {
         PopupKind::Notifications => crate::popup_notif::new(),
         PopupKind::Audio => crate::popup_audio::new(volume),
         PopupKind::Calendar => crate::popup_calendar::new(),
         PopupKind::Power => crate::popup_power::new(),
-        PopupKind::TrayOverflow => {
-            if TRAY_CHOOSER.swap(false, Ordering::Relaxed) {
-                crate::popup_tray::new_chooser()
-            } else {
-                crate::popup_tray::new()
-            }
-        }
+        PopupKind::TrayOverflow => crate::popup_tray::new(),
         PopupKind::AppMenu => popup_app::new(take_app_info().unwrap_or_default()),
         PopupKind::Network => crate::popup_network::new(net),
-        PopupKind::Settings => crate::popup_settings::new(),
+        PopupKind::Battery => crate::popup_battery::new(battery, crate::battery::power_mode()),
         PopupKind::Start => popup_start::new(),
         PopupKind::StartMenu => popup_startmenu::new(),
     }
@@ -823,6 +834,17 @@ pub(crate) fn work_area(bar: &RECT) -> RECT {
     crate::ui::monitor_info(mon).map_or(*bar, |mi| mi.rcWork)
 }
 
+/// `w` x `h` capped to the work area minus `margin` on each side (never below 1 px).
+pub(crate) fn fit_to_work(w: i32, h: i32, work: &RECT, margin: i32) -> (i32, i32) {
+    (w.min(work.right - work.left - 2 * margin).max(1), h.min(work.bottom - work.top - 2 * margin).max(1))
+}
+
+/// Largest popup size for the monitor of `a`.
+pub(crate) fn max_size(a: &Anchor) -> (i32, i32) {
+    let margin = Metrics { dpi: a.dpi }.px(POPUP_SCREEN_MARGIN);
+    fit_to_work(i32::MAX, i32::MAX, &work_area(&a.bar), margin)
+}
+
 /// Top-left corner position of a `w` x `h` popup (also used by the window picker).
 pub(crate) fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
     let m = Metrics { dpi: a.dpi };
@@ -843,6 +865,10 @@ fn open(kind: PopupKind, anchor: Anchor) {
     close_inner("popup switch");
     crate::picker::close("popup opened");
     let Some(hwnd) = ensure_window() else { return };
+    if kind == PopupKind::StartMenu {
+        // SAFETY: our window; fails harmlessly if the timer is not armed.
+        let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
+    }
     let metrics = Metrics { dpi: anchor.dpi.max(96) };
     let surf = match Surface::new(metrics) {
         Ok(s) => s,
@@ -853,8 +879,10 @@ fn open(kind: PopupKind, anchor: Anchor) {
     };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
-    let Some((volume, net)) = with(|st| (st.last_volume, st.last_net.clone())) else { return };
-    let content = make_content(kind, volume, net);
+    let Some((volume, net, battery)) = with(|st| (st.last_volume, st.last_net.clone(), st.last_battery)) else {
+        return;
+    };
+    let content = make_content(kind, volume, net, battery);
     debug_assert_eq!(content.kind(), kind);
     let installed = with(|st| {
         st.last_inactive = None;
@@ -969,7 +997,10 @@ fn render(relayout: bool) -> bool {
         let mut surf = o.surf.take()?;
         // A previous failed resize leaves the surface without a DIB (0 x 0): retry the layout.
         if relayout || surf.size() == (0, 0) {
+            o.content.limit(max_size(&o.anchor));
             let (w, h) = o.content.size(&surf);
+            let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
+            let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
             if let Err(e) = surf.resize(w.max(1), h.max(1)) {
                 log!("popup: resize failed: {e}");
                 // The surface goes back into the state: the next render retries instead of staying
@@ -1005,13 +1036,6 @@ fn apply(reply: Reply) {
             render(true);
         }
         Reply::Close => close_inner("action"),
-        Reply::Switch(kind) => {
-            let anchor = with(|st| st.open.as_ref().map(|o| o.anchor)).flatten();
-            close_inner("switch");
-            if let Some(a) = anchor {
-                open(kind, a);
-            }
-        }
     }
 }
 
@@ -1111,6 +1135,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 TIMER_POPUP_ANIM => on_anim(hwnd),
                 TIMER_POPUP_TICK => on_tick(hwnd),
                 TIMER_POPUP_FOCUS => on_focus_retry(hwnd),
+                TIMER_POPUP_START_RELEASE => on_start_release(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -1350,6 +1375,35 @@ pub(crate) fn tick_soon(ms: u32) {
     }
 }
 
+/// Delay after a Start menu close before its catalog and icons are released (`TIMER_POPUP_START_RELEASE`).
+const START_RELEASE_MS: u32 = 60_000;
+
+/// Whether the release timer may free the Start data: not while a Start menu is open.
+fn start_release_due(open: Option<PopupKind>) -> bool {
+    open != Some(PopupKind::StartMenu)
+}
+
+/// Arms (or restarts) the one-shot that releases the Start menu data; called when it closes.
+pub(crate) fn arm_start_release() {
+    let Some(hwnd) = with(|st| st.hwnd) else { return };
+    if hwnd.0.is_null() {
+        return;
+    }
+    // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
+    if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_START_RELEASE, START_RELEASE_MS, None) } == 0 {
+        log!("popup: SetTimer(start release) failed");
+    }
+}
+
+/// `TIMER_POPUP_START_RELEASE`: frees the Start menu data unless a Start menu is open again.
+fn on_start_release(hwnd: HWND) {
+    // SAFETY: timer of our window.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
+    if start_release_due(current()) {
+        popup_startmenu::release();
+    }
+}
+
 /// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
 /// the foreground is still the window that was in front at open time (or null, or ours): if the
 /// user has meanwhile moved to another window, the popup is not pushed in front of it (the tick
@@ -1373,10 +1427,10 @@ fn on_focus_retry(hwnd: HWND) {
             return None;
         }
         o.focus_tries -= 1;
-        Some(o.focus_tries)
+        Some((o.focus_tries, ()))
     })
     .flatten();
-    let Some(left) = go else { return };
+    let Some((left, _)) = go else { return };
     let ok = crate::ui::force_foreground(hwnd);
     log!("popup: foreground retry ({left} left) -> {ok}");
     if !ok && left > 0 {
@@ -1481,7 +1535,7 @@ const SLIDER_TRACK_H: i32 = 4;
 
 /// Value in `lo..=hi` (rounded to the nearest step) for pointer x on slider `rc`. The center of
 /// the knob (radius `knob_r`) travels between `rc.left + knob_r` and `rc.right - knob_r`.
-/// Shared by the Settings and Audio popups.
+/// Shared by the Settings window and the Audio popup.
 pub(crate) fn slider_value_at(rc: &RECT, knob_r: i32, lo: i32, hi: i32, x: i32) -> i32 {
     let (l, r) = (rc.left + knob_r, rc.right - knob_r);
     let span = (r - l).max(1);
@@ -1510,4 +1564,31 @@ pub(crate) fn launch(target: &str) {
 /// Monotonic milliseconds (for deadlines and content throttling).
 pub(crate) fn tick_ms() -> u64 {
     now_ms()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_is_clamped_to_the_work_area() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(fit_to_work(1000, 600, &work, 16), (1000, 600), "fits: unchanged");
+        assert_eq!(fit_to_work(1280, 1240, &work, 16), (1280, 1008), "1080p at 200 %: 640x620 logical");
+        assert_eq!(fit_to_work(5000, 5000, &work, 16), (1888, 1008));
+        assert_eq!(fit_to_work(50, 50, &RECT { left: 0, top: 0, right: 40, bottom: 40 }, 16), (8, 8), "40 - 2 * 16");
+        assert_eq!(
+            fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 20, bottom: 20 }, 16),
+            (1, 1),
+            "20 - 32 < 0: never zero or negative"
+        );
+        assert_eq!(fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 10, bottom: 10 }, 16), (1, 1), "never zero");
+    }
+
+    #[test]
+    fn start_data_is_released_only_when_no_start_menu_is_open() {
+        assert!(start_release_due(None));
+        assert!(start_release_due(Some(PopupKind::Power)));
+        assert!(!start_release_due(Some(PopupKind::StartMenu)));
+    }
 }

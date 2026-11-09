@@ -1,5 +1,5 @@
-//! POWER popup: Sleep, Lock, Restart, Shut down, separator, "Settings" (switches to the Settings
-//! popup, `popup_settings`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
+//! POWER popup: Sleep, Lock, Restart, Shut down, separator, "Settings" (closes the popup and opens the
+//! Settings window, `settings_window`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
 //! (user's choice, no confirmation). Actions in `power::run`.
 //!
 //! The items, labels, glyphs and the choice behind each one are shared (`pub(crate)` helpers below)
@@ -15,6 +15,8 @@ use crate::i18n::tr;
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub(crate) const ID_SLEEP: u32 = 1;
 pub(crate) const ID_LOCK: u32 = 2;
@@ -35,7 +37,7 @@ pub(crate) const DOCK_ITEMS: [u32; 2] = [ID_SETTINGS, ID_EXIT];
 pub(crate) enum Choice {
     /// Run the action after the popup closes (`power::run`).
     Run(PowerAction),
-    /// Switch to the Settings popup.
+    /// Close the popup, then open the Settings window.
     Settings,
 }
 
@@ -79,6 +81,23 @@ pub(crate) fn run(a: PowerAction) {
     power::run(a);
 }
 
+/// Asks the UI thread to open (or activate) the Settings window. Any thread.
+pub(crate) fn open_settings_window() {
+    // SAFETY: PostMessageW is thread-safe; if the dock window no longer exists it just fails.
+    let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) };
+    if let Err(e) = r {
+        log!("settings: could not post the open request: {e}");
+    }
+}
+
+/// Carries out a choice after the popup that offered it has closed.
+pub(crate) fn run_choice(c: Choice) {
+    match c {
+        Choice::Run(a) => run(a),
+        Choice::Settings => open_settings_window(),
+    }
+}
+
 /// State of the "Start with Windows" toggle (shared with the threads that query/modify the task).
 const AS_UNKNOWN: u8 = 0;
 const AS_OFF: u8 = 1;
@@ -87,8 +106,8 @@ const AS_BUSY: u8 = 3;
 
 pub(crate) struct PowerPopup {
     hits: HitMap,
-    /// Action to run after closing.
-    pending: Option<PowerAction>,
+    /// Choice to carry out after closing.
+    pending: Option<Choice>,
     /// Cached geometry: separator and padding (physical px).
     sep_y: i32,
     pad_text: i32,
@@ -97,10 +116,41 @@ pub(crate) struct PowerPopup {
     autostart: Arc<AtomicU8>,
     /// Last state seen by `tick` (to redraw only when it changes).
     seen: u8,
+    /// Update badge of the Settings row (`update::status().badge()`), re-read by `tick`.
+    badge: u32,
+    /// Preview only: a fixed badge that `tick` never overwrites.
+    forced_badge: Option<u32>,
+}
+
+/// Text of the update badge on the Settings row: nothing for 0, the count, "9+" above 9.
+pub(crate) fn settings_badge(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1..=9 => Some(count.to_string()),
+        _ => Some("9+".to_string()),
+    }
+}
+
+/// Orange dot that carries the update count `text`, its right edge at `right`, centred vertically
+/// in `rc`. Also drawn on the Updates entry of the Settings window (`settings_view`).
+pub(crate) fn paint_badge(s: &mut Surface, right: i32, rc: &windows::Win32::Foundation::RECT, text: &str) {
+    let m = s.metrics();
+    let tw = s.text_width(text, Font::Small);
+    let bh = m.px(16);
+    let bw = bh.max(tw + m.px(8));
+    let left = right - bw;
+    let top = rc.top + ((rc.bottom - rc.top) - bh) / 2;
+    s.fill_rr(rect_wh(left, top, bw, bh), m.px(8), crate::render::ATTENTION_RGB, 255);
+    let ty = center_y(&rect_wh(left, top, bw, bh), s.line_height(Font::Small));
+    s.text(text, left + (bw - tw) / 2, ty, Font::Small, WHITE, TEXT_ALPHA);
 }
 
 /// Creates the content (initial state).
 pub(crate) fn new() -> Box<dyn Content> {
+    build(None)
+}
+
+fn build(forced_badge: Option<u32>) -> Box<dyn Content> {
     let autostart = Arc::new(AtomicU8::new(AS_UNKNOWN));
     // The schtasks.exe query can take hundreds of ms: keep it off the UI thread.
     let a = Arc::clone(&autostart);
@@ -119,7 +169,14 @@ pub(crate) fn new() -> Box<dyn Content> {
         width: 0,
         autostart,
         seen: AS_UNKNOWN,
+        badge: forced_badge.unwrap_or_else(|| crate::update::status().badge()),
+        forced_badge,
     })
+}
+
+/// Preview: the popup with a fixed update badge.
+pub(crate) fn preview_with_badge(count: u32) -> Box<dyn Content> {
+    build(Some(count))
 }
 
 /// Label of item `id` in the dock language.
@@ -181,7 +238,12 @@ impl Content for PowerPopup {
             s.text(txt, rc.left + self.pad_text + icon + m.px(8), y, font, WHITE, lift(alpha, h));
             if id == ID_SETTINGS {
                 let cw = s.text_width("\u{203A}", font);
-                s.text("\u{203A}", rc.right - self.pad_text - cw, y, font, WHITE, lift(TEXT3_ALPHA, h));
+                let cx = rc.right - self.pad_text - cw;
+                s.text("\u{203A}", cx, y, font, WHITE, lift(TEXT3_ALPHA, h));
+                if let Some(text) = settings_badge(self.badge) {
+                    // Right-aligned before the chevron.
+                    paint_badge(s, cx - s.metrics().px(6), &rc, &text);
+                }
             }
             if id == ID_AUTOSTART {
                 let st = self.autostart.load(SeqCst);
@@ -202,8 +264,10 @@ impl Content for PowerPopup {
 
     fn tick(&mut self) -> Reply {
         let cur = self.autostart.load(SeqCst);
-        if cur != self.seen {
+        let badge = self.forced_badge.unwrap_or_else(|| crate::update::status().badge());
+        if cur != self.seen || badge != self.badge {
             self.seen = cur;
+            self.badge = badge;
             return Reply::Redraw;
         }
         Reply::None
@@ -214,9 +278,8 @@ impl Content for PowerPopup {
             return self.toggle_autostart();
         }
         match choice(id) {
-            Some(Choice::Settings) => Reply::Switch(PopupKind::Settings),
-            Some(Choice::Run(a)) => {
-                self.pending = Some(a);
+            Some(c) => {
+                self.pending = Some(c);
                 Reply::Close
             }
             None => Reply::None,
@@ -224,8 +287,8 @@ impl Content for PowerPopup {
     }
 
     fn after_close(&mut self) {
-        if let Some(a) = self.pending.take() {
-            run(a);
+        if let Some(c) = self.pending.take() {
+            run_choice(c);
         }
     }
 }
@@ -244,7 +307,14 @@ impl PowerPopup {
         }
         let a = Arc::clone(&self.autostart);
         let spawned = std::thread::Builder::new().name("autostart-set".into()).spawn(move || {
-            let r = if want_on { crate::autostart::enable(false).map(|_| ()) } else { crate::autostart::disable() };
+            let r = if want_on {
+                match crate::autostart::enable(false).error {
+                    None => Ok(()),
+                    Some(e) => Err(e.to_string()),
+                }
+            } else {
+                crate::autostart::disable()
+            };
             if let Err(e) = &r {
                 log!("autostart: operation failed: {e}");
             }
@@ -256,5 +326,36 @@ impl PowerPopup {
             self.autostart.store(cur, SeqCst);
         }
         Reply::Redraw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_closes_the_popup_then_opens_the_window() {
+        let mut p = PowerPopup {
+            hits: HitMap::default(),
+            pending: None,
+            sep_y: 0,
+            pad_text: 0,
+            width: 0,
+            autostart: Arc::new(AtomicU8::new(AS_OFF)),
+            seen: AS_OFF,
+            badge: 0,
+            forced_badge: Some(0),
+        };
+        assert_eq!(p.click(ID_SETTINGS), Reply::Close);
+        assert_eq!(p.pending, Some(Choice::Settings));
+        assert_eq!(p.click(ID_LOCK), Reply::Close);
+        assert_eq!(p.pending, Some(Choice::Run(PowerAction::Lock)));
+    }
+
+    #[test]
+    fn settings_badge_text() {
+        assert_eq!(settings_badge(0), None);
+        assert_eq!(settings_badge(1).as_deref(), Some("1"));
+        assert_eq!(settings_badge(12).as_deref(), Some("9+"));
     }
 }

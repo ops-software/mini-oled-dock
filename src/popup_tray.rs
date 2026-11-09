@@ -7,8 +7,8 @@
 //!    (the app menu must be able to take the foreground).
 //!  * CUSTOMIZE: list of ALL tray apps (16 px icon, short name, pill toggle
 //!    "visible in the bar"). A click flips the choice (`tray_host::set_user_hidden`: atomic config
-//!    write and immediate bar update) and the popup stays open. "Done" returns to the grid, or closes the popup when
-//!    it was opened directly in this mode (`popup::next_tray_chooser`, from the Settings popup).
+//!    write and immediate bar update) and the popup stays open. "Done" returns to the grid. (The
+//!    Settings window has its own inline chooser built on `customize_rows`.)
 
 use std::sync::Arc;
 
@@ -36,24 +36,22 @@ struct Cell {
     bitmap: Option<Arc<IconBitmap>>,
 }
 
-struct Row {
-    key: String,
-    name: String,
-    bitmap: Option<Arc<IconBitmap>>,
+pub(crate) struct TrayRow {
+    pub(crate) key: String,
+    pub(crate) name: String,
+    pub(crate) bitmap: Option<Arc<IconBitmap>>,
     /// true = visible in the bar (toggle on).
-    visible: bool,
+    pub(crate) visible: bool,
     /// true = visible and really in the bar (false if it did not fit the bar width).
-    in_bar: bool,
+    pub(crate) in_bar: bool,
 }
 
 pub(crate) struct TrayPopup {
     cells: Vec<Cell>,
-    rows: Vec<Row>,
+    rows: Vec<TrayRow>,
     /// First row shown of "Customize" (scrolling).
     scroll: usize,
     customize: bool,
-    /// true if opened directly in CUSTOMIZE mode: "Done" closes the popup instead of showing the grid.
-    direct: bool,
     hits: HitMap,
     /// Click to forward after closing.
     pending: Option<(u64, TrayClick)>,
@@ -62,6 +60,10 @@ pub(crate) struct TrayPopup {
     sep_y: i32,
     width: i32,
     empty_rc: Option<RECT>,
+    /// Largest height (physical px) the popup may take, set by `limit`.
+    max_h: i32,
+    /// Chooser rows shown at once (`chooser_rows`, set by `size`).
+    visible: usize,
 }
 
 /// Icons outside the bar: those that the last layout put behind the chevron (`Layout::tray_hidden`)
@@ -76,11 +78,11 @@ fn overflow_cells() -> Vec<Cell> {
 }
 
 /// Rows of the "Customize" list: all tray apps, sorted by name.
-fn customize_rows() -> Vec<Row> {
+pub(crate) fn customize_rows() -> Vec<TrayRow> {
     let behind = crate::ui::tray_hidden_ids();
-    let mut rows: Vec<Row> = tray_host::snapshot_all()
+    let mut rows: Vec<TrayRow> = tray_host::snapshot_all()
         .into_iter()
-        .map(|v: TrayView| Row {
+        .map(|v: TrayView| TrayRow {
             key: v.key,
             name: v.name,
             bitmap: v.bitmap,
@@ -92,6 +94,11 @@ fn customize_rows() -> Vec<Row> {
     rows
 }
 
+/// Chooser rows that fit under `max_h` next to the `fixed_h` of everything else (1..=`MAX_ROWS`).
+fn chooser_rows(max_h: i32, fixed_h: i32, row_h: i32) -> usize {
+    ((max_h - fixed_h) / row_h.max(1)).clamp(1, MAX_ROWS as i32) as usize
+}
+
 /// Creates the content (initial state).
 pub(crate) fn new() -> Box<dyn Content> {
     Box::new(TrayPopup {
@@ -99,36 +106,24 @@ pub(crate) fn new() -> Box<dyn Content> {
         rows: Vec::new(),
         scroll: 0,
         customize: false,
-        direct: false,
         hits: HitMap::default(),
         pending: None,
         icon: 16,
         sep_y: 0,
         width: 0,
         empty_rc: None,
-    })
-}
-
-/// Creates the content directly in the "choose visible icons" mode (no overflow grid).
-pub(crate) fn new_chooser() -> Box<dyn Content> {
-    Box::new(TrayPopup {
-        cells: Vec::new(),
-        rows: customize_rows(),
-        scroll: 0,
-        customize: true,
-        direct: true,
-        hits: HitMap::default(),
-        pending: None,
-        icon: 16,
-        sep_y: 0,
-        width: 0,
-        empty_rc: None,
+        max_h: i32::MAX,
+        visible: MAX_ROWS,
     })
 }
 
 impl Content for TrayPopup {
     fn kind(&self) -> PopupKind {
         PopupKind::TrayOverflow
+    }
+
+    fn limit(&mut self, max: (i32, i32)) {
+        self.max_h = max.1;
     }
 
     fn size(&mut self, s: &Surface) -> (i32, i32) {
@@ -141,8 +136,9 @@ impl Content for TrayPopup {
             let (w, row) = (m.px(264), m.px(34));
             self.width = w;
             let mut y = pad;
-            self.scroll = self.scroll.min(self.rows.len().saturating_sub(MAX_ROWS));
-            let end = self.rows.len().min(self.scroll + MAX_ROWS);
+            self.visible = chooser_rows(self.max_h, 2 * pad + 2 * m.px(4) + m.px(1) + m.px(32), row);
+            self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.visible));
+            let end = self.rows.len().min(self.scroll + self.visible);
             for i in self.scroll..end {
                 self.hits.add(ROW_BASE + i as u32, rect_wh(pad, y, w - 2 * pad, row));
                 y += row;
@@ -232,7 +228,6 @@ impl Content for TrayPopup {
 
     fn click(&mut self, id: u32) -> Reply {
         match id {
-            ID_DONE if self.direct => Reply::Close,
             ID_DONE => {
                 self.customize = false;
                 self.cells = overflow_cells();
@@ -274,7 +269,7 @@ impl Content for TrayPopup {
     }
 
     fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
-        let max = self.rows.len().saturating_sub(MAX_ROWS);
+        let max = self.rows.len().saturating_sub(self.visible);
         if !self.customize || max == 0 {
             return Reply::None;
         }
@@ -327,16 +322,30 @@ pub(crate) fn preview_new(
         cells: cells.into_iter().map(|(id, bitmap)| Cell { id, bitmap }).collect(),
         rows: rows
             .into_iter()
-            .map(|(key, name, bitmap, visible)| Row { key, name, bitmap, visible, in_bar: true })
+            .map(|(key, name, bitmap, visible)| TrayRow { key, name, bitmap, visible, in_bar: true })
             .collect(),
         scroll: 0,
         customize,
-        direct: false,
         hits: HitMap::default(),
         pending: None,
         icon: 16,
         sep_y: 0,
         width: 0,
         empty_rc: None,
+        max_h: i32::MAX,
+        visible: MAX_ROWS,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_chooser_rows_follow_the_cap() {
+        // 200 %: row 68, fixed part 16 + 18 + 64 + 16 = 114, 1080p work area minus margins 1008.
+        assert_eq!(chooser_rows(1008, 114, 68), 13);
+        assert_eq!(chooser_rows(i32::MAX, 114, 68), MAX_ROWS, "uncapped: today's 14 rows");
+        assert_eq!(chooser_rows(100, 114, 68), 1, "never zero");
+    }
 }

@@ -22,10 +22,12 @@
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
 //!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
-//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
+//!    (Task Manager), battery (popup `popup_battery`; without popups `ms-settings:batterysaver`), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
 //!    `popup_startmenu`, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
+//!  * Battery (`TIMER_BATTERY`, `battery_refresh`, `battery_sync`): `GetSystemPowerStatus` every 30 s only while the
+//!    bar is visible and a battery is present, plus `WM_POWERBROADCAST`; a hidden bar takes no sample.
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
 //!    (`config::pin/unpin`), New window, Close all windows (`apps::close_group`).
 //!    While the popup is open, auto-hide is suspended (`popup::is_open`).
@@ -70,10 +72,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
     SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HTCLIENT,
-    HWND_TOPMOST, IDC_HAND,
-    MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WS_CAPTION,
+    HWND_TOPMOST, IDC_HAND, PBT_APMPOWERSTATUSCHANGE,
+    MA_NOACTIVATE, SC_CLOSE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -82,8 +84,8 @@ use crate::config::{self, PinnedApp};
 use crate::icons::IconBitmap;
 use crate::log;
 use crate::msg::{
-    ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK,
-    TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD,
+    ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_BATTERY,
+    TIMER_CLOCK, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD,
     WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
 };
 use crate::popup::{self, Anchor, AppMenuInfo, PopupKind};
@@ -171,8 +173,9 @@ static EDGE_SINCE: AtomicU64 = AtomicU64::new(0);
 static EDGE_ARMED: AtomicBool = AtomicBool::new(true);
 /// true if the dock was shown over a fullscreen / borderless app.
 static FS_SHOWN: AtomicBool = AtomicBool::new(false);
-/// HWND (as isize) of the fullscreen app under the dock, to give it the foreground back.
-static FS_PREV: AtomicIsize = AtomicIsize::new(0);
+/// HWND (as isize, 0 = none) that had the foreground before the dock took it (Win key, fullscreen
+/// app), to give it the foreground back when the dock hides. With `FS_SHOWN` it is the fullscreen app.
+static PREV_FG: AtomicIsize = AtomicIsize::new(0);
 /// Tick (ms) of the last `force_foreground` call (0 = never).
 static FG_TAKEN_AT: AtomicU64 = AtomicU64::new(0);
 /// Foreground re-takes after a fullscreen bounce since the dock was shown.
@@ -321,6 +324,8 @@ struct UiState {
     monitor_dpi: u32,
     entries: Vec<Entry>,
     layout: Layout,
+    /// Last battery sample (`battery::BatteryStatus::NONE` until the module is sampled).
+    battery: crate::battery::BatteryStatus,
     volume: VolumeState,
     hover: Option<ItemId>,
     pressed: Option<ItemId>,
@@ -468,7 +473,19 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
     }
     match msg {
         WM_TIMER => on_timer(h, wp.0),
+        WM_POWERBROADCAST => {
+            if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize {
+                battery_tick();
+            }
+            // TRUE grants the event.
+            Some(LRESULT(1))
+        }
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        // The bar can hold the foreground (Win key): Alt+F4 must not reach WM_CLOSE, which exits the dock.
+        WM_SYSCOMMAND if wp.0 & 0xFFF0 == SC_CLOSE as usize => {
+            log!("Alt+F4 / SC_CLOSE on the bar ignored");
+            Some(LRESULT(0))
+        }
         WM_DOCK_APP_MENU_CMD => {
             on_app_menu_cmd(wp.0 as u32);
             Some(LRESULT(0))
@@ -576,6 +593,7 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
         TIMER_ATTN => on_attn_tick(h),
         TIMER_VIS => on_vis_tick(h),
         TIMER_SYSMON => sysmon_tick(),
+        TIMER_BATTERY => battery_tick(),
         TIMER_HOVER_PICKER => on_hover_picker_timer(h),
         TIMER_CLOCK => {
             if VISIBLE.load(Relaxed) && config::get().show_clock {
@@ -599,7 +617,7 @@ pub fn toggle() {
     if VISIBLE.load(Relaxed) && !moved {
         hide_dock("Win alone (toggle)");
     } else {
-        show_dock(if moved { "Win alone (pointer display)" } else { "Win alone (toggle)" }, SHOW_MS);
+        show_dock_win(if moved { "Win alone (pointer display)" } else { "Win alone (toggle)" });
     }
 }
 
@@ -631,7 +649,7 @@ pub fn win_double_tap() {
 fn start_with_bar() {
     if popup::current() == Some(PopupKind::StartMenu) {
         if !VISIBLE.load(Relaxed) && popup::is_linked() {
-            show_dock("Win (Start + bar, reversed)", SHOW_MS);
+            show_dock_win("Win (Start + bar, reversed)");
         } else if VISIBLE.load(Relaxed) && config::effective_autohide() {
             popup::link_to_bar();
             hide_dock("Win (Start + bar)");
@@ -645,11 +663,12 @@ fn start_with_bar() {
 
 /// Toggles the dock's Start menu on the bar, which in "pointer" mode is first brought to the display
 /// under the pointer. A hidden bar is shown and an opening menu is linked to its slide+fade.
+/// Only the Win key calls it: a hidden bar is shown with the foreground (`show_dock_win`).
 fn toggle_start_menu(reason: &str) {
     follow_pointer();
     let was_visible = VISIBLE.load(Relaxed);
     if !was_visible {
-        show_dock(reason, SHOW_MS);
+        show_dock_win(reason);
     }
     match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
         Some(a) => popup::toggle(PopupKind::StartMenu, a),
@@ -752,6 +771,12 @@ pub fn on_config_changed() {
     redraw();
     // Modules switched on/off: start/stop their polling and free their state.
     sysmon_sync();
+    battery_refresh(VISIBLE.load(Relaxed));
+    battery_sync();
+    let battery_present = UI.with(|u| u.borrow().battery.present);
+    if battery_popup_should_close(&render::visible_modules(&config::get(), battery_present), popup::current()) {
+        popup::close("battery module off");
+    }
     if VISIBLE.load(Relaxed) {
         // `show_seconds` / `show_clock` may have changed: re-align the clock timer.
         arm_clock(hwnd());
@@ -769,6 +794,8 @@ pub fn on_config_changed() {
     if let Some(a) = popup::current().and_then(item_for_popup).and_then(anchor_for) {
         popup::reanchor(a);
     }
+    // Last: the Settings window shows the values the bar now uses.
+    crate::settings_window::on_config_changed();
 }
 
 /// Starts or stops the notification thread and the audio controller to match `show_notifications` /
@@ -794,23 +821,54 @@ fn modules_sync() {
 /// Starts the tray host when `show_tray` is switched on (native taskbar hidden), stops it when switched
 /// off; in both cases `TaskbarCreated` is announced so apps re-register their icons with whoever now owns
 /// the tray (our host, or Explorer). Blocks the UI thread for at most ~2 s, only on a real switch.
-fn tray_sync() {
-    let on = config::get().show_tray;
-    let started = tray_host::is_started();
-    if on && !started && crate::taskbar::is_hidden() {
-        // The wait below must not run under the popup's low-level mouse hook (it would stall the mouse).
-        let hook = popup::suspend_mouse_hook();
-        match tray_host::start(hwnd()) {
-            Ok(()) => crate::taskbar::announce_tray(),
-            Err(e) => log!("tray host not started: {e}"),
+/// Never starts during the Explorer-restart pause (`taskbar::host_paused`): the resume path calls it.
+pub(crate) fn tray_sync() {
+    let action = tray_sync_action(
+        config::get().show_tray,
+        tray_host::is_started(),
+        crate::taskbar::is_hidden(),
+        crate::taskbar::host_paused(),
+        crate::taskbar::exiting(),
+    );
+    match action {
+        TraySync::Start => {
+            // The wait below must not run under the popup's low-level mouse hook (it would stall the mouse).
+            let hook = popup::suspend_mouse_hook();
+            match tray_host::start(hwnd()) {
+                Ok(()) => crate::taskbar::announce_tray(),
+                Err(e) => log!("tray host not started: {e}"),
+            }
+            popup::resume_mouse_hook(hook);
         }
-        popup::resume_mouse_hook(hook);
-    } else if !on && started {
-        let hook = popup::suspend_mouse_hook();
-        tray_host::stop();
-        crate::taskbar::announce_tray();
-        popup::resume_mouse_hook(hook);
-        log!("tray: host stopped (show_tray off)");
+        TraySync::Stop => {
+            let hook = popup::suspend_mouse_hook();
+            tray_host::stop();
+            crate::taskbar::announce_tray();
+            popup::resume_mouse_hook(hook);
+            log!("tray: host stopped (show_tray off)");
+        }
+        TraySync::Nothing => {}
+    }
+}
+
+/// What `tray_sync` must do with the tray host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraySync {
+    Start,
+    Stop,
+    Nothing,
+}
+
+/// Start only when wanted, not running, native taskbar hidden by us, Explorer not restarting
+/// (a host started then would own `Shell_TrayWnd` and Explorer would never register its desktop)
+/// and the dock not exiting (`taskbar::exiting`). Stopping is always allowed.
+fn tray_sync_action(show_tray: bool, started: bool, hidden: bool, paused: bool, exiting: bool) -> TraySync {
+    if show_tray && !started && hidden && !paused && !exiting {
+        TraySync::Start
+    } else if !show_tray && started {
+        TraySync::Stop
+    } else {
+        TraySync::Nothing
     }
 }
 
@@ -869,9 +927,10 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Notifications => Some(ItemId::Notifications),
         PopupKind::Audio => Some(ItemId::Volume),
         PopupKind::Calendar => Some(ItemId::Clock),
-        PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
+        PopupKind::Power => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
         PopupKind::Network => Some(ItemId::Network),
+        PopupKind::Battery => Some(ItemId::Battery),
         PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
         PopupKind::AppMenu => None,
     }
@@ -982,7 +1041,8 @@ pub fn redraw() {
     let wa = mi.rcWork;
     let max_width = (wa.right - wa.left - 2 * m.px(render::EDGE_MARGIN)).max(0);
     let date = if cfg.show_date && !clock.date.is_empty() { Some(clock.date.as_str()) } else { None };
-    let modules = render::visible_modules(&cfg);
+    let battery = UI.with(|u| u.borrow().battery);
+    let modules = render::visible_modules(&cfg, battery.present);
 
     let now = now_ms();
     let attn: Vec<isize> = ATTN.with(|a| a.borrow().clone());
@@ -1034,6 +1094,11 @@ pub fn redraw() {
                 bell_dnd: st.notif_dnd == Some(true),
                 net: st.net,
                 usage: st.usage,
+                battery: render::BatteryView {
+                    status: battery,
+                    percent: cfg.battery_percent,
+                    inside: cfg.battery_percent_inside,
+                },
             },
             plate: None,
             modules: &modules,
@@ -1182,6 +1247,9 @@ fn on_vis_tick(h: HWND) {
             if popup::is_linked() {
                 popup::close("bar hidden (with Start)");
             }
+            // Deferred by `hide` while the linked popup held the foreground; before the bar hides, which
+            // could hand the foreground to a third window.
+            restore_prev_foreground();
             hide_window(h);
             return;
         }
@@ -1922,6 +1990,7 @@ fn on_rbutton_up(lp: LPARAM) {
         }
         Some(ItemId::Volume) => launch_target_str("ms-settings:apps-volume"),
         Some(ItemId::Network) => launch_target_str("ms-settings:network"),
+        Some(ItemId::Battery) => launch_target_str("ms-settings:batterysaver"),
         Some(ItemId::Start) => toggle_popup(PopupKind::Start, ItemId::Start),
         Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Right),
         Some(ItemId::Notifications)
@@ -2016,6 +2085,7 @@ fn zone_of(id: ItemId) -> Option<Zone> {
         | ItemId::ShowDesktop
         | ItemId::Power
         | ItemId::Network
+        | ItemId::Battery
         | ItemId::Metrics => Some(Zone::Modules),
     }
 }
@@ -2410,7 +2480,11 @@ fn click_left(id: ItemId) {
                     Some(t) => shell_thread::request(ShellRequest::Launch { target: t, args: None }),
                     None => log!("click: no launch target for '{}'", e.key),
                 },
-                ClickOutcome::Activated(_) | ClickOutcome::Minimized(_) => {}
+                // A minimized window must not get the foreground back when the bar hides.
+                ClickOutcome::Minimized(h) => {
+                    let _ = PREV_FG.compare_exchange(h, 0, Relaxed, Relaxed);
+                }
+                ClickOutcome::Activated(_) => {}
             }
         }
         // Without a popup (class not registered) fall back to the direct actions.
@@ -2467,6 +2541,14 @@ fn click_left(id: ItemId) {
         ItemId::Metrics => {
             popup::close("task manager");
             launch_target_str("taskmgr.exe");
+        }
+        ItemId::Battery => {
+            if popup::is_available() {
+                toggle_popup(PopupKind::Battery, id);
+            } else {
+                popup::close("battery settings");
+                launch_target_str("ms-settings:batterysaver");
+            }
         }
     }
 }
@@ -2614,7 +2696,7 @@ pub struct Screen {
     pub primary: bool,
 }
 
-/// Displays offered by the Settings popup (more are ignored: the segments would not fit).
+/// Displays offered by the Settings window (more are ignored: the segments would not fit).
 const MAX_SCREENS: usize = 6;
 const SCREEN_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
@@ -2665,7 +2747,8 @@ pub fn screens() -> Vec<Screen> {
 }
 
 /// The display the bar belongs on: `config.monitor` if it is connected, otherwise the primary one.
-fn dock_hmonitor() -> HMONITOR {
+/// `pub(crate)`: the Settings window opens centred on it.
+pub(crate) fn dock_hmonitor() -> HMONITOR {
     let want = config::get().monitor.clone();
     if want.eq_ignore_ascii_case(config::MONITOR_POINTER) {
         return followed_hmonitor();
@@ -2806,6 +2889,35 @@ fn hide_window(h: HWND) {
 /// the foreground (or with `--foreground`) it also tries to bring itself to the foreground
 /// (`force_foreground`) and remembers the app to give the foreground back when it hides.
 pub fn show_dock(reason: &str, hide_after_ms: u64) {
+    show_dock_as(reason, hide_after_ms, false);
+}
+
+/// `show_dock` for the Win key: like the Windows taskbar and Start it always takes the foreground
+/// (`show_takes_foreground`), over any window, fullscreen or not.
+fn show_dock_win(reason: &str) {
+    show_dock_as(reason, SHOW_MS, true);
+}
+
+/// true if a show takes the foreground: by the Win key or over a recognised fullscreen app, unless
+/// `--no-foreground`; always with `--foreground`. The screen edge and other shows do not.
+fn show_takes_foreground(by_win: bool, fullscreen: bool, foreground_flag: bool, no_foreground: bool) -> bool {
+    foreground_flag || ((by_win || fullscreen) && !no_foreground)
+}
+
+/// Window (as isize, 0 = none) to remember on a fresh show: the fullscreen app, else the previous
+/// foreground window (not ours) if the show takes the foreground, else the one still remembered
+/// (a linked Start hide reversed before its deferred restore).
+fn prev_to_remember(fullscreen: isize, other_fg: isize, takes: bool, kept: isize) -> isize {
+    if fullscreen != 0 {
+        fullscreen
+    } else if takes && other_fg != 0 {
+        other_fg
+    } else {
+        kept
+    }
+}
+
+fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
     if GEOM.with(|g| g.get()).is_none() {
         return;
     }
@@ -2813,6 +2925,10 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     if !was_visible {
         // Before the redraw, so the first present is already at alpha 0 / slid out.
         start_vis_anim(1.0, SHOW_ANIM_MS);
+    }
+    if !was_visible {
+        // One sample just before the first frame, so the battery module is already in it.
+        battery_refresh(true);
     }
     // List from the cache: no EnumWindows in the hook path.
     redraw();
@@ -2823,6 +2939,7 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     EDGE_ARMED.store(false, Relaxed);
     // The foreground must be read BEFORE showing/activating the dock (afterwards it would be the dock itself).
     let fs = if was_visible { None } else { fullscreen_window(&g.mon) };
+    let other_fg = if was_visible { HWND::default() } else { foreign_foreground() };
     let (dy, _) = vis_offset(config_top());
     show_topmost(hwnd(), &Geom { y: g.y + dy, ..g });
     HIDE_AT.store(now_ms() + hide_after_ms, Relaxed);
@@ -2831,29 +2948,47 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
         // The clock and sysmon timers are off while hidden: redraw happened above, re-arm them now.
         arm_clock(hwnd());
         sysmon_sync();
+        battery_sync();
     }
     if hide_after_ms >= u64::MAX / 4 {
         log!("SHOW ({reason}), autohide off");
     } else {
         log!("SHOW ({reason}), hiding in {hide_after_ms} ms");
     }
+    let args = crate::args();
+    let fullscreen = FS_SHOWN.load(Relaxed) || fs.is_some();
+    let takes = show_takes_foreground(by_win, fullscreen, args.foreground, args.no_foreground);
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
-        FS_PREV.store(fs.map(|h| h.0 as isize).unwrap_or(0), Relaxed);
+        let fs_raw = fs.map(|h| h.0 as isize).unwrap_or(0);
+        PREV_FG.store(prev_to_remember(fs_raw, other_fg.0 as isize, takes, PREV_FG.load(Relaxed)), Relaxed);
         FS_RETAKES.store(0, Relaxed);
         CLICK_DOWN.store(mouse_buttons_down(), Relaxed);
         if let Some(h) = fs {
             log!("  fullscreen foreground window: \"{}\"", window_title(h));
+        } else if takes && !other_fg.0.is_null() {
+            log!("  previous foreground window: \"{}\"", window_title(other_fg));
         }
     }
-    let args = crate::args();
-    if args.foreground || (FS_SHOWN.load(Relaxed) && !args.no_foreground) {
-        force_foreground(hwnd());
+    if takes {
+        // An open popup (linked Start menu, Win+N) keeps the focus: it closes when it loses it.
+        force_foreground(popup::current_hwnd().unwrap_or_else(hwnd));
     }
 }
 
-/// Hides the dock. If it was over a fullscreen app and the foreground is still ours (timeout,
-/// Win key), it gives the foreground back to that app.
+/// Foreground window if it is not ours (null otherwise).
+fn foreign_foreground() -> HWND {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() || is_own_window(fg) {
+        HWND::default()
+    } else {
+        fg
+    }
+}
+
+/// Hides the dock. If the dock took the foreground (Win key, fullscreen app) and it is still ours
+/// or nobody's (timeout, Win key), it gives it back to the window that had it before.
 pub fn hide_dock(reason: &str) {
     hide(reason, false);
 }
@@ -2863,9 +2998,11 @@ fn hide(reason: &str, now: bool) {
     // Hiding over a fullscreen app is instant; otherwise slide+fade out.
     let fs = FS_SHOWN.swap(false, Relaxed);
     let instant = now || fs;
-    let prev = if fs { FS_PREV.swap(0, Relaxed) } else { 0 };
-    // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`.
-    if instant || !crate::popup::is_linked() {
+    // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`,
+    // which then gives the foreground back: taken now, the popup would close on the focus loss.
+    let linked = !instant && crate::popup::is_linked();
+    let prev = if linked { 0 } else { PREV_FG.swap(0, Relaxed) };
+    if !linked {
         crate::popup::close("dock hidden");
     }
     picker_cancel("dock hidden");
@@ -2877,6 +3014,7 @@ fn hide(reason: &str, now: bool) {
     reset_hover();
     kill_timer(hwnd(), TIMER_CLOCK);
     sysmon_sync();
+    battery_sync();
     let was_animating = UI.with(|u| std::mem::replace(&mut u.borrow_mut().wanim.running, false));
     kill_timer(hwnd(), TIMER_WIDTH);
     if was_animating {
@@ -2900,6 +3038,68 @@ fn arm_clock(h: HWND) {
     } else {
         kill_timer(h, TIMER_CLOCK);
     }
+}
+
+// ------------------------------------------------------- battery
+
+/// `TIMER_BATTERY` period.
+const BATTERY_POLL_MS: u32 = 30_000;
+
+/// The battery status to store: `Off` clears it (sample not taken); a hidden bar takes no sample and
+/// keeps the last value; otherwise a fresh sample (`None` = unreadable or unknown right now: the last
+/// value is kept, so a brief "unknown" from the firmware neither drops the module nor stops the polling).
+fn next_battery(
+    show: config::BatteryShow,
+    visible: bool,
+    current: crate::battery::BatteryStatus,
+    sample: impl FnOnce() -> Option<crate::battery::BatteryStatus>,
+) -> crate::battery::BatteryStatus {
+    use crate::battery::BatteryStatus;
+    if show == config::BatteryShow::Off {
+        BatteryStatus::NONE
+    } else if !visible {
+        current
+    } else {
+        sample().unwrap_or(current)
+    }
+}
+
+/// The only caller of `battery::query`. `visible` is a parameter because `show_dock` samples before
+/// it sets `VISIBLE`. Redraws the bar when the stored value changed.
+fn battery_refresh(visible: bool) {
+    let show = config::get().show_battery;
+    let changed = UI.with(|u| {
+        let st = &mut *u.borrow_mut();
+        let next = next_battery(show, visible, st.battery, crate::battery::query);
+        std::mem::replace(&mut st.battery, next) != next
+    });
+    if changed {
+        popup::on_battery(UI.with(|u| u.borrow().battery));
+        redraw_if_visible();
+    }
+}
+
+/// Arms `TIMER_BATTERY` while the bar is visible, a battery is present and the module is not off;
+/// kills it otherwise. Takes no sample.
+fn battery_sync() {
+    let present = UI.with(|u| u.borrow().battery.present);
+    if crate::battery::polling_wanted(config::get().show_battery, present, VISIBLE.load(Relaxed)) {
+        set_timer(hwnd(), TIMER_BATTERY, BATTERY_POLL_MS);
+    } else {
+        kill_timer(hwnd(), TIMER_BATTERY);
+    }
+}
+
+/// True when the open popup is the battery one and the module is no longer in the bar.
+fn battery_popup_should_close(visible: &[ItemId], current: Option<PopupKind>) -> bool {
+    current == Some(PopupKind::Battery) && !visible.contains(&ItemId::Battery)
+}
+
+/// Timer tick and power broadcast: sample (if visible), then re-evaluate the timer (a battery can
+/// appear or vanish between two samples).
+fn battery_tick() {
+    battery_refresh(VISIBLE.load(Relaxed));
+    battery_sync();
 }
 
 // ------------------------------------------------------- system monitor (network, metrics)
@@ -2987,6 +3187,36 @@ fn sysmon_tick() {
     }
 }
 
+/// `restore_foreground` for the remembered window (`PREV_FG`), which is then forgotten.
+fn restore_prev_foreground() {
+    let prev = PREV_FG.swap(0, Relaxed);
+    if prev != 0 {
+        restore_foreground(HWND(prev as *mut std::ffi::c_void));
+    }
+}
+
+/// Foreground window as the app buttons see it: while the bar (or a popup) holds the foreground it
+/// took by the Win key, the window that had it before (`PREV_FG`), so a click on that app still
+/// minimizes or cycles it. UI thread.
+pub fn effective_foreground() -> HWND {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    let prev = PREV_FG.load(Relaxed);
+    // SAFETY: IsWindow accepts any handle value.
+    let prev_alive = prev != 0 && unsafe { IsWindow(Some(HWND(prev as *mut std::ffi::c_void))) }.as_bool();
+    let own = !fg.0.is_null() && is_own_window(fg);
+    HWND(effective_fg(fg.0 as isize, own, prev, prev_alive) as *mut std::ffi::c_void)
+}
+
+/// `effective_foreground` decision: `prev` if the foreground `fg` is ours and `prev` is alive, else `fg`.
+fn effective_fg(fg: isize, fg_own: bool, prev: isize, prev_alive: bool) -> isize {
+    if fg_own && prev != 0 && prev_alive {
+        prev
+    } else {
+        fg
+    }
+}
+
 /// Gives the foreground back to `prev` only if it now belongs to nobody else (null or ours).
 fn restore_foreground(prev: HWND) {
     // SAFETY: no preconditions.
@@ -3000,16 +3230,26 @@ fn restore_foreground(prev: HWND) {
     }
     // SAFETY: SetForegroundWindow is allowed for us: until now we are the foreground.
     let ok = unsafe { SetForegroundWindow(prev) };
-    log!("  foreground returned to the fullscreen app -> {}", ok.as_bool());
+    log!("  foreground returned to the previous window -> {}", ok.as_bool());
 }
 
-/// true if `h` belongs to our process (dock, popups).
+/// true if `h` is one of the dock's own surfaces (bar, popups, picker, tray host). The Settings
+/// window lives in this process too but counts as a normal app window: the bar remembers it as the
+/// previous foreground (`PREV_FG`) and gives the focus back to it, never takes the focus from it on
+/// hide, a popup is not pushed in front of it, and over a fullscreen app activating it is like
+/// going to any other window.
 pub fn is_own_window(h: HWND) -> bool {
     let mut pid = 0u32;
     // SAFETY: `pid` is writable; `h` can be any HWND (fails with pid 0).
     unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
     // SAFETY: no preconditions.
-    pid != 0 && pid == unsafe { GetCurrentProcessId() }
+    let in_process = pid != 0 && pid == unsafe { GetCurrentProcessId() };
+    dock_surface(in_process, in_process && crate::settings_window::is_window(h))
+}
+
+/// `is_own_window` decision: a window of this process that is not the Settings window.
+fn dock_surface(in_process: bool, settings: bool) -> bool {
+    in_process && !settings
 }
 
 /// true if the left or right mouse button is pressed right now.
@@ -3089,6 +3329,19 @@ fn fullscreen_window(mon: &RECT) -> Option<HWND> {
     full.then_some(fg)
 }
 
+/// A fullscreen or borderless app has the foreground on its monitor (the auto-installer must not
+/// interrupt it).
+pub fn foreground_is_fullscreen() -> bool {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return false;
+    }
+    // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
+    let hm = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
+    monitor_info(hm).is_some_and(|mi| fullscreen_window(&mi.rcMonitor).is_some())
+}
+
 /// `EVENT_SYSTEM_FOREGROUND` (forwarded by `WM_DOCK_APPS_DIRTY`): if the dock is over a fullscreen
 /// app and the foreground moves to another window that is not ours (the user went back to the game),
 /// the dock hides immediately. A fullscreen app taking the foreground while the dock is
@@ -3108,7 +3361,7 @@ fn on_foreground_changed(fg: HWND) {
     if FS_SHOWN.load(Relaxed) {
         // Closing one of our popups gives the foreground back to the game: it is not a user click.
         // A real click on the game is detected by `on_poll` anyway.
-        if fg.0 as isize == FS_PREV.load(Relaxed) && popup::closed_within(POPUP_CLOSE_GRACE_MS) {
+        if fg.0 as isize == PREV_FG.load(Relaxed) && popup::closed_within(POPUP_CLOSE_GRACE_MS) {
             log!("foreground returned to the game by closing a popup: the dock stays");
             return;
         }
@@ -3130,7 +3383,7 @@ fn on_foreground_changed(fg: HWND) {
 /// `pub` because `popup` must not close on that bounce either.
 pub fn fs_bounce_grace(fg: HWND) -> bool {
     FS_SHOWN.load(Relaxed)
-        && fg.0 as isize == FS_PREV.load(Relaxed)
+        && fg.0 as isize == PREV_FG.load(Relaxed)
         && within_grace(now_ms(), FG_TAKEN_AT.load(Relaxed), FS_BOUNCE_GRACE_MS)
 }
 
@@ -3234,7 +3487,7 @@ fn point_in(r: &RECT, p: POINT) -> bool {
 /// With `!config::effective_autohide()` the bar never hides by itself; nor does it
 /// while the context menu (popup) is open.
 fn on_poll() {
-    // Esc cancels a drag (the bar never has the keyboard focus, so the key state is polled).
+    // Esc cancels a drag (the bar has the keyboard focus only after the Win key, so the key state is polled).
     // SAFETY: GetAsyncKeyState has no preconditions; the high bit means "pressed".
     if drag_active() && unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000 != 0 {
         end_drag(true);
@@ -3319,6 +3572,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tray_sync_waits_for_explorer() {
+        use TraySync::*;
+        //                          show   started hidden paused exiting
+        assert_eq!(tray_sync_action(true,  false,  true,  false, false), Start);
+        assert_eq!(tray_sync_action(true,  false,  true,  true,  false), Nothing,
+            "Explorer restarting: no Shell_TrayWnd of ours");
+        assert_eq!(tray_sync_action(true,  false,  false, false, false), Nothing, "native taskbar not hidden by us");
+        assert_eq!(tray_sync_action(false, true,   true,  false, false), Stop);
+        assert_eq!(tray_sync_action(false, true,   true,  true,  false), Stop, "switching off is always allowed");
+        assert_eq!(tray_sync_action(false, false,  true,  false, false), Nothing);
+        assert_eq!(tray_sync_action(true,  true,   true,  false, false), Nothing);
+        assert_eq!(tray_sync_action(true,  false,  true,  false, true),  Nothing, "never started while exiting");
+        assert_eq!(tray_sync_action(false, true,   true,  false, true),  Stop, "stopping while exiting is allowed");
+    }
+
+    #[test]
+    fn win_show_takes_the_foreground() {
+        assert!(show_takes_foreground(true, false, false, false), "Win over a normal window or a missed game");
+        assert!(show_takes_foreground(true, true, false, false), "Win over a recognised fullscreen app");
+        assert!(show_takes_foreground(false, true, false, false), "fullscreen show: as before");
+        assert!(!show_takes_foreground(false, false, false, false), "screen edge / startup: no focus");
+        assert!(!show_takes_foreground(true, false, false, true), "--no-foreground wins over Win");
+        assert!(!show_takes_foreground(true, true, false, true), "--no-foreground wins over fullscreen");
+        assert!(show_takes_foreground(false, false, true, false), "--foreground always");
+        assert!(show_takes_foreground(false, false, true, true), "--foreground wins over --no-foreground");
+    }
+
+    #[test]
+    fn remembered_window_on_show() {
+        assert_eq!(prev_to_remember(7, 9, true, 0), 7, "the fullscreen app first");
+        assert_eq!(prev_to_remember(7, 9, false, 0), 7, "fullscreen app kept even with --no-foreground");
+        assert_eq!(prev_to_remember(0, 9, true, 0), 9, "Win over a normal window");
+        assert_eq!(prev_to_remember(0, 9, false, 0), 0, "edge show: nothing to give back");
+        assert_eq!(prev_to_remember(0, 0, true, 5), 5, "foreground ours (linked Start reversed): kept");
+        assert_eq!(prev_to_remember(0, 0, false, 0), 0);
+    }
+
+    #[test]
+    fn effective_foreground_choice() {
+        assert_eq!(effective_fg(3, true, 9, true), 9, "bar focused by Win: the previous window");
+        assert_eq!(effective_fg(3, false, 9, true), 3, "foreign foreground: itself");
+        assert_eq!(effective_fg(3, true, 9, false), 3, "previous window closed");
+        assert_eq!(effective_fg(3, true, 0, false), 3, "nothing remembered");
+        assert_eq!(effective_fg(0, false, 9, true), 0, "null foreground: not ours");
+    }
+
+    #[test]
+    fn settings_window_is_not_a_dock_surface() {
+        assert!(dock_surface(true, false), "bar, popups, picker, tray host");
+        assert!(!dock_surface(true, true), "the Settings window is treated like an app window");
+        assert!(!dock_surface(false, false), "another process");
+    }
+
+    #[test]
     fn slot_items_follow_the_drop_slot() {
         let order = |from, slot| (0..4).map(|p| slot_item(p, from, slot)).collect::<Vec<_>>();
         assert_eq!(order(1, 3), [0, 2, 3, 1]);
@@ -3328,11 +3635,36 @@ mod tests {
     }
 
     #[test]
+    fn battery_popup_closes_when_the_module_leaves_the_bar() {
+        use crate::popup::PopupKind::{Audio, Battery};
+        assert!(battery_popup_should_close(&[ItemId::Volume], Some(Battery))); // module switched off or battery gone
+        assert!(!battery_popup_should_close(&[ItemId::Volume, ItemId::Battery], Some(Battery)));
+        assert!(!battery_popup_should_close(&[ItemId::Volume], Some(Audio))); // another popup is not ours to close
+        assert!(!battery_popup_should_close(&[], None));
+    }
+
+    #[test]
+    fn next_battery_follows_show_and_visibility() {
+        use crate::battery::BatteryStatus;
+        use crate::config::BatteryShow::*;
+        let b = BatteryStatus::from_raw(0, 1, 64, 600);
+        let boom = || -> Option<BatteryStatus> { panic!("a sample was taken") };
+        assert_eq!(next_battery(Off, true, b, || Some(b)), BatteryStatus::NONE); // switched off: nothing stale is drawn
+        assert_eq!(next_battery(Off, false, b, boom), BatteryStatus::NONE); // ... and nothing is sampled
+        assert_eq!(next_battery(Auto, false, b, boom), b); // bar hidden: no sample, last value kept
+        assert_eq!(next_battery(Auto, true, BatteryStatus::NONE, || Some(b)), b);
+        assert_eq!(next_battery(On, true, b, || None), b); // failed or unknown sample: last value kept
+        assert!(next_battery(Auto, true, b, || None).present); // ... so the module and its timer stay
+        assert_eq!(next_battery(Auto, true, BatteryStatus::NONE, || None), BatteryStatus::NONE); // desktop stays empty
+        assert_eq!(next_battery(Auto, true, b, || Some(BatteryStatus::NONE)), BatteryStatus::NONE); // battery removed
+    }
+
+    #[test]
     fn hidden_modules_keep_their_slots() {
         let old: Vec<String> = ["notifications", "volume", "clock", "show_desktop", "power"].map(String::from).to_vec();
         // Old 5-module config: network / metrics come back next to their default neighbours.
         let full = render::modules_from_names(&old);
-        assert_eq!(full.len(), 7);
+        assert_eq!(full.len(), 8);
         assert_eq!(full[0], ItemId::Metrics);
         assert_eq!(full[2], ItemId::Network);
         // A "start" written by an earlier version is ignored: the Start button is not a module any more.
@@ -3342,7 +3674,7 @@ mod tests {
         let vis: Vec<String> =
             ["power", "notifications", "network", "volume", "clock", "show_desktop"].map(String::from).to_vec();
         let out = reorder_visible_modules(&old, &vis);
-        assert_eq!(out, ["metrics", "power", "notifications", "network", "volume", "clock", "show_desktop"]);
+        assert_eq!(out, ["metrics", "power", "notifications", "network", "battery", "volume", "clock", "show_desktop"]);
     }
 
     #[test]

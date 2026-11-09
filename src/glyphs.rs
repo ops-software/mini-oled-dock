@@ -323,6 +323,72 @@ pub fn net_badge_shape(u: f32, v: f32, online: bool) -> bool {
     }
 }
 
+/// Even-odd point-in-polygon test.
+fn in_polygon(u: f32, v: f32, pts: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = pts.len() - 1;
+    for i in 0..pts.len() {
+        let ((xi, yi), (xj, yj)) = (pts[i], pts[j]);
+        if (yi > v) != (yj > v) && u < (xj - xi) * (v - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Signed distance to a rounded rectangle (negative inside).
+fn rrect_sd(u: f32, v: f32, rect: (f32, f32, f32, f32), rad: f32) -> f32 {
+    let (l, t, r, b) = rect;
+    let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
+    let (hx, hy) = ((r - l) / 2.0 - rad, (b - t) / 2.0 - rad);
+    let (qx, qy) = ((u - cx).abs() - hx, (v - cy).abs() - hy);
+    (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - rad
+}
+
+/// Battery: rounded body outline (same stroke as the other icons) plus the filled nub on the right.
+/// The charge is a separate layer (`battery_fill_shape`).
+pub fn battery_outline_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let rect = (snap(1.5), snap(4.5), snap(13.0), snap(11.5));
+    let body = rrect_sd(u, v, rect, 2.0).abs() <= st;
+    let nub = u >= edge(13.5) && u <= edge(15.0) && v >= edge(6.5) && v <= edge(9.5);
+    body || nub
+}
+
+/// Charge inside the battery body, from the left up to `percent`; with `bolt` the bolt and a margin
+/// around it are cut out so the bolt can be drawn on top in another colour.
+pub fn battery_fill_shape(u: f32, v: f32, percent: u8, bolt: bool) -> bool {
+    let rect = (edge(3.0), edge(6.0), edge(11.5), edge(10.0));
+    let end = edge(3.0 + 8.5 * percent.min(100) as f32 / 100.0);
+    if u > end || rrect_sd(u, v, rect, 1.0) > 0.0 {
+        return false;
+    }
+    !(bolt && near_bolt(u, v, 0.9))
+}
+
+const BOLT: [(f32, f32); 6] = [(8.6, 5.2), (6.0, 8.2), (7.6, 8.2), (6.8, 10.8), (9.4, 7.6), (7.8, 7.6)];
+
+fn near_bolt(u: f32, v: f32, margin: f32) -> bool {
+    in_polygon(u, v, &BOLT)
+        || (0..BOLT.len()).any(|i| {
+            let (a, b) = (BOLT[i], BOLT[(i + 1) % BOLT.len()]);
+            dist_seg(u, v, a.0, a.1, b.0, b.1) <= margin
+        })
+}
+
+/// Lightning bolt (charging), drawn over the fill.
+pub fn bolt_shape(u: f32, v: f32) -> bool {
+    in_polygon(u, v, &BOLT)
+}
+
+/// Battery crossed out (no battery): the outline with a diagonal bar and an empty halo around it.
+pub fn battery_off_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let d = dist_seg(u, v, 2.0, 2.0, 14.0, 14.0);
+    (battery_outline_shape(u, v) && d > st + 1.0) || d <= st
+}
+
 /// Chevron pointing up (tray overflow with the bar at the bottom).
 pub fn chevron_up_shape(u: f32, v: f32) -> bool {
     let c = ax();
@@ -457,9 +523,227 @@ pub fn eye_shape(u: f32, v: f32, off: bool) -> bool {
     (shape && d > st + 1.0) || d <= st
 }
 
+// ---- Settings window icons
+
+/// Ring of radius `r` around `(cx, cy)`, one stroke thick.
+fn ring_at(u: f32, v: f32, cx: f32, cy: f32, r: f32) -> bool {
+    let (dx, dy) = (u - cx, v - cy);
+    ((dx * dx + dy * dy).sqrt() - r).abs() <= half()
+}
+
+/// Disc of radius `r` around `(cx, cy)`.
+fn disc_at(u: f32, v: f32, cx: f32, cy: f32, r: f32) -> bool {
+    let (dx, dy) = (u - cx, v - cy);
+    dx * dx + dy * dy <= r * r
+}
+
+/// Clockwise angle in degrees (0 = right, 90 = down) of `(dx, dy)`, in 0..360.
+fn angle_deg(dx: f32, dy: f32) -> f32 {
+    dy.atan2(dx).to_degrees().rem_euclid(360.0)
+}
+
+/// Rounded rectangle outline, one stroke thick, with snapped edges.
+fn rrect_outline(u: f32, v: f32, l: f32, t: f32, r: f32, b: f32, rad: f32) -> bool {
+    rrect_sd(u, v, (snap(l), snap(t), snap(r), snap(b)), rad).abs() <= half()
+}
+
+/// Palette (Appearance): ring with a notch at the bottom right and colour dots.
+pub fn palette_shape(u: f32, v: f32) -> bool {
+    let c = ax();
+    let cy = snap(8.0);
+    let a = angle_deg(u - c, v - cy);
+    let ring = ring_at(u, v, c, cy, 5.8) && !(25.0..75.0).contains(&a);
+    let dots = disc_at(u, v, c - 2.7, cy - 0.2, 1.0)
+        || disc_at(u, v, c - 0.9, cy - 2.9, 1.0)
+        || disc_at(u, v, c + 2.2, cy - 2.1, 1.0)
+        || disc_at(u, v, c - 2.2, cy + 2.7, 1.0);
+    ring || dots
+}
+
+/// Bar (Bar, Position): wide pill outline with three dots.
+pub fn bar_shape(u: f32, v: f32) -> bool {
+    let y = snap(8.0);
+    rrect_outline(u, v, 1.5, 4.5, 14.5, 11.5, 3.5)
+        || disc_at(u, v, 5.0, y, 0.95)
+        || disc_at(u, v, 8.0, y, 0.95)
+        || disc_at(u, v, 11.0, y, 0.95)
+}
+
+/// Grid (Start, Start layout): 2x2 outlined squares.
+pub fn grid_shape(u: f32, v: f32) -> bool {
+    rrect_outline(u, v, 2.0, 2.0, 7.0, 7.0, 1.0)
+        || rrect_outline(u, v, 9.0, 2.0, 14.0, 7.0, 1.0)
+        || rrect_outline(u, v, 2.0, 9.0, 7.0, 14.0, 1.0)
+        || rrect_outline(u, v, 9.0, 9.0, 14.0, 14.0, 1.0)
+}
+
+/// List (Modules): three bullets, each with a line.
+pub fn list_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    [3.5, 8.0, 12.5].iter().any(|&y| {
+        let y = snap(y);
+        disc_at(u, v, 3.0, y, 1.1) || dist_seg(u, v, 6.2, y, 14.0, y) <= st
+    })
+}
+
+/// Monitor (Screen, Display): screen outline with a thick strip under it, no stand.
+pub fn monitor_shape(u: f32, v: f32) -> bool {
+    let c = ax();
+    let strip = u >= edge(c - 3.5) && u <= edge(c + 3.5) && v >= edge(12.2) && v <= edge(13.6);
+    rrect_outline(u, v, 1.5, 2.5, 14.5, 10.5, 1.2) || strip
+}
+
+/// Arrowhead of an arc around `(cx, cy)` with radius `r`, at clockwise angle `deg`.
+fn arc_arrow(u: f32, v: f32, cx: f32, cy: f32, r: f32, deg: f32) -> bool {
+    let (s, c) = deg.to_radians().sin_cos();
+    let (px, py) = (cx + r * c, cy + r * s);
+    let (tx, ty) = (-s, c); // clockwise tangent
+    let tip = (px + tx * 1.4, py + ty * 1.4);
+    let w1 = (px - tx + c * 2.0, py - ty + s * 2.0);
+    let w2 = (px - tx - c * 2.0, py - ty - s * 2.0);
+    polyline(u, v, &[w1, tip, w2], half())
+}
+
+/// Refresh (Updates): two opposite arcs, each ending in an arrowhead.
+pub fn refresh_shape(u: f32, v: f32) -> bool {
+    let (c, cy, r) = (ax(), snap(8.0), 4.9);
+    let a = angle_deg(u - c, v - cy);
+    let on_arc = (200.0..322.0).contains(&a) || (20.0..142.0).contains(&a);
+    (ring_at(u, v, c, cy, r) && on_arc) || arc_arrow(u, v, c, cy, r, 322.0) || arc_arrow(u, v, c, cy, r, 142.0)
+}
+
+/// Info (About): ring with an "i".
+pub fn info_shape(u: f32, v: f32) -> bool {
+    let (c, cy) = (ax(), snap(8.0));
+    ring_at(u, v, c, cy, 5.8) || disc_at(u, v, c, cy - 2.6, 0.95) || dist_seg(u, v, c, cy - 0.6, c, cy + 3.2) <= half()
+}
+
+/// Circle with the left half filled (Background).
+pub fn circle_shape(u: f32, v: f32) -> bool {
+    let (c, cy) = (ax(), snap(8.0));
+    ring_at(u, v, c, cy, 5.8) || (disc_at(u, v, c, cy, 5.8) && u <= c)
+}
+
+/// Water drop outline (Opacity).
+pub fn drop_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let (c, cy, r) = (ax(), 9.6, 4.5);
+    let (tip_y, ty, tx) = (1.8, 7.0, 3.8);
+    let arc = v >= ty && ring_at(u, v, c, cy, r);
+    arc || dist_seg(u, v, c, tip_y, c - tx, ty) <= st || dist_seg(u, v, c, tip_y, c + tx, ty) <= st
+}
+
+/// Rounded square outline (App icons).
+pub fn square_shape(u: f32, v: f32) -> bool {
+    rrect_outline(u, v, 2.5, 2.5, 13.5, 13.5, 3.0)
+}
+
+/// Stroked capital "A" (App names, Display mode, Percentage).
+pub fn text_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let c = ax();
+    let y = snap(10.0);
+    polyline(u, v, &[(3.0, 13.5), (c, 2.5), (13.0, 13.5)], st) || dist_seg(u, v, c - 2.8, y, c + 2.8, y) <= st
+}
+
+/// Plain ring with an empty centre (Tray icons).
+pub fn ring_shape(u: f32, v: f32) -> bool {
+    ring_at(u, v, ax(), snap(8.0), 5.3)
+}
+
+/// Three ascending filled bars (Modules size, System metrics, Memory).
+pub fn bars_shape(u: f32, v: f32) -> bool {
+    let b = edge(13.5);
+    let bar = |l: f32, t: f32| u >= edge(l) && u <= edge(l + 2.0) && v >= edge(t) && v <= b;
+    bar(2.6, 9.0) || bar(7.0, 5.7) || bar(11.4, 2.5)
+}
+
+/// Globe (Language): ring, equator and a meridian ellipse.
+pub fn globe_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let (c, cy, r) = (ax(), snap(8.0), 5.8);
+    let (dx, dy) = (u - c, v - cy);
+    let (rx, ry) = (2.9f32, r);
+    let e = ((dx / rx).powi(2) + (dy / ry).powi(2)).sqrt();
+    let grad = ((dx / (rx * rx)).powi(2) + (dy / (ry * ry)).powi(2)).sqrt() / e.max(1e-3);
+    let meridian = (e - 1.0).abs() <= st * grad;
+    ring_at(u, v, c, cy, r) || meridian || dist_seg(u, v, c - r, cy, c + r, cy) <= st
+}
+
+/// Clock (Clock, Last check): ring with two hands.
+pub fn clock_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let (c, cy) = (ax(), snap(8.0));
+    ring_at(u, v, c, cy, 5.8)
+        || dist_seg(u, v, c, cy, c, cy - 3.4) <= st
+        || dist_seg(u, v, c, cy, c + 2.8, cy + 1.8) <= st
+}
+
+/// Arrow down into a tray (Import, Update now, Install automatically).
+pub fn download_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let c = ax();
+    let y = snap(13.0);
+    dist_seg(u, v, c, 2.0, c, 9.6) <= st
+        || polyline(u, v, &[(c - 3.0, 6.8), (c, 9.8), (c + 3.0, 6.8)], st)
+        || polyline(u, v, &[(snap(2.5), 10.5), (snap(2.5), y), (snap(13.5), y), (snap(13.5), 10.5)], st)
+}
+
+/// Folder outline (Data folder).
+pub fn folder_shape(u: f32, v: f32) -> bool {
+    let (l, r, t, m, b) = (snap(1.5), snap(14.5), snap(3.0), snap(5.5), snap(13.0));
+    polyline(u, v, &[(l, t), (6.0, t), (7.6, m), (r, m), (r, b), (l, b), (l, t)], half())
+}
+
+/// Page with text lines (Log).
+pub fn log_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    rrect_outline(u, v, 3.0, 1.5, 13.0, 14.5, 1.5)
+        || [5.5, 8.0, 10.5].iter().any(|&y| dist_seg(u, v, 5.6, snap(y), 10.4, snap(y)) <= st)
+}
+
+/// Key cap with a small square inside (Win key opens Start).
+pub fn keycap_shape(u: f32, v: f32) -> bool {
+    let inner = u >= edge(6.2) && u <= edge(9.8) && v >= edge(6.2) && v <= edge(9.8);
+    rrect_outline(u, v, 1.5, 2.0, 14.5, 14.0, 3.5) || inner
+}
+
+/// Speaker with all its waves (Volume).
+pub fn speaker_icon(u: f32, v: f32) -> bool {
+    speaker_shape(u, v, 3, false)
+}
+
+/// Wi-Fi with every bar (Network).
+pub fn wifi_icon(u: f32, v: f32) -> bool {
+    wifi_shape(u, v, 4)
+}
+
+/// Eye (visible tray icons).
+pub fn eye_icon(u: f32, v: f32) -> bool {
+    eye_shape(u, v, false)
+}
+
+/// Battery at 60 % (Battery rows).
+pub fn battery_icon(u: f32, v: f32) -> bool {
+    battery_outline_shape(u, v) || battery_fill_shape(u, v, 60, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_shapes_hit_expected_points() {
+        assert!(battery_outline_shape(1.5, 8.0) && battery_outline_shape(7.0, 4.5)); // left edge, top edge
+        assert!(!battery_outline_shape(7.0, 8.0)); // hollow body
+        assert!(battery_outline_shape(14.3, 8.0) && !battery_outline_shape(14.3, 5.0)); // nub
+        assert!(battery_fill_shape(5.0, 8.0, 50, false) && !battery_fill_shape(9.0, 8.0, 50, false));
+        assert!(battery_fill_shape(11.0, 8.0, 100, false) && !battery_fill_shape(3.5, 8.0, 0, false));
+        assert!(!battery_fill_shape(3.5, 5.2, 100, false)); // never outside the interior
+        assert!(battery_fill_shape(7.7, 7.9, 100, false) && !battery_fill_shape(7.7, 7.9, 100, true)); // bolt cut-out
+        assert!(bolt_shape(7.7, 7.9) && !bolt_shape(3.5, 8.0));
+        assert!(battery_off_shape(8.0, 8.0) && battery_off_shape(1.5, 8.0));
+    }
 
     #[test]
     fn shapes_hit_expected_points() {
@@ -491,5 +775,52 @@ mod tests {
         assert!(net_badge_shape(12.6, 12.6, false) && !wifi_shape(12.6, 12.6, 4));
         assert_eq!(waves_for(0), 0);
         assert_eq!(waves_for(100), 3);
+    }
+
+    #[test]
+    fn settings_glyphs_are_distinct_and_sized() {
+        let set: [(&str, fn(f32, f32) -> bool); 19] = [
+            ("palette", palette_shape),
+            ("bar", bar_shape),
+            ("grid", grid_shape),
+            ("list", list_shape),
+            ("monitor", monitor_shape),
+            ("refresh", refresh_shape),
+            ("info", info_shape),
+            ("circle", circle_shape),
+            ("drop", drop_shape),
+            ("square", square_shape),
+            ("text", text_shape),
+            ("ring", ring_shape),
+            ("bars", bars_shape),
+            ("globe", globe_shape),
+            ("clock", clock_shape),
+            ("download", download_shape),
+            ("folder", folder_shape),
+            ("log", log_shape),
+            ("keycap", keycap_shape),
+        ];
+        let sample = |g: fn(f32, f32) -> bool| -> Vec<bool> {
+            (0..64 * 64).map(|i| g((i % 64) as f32 / 4.0 + 0.125, (i / 64) as f32 / 4.0 + 0.125)).collect()
+        };
+        let mut seen: Vec<Vec<bool>> = Vec::new();
+        for (name, g) in set {
+            let s = sample(g);
+            let cov = s.iter().filter(|b| **b).count() as f32 / s.len() as f32;
+            assert!((0.04..0.6).contains(&cov), "{name}: coverage {cov}");
+            assert!(!g(0.5, 0.5) && !g(15.5, 0.5) && !g(0.5, 15.5) && !g(15.5, 15.5), "{name} touches a corner");
+            let outside = s.iter().enumerate().any(|(i, b)| {
+                let (x, y) = ((i % 64) as f32 / 4.0, (i / 64) as f32 / 4.0);
+                *b && (!(1.0..15.0).contains(&x) || !(1.0..15.0).contains(&y))
+            });
+            assert!(!outside, "{name} leaves the 1..15 box");
+            assert!(!seen.contains(&s), "{name} is identical to another glyph");
+            seen.push(s);
+        }
+        assert!(!ring_shape(8.0, 8.0) && !clock_shape(3.5, 3.5));
+        assert_eq!(speaker_icon(2.5, 8.0), speaker_shape(2.5, 8.0, 3, false));
+        assert_eq!(wifi_icon(8.0, 11.9), wifi_shape(8.0, 11.9, 4));
+        assert_eq!(eye_icon(8.0, 8.0), eye_shape(8.0, 8.0, false));
+        assert!(battery_icon(1.5, 8.0) && battery_icon(5.0, 8.0) && !battery_icon(11.0, 8.0));
     }
 }

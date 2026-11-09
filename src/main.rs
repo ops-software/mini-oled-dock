@@ -31,8 +31,10 @@
 #![windows_subsystem = "windows"]
 
 mod apps;
+mod arp;
 mod audio;
 mod autostart;
+mod battery;
 mod calendar;
 mod clock;
 mod config;
@@ -50,22 +52,29 @@ mod notif;
 mod picker;
 mod popup;
 mod popup_audio;
+mod popup_battery;
 mod popup_calendar;
 mod popup_network;
 mod popup_notif;
 mod popup_power;
-mod popup_settings;
 mod popup_tray;
 mod power;
 mod preview;
 mod render;
+mod settings_pages;
+mod settings_view;
+mod settings_window;
+mod sha256;
 mod shell_thread;
 mod start_import;
 mod surface;
 mod taskbar;
 mod tray_host;
 mod ui;
+mod update;
+mod update_release;
 mod watchdog;
+mod winhttp;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -89,17 +98,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
     KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
-    UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
-    WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MSGFLT_ALLOW, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
+    WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use msg::{
     TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
-    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG, WM_DOCK_NOTIF,
-    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE,
-    WM_DOCK_TRAY_CHANGED, WM_DOCK_WINKEY,
+    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG,
+    WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU,
+    WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -164,6 +174,22 @@ pub struct Args {
     pub autostart: bool,
     /// `--console`: attach the parent console (log on stdout, Ctrl+C) in normal runs.
     pub console: bool,
+    /// `--version`: print "mini-oled-dock X.Y.Z" and exit 0.
+    pub version: bool,
+    /// `--quiet` (with `--install` / `--uninstall`): no message box, no console output; the exit code is the result.
+    pub quiet: bool,
+    /// `--no-relaunch` (with `--install`): do not start the dock again after installing.
+    pub no_relaunch: bool,
+    /// `--remove` (with `--uninstall`): also delete the installed files.
+    pub remove: bool,
+    /// `--purge-data` (with `--uninstall --remove`): also delete the data folder.
+    pub purge_data: bool,
+    /// `--update-check`: check for a new release, print the result and exit.
+    pub update_check: bool,
+    /// `--update-install <tag>`: install the staged release `<tag>`.
+    pub update_install: Option<String>,
+    /// `--settings`: ask the running dock to open its Settings window and exit.
+    pub settings: bool,
 }
 
 static ARGS: OnceLock<Args> = OnceLock::new();
@@ -174,8 +200,11 @@ pub fn args() -> &'static Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args::default();
-    let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
             "--top" => a.top = Some(true),
@@ -198,11 +227,64 @@ fn parse_args() -> Result<Args, String> {
             "--uninstall" => a.uninstall = true,
             "--autostart" => a.autostart = true,
             "--console" => a.console = true,
+            "--version" => a.version = true,
+            "--quiet" => a.quiet = true,
+            "--no-relaunch" => a.no_relaunch = true,
+            "--remove" => a.remove = true,
+            "--purge-data" => a.purge_data = true,
+            "--update-check" => a.update_check = true,
+            "--settings" => a.settings = true,
+            "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    if a.install && a.uninstall {
+        return Err("--install and --uninstall cannot be combined".into());
+    }
+    if a.quiet && !(a.install || a.uninstall) {
+        return Err("--quiet requires --install or --uninstall".into());
+    }
+    if a.no_relaunch && !a.install {
+        return Err("--no-relaunch requires --install".into());
+    }
+    if a.remove && !a.uninstall {
+        return Err("--remove requires --uninstall".into());
+    }
+    if a.purge_data && !a.remove {
+        return Err("--purge-data requires --uninstall --remove".into());
+    }
     Ok(a)
+}
+
+/// Exit code for a command-line parse error: 0 for `--help` (empty message), else "bad arguments".
+fn parse_error_exit(msg: &str) -> i32 {
+    if msg.is_empty() {
+        autostart::EXIT_OK
+    } else {
+        autostart::EXIT_BAD_ARGS
+    }
+}
+
+/// Where the result of `--install` / `--uninstall` goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliReport {
+    /// Printed on the attached console.
+    Console,
+    /// No console: shown in a message box (the behaviour without `--quiet`).
+    MessageBox,
+    /// `--quiet`: log file only, the exit code carries the result.
+    LogOnly,
+}
+
+fn cli_report(quiet: bool, has_console: bool) -> CliReport {
+    if quiet {
+        CliReport::LogOnly
+    } else if has_console {
+        CliReport::Console
+    } else {
+        CliReport::MessageBox
+    }
 }
 
 // ------------------------------------------------------------------ RAM
@@ -232,7 +314,8 @@ thread_local! {
 fn trim_tick() {
     let now = Instant::now();
     let visible = ui::is_visible();
-    let popup = popup::is_open();
+    // An open Settings window counts like an open popup: no trim under the user's hands.
+    let popup = popup::is_open() || settings_window::is_open();
     let go = TRIM.with(|s| {
         let mut s = s.borrow_mut();
         let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
@@ -267,6 +350,12 @@ fn trim_tick() {
     }
 }
 
+/// `busy` of `update::on_idle`: an automatic install would interrupt an open popup, the open Settings
+/// window or a fullscreen app.
+fn auto_install_busy(popup: bool, settings: bool, fullscreen: bool) -> bool {
+    popup || settings || fullscreen
+}
+
 // ------------------------------------------------------------ window proc
 
 /// "Core" messages handled here (exit, keyboard hook, service timers, taskbar, session);
@@ -284,8 +373,22 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 if config::poll_changed() {
                     tray_host::invalidate_trust_cache();
                     ui::on_config_changed();
+                    update::sync_timer(h);
                 }
                 trim_tick();
+                if update::auto_install_pending() {
+                    // No automatic install while a popup or the Settings window is open, or over a
+                    // fullscreen app.
+                    update::on_idle(auto_install_busy(
+                        popup::is_open(),
+                        settings_window::is_open(),
+                        ui::foreground_is_fullscreen(),
+                    ));
+                }
+                LRESULT(0)
+            }
+            TIMER_UPDATE_CHECK => {
+                update::on_timer(h);
                 LRESULT(0)
             }
             TIMER_RAM => {
@@ -354,6 +457,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_DOCK_TRAY_CHANGED => {
             ui::on_tray_changed(wp.0);
             popup::on_tray_changed();
+            settings_window::on_tray_changed();
             LRESULT(0)
         }
         WM_DOCK_NOTIF => {
@@ -367,6 +471,16 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_CONFIG_APPLY => {
             ui::on_config_changed();
+            update::sync_timer(h);
+            LRESULT(0)
+        }
+        WM_DOCK_OPEN_SETTINGS => {
+            settings_window::open();
+            LRESULT(0)
+        }
+        WM_DOCK_UPDATE => {
+            update::on_changed(h);
+            settings_window::on_update_changed();
             LRESULT(0)
         }
         WM_DOCK_TASKBAR_EVENT => {
@@ -374,13 +488,15 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_DOCK_QUIT_REQUEST => {
-            log!("quit request from --restore: exiting");
+            taskbar::begin_exit();
+            log!("quit request (stop event: --restore, --install or --uninstall): exiting");
             // SAFETY: no preconditions.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         WM_HOTKEY => {
             if wp.0 as i32 == HOTKEY_ID {
+                taskbar::begin_exit();
                 log!("Ctrl+Alt+Q: exit");
                 // SAFETY: no preconditions.
                 unsafe { PostQuitMessage(0) };
@@ -388,14 +504,22 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_CLOSE => {
+            taskbar::begin_exit();
             log!("close request (Ctrl+C / menu): exiting");
             // SAFETY: no preconditions.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
+        WM_QUERYENDSESSION => {
+            // Deliberately no `begin_exit`: another app can still cancel the shutdown, and a surviving dock
+            // would be left with `RESTORING` set and its paused tray host never restarted.
+            log!("WM_QUERYENDSESSION: allowing the session end, exit deferred to WM_ENDSESSION");
+            LRESULT(1)
+        }
         WM_ENDSESSION => {
             // End of session: the taskbar state would survive a reboot, so restore it right away.
             if wp.0 != 0 {
+                taskbar::begin_exit();
                 taskbar::restore();
             }
             LRESULT(0)
@@ -468,7 +592,15 @@ fn create_window(inst: HINSTANCE, g: &ui::Geom) -> Option<HWND> {
         )
     };
     match r {
-        Ok(h) => Some(h),
+        Ok(h) => {
+            // `dock --settings` posts from a medium-integrity terminal to this elevated window; UIPI would
+            // drop the message. It only opens the dock's own Settings window, so allowing it is harmless.
+            // SAFETY: `h` is the window just created by this thread; no optional struct.
+            if let Err(e) = unsafe { ChangeWindowMessageFilterEx(h, WM_DOCK_OPEN_SETTINGS, MSGFLT_ALLOW, None) } {
+                log!("ChangeWindowMessageFilterEx(WM_DOCK_OPEN_SETTINGS) failed: {e}");
+            }
+            Some(h)
+        }
         Err(e) => {
             log!("CreateWindowExW failed: {e}");
             None
@@ -652,6 +784,7 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
         TIMER_CLOCK,
         TIMER_TRAY_REANNOUNCE,
         TIMER_HOVER_PICKER,
+        TIMER_UPDATE_CHECK,
     ] {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), id) };
@@ -662,6 +795,8 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
     // The native taskbar right after: it is the thing that must not stay hidden.
     taskbar::shutdown();
     picker::shutdown();
+    // A drag still held in the Settings window is saved before the window goes.
+    settings_window::shutdown();
     popup::shutdown();
     // SAFETY: as above.
     let _ = unsafe { UnregisterHotKey(Some(h), HOTKEY_ID) };
@@ -816,6 +951,7 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     set_timer(h, TIMER_HOUSEKEEPING, 2000);
     set_timer(h, TIMER_RAM, 30_000);
     set_timer(h, TIMER_SECOND, 1000);
+    update::init(h);
     mem::log_memory();
 
     // The window already exists (HWND_RAW set): the callback can post messages to it.
@@ -828,13 +964,45 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
 
 // ------------------------------------------------------------------ main
 
+/// First line of `--version`.
+fn version_line() -> String {
+    format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `--settings`: posts `WM_DOCK_OPEN_SETTINGS` to the running dock. 0 = posted, 1 = no dock or post failed.
+fn open_settings_cli() -> u8 {
+    use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetWindowThreadProcessId};
+    // SAFETY: static literal class; FindWindowW has no other preconditions.
+    let Ok(h) = (unsafe { FindWindowW(CLASS_NAME, PCWSTR::null()) }) else {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "dock: no running dock found");
+        return 1;
+    };
+    let mut pid = 0u32;
+    // SAFETY: `h` was just found; `pid` is a valid out pointer. Both calls fail harmlessly if the window is gone.
+    unsafe {
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        let _ = AllowSetForegroundWindow(pid);
+    }
+    // SAFETY: PostMessageW is thread-safe; if the window no longer exists it just fails.
+    match unsafe { PostMessageW(Some(h), WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) } {
+        Ok(()) => 0,
+        Err(e) => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "dock: could not reach the dock (access denied?): {e}");
+            1
+        }
+    }
+}
+
 fn usage() {
     use std::io::Write;
     let mut e = std::io::stderr();
     let _ = writeln!(
         e,
         "usage: dock [--top | --bottom] [--no-autohide] [--keep-taskbar] [--diag] [--restore] \
-         [--install | --uninstall] [--autostart] [--console] \
+         [--install [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
+         [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] [--console] \
          [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] [--list-apps]"
     );
 }
@@ -861,10 +1029,17 @@ fn main() -> std::process::ExitCode {
                 let _ = writeln!(std::io::stderr(), "{msg}");
             }
             usage();
-            return std::process::ExitCode::from(if msg.is_empty() { 0 } else { 2 });
+            return std::process::ExitCode::from(parse_error_exit(&msg) as u8);
         }
     };
     let args = ARGS.get_or_init(|| args);
+
+    // --version: no data folder, logger or mutex.
+    if args.version {
+        attach_console();
+        println!("{}", version_line());
+        return std::process::ExitCode::SUCCESS;
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -886,8 +1061,8 @@ fn main() -> std::process::ExitCode {
     // --install / --uninstall mode: messages via `logger::say`, log to file only.
     if args.install || args.uninstall {
         // Without a console (UAC from a non-elevated terminal, Explorer) the result would be lost: message box.
-        let has_console = attach_console();
-        if !has_console {
+        let report = cli_report(args.quiet, !args.quiet && attach_console());
+        if report != CliReport::Console {
             logger::buffer_say();
         }
         let (log_thread, notes) = start_logging("");
@@ -895,9 +1070,32 @@ fn main() -> std::process::ExitCode {
         for n in notes.iter().filter(|n| !n.starts_with("data: created")) {
             logger::say(n);
         }
-        let code = if args.install { autostart::run_install_cli() } else { autostart::run_uninstall_cli() };
+        let mut code = if args.install {
+            autostart::run_install_cli(args.no_relaunch)
+        } else {
+            autostart::run_uninstall_cli(args.remove)
+        };
+        if report == CliReport::LogOnly {
+            // Keep the messages in the log, then keep buffering whatever is said later (nobody shows it).
+            for line in logger::take_say_buffer().lines() {
+                log!("{line}");
+            }
+            logger::buffer_say();
+        }
         logger::stop(log_thread);
-        if !has_console {
+        // `--purge-data`: only after a clean `--uninstall --remove`, and only now that `dock.log` is closed.
+        // The result is still said before the message box or console output (with `--quiet` only the exit
+        // code reports it).
+        if code == autostart::EXIT_OK && args.purge_data {
+            match datadir::purge() {
+                Ok(()) => logger::say("Data folder removed."),
+                Err(e) => {
+                    logger::say(&format!("Removing the data folder failed: {e}"));
+                    code = autostart::EXIT_FAILED;
+                }
+            }
+        }
+        if report == CliReport::MessageBox {
             let text = logger::take_say_buffer();
             if !text.is_empty() {
                 let wtext: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -915,6 +1113,34 @@ fn main() -> std::process::ExitCode {
         }
         let (log_thread, _) = start_logging("");
         let code = taskbar::run_restore_cli();
+        logger::stop(log_thread);
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+
+    // --settings mode: asks the running dock to open the Settings window.
+    if args.settings {
+        attach_console();
+        return std::process::ExitCode::from(open_settings_cli());
+    }
+
+    // --update-check mode: asks GitHub once, prints the result and exits.
+    if args.update_check {
+        if attach_console() {
+            logger::enable_stdout();
+        }
+        let (log_thread, _) = start_logging("");
+        let code = update::run_check_cli();
+        logger::stop(log_thread);
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+
+    // --update-install <tag> mode: hands an already staged, verified release to --install --quiet.
+    if let Some(tag) = &args.update_install {
+        if attach_console() {
+            logger::enable_stdout();
+        }
+        let (log_thread, _) = start_logging("");
+        let code = update::run_install_cli(tag);
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
@@ -950,4 +1176,79 @@ fn main() -> std::process::ExitCode {
     };
     logger::stop(log_thread);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(a: &[&str]) -> Result<Args, String> {
+        parse_args_from(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_auto_install_while_settings_is_open() {
+        assert!(auto_install_busy(false, true, false), "Settings window open");
+        assert!(auto_install_busy(true, false, false), "popup open");
+        assert!(auto_install_busy(false, false, true), "fullscreen app");
+        assert!(!auto_install_busy(false, false, false));
+    }
+
+    #[test]
+    fn settings_flag_parses() {
+        let a = p(&["--settings"]).unwrap();
+        assert!(a.settings && !a.install);
+        assert!(!p(&[]).unwrap().settings);
+        assert!(p(&["--setings"]).is_err());
+    }
+
+    #[test]
+    fn cli_new_flags() {
+        let a = p(&["--install", "--quiet", "--no-relaunch"]).unwrap();
+        assert!(a.install && a.quiet && a.no_relaunch);
+        let u = p(&["--uninstall", "--remove", "--purge-data", "--quiet"]).unwrap();
+        assert!(u.uninstall && u.remove && u.purge_data && u.quiet);
+        assert_eq!(p(&["--update-install", "v1.4.1"]).unwrap().update_install.as_deref(), Some("v1.4.1"));
+        assert!(p(&["--update-check"]).unwrap().update_check);
+        assert!(p(&["--version"]).unwrap().version);
+    }
+
+    #[test]
+    fn cli_rejects_bad_combinations() {
+        let bad: [&[&str]; 8] = [
+            &["--quiet"],
+            &["--no-relaunch"],
+            &["--remove"],
+            &["--uninstall", "--purge-data"],
+            &["--install", "--remove"],
+            &["--install", "--uninstall"],
+            &["--uninstall", "--no-relaunch"],
+            &["--update-install"],
+        ];
+        for b in bad {
+            assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn cli_report_quiet_never_shows_a_box() {
+        assert_eq!(cli_report(true, false), CliReport::LogOnly);
+        assert_eq!(cli_report(true, true), CliReport::LogOnly);
+        assert_eq!(cli_report(false, true), CliReport::Console);
+        assert_eq!(cli_report(false, false), CliReport::MessageBox);
+    }
+
+    #[test]
+    fn cli_exit_codes() {
+        use crate::autostart::{EXIT_BAD_ARGS, EXIT_FAILED, EXIT_OK, EXIT_STOP_FAILED};
+        assert_eq!((EXIT_OK, EXIT_FAILED, EXIT_BAD_ARGS, EXIT_STOP_FAILED), (0, 1, 2, 3));
+        assert_eq!(parse_error_exit(""), EXIT_OK);
+        assert_eq!(parse_error_exit(&p(&["--quiet"]).unwrap_err()), EXIT_BAD_ARGS);
+        assert_eq!(parse_error_exit(&p(&["--bogus"]).unwrap_err()), EXIT_BAD_ARGS);
+    }
+
+    #[test]
+    fn version_line_matches_cargo() {
+        assert_eq!(version_line(), format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION")));
+    }
 }

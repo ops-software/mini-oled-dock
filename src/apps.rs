@@ -263,7 +263,8 @@ pub fn refresh(own: HWND) -> bool {
             live.push(h);
         }
     }
-    let mut fg = foreground_target(&live);
+    // The active app stays highlighted while the bar holds the foreground it took by Win.
+    let mut fg = foreground_target_of(crate::ui::effective_foreground(), &live);
     // A window that just came to the foreground (e.g. a UWP frame restored long after the dock
     // started) gets one forced re-check if its identity is still provisional.
     let fg_changed = STATE.with(|s| s.borrow().last_fg) != fg;
@@ -838,9 +839,14 @@ pub fn aumid_from_launch(launch: &str) -> Option<String> {
 /// may be a popup owned by a tracked window (we walk up to the root owner).
 /// 0 if the foreground window is not tracked (desktop, Start menu, the dock itself...).
 fn foreground_target(live: &[isize]) -> isize {
-    // SAFETY: no preconditions; GetAncestor accepts arbitrary HWNDs.
+    // SAFETY: no preconditions.
+    foreground_target_of(unsafe { GetForegroundWindow() }, live)
+}
+
+/// `foreground_target` for the foreground `fg` (e.g. `ui::effective_foreground`).
+fn foreground_target_of(fg: HWND, live: &[isize]) -> isize {
+    // SAFETY: GetAncestor accepts arbitrary HWNDs.
     let (fg, root_owner, root) = unsafe {
-        let fg = GetForegroundWindow();
         if fg.0.is_null() {
             return 0;
         }
@@ -901,7 +907,8 @@ pub fn click_group(key: &str) -> ClickOutcome {
     }
 
     let handles: Vec<isize> = wins.iter().map(|w| w.0).collect();
-    let fg = foreground_target(&handles); // 0 if no window of the group is in the foreground
+    // 0 if no window of the group is in the foreground (the bar focused by Win counts as the window before).
+    let fg = foreground_target_of(crate::ui::effective_foreground(), &handles);
 
     if fg == 0 {
         // Inactive group: the most recent one.
@@ -1065,10 +1072,7 @@ pub fn is_taskbar_window(h: HWND, own: HWND) -> bool {
         let mut cls = [0u16; 64];
         let n = GetClassNameW(h, &mut cls).max(0) as usize;
         let class = String::from_utf16_lossy(&cls[..n.min(cls.len())]);
-        if matches!(
-            class.as_str(),
-            "Progman" | "WorkerW" | "Windows.UI.Core.CoreWindow" | "Windows.Internal.Shell.TabProxyWindow"
-        ) {
+        if excluded_class(&class) {
             return false;
         }
         // Property set by Explorer on windows removed from the taskbar.
@@ -1087,9 +1091,28 @@ pub fn is_taskbar_window(h: HWND, own: HWND) -> bool {
     true
 }
 
+/// Window classes that are never bar apps: the desktop, shell `CoreWindow`s, Edge's tab proxies and
+/// the dock's own Settings window (a dock window, not an app).
+fn excluded_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman"
+            | "WorkerW"
+            | "Windows.UI.Core.CoreWindow"
+            | "Windows.Internal.Shell.TabProxyWindow"
+            | crate::settings_window::CLASS
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_window_is_not_an_app() {
+        assert!(excluded_class("DockSettings") && excluded_class("Progman") && excluded_class("WorkerW"));
+        assert!(!excluded_class("Notepad"));
+    }
 
     #[test]
     fn key_normalization() {

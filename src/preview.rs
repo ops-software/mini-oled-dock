@@ -7,11 +7,16 @@
 //! build with `DOCK_NO_MANIFEST=1` (manifest without `requireAdministrator`).
 //!
 //! Files produced for each preview: `<name>.png` (DPI 120) and `<name>_96.png` (DPI 96).
+//! The Settings window pages are `settings_<page>.png` (DPI 144), `settings_<page>_96.png` (DPI 96) and
+//! `settings_<page>_it.png` (144, Italian).
 //! Errors go to stderr (the async logger is not started in this mode).
 //!
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
 //! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`,
-//! `popup_settings::preview_new`, `picker::preview_pixels`.
+//! `picker::preview_pixels`.
+//!
+//! The default bar has no battery (existing bar PNGs stay unchanged); `bar_battery*` and `popup_battery`
+//! show the mock battery (`mock_battery`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,13 +25,13 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::audio::{DeviceKind, OutputDevice, VolumeState};
+use crate::battery::{BatteryStatus, PowerMode};
 use crate::config::{Background, Config, DisplayMode};
 use crate::icons::{self, IconBitmap};
 use crate::metrics::Usage;
 use crate::net::{NetInfo, NetKind, NetStatus};
 use crate::notif::{self, NotifAccess, NotifItem, NotifState};
 use crate::popup::{Content, DataEvent};
-use crate::popup_settings::Page;
 use crate::render::{self, AppView, BarSizes, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
 use crate::surface::Surface;
 use crate::ui::Screen;
@@ -35,6 +40,8 @@ thread_local! {
     /// Bar style of the next `render_bar` (sizes, background, opacity): applied to the config of the
     /// bar; a no-op except for the style variants.
     static STYLE: std::cell::Cell<Style> = const { std::cell::Cell::new(no_style) };
+    /// Battery of the next `render_bar`: none by default, so every existing bar PNG is unchanged.
+    static BATTERY: std::cell::Cell<BatteryStatus> = const { std::cell::Cell::new(BatteryStatus::NONE) };
 }
 
 /// A bar style variant: edits the config the bar is drawn with.
@@ -80,7 +87,7 @@ fn rounded_cov(x: i32, y: i32, size: i32, radius: f32) -> f32 {
 }
 
 /// Mock icon `size` x `size`: rounded square `rgb` with a white letter. Premultiplied.
-fn mock_icon(letter: char, rgb: u32, size: i32) -> IconBitmap {
+pub(crate) fn mock_icon(letter: char, rgb: u32, size: i32) -> IconBitmap {
     let size = size.max(8);
     let mut bmp = IconBitmap::new(size as u32, size as u32);
     let (r, g, b) = (((rgb >> 16) & 255) as f32, ((rgb >> 8) & 255) as f32, (rgb & 255) as f32);
@@ -314,6 +321,11 @@ fn mock_net() -> NetInfo {
     }
 }
 
+/// Mock battery: on battery, 64 %, 3 h 12 min left.
+fn mock_battery() -> BatteryStatus {
+    BatteryStatus::from_raw(0, 1, 64, 11520)
+}
+
 // ------------------------------------------------------------------ bar
 
 /// Moves the app items of `layout` as in the middle of a drag: Steam (app 1) is lifted and hovers
@@ -356,7 +368,10 @@ fn render_bar(
     let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
     STYLE.with(|s| s.get())(&mut cfg);
     let sizes = BarSizes::from_config(&cfg);
-    let modules = render::visible_modules(&cfg);
+    let battery = BATTERY.with(|b| b.get());
+    let modules = render::visible_modules(&cfg, battery.present);
+    let battery_view =
+        render::BatteryView { status: battery, percent: cfg.battery_percent, inside: cfg.battery_percent_inside };
     let cfg_start = cfg.show_start_button;
     crate::config::set(cfg);
     if let Err(e) = render::init(m, sizes) {
@@ -395,6 +410,7 @@ fn render_bar(
             bell_dnd: false,
             net,
             usage: Usage { cpu: 12, ram: 48 },
+            battery: battery_view,
         },
         plate: None,
         modules: &modules,
@@ -500,6 +516,100 @@ fn pick_hot(c: &dyn Content, w: i32, h: i32, step: i32, nth: usize) -> Option<u3
     seen.get(nth).copied().or_else(|| seen.last().copied())
 }
 
+/// Rendered DPIs of the Settings window pages (the spec asks for 96 and 144; `DPIS` stays as it is).
+const SETTINGS_DPIS: [(u32, &str); 2] = [(144, ""), (96, "_96")];
+
+/// Mock live state of the Settings window: two displays, three tray apps, an update known.
+struct SettingsMock {
+    screens: Vec<Screen>,
+    tray: Vec<crate::popup_tray::TrayRow>,
+    update: crate::update::UpdateStatus,
+}
+
+fn settings_mock(m: Metrics) -> SettingsMock {
+    use crate::update::{Available, Outcome, Phase, UpdateStatus};
+    use crate::update_release::Version;
+    let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
+    let px = m.px(16);
+    let tray = TRAY_NAMES
+        .iter()
+        .zip(TRAY)
+        .take(3)
+        .enumerate()
+        .map(|(i, (name, (letter, rgb)))| crate::popup_tray::TrayRow {
+            key: format!("mock-{i}"),
+            name: name.to_string(),
+            bitmap: Some(Arc::new(mock_icon(letter, rgb, px))),
+            visible: i != 1,
+            in_bar: i == 0,
+        })
+        .collect();
+    let next = Version { major: 1, minor: 4, patch: 1 };
+    SettingsMock {
+        screens: vec![d("\\\\.\\DISPLAY1", "1", true), d("\\\\.\\DISPLAY2", "2", false)],
+        tray,
+        update: UpdateStatus {
+            installed: Version::current(),
+            phase: Phase::Idle,
+            available: Some(Available {
+                tag: "v1.4.1".into(),
+                version: next,
+                date: "2026-11-20".into(),
+                notes: String::new(),
+            }),
+            last_check: "2026-11-21T09:12:00Z".into(),
+            outcome: Outcome::Available,
+            staged: false,
+        },
+    }
+}
+
+/// Settings page `page` in a window of `size` logical px over the wallpaper (40 px margin).
+#[allow(clippy::too_many_arguments)] // preview helper: one flag per variant
+fn settings_png_with(
+    dir: &Path,
+    file: &str,
+    m: Metrics,
+    page: crate::settings_pages::Page,
+    c: &Config,
+    open: (bool, bool),
+    hot: Option<crate::settings_view::Hit>,
+    size: (i32, i32),
+) -> bool {
+    use crate::settings_pages::{Ctx, Memory};
+    use crate::settings_view::{hit_id, window_pixels, Focus};
+    let mock = settings_mock(m);
+    let ctx = Ctx {
+        screens: &mock.screens,
+        picker_open: open.0,
+        chooser_open: open.1,
+        tray: &mock.tray,
+        import: crate::start_import::Status::Idle,
+        update: &mock.update,
+        memory: Memory { now: Some(10_276_044), trimmed: Some(6_396_314) },
+        data_dir: Some("C:\\ProgramData\\mini-oled-dock"),
+        log_path: Some("C:\\ProgramData\\mini-oled-dock\\dock.log"),
+        trust_elevated: false,
+    };
+    // The mini bar is drawn by the bar renderer, which reads the global config.
+    crate::config::set(c.clone());
+    let focus = if hot.is_some() { Focus::Page } else { Focus::Nav };
+    let Some((w, h, px)) = window_pixels(m, page, c, &ctx, hot.map(hit_id), focus, size) else {
+        eprintln!("preview: settings {file} not rendered");
+        return false;
+    };
+    let pad = m.px(40);
+    let (cw, ch) = (w + 2 * pad, h + 2 * pad);
+    let mut bg = wallpaper(cw, ch, ch);
+    composite(&mut bg, cw, ch, &px, w, h, pad, pad);
+    write_png(dir, file, cw, ch, bg)
+}
+
+/// Settings page `page` as the README shows it: default config, nothing open, nothing hovered.
+fn settings_png(dir: &Path, file: &str, m: Metrics, page: crate::settings_pages::Page) -> bool {
+    settings_png_with(dir, file, m, page, &Config::default(), (false, false), None, (860, 600))
+}
+
 /// Popup on a background, written to `file`. `nth` = hovered control (scan index).
 fn popup_png(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, nth: usize) -> bool {
     let mut surf = match Surface::new(m) {
@@ -551,6 +661,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         }
         "popup_calendar" => crate::popup_calendar::new(),
         "popup_network" => crate::popup_network::new(mock_net()),
+        "popup_battery" => crate::popup_battery::new(mock_battery(), Some(PowerMode::Balanced)),
         "popup_network_offline" => crate::popup_network::new(NetInfo {
             kind: NetKind::Ethernet,
             name: "Ethernet".to_string(),
@@ -559,49 +670,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             ..Default::default()
         }),
         "popup_power" => crate::popup_power::new(),
-        // No displays passed: no "Screen" row, whatever monitors this machine has.
-        "popup_settings" => crate::popup_settings::preview_with_screens(Vec::new()),
-        // Italian texts: the caller lifts the preview's forced English around this one.
-        "popup_settings_it" => {
-            crate::config::set(Config { language: crate::config::Language::It, ..Config::default() });
-            crate::popup_settings::preview_with_screens(Vec::new())
-        }
-        "popup_settings_navy" => {
-            crate::config::set(Config {
-                background: Background(0x0E1A33),
-                bar_opacity: 80,
-                show_metrics: true,
-                autohide: false,
-                ..Config::default()
-            });
-            crate::popup_settings::preview_with_screens(Vec::new())
-        }
-        "popup_settings_screen" | "popup_settings_pointer" => {
-            // Two mock displays, bar moved to the second one (or following the pointer).
-            let monitor = if name == "popup_settings_pointer" {
-                crate::config::MONITOR_POINTER.to_string()
-            } else {
-                "\\\\.\\DISPLAY2".to_string()
-            };
-            crate::config::set(Config { monitor, ..Config::default() });
-            let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
-            crate::popup_settings::preview_with_screens(vec![
-                d("\\\\.\\DISPLAY1", "1", true),
-                d("\\\\.\\DISPLAY2", "2", false),
-            ])
-        }
-        "popup_settings_background" => {
-            crate::config::set(Config { background: Background(0x2A1F3D), bar_opacity: 60, ..Config::default() });
-            crate::popup_settings::preview_new(Page::Background, true)
-        }
-        "popup_settings_presets" => {
-            crate::config::set(Config { background: Background(0x1A222D), ..Config::default() });
-            crate::popup_settings::preview_new(Page::Background, false)
-        }
-        "popup_settings_sizes" => {
-            crate::config::set(Config { app_icon_size: 24, module_size: 125, ..Config::default() });
-            crate::popup_settings::preview_new(Page::Sizes, false)
-        }
+        "popup_power_update" => crate::popup_power::preview_with_badge(1),
         "popup_app" => crate::popup::popup_app::new(crate::popup::AppMenuInfo {
             key: "discord".to_string(),
             name: "Discord".to_string(),
@@ -610,7 +679,6 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             can_launch: true,
         }),
         "popup_start" => crate::popup::popup_start::new(),
-        "popup_settings_startmenu" => crate::popup_settings::preview_new(Page::StartMenu, false),
         "popup_startmenu"
         | "popup_startmenu_search"
         | "popup_startmenu_h"
@@ -762,6 +830,29 @@ pub fn run(dir: &str) -> i32 {
                 net,
             ));
         }
+        // Battery variants: on battery with the percentage beside, charging with it inside.
+        let styles: [(&str, BatteryStatus, Style); 2] = [
+            ("bar_battery", mock_battery(), no_style),
+            ("bar_battery_inside", BatteryStatus::from_raw(1, 9, 100, u32::MAX), |c| {
+                c.battery_percent_inside = true
+            }),
+        ];
+        for (name, status, style) in styles {
+            BATTERY.with(|b| b.set(status));
+            STYLE.with(|s| s.set(style));
+            failures += i32::from(!bar_png(
+                dir,
+                &format!("{name}{suffix}.png"),
+                m,
+                None,
+                DisplayMode::IconText,
+                None,
+                false,
+                wifi,
+            ));
+            BATTERY.with(|b| b.set(BatteryStatus::NONE));
+            STYLE.with(|s| s.set(no_style));
+        }
         // Style variants: transparent background, coloured background, independent sizes.
         let styles: [(&str, Style); 5] = [
             ("bar_opacity_0", |c| c.bar_opacity = 0),
@@ -815,19 +906,12 @@ pub fn run(dir: &str) -> i32 {
             ("popup_notif", 1),
             ("popup_audio", 3),
             ("popup_audio_customize", 2),
-            ("popup_settings_it", 3),
             ("popup_calendar", 8),
             ("popup_network", 0),
             ("popup_network_offline", 9),
+            ("popup_battery", 0),
             ("popup_power", 4),
-            ("popup_settings", 3),
-            ("popup_settings_navy", 2),
-            ("popup_settings_screen", 2),
-            ("popup_settings_pointer", 2),
-            ("popup_settings_background", 4),
-            ("popup_settings_presets", 3),
-            ("popup_settings_sizes", 5),
-            ("popup_settings_startmenu", 1),
+            ("popup_power_update", 4),
             ("popup_app", 1),
             ("popup_start", 4),
             ("popup_startmenu", 12),
@@ -855,9 +939,44 @@ pub fn run(dir: &str) -> i32 {
             failures += i32::from(!ok);
         }
     }
+    // Settings window pages, then the same pages in Italian at 144 DPI.
+    for (dpi, suffix) in SETTINGS_DPIS {
+        for page in crate::settings_pages::Page::ALL {
+            let file = format!("settings_{}{suffix}.png", page.slug());
+            failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
+        }
+    }
+    // The whole Modules page, down to the Tray section (elevated-apps switch).
+    let (m, modules) = (Metrics { dpi: 144 }, crate::settings_pages::Page::Modules);
+    let c = Config::default();
+    let tall = settings_png_with(dir, "settings_modules_tray.png", m, modules, &c, (false, false), None, (860, 900));
+    failures += i32::from(!tall);
+    crate::i18n::set_preview(false);
+    for page in crate::settings_pages::Page::ALL {
+        let c = Config { language: crate::config::Language::It, ..Config::default() };
+        let file = format!("settings_{}_it.png", page.slug());
+        let m = Metrics { dpi: 144 };
+        failures += i32::from(!settings_png_with(dir, &file, m, page, &c, (false, false), None, (860, 600)));
+    }
+    crate::i18n::set_preview(true);
+    crate::config::set(Config::default());
     if failures > 0 {
         eprintln!("preview: {failures} previews not written");
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn battery_mock_shows_the_module_and_the_default_does_not() {
+        let cfg = Config::default();
+        assert!(!render::visible_modules(&cfg, BatteryStatus::NONE.present).contains(&ItemId::Battery));
+        assert!(render::visible_modules(&cfg, mock_battery().present).contains(&ItemId::Battery));
+        let b = mock_battery();
+        assert_eq!((b.percent, b.ac, b.charging, b.seconds_left), (64, false, false, Some(11520)));
+    }
 }

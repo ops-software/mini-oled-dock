@@ -27,7 +27,8 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowThreadProcessId,
-    IsWindowVisible, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW, SendNotifyMessageW,
+    IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
+    SendNotifyMessageW,
     SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
     HWND_BOTTOM,
     HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW, OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT,
@@ -715,10 +716,30 @@ fn explorer_restarted(why: &str) {
     if HOST_PAUSED_AT.load(Relaxed) != 0 {
         return; // our host comes back (and is announced) once the new desktop is registered
     }
+    if RESTORING.load(Relaxed) {
+        return; // exit began: no host raise, no re-announcement
+    }
     // Explorer's new Shell_TrayWnd is born topmost and would sit in front of ours: it is brought back to the
     // top and, after 300 ms, announced again so apps re-register their icons with us.
     crate::tray_host::raise();
     arm_reannounce(300);
+}
+
+/// Marks the exit as begun: `RESTORING = true`, drops the Explorer-restart pause and kills
+/// `TIMER_TRAY_REANNOUNCE`. Idempotent, UI thread, first thing in the explicit exit requests (quit request,
+/// hotkey, close, end of session).
+/// This is only the EARLY part of the exit: `restore()` / `restore_force()` remain the exit path that puts
+/// the taskbar back (they set `RESTORING` themselves). `begin_exit` merely makes the exit visible sooner,
+/// so that `pause_step`, `hide_all` and `explorer_restarted` stop acting before `restore()` runs, and it
+/// cancels the pause and its timer, which `restore()` does not.
+pub fn begin_exit() {
+    RESTORING.store(true, Relaxed);
+    HOST_PAUSED_AT.store(0, Relaxed);
+    let ui = crate::hwnd();
+    if !ui.0.is_null() {
+        // SAFETY: our own id on the dock window (UI thread); fails harmlessly if the timer does not exist.
+        let _ = unsafe { KillTimer(Some(ui), TIMER_TRAY_REANNOUNCE) };
+    }
 }
 
 /// "Normal" restore by the dock on exit (WM_DESTROY/clean exit, WM_ENDSESSION wParam != 0,
@@ -819,6 +840,16 @@ pub fn is_hidden() -> bool {
     HIDDEN.load(Relaxed)
 }
 
+/// true while our tray host is paused for an Explorer restart (`explorer_gone` until resume).
+pub fn host_paused() -> bool {
+    HOST_PAUSED_AT.load(Relaxed) != 0
+}
+
+/// true once the exit has begun (`RESTORING`, set by `begin_exit` / `restore()`).
+pub fn exiting() -> bool {
+    RESTORING.load(Relaxed)
+}
+
 /// true for a `Shell_TrayWnd` created by the tray host of ANY dock process (property
 /// `tray_host::PROP_DOCK_TRAY_HOST`) or by this process. Used by `native_taskbars()`,
 /// `on_winevent` and by the tray host to tell Explorer's taskbar apart.
@@ -853,28 +884,48 @@ fn broadcast_taskbar_created() -> bool {
     true
 }
 
+/// What `on_reannounce_timer` does while our tray host is paused for an Explorer restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseStep {
+    /// Keep waiting for the new Explorer's desktop.
+    Wait,
+    /// Start our tray host again (desktop registered, or `HOST_RESUME_MAX_MS` elapsed).
+    Resume,
+    /// The dock is exiting: drop the pause, never start a host.
+    GiveUp,
+}
+
+/// Pure decision of the pause: `paused_at` / `now` from `now_ms()`, `exiting` = `RESTORING`.
+fn pause_step(paused_at: u64, now: u64, desktop_ready: bool, exiting: bool) -> PauseStep {
+    if exiting {
+        PauseStep::GiveUp
+    } else if !desktop_ready && now.saturating_sub(paused_at) < HOST_RESUME_MAX_MS {
+        PauseStep::Wait
+    } else {
+        PauseStep::Resume
+    }
+}
+
 /// `TIMER_TRAY_REANNOUNCE` (one-shot, already killed by `main`): second announcement after an Explorer
 /// restart, if the taskbar is still hidden and the tray host is active.
 pub fn on_reannounce_timer() {
     let paused = HOST_PAUSED_AT.load(Relaxed);
     if paused != 0 {
         // Waiting for the new Explorer: its desktop first, then our host (`HOST_RESUME_MAX_MS` at most).
-        let waited = now_ms().saturating_sub(paused);
-        if !crate::shell_thread::desktop_registered() && waited < HOST_RESUME_MAX_MS {
-            arm_reannounce(1000);
-            return;
-        }
-        HOST_PAUSED_AT.store(0, Relaxed);
-        if !HIDDEN.load(Relaxed) {
-            return;
-        }
-        log!("taskbar: Explorer back after {waited} ms, starting our tray host again");
-        let hook = crate::popup::suspend_mouse_hook();
-        let started = crate::tray_host::start(crate::hwnd());
-        crate::popup::resume_mouse_hook(hook);
-        match started {
-            Ok(()) => announce_tray(),
-            Err(e) => log!("taskbar: tray host not restarted (icons stay in Explorer's tray): {e}"),
+        let now = now_ms();
+        match pause_step(paused, now, crate::shell_thread::desktop_registered(), RESTORING.load(Relaxed)) {
+            PauseStep::Wait => arm_reannounce(1000),
+            PauseStep::GiveUp => HOST_PAUSED_AT.store(0, Relaxed),
+            PauseStep::Resume => {
+                HOST_PAUSED_AT.store(0, Relaxed);
+                if !HIDDEN.load(Relaxed) {
+                    return;
+                }
+                let waited = now.saturating_sub(paused);
+                log!("taskbar: Explorer back after {waited} ms, syncing the tray host");
+                // The current `show_tray` decides (it may have been switched off during the pause).
+                crate::ui::tray_sync();
+            }
         }
         return;
     }
@@ -934,5 +985,17 @@ mod tests {
         // Unit tests never initialize the data folder: nothing legacy is read or recorded.
         assert_eq!(read_legacy_state(), None);
         assert!(legacy_marker_path().is_none());
+    }
+
+    #[test]
+    fn pause_state_machine() {
+        use PauseStep::*;
+        let max = HOST_RESUME_MAX_MS;
+        assert_eq!(pause_step(1000, 1500, false, false), Wait, "desktop not registered yet");
+        assert_eq!(pause_step(1000, 1500, true, false), Resume);
+        assert_eq!(pause_step(1000, 1000 + max - 1, false, false), Wait);
+        assert_eq!(pause_step(1000, 1000 + max, false, false), Resume, "stop waiting, start anyway");
+        assert_eq!(pause_step(1000, 1500, true, true), GiveUp, "exit began: never start a host");
+        assert_eq!(pause_step(1000, 1500, false, true), GiveUp);
     }
 }

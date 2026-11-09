@@ -1,4 +1,4 @@
-# mini-oled-dock
+# <img src="assets/icon-256.png" alt="" width="40" height="40" align="absmiddle"> mini-oled-dock
 
 [![CI](https://github.com/ops-software/mini-oled-dock/actions/workflows/ci.yml/badge.svg)](https://github.com/ops-software/mini-oled-dock/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/ops-software/mini-oled-dock)](https://github.com/ops-software/mini-oled-dock/releases/latest)
@@ -11,7 +11,7 @@ A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust
 It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), the bar shows program names only (window titles appear in the hover previews), tray icons of other apps are hosted in the bar, and every popup is drawn by hand.
 
 - **Tiny:** the executable is about 0.7 MB and uses roughly 10 MB of RAM, trimmed to under 1 MB while hidden (numbers from the author's machine).
-- **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
+- **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network, battery and metrics modules are polled only while the bar is visible.
 - **Safe to try:** a watchdog process always restores the native taskbar, and `dock.exe --restore` works even when no dock is running.
 - **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it.
 
@@ -35,13 +35,21 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|---|
 | ![](docs/screenshots/popup_calendar.png) | ![](docs/screenshots/popup_network.png) | ![](docs/screenshots/popup_power.png) |
 
-| Window previews | Tray: choose visible icons | Settings |
+| Battery bar (percent beside) | Battery bar (percent inside, charging) | Battery popup |
 |---|---|---|
-| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_settings.png) |
+| ![](docs/screenshots/bar_battery.png) | ![](docs/screenshots/bar_battery_inside.png) | ![](docs/screenshots/popup_battery.png) |
 
-| Settings: screen | Settings: follow the pointer | Settings: Start menu | Settings in Italian |
-|---|---|---|---|
-| ![](docs/screenshots/popup_settings_screen.png) | ![](docs/screenshots/popup_settings_pointer.png) | ![](docs/screenshots/popup_settings_startmenu.png) | ![](docs/screenshots/popup_settings_it.png) |
+| Window previews | Tray: choose visible icons | Settings: Appearance |
+|---|---|---|
+| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/settings_appearance.png) |
+
+| Settings: Bar | Settings: Start | Settings: Modules |
+|---|---|---|
+| ![](docs/screenshots/settings_bar.png) | ![](docs/screenshots/settings_start.png) | ![](docs/screenshots/settings_modules.png) |
+
+| Settings: Screen | Settings: Updates | Settings: About |
+|---|---|---|
+| ![](docs/screenshots/settings_screen.png) | ![](docs/screenshots/settings_updates.png) | ![](docs/screenshots/settings_about.png) |
 
 ## Features
 
@@ -74,13 +82,14 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - **Notifications:** click one to switch to the app that sent it, X or **Clear all** remove them from Windows' notification history too; Do not disturb.
 - **Audio:** volume, mute, output device, spatial sound formats available on the current output (Windows Sonic, Dolby Atmos, ...) and a per-app mixer. Sections can be collapsed, hidden and reordered; a collapsed or hidden section loads nothing.
 - **Network:** Wi-Fi signal bars or ethernet, with a globe badge when the internet is reachable; click for name, IPv4 and signal.
+- **Battery** (laptops): an Apple-style battery icon with the fill proportional to the charge, a bolt while charging, and the percentage beside the icon or inside it. Orange fill under 20 %, red at 10 % and below. Shown automatically only when Windows reports a battery, so a desktop sees no change; click for charge, state, time remaining on battery and the power plan.
 - **System metrics** (off by default): CPU and RAM usage; click opens Task Manager.
 - **Calendar**, **power** menu and an **app menu** (new window, pin / unpin, close).
 - **Tray icon hosting**, with an overflow popup and a view to choose which icons stay in the bar.
 
 ### Settings and system
 
-- **Settings popup** (from the power button): every option, applied live and saved to a commented JSON config that also reloads on its own when edited by hand.
+- **Settings window** (power button → **Settings**, Start quick links → **Dock settings**, or `dock.exe --settings`): seven pages (Appearance, Bar, Start, Modules, Screen, Updates, About), every option applied live and saved to the commented `config.json`, which also reloads on its own when edited by hand.
 - **Language:** System (follows Windows), English or Italian, applied at once, clock and calendar included.
 - Autostart without UAC prompts (scheduled task).
 - Watchdog process that always restores the native taskbar.
@@ -103,15 +112,22 @@ The exe asks for administrator rights (UAC prompt): a non-elevated process canno
 To start with Windows (or use the toggle in the power popup):
 
 ```powershell
-.\target\release\dock.exe --install     # copies the exe to %ProgramFiles%\mini-oled-dock and registers a logon task
-.\target\release\dock.exe --uninstall   # removes the logon task
+.\target\release\dock.exe --install     # copies the exe to %ProgramFiles%\mini-oled-dock, registers a logon task and an Add/Remove Programs entry, starts the dock
+.\target\release\dock.exe --uninstall   # removes the logon task and the Add/Remove Programs entry
+.\target\release\dock.exe --version     # prints "mini-oled-dock X.Y.Z"
 ```
+
+`--install` replaces the installed `dock.exe` in one step: the new copy is first written next to it as `dock.exe.new`, so a failed copy never leaves a half-written file. A running dock is asked to exit, and the installer waits up to 35 s until neither the dock nor its taskbar-restoring watchdog is left. Then the new copy is started (`--no-relaunch` skips that). If a dock is still running when `--install` ends (for example, `--install` run from the installed copy while it runs), it is left running and nothing is restarted. `--quiet` shows no message box, for scripts and unattended runs. Exit codes: `0` success, `1` failure, `2` bad arguments, `3` the running dock could not be stopped.
 
 The logon task runs the dock elevated, so the installed copy lives in an admin-only folder (`%ProgramFiles%\mini-oled-dock\dock.exe`, inheriting the Program Files permissions) that normal programs cannot modify. Its data lives in `%ProgramData%\mini-oled-dock` (see [Data folder](#data-folder)).
 
-**Update:** run `--install` again after rebuilding; if the installed dock is running it is asked to exit and restarted from the new copy. If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
+**Update:** the dock checks GitHub Releases once a day (`update_check`, one request to api.github.com, nothing is downloaded by the check). When a newer version exists, an orange dot with a count on **Settings** in the power popup shows it. Nothing is installed unless you set `update_auto_install` to `true`: then a verified release is installed when no popup is open and no fullscreen app is in front. The installer downloads `dock.exe` and its `.sha256` into the admin-only folder `%ProgramData%\mini-oled-dock\update\<tag>\`, checks the hash, runs the new exe's `--version`, and then runs its `--install --quiet`. No UAC prompt is shown, and the dock restarts from the new copy by itself. Trust rests on HTTPS to github.com and on the hash published with the same release; the exe is not code-signed.
 
-**Uninstall:** `--uninstall` removes the logon task but keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). Delete that folder from an elevated prompt if you no longer need it, and `%ProgramData%\mini-oled-dock` (also elevated) to remove your settings, logs and icons.
+Manual updating still works: run `--install` from a downloaded `dock.exe`. Diagnostics: `dock.exe --update-check` makes one check and prints the result (exit `0` when GitHub answered, `1` when it could not be checked); `dock.exe --update-install <tag>` verifies and installs a release already staged in `update\<tag>\`, and accepts no other path.
+
+If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
+
+**Uninstall:** `--uninstall` removes the logon task and the Add/Remove Programs entry and keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). `--uninstall --remove`, which Settings → Apps → Installed apps also runs, stops the dock, restores the taskbar, deletes `%ProgramFiles%\mini-oled-dock` (a file still in use goes at the next restart) and the downloaded updates, and keeps your settings, logs and icons. `--uninstall --remove --purge-data` also deletes `%ProgramData%\mini-oled-dock`. Add `--quiet` to either form for a silent run.
 
 ## Usage
 
@@ -121,12 +137,19 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 - **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu; resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup (output, spatial sound, per-app mixer). Click a section header to collapse it; the pencil at the bottom enters Customize mode (eye = hide / show, drag a header to reorder).
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
+- **Battery:** left click opens the battery popup (charge, state, time remaining on battery, power plan, "Power & battery settings"); right click opens Windows' battery saver settings. The wheel is not used.
 - **System metrics:** click opens Task Manager.
-- **Settings:** power button, then **Settings**: position, screen (with two or more displays: **Main**, the display number or **Pointer**), display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
-  - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
-  - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
+- **Settings window:** power button, then **Settings** (or Start quick links → **Dock settings**, or `dock.exe --settings`). Resizable, with a dark title bar in the bar's colour and a navigation on the left; `Esc` closes, `Tab` moves between the navigation and the page, `Up`/`Down` change page.
+  - **Appearance:** a live preview of the bar, the background colour (seven dark presets: Black, Graphite, Slate, Navy, Plum, Wine, Forest, and a custom swatch that opens a colour picker with saturation/value square, hue strip, preview and hex code), the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse), sliders for app icons, app names, tray icons and modules, **Reset sizes**, and the language.
+  - **Bar:** position, display mode, auto-hide, window previews, clock seconds, volume percent.
+  - **Start:** the Start button, the Start layout, Win key opens Start, and the import of pinned apps from Windows Start.
+  - **Modules:** one switch per module, the **Battery** group (show: Auto, On or Off; percentage; percentage inside the icon), the **Tray** group (tray icons, **Icons of apps run as administrator**, see [Tray icons of elevated apps](#configuration)) and the tray icon chooser, inline.
+  - **Screen:** which display the bar sits on (**Main**, the display number, or **Pointer**).
+  - **Updates:** installed and available version, last check, **Check now**, **Release notes**, **Update now**, and the switches for the daily check and the automatic install.
+  - **About:** version, memory, the data folder and the log, and **Exit the dock** (restores the Windows taskbar).
 
-  Sliders follow a drag or a click on the track, and the mouse wheel (opacity and modules in steps of 5 %, the others 1 px). Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button.
+  Sliders follow a drag or a click on the track; the mouse wheel scrolls the page. Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button. The window remembers its size (`settings_window_size`).
+- **Updates:** an orange dot on Settings in the power popup means a new release is available.
 - **Exit:** `Ctrl+Alt+Q`, or the power popup, or `dock.exe --restore`.
 
 ## Configuration
@@ -143,7 +166,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `app_icon_size` | `16` | App icon size in logical px, 14-32 |
 | `app_text_size` | `13` | App name text size in logical px, 10-18 |
 | `tray_icon_size` | `16` | Tray icon size in logical px, 12-24 |
-| `module_size` | `100` | Scale of the Start button and the system modules (notifications, volume, network, metrics, clock, show desktop, power) in percent, 75-150 |
+| `module_size` | `100` | Scale of the Start button and the system modules (notifications, volume, network, battery, metrics, clock, show desktop, power) in percent, 75-150 |
 | `background` | `"#000000"` | Background colour of the bar and the popups, `"#RRGGBB"` (the old values `"black"` and `"dark"` are still accepted) |
 | `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
@@ -154,6 +177,9 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `show_volume_percent` | `true` | Show `NN%` next to the speaker |
 | `show_tray` | `true` | Host other apps' tray icons (switching it off stops the tray host; the icons go back to Explorer) |
 | `show_network` | `true` | Network module: Wi-Fi bars / ethernet, internet badge, details popup |
+| `show_battery` | `"auto"` | Battery module: `"auto"` (only when the PC has a battery), `true` (always) or `false` (never) |
+| `battery_percent` | `true` | Show the charge percentage with the battery icon |
+| `battery_percent_inside` | `false` | Draw the percentage inside a larger battery icon instead of beside it |
 | `show_metrics` | `false` | CPU / RAM usage module (click opens Task Manager) |
 | `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
 | `show_start_button` | `true` | Start button at the left end of the bar (a fixed item, not a movable module) |
@@ -164,18 +190,22 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `win_opens_start` | `false` | One tap of Win opens the dock and the Start menu together |
 | `start_style` | `"vertical"` | Start menu layout: `"vertical"` or `"horizontal"` |
 | `audio_layout` | `"MOSX"` | Volume popup sections in order (M master, O output, S spatial, X mixer; lowercase = collapsed, `-` in front = hidden); normally set from the popup |
+| `update_check` | `true` | Ask GitHub once a day whether a newer release exists (badge only) |
+| `update_auto_install` | `false` | Download, verify and install new releases by themselves |
+
+`last_update_check` and `update_available` are written by the dock itself.
 
 The bar height follows the tallest content; the defaults give the original 36 px bar. An old `bar_size` value (`"small"`, `"medium"`, `"large"`) is converted once into the four sizes.
 
 Tray visibility and ordering (`tray_hidden`, `app_order`, `tray_order`, `modules_order`) are written by the dock itself.
 
-**Tray icons of elevated apps.** The dock runs as administrator, so by default it refuses to send click, hover and menu messages to a tray icon whose window belongs to another elevated program: otherwise any normal program could register a fake icon pointing at an elevated window and use the dock to deliver messages Windows would block (a UIPI bypass). This opt-in is deliberately not in `config.json` (any program running as you can write that file); it is an admin-only registry value. To enable it, from an elevated PowerShell:
+**Tray icons of elevated apps.** The dock runs as administrator, so by default it refuses to send click, hover and menu messages to a tray icon whose window belongs to another elevated program (for example MSI Afterburner run as administrator): a tray registration can come from any program and names the window and the message itself, and Windows does not tell the dock which program sent it, so otherwise any normal program could register a fake icon pointing at an elevated window and use the dock to deliver messages Windows would block (a UIPI bypass). To use such icons, turn on **Settings → Modules → Tray → Icons of apps run as administrator**. The switch is not in `config.json` (any program running as you can write that file): it is the admin-only registry value `HKLM\SOFTWARE\mini-oled-dock\TrustElevatedTrayIcons` (DWORD, 1 = on), which the elevated dock writes when you flip the toggle and which takes effect at once. It can also be set by hand from an elevated PowerShell (picked up within about 10 s; `0` or deleting the key turns it off):
 
 ```powershell
 New-Item -Path HKLM:\SOFTWARE\mini-oled-dock -Force; Set-ItemProperty HKLM:\SOFTWARE\mini-oled-dock TrustElevatedTrayIcons 1 -Type DWord
 ```
 
-It is picked up within about 10 s. Set it to `0` or delete the key to turn it off. System messages (below `WM_USER`) are never forwarded to elevated windows either way.
+Even with the switch on, the dock sends a message to an elevated window only if: the window still belongs to the process that owned it when the icon was registered, and that process still runs the same program file the dock recorded for the icon then; and the message is an application message (`WM_USER` to `0xFFFF`: private, `WM_APP` and registered messages), never a system message below `WM_USER` such as `WM_COMMAND` or `WM_SYSCOMMAND`; and the window is a top-level or message-only window, never a child control (controls read `WM_USER`-range messages as commands). What remains possible with the switch on: a normal program can still make the dock send an application message (`WM_USER` to `0xFFFF`), with a value it partly chooses, to a window of a program running as administrator, when you click or hover an icon it registered. The process and program-file checks only stop a closed program's window or process id from being reused; they do not limit which elevated window can be named. Turn the switch on only if you trust the programs you run. Icons of programs that do not run as administrator are not affected by the switch. A refused click is logged once per window in `dock.log`, naming the Settings option and the registry value.
 
 A pinned app looks like this; `launch` is an exe path or `shell:AppsFolder\<AUMID>` (list AUMIDs with `Get-StartApps`), `icon` is an optional PNG in `%ProgramData%\mini-oled-dock\icons\` (you can drop files there without admin rights; at most 4 MB, no shortcuts, links or hard links), given as a plain file name only (paths, `..`, drive letters and UNC paths are rejected). Pinning from the right-click menu fills it in for you. Apps are always started without administrator rights, through the desktop shell, even though the dock itself is elevated; if that is not possible the launch is refused rather than run elevated. The two admin entries of the Start quick-links menu (Terminal and PowerShell) ask Explorer to start them with the `runas` verb, so they go through the normal UAC prompt; the dock never uses its own token.
 
@@ -213,6 +243,7 @@ Everything the dock stores is in `%ProgramData%\mini-oled-dock`:
 | `config.json` (+ `config.json.bak`) | settings | you (edit in place) and administrators; the `.bak` copy is admin-only |
 | `icons\` | your custom PNGs | you can add, replace and delete files |
 | `cache\` | extracted icon cache (PNG) | administrators only |
+| `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), deleted once that version or a newer one runs | administrators only |
 | `dock.log`, `dock.log.1` | log, rotated at 2 MB | administrators only |
 | `taskbar-state` | the original taskbar state, used to restore it | administrators only |
 
@@ -228,6 +259,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
+| [1.4.0](.github/release-notes/v1.4.0.md) | unreleased | Self-updater, battery module, Settings window, review fixes |
 | [1.3.0](.github/release-notes/v1.3.0.md) | 2026-10-29 | Keeps working across Explorer restarts, multi-monitor edge fix, −511 lines de-duplication |
 | [1.2.1](.github/release-notes/v1.2.1.md) | 2026-10-29 | Hotfix: the first click on a popup is no longer lost |
 | [1.2.0](.github/release-notes/v1.2.0.md) | 2026-10-29 | Horizontal Start, Win opens Start, IT/EN language, spatial sound and mixer, customizable volume popup |

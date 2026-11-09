@@ -19,6 +19,9 @@
 //!    the user can create entries there, custom icons are opened WITHOUT following reparse points,
 //!    must be single-link regular files whose final path is exactly `<icons>\<name>`, and are decoded
 //!    from memory (`read_icon`). The elevated process never writes into `icons\`.
+//!  * `<root>\update\<tag>\`: releases staged by the updater (`dock.exe`, `dock.exe.sha256`),
+//!    admin-only (inherited root DACL). A staged file is read or executed only through the checked
+//!    path (`read_stage_file`, `checked_stage_path`).
 //!
 //! MODES: `init()` runs once, in the processes that need persistent data (dock, watchdog,
 //! `--install`/`--uninstall`, `--restore`). Elevated: creates, verifies and repairs the folders.
@@ -75,6 +78,10 @@ use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, FOLDERID_ProgramData, SHG
 pub const ROOT_NAME: &str = "mini-oled-dock";
 const CACHE_NAME: &str = "cache";
 const ICONS_NAME: &str = "icons";
+/// `<root>\update\<tag>\`: staged releases (admin-only, inherited root DACL).
+const UPDATE_NAME: &str = "update";
+/// The only files a staging folder holds.
+const STAGE_FILES: [&str; 2] = ["dock.exe", "dock.exe.sha256"];
 
 /// Size caps of the files read into memory.
 pub const CONFIG_MAX_BYTES: u64 = 1024 * 1024;
@@ -533,6 +540,159 @@ pub fn read_icon(name: &str) -> io::Result<Vec<u8>> {
         ));
     }
     read_capped(f, ICON_MAX_BYTES)
+}
+
+// ------------------------------------------------------------------ update staging
+
+/// true for a staging folder name: 1..=32 chars of `[A-Za-z0-9.]`, not starting with `.`, no `..`.
+/// Pure. Canonical release tags (`v1.4.0`) pass; separators, drive colons and spaces never do.
+pub(crate) fn is_plain_dir_name(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && !s.starts_with('.')
+        && !s.contains("..")
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
+/// The verified root, only if this process may write in it (elevated).
+fn writable_root() -> Result<&'static Root, String> {
+    root_ref().filter(|r| r.writable).ok_or_else(|| "no writable data folder".to_string())
+}
+
+/// Rejects anything but a plain tag and one of `STAGE_FILES`.
+fn check_stage_names(tag: &str, name: Option<&str>) -> Result<(), String> {
+    if !is_plain_dir_name(tag) {
+        return Err(format!("{tag:?} is not a plain folder name"));
+    }
+    match name {
+        Some(n) if !STAGE_FILES.contains(&n) => Err(format!("{n:?} is not a staging file")),
+        _ => Ok(()),
+    }
+}
+
+/// An existing folder that must classify `Use` as is (admin-owned, admin-only, not a reparse point);
+/// returns its final path. Nothing is repaired here.
+fn checked_dir(path: &Path) -> Result<String, String> {
+    let shown = path.display();
+    let dir = open_dir(path, false).map_err(|e| format!("cannot open {shown}: {e}"))?;
+    let facts = dir_facts(&dir).map_err(|e| format!("cannot inspect {shown}: {e}"))?;
+    match classify(&facts, false) {
+        Verdict::Use => final_path(handle_of(&dir.handle)).ok_or_else(|| format!("{shown}: final path unavailable")),
+        v => Err(format!("{shown} is not usable ({v:?})")),
+    }
+}
+
+/// `<root>\update`, which must already exist and be admin-only.
+fn checked_update_dir(r: &Root) -> Result<PathBuf, String> {
+    let update = r.path.join(UPDATE_NAME);
+    checked_dir(&update)?;
+    Ok(update)
+}
+
+/// Creates (or validates) `<root>\update` and `<root>\update\<tag>` and returns the latter. Both
+/// inherit the protected root DACL (no explicit SDDL) and must end up admin-only.
+pub fn update_stage_dir(tag: &str) -> Result<PathBuf, String> {
+    let r = writable_root()?;
+    check_stage_names(tag, None)?;
+    let mut notes = Vec::new();
+    let update = r.path.join(UPDATE_NAME);
+    let stage = update.join(tag);
+    for dir in [&update, &stage] {
+        if ensure_subdir(dir, None, true, &mut notes).is_none() {
+            return Err(notes.join("; "));
+        }
+    }
+    Ok(stage)
+}
+
+/// Names of the real subfolders of an EXISTING `<root>\update` that are plain names (never creates
+/// it). Reparse points and odd names are skipped; empty without a writable root.
+pub fn update_stage_names() -> Vec<String> {
+    let Ok(update) = writable_root().and_then(checked_update_dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&update) else { return Vec::new() };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            // symlink_metadata never follows a junction or symlink.
+            std::fs::symlink_metadata(e.path()).is_ok_and(|m| {
+                use std::os::windows::fs::MetadataExt;
+                m.is_dir() && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+            })
+        })
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| is_plain_dir_name(n))
+        .collect()
+}
+
+/// Writes `<root>\update\<tag>\<name>` atomically (admin-only, inherited DACL), creating the folders.
+pub fn write_stage_file(tag: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    writable_root()?;
+    check_stage_names(tag, Some(name))?;
+    let dir = update_stage_dir(tag)?;
+    write_atomic(&dir.join(name), bytes, FileAcl::Inherit)
+}
+
+/// Opens a staged file like `read_icon`: the stage folder (and `update\`) must be admin-only real
+/// folders, the file a single-link regular file (no reparse point) whose final path is exactly
+/// `<stage folder>\<name>`.
+fn open_stage_file(tag: &str, name: &str) -> io::Result<(File, PathBuf)> {
+    let denied = |e: String| io::Error::new(io::ErrorKind::PermissionDenied, e);
+    let r = writable_root().map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
+    check_stage_names(tag, Some(name)).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let dir = checked_update_dir(r).map_err(denied)?.join(tag);
+    let dir_final = checked_dir(&dir).map_err(denied)?;
+    let path = dir.join(name);
+    let f = open_checked(&path, true)?;
+    let fin = final_path(handle_of(&f)).ok_or_else(|| io::Error::other("final path unavailable"))?;
+    if !final_path_matches(&fin, &dir_final, name) {
+        return Err(denied(format!("resolves to {fin}, outside the staging folder")));
+    }
+    Ok((f, path))
+}
+
+/// Reads a staged file (at most `cap` bytes) through the checks of `open_stage_file`.
+pub fn read_stage_file(tag: &str, name: &str, cap: u64) -> io::Result<Vec<u8>> {
+    read_capped(open_stage_file(tag, name)?.0, cap)
+}
+
+/// Path of a staged file that passed the checks of `open_stage_file`: the only path the updater
+/// may execute. The folder is admin-only, so it cannot be swapped after the check.
+pub fn checked_stage_path(tag: &str, name: &str) -> io::Result<PathBuf> {
+    open_stage_file(tag, name).map(|(_, p)| p)
+}
+
+/// Removes `<root>\update\<tag>` and everything in it (missing = Ok). `remove_dir_all` does not
+/// follow junctions or symlinks inside the tree (Rust 1.58.1+); `update\` and the stage folder
+/// themselves must be admin-only real folders.
+pub fn remove_update_stage(tag: &str) -> Result<(), String> {
+    let r = writable_root()?;
+    check_stage_names(tag, None)?;
+    let stage = r.path.join(UPDATE_NAME).join(tag);
+    if std::fs::symlink_metadata(&stage).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    checked_update_dir(r)?;
+    checked_dir(&stage)?;
+    std::fs::remove_dir_all(&stage).map_err(|e| format!("removing {}: {e}", stage.display()))
+}
+
+/// Removes the whole `<root>\update` (missing = Ok), with the same guarantees as `remove_update_stage`.
+pub fn remove_update_dir() -> Result<(), String> {
+    let r = writable_root()?;
+    let update = r.path.join(UPDATE_NAME);
+    if std::fs::symlink_metadata(&update).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    checked_update_dir(r)?;
+    std::fs::remove_dir_all(&update).map_err(|e| format!("removing {}: {e}", update.display()))
+}
+
+/// Deletes the whole data root (`--uninstall --remove --purge-data`). `remove_dir_all` does not follow
+/// junctions or symlinks inside the tree (Rust 1.58.1+), which matters because `icons\` is
+/// user-writable. Call only after `logger::stop`: `dock.log` is open while the logger runs.
+pub fn purge() -> Result<(), String> {
+    let r = writable_root()?;
+    checked_dir(&r.path)?;
+    std::fs::remove_dir_all(&r.path).map_err(|e| format!("removing {}: {e}", r.path.display()))
 }
 
 /// Reads the legacy `%LOCALAPPDATA%\Dock\config.json` for the one-time migration. `Ok(None)` = absent.
@@ -1087,6 +1247,30 @@ mod tests {
         assert!(!final_path_matches(r"\\?\C:\Windows\System32\a.png", dir, "a.png"));
         assert!(!final_path_matches(r"\\?\C:\ProgramData\mini-oled-dock\icons\sub\a.png", dir, "a.png"));
         assert!(!final_path_matches(r"\\?\C:\ProgramData\mini-oled-dock\icons\b.png", dir, "a.png"));
+    }
+
+    #[test]
+    fn plain_dir_names() {
+        for ok in ["v1.4.0", "v10.0.12"] {
+            assert!(is_plain_dir_name(ok), "{ok}");
+        }
+        let long = "a".repeat(33);
+        for bad in ["", ".", "..", ".v1", "v1..4", "v1/4", r"v1\4", "v1.4.0 ", "C:", "v1:4", long.as_str()] {
+            assert!(!is_plain_dir_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn staging_needs_an_initialized_writable_root() {
+        // Unit tests never call init(): nothing may be created or touched.
+        assert!(update_stage_dir("v1.4.0").is_err());
+        assert!(update_stage_names().is_empty());
+        assert!(read_stage_file("v1.4.0", "dock.exe", 10).is_err());
+        assert!(checked_stage_path("..", "dock.exe").is_err());
+        assert!(write_stage_file("v1.4.0", "dock.exe", b"x").is_err());
+        assert!(remove_update_stage("v1.4.0").is_err());
+        assert!(remove_update_dir().is_err());
+        assert!(purge().is_err());
     }
 
     #[test]

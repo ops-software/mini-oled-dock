@@ -57,7 +57,7 @@ pub const WM_DOCK_APP_MENU_CMD: u32 = WM_APP + 13;
 /// POPUP window (not the dock's): a mouse button went down outside the popup. wParam = lParam = 0.
 /// Posted (never handled inside the hook callback); the popup closes itself.
 pub const WM_POPUP_OUTSIDE: u32 = WM_APP + 14;
-/// Settings popup (UI thread, popup window) -> dock window: a setting was changed and saved
+/// Settings window (UI thread, `DockSettings` window) -> dock window: a setting was changed and saved
 /// (`config::modify`). wParam = lParam = 0. Posted so the bar is rebuilt OUTSIDE the popup's
 /// wnd_proc (no re-entry). `main` calls `ui::on_config_changed()`.
 pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
@@ -65,6 +65,12 @@ pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
 /// dock's Start menu (`popup_startmenu`). wParam = 0, lParam = 0. Posted by the `hook` thread
 /// INSTEAD of the second `WM_DOCK_TOGGLE`. `main` calls `ui::open_start_menu()`.
 pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
+/// Popups, the quick-links menu and `--settings` -> dock window: open the Settings window (or bring
+/// the open one to the front). wParam = lParam = 0. `main` calls `settings_window::open()`.
+pub const WM_DOCK_OPEN_SETTINGS: u32 = WM_APP + 40;
+/// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
+/// Consecutive posts may be coalesced: re-read `update::status()`.
+pub const WM_DOCK_UPDATE: u32 = WM_APP + 17;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
@@ -122,6 +128,13 @@ pub const TIMER_HOVER_PICKER: usize = 11;
 /// 300 ms one-shot on the PICKER window: the pointer left the picker and the app item; closes the
 /// picker unless the pointer came back. Armed and handled only by `picker`.
 pub const TIMER_PICKER_LEAVE: usize = 12;
+/// 30 s on the dock window, ONLY while the bar is visible, a battery is present and the module is not
+/// off; armed and killed by `ui::battery_sync`. Handled by `ui`.
+pub const TIMER_BATTERY: usize = 13;
+/// Dock window, armed only while `update_check` is on (`update::sync_timer`): first 60 s after start,
+/// then the remaining time to 24 h since `last_update_check`, 24 h after a check, 1 h after a failed
+/// scheduled check. Handled by `main` -> `update::on_timer`.
+pub const TIMER_UPDATE_CHECK: usize = 14;
 
 // POPUP window timers (different hwnd from the dock's; handled only by `popup`).
 /// 15 ms: popup open fade and hover plate; off when idle.
@@ -132,6 +145,19 @@ pub const TIMER_POPUP_TICK: usize = 31;
 /// Short one-shot retries (`FOCUS_RETRY_MS`) after open while the popup did NOT get the foreground
 /// (keyboard focus: the Start menu search box). Off once it is foreground, after the last try, on close.
 pub const TIMER_POPUP_FOCUS: usize = 32;
+/// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
+/// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
+pub const TIMER_POPUP_START_RELEASE: usize = 33;
+
+// SETTINGS window timers (`DockSettings` hwnd; handled only by `settings_window`). Timer ids are per
+// HWND, so they could not clash with the dock window's private ones (`ui.rs`: 40, 41, 42), but 50 to
+// 52 keep this registry unambiguous.
+/// 1 s, ONLY while the Settings window is open: import and update status, memory figures.
+pub const TIMER_SETTINGS_TICK: usize = 50;
+/// One-shot: sends the bar rebuild (`WM_DOCK_CONFIG_APPLY`) that the drag throttle skipped.
+pub const TIMER_SETTINGS_APPLY: usize = 51;
+/// One-shot: redraws the mini bar of the Appearance page that its throttle skipped (drag, resize).
+pub const TIMER_SETTINGS_BAR: usize = 52;
 
 // --------------------------------------------- context menu command ids
 

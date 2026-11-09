@@ -59,7 +59,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, GetWindowThreadProcessId,
     KillTimer, PeekMessageW, PostMessageW, PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage,
-    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
+    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
     WM_GETICON, WM_QUIT, WM_TIMER,
 };
 
@@ -100,7 +100,8 @@ pub struct StartApp {
 }
 
 /// Tools the Start menu can start elevated (via UAC, see `ShellRequest::LaunchAdmin`). A closed set:
-/// the executable is a constant resolved here, never a string from the config, pins or registry.
+/// the target is a constant resolved here (an absolute System32 path or an AUMID), never a bare exe
+/// name and never a string from the config, pins or registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminTool {
     Terminal,
@@ -108,10 +109,14 @@ pub enum AdminTool {
 }
 
 impl AdminTool {
-    fn exe(self) -> &'static str {
+    /// What Explorer is asked to run: PowerShell by absolute path under `system_dir`, the Store app
+    /// Windows Terminal by its AUMID.
+    fn target(self, system_dir: &std::path::Path) -> String {
         match self {
-            AdminTool::Terminal => "wt.exe",
-            AdminTool::PowerShell => "powershell.exe",
+            AdminTool::Terminal => r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(),
+            AdminTool::PowerShell => {
+                system_dir.join(r"WindowsPowerShell\v1.0\powershell.exe").to_string_lossy().into_owned()
+            }
         }
     }
 }
@@ -187,6 +192,8 @@ pub enum ShellRequest {
     /// One batch of Start menu icons -> `ShellEvent::StartIcons`. Queued by `ListStartApps` only;
     /// low priority like `ResolveApp`.
     StartIcons { icon_px: u32, ids: Vec<String> },
+    /// The Start menu closed: forget the icons sent and drop the queued `StartIcons` batches.
+    StartRelease,
     /// Click on a notification whose app has no open window: launches the app that sent it, found in
     /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
     OpenNotifApp { aumid: String, name: String },
@@ -583,6 +590,7 @@ impl Shell {
                 }
             }
             ShellRequest::ListStartApps { icon_px, first } => self.list_start_apps(icon_px, &first),
+            ShellRequest::StartRelease => start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending),
             ShellRequest::StartIcons { icon_px, ids } => {
                 // A batch queued for a previous size: its ids were forgotten with that size.
                 if icon_px != self.start_px {
@@ -1435,14 +1443,19 @@ fn icon_from_window(hwnd: isize) -> Option<IconBitmap> {
 
 // ------------------------------------------------------------------ launch
 
-/// true if the current process is elevated (token with `TokenIsElevated`). Computed once.
+/// true if the current process is elevated (token with `TokenIsElevated`); false when unknown. Computed once.
 pub(crate) fn is_elevated() -> bool {
-    static ELEVATED: OnceLock<bool> = OnceLock::new();
+    elevation() == Some(true)
+}
+
+/// Whether the current process is elevated; `None` when its token cannot be read. Computed once.
+pub(crate) fn elevation() -> Option<bool> {
+    static ELEVATED: OnceLock<Option<bool>> = OnceLock::new();
     *ELEVATED.get_or_init(|| {
         let mut token = HANDLE::default();
         // SAFETY: GetCurrentProcess returns the pseudo-handle; `token` writable, closed below.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
-            return false;
+            return None;
         }
         let mut te = TOKEN_ELEVATION::default();
         let mut ret = 0u32;
@@ -1459,7 +1472,7 @@ pub(crate) fn is_elevated() -> bool {
         .is_ok();
         // SAFETY: handle opened above and no longer used.
         let _ = unsafe { CloseHandle(token) };
-        ok && te.TokenIsElevated != 0
+        ok.then_some(te.TokenIsElevated != 0)
     })
 }
 
@@ -1486,7 +1499,7 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
         log!("shell: Launch '{target}' args={args:?}");
         return shell_execute(target, args, dir.as_deref());
     }
-    match desktop_shell_execute(target, args, dir.as_deref(), Verb::Open) {
+    match desktop_shell_execute(target, args, dir.as_deref(), Verb::Open, SW_SHOWNORMAL.0) {
         Ok(()) => {
             log!("shell: Launch '{target}' args={args:?} via the desktop shell (de-elevated)");
             Ok(())
@@ -1503,10 +1516,14 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
 /// elevated; if the desktop shell is unavailable the launch is REFUSED (no direct ShellExecute or
 /// CreateProcess, so the dock's token is never inherited). A cancelled prompt is handled by Explorer.
 fn launch_admin(tool: AdminTool) {
-    let exe = tool.exe();
-    match desktop_shell_execute(exe, None, None, Verb::RunAs) {
-        Ok(()) => log!("shell: LaunchAdmin '{exe}' via the desktop shell (runas, UAC prompt)"),
-        Err(e) => log!("shell: LaunchAdmin '{exe}' through the desktop shell failed ({e}): REFUSED"),
+    let Some(sys) = system_dir() else {
+        log!("shell: LaunchAdmin: no system directory: REFUSED");
+        return;
+    };
+    let target = tool.target(&sys);
+    match desktop_shell_execute(&target, None, None, Verb::RunAs, SW_SHOWNORMAL.0) {
+        Ok(()) => log!("shell: LaunchAdmin '{target}' via the desktop shell (runas, UAC prompt)"),
+        Err(e) => log!("shell: LaunchAdmin '{target}' through the desktop shell failed ({e}): REFUSED"),
     }
 }
 
@@ -1575,19 +1592,22 @@ pub(crate) fn desktop_registered() -> bool {
 /// process is NOT elevated even when the dock is:
 /// `IShellWindows::FindWindowSW(CSIDL_DESKTOP)` -> `IServiceProvider::QueryService(SID_STopLevelBrowser)`
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
-/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, SW_SHOWNORMAL)`.
+/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, show)`
+/// (`SW_SHOWNORMAL` except the hidden PowerShell export, see `desktop_open_hidden`).
 /// `verb` is `Open` for every launch except `launch_admin` (`RunAs`: Explorer asks UAC, not the dock).
 /// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
-fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> windows::core::Result<()> {
+fn desktop_shell_execute(
+    file: &str,
+    args: Option<&str>,
+    dir: Option<&str>,
+    verb: Verb,
+    show: i32,
+) -> windows::core::Result<()> {
+    let (desktop, hwnd) = find_desktop()?;
     // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
     // thread and released when it goes out of scope. The VARIANTs passed by pointer outlive the calls.
     unsafe {
-        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
-        let loc = OwnedVariant::i4(CSIDL_DESKTOP as i32);
-        let root = OwnedVariant::empty();
-        let mut hwnd = 0i32;
-        let desktop: IDispatch = windows.FindWindowSW(&loc.0, &root.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
         let sp: IServiceProvider = desktop.cast()?;
         let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
         let view = browser.QueryActiveShellView()?;
@@ -1599,7 +1619,7 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
         // Grant them to Explorer (desktop window owner), which passes them on to the process it
         // starts; ASFW_ANY as a fallback. Both expire at the next user input.
         let mut explorer_pid = 0u32;
-        GetWindowThreadProcessId(HWND(hwnd as isize as *mut c_void), Some(&mut explorer_pid));
+        GetWindowThreadProcessId(hwnd, Some(&mut explorer_pid));
         if explorer_pid == 0 || AllowSetForegroundWindow(explorer_pid).is_err() {
             let _ = AllowSetForegroundWindow(ASFW_ANY);
         }
@@ -1609,9 +1629,51 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
             &OwnedVariant::opt_bstr(args).0,
             &OwnedVariant::opt_bstr(dir).0,
             &OwnedVariant::bstr(verb.as_str()).0,
-            &OwnedVariant::i4(SW_SHOWNORMAL.0).0,
+            &OwnedVariant::i4(show).0,
         )
     }
+}
+
+/// Explorer's desktop (`IShellWindows::FindWindowSW(CSIDL_DESKTOP)`) and its window.
+/// Must be called on a COM STA thread.
+fn find_desktop() -> windows::core::Result<(IDispatch, HWND)> {
+    // SAFETY: COM STA initialized by the caller; the interfaces are released when they go out of
+    // scope and the VARIANTs outlive the call.
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let loc = OwnedVariant::i4(CSIDL_DESKTOP as i32);
+        let root = OwnedVariant::empty();
+        let mut hwnd = 0i32;
+        let desktop: IDispatch = windows.FindWindowSW(&loc.0, &root.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        Ok((desktop, HWND(hwnd as isize as *mut c_void)))
+    }
+}
+
+/// Pid of the Explorer process that owns the desktop window. Must be called on a COM STA thread.
+pub(crate) fn explorer_pid() -> windows::core::Result<u32> {
+    let (_, hwnd) = find_desktop()?;
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale `hwnd` only yields 0.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return Err(windows::Win32::Foundation::E_FAIL.into());
+    }
+    Ok(pid)
+}
+
+/// `file` opened through the desktop shell, de-elevated (see `desktop_shell_execute`), with
+/// `SW_HIDE`: no console window for the PowerShell export.
+/// Must be called on a COM STA thread.
+pub(crate) fn desktop_open_hidden(file: &str, args: Option<&str>, dir: Option<&str>) -> windows::core::Result<()> {
+    desktop_shell_execute(file, args, dir, Verb::Open, SW_HIDE.0)
+}
+
+/// `System32` from `GetSystemDirectoryW` (never from an environment variable).
+pub(crate) fn system_dir() -> Option<std::path::PathBuf> {
+    let mut buf = [0u16; 260];
+    // SAFETY: `buf` is writable and its length is passed by the wrapper.
+    let n = unsafe { windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
 // ------------------------------------------------------------------ show desktop
@@ -1672,9 +1734,40 @@ fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) -> Result<
     unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| format!("ShellExecuteExW: {e}"))
 }
 
+/// `StartRelease`: a reopened Start menu starts from nothing, so the next `ListStartApps` resends every icon.
+fn start_release(start_px: &mut u32, sent: &mut HashSet<String>, pending: &mut VecDeque<ShellRequest>) {
+    *start_px = 0;
+    sent.clear();
+    pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_release_makes_a_reopen_resend_everything() {
+        let mut px = 48u32;
+        let mut sent: HashSet<String> = ["a".to_string(), "b".to_string()].into();
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        pending.push_back(ShellRequest::StartIcons { icon_px: 48, ids: vec!["c".into()] });
+        pending.push_back(ShellRequest::VolumeRefresh);
+        start_release(&mut px, &mut sent, &mut pending);
+        assert_eq!((px, sent.len(), pending.len()), (0, 0, 1));
+        assert!(matches!(pending[0], ShellRequest::VolumeRefresh));
+    }
+
+    #[test]
+    fn admin_tools_launch_by_absolute_path_or_aumid() {
+        let sys = std::path::Path::new(r"C:\Windows\System32");
+        assert_eq!(AdminTool::PowerShell.target(sys), r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        assert_eq!(AdminTool::Terminal.target(sys), r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
+        for tool in [AdminTool::Terminal, AdminTool::PowerShell] {
+            let s = tool.target(sys);
+            assert!(s.contains('\\'), "never a bare executable name: {s}");
+            assert!(!s.eq_ignore_ascii_case("wt.exe") && !s.eq_ignore_ascii_case("powershell.exe"));
+        }
+    }
 
     #[test]
     fn words_and_tokens() {
@@ -1771,5 +1864,11 @@ mod tests {
         assert_eq!(strip_paren_suffix("PowerToys (Preview)"), "PowerToys");
         assert_eq!(strip_paren_suffix("Steam"), "Steam");
         assert_eq!(expand_env("%NOPE_X%\\a"), "%NOPE_X%\\a");
+    }
+
+    #[test]
+    fn system_dir_comes_from_the_api() {
+        let d = system_dir().expect("GetSystemDirectoryW");
+        assert!(d.is_absolute() && d.join("kernel32.dll").is_file());
     }
 }

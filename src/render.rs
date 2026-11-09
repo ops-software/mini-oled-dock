@@ -43,6 +43,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{HDC, HFONT};
 
 use crate::audio::VolumeState;
+use crate::battery::{BatteryStatus, Tint};
 use crate::config::DisplayMode;
 use crate::glyphs;
 use crate::icons::IconBitmap;
@@ -99,7 +100,7 @@ const INDICATOR_EDGE: i32 = 2;
 /// Indicator height (logical px).
 const INDICATOR_H: i32 = 2;
 /// Colour of the attention indicator (a window asked for attention): the only colour in the UI.
-const ATTENTION_RGB: (u32, u32, u32) = (255, 140, 0);
+pub(crate) const ATTENTION_RGB: (u32, u32, u32) = (255, 140, 0);
 /// Distance of the indicator from the icon's bottom edge with the bar at the top (logical px).
 const INDICATOR_BELOW_ICON: i32 = 2;
 /// Radius of the app icon placeholder (logical px).
@@ -275,6 +276,8 @@ pub enum ItemId {
     Network,
     /// CPU / RAM usage (two small text lines).
     Metrics,
+    /// Battery (Apple-style glyph, optional percentage): opens the battery popup.
+    Battery,
 }
 
 /// Status indicator under the icon.
@@ -324,6 +327,121 @@ pub struct SystemView<'a> {
     pub net: NetStatus,
     /// CPU / RAM percentages (`ItemId::Metrics`).
     pub usage: Usage,
+    /// Battery state and options (`ItemId::Battery`).
+    pub battery: BatteryView,
+}
+
+/// Battery module content.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BatteryView {
+    pub status: BatteryStatus,
+    /// Shows the percentage (`Config::battery_percent`).
+    pub percent: bool,
+    /// Percentage inside the icon (`Config::battery_percent_inside`).
+    pub inside: bool,
+}
+
+/// Where the battery percentage goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatteryText {
+    None,
+    /// "64%" next to the icon.
+    Beside(String),
+    /// "64" (digits only) drawn inside the icon.
+    Inside(String),
+}
+
+/// The percentage text of the battery module: none without a battery or with the option off.
+pub fn battery_text(v: &BatteryView) -> BatteryText {
+    if !v.status.present || !v.percent {
+        BatteryText::None
+    } else if v.inside {
+        BatteryText::Inside(v.status.percent.to_string())
+    } else {
+        BatteryText::Beside(format!("{}%", v.status.percent))
+    }
+}
+
+/// Body of the battery pill that holds the percentage (logical px): wide and as tall as the cap
+/// height of the module text plus a little air, so it sits on the text line of its neighbours.
+const BATT_BODY_W: i32 = 26;
+const BATT_BODY_H: i32 = 12;
+/// Corner radius of the pill body (logical px), about a third of its height.
+const BATT_BODY_R: i32 = 4;
+/// Gap between the body and the nub, nub width and height (logical px).
+const BATT_NUB_GAP: i32 = 1;
+const BATT_NUB_W: i32 = 2;
+const BATT_NUB_H: i32 = 4;
+/// Opacity (of the glyph alpha, 0..255) of the thin outline and the nub.
+const BATT_OUTLINE_ALPHA: u32 = 105;
+/// Semibold digit font of the pill (logical px).
+const BATT_DIGIT_PX: i32 = 11;
+/// Bolt left of the pill while charging: glyph box (logical px; the bolt is 5.6/16 of it tall)
+/// and gap to the body.
+const BATT_BOLT_BOX: i32 = 30;
+const BATT_BOLT_GAP: i32 = 2;
+/// Fill colour on battery at 10 % and below (critical).
+pub(crate) const BATT_CRITICAL_RGB: (u32, u32, u32) = (255, 69, 58);
+
+/// Fill colour of the battery glyph for a tint: white, the attention orange below 20 %, red at 10 % and below.
+pub(crate) fn batt_tint_rgb(t: Tint) -> (u32, u32, u32) {
+    match t {
+        Tint::Normal => WHITE,
+        Tint::Low => ATTENTION_RGB,
+        Tint::Critical => BATT_CRITICAL_RGB,
+    }
+}
+
+/// Physical geometry of the battery pill (percentage-inside mode) at module metrics `m`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BattPill {
+    body_w: i32,
+    body_h: i32,
+    radius: i32,
+    /// Outline width: a whole-pixel hairline (one logical px rounded down, at least one).
+    line: i32,
+    nub_gap: i32,
+    nub_w: i32,
+    nub_h: i32,
+    /// Side of the glyph box the bolt is drawn in, and the bolt's ink left edge / width in it.
+    bolt_box: i32,
+    bolt_ink_l: i32,
+    bolt_w: i32,
+    bolt_gap: i32,
+}
+
+impl BattPill {
+    fn new(m: Metrics) -> BattPill {
+        let bolt_box = m.px(BATT_BOLT_BOX);
+        let at = |u: f32| (u * bolt_box as f32 / 16.0).round() as i32;
+        BattPill {
+            body_w: m.px(BATT_BODY_W),
+            body_h: m.px(BATT_BODY_H),
+            radius: m.px(BATT_BODY_R),
+            line: (m.scale().floor() as i32).max(1),
+            nub_gap: m.px(BATT_NUB_GAP),
+            nub_w: m.px(BATT_NUB_W),
+            nub_h: m.px(BATT_NUB_H),
+            bolt_box,
+            bolt_ink_l: at(6.0),
+            bolt_w: at(9.4) - at(6.0),
+            bolt_gap: m.px(BATT_BOLT_GAP),
+        }
+    }
+
+    /// Room left of the body for the bolt (0 when not charging).
+    fn bolt_slot(&self, charging: bool) -> i32 {
+        if charging {
+            self.bolt_w + self.bolt_gap
+        } else {
+            0
+        }
+    }
+
+    /// Total ink width: bolt slot, body, nub.
+    fn width(&self, charging: bool) -> i32 {
+        self.bolt_slot(charging) + self.body_w + self.nub_gap + self.nub_w
+    }
 }
 
 /// A tray icon to draw (bitmap already at `Metrics::px(SYS_ICON)`).
@@ -336,11 +454,12 @@ pub struct TrayIcon<'a> {
 
 /// Names of the system modules in `config.modules_order`, with their items, in the default order
 /// (`config::DEFAULT_MODULES_ORDER`).
-pub const MODULES: [(&str, ItemId); 7] = [
+pub const MODULES: [(&str, ItemId); 8] = [
     ("metrics", ItemId::Metrics),
     ("notifications", ItemId::Notifications),
     ("network", ItemId::Network),
     ("volume", ItemId::Volume),
+    ("battery", ItemId::Battery),
     ("clock", ItemId::Clock),
     ("show_desktop", ItemId::ShowDesktop),
     ("power", ItemId::Power),
@@ -373,10 +492,14 @@ pub fn modules_from_names(names: &[String]) -> Vec<ItemId> {
 }
 
 /// The visible system modules, in order: `modules_from_names` without the ones switched off in the
-/// config (`Config::module_visible`; power is always visible).
-pub fn visible_modules(cfg: &crate::config::Config) -> Vec<ItemId> {
+/// config (`Config::module_visible`; power is always visible; the battery follows `Config::show_battery` and
+/// whether a battery was found).
+pub fn visible_modules(cfg: &crate::config::Config, battery_present: bool) -> Vec<ItemId> {
     let mut v = modules_from_names(&cfg.modules_order);
-    v.retain(|id| module_name(*id).is_none_or(|n| cfg.module_visible(n)));
+    v.retain(|id| match id {
+        ItemId::Battery => cfg.show_battery.shown(battery_present),
+        _ => module_name(*id).is_none_or(|n| cfg.module_visible(n)),
+    });
     v
 }
 
@@ -510,9 +633,12 @@ struct Fonts {
     app: HFONT,
     module: HFONT,
     small: HFONT,
+    /// Semibold digits inside the battery pill.
+    batt: HFONT,
     lh_app: i32,
     lh: i32,
     lh_small: i32,
+    lh_batt: i32,
 }
 
 impl Fonts {
@@ -525,11 +651,11 @@ impl Fonts {
     }
 
     fn max_lh(&self) -> i32 {
-        self.lh_app.max(self.lh).max(self.lh_small)
+        self.lh_app.max(self.lh).max(self.lh_small).max(self.lh_batt)
     }
 
     fn delete(&self) {
-        for f in [self.app, self.module, self.small] {
+        for f in [self.app, self.module, self.small, self.batt] {
             delete_font(f);
         }
     }
@@ -551,6 +677,11 @@ enum Txt {
 /// Creates the GDI resources (memory DCs, Segoe UI Variable Text fonts -> Segoe UI fallback, see
 /// `Fonts`) for the given `metrics` and `sizes`. The DIB is born with the first `resize`.
 pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
+    init_inner(metrics, sizes, true)
+}
+
+/// `init` with the log line optional: `paint_offscreen` runs it on every mini bar rebuild.
+fn init_inner(metrics: Metrics, sizes: BarSizes, log: bool) -> Result<(), String> {
     destroy();
     let gdi = Gdi::new()?;
     // On error `gdi` is dropped, which deletes the DCs.
@@ -558,15 +689,17 @@ pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
     GFX.with(|c| {
         *c.borrow_mut() = Some(Gfx { metrics, gdi, sizes, fonts, pill_w: 0 });
     });
-    log!("render::init: dpi={} {sizes:?}", metrics.dpi);
+    if log {
+        log!("render::init: dpi={} {sizes:?}", metrics.dpi);
+    }
     Ok(())
 }
 
 fn build_fonts(dc: HDC, m: Metrics, s: BarSizes) -> Result<Fonts, String> {
     let mm = s.module_metrics(m);
-    let mut made: Vec<HFONT> = Vec::with_capacity(3);
-    for px in [m.px(s.text), mm.px(13), mm.px(11)] {
-        match create_font(dc, &TEXT_FACES, px.max(1), 400) {
+    let mut made: Vec<HFONT> = Vec::with_capacity(4);
+    for (px, weight) in [(m.px(s.text), 400), (mm.px(13), 400), (mm.px(11), 400), (mm.px(BATT_DIGIT_PX), 600)] {
+        match create_font(dc, &TEXT_FACES, px.max(1), weight) {
             Ok(f) => made.push(f),
             Err(e) => {
                 for f in made {
@@ -576,14 +709,16 @@ fn build_fonts(dc: HDC, m: Metrics, s: BarSizes) -> Result<Fonts, String> {
             }
         }
     }
-    let (app, module, small) = (made[0], made[1], made[2]);
+    let (app, module, small, batt) = (made[0], made[1], made[2], made[3]);
     Ok(Fonts {
         app,
         module,
         small,
+        batt,
         lh_app: line_height(dc, app),
         lh: line_height(dc, module),
         lh_small: line_height(dc, small),
+        lh_batt: line_height(dc, batt),
     })
 }
 
@@ -637,6 +772,7 @@ struct SysWidths {
     power: i32,
     net: i32,
     metrics: i32,
+    battery: i32,
 }
 
 fn sys_widths(scene: &Scene<'_>) -> SysWidths {
@@ -661,7 +797,19 @@ fn sys_widths(scene: &Scene<'_>) -> SysWidths {
     } else {
         0
     };
-    SysWidths { bell, volume, clock, desk: bell, start: bell, power: bell, net: bell, metrics }
+    let battery = if scene.modules.contains(&ItemId::Battery) {
+        match battery_text(&sys.battery) {
+            BatteryText::None => bell,
+            BatteryText::Beside(_) => {
+                let slot = if sys.battery.status.percent >= 100 { "100%" } else { "88%" };
+                bell + m.px(SYS_TEXT_GAP) + measure(slot, Txt::Module, m)
+            }
+            BatteryText::Inside(_) => 2 * m.px(TRAY_PAD) + BattPill::new(m).width(sys.battery.status.charging),
+        }
+    } else {
+        0
+    };
+    SysWidths { bell, volume, clock, desk: bell, start: bell, power: bell, net: bell, metrics, battery }
 }
 
 /// Labels of the two metric lines.
@@ -690,6 +838,7 @@ fn module_width(sw: &SysWidths, id: ItemId) -> i32 {
         ItemId::Start => sw.start,
         ItemId::Network => sw.net,
         ItemId::Metrics => sw.metrics,
+        ItemId::Battery => sw.battery,
         _ => sw.power,
     }
 }
@@ -981,6 +1130,77 @@ fn draw_text(g: &Gfx, cv: &mut Canvas<'_>, s: &str, x: i32, y: i32, t: Txt, alph
     g.gdi.text(cv, s, x, y, g.fonts.get(t), text_width(g, s, t), WHITE, alpha);
 }
 
+/// Battery pill with the percentage inside (Apple style), ink starting at `x0`, centred on row
+/// boundary `cy`: thin dim outline and nub, charge fill from the left in `tint`, the digits knocked
+/// out of the fill (background shows through) and white over the empty part; the bolt goes left of
+/// the body while charging. `alpha` = glyph alpha (hover).
+#[allow(clippy::too_many_arguments)]
+fn paint_batt_pill(
+    g: &Gfx,
+    cv: &mut Canvas<'_>,
+    m: Metrics,
+    x0: i32,
+    cy: i32,
+    st: BatteryStatus,
+    digits: &str,
+    tint: (u32, u32, u32),
+    alpha: u32,
+) {
+    let p = BattPill::new(m);
+    let (l, t) = (x0 + p.bolt_slot(st.charging), cy - p.body_h / 2);
+    let (r, b) = (l + p.body_w, t + p.body_h);
+    let (il, it, ir, ib) = (l + p.line, t + p.line, r - p.line, b - p.line);
+    let line_a = (alpha * BATT_OUTLINE_ALPHA / 255) as f32;
+    let fill_end = il as f32 + (ir - il) as f32 * st.percent.min(100) as f32 / 100.0;
+    // Digits: coverage mask of the semibold font, its ink centred in the inner body.
+    let font = (g.fonts.batt, g.fonts.lh_batt);
+    let mask = g.gdi.text_mask(digits, font, g.gdi.text_width(digits, font.0, 7));
+    let (mut tx, mut ty, mut mw, mut mh, mut cov) = (0, 0, 0, 0, Vec::new());
+    if let Some((w, h, mk)) = mask {
+        let ink = |i: usize| mk[i] >= 128;
+        let cols: Vec<i32> = (0..w).filter(|&c| (0..h).any(|rr| ink((rr * w + c) as usize))).collect();
+        let rows: Vec<i32> = (0..h).filter(|&rr| (0..w).any(|c| ink((rr * w + c) as usize))).collect();
+        if let (Some(&c0), Some(&c1), Some(&r0), Some(&r1)) = (cols.first(), cols.last(), rows.first(), rows.last()) {
+            tx = (il + ir - (c0 + c1 + 1)) / 2;
+            ty = (it + ib - (r0 + r1 + 1)) / 2;
+            (mw, mh, cov) = (w, h, mk);
+        }
+    }
+    let text_at = |x: i32, y: i32| -> f32 {
+        let (c, rr) = (x - tx, y - ty);
+        if c < 0 || rr < 0 || c >= mw || rr >= mh {
+            0.0
+        } else {
+            cov[(rr * mw + c) as usize] as f32 / 255.0
+        }
+    };
+    let a = alpha as f32;
+    for y in t..b {
+        for x in l..r {
+            let outer = rr_cov(x, y, l, t, r, b, p.radius);
+            let inner = rr_cov(x, y, il, it, ir, ib, p.radius - p.line);
+            let ring = (outer - inner).max(0.0) * line_a;
+            let fill = inner * (fill_end - x as f32).clamp(0.0, 1.0);
+            let txt = text_at(x, y);
+            // Knock-out: the fill loses the digit pixels, the digits show only where there is no fill.
+            let (fa, ta) = (fill * (1.0 - txt) * a, txt * (1.0 - fill) * a);
+            let sa = ring + fa + ta;
+            if sa < 0.5 {
+                continue;
+            }
+            let ch = |c: u32| ((c as f32 * fa + 255.0 * (ring + ta)) / 255.0 + 0.5) as u32;
+            let (pa, pr, pg, pb) = ((sa + 0.5) as u32, ch(tint.0), ch(tint.1), ch(tint.2));
+            cv.blend(x, y, (pa.min(255) << 24) | (pr.min(pa) << 16) | (pg.min(pa) << 8) | pb.min(pa));
+        }
+    }
+    let nub = rect_wh(r + p.nub_gap, cy - p.nub_h / 2, p.nub_w, p.nub_h);
+    cv.fill_rr(nub, p.nub_w / 2, WHITE, line_a as u32);
+    if st.charging {
+        let bs = p.bolt_box;
+        cv.glyph(x0 - p.bolt_ink_l, cy - bs / 2, bs, WHITE, alpha, &glyphs::bolt_shape);
+    }
+}
+
 // ------------------------------------------------------------------ paint
 
 /// Upward shift (physical px) of the labels to centre the cap height on the icon axis.
@@ -1233,6 +1453,33 @@ fn paint_inner(g: &Gfx, scene: &Scene<'_>, layout: &Layout) {
                         draw_text(g, &mut cv, &s, r.right - pad - vw, y, Txt::Small, va);
                     }
                 }
+                ItemId::Battery => {
+                    let b = scene.system.battery;
+                    let st = b.status;
+                    if !st.present {
+                        cv.glyph(gx, gy, sys_icon, WHITE, glyph_a, &glyphs::battery_off_shape);
+                        continue;
+                    }
+                    let text = battery_text(&b);
+                    let tint = batt_tint_rgb(st.tint());
+                    let x = r.left + sys_pad;
+                    if let BatteryText::Inside(s) = &text {
+                        paint_batt_pill(g, &mut cv, mm, x, mcy, st, s, tint, glyph_a);
+                        continue;
+                    }
+                    cv.glyph(x, gy, sys_icon, tint, glyph_a, &|u, v| {
+                        glyphs::battery_fill_shape(u, v, st.percent, st.charging)
+                    });
+                    cv.glyph(x, gy, sys_icon, WHITE, glyph_a, &glyphs::battery_outline_shape);
+                    if st.charging {
+                        cv.glyph(x, gy, sys_icon, WHITE, 255, &glyphs::bolt_shape);
+                    }
+                    if let BatteryText::Beside(s) = text {
+                        let a = if hot { TEXT2_ALPHA_HOT } else { TEXT2_ALPHA };
+                        let tx = x + sys_icon + mm.px(SYS_TEXT_GAP);
+                        draw_text(g, &mut cv, &s, tx, mcy - lh / 2 - label_up(mm), Txt::Module, a);
+                    }
+                }
             }
         }
     }
@@ -1251,9 +1498,37 @@ pub(crate) fn snapshot_pixels() -> Option<(i32, i32, Vec<u32>)> {
     GFX.with(|c| c.borrow().as_ref()?.gdi.snapshot_pixels())
 }
 
+/// Paints `scene` into a fresh set of GDI resources and returns the premultiplied pixels with the
+/// bar's size, for the mini live preview of the Settings window. Goes through the real `layout`,
+/// `resize` and `paint` at `scene.metrics` / `scene.sizes`. The bar's own `Gfx` is taken out of `GFX`
+/// first and always put back, so the bar is untouched; works with no bar `Gfx` at all (preview mode).
+/// Never pumps messages and writes nothing to the log.
+pub(crate) fn paint_offscreen(scene: &Scene<'_>) -> Option<(i32, i32, Vec<u32>)> {
+    let saved = GFX.with(|c| c.borrow_mut().take());
+    let out = (|| {
+        init_inner(scene.metrics, scene.sizes, false).ok()?;
+        let lay = layout(scene);
+        let h = bar_height(scene.metrics, scene.sizes);
+        resize(lay.width, h).ok()?;
+        paint(scene, &lay);
+        snapshot_pixels()
+    })();
+    destroy();
+    GFX.with(|c| *c.borrow_mut() = saved);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BatteryShow, Config};
+
+    #[test]
+    fn battery_low_is_orange_and_critical_is_red() {
+        assert_eq!(batt_tint_rgb(Tint::Normal), WHITE);
+        assert_eq!(batt_tint_rgb(Tint::Low), (255, 140, 0));
+        assert_eq!(batt_tint_rgb(Tint::Critical), (255, 69, 58));
+    }
 
     #[test]
     fn transparent_bar_keeps_the_mouse() {
@@ -1285,12 +1560,125 @@ mod tests {
     }
 
     #[test]
+    fn battery_text_rules() {
+        let st = |p| BatteryStatus::from_raw(0, 1, p, u32::MAX);
+        let v = |status, percent, inside| BatteryView { status, percent, inside };
+        assert!(matches!(battery_text(&v(st(64), true, false)), BatteryText::Beside(s) if s == "64%"));
+        assert!(matches!(battery_text(&v(st(100), true, true)), BatteryText::Inside(s) if s == "100"));
+        assert!(matches!(battery_text(&v(st(64), false, true)), BatteryText::None)); // percent off wins
+        // no battery
+        assert!(matches!(battery_text(&v(BatteryStatus::NONE, true, false)), BatteryText::None));
+    }
+
+    #[test]
+    fn visible_modules_hides_battery_without_one() {
+        let cfg = Config::default(); // show_battery = auto
+        assert!(!visible_modules(&cfg, false).contains(&ItemId::Battery));
+        assert!(visible_modules(&cfg, true).contains(&ItemId::Battery));
+        let on = Config { show_battery: BatteryShow::On, ..Config::default() };
+        assert!(visible_modules(&on, false).contains(&ItemId::Battery));
+        let off = Config { show_battery: BatteryShow::Off, ..Config::default() };
+        assert!(!visible_modules(&off, true).contains(&ItemId::Battery));
+    }
+
+    #[test]
+    fn default_order_places_battery_after_volume() {
+        let order = modules_from_names(&Config::default().modules_order);
+        let at = |id| order.iter().position(|x| *x == id).unwrap();
+        assert_eq!(at(ItemId::Battery), at(ItemId::Volume) + 1);
+        // An old config without "battery": it lands right after volume.
+        let old: Vec<String> = ["metrics", "notifications", "network", "volume", "clock", "show_desktop", "power"]
+            .map(String::from)
+            .to_vec();
+        let m = modules_from_names(&old);
+        assert_eq!(m.len(), 8);
+        assert_eq!(m[4], ItemId::Battery);
+    }
+
+    #[test]
+    fn battery_width_follows_the_options() {
+        let m = Metrics { dpi: 96 };
+        let sizes = BarSizes::default();
+        render_init_for_test(m, sizes);
+        let width = |status: BatteryStatus, percent, inside| {
+            let modules = [ItemId::Battery, ItemId::Power];
+            let mut scene = test_scene(m, sizes, &modules, false);
+            scene.system.battery = BatteryView { status, percent, inside };
+            let l = layout(&scene);
+            let r = l.rect_of(ItemId::Battery).unwrap();
+            r.right - r.left
+        };
+        let batt = BatteryStatus::from_raw(0, 1, 64, u32::MAX);
+        let charging = BatteryStatus::from_raw(1, 9, 64, u32::MAX);
+        let plain = width(batt, false, false);
+        assert_eq!(plain, width(BatteryStatus::NONE, true, false)); // slash icon: same as the plain icon
+        assert!(width(batt, true, false) > plain); // percentage beside
+        assert!(width(batt, true, true) > plain); // larger icon with digits inside
+        assert!(width(charging, true, true) > width(batt, true, true)); // bolt slot only while charging
+        assert_eq!(width(charging, true, false), width(batt, true, false)); // beside mode: bolt is inside the icon
+    }
+
+    #[test]
+    fn battery_pill_is_a_wide_low_pill() {
+        // Apple-style body: about 2.2:1, corner radius about a third of the height, never taller than
+        // the 16 px system icons, a whole-pixel outline and a bolt about as tall as the body.
+        for dpi in [96, 120, 144, 192] {
+            let m = Metrics { dpi };
+            let p = BattPill::new(m);
+            assert!(p.body_w * 10 >= p.body_h * 20 && p.body_w * 10 <= p.body_h * 24, "{dpi}");
+            assert!((p.radius * 3 - p.body_h).abs() <= p.body_h / 4, "{dpi}");
+            assert!(p.body_h < m.px(SYS_ICON) && p.line >= 1 && p.nub_h < p.body_h, "{dpi}");
+            let bolt_h = 5.6 * p.bolt_box as f32 / 16.0;
+            assert!((bolt_h - p.body_h as f32).abs() <= p.body_h as f32 * 0.25, "{dpi}");
+            assert_eq!(p.width(true) - p.width(false), p.bolt_w + p.bolt_gap);
+        }
+    }
+
+    #[test]
     fn start_button_is_the_first_item_only_when_on() {
         let m = Metrics { dpi: 96 };
         let sizes = BarSizes::default();
         render_init_for_test(m, sizes);
         let modules = [ItemId::Notifications, ItemId::Power];
-        let scene = |start_button| Scene {
+        let scene = |start_button| test_scene(m, sizes, &modules, start_button);
+        let on = layout(&scene(true));
+        let off = layout(&scene(false));
+        assert_eq!(on.items[0].id, ItemId::Start);
+        assert_eq!(on.items.len(), off.items.len() + 1);
+        assert!(!off.items.iter().any(|i| i.id == ItemId::Start));
+        // Same width as the other glyph buttons, and everything else moves right by one slot.
+        let start = on.items[0].rect;
+        let bell = on.rect_of(ItemId::Notifications).unwrap();
+        assert_eq!(start.right - start.left, bell.right - bell.left);
+        assert!(on.width > off.width);
+        assert_eq!(on.hit_test(start.left + 1, 1), Some(ItemId::Start));
+        assert_eq!(off.hit_test(start.left + 1, 1), Some(ItemId::Notifications));
+        // With no apps the Start button still gets its separator; without it there is none.
+        assert!(on.separator_x > start.right);
+        assert_eq!(off.separator_x, -1);
+    }
+
+    #[test]
+    fn paint_offscreen_leaves_the_bar_untouched() {
+        let m = Metrics { dpi: 96 };
+        let sizes = BarSizes::default();
+        render_init_for_test(m, sizes);
+        resize(40, bar_height(m, sizes)).unwrap();
+        let before = snapshot_pixels();
+        let big = Metrics { dpi: 144 };
+        let modules = [ItemId::Volume, ItemId::Clock];
+        let scene = test_scene(big, sizes, &modules, false);
+        let (w, h, px) = paint_offscreen(&scene).expect("offscreen bar");
+        assert_eq!(h, bar_height(big, sizes));
+        assert_eq!(px.len(), (w * h) as usize);
+        assert_eq!(snapshot_pixels(), before);
+        destroy();
+        assert!(paint_offscreen(&scene).is_some());
+        assert!(snapshot_pixels().is_none());
+    }
+
+    fn test_scene<'a>(m: Metrics, sizes: BarSizes, modules: &'a [ItemId], start_button: bool) -> Scene<'a> {
+        Scene {
             metrics: m,
             sizes,
             apps: &[],
@@ -1307,29 +1695,15 @@ mod tests {
                 bell_dnd: false,
                 net: NetStatus { kind: NetKind::Ethernet, bars: 0, internet: false },
                 usage: Usage { cpu: 0, ram: 0 },
+                battery: BatteryView::default(),
             },
             plate: None,
-            modules: &modules,
+            modules,
             start_button,
             lift: None,
             hover: None,
             max_width: 0,
-        };
-        let on = layout(&scene(true));
-        let off = layout(&scene(false));
-        assert_eq!(on.items[0].id, ItemId::Start);
-        assert_eq!(on.items.len(), off.items.len() + 1);
-        assert!(!off.items.iter().any(|i| i.id == ItemId::Start));
-        // Same width as the other glyph buttons, and everything else moves right by one slot.
-        let start = on.items[0].rect;
-        let bell = on.rect_of(ItemId::Notifications).unwrap();
-        assert_eq!(start.right - start.left, bell.right - bell.left);
-        assert!(on.width > off.width);
-        assert_eq!(on.hit_test(start.left + 1, 1), Some(ItemId::Start));
-        assert_eq!(off.hit_test(start.left + 1, 1), Some(ItemId::Notifications));
-        // With no apps the Start button still gets its separator; without it there is none.
-        assert!(on.separator_x > start.right);
-        assert_eq!(off.separator_x, -1);
+        }
     }
 
     /// Initialises the GDI state `layout` measures with (memory DCs only, no window).

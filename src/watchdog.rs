@@ -28,6 +28,7 @@
 //! `run_watchdog` is the main of the watchdog process (no window, no hook, no COM).
 
 use std::ffi::c_void;
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
@@ -56,7 +57,7 @@ pub const STOP_EVENT_NAME: &str = "Local\\DockStop";
 /// Name of the dock's single-instance mutex.
 const INSTANCE_MUTEX_NAME: &str = "Local\\DockInstance";
 /// Maximum wait for `Shell_TrayWnd` before a restore by the watchdog.
-const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Timeout of each watchdog wait (slightly above the heartbeat period).
 const WAIT_MS: u32 = 1100;
@@ -185,8 +186,17 @@ pub fn spawn() -> Result<(), String> {
 /// `CreateProcessW` of `current_exe --watchdog <pid> <event>`, with a fallback without breakaway.
 fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // The process handle is not needed by the dock: dropping it closes it.
+    spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}")).map(drop)
+}
+
+/// `CreateProcessW` of `"<exe>" <args>` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW`, falling
+/// back to `CREATE_NO_WINDOW` if breakaway is denied. Breakaway lets the child outlive the dock when
+/// the dock runs inside the Task Scheduler job (the watchdog, the updater's installer). Returns the
+/// process handle; the thread handle is closed at once.
+pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<OwnedHandle, String> {
     let exe_str = exe.to_string_lossy().into_owned();
-    let cmdline = format!("\"{exe_str}\" --watchdog {pid} {ev_name}");
+    let cmdline = format!("\"{exe_str}\" {args}");
     let app = HSTRING::from(exe_str.as_str());
 
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
@@ -214,15 +224,16 @@ fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
         };
         match r {
             Ok(()) => {
-                // SAFETY: handles returned by CreateProcessW, not needed by the dock.
-                unsafe {
-                    let _ = CloseHandle(pi.hProcess);
+                // SAFETY: both handles were just returned by CreateProcessW and are owned here; the
+                // thread handle is closed once, the process handle is moved into the OwnedHandle.
+                let process = unsafe {
                     let _ = CloseHandle(pi.hThread);
-                }
-                return Ok(());
+                    OwnedHandle::from_raw_handle(pi.hProcess.0)
+                };
+                return Ok(process);
             }
             Err(e) => {
-                log!("watchdog: CreateProcessW ({label}) failed: {e}");
+                log!("spawn: CreateProcessW of {exe_str} ({label}) failed: {e}");
                 if flags == CREATE_NO_WINDOW {
                     return Err(format!("CreateProcessW: {e}"));
                 }
@@ -415,19 +426,27 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
         if r == WAIT_OBJECT_0 {
             let mut exit = 0u32;
             // SAFETY: `proc` opened with PROCESS_QUERY_LIMITED_INFORMATION; `exit` is writable.
-            if let Err(e) = unsafe { GetExitCodeProcess(proc, &mut exit) } {
-                log!("watchdog: GetExitCodeProcess failed: {e}, restoring");
-                restore();
-            } else if exit == 0 {
-                log!("watchdog: the dock exited normally");
-                // Exit with Explorer absent: restore_force kept the state file, so the
-                // taskbar is still in autohide. Wait for Explorer and restore.
-                if crate::taskbar::state_file_exists() {
-                    log!("watchdog: state file still present after exit, restoring the taskbar");
-                    restore();
+            let exit_code = match unsafe { GetExitCodeProcess(proc, &mut exit) } {
+                Ok(()) => Some(exit),
+                Err(e) => {
+                    log!("watchdog: GetExitCodeProcess failed: {e}, restoring");
+                    None
                 }
-            } else {
-                log!("watchdog: the dock ended with code 0x{exit:X}, restoring the taskbar");
+            };
+            let state_kept = crate::taskbar::state_file_exists();
+            match exit_code {
+                Some(0) => {
+                    log!("watchdog: the dock exited normally");
+                    // Exit with Explorer absent: restore_force kept the state file, so the
+                    // taskbar is still in autohide. Wait for Explorer and restore.
+                    if state_kept {
+                        log!("watchdog: state file still present after exit, restoring the taskbar");
+                    }
+                }
+                Some(n) => log!("watchdog: the dock ended with code 0x{n:X}, restoring the taskbar"),
+                None => {}
+            }
+            if exit_needs_restore(exit_code, state_kept) {
                 restore();
             }
             break 0;
@@ -519,5 +538,28 @@ fn terminate_dock(pid: u32) {
             let _ = unsafe { CloseHandle(h) };
         }
         Err(e) => log!("watchdog: OpenProcess(TERMINATE, {pid}) failed: {e}"),
+    }
+}
+
+/// Post-exit decision of `run_watchdog`: restore unless the dock exited cleanly AND left no state file.
+/// `exit_code` is `None` when `GetExitCodeProcess` failed. A clean exit with Explorer absent keeps the file.
+fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
+    match exit_code {
+        Some(0) => state_file_exists,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_restores_whenever_the_state_file_is_left() {
+        assert!(exit_needs_restore(Some(0), true), "clean exit with Explorer absent: state file kept");
+        assert!(!exit_needs_restore(Some(0), false));
+        assert!(exit_needs_restore(Some(1), false));
+        assert!(exit_needs_restore(Some(0xC000_0005), true));
+        assert!(exit_needs_restore(None, false), "exit code unreadable: restore anyway");
     }
 }

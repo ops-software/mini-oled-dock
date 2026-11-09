@@ -5,6 +5,7 @@
 //! to the OS. `trim` does that; `log_memory` writes one line with the numbers to `dock.log`.
 
 use crate::log;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
 use windows::Win32::System::ProcessStatus::{
@@ -16,6 +17,9 @@ use windows::Win32::System::Threading::{
 
 /// Maximum number of process heaps handled by `trim`.
 const MAX_HEAPS: usize = 64;
+
+/// Private bytes right after the last `trim("hidden")` (0 = none yet).
+static LAST_HIDDEN_TRIM: AtomicUsize = AtomicUsize::new(0);
 
 /// Snapshot of the process memory counters (bytes).
 struct Counters {
@@ -70,6 +74,19 @@ pub fn log_memory() {
     );
 }
 
+/// Private bytes of the process now, or None when the query fails.
+pub fn private_bytes() -> Option<usize> {
+    counters().map(|c| c.private)
+}
+
+/// Private bytes right after the last trim while the bar was hidden (None = not trimmed yet).
+pub fn last_hidden_trim() -> Option<usize> {
+    match LAST_HIDDEN_TRIM.load(Ordering::Relaxed) {
+        0 => None,
+        b => Some(b),
+    }
+}
+
 /// Compacts every process heap (decommits coalesced free blocks) and empties the working set.
 /// Call only while the dock is idle: the next show takes a few soft page faults.
 pub fn trim(reason: &str) {
@@ -89,7 +106,13 @@ pub fn trim(reason: &str) {
     if let Err(e) = unsafe { EmptyWorkingSet(GetCurrentProcess()) } {
         log!("EmptyWorkingSet failed: {e}");
     }
-    match (before, counters()) {
+    let after = counters();
+    if reason == "hidden" {
+        if let Some(a) = &after {
+            LAST_HIDDEN_TRIM.store(a.private, Ordering::Relaxed);
+        }
+    }
+    match (before, after) {
         (Some(b), Some(a)) => log!(
             "trim({reason}): heaps={n} private {} -> {} KB, ws {} -> {} KB",
             b.private / 1024,
@@ -98,5 +121,17 @@ pub fn trim(reason: &str) {
             a.working_set / 1024
         ),
         _ => log!("trim({reason}): heaps={n}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_trim_is_remembered() {
+        assert!(private_bytes().is_some_and(|b| b > 0));
+        trim("hidden");
+        assert!(last_hidden_trim().is_some_and(|b| b > 0));
     }
 }

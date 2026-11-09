@@ -28,16 +28,19 @@
 //! popup itself over its own surface (no second window), right-aligned to the button and just above
 //! it, like the native Windows 11 one. It offers the entries of the power popup (`popup_power`:
 //! labels, glyphs and actions shared from there, without the autostart toggle): a system action runs
-//! after the Start closes, "Settings" switches to the Settings popup. While it is open a backdrop
-//! hit covers the rest of the menu: a click anywhere else, a right click or Esc closes only the
-//! flyout (Esc does not close the Start); typing closes it and goes on searching. It lives in the
-//! content, so it is gone when the Start closes.
+//! after the Start closes, "Settings" closes the Start menu and opens the Settings window
+//! (`popup_power::run_choice`). While it is open a backdrop hit covers the rest of the menu: a
+//! click anywhere else, a right click or Esc closes only the flyout (Esc does not close the Start);
+//! typing closes it and goes on searching. It lives in the content, so it is gone when the Start
+//! closes.
 //!
-//! DATA: the catalog and the icons live in a UI-thread store (`STORE`) that outlives the popup, so the
-//! menu reopens instantly. Every open asks the shell thread for a fresh catalog
-//! (`ShellRequest::ListStartApps`); only the icons not received yet are extracted (in small batches,
-//! behind every other shell request) and arrive as `ShellEvent::StartIcons`. Nothing is loaded until
-//! the menu is opened the first time.
+//! DATA: the catalog and the icons live in a UI-thread store (`STORE`) filled only while a Start menu
+//! is open. Every open asks the shell thread for a fresh catalog (`ShellRequest::ListStartApps`);
+//! the icons are extracted in small batches (behind every other shell request) and arrive as
+//! `ShellEvent::StartIcons`. `after_close` keeps the store and arms a 60 s
+//! one-shot (`popup::arm_start_release`); a reopen before it fires draws at once. When it fires with
+//! no Start menu open, `release` empties the store and sends `ShellRequest::StartRelease` (the shell
+//! thread forgets what it sent); events that arrive after that are dropped.
 //!
 //! Declared as a child module of `popup` (`#[path]`). UI thread only.
 
@@ -52,7 +55,6 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
 use crate::popup_power::{self, Choice};
-use crate::power::PowerAction;
 use crate::render::Metrics;
 use crate::shell_thread::{self, ShellRequest, StartApp};
 use crate::surface::{
@@ -74,6 +76,10 @@ const HEADER_H: i32 = 28;
 /// Pinned grid: columns, rows at most, tile height and icon side.
 const COLS: usize = 6;
 const MAX_PIN_ROWS: usize = 2;
+/// Fewest list rows kept when the work area is too short for the full panel.
+const MIN_LIST_ROWS: usize = 3;
+/// No cap (the default until `limit`, and the tests).
+const UNCAPPED: (i32, i32) = (i32::MAX, i32::MAX);
 const TILE_H: i32 = 80;
 const TILE_ICON: i32 = 32;
 /// App list: row height, icon side, horizontal padding inside a row.
@@ -98,6 +104,7 @@ const H_INSET: i32 = 20;
 /// Pinned page: columns, rows, tiles per page, tile height, icon top inside a tile.
 const H_COLS: usize = 6;
 const H_ROWS: usize = 3;
+#[cfg(test)]
 const H_PAGE: usize = H_COLS * H_ROWS;
 const H_TILE_H: i32 = 96;
 const H_TILE_ICON_TOP: i32 = 16;
@@ -174,10 +181,30 @@ struct Store {
     /// Icons by lowercase id, `icon_px` square.
     icons: HashMap<String, IconBitmap>,
     icon_px: u32,
+    /// true between `request_catalog` and `release`; late shell events are dropped otherwise.
+    open: bool,
 }
 
 thread_local! {
     static STORE: RefCell<Store> = RefCell::new(Store::default());
+}
+
+/// Empties the store (60 s after the menu closed). Returns the bytes of icon bitmaps freed.
+fn release_store() -> usize {
+    STORE.with(|s| {
+        let Ok(mut s) = s.try_borrow_mut() else { return 0 };
+        let bytes: usize = s.icons.values().map(|b| (b.width * b.height * 4) as usize).sum();
+        let apps = s.apps.len();
+        *s = Store::default();
+        log!("startmenu: freed {} KB of icons ({apps} apps)", bytes / 1024);
+        bytes
+    })
+}
+
+/// Frees the store and tells the shell thread to forget what it sent.
+pub(crate) fn release() {
+    release_store();
+    shell_thread::request(ShellRequest::StartRelease);
 }
 
 /// `ShellEvent::StartApps`: replaces the catalog (sorted by name).
@@ -186,10 +213,11 @@ pub(crate) fn store_apps(list: Vec<StartApp>) {
         list.into_iter().map(|a| App { lower: a.name.to_lowercase(), id: a.id, name: a.name }).collect();
     apps.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.name.cmp(&b.name)));
     STORE.with(|s| match s.try_borrow_mut() {
-        Ok(mut s) => {
+        Ok(mut s) if s.open => {
             s.apps = apps;
             s.loaded = true;
         }
+        Ok(_) => {}
         Err(_) => log!("startmenu: store busy, catalog dropped"),
     });
 }
@@ -198,7 +226,7 @@ pub(crate) fn store_apps(list: Vec<StartApp>) {
 pub(crate) fn store_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>) -> bool {
     STORE.with(|s| {
         let Ok(mut s) = s.try_borrow_mut() else { return false };
-        if icon_px != s.icon_px {
+        if !s.open || icon_px != s.icon_px {
             return false;
         }
         let mut any = false;
@@ -218,6 +246,7 @@ pub(crate) fn store_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>
 fn request_catalog(px: u32) {
     let px = STORE.with(|s| match s.try_borrow_mut() {
         Ok(mut s) => {
+            s.open = true;
             if px > s.icon_px {
                 s.icon_px = px;
                 s.icons.clear();
@@ -292,17 +321,27 @@ pub(crate) struct Geo {
     pub dots: Vec<RECT>,
     pub bar: Option<RECT>,
     pub power: Option<RECT>,
+    /// Horizontal style only: pinned tiles per page (`H_COLS` x the rows that fit; `H_PAGE` uncapped).
+    pub page_size: usize,
 }
 
-/// Layout for `pins` pinned apps to show (0 while searching).
-pub(crate) fn layout(m: Metrics, pins: usize) -> Geo {
-    let (w, h, inset, gap) = (m.px(W), m.px(H), m.px(INSET), m.px(GAP));
+/// Layout for `pins` pinned apps to show (0 while searching), inside `max` (the work area minus the
+/// margins): pin rows are dropped until at least `MIN_LIST_ROWS` list rows are left.
+pub(crate) fn layout(m: Metrics, pins: usize, max: (i32, i32)) -> Geo {
+    let (w, h, inset, gap) = (m.px(W).min(max.0), m.px(H).min(max.1), m.px(INSET), m.px(GAP));
     let inner = w - 2 * inset;
     let search = rect_wh(inset, inset, inner, m.px(SEARCH_H));
     let mut y = search.bottom + gap;
     let mut pins_header = None;
     let mut tiles = Vec::new();
-    let shown = pins.min(COLS * MAX_PIN_ROWS);
+    let row_h = m.px(ROW_H).max(1);
+    let (hh_h, th) = (m.px(HEADER_H), m.px(TILE_H));
+    let list_rows = |r: usize| {
+        let top = y + if r > 0 { hh_h + r as i32 * th + gap } else { 0 } + hh_h;
+        (h - inset - top) / row_h
+    };
+    let pin_rows = (0..=MAX_PIN_ROWS).rev().find(|&r| list_rows(r) >= MIN_LIST_ROWS as i32).unwrap_or(0);
+    let shown = pins.min(COLS * pin_rows);
     if shown > 0 {
         let hh = rect_wh(inset, y, inner, m.px(HEADER_H));
         y = hh.bottom;
@@ -315,7 +354,6 @@ pub(crate) fn layout(m: Metrics, pins: usize) -> Geo {
         y += shown.div_ceil(COLS) as i32 * th + gap;
     }
     let list_header = rect_wh(inset, y, inner, m.px(HEADER_H));
-    let row_h = m.px(ROW_H).max(1);
     let list = RECT { left: inset, top: list_header.bottom, right: w - inset, bottom: h - inset };
     let rows = ((list.bottom - list.top) / row_h).max(1) as usize;
     Geo { w, h, search, pins_header, tiles, list_header, list, row_h, rows, list_shown: true, ..Geo::default() }
@@ -323,9 +361,17 @@ pub(crate) fn layout(m: Metrics, pins: usize) -> Geo {
 
 /// Horizontal layout. `pins`: pinned apps to page through (0 on the list); `page`: the page shown
 /// (clamped by the caller); `list`: the list replaces the pinned page (search or "All apps");
-/// `button_w`: width of the header button (physical px), `None` = no button (searching).
-pub(crate) fn layout_h(m: Metrics, pins: usize, page: usize, list: bool, button_w: Option<i32>) -> Geo {
-    let (w, h, inset, gap) = (m.px(HW), m.px(HH), m.px(H_INSET), m.px(GAP));
+/// `button_w`: width of the header button (physical px), `None` = no button (searching); `max`: the work
+/// area minus the margins (tile rows are dropped until the pinned page fits above the bottom bar).
+pub(crate) fn layout_h(
+    m: Metrics,
+    pins: usize,
+    page: usize,
+    list: bool,
+    button_w: Option<i32>,
+    max: (i32, i32),
+) -> Geo {
+    let (w, h, inset, gap) = (m.px(HW).min(max.0), m.px(HH).min(max.1), m.px(H_INSET), m.px(GAP));
     let inner = w - 2 * inset;
     let search = rect_wh(inset, inset, inner, m.px(SEARCH_H));
     let list_header = rect_wh(inset, search.bottom + gap + m.px(6), inner, m.px(HEADER_H));
@@ -338,16 +384,18 @@ pub(crate) fn layout_h(m: Metrics, pins: usize, page: usize, list: bool, button_
     let row_h = m.px(ROW_H).max(1);
     let rows = ((body.bottom - body.top) / row_h).max(1) as usize;
     let (tw, th) = (inner / H_COLS as i32, m.px(H_TILE_H));
-    let grid = RECT { bottom: body.top + H_ROWS as i32 * th, ..body };
+    let tile_rows = (1..=H_ROWS).rev().find(|&r| body.top + r as i32 * th <= body.bottom).unwrap_or(1);
+    let page_size = H_COLS * tile_rows;
+    let grid = RECT { bottom: body.top + tile_rows as i32 * th, ..body };
     let mut tiles = Vec::new();
     let mut dots = Vec::new();
     if !list {
-        let first = page * H_PAGE;
-        for i in 0..pins.saturating_sub(first).min(H_PAGE) {
+        let first = page * page_size;
+        for i in 0..pins.saturating_sub(first).min(page_size) {
             let (r, c) = ((i / H_COLS) as i32, (i % H_COLS) as i32);
             tiles.push(rect_wh(inset + c * tw, grid.top + r * th, tw, th));
         }
-        let pages = pins.div_ceil(H_PAGE).min(MAX_DOTS);
+        let pages = pins.div_ceil(page_size).min(MAX_DOTS);
         if pages > 1 {
             // A column in the right margin, centred on the grid.
             let d = m.px(H_DOT_HIT);
@@ -374,6 +422,7 @@ pub(crate) fn layout_h(m: Metrics, pins: usize, page: usize, list: bool, button_
         dots,
         bar: Some(bar),
         power: Some(power),
+        page_size,
     }
 }
 
@@ -502,7 +551,9 @@ pub(crate) struct StartMenu {
     flyout: bool,
     fly: Flyout,
     /// Power action chosen in the flyout, run after the popup closes.
-    power_pending: Option<PowerAction>,
+    power_pending: Option<Choice>,
+    /// Largest panel size (physical px): the work area minus the margins, set by `limit`.
+    max: (i32, i32),
 }
 
 /// Creates the content in the configured style; labels in the dock language (`i18n`).
@@ -536,6 +587,7 @@ fn make() -> StartMenu {
         flyout: false,
         fly: Flyout::default(),
         power_pending: None,
+        max: UNCAPPED,
     }
 }
 
@@ -553,7 +605,7 @@ pub(crate) fn preview_new(
     let px = apps.first().map_or(32, |a| a.2.width);
     STORE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
-            *s = Store { icon_px: px, ..Store::default() };
+            *s = Store { icon_px: px, open: true, ..Store::default() };
         }
     });
     store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect());
@@ -597,15 +649,21 @@ impl StartMenu {
         self.pins = pins;
         if self.horiz {
             let list = self.list_mode();
-            self.page = self.page.min(self.pages() - 1);
             let button = (!searching).then_some(if self.all { self.button_w.1 } else { self.button_w.0 });
-            self.geo = layout_h(self.m, if list { 0 } else { self.pins.len() }, self.page, list, button);
+            let pins = if list { 0 } else { self.pins.len() };
+            self.geo = layout_h(self.m, pins, self.page, list, button, self.max);
+            // The page size comes from the layout: clamp the page, then lay out again if it moved.
+            let page = self.page.min(self.pages() - 1);
+            if page != self.page {
+                self.page = page;
+                self.geo = layout_h(self.m, pins, page, list, button, self.max);
+            }
             self.fly = match self.geo.power {
                 Some(p) => layout_flyout(self.m, self.geo.w, self.geo.h, p),
                 None => Flyout::default(),
             };
         } else {
-            self.geo = layout(self.m, self.pins.len());
+            self.geo = layout(self.m, self.pins.len(), self.max);
             self.pins.truncate(self.geo.tiles.len());
         }
         self.scroll = self.scroll.min(self.max_scroll());
@@ -626,13 +684,13 @@ impl StartMenu {
 
     /// Horizontal: pinned pages (at least 1, at most `MAX_DOTS`).
     fn pages(&self) -> usize {
-        self.pins.len().div_ceil(H_PAGE).clamp(1, MAX_DOTS)
+        self.pins.len().div_ceil(self.geo.page_size.max(1)).clamp(1, MAX_DOTS)
     }
 
     /// Index into `pins` of the first tile shown.
     fn pin_base(&self) -> usize {
         if self.horiz {
-            self.page * H_PAGE
+            self.page * self.geo.page_size
         } else {
             0
         }
@@ -702,12 +760,11 @@ impl StartMenu {
         Reply::Redraw
     }
 
-    /// A row of the flyout was chosen: an action runs after the popup closes, "Settings" switches.
+    /// A row of the flyout was chosen: the action (or the Settings window) runs after the popup closes.
     fn choose_power(&mut self, item: u32) -> Reply {
         match popup_power::choice(item) {
-            Some(Choice::Settings) => Reply::Switch(PopupKind::Settings),
-            Some(Choice::Run(a)) => {
-                self.power_pending = Some(a);
+            Some(c) => {
+                self.power_pending = Some(c);
                 Reply::Close
             }
             None => Reply::None,
@@ -1022,6 +1079,10 @@ impl Content for StartMenu {
         PopupKind::StartMenu
     }
 
+    fn limit(&mut self, max: (i32, i32)) {
+        self.max = max;
+    }
+
     fn size(&mut self, s: &Surface) -> (i32, i32) {
         self.m = s.metrics();
         if self.horiz {
@@ -1182,8 +1243,9 @@ impl Content for StartMenu {
     }
 
     fn after_close(&mut self) {
-        if let Some(a) = self.power_pending.take() {
-            popup_power::run(a);
+        crate::popup::arm_start_release();
+        if let Some(c) = self.power_pending.take() {
+            popup_power::run_choice(c);
             return;
         }
         if let Some(id) = self.pending.take() {
@@ -1196,8 +1258,26 @@ impl Content for StartMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::power::PowerAction;
 
     const M: Metrics = Metrics { dpi: 96 };
+
+    #[test]
+    fn releasing_frees_the_store_and_late_events_are_dropped() {
+        let apps = vec![
+            ("a".to_string(), "Alpha".to_string(), IconBitmap::new(32, 32)),
+            ("b".to_string(), "Beta".to_string(), IconBitmap::new(32, 32)),
+        ];
+        drop(preview_new(apps, "", StartStyle::Vertical, false, false));
+        assert_eq!(release_store(), 2 * 32 * 32 * 4);
+        STORE.with(|s| {
+            let s = s.borrow();
+            assert!(s.apps.is_empty() && s.icons.is_empty() && !s.loaded && !s.open);
+        });
+        store_apps(vec![StartApp { id: "x".into(), name: "X".into() }]);
+        assert!(!store_icons(32, vec![("x".into(), Some(IconBitmap::new(32, 32)))]), "closed menu ignores late icons");
+        STORE.with(|s| assert!(s.borrow().apps.is_empty()));
+    }
 
     #[test]
     fn search_ranks_prefix_then_word_then_substring() {
@@ -1218,9 +1298,9 @@ mod tests {
 
     #[test]
     fn layout_without_pins_gives_the_list_more_rows() {
-        let none = layout(M, 0);
-        let some = layout(M, 3);
-        let full = layout(M, 40);
+        let none = layout(M, 0, UNCAPPED);
+        let some = layout(M, 3, UNCAPPED);
+        let full = layout(M, 40, UNCAPPED);
         assert!(none.pins_header.is_none() && none.tiles.is_empty());
         assert_eq!(some.tiles.len(), 3);
         assert_eq!(full.tiles.len(), COLS * MAX_PIN_ROWS);
@@ -1232,7 +1312,7 @@ mod tests {
             assert!(g.tiles.iter().all(|t| t.right <= g.w - INSET && t.bottom <= g.list_header.top));
         }
         // Tiles: one row of 6, then the 7th starts the second row.
-        let seven = layout(M, 7);
+        let seven = layout(M, 7, UNCAPPED);
         assert_eq!(seven.tiles[6].left, seven.tiles[0].left);
         assert_eq!(seven.tiles[6].top, seven.tiles[0].bottom);
     }
@@ -1240,7 +1320,7 @@ mod tests {
     #[test]
     fn horizontal_layout_pages_and_stays_inside() {
         // One full page, no dots.
-        let one = layout_h(M, 18, 0, false, Some(90));
+        let one = layout_h(M, 18, 0, false, Some(90), UNCAPPED);
         assert_eq!((one.w, one.h), (HW, HH));
         assert_eq!(one.tiles.len(), H_PAGE);
         assert!(one.dots.is_empty() && !one.list_shown);
@@ -1249,12 +1329,12 @@ mod tests {
         assert_eq!(one.tiles[6].top, one.tiles[0].bottom);
         assert_eq!(one.tiles[17].bottom, one.grid.bottom);
         // 20 pins: two pages, the second one with 2 tiles, one dot per page.
-        let p0 = layout_h(M, 20, 0, false, Some(90));
-        let p1 = layout_h(M, 20, 1, false, Some(90));
+        let p0 = layout_h(M, 20, 0, false, Some(90), UNCAPPED);
+        let p1 = layout_h(M, 20, 1, false, Some(90), UNCAPPED);
         assert_eq!((p0.tiles.len(), p1.tiles.len()), (H_PAGE, 2));
         assert_eq!((p0.dots.len(), p1.dots.len()), (2, 2));
         // List page: no tiles, rows fill the body above the bottom bar.
-        let list = layout_h(M, 0, 0, true, None);
+        let list = layout_h(M, 0, 0, true, None, UNCAPPED);
         assert!(list.list_shown && list.tiles.is_empty() && list.button.is_none() && list.rows > 8);
         for g in [&one, &p0, &p1, &list] {
             let bar = g.bar.unwrap();
@@ -1268,7 +1348,7 @@ mod tests {
                 assert!(b.right == g.list_header.right && b.top >= g.list_header.top && b.bottom <= g.list_header.bottom);
             }
         }
-        let big = layout_h(Metrics { dpi: 144 }, 3, 0, false, None);
+        let big = layout_h(Metrics { dpi: 144 }, 3, 0, false, None, UNCAPPED);
         assert_eq!((big.w, big.h), (HW * 3 / 2, HH * 3 / 2));
     }
 
@@ -1279,8 +1359,8 @@ mod tests {
         c.requested = true;
         c.button_w = (90, 70);
         c.pins = (0..40).collect();
+        c.geo = layout_h(M, c.pins.len(), 0, false, Some(90), UNCAPPED);
         assert_eq!(c.pages(), 3);
-        c.geo = layout_h(M, c.pins.len(), 0, false, Some(90));
         assert!(!c.list_mode());
         // Pin ids map through the page.
         c.page = 1;
@@ -1298,7 +1378,7 @@ mod tests {
     fn power_flyout_sits_above_the_power_button_inside_the_panel() {
         for dpi in [96, 120, 144, 192] {
             let m = Metrics { dpi };
-            let g = layout_h(m, 8, 0, false, Some(90));
+            let g = layout_h(m, 8, 0, false, Some(90), UNCAPPED);
             let power = g.power.unwrap();
             let f = layout_flyout(m, g.w, g.h, power);
             let p = f.panel;
@@ -1353,11 +1433,13 @@ mod tests {
         c.click(ID_POWER);
         c.click(ID_POWER);
         assert!(!c.flyout);
-        // Settings switches; an action closes the Start and waits for `after_close`.
+        // Settings and every action close the Start and wait for `after_close`.
         c.click(ID_POWER);
-        assert_eq!(c.click(ID_FLY + popup_power::ID_SETTINGS), Reply::Switch(PopupKind::Settings));
+        assert_eq!(c.click(ID_FLY + popup_power::ID_SETTINGS), Reply::Close);
+        assert_eq!(c.power_pending, Some(Choice::Settings));
+        c.power_pending = None;
         assert_eq!(c.click(ID_FLY + popup_power::ID_LOCK), Reply::Close);
-        assert_eq!(c.power_pending, Some(PowerAction::Lock));
+        assert_eq!(c.power_pending, Some(Choice::Run(PowerAction::Lock)));
         c.power_pending = None;
         // The vertical style has no power button: no flyout.
         let mut v = make();
@@ -1368,7 +1450,7 @@ mod tests {
 
     #[test]
     fn layout_scales_with_dpi() {
-        let g = layout(Metrics { dpi: 144 }, 2);
+        let g = layout(Metrics { dpi: 144 }, 2, UNCAPPED);
         assert_eq!((g.w, g.h), (W * 3 / 2, H * 3 / 2));
     }
 
@@ -1387,5 +1469,46 @@ mod tests {
         let t = tail_fit(&s, long, 60);
         assert!(long.ends_with(&t) && !t.is_empty() && s.text_width(&t, Font::Normal) <= 60);
         assert_eq!(tail_fit(&s, "abc", 500), "abc");
+    }
+
+    #[test]
+    fn start_menu_fits_a_short_work_area() {
+        let m = Metrics { dpi: 192 }; // 200 %
+        let max = (m.px(W) + 100, 1008); // 1080p work area minus margins
+        let g = layout(m, 12, max);
+        assert!(g.h <= max.1 && g.list.bottom <= g.h && g.rows >= 3, "{g:?}");
+        assert!(g.tiles.iter().all(|t| t.bottom <= g.list_header.top));
+        let h = layout_h(m, 20, 0, false, Some(90), max);
+        assert!(h.h <= max.1);
+        let bar = h.bar.unwrap();
+        assert!(bar.bottom <= h.h && h.grid.bottom <= bar.top);
+        assert!(h.page_size >= H_COLS && h.page_size <= H_PAGE && h.tiles.len() == h.page_size.min(20));
+        // Uncapped results are unchanged.
+        assert_eq!(layout(Metrics { dpi: 96 }, 12, UNCAPPED).h, H);
+        assert_eq!(layout_h(Metrics { dpi: 96 }, 18, 0, false, Some(90), UNCAPPED).page_size, H_PAGE);
+    }
+
+    #[test]
+    fn short_work_area_drops_pin_rows_and_tile_rows() {
+        let m = Metrics { dpi: 96 };
+        // Vertical: with both pin rows the list header ends at 288 px and 3 list rows need h >= 416;
+        // one pin row needs h >= 336.
+        let full = layout(m, 12, (i32::MAX, 416));
+        assert_eq!(full.tiles.len(), COLS * MAX_PIN_ROWS, "416 keeps both pin rows");
+        let g = layout(m, 12, (i32::MAX, 380));
+        assert_eq!(g.tiles.len(), COLS, "380 keeps one pin row");
+        assert!(g.h <= 380 && g.rows >= MIN_LIST_ROWS && g.list.bottom <= g.h, "{g:?}");
+        let none = layout(m, 12, (i32::MAX, 300));
+        assert!(none.tiles.is_empty() && none.pins_header.is_none() && none.rows >= MIN_LIST_ROWS, "{none:?}");
+        // Horizontal: tile row r needs h >= 178 + 96 r (grid top 108, bar 60 + gap 10 below).
+        let two = layout_h(m, 20, 0, false, Some(90), (i32::MAX, 400));
+        assert_eq!((two.page_size, two.tiles.len()), (2 * H_COLS, 2 * H_COLS));
+        assert!(two.h <= 400 && two.grid.bottom <= two.bar.unwrap().top);
+        let one = layout_h(m, 20, 0, false, Some(90), (i32::MAX, 300));
+        assert_eq!((one.page_size, one.tiles.len()), (H_COLS, H_COLS));
+        assert!(one.h <= 300 && one.grid.bottom <= one.bar.unwrap().top);
+        // Pages follow the smaller page: 20 pins on 6-tile pages = 4 dots, and page 3 holds the last 2.
+        assert_eq!(one.dots.len(), 4);
+        assert_eq!(layout_h(m, 20, 3, false, Some(90), (i32::MAX, 300)).tiles.len(), 2);
     }
 }

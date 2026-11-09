@@ -72,6 +72,63 @@ impl<'de> Deserialize<'de> for StartStyle {
     }
 }
 
+/// Battery module visibility. Written as `"auto"` / `true` / `false`; an unreadable value is `Auto`
+/// instead of rejecting the file. `Auto` shows the module only when the machine has a battery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BatteryShow {
+    /// Shown only on a machine with a battery (decided at runtime from the last sample).
+    #[default]
+    Auto,
+    /// Always shown (an icon with a slash when there is no battery).
+    On,
+    /// Never shown.
+    Off,
+}
+
+impl BatteryShow {
+    /// Whether the module is in the bar, given whether a battery was seen.
+    pub fn shown(self, battery_present: bool) -> bool {
+        match self {
+            BatteryShow::Auto => battery_present,
+            BatteryShow::On => true,
+            BatteryShow::Off => false,
+        }
+    }
+
+    fn parse_str(s: &str) -> BatteryShow {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("true") {
+            BatteryShow::On
+        } else if s.eq_ignore_ascii_case("false") {
+            BatteryShow::Off
+        } else {
+            BatteryShow::Auto
+        }
+    }
+}
+
+impl Serialize for BatteryShow {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            BatteryShow::Auto => s.serialize_str("auto"),
+            BatteryShow::On => s.serialize_bool(true),
+            BatteryShow::Off => s.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BatteryShow {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Any JSON value is accepted: a boolean is a valid setting, everything unreadable is `Auto`.
+        Ok(match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Bool(true) => BatteryShow::On,
+            serde_json::Value::Bool(false) => BatteryShow::Off,
+            serde_json::Value::String(s) => BatteryShow::parse_str(&s),
+            _ => BatteryShow::Auto,
+        })
+    }
+}
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -162,7 +219,7 @@ impl<'de> Deserialize<'de> for Background {
     }
 }
 
-/// Preset background colours offered by the Settings popup: dark tones that keep white text readable.
+/// Preset background colours offered by the Settings window: dark tones that keep white text readable.
 pub const BACKGROUND_PRESETS: [(&str, Background); 7] = [
     ("Black", Background::BLACK),
     ("Graphite", Background::DARK),
@@ -357,6 +414,13 @@ pub const MODULE_SIZE: SizeRange = SizeRange { min: 75, max: 150, default: 100 }
 /// Default opacity of the bar background (percent).
 pub const DEFAULT_BAR_OPACITY: u8 = 95;
 
+/// Smallest Settings window client area (logical px at 96 DPI).
+pub const SETTINGS_WINDOW_MIN: (i32, i32) = (640, 460);
+/// Default Settings window client area (logical px at 96 DPI).
+pub const SETTINGS_WINDOW_DEFAULT: (i32, i32) = (860, 600);
+/// Largest sane Settings window dimension; anything above is treated as corrupt.
+const SETTINGS_WINDOW_MAX: u16 = 16384;
+
 /// An app pinned to the dock.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
@@ -413,6 +477,12 @@ pub struct Config {
     pub show_network: bool,
     /// CPU / RAM usage module (`metrics`).
     pub show_metrics: bool,
+    /// Battery module: "auto" (only on a laptop) | true | false (`BatteryShow`).
+    pub show_battery: BatteryShow,
+    /// Battery module: show the charge percentage.
+    pub battery_percent: bool,
+    /// Battery module: put the percentage inside the battery body instead of beside it.
+    pub battery_percent_inside: bool,
     pub show_clock: bool,
     pub show_desktop_button: bool,
     /// Start button: fixed item at the left end of the bar (not a movable module); see `module_visible("start")`.
@@ -434,6 +504,8 @@ pub struct Config {
     pub background: Background,
     /// Opacity of the bar background in percent (0..=100; text and icons stay fully opaque).
     pub bar_opacity: u8,
+    /// Size of the Settings window in logical pixels (96 DPI), [width, height]. Use `settings_size`.
+    pub settings_window_size: [u16; 2],
     /// Clock picture for GetTimeFormatEx (default "HH:mm").
     pub time_format: String,
     /// If true and `time_format` has no "s", ":ss" is appended.
@@ -463,6 +535,14 @@ pub struct Config {
     /// true once the `notif` thread has already asked for notification access once
     /// (`RequestAccessAsync`): the prompt is not shown again on every start.
     pub notif_prompted: bool,
+    /// true = once a day ask GitHub whether a newer release exists (badge only).
+    pub update_check: bool,
+    /// true = also download, verify and install a new release by itself when it is quiet.
+    pub update_auto_install: bool,
+    /// Internal: UTC time (RFC 3339) of the last successful update check, "" = never.
+    pub last_update_check: String,
+    /// Internal: tag of the newest release found by the last check, "" = none.
+    pub update_available: String,
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -470,8 +550,8 @@ pub const APP_ORDER_CAP: usize = 64;
 pub const TRAY_ORDER_CAP: usize = 128;
 
 /// Default order of the system modules (names accepted by `modules_order`).
-pub const DEFAULT_MODULES_ORDER: [&str; 7] =
-    ["metrics", "notifications", "network", "volume", "clock", "show_desktop", "power"];
+pub const DEFAULT_MODULES_ORDER: [&str; 8] =
+    ["metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power"];
 
 /// GUIDs of the system tray icons hidden by default: volume, network, power, location,
 /// microphone (the dock draws/duplicates the first three).
@@ -504,6 +584,9 @@ impl Default for Config {
             show_volume: true,
             show_network: true,
             show_metrics: false,
+            show_battery: BatteryShow::Auto,
+            battery_percent: true,
+            battery_percent_inside: false,
             show_clock: true,
             show_desktop_button: true,
             show_start_button: true,
@@ -515,6 +598,7 @@ impl Default for Config {
             module_size: MODULE_SIZE.default,
             background: Background::BLACK,
             bar_opacity: DEFAULT_BAR_OPACITY,
+            settings_window_size: [SETTINGS_WINDOW_DEFAULT.0 as u16, SETTINGS_WINDOW_DEFAULT.1 as u16],
             time_format: "HH:mm".to_string(),
             show_seconds: false,
             date_format: "ddd d MMM".to_string(),
@@ -525,6 +609,10 @@ impl Default for Config {
             modules_order: DEFAULT_MODULES_ORDER.iter().map(|s| s.to_string()).collect(),
             audio_layout: AudioLayout::default(),
             notif_prompted: false,
+            update_check: true,
+            update_auto_install: false,
+            last_update_check: String::new(),
+            update_available: String::new(),
         }
     }
 }
@@ -719,7 +807,7 @@ fn render(c: &Config) -> String {
   //   app_icon_size   app icons, 14-32 px (default 16)
   //   app_text_size   app names, 10-18 px (default 13)
   //   tray_icon_size  tray icons, 12-24 px (default 16)
-  //   module_size     start button, notifications, volume, network, metrics, clock, show desktop and
+  //   module_size     start button, notifications, volume, network, metrics, battery, clock, show desktop and
   //                   power, 75-150 % (default 100)
   // Logical pixels: the Windows display scaling is applied on top.
   "app_icon_size": {icon_size},
@@ -728,12 +816,16 @@ fn render(c: &Config) -> String {
   "module_size": {module_size},
 
   // Background colour of the bar and the popups as a hex code, #RRGGBB (e.g. #000000, pure black,
-  // ideal for OLED). The Settings popup offers dark presets and a colour picker.
+  // ideal for OLED). The Settings window offers dark presets and a colour picker.
   "background": "{bg}",
 
   // Opacity of the bar background in percent, 0-100 (0 = only text and icons are visible; the
   // bar still reacts to the mouse). Text and icons always stay fully opaque.
   "bar_opacity": {opacity},
+
+  // Size of the Settings window in logical pixels (96 DPI), [width, height]. Remembered when you
+  // resize it; at least [640, 460]; clamped to the display it opens on.
+  "settings_window_size": {settings_size},
 
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
   "autohide": {autohide},
@@ -796,6 +888,17 @@ fn render(c: &Config) -> String {
   // Click to open Task Manager.
   "show_metrics": {show_metrics},
 
+  // Battery: an Apple-style icon filled in proportion to the charge, with a bolt while charging.
+  // Click for the details. Refreshed every 30 s while the bar is visible, and at once when the
+  // charger is plugged or unplugged.
+  //   show_battery            "auto" (only on a laptop) | true (always; an icon with a slash when there
+  //                           is no battery) | false
+  //   battery_percent         show the number
+  //   battery_percent_inside  put the number inside the battery body (Apple style) instead of beside it
+  "show_battery": {show_battery},
+  "battery_percent": {battery_percent},
+  "battery_percent_inside": {battery_percent_inside},
+
   "show_clock": {show_clock},
   "show_desktop_button": {show_desk},
 
@@ -835,7 +938,7 @@ fn render(c: &Config) -> String {
   "app_order": {app_order},
 
   // Order of the system buttons on the right of the bar. Normally managed by dragging them.
-  // Names: "metrics", "notifications", "network", "volume", "clock", "show_desktop", "power".
+  // Names: "metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power".
   // Missing names go back next to their default neighbour, unknown names are ignored.
   // Hiding a module (the show_* switches above) keeps its place in this list.
   "modules_order": {modules_order},
@@ -853,12 +956,26 @@ fn render(c: &Config) -> String {
   // value = the name to show. Example: {{ "code.exe": "VS Code" }}
   "names": {names},
 
+  // Updates. Once a day the dock asks GitHub (api.github.com) whether a newer release exists and
+  // shows a badge on Settings; nothing is downloaded until you choose "Update now" in Settings ->
+  // Updates. false = never ask by itself ("Check now" still works).
+  "update_check": {update_check},
+
+  // true = also download, verify (SHA-256 + version) and install a new release by itself, the next
+  // time no popup or Settings window is open and no fullscreen app is in front.
+  "update_auto_install": {update_auto_install},
+
+  // Internal: time of the last successful check (UTC) and the newest release found. Leave as is.
+  "last_update_check": {last_update_check},
+  "update_available": {update_available},
+
   // Internal: set once the notification-access prompt has been shown. Leave as is.
   "notif_prompted": {notif}
 }}
 "#,
         monitor = js(&c.monitor),
         opacity = c.bar_opacity.min(100),
+        settings_size = js(&c.settings_window_size),
         icon_size = c.app_icon_size,
         text_size = c.app_text_size,
         tray_size = c.tray_icon_size,
@@ -878,6 +995,9 @@ fn render(c: &Config) -> String {
         show_vol_mod = c.show_volume,
         show_network = c.show_network,
         show_metrics = c.show_metrics,
+        show_battery = js(&c.show_battery),
+        battery_percent = c.battery_percent,
+        battery_percent_inside = c.battery_percent_inside,
         show_clock = c.show_clock,
         show_desk = c.show_desktop_button,
         show_start = c.show_start_button,
@@ -891,6 +1011,10 @@ fn render(c: &Config) -> String {
         start_pins = js_block(&c.start_pins),
         names = js_block(&c.names),
         notif = c.notif_prompted,
+        update_check = c.update_check,
+        update_auto_install = c.update_auto_install,
+        last_update_check = js(&c.last_update_check),
+        update_available = js(&c.update_available),
     )
 }
 
@@ -1103,7 +1227,9 @@ fn write_file(c: &Config) -> Result<(), String> {
 /// Names accepted by `Config::module_visible` / `set_module_visible`: the `modules_order` names
 /// plus "tray" (`show_tray`). The power button is not listed: it is always shown. The Start button
 /// ("start", `show_start_button`) is a fixed item, not a module: the two methods accept it but it is
-/// not listed here (the settings popup adds its switch by hand).
+/// not listed here (the Settings window adds its switch by hand). The Settings window lists its toggles
+/// explicitly (`settings_pages::MODULE_TOGGLES`), so only the tests use this one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const MODULE_NAMES: [&str; 7] = ["notifications", "volume", "network", "metrics", "clock", "show_desktop", "tray"];
 
 impl Config {
@@ -1152,6 +1278,20 @@ impl Config {
     /// Bar background alpha (0..=255) from `bar_opacity` (0..=100 %).
     pub fn bar_alpha(&self) -> u32 {
         (self.bar_opacity.min(100) as u32 * 255 + 50) / 100
+    }
+
+    /// Settings window client size in logical px: a dimension that is 0 or above 16384 falls back to
+    /// its default, then the result is raised to the minimum.
+    pub fn settings_size(&self) -> (i32, i32) {
+        let dim = |v: u16, default: i32, min: i32| {
+            let v = if v == 0 || v > SETTINGS_WINDOW_MAX { default } else { v as i32 };
+            v.max(min)
+        };
+        let [w, h] = self.settings_window_size;
+        (
+            dim(w, SETTINGS_WINDOW_DEFAULT.0, SETTINGS_WINDOW_MIN.0),
+            dim(h, SETTINGS_WINDOW_DEFAULT.1, SETTINGS_WINDOW_MIN.1),
+        )
     }
 
     /// The four sizes clamped to their ranges: (app icon px, app text px, tray icon px, module %).
@@ -1277,6 +1417,41 @@ mod tests {
     }
 
     #[test]
+    fn update_keys_default_and_roundtrip() {
+        let d = Config::default();
+        assert!(d.update_check && !d.update_auto_install);
+        assert!(d.last_update_check.is_empty() && d.update_available.is_empty());
+        let c = Config {
+            update_check: false,
+            update_auto_install: true,
+            last_update_check: "2026-11-09T12:34:56Z".into(),
+            update_available: "v1.4.1".into(),
+            ..Config::default()
+        };
+        let r = render(&c);
+        assert!(r.contains("\"update_check\": false") && r.contains("\"update_auto_install\": true"));
+        assert!(
+            r.contains("\"last_update_check\": \"2026-11-09T12:34:56Z\"")
+                && r.contains("\"update_available\": \"v1.4.1\"")
+        );
+        assert_eq!(parse(&r).unwrap(), c);
+        assert!(parse("{}").unwrap().update_check); // an old config.json gets the default
+    }
+
+    #[test]
+    fn settings_window_size_defaults_and_clamps() {
+        let c = Config::default();
+        assert_eq!(c.settings_window_size, [860, 600]);
+        assert_eq!(c.settings_size(), (860, 600));
+        let r = render(&c);
+        assert!(r.contains("\"settings_window_size\": [860,600]"));
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(parse("{\"settings_window_size\": [100, 100]}").unwrap().settings_size(), (640, 460));
+        assert_eq!(parse("{\"settings_window_size\": [0, 20000]}").unwrap().settings_size(), (860, 600));
+        assert_eq!(parse("{}").unwrap().settings_window_size, [860, 600]);
+    }
+
+    #[test]
     fn template_roundtrip() {
         let mut c = Config::default();
         c.pinned.push(PinnedApp {
@@ -1296,6 +1471,7 @@ mod tests {
         c.module_size = 125;
         c.background = Background(0x2E1119);
         c.bar_opacity = 0;
+        c.settings_window_size = [1000, 700];
         c.window_previews = false;
         c.win_opens_start = true;
         c.language = Language::It;
@@ -1310,6 +1486,51 @@ mod tests {
     }
 
     #[test]
+    fn battery_defaults_and_roundtrip() {
+        let d = Config::default();
+        assert_eq!(d.show_battery, BatteryShow::Auto);
+        assert!(d.battery_percent && !d.battery_percent_inside);
+        assert_eq!(d.modules_order.len(), 8);
+        assert_eq!(d.modules_order[4], "battery");
+        assert!(render(&d).contains("\"show_battery\": \"auto\""));
+        let c = Config {
+            show_battery: BatteryShow::On,
+            battery_percent: false,
+            battery_percent_inside: true,
+            ..Config::default()
+        };
+        let r = render(&c);
+        assert!(r.contains("\"show_battery\": true") && r.contains("\"battery_percent\": false"));
+        assert!(r.contains("\"battery_percent_inside\": true"));
+        assert_eq!(parse(&r).unwrap(), c);
+    }
+
+    #[test]
+    fn battery_show_parses_leniently() {
+        for (text, want) in [
+            ("\"auto\"", BatteryShow::Auto),
+            ("\"AUTO\"", BatteryShow::Auto),
+            ("true", BatteryShow::On),
+            ("false", BatteryShow::Off),
+            ("\"true\"", BatteryShow::On),
+            ("\"false\"", BatteryShow::Off),
+            ("\"yes\"", BatteryShow::Auto),
+            ("1", BatteryShow::Auto),
+            ("null", BatteryShow::Auto),
+        ] {
+            let c = parse(&format!("{{ \"show_battery\": {text}, \"autohide\": false }}")).unwrap();
+            assert_eq!(c.show_battery, want, "{text}");
+            assert!(!c.autohide, "the rest of the file must survive: {text}");
+        }
+    }
+
+    #[test]
+    fn battery_show_resolves_auto_with_presence() {
+        assert!(!BatteryShow::Auto.shown(false) && BatteryShow::Auto.shown(true));
+        assert!(BatteryShow::On.shown(false) && !BatteryShow::Off.shown(true));
+    }
+
+    #[test]
     fn order_fields_roundtrip() {
         let mut c = Config::default();
         c.app_order = vec!["a".into(), "b".into()];
@@ -1318,7 +1539,7 @@ mod tests {
         let r = render(&c);
         assert!(r.contains("\"modules_order\""));
         assert_eq!(parse(&r).unwrap(), c);
-        assert_eq!(Config::default().modules_order.len(), 7);
+        assert_eq!(Config::default().modules_order.len(), 8);
     }
 
     #[test]
