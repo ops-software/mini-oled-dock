@@ -726,7 +726,8 @@ fn explorer_restarted(why: &str) {
 }
 
 /// Marks the exit as begun: `RESTORING = true`, drops the Explorer-restart pause and kills
-/// `TIMER_TRAY_REANNOUNCE`. Idempotent, UI thread, first thing in every exit path of `main`.
+/// `TIMER_TRAY_REANNOUNCE`. Idempotent, UI thread, first thing in the explicit exit requests (quit request,
+/// hotkey, close, end of session).
 /// This is only the EARLY part of the exit: `restore()` / `restore_force()` remain the exit path that puts
 /// the taskbar back (they set `RESTORING` themselves). `begin_exit` merely makes the exit visible sooner,
 /// so that `pause_step`, `hide_all` and `explorer_restarted` stop acting before `restore()` runs, and it
@@ -844,6 +845,11 @@ pub fn host_paused() -> bool {
     HOST_PAUSED_AT.load(Relaxed) != 0
 }
 
+/// true once the exit has begun (`RESTORING`, set by `begin_exit` / `restore()`).
+pub fn exiting() -> bool {
+    RESTORING.load(Relaxed)
+}
+
 /// true for a `Shell_TrayWnd` created by the tray host of ANY dock process (property
 /// `tray_host::PROP_DOCK_TRAY_HOST`) or by this process. Used by `native_taskbars()`,
 /// `on_winevent` and by the tray host to tell Explorer's taskbar apart.
@@ -916,7 +922,7 @@ pub fn on_reannounce_timer() {
                     return;
                 }
                 let waited = now.saturating_sub(paused);
-                log!("taskbar: Explorer back after {waited} ms, starting our tray host again");
+                log!("taskbar: Explorer back after {waited} ms, syncing the tray host");
                 // The current `show_tray` decides (it may have been switched off during the pause).
                 crate::ui::tray_sync();
             }

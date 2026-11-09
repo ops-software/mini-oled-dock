@@ -801,6 +801,7 @@ pub(crate) fn tray_sync() {
         tray_host::is_started(),
         crate::taskbar::is_hidden(),
         crate::taskbar::host_paused(),
+        crate::taskbar::exiting(),
     );
     match action {
         TraySync::Start => {
@@ -831,10 +832,11 @@ enum TraySync {
     Nothing,
 }
 
-/// Start only when wanted, not running, native taskbar hidden by us and Explorer not restarting
-/// (a host started then would own `Shell_TrayWnd` and Explorer would never register its desktop).
-fn tray_sync_action(show_tray: bool, started: bool, hidden: bool, paused: bool) -> TraySync {
-    if show_tray && !started && hidden && !paused {
+/// Start only when wanted, not running, native taskbar hidden by us, Explorer not restarting
+/// (a host started then would own `Shell_TrayWnd` and Explorer would never register its desktop)
+/// and the dock not exiting (`taskbar::exiting`). Stopping is always allowed.
+fn tray_sync_action(show_tray: bool, started: bool, hidden: bool, paused: bool, exiting: bool) -> TraySync {
+    if show_tray && !started && hidden && !paused && !exiting {
         TraySync::Start
     } else if !show_tray && started {
         TraySync::Stop
@@ -3350,15 +3352,17 @@ mod tests {
     #[test]
     fn tray_sync_waits_for_explorer() {
         use TraySync::*;
-        //                          show   started hidden paused
-        assert_eq!(tray_sync_action(true,  false,  true,  false), Start);
-        assert_eq!(tray_sync_action(true,  false,  true,  true),  Nothing,
+        //                          show   started hidden paused exiting
+        assert_eq!(tray_sync_action(true,  false,  true,  false, false), Start);
+        assert_eq!(tray_sync_action(true,  false,  true,  true,  false), Nothing,
             "Explorer restarting: no Shell_TrayWnd of ours");
-        assert_eq!(tray_sync_action(true,  false,  false, false), Nothing, "native taskbar not hidden by us");
-        assert_eq!(tray_sync_action(false, true,   true,  false), Stop);
-        assert_eq!(tray_sync_action(false, true,   true,  true),  Stop, "switching off is always allowed");
-        assert_eq!(tray_sync_action(false, false,  true,  false), Nothing);
-        assert_eq!(tray_sync_action(true,  true,   true,  false), Nothing);
+        assert_eq!(tray_sync_action(true,  false,  false, false, false), Nothing, "native taskbar not hidden by us");
+        assert_eq!(tray_sync_action(false, true,   true,  false, false), Stop);
+        assert_eq!(tray_sync_action(false, true,   true,  true,  false), Stop, "switching off is always allowed");
+        assert_eq!(tray_sync_action(false, false,  true,  false, false), Nothing);
+        assert_eq!(tray_sync_action(true,  true,   true,  false, false), Nothing);
+        assert_eq!(tray_sync_action(true,  false,  true,  false, true),  Nothing, "never started while exiting");
+        assert_eq!(tray_sync_action(false, true,   true,  false, true),  Stop, "stopping while exiting is allowed");
     }
 
     #[test]
