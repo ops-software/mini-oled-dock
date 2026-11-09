@@ -4,7 +4,7 @@
 //! JOB: one short-lived thread per click (`start`), ended when the job ends. The dock runs elevated
 //! and never starts PowerShell itself (its modules are found through the user-writable
 //! `PSModulePath`): it asks the desktop shell (Explorer, at the user's medium integrity,
-//! `shell_thread::desktop_open`) to run `powershell.exe` with `export_args`. That de-elevated
+//! `shell_thread::desktop_open_hidden`) to run `powershell.exe` with `export_args`. That de-elevated
 //! PowerShell writes `Export-StartLayout` to `start-layout-<128-bit random id>.json.tmp` in
 //! `<LocalAppData of the shell user>\mini-oled-dock\`, renames it to `.json` when complete (or
 //! writes `.json.err` on failure) and deletes the files of that pattern older than one hour.
@@ -43,7 +43,7 @@ use crate::log;
 use crate::shell_thread::StartApp;
 
 /// Longest wait for the de-elevated export.
-const LAYOUT_TIMEOUT: Duration = Duration::from_secs(15);
+const LAYOUT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Interval between two checks for the layout file.
 const POLL_MS: u64 = 200;
 /// Largest layout file read back.
@@ -175,8 +175,8 @@ fn layout_file_name(id: &[u8; 16]) -> String {
 }
 
 /// Whole argument string for `powershell.exe`: every path is a single-quoted PowerShell literal
-/// (only the quote itself needs doubling); `-WindowStyle Hidden` because the shell starts it with
-/// `SW_SHOWNORMAL`. `-LiteralPath` wherever it exists: `[` `]` are legal in profile names and are
+/// (only the quote itself needs doubling); `-WindowStyle Hidden` as a second guard (the shell starts it
+/// with `SW_HIDE`). `-LiteralPath` wherever it exists: `[` `]` are legal in profile names and are
 /// wildcards for `-Path`. `Stop` turns non-terminating errors into the `catch` (the `.err` file).
 fn export_args(dir: &str, file: &str) -> String {
     let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
@@ -291,7 +291,7 @@ fn job() -> Result<usize, JobError> {
         .ok_or_else(|| JobError::Failed("no system directory".into()))?
         .join(r"WindowsPowerShell\v1.0\powershell.exe");
     let args = export_args(&dir.to_string_lossy(), &file.to_string_lossy());
-    crate::shell_thread::desktop_open(&ps.to_string_lossy(), Some(&args), None)
+    crate::shell_thread::desktop_open_hidden(&ps.to_string_lossy(), Some(&args), None)
         .map_err(|e| JobError::Failed(format!("cannot start the de-elevated export: {e}")))?;
     let t = Instant::now();
     loop {
@@ -593,8 +593,8 @@ mod tests {
         assert_eq!(poll_step(true, false, s(1)), Poll::Ready);
         assert_eq!(poll_step(false, true, s(1)), Poll::Failed);
         assert_eq!(poll_step(true, true, s(1)), Poll::Ready, "a complete file wins over a stale .err");
-        assert_eq!(poll_step(false, false, s(14)), Poll::Wait);
-        assert_eq!(poll_step(false, false, s(15)), Poll::TimedOut);
+        assert_eq!(poll_step(false, false, s(29)), Poll::Wait);
+        assert_eq!(poll_step(false, false, s(30)), Poll::TimedOut);
     }
 
     #[test]

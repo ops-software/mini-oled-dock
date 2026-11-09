@@ -59,7 +59,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, GetWindowThreadProcessId,
     KillTimer, PeekMessageW, PostMessageW, PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage,
-    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
+    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
     WM_GETICON, WM_QUIT, WM_TIMER,
 };
 
@@ -1499,7 +1499,7 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
         log!("shell: Launch '{target}' args={args:?}");
         return shell_execute(target, args, dir.as_deref());
     }
-    match desktop_shell_execute(target, args, dir.as_deref(), Verb::Open) {
+    match desktop_shell_execute(target, args, dir.as_deref(), Verb::Open, SW_SHOWNORMAL.0) {
         Ok(()) => {
             log!("shell: Launch '{target}' args={args:?} via the desktop shell (de-elevated)");
             Ok(())
@@ -1521,7 +1521,7 @@ fn launch_admin(tool: AdminTool) {
         return;
     };
     let target = tool.target(&sys);
-    match desktop_shell_execute(&target, None, None, Verb::RunAs) {
+    match desktop_shell_execute(&target, None, None, Verb::RunAs, SW_SHOWNORMAL.0) {
         Ok(()) => log!("shell: LaunchAdmin '{target}' via the desktop shell (runas, UAC prompt)"),
         Err(e) => log!("shell: LaunchAdmin '{target}' through the desktop shell failed ({e}): REFUSED"),
     }
@@ -1592,11 +1592,18 @@ pub(crate) fn desktop_registered() -> bool {
 /// process is NOT elevated even when the dock is:
 /// `IShellWindows::FindWindowSW(CSIDL_DESKTOP)` -> `IServiceProvider::QueryService(SID_STopLevelBrowser)`
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
-/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, SW_SHOWNORMAL)`.
+/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, show)`
+/// (`SW_SHOWNORMAL` except the hidden PowerShell export, see `desktop_open_hidden`).
 /// `verb` is `Open` for every launch except `launch_admin` (`RunAs`: Explorer asks UAC, not the dock).
 /// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
-fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> windows::core::Result<()> {
+fn desktop_shell_execute(
+    file: &str,
+    args: Option<&str>,
+    dir: Option<&str>,
+    verb: Verb,
+    show: i32,
+) -> windows::core::Result<()> {
     let (desktop, hwnd) = find_desktop()?;
     // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
     // thread and released when it goes out of scope. The VARIANTs passed by pointer outlive the calls.
@@ -1622,7 +1629,7 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
             &OwnedVariant::opt_bstr(args).0,
             &OwnedVariant::opt_bstr(dir).0,
             &OwnedVariant::bstr(verb.as_str()).0,
-            &OwnedVariant::i4(SW_SHOWNORMAL.0).0,
+            &OwnedVariant::i4(show).0,
         )
     }
 }
@@ -1654,10 +1661,11 @@ pub(crate) fn explorer_pid() -> windows::core::Result<u32> {
     Ok(pid)
 }
 
-/// `file` opened through the desktop shell, de-elevated (see `desktop_shell_execute`).
+/// `file` opened through the desktop shell, de-elevated (see `desktop_shell_execute`), with
+/// `SW_HIDE`: no console window for the PowerShell export.
 /// Must be called on a COM STA thread.
-pub(crate) fn desktop_open(file: &str, args: Option<&str>, dir: Option<&str>) -> windows::core::Result<()> {
-    desktop_shell_execute(file, args, dir, Verb::Open)
+pub(crate) fn desktop_open_hidden(file: &str, args: Option<&str>, dir: Option<&str>) -> windows::core::Result<()> {
+    desktop_shell_execute(file, args, dir, Verb::Open, SW_HIDE.0)
 }
 
 /// `System32` from `GetSystemDirectoryW` (never from an environment variable).
