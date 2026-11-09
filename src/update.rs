@@ -177,13 +177,15 @@ pub(crate) fn status_from_config(c: &Config, installed: Version) -> UpdateStatus
 pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>, installed: Version, now: u64) {
     match r {
         Ok(rel) if rel.version > installed => {
+            // `staged` only holds for the tag that was verified: a newer tag is not downloaded yet.
+            st.staged &= st.available.as_ref().is_some_and(|a| a.tag == rel.tag);
             st.available = Some(Available {
                 tag: rel.tag.clone(),
                 version: rel.version,
                 date: rel.published.get(..10).unwrap_or("").to_string(),
                 notes: rel.notes.clone(),
             });
-            st.outcome = Outcome::Available;
+            st.outcome = if st.staged { Outcome::Ready } else { Outcome::Available };
             st.last_check = rfc3339_utc(now);
         }
         Ok(_) => {
@@ -787,6 +789,13 @@ mod tests {
         assert_eq!(s.outcome, Outcome::CouldNotCheck(Some(403)));
         // a failed check changes nothing else
         assert_eq!((s.badge(), s.last_check.as_str()), (1, "2026-11-09T12:34:56Z"));
+        // the staged tag survives a re-check of the same tag, not a newer one
+        s.staged = true;
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_300_000);
+        assert_eq!((s.staged, s.outcome.clone()), (true, Outcome::Ready));
+        let newer = Release { tag: "v1.4.9".into(), version: Version::parse("1.4.9").unwrap(), ..rel.clone() };
+        apply_check(&mut s, &Ok(newer), cur, 1_794_300_000);
+        assert_eq!((s.staged, s.outcome.clone(), s.badge()), (false, Outcome::Available, 1));
         let same = Release { tag: "v1.4.0".into(), version: cur, ..rel };
         apply_check(&mut s, &Ok(same), cur, 1_794_300_000);
         assert_eq!((s.outcome.clone(), s.badge()), (Outcome::UpToDate, 0));
