@@ -375,7 +375,7 @@ const BATT_BOLT_SLOT: i32 = 7;
 /// Alpha (of the glyph alpha, 0..255) of the fill when digits sit on it.
 const BATT_INSIDE_FILL_ALPHA: u32 = 110;
 /// Fill colour on battery below 20 %.
-const BATT_LOW_RGB: (u32, u32, u32) = (255, 69, 58);
+pub(crate) const BATT_LOW_RGB: (u32, u32, u32) = (255, 69, 58);
 
 /// A tray icon to draw (bitmap already at `Metrics::px(SYS_ICON)`).
 #[derive(Clone, Copy, Debug)]

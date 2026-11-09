@@ -91,6 +91,8 @@ pub enum PopupKind {
     Start = 9,
     /// Full Start menu (all apps, search, pins) opened by the Win double tap (`popup_startmenu`).
     StartMenu = 10,
+    /// Battery details of the BATTERY module (`popup_battery`).
+    Battery = 11,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -251,6 +253,7 @@ pub(crate) enum DataEvent {
     NotifChanged,
     TrayChanged,
     Network(crate::net::NetInfo),
+    Battery(crate::battery::BatteryStatus),
     /// The Start menu catalog or some of its icons arrived (`popup_startmenu` store updated).
     StartMenuChanged,
 }
@@ -382,6 +385,8 @@ struct State {
     last_volume: VolumeState,
     /// Last network status received (initial data of the network popup; empty while the module is off).
     last_net: crate::net::NetInfo,
+    /// Last battery sample received (initial data of the battery popup).
+    last_battery: crate::battery::BatteryStatus,
 }
 
 thread_local! {
@@ -393,6 +398,7 @@ thread_local! {
         last_inactive: None,
         last_volume: VolumeState::default(),
         last_net: crate::net::NetInfo::default(),
+        last_battery: crate::battery::BatteryStatus::NONE,
     });
 }
 
@@ -610,6 +616,18 @@ pub fn on_network(info: crate::net::NetInfo) {
     }
 }
 
+/// A new battery sample reached the UI: remembered for the next battery popup and forwarded to the
+/// open one. Called by `ui`.
+pub fn on_battery(status: crate::battery::BatteryStatus) {
+    let open = with(|s| {
+        s.last_battery = status;
+        s.open.as_ref().is_some_and(|o| o.kind == PopupKind::Battery)
+    });
+    if open == Some(true) {
+        dispatch(DataEvent::Battery(status));
+    }
+}
+
 /// `WM_DOCK_NOTIF`: re-reads `notif::snapshot()` if the notifications popup is open. Called by `main`.
 pub fn on_notif_changed() {
     dispatch(DataEvent::NotifChanged);
@@ -753,7 +771,12 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
 // ------------------------------------------------------------------ open / close
 
 /// Builds the content for `kind`.
-fn make_content(kind: PopupKind, volume: VolumeState, net: crate::net::NetInfo) -> Box<dyn Content> {
+fn make_content(
+    kind: PopupKind,
+    volume: VolumeState,
+    net: crate::net::NetInfo,
+    battery: crate::battery::BatteryStatus,
+) -> Box<dyn Content> {
     match kind {
         PopupKind::Notifications => crate::popup_notif::new(),
         PopupKind::Audio => crate::popup_audio::new(volume),
@@ -768,6 +791,7 @@ fn make_content(kind: PopupKind, volume: VolumeState, net: crate::net::NetInfo) 
         }
         PopupKind::AppMenu => popup_app::new(take_app_info().unwrap_or_default()),
         PopupKind::Network => crate::popup_network::new(net),
+        PopupKind::Battery => crate::popup_battery::new(battery, crate::battery::power_mode()),
         PopupKind::Settings => crate::popup_settings::new(),
         PopupKind::Start => popup_start::new(),
         PopupKind::StartMenu => popup_startmenu::new(),
@@ -875,8 +899,8 @@ fn open(kind: PopupKind, anchor: Anchor) {
     };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
-    let Some((volume, net)) = with(|st| (st.last_volume, st.last_net.clone())) else { return };
-    let content = make_content(kind, volume, net);
+    let Some((volume, net, battery)) = with(|st| (st.last_volume, st.last_net.clone(), st.last_battery)) else { return };
+    let content = make_content(kind, volume, net, battery);
     debug_assert_eq!(content.kind(), kind);
     let installed = with(|st| {
         st.last_inactive = None;

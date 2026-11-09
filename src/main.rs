@@ -52,6 +52,7 @@ mod notif;
 mod picker;
 mod popup;
 mod popup_audio;
+mod popup_battery;
 mod popup_calendar;
 mod popup_network;
 mod popup_notif;

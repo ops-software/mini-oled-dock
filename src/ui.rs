@@ -773,6 +773,10 @@ pub fn on_config_changed() {
     sysmon_sync();
     battery_refresh(VISIBLE.load(Relaxed));
     battery_sync();
+    let battery_present = UI.with(|u| u.borrow().battery.present);
+    if battery_popup_should_close(&render::visible_modules(&config::get(), battery_present), popup::current()) {
+        popup::close("battery module off");
+    }
     if VISIBLE.load(Relaxed) {
         // `show_seconds` / `show_clock` may have changed: re-align the clock timer.
         arm_clock(hwnd());
@@ -924,6 +928,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
         PopupKind::Network => Some(ItemId::Network),
+        PopupKind::Battery => Some(ItemId::Battery),
         PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
         PopupKind::AppMenu => None,
     }
@@ -1983,7 +1988,6 @@ fn on_rbutton_up(lp: LPARAM) {
         }
         Some(ItemId::Volume) => launch_target_str("ms-settings:apps-volume"),
         Some(ItemId::Network) => launch_target_str("ms-settings:network"),
-        // Interim (replaced by the battery popup): the Windows battery page.
         Some(ItemId::Battery) => launch_target_str("ms-settings:batterysaver"),
         Some(ItemId::Start) => toggle_popup(PopupKind::Start, ItemId::Start),
         Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Right),
@@ -2537,8 +2541,12 @@ fn click_left(id: ItemId) {
             launch_target_str("taskmgr.exe");
         }
         ItemId::Battery => {
-            popup::close("battery settings");
-            launch_target_str("ms-settings:batterysaver");
+            if popup::is_available() {
+                toggle_popup(PopupKind::Battery, id);
+            } else {
+                popup::close("battery settings");
+                launch_target_str("ms-settings:batterysaver");
+            }
         }
     }
 }
@@ -3062,6 +3070,7 @@ fn battery_refresh(visible: bool) {
         std::mem::replace(&mut st.battery, next) != next
     });
     if changed {
+        popup::on_battery(UI.with(|u| u.borrow().battery));
         redraw_if_visible();
     }
 }
@@ -3075,6 +3084,11 @@ fn battery_sync() {
     } else {
         kill_timer(hwnd(), TIMER_BATTERY);
     }
+}
+
+/// True when the open popup is the battery one and the module is no longer in the bar.
+fn battery_popup_should_close(visible: &[ItemId], current: Option<PopupKind>) -> bool {
+    current == Some(PopupKind::Battery) && !visible.contains(&ItemId::Battery)
 }
 
 /// Timer tick and power broadcast: sample (if visible), then re-evaluate the timer (a battery can
@@ -3597,6 +3611,15 @@ mod tests {
         assert_eq!(order(1, 0), [1, 0, 2, 3]);
         assert_eq!(order(2, 2), [0, 1, 2, 3]);
         assert_eq!(order(0, 3), [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn battery_popup_closes_when_the_module_leaves_the_bar() {
+        use crate::popup::PopupKind::{Audio, Battery};
+        assert!(battery_popup_should_close(&[ItemId::Volume], Some(Battery))); // module switched off or battery gone
+        assert!(!battery_popup_should_close(&[ItemId::Volume, ItemId::Battery], Some(Battery)));
+        assert!(!battery_popup_should_close(&[ItemId::Volume], Some(Audio))); // another popup is not ours to close
+        assert!(!battery_popup_should_close(&[], None));
     }
 
     #[test]

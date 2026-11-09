@@ -145,7 +145,6 @@ fn mode_from_guid(g: &GUID) -> Option<PowerMode> {
 }
 
 /// The active power plan, `None` when it cannot be read or is a custom plan.
-#[allow(dead_code)] // wired to the battery popup in a later commit
 pub fn power_mode() -> Option<PowerMode> {
     let mut p: *mut GUID = std::ptr::null_mut();
     // SAFETY: `p` is a valid out pointer; on success Windows allocates the GUID with LocalAlloc.
