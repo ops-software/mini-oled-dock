@@ -112,6 +112,20 @@ pub(crate) fn settings_badge(count: u32) -> Option<String> {
     }
 }
 
+/// Orange dot that carries the update count `text`, its right edge at `right`, centred vertically
+/// in `rc`. Also drawn on the Updates entry of the Settings window (`settings_view`).
+pub(crate) fn paint_badge(s: &mut Surface, right: i32, rc: &windows::Win32::Foundation::RECT, text: &str) {
+    let m = s.metrics();
+    let tw = s.text_width(text, Font::Small);
+    let bh = m.px(16);
+    let bw = bh.max(tw + m.px(8));
+    let left = right - bw;
+    let top = rc.top + ((rc.bottom - rc.top) - bh) / 2;
+    s.fill_rr(rect_wh(left, top, bw, bh), m.px(8), crate::render::ATTENTION_RGB, 255);
+    let ty = center_y(&rect_wh(left, top, bw, bh), s.line_height(Font::Small));
+    s.text(text, left + (bw - tw) / 2, ty, Font::Small, WHITE, TEXT_ALPHA);
+}
+
 /// Creates the content (initial state).
 pub(crate) fn new() -> Box<dyn Content> {
     build(None)
@@ -208,16 +222,8 @@ impl Content for PowerPopup {
                 let cx = rc.right - self.pad_text - cw;
                 s.text("\u{203A}", cx, y, font, WHITE, lift(TEXT3_ALPHA, h));
                 if let Some(text) = settings_badge(self.badge) {
-                    // Orange dot that carries the count, right-aligned before the chevron.
-                    let m = s.metrics();
-                    let tw = s.text_width(&text, Font::Small);
-                    let (bh, gap) = (m.px(16), m.px(6));
-                    let bw = bh.max(tw + m.px(8));
-                    let left = cx - gap - bw;
-                    let top = rc.top + ((rc.bottom - rc.top) - bh) / 2;
-                    s.fill_rr(rect_wh(left, top, bw, bh), m.px(8), crate::render::ATTENTION_RGB, 255);
-                    let ty = center_y(&rect_wh(left, top, bw, bh), s.line_height(Font::Small));
-                    s.text(&text, left + (bw - tw) / 2, ty, Font::Small, WHITE, TEXT_ALPHA);
+                    // Right-aligned before the chevron.
+                    paint_badge(s, cx - s.metrics().px(6), &rc, &text);
                 }
             }
             if id == ID_AUTOSTART {

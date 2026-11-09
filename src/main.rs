@@ -63,6 +63,7 @@ mod power;
 mod preview;
 mod render;
 mod settings_pages;
+mod settings_view;
 mod sha256;
 mod shell_thread;
 mod start_import;

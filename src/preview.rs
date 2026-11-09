@@ -516,6 +516,99 @@ fn pick_hot(c: &dyn Content, w: i32, h: i32, step: i32, nth: usize) -> Option<u3
 }
 
 /// Popup on a background, written to `file`. `nth` = hovered control (scan index).
+/// Rendered DPIs of the Settings window pages (the spec asks for 96 and 144; `DPIS` stays as it is).
+const SETTINGS_DPIS: [(u32, &str); 2] = [(144, ""), (96, "_96")];
+
+/// Mock live state of the Settings window: two displays, three tray apps, an update known.
+struct SettingsMock {
+    screens: Vec<Screen>,
+    tray: Vec<crate::popup_tray::TrayRow>,
+    update: crate::update::UpdateStatus,
+}
+
+fn settings_mock(m: Metrics) -> SettingsMock {
+    use crate::update::{Available, Outcome, Phase, UpdateStatus};
+    use crate::update_release::Version;
+    let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
+    let px = m.px(16);
+    let tray = TRAY_NAMES
+        .iter()
+        .zip(TRAY)
+        .take(3)
+        .enumerate()
+        .map(|(i, (name, (letter, rgb)))| crate::popup_tray::TrayRow {
+            key: format!("mock-{i}"),
+            name: name.to_string(),
+            bitmap: Some(Arc::new(mock_icon(letter, rgb, px))),
+            visible: i != 1,
+            in_bar: i == 0,
+        })
+        .collect();
+    let next = Version { major: 1, minor: 4, patch: 1 };
+    SettingsMock {
+        screens: vec![d("\\\\.\\DISPLAY1", "1", true), d("\\\\.\\DISPLAY2", "2", false)],
+        tray,
+        update: UpdateStatus {
+            installed: Version::current(),
+            phase: Phase::Idle,
+            available: Some(Available {
+                tag: "v1.4.1".into(),
+                version: next,
+                date: "2026-11-20".into(),
+                notes: String::new(),
+            }),
+            last_check: "2026-11-21T09:12:00Z".into(),
+            outcome: Outcome::Available,
+            staged: false,
+        },
+    }
+}
+
+/// Settings page `page` in a window of `size` logical px over the wallpaper (40 px margin).
+#[allow(clippy::too_many_arguments)] // preview helper: one flag per variant
+fn settings_png_with(
+    dir: &Path,
+    file: &str,
+    m: Metrics,
+    page: crate::settings_pages::Page,
+    c: &Config,
+    open: (bool, bool),
+    hot: Option<crate::settings_view::Hit>,
+    size: (i32, i32),
+) -> bool {
+    use crate::settings_pages::{Ctx, Memory};
+    use crate::settings_view::{hit_id, window_pixels, Focus};
+    let mock = settings_mock(m);
+    let ctx = Ctx {
+        screens: &mock.screens,
+        picker_open: open.0,
+        chooser_open: open.1,
+        tray: &mock.tray,
+        import: crate::start_import::Status::Idle,
+        update: &mock.update,
+        memory: Memory { now: Some(10_276_044), trimmed: Some(6_396_314) },
+        data_dir: Some("C:\\ProgramData\\mini-oled-dock"),
+        log_path: Some("C:\\ProgramData\\mini-oled-dock\\dock.log"),
+    };
+    // The mini bar is drawn by the bar renderer, which reads the global config.
+    crate::config::set(c.clone());
+    let focus = if hot.is_some() { Focus::Page } else { Focus::Nav };
+    let Some((w, h, px)) = window_pixels(m, page, c, &ctx, hot.map(hit_id), focus, size) else {
+        eprintln!("preview: settings {file} not rendered");
+        return false;
+    };
+    let pad = m.px(40);
+    let (cw, ch) = (w + 2 * pad, h + 2 * pad);
+    let mut bg = wallpaper(cw, ch, ch);
+    composite(&mut bg, cw, ch, &px, w, h, pad, pad);
+    write_png(dir, file, cw, ch, bg)
+}
+
+/// Settings page `page` as the README shows it: default config, nothing open, nothing hovered.
+fn settings_png(dir: &Path, file: &str, m: Metrics, page: crate::settings_pages::Page) -> bool {
+    settings_png_with(dir, file, m, page, &Config::default(), (false, false), None, (860, 600))
+}
+
 fn popup_png(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, nth: usize) -> bool {
     let mut surf = match Surface::new(m) {
         Ok(s) => s,
@@ -897,6 +990,22 @@ pub fn run(dir: &str) -> i32 {
             failures += i32::from(!ok);
         }
     }
+    // Settings window pages, then the same pages in Italian at 144 DPI.
+    for (dpi, suffix) in SETTINGS_DPIS {
+        for page in crate::settings_pages::Page::ALL {
+            let file = format!("settings_{}{suffix}.png", page.slug());
+            failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
+        }
+    }
+    crate::i18n::set_preview(false);
+    for page in crate::settings_pages::Page::ALL {
+        let c = Config { language: crate::config::Language::It, ..Config::default() };
+        let file = format!("settings_{}_it.png", page.slug());
+        let m = Metrics { dpi: 144 };
+        failures += i32::from(!settings_png_with(dir, &file, m, page, &c, (false, false), None, (860, 600)));
+    }
+    crate::i18n::set_preview(true);
+    crate::config::set(Config::default());
     if failures > 0 {
         eprintln!("preview: {failures} previews not written");
         return 1;
