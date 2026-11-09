@@ -516,7 +516,6 @@ fn pick_hot(c: &dyn Content, w: i32, h: i32, step: i32, nth: usize) -> Option<u3
     seen.get(nth).copied().or_else(|| seen.last().copied())
 }
 
-/// Popup on a background, written to `file`. `nth` = hovered control (scan index).
 /// Rendered DPIs of the Settings window pages (the spec asks for 96 and 144; `DPIS` stays as it is).
 const SETTINGS_DPIS: [(u32, &str); 2] = [(144, ""), (96, "_96")];
 
@@ -610,6 +609,7 @@ fn settings_png(dir: &Path, file: &str, m: Metrics, page: crate::settings_pages:
     settings_png_with(dir, file, m, page, &Config::default(), (false, false), None, (860, 600))
 }
 
+/// Popup on a background, written to `file`. `nth` = hovered control (scan index).
 fn popup_png(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, nth: usize) -> bool {
     let mut surf = match Surface::new(m) {
         Ok(s) => s,
