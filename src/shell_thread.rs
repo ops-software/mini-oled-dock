@@ -1443,14 +1443,19 @@ fn icon_from_window(hwnd: isize) -> Option<IconBitmap> {
 
 // ------------------------------------------------------------------ launch
 
-/// true if the current process is elevated (token with `TokenIsElevated`). Computed once.
+/// true if the current process is elevated (token with `TokenIsElevated`); false when unknown. Computed once.
 pub(crate) fn is_elevated() -> bool {
-    static ELEVATED: OnceLock<bool> = OnceLock::new();
+    elevation() == Some(true)
+}
+
+/// Whether the current process is elevated; `None` when its token cannot be read. Computed once.
+pub(crate) fn elevation() -> Option<bool> {
+    static ELEVATED: OnceLock<Option<bool>> = OnceLock::new();
     *ELEVATED.get_or_init(|| {
         let mut token = HANDLE::default();
         // SAFETY: GetCurrentProcess returns the pseudo-handle; `token` writable, closed below.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
-            return false;
+            return None;
         }
         let mut te = TOKEN_ELEVATION::default();
         let mut ret = 0u32;
@@ -1467,7 +1472,7 @@ pub(crate) fn is_elevated() -> bool {
         .is_ok();
         // SAFETY: handle opened above and no longer used.
         let _ = unsafe { CloseHandle(token) };
-        ok && te.TokenIsElevated != 0
+        ok.then_some(te.TokenIsElevated != 0)
     })
 }
 

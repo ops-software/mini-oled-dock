@@ -2127,7 +2127,7 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
     }
     // SAFETY: no preconditions.
     let own = unsafe { GetCurrentProcessId() };
-    let elevated = crate::shell_thread::is_elevated();
+    let elevated = crate::shell_thread::elevation();
     // Sender windows named by the message (`wParam` and the APPBARDATA `hWnd`); windows of the dock itself
     // (e.g. `FindWindow("Shell_TrayWnd")` passed to `ABM_GETTASKBARPOS`) say nothing about the sender.
     let senders: Vec<u32> = [wp.0 as isize, ext(m.abd.hwnd)]
@@ -2166,9 +2166,10 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
 /// log line (claimed pid, holder pid, reason). Acceptance rule: the message's `shared` value is resolved
 /// exactly once (`resolve`), as a global atom whose name decodes into a section handle and the pid of the
 /// process holding it. The holder must not be the dock itself (allowed only while the dock is not elevated,
-/// i.e. a `DOCK_NO_MANIFEST=1` developer build). When the message names sender windows (`senders`: the pids
-/// of `wParam` and of the APPBARDATA `hWnd`, windows of the dock left out), each must belong to the holder,
-/// and a window whose process is gone (pid 0) rejects. The holder process is opened once (`open`), and that
+/// i.e. a `DOCK_NO_MANIFEST=1` developer build; unknown elevation counts as elevated). When the message names
+/// sender windows (`senders`: the pids of `wParam` and of the APPBARDATA `hWnd`, windows of the dock left
+/// out), each must belong to the holder, and a window whose process is gone (pid 0) rejects. The holder
+/// process is opened once (`open`), and that
 /// same process handle is used for the integrity check (at most medium, `medium`) and for the duplication of
 /// its section handle with `DUPLICATE_SAME_ACCESS` (`dup`), so no right is added that the holder did not have;
 /// the access granted to that handle must include `SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE`
@@ -2185,7 +2186,7 @@ fn appbar_gate<P, B>(
     m: &AppBarMsg,
     senders: &[u32],
     own: u32,
-    own_elevated: bool,
+    own_elevated: Option<bool>,
     resolve: impl Fn(u64) -> Result<(u64, u32), String>,
     open: impl Fn(u32) -> Result<P, String>,
     medium: impl Fn(&P) -> bool,
@@ -2199,7 +2200,8 @@ fn appbar_gate<P, B>(
     };
     let (handle, holder) = resolve(m.shared).map_err(|e| reject(None, &e))?;
     let fail = |why: &str| reject(Some(holder), why);
-    if holder == own && own_elevated {
+    // Unknown elevation (token unreadable) counts as elevated: fail closed.
+    if holder == own && own_elevated != Some(false) {
         return Err(fail("block held by the dock itself"));
     }
     if let Some(s) = senders.iter().find(|&&s| s != holder) {
@@ -2894,7 +2896,7 @@ mod tests {
                     &m,
                     senders,
                     OWN,
-                    elevated,
+                    Some(elevated),
                     |s| {
                         assert_eq!(s, 0x1234, "the value received is resolved, and only once");
                         Ok((0x9B0, holder))
@@ -2936,6 +2938,11 @@ mod tests {
         }
         // Every failed Win32 step rejects, with the holder pid once it is known.
         let m = crafted(ABM_GETTASKBARPOS, OWN);
+        // Elevation unknown (token unreadable) + block held by the dock: rejected like an elevated dock.
+        let never = |_: u32| -> Result<u32, String> { panic!("the holder is not opened") };
+        let dock_block = |_: u64| Ok((0x9B0, OWN));
+        let text = appbar_gate(&m, &[], OWN, None, dock_block, never, medium, |_, _| Ok((7u8, good)), |b| Ok(b));
+        assert!(text.is_err_and(|t| t.contains("held by the dock itself")), "unknown elevation fails closed");
         let ok_resolve = |_: u64| Ok((0x9B0, APP));
         let ok_open = |p: u32| Ok(p);
         let ok_dup = |_: &u32, _: u64| Ok((7u8, good));
@@ -2944,7 +2951,7 @@ mod tests {
                     open: &dyn Fn(u32) -> Result<u32, String>,
                     dup: &dyn Fn(&u32, u64) -> Result<(u8, SharedBlock), String>,
                     map: &dyn Fn(u8) -> Result<u8, String>| {
-            appbar_gate(&m, &[], OWN, true, resolve, open, medium, dup, map).unwrap_err()
+            appbar_gate(&m, &[], OWN, Some(true), resolve, open, medium, dup, map).unwrap_err()
         };
         let text = gate(&|_| Err("no atom".into()), &ok_open, &ok_dup, &ok_map);
         assert!(text.contains("holder pid -") && text.contains("no atom"), "{text}");
