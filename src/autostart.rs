@@ -469,6 +469,9 @@ pub(crate) fn enable(allow_stop: bool) -> InstallReport {
     if report.copy == CopyOutcome::Failed {
         return report;
     }
+    if let Some(dir) = dest.parent() {
+        remove_old_copies(dir);
+    }
     match register_task(&dest) {
         Ok(()) => log!("autostart: task '{TASK_NAME}' registered -> {}", dest.display()),
         Err(e) => report.error = Some(InstallError::Failed(e)),
@@ -626,15 +629,63 @@ fn delete_at_reboot(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("scheduling the removal of {} at restart: {e}", path.display()))
 }
 
+/// The unique name a file in use is renamed to before its delete is scheduled: `<name>.old-<pid>`
+/// in the same folder. Pure.
+fn old_copy_path(path: &Path, pid: u32) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".old-{pid}"));
+    path.with_file_name(name)
+}
+
+/// True for a name made by `old_copy_path` from one of `removal_targets`. Pure.
+fn is_old_copy_name(name: &str) -> bool {
+    ["dock.exe", "dock.exe.new", "autostart-task.xml"].iter().any(|t| {
+        name.strip_prefix(t)
+            .and_then(|rest| rest.strip_prefix(".old-"))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Deletes the `*.old-<pid>` leftovers of an uninstall not yet followed by a restart (`--install`).
+/// Only regular files (no reparse points); one still in use is left to its delete at restart.
+fn remove_old_copies(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.to_str().is_some_and(is_old_copy_name) {
+            continue;
+        }
+        let p = e.path();
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+            match std::fs::remove_file(&p) {
+                Ok(()) => log!("autostart: leftover {} deleted", p.display()),
+                Err(e) => log!("autostart: leftover {} kept ({e}), it goes at restart", p.display()),
+            }
+        }
+    }
+}
+
 /// Deletes `path`: `Ok(true)` deleted now (or already gone), `Ok(false)` scheduled for the next
 /// restart (in practice only the exe of this very process, when started from Add/Remove Programs).
+/// The pending delete is stored by path, so a file in use is first renamed to `old_copy_path`
+/// (Windows allows renaming a running image): a reinstall before the restart then puts a new
+/// file at `path` that the restart does not touch.
 fn remove_or_schedule(path: &Path) -> Result<bool, String> {
     match retry_for(RELEASE_GRACE, RETRY_STEP, || std::fs::remove_file(path)) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(e) => {
-            log!("autostart: deleting {} failed ({e}), scheduling it at restart", path.display());
-            delete_at_reboot(path).map(|()| false)
+            // SAFETY: GetCurrentProcessId has no preconditions.
+            let old = old_copy_path(path, unsafe { GetCurrentProcessId() });
+            let target = match std::fs::rename(path, &old) {
+                Ok(()) => old,
+                Err(re) => {
+                    log!("autostart: renaming {} to {} failed ({re})", path.display(), old.display());
+                    path.to_path_buf()
+                }
+            };
+            log!("autostart: deleting {} failed ({e}), scheduling {} at restart", path.display(), target.display());
+            delete_at_reboot(&target).map(|()| false)
         }
     }
 }
@@ -809,6 +860,21 @@ mod tests {
     fn removal_targets_are_only_our_files() {
         let d = Path::new(r"C:\Program Files\mini-oled-dock");
         assert_eq!(removal_targets(d), [d.join("dock.exe"), d.join("dock.exe.new"), d.join("autostart-task.xml")]);
+    }
+
+    #[test]
+    fn a_file_in_use_is_renamed_to_a_unique_old_copy() {
+        let exe = Path::new(r"C:\Program Files\mini-oled-dock\dock.exe");
+        let old = old_copy_path(exe, 4242);
+        assert_eq!(old, PathBuf::from(r"C:\Program Files\mini-oled-dock\dock.exe.old-4242"));
+        assert_ne!(old, old_copy_path(exe, 4243));
+        assert!(is_old_copy_name("dock.exe.old-4242"));
+        assert!(is_old_copy_name("autostart-task.xml.old-1"));
+        assert!(!is_old_copy_name("dock.exe"));
+        assert!(!is_old_copy_name("dock.exe.old-"));
+        assert!(!is_old_copy_name("dock.exe.old-12x"));
+        assert!(!is_old_copy_name("other.exe.old-12"));
+        assert!(!is_old_copy_name("dock.exe.old-12.dll"));
     }
 
     #[test]
