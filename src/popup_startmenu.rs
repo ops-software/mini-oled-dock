@@ -33,11 +33,11 @@
 //! flyout (Esc does not close the Start); typing closes it and goes on searching. It lives in the
 //! content, so it is gone when the Start closes.
 //!
-//! DATA: the catalog and the icons live in a UI-thread store (`STORE`) that outlives the popup, so the
-//! menu reopens instantly. Every open asks the shell thread for a fresh catalog
-//! (`ShellRequest::ListStartApps`); only the icons not received yet are extracted (in small batches,
-//! behind every other shell request) and arrive as `ShellEvent::StartIcons`. Nothing is loaded until
-//! the menu is opened the first time.
+//! DATA: the catalog and the icons live in a UI-thread store (`STORE`) filled only while a Start menu
+//! is open. Every open asks the shell thread for a fresh catalog (`ShellRequest::ListStartApps`);
+//! the icons are extracted in small batches (behind every other shell request) and arrive as
+//! `ShellEvent::StartIcons`. `after_close` empties the store and sends `ShellRequest::StartRelease`
+//! (the shell thread forgets what it sent); events that arrive after the close are dropped.
 //!
 //! Declared as a child module of `popup` (`#[path]`). UI thread only.
 
@@ -174,10 +174,24 @@ struct Store {
     /// Icons by lowercase id, `icon_px` square.
     icons: HashMap<String, IconBitmap>,
     icon_px: u32,
+    /// true between `request_catalog` and `after_close`; late shell events are dropped otherwise.
+    open: bool,
 }
 
 thread_local! {
     static STORE: RefCell<Store> = RefCell::new(Store::default());
+}
+
+/// Empties the store when the menu closes. Returns the bytes of icon bitmaps freed.
+fn release_store() -> usize {
+    STORE.with(|s| {
+        let Ok(mut s) = s.try_borrow_mut() else { return 0 };
+        let bytes: usize = s.icons.values().map(|b| (b.width * b.height * 4) as usize).sum();
+        let apps = s.apps.len();
+        *s = Store::default();
+        log!("startmenu: freed {} KB of icons ({apps} apps)", bytes / 1024);
+        bytes
+    })
 }
 
 /// `ShellEvent::StartApps`: replaces the catalog (sorted by name).
@@ -186,10 +200,11 @@ pub(crate) fn store_apps(list: Vec<StartApp>) {
         list.into_iter().map(|a| App { lower: a.name.to_lowercase(), id: a.id, name: a.name }).collect();
     apps.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.name.cmp(&b.name)));
     STORE.with(|s| match s.try_borrow_mut() {
-        Ok(mut s) => {
+        Ok(mut s) if s.open => {
             s.apps = apps;
             s.loaded = true;
         }
+        Ok(_) => {}
         Err(_) => log!("startmenu: store busy, catalog dropped"),
     });
 }
@@ -198,7 +213,7 @@ pub(crate) fn store_apps(list: Vec<StartApp>) {
 pub(crate) fn store_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>) -> bool {
     STORE.with(|s| {
         let Ok(mut s) = s.try_borrow_mut() else { return false };
-        if icon_px != s.icon_px {
+        if !s.open || icon_px != s.icon_px {
             return false;
         }
         let mut any = false;
@@ -218,6 +233,7 @@ pub(crate) fn store_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>
 fn request_catalog(px: u32) {
     let px = STORE.with(|s| match s.try_borrow_mut() {
         Ok(mut s) => {
+            s.open = true;
             if px > s.icon_px {
                 s.icon_px = px;
                 s.icons.clear();
@@ -553,7 +569,7 @@ pub(crate) fn preview_new(
     let px = apps.first().map_or(32, |a| a.2.width);
     STORE.with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
-            *s = Store { icon_px: px, ..Store::default() };
+            *s = Store { icon_px: px, open: true, ..Store::default() };
         }
     });
     store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect());
@@ -1182,6 +1198,8 @@ impl Content for StartMenu {
     }
 
     fn after_close(&mut self) {
+        release_store();
+        shell_thread::request(ShellRequest::StartRelease);
         if let Some(a) = self.power_pending.take() {
             popup_power::run(a);
             return;
@@ -1198,6 +1216,23 @@ mod tests {
     use super::*;
 
     const M: Metrics = Metrics { dpi: 96 };
+
+    #[test]
+    fn closing_frees_the_store_and_late_events_are_dropped() {
+        let apps = vec![
+            ("a".to_string(), "Alpha".to_string(), IconBitmap::new(32, 32)),
+            ("b".to_string(), "Beta".to_string(), IconBitmap::new(32, 32)),
+        ];
+        drop(preview_new(apps, "", StartStyle::Vertical, false, false));
+        assert_eq!(release_store(), 2 * 32 * 32 * 4);
+        STORE.with(|s| {
+            let s = s.borrow();
+            assert!(s.apps.is_empty() && s.icons.is_empty() && !s.loaded && !s.open);
+        });
+        store_apps(vec![StartApp { id: "x".into(), name: "X".into() }]);
+        assert!(!store_icons(32, vec![("x".into(), Some(IconBitmap::new(32, 32)))]), "closed menu ignores late icons");
+        STORE.with(|s| assert!(s.borrow().apps.is_empty()));
+    }
 
     #[test]
     fn search_ranks_prefix_then_word_then_substring() {

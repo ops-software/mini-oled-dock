@@ -192,6 +192,8 @@ pub enum ShellRequest {
     /// One batch of Start menu icons -> `ShellEvent::StartIcons`. Queued by `ListStartApps` only;
     /// low priority like `ResolveApp`.
     StartIcons { icon_px: u32, ids: Vec<String> },
+    /// The Start menu closed: forget the icons sent and drop the queued `StartIcons` batches.
+    StartRelease,
     /// Click on a notification whose app has no open window: launches the app that sent it, found in
     /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
     OpenNotifApp { aumid: String, name: String },
@@ -588,6 +590,7 @@ impl Shell {
                 }
             }
             ShellRequest::ListStartApps { icon_px, first } => self.list_start_apps(icon_px, &first),
+            ShellRequest::StartRelease => start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending),
             ShellRequest::StartIcons { icon_px, ids } => {
                 // A batch queued for a previous size: its ids were forgotten with that size.
                 if icon_px != self.start_px {
@@ -1718,9 +1721,28 @@ fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) -> Result<
     unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| format!("ShellExecuteExW: {e}"))
 }
 
+/// `StartRelease`: a reopened Start menu starts from nothing, so the next `ListStartApps` resends every icon.
+fn start_release(start_px: &mut u32, sent: &mut HashSet<String>, pending: &mut VecDeque<ShellRequest>) {
+    *start_px = 0;
+    sent.clear();
+    pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_release_makes_a_reopen_resend_everything() {
+        let mut px = 48u32;
+        let mut sent: HashSet<String> = ["a".to_string(), "b".to_string()].into();
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        pending.push_back(ShellRequest::StartIcons { icon_px: 48, ids: vec!["c".into()] });
+        pending.push_back(ShellRequest::VolumeRefresh);
+        start_release(&mut px, &mut sent, &mut pending);
+        assert_eq!((px, sent.len(), pending.len()), (0, 0, 1));
+        assert!(matches!(pending[0], ShellRequest::VolumeRefresh));
+    }
 
     #[test]
     fn admin_tools_launch_by_absolute_path_or_aumid() {
