@@ -92,7 +92,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
     KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
     UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
-    WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use msg::{
@@ -374,6 +375,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_DOCK_QUIT_REQUEST => {
+            taskbar::begin_exit();
             log!("quit request from --restore: exiting");
             // SAFETY: no preconditions.
             unsafe { PostQuitMessage(0) };
@@ -381,6 +383,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_HOTKEY => {
             if wp.0 as i32 == HOTKEY_ID {
+                taskbar::begin_exit();
                 log!("Ctrl+Alt+Q: exit");
                 // SAFETY: no preconditions.
                 unsafe { PostQuitMessage(0) };
@@ -388,14 +391,22 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_CLOSE => {
+            taskbar::begin_exit();
             log!("close request (Ctrl+C / menu): exiting");
             // SAFETY: no preconditions.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
+        WM_QUERYENDSESSION => {
+            // Deliberately no `begin_exit`: another app can still cancel the shutdown, and a surviving dock
+            // would be left with `RESTORING` set and its paused tray host never restarted.
+            log!("WM_QUERYENDSESSION: allowing the session end, exit deferred to WM_ENDSESSION");
+            LRESULT(1)
+        }
         WM_ENDSESSION => {
             // End of session: the taskbar state would survive a reboot, so restore it right away.
             if wp.0 != 0 {
+                taskbar::begin_exit();
                 taskbar::restore();
             }
             LRESULT(0)

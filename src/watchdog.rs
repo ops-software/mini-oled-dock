@@ -415,19 +415,27 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
         if r == WAIT_OBJECT_0 {
             let mut exit = 0u32;
             // SAFETY: `proc` opened with PROCESS_QUERY_LIMITED_INFORMATION; `exit` is writable.
-            if let Err(e) = unsafe { GetExitCodeProcess(proc, &mut exit) } {
-                log!("watchdog: GetExitCodeProcess failed: {e}, restoring");
-                restore();
-            } else if exit == 0 {
-                log!("watchdog: the dock exited normally");
-                // Exit with Explorer absent: restore_force kept the state file, so the
-                // taskbar is still in autohide. Wait for Explorer and restore.
-                if crate::taskbar::state_file_exists() {
-                    log!("watchdog: state file still present after exit, restoring the taskbar");
-                    restore();
+            let exit_code = match unsafe { GetExitCodeProcess(proc, &mut exit) } {
+                Ok(()) => Some(exit),
+                Err(e) => {
+                    log!("watchdog: GetExitCodeProcess failed: {e}, restoring");
+                    None
                 }
-            } else {
-                log!("watchdog: the dock ended with code 0x{exit:X}, restoring the taskbar");
+            };
+            let state_kept = crate::taskbar::state_file_exists();
+            match exit_code {
+                Some(0) => {
+                    log!("watchdog: the dock exited normally");
+                    // Exit with Explorer absent: restore_force kept the state file, so the
+                    // taskbar is still in autohide. Wait for Explorer and restore.
+                    if state_kept {
+                        log!("watchdog: state file still present after exit, restoring the taskbar");
+                    }
+                }
+                Some(n) => log!("watchdog: the dock ended with code 0x{n:X}, restoring the taskbar"),
+                None => {}
+            }
+            if exit_needs_restore(exit_code, state_kept) {
                 restore();
             }
             break 0;
@@ -519,5 +527,28 @@ fn terminate_dock(pid: u32) {
             let _ = unsafe { CloseHandle(h) };
         }
         Err(e) => log!("watchdog: OpenProcess(TERMINATE, {pid}) failed: {e}"),
+    }
+}
+
+/// Post-exit decision of `run_watchdog`: restore unless the dock exited cleanly AND left no state file.
+/// `exit_code` is `None` when `GetExitCodeProcess` failed. A clean exit with Explorer absent keeps the file.
+fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
+    match exit_code {
+        Some(0) => state_file_exists,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_restores_whenever_the_state_file_is_left() {
+        assert!(exit_needs_restore(Some(0), true), "clean exit with Explorer absent: state file kept");
+        assert!(!exit_needs_restore(Some(0), false));
+        assert!(exit_needs_restore(Some(1), false));
+        assert!(exit_needs_restore(Some(0xC000_0005), true));
+        assert!(exit_needs_restore(None, false), "exit code unreadable: restore anyway");
     }
 }
