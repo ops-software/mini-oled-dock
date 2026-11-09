@@ -273,6 +273,25 @@ fn exe_in_use_by_other(dest: &Path) -> bool {
         .any(|path| same_file(Path::new(&path), dest))
 }
 
+/// Retry loop of `copy_self`, with the copy (sleep included), the `(instance_up, exe_in_use)` check
+/// and the clock passed in. `Err((old_alive, last copy error))` when it gives up.
+fn retry_copy(
+    mut copy: impl FnMut() -> std::io::Result<()>,
+    mut check: impl FnMut() -> (bool, bool),
+    elapsed: impl Fn() -> Duration,
+) -> Result<(), (bool, std::io::Error)> {
+    loop {
+        let (up, in_use) = check();
+        let stop = !keep_waiting(elapsed(), up, in_use);
+        // Always copy after the check: the holder may have left while it ran.
+        match copy() {
+            Ok(()) => return Ok(()),
+            Err(e) if stop => return Err((up || in_use, e)),
+            Err(_) => {}
+        }
+    }
+}
+
 /// Copies the current exe to `dest`. If the destination is locked and `allow_stop` is set, asks
 /// the running instance to exit (`signal_stop_to_instance`) and retries while `keep_waiting` says
 /// so: up to `STOP_WAIT` (35 s) while the old instance or its watchdog still runs the exe.
@@ -298,20 +317,14 @@ fn copy_self(dest: &Path, allow_stop: bool) -> Result<bool, String> {
         return Err(format!("copy to {} failed: {first}", dest.display()));
     }
     let t = Instant::now();
-    let mut last = first;
-    let mut old_alive;
-    loop {
-        let (up, in_use) = (crate::watchdog::instance_running(), exe_in_use_by_other(dest));
-        old_alive = up || in_use;
-        if !keep_waiting(t.elapsed(), up, in_use) {
-            break;
-        }
+    let copy = || {
         std::thread::sleep(Duration::from_millis(250));
-        match std::fs::copy(&me, dest) {
-            Ok(_) => return Ok(true),
-            Err(e) => last = e,
-        }
-    }
+        std::fs::copy(&me, dest).map(|_| ())
+    };
+    let check = || (crate::watchdog::instance_running(), exe_in_use_by_other(dest));
+    let Err((old_alive, last)) = retry_copy(copy, check, || t.elapsed()) else {
+        return Ok(true);
+    };
     // The instance was stopped but the copy did not succeed: restart the already installed version,
     // so the user is not left without a dock.
     if dest.exists() {
@@ -465,6 +478,24 @@ mod tests {
         assert!(keep_waiting(s(10), true, false));
         assert!(keep_waiting(s(34), false, true), "watchdog still waiting for Explorer");
         assert!(!keep_waiting(s(35), true, true), "hard limit");
+    }
+
+    #[test]
+    fn a_copy_is_tried_after_the_old_watchdog_leaves() {
+        // Past the grace: a copy fails while the watchdog lives, then the check sees both gone.
+        let locked = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let mut copies = 0;
+        let mut checks = vec![(false, false), (false, true)];
+        let r = retry_copy(
+            || {
+                copies += 1;
+                if copies == 1 { Err(locked()) } else { Ok(()) }
+            },
+            || checks.pop().unwrap_or((false, false)),
+            || Duration::from_secs(10),
+        );
+        assert!(r.is_ok(), "the file freed during the last check is copied");
+        assert_eq!(copies, 2);
     }
 
     #[test]
