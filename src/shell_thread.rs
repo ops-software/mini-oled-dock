@@ -100,7 +100,8 @@ pub struct StartApp {
 }
 
 /// Tools the Start menu can start elevated (via UAC, see `ShellRequest::LaunchAdmin`). A closed set:
-/// the executable is a constant resolved here, never a string from the config, pins or registry.
+/// the target is a constant resolved here (an absolute System32 path or an AUMID), never a bare exe
+/// name and never a string from the config, pins or registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminTool {
     Terminal,
@@ -108,10 +109,14 @@ pub enum AdminTool {
 }
 
 impl AdminTool {
-    fn exe(self) -> &'static str {
+    /// What Explorer is asked to run: PowerShell by absolute path under `system_dir`, the Store app
+    /// Windows Terminal by its AUMID.
+    fn target(self, system_dir: &std::path::Path) -> String {
         match self {
-            AdminTool::Terminal => "wt.exe",
-            AdminTool::PowerShell => "powershell.exe",
+            AdminTool::Terminal => r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(),
+            AdminTool::PowerShell => {
+                system_dir.join(r"WindowsPowerShell\v1.0\powershell.exe").to_string_lossy().into_owned()
+            }
         }
     }
 }
@@ -1503,10 +1508,14 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
 /// elevated; if the desktop shell is unavailable the launch is REFUSED (no direct ShellExecute or
 /// CreateProcess, so the dock's token is never inherited). A cancelled prompt is handled by Explorer.
 fn launch_admin(tool: AdminTool) {
-    let exe = tool.exe();
-    match desktop_shell_execute(exe, None, None, Verb::RunAs) {
-        Ok(()) => log!("shell: LaunchAdmin '{exe}' via the desktop shell (runas, UAC prompt)"),
-        Err(e) => log!("shell: LaunchAdmin '{exe}' through the desktop shell failed ({e}): REFUSED"),
+    let Some(sys) = system_dir() else {
+        log!("shell: LaunchAdmin: no system directory: REFUSED");
+        return;
+    };
+    let target = tool.target(&sys);
+    match desktop_shell_execute(&target, None, None, Verb::RunAs) {
+        Ok(()) => log!("shell: LaunchAdmin '{target}' via the desktop shell (runas, UAC prompt)"),
+        Err(e) => log!("shell: LaunchAdmin '{target}' through the desktop shell failed ({e}): REFUSED"),
     }
 }
 
@@ -1712,6 +1721,18 @@ fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_tools_launch_by_absolute_path_or_aumid() {
+        let sys = std::path::Path::new(r"C:\Windows\System32");
+        assert_eq!(AdminTool::PowerShell.target(sys), r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        assert_eq!(AdminTool::Terminal.target(sys), r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
+        for tool in [AdminTool::Terminal, AdminTool::PowerShell] {
+            let s = tool.target(sys);
+            assert!(s.contains('\\'), "never a bare executable name: {s}");
+            assert!(!s.eq_ignore_ascii_case("wt.exe") && !s.eq_ignore_ascii_case("powershell.exe"));
+        }
+    }
 
     #[test]
     fn words_and_tokens() {
