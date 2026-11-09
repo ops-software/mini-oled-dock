@@ -384,6 +384,40 @@ impl Gdi {
         }
     }
 
+    /// Coverage mask (0..255, row-major, `w` x line height) of `s` drawn with `font` = (font, line
+    /// height), top-left at (0, 0); `w` = width of `s` as measured by `text_width`. Lets the caller
+    /// composite the text per pixel (e.g. knocked out of a fill). `None` without the scratch DIB.
+    pub(crate) fn text_mask(&self, s: &str, font: (HFONT, i32), w: i32) -> Option<(i32, i32, Vec<u8>)> {
+        let txt = self.txt.as_ref()?;
+        let (fnt, lh) = font;
+        let (w, h) = (w.min(txt.w), lh.min(txt.h));
+        if s.is_empty() || w <= 0 || h <= 0 {
+            return None;
+        }
+        let tbuf = dib_pixels(txt);
+        for row in 0..h as usize {
+            let start = row * txt.w as usize;
+            tbuf[start..start + w as usize].fill(0);
+        }
+        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
+        // SAFETY: as in `text`: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the
+        // call; the font is restored right away; GdiFlush makes GDI write before the read.
+        unsafe {
+            let old = SelectObject(self.dc_txt, HGDIOBJ(fnt.0));
+            DrawTextW(self.dc_txt, &mut wide, &mut rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+            SelectObject(self.dc_txt, old);
+            let _ = GdiFlush();
+        }
+        let mut mask = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            for col in 0..w {
+                mask.push(((tbuf[(row * txt.w + col) as usize] >> 8) & 0xFF) as u8); // coverage = G channel
+            }
+        }
+        Some((w, h, mask))
+    }
+
     /// Copy of the main DIB pixels (premultiplied 0xAARRGGBB), for the preview.
     pub(crate) fn snapshot_pixels(&self) -> Option<(i32, i32, Vec<u32>)> {
         let d = self.main.as_ref()?;

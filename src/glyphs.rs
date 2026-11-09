@@ -356,22 +356,6 @@ pub fn battery_outline_shape(u: f32, v: f32) -> bool {
     body || nub
 }
 
-/// Taller variant of the battery body for the percentage-inside mode (room for digits).
-pub fn battery_tall_outline_shape(u: f32, v: f32) -> bool {
-    let st = half();
-    let rect = (snap(1.0), snap(2.0), snap(13.5), snap(14.0));
-    let body = rrect_sd(u, v, rect, 2.5).abs() <= st;
-    let nub = u >= edge(14.0) && u <= edge(15.5) && v >= edge(6.0) && v <= edge(10.0);
-    body || nub
-}
-
-/// Charge fill of the tall body, from the left up to `percent`.
-pub fn battery_tall_fill_shape(u: f32, v: f32, percent: u8) -> bool {
-    let rect = (edge(2.5), edge(3.5), edge(12.0), edge(12.5));
-    let end = edge(2.5 + 9.5 * percent.min(100) as f32 / 100.0);
-    u <= end && rrect_sd(u, v, rect, 1.2) <= 0.0
-}
-
 /// Charge inside the battery body, from the left up to `percent`; with `bolt` the bolt and a margin
 /// around it are cut out so the bolt can be drawn on top in another colour.
 pub fn battery_fill_shape(u: f32, v: f32, percent: u8, bolt: bool) -> bool {
@@ -554,8 +538,6 @@ mod tests {
         assert!(battery_fill_shape(7.7, 7.9, 100, false) && !battery_fill_shape(7.7, 7.9, 100, true)); // bolt cut-out
         assert!(bolt_shape(7.7, 7.9) && !bolt_shape(3.5, 8.0));
         assert!(battery_off_shape(8.0, 8.0) && battery_off_shape(1.5, 8.0));
-        assert!(battery_tall_outline_shape(7.0, 2.5) && !battery_tall_outline_shape(7.0, 8.0));
-        assert!(battery_tall_fill_shape(5.0, 8.0, 100) && !battery_tall_fill_shape(5.0, 8.0, 0));
     }
 
     #[test]

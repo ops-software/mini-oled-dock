@@ -362,20 +362,78 @@ pub fn battery_text(v: &BatteryView) -> BatteryText {
     }
 }
 
-/// Each character of `s` with the x offset of its cell (all cells `cell` wide); the caller centres the
-/// glyph in the cell, so no digit shifts sideways when the charge changes.
-fn tabular_digits(s: &str, cell: i32) -> Vec<(char, i32)> {
-    s.chars().enumerate().map(|(i, c)| (c, i as i32 * cell)).collect()
-}
-
-/// Box (logical px) of the larger icon that holds the percentage.
-const BATT_INSIDE_BOX: i32 = 32;
-/// Extra slot (logical px) left of the icon for the bolt while charging in the inside mode.
-const BATT_BOLT_SLOT: i32 = 7;
-/// Alpha (of the glyph alpha, 0..255) of the fill when digits sit on it.
-const BATT_INSIDE_FILL_ALPHA: u32 = 110;
+/// Body of the battery pill that holds the percentage (logical px): wide and as tall as the cap
+/// height of the module text plus a little air, so it sits on the text line of its neighbours.
+const BATT_BODY_W: i32 = 26;
+const BATT_BODY_H: i32 = 12;
+/// Corner radius of the pill body (logical px), about a third of its height.
+const BATT_BODY_R: i32 = 4;
+/// Gap between the body and the nub, nub width and height (logical px).
+const BATT_NUB_GAP: i32 = 1;
+const BATT_NUB_W: i32 = 2;
+const BATT_NUB_H: i32 = 4;
+/// Opacity (of the glyph alpha, 0..255) of the thin outline and the nub.
+const BATT_OUTLINE_ALPHA: u32 = 105;
+/// Semibold digit font of the pill (logical px).
+const BATT_DIGIT_PX: i32 = 11;
+/// Bolt left of the pill while charging: glyph box (logical px; the bolt is 5.6/16 of it tall)
+/// and gap to the body.
+const BATT_BOLT_BOX: i32 = 30;
+const BATT_BOLT_GAP: i32 = 2;
 /// Fill colour on battery below 20 %.
 pub(crate) const BATT_LOW_RGB: (u32, u32, u32) = (255, 69, 58);
+
+/// Physical geometry of the battery pill (percentage-inside mode) at module metrics `m`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BattPill {
+    body_w: i32,
+    body_h: i32,
+    radius: i32,
+    /// Outline width: a whole-pixel hairline (one logical px rounded down, at least one).
+    line: i32,
+    nub_gap: i32,
+    nub_w: i32,
+    nub_h: i32,
+    /// Side of the glyph box the bolt is drawn in, and the bolt's ink left edge / width in it.
+    bolt_box: i32,
+    bolt_ink_l: i32,
+    bolt_w: i32,
+    bolt_gap: i32,
+}
+
+impl BattPill {
+    fn new(m: Metrics) -> BattPill {
+        let bolt_box = m.px(BATT_BOLT_BOX);
+        let at = |u: f32| (u * bolt_box as f32 / 16.0).round() as i32;
+        BattPill {
+            body_w: m.px(BATT_BODY_W),
+            body_h: m.px(BATT_BODY_H),
+            radius: m.px(BATT_BODY_R),
+            line: (m.scale().floor() as i32).max(1),
+            nub_gap: m.px(BATT_NUB_GAP),
+            nub_w: m.px(BATT_NUB_W),
+            nub_h: m.px(BATT_NUB_H),
+            bolt_box,
+            bolt_ink_l: at(6.0),
+            bolt_w: at(9.4) - at(6.0),
+            bolt_gap: m.px(BATT_BOLT_GAP),
+        }
+    }
+
+    /// Room left of the body for the bolt (0 when not charging).
+    fn bolt_slot(&self, charging: bool) -> i32 {
+        if charging {
+            self.bolt_w + self.bolt_gap
+        } else {
+            0
+        }
+    }
+
+    /// Total ink width: bolt slot, body, nub.
+    fn width(&self, charging: bool) -> i32 {
+        self.bolt_slot(charging) + self.body_w + self.nub_gap + self.nub_w
+    }
+}
 
 /// A tray icon to draw (bitmap already at `Metrics::px(SYS_ICON)`).
 #[derive(Clone, Copy, Debug)]
@@ -566,9 +624,12 @@ struct Fonts {
     app: HFONT,
     module: HFONT,
     small: HFONT,
+    /// Semibold digits inside the battery pill.
+    batt: HFONT,
     lh_app: i32,
     lh: i32,
     lh_small: i32,
+    lh_batt: i32,
 }
 
 impl Fonts {
@@ -581,11 +642,11 @@ impl Fonts {
     }
 
     fn max_lh(&self) -> i32 {
-        self.lh_app.max(self.lh).max(self.lh_small)
+        self.lh_app.max(self.lh).max(self.lh_small).max(self.lh_batt)
     }
 
     fn delete(&self) {
-        for f in [self.app, self.module, self.small] {
+        for f in [self.app, self.module, self.small, self.batt] {
             delete_font(f);
         }
     }
@@ -620,9 +681,9 @@ pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
 
 fn build_fonts(dc: HDC, m: Metrics, s: BarSizes) -> Result<Fonts, String> {
     let mm = s.module_metrics(m);
-    let mut made: Vec<HFONT> = Vec::with_capacity(3);
-    for px in [m.px(s.text), mm.px(13), mm.px(11)] {
-        match create_font(dc, &TEXT_FACES, px.max(1), 400) {
+    let mut made: Vec<HFONT> = Vec::with_capacity(4);
+    for (px, weight) in [(m.px(s.text), 400), (mm.px(13), 400), (mm.px(11), 400), (mm.px(BATT_DIGIT_PX), 600)] {
+        match create_font(dc, &TEXT_FACES, px.max(1), weight) {
             Ok(f) => made.push(f),
             Err(e) => {
                 for f in made {
@@ -632,14 +693,16 @@ fn build_fonts(dc: HDC, m: Metrics, s: BarSizes) -> Result<Fonts, String> {
             }
         }
     }
-    let (app, module, small) = (made[0], made[1], made[2]);
+    let (app, module, small, batt) = (made[0], made[1], made[2], made[3]);
     Ok(Fonts {
         app,
         module,
         small,
+        batt,
         lh_app: line_height(dc, app),
         lh: line_height(dc, module),
         lh_small: line_height(dc, small),
+        lh_batt: line_height(dc, batt),
     })
 }
 
@@ -725,10 +788,7 @@ fn sys_widths(scene: &Scene<'_>) -> SysWidths {
                 let slot = if sys.battery.status.percent >= 100 { "100%" } else { "88%" };
                 bell + m.px(SYS_TEXT_GAP) + measure(slot, Txt::Module, m)
             }
-            BatteryText::Inside(_) => {
-                let slot = if sys.battery.status.charging { m.px(BATT_BOLT_SLOT) } else { 0 };
-                2 * m.px(TRAY_PAD) + m.px(BATT_INSIDE_BOX) + slot
-            }
+            BatteryText::Inside(_) => 2 * m.px(TRAY_PAD) + BattPill::new(m).width(sys.battery.status.charging),
         }
     } else {
         0
@@ -1054,6 +1114,77 @@ fn draw_text(g: &Gfx, cv: &mut Canvas<'_>, s: &str, x: i32, y: i32, t: Txt, alph
     g.gdi.text(cv, s, x, y, g.fonts.get(t), text_width(g, s, t), WHITE, alpha);
 }
 
+/// Battery pill with the percentage inside (Apple style), ink starting at `x0`, centred on row
+/// boundary `cy`: thin dim outline and nub, charge fill from the left in `tint`, the digits knocked
+/// out of the fill (background shows through) and white over the empty part; the bolt goes left of
+/// the body while charging. `alpha` = glyph alpha (hover).
+#[allow(clippy::too_many_arguments)]
+fn paint_batt_pill(
+    g: &Gfx,
+    cv: &mut Canvas<'_>,
+    m: Metrics,
+    x0: i32,
+    cy: i32,
+    st: BatteryStatus,
+    digits: &str,
+    tint: (u32, u32, u32),
+    alpha: u32,
+) {
+    let p = BattPill::new(m);
+    let (l, t) = (x0 + p.bolt_slot(st.charging), cy - p.body_h / 2);
+    let (r, b) = (l + p.body_w, t + p.body_h);
+    let (il, it, ir, ib) = (l + p.line, t + p.line, r - p.line, b - p.line);
+    let line_a = (alpha * BATT_OUTLINE_ALPHA / 255) as f32;
+    let fill_end = il as f32 + (ir - il) as f32 * st.percent.min(100) as f32 / 100.0;
+    // Digits: coverage mask of the semibold font, its ink centred in the inner body.
+    let font = (g.fonts.batt, g.fonts.lh_batt);
+    let mask = g.gdi.text_mask(digits, font, g.gdi.text_width(digits, font.0, 7));
+    let (mut tx, mut ty, mut mw, mut mh, mut cov) = (0, 0, 0, 0, Vec::new());
+    if let Some((w, h, mk)) = mask {
+        let ink = |i: usize| mk[i] >= 128;
+        let cols: Vec<i32> = (0..w).filter(|&c| (0..h).any(|rr| ink((rr * w + c) as usize))).collect();
+        let rows: Vec<i32> = (0..h).filter(|&rr| (0..w).any(|c| ink((rr * w + c) as usize))).collect();
+        if let (Some(&c0), Some(&c1), Some(&r0), Some(&r1)) = (cols.first(), cols.last(), rows.first(), rows.last()) {
+            tx = (il + ir - (c0 + c1 + 1)) / 2;
+            ty = (it + ib - (r0 + r1 + 1)) / 2;
+            (mw, mh, cov) = (w, h, mk);
+        }
+    }
+    let text_at = |x: i32, y: i32| -> f32 {
+        let (c, rr) = (x - tx, y - ty);
+        if c < 0 || rr < 0 || c >= mw || rr >= mh {
+            0.0
+        } else {
+            cov[(rr * mw + c) as usize] as f32 / 255.0
+        }
+    };
+    let a = alpha as f32;
+    for y in t..b {
+        for x in l..r {
+            let outer = rr_cov(x, y, l, t, r, b, p.radius);
+            let inner = rr_cov(x, y, il, it, ir, ib, p.radius - p.line);
+            let ring = (outer - inner).max(0.0) * line_a;
+            let fill = inner * (fill_end - x as f32).clamp(0.0, 1.0);
+            let txt = text_at(x, y);
+            // Knock-out: the fill loses the digit pixels, the digits show only where there is no fill.
+            let (fa, ta) = (fill * (1.0 - txt) * a, txt * (1.0 - fill) * a);
+            let sa = ring + fa + ta;
+            if sa < 0.5 {
+                continue;
+            }
+            let ch = |c: u32| ((c as f32 * fa + 255.0 * (ring + ta)) / 255.0 + 0.5) as u32;
+            let (pa, pr, pg, pb) = ((sa + 0.5) as u32, ch(tint.0), ch(tint.1), ch(tint.2));
+            cv.blend(x, y, (pa.min(255) << 24) | (pr.min(pa) << 16) | (pg.min(pa) << 8) | pb.min(pa));
+        }
+    }
+    let nub = rect_wh(r + p.nub_gap, cy - p.nub_h / 2, p.nub_w, p.nub_h);
+    cv.fill_rr(nub, p.nub_w / 2, WHITE, line_a as u32);
+    if st.charging {
+        let bs = p.bolt_box;
+        cv.glyph(x0 - p.bolt_ink_l, cy - bs / 2, bs, WHITE, alpha, &glyphs::bolt_shape);
+    }
+}
+
 // ------------------------------------------------------------------ paint
 
 /// Upward shift (physical px) of the labels to centre the cap height on the icon axis.
@@ -1314,65 +1445,27 @@ fn paint_inner(g: &Gfx, scene: &Scene<'_>, layout: &Layout) {
                         continue;
                     }
                     let text = battery_text(&b);
-                    let inside = matches!(text, BatteryText::Inside(_));
                     let tint = match st.tint() {
                         Tint::Normal => WHITE,
                         Tint::Low => BATT_LOW_RGB,
                         Tint::Critical => ATTENTION_RGB,
                     };
-                    let x0 = r.left + sys_pad;
-                    // Inside mode: a larger icon, shifted right by the bolt slot while charging.
-                    let (size, x, y) = if inside {
-                        let size = mm.px(BATT_INSIDE_BOX);
-                        let slot = if st.charging { mm.px(BATT_BOLT_SLOT) } else { 0 };
-                        (size, x0 + slot, mcy - size / 2)
-                    } else {
-                        (sys_icon, x0, gy)
-                    };
-                    let fill_shape: &dyn Fn(f32, f32) -> bool = &|u, v| {
-                        if inside {
-                            glyphs::battery_tall_fill_shape(u, v, st.percent)
-                        } else {
-                            glyphs::battery_fill_shape(u, v, st.percent, st.charging)
-                        }
-                    };
-                    let fill_a = if inside { glyph_a * BATT_INSIDE_FILL_ALPHA / 255 } else { glyph_a };
-                    cv.glyph(x, y, size, tint, fill_a, fill_shape);
-                    if inside {
-                        cv.glyph(x, y, size, WHITE, glyph_a, &glyphs::battery_tall_outline_shape);
-                    } else {
-                        cv.glyph(x, y, size, WHITE, glyph_a, &glyphs::battery_outline_shape);
+                    let x = r.left + sys_pad;
+                    if let BatteryText::Inside(s) = &text {
+                        paint_batt_pill(g, &mut cv, mm, x, mcy, st, s, tint, glyph_a);
+                        continue;
                     }
+                    cv.glyph(x, gy, sys_icon, tint, glyph_a, &|u, v| {
+                        glyphs::battery_fill_shape(u, v, st.percent, st.charging)
+                    });
+                    cv.glyph(x, gy, sys_icon, WHITE, glyph_a, &glyphs::battery_outline_shape);
                     if st.charging {
-                        if inside {
-                            // The bolt cannot sit under the digits: it goes in the slot left of the icon.
-                            let slot = mm.px(BATT_BOLT_SLOT);
-                            let bs = mm.px(24);
-                            let bx = x0 + slot / 2 - (7.7 * bs as f32 / 16.0).round() as i32;
-                            cv.glyph(bx, mcy - bs / 2, bs, WHITE, 255, &glyphs::bolt_shape);
-                        } else {
-                            cv.glyph(x, y, size, WHITE, 255, &glyphs::bolt_shape);
-                        }
+                        cv.glyph(x, gy, sys_icon, WHITE, 255, &glyphs::bolt_shape);
                     }
-                    match text {
-                        BatteryText::None => {}
-                        BatteryText::Beside(s) => {
-                            let a = if hot { TEXT2_ALPHA_HOT } else { TEXT2_ALPHA };
-                            let tx = x + sys_icon + mm.px(SYS_TEXT_GAP);
-                            draw_text(g, &mut cv, &s, tx, mcy - lh / 2 - label_up(mm), Txt::Module, a);
-                        }
-                        BatteryText::Inside(s) => {
-                            let a = if hot { TEXT_ALPHA_HOT } else { TEXT_ALPHA };
-                            let cell = text_width(g, "8", Txt::Small);
-                            // Centred on the body of the battery (u = 7.25 of the 16-unit box).
-                            let body_cx = x + (7.25 * size as f32 / 16.0).round() as i32;
-                            let left = body_cx - cell * s.chars().count() as i32 / 2;
-                            for (c, off) in tabular_digits(&s, cell) {
-                                let t = c.to_string();
-                                let cx = left + off + (cell - text_width(g, &t, Txt::Small)) / 2;
-                                draw_text(g, &mut cv, &t, cx, mcy - lh_small / 2 - label_up(mm), Txt::Small, a);
-                            }
-                        }
+                    if let BatteryText::Beside(s) = text {
+                        let a = if hot { TEXT2_ALPHA_HOT } else { TEXT2_ALPHA };
+                        let tx = x + sys_icon + mm.px(SYS_TEXT_GAP);
+                        draw_text(g, &mut cv, &s, tx, mcy - lh / 2 - label_up(mm), Txt::Module, a);
                     }
                 }
             }
@@ -1487,16 +1580,19 @@ mod tests {
     }
 
     #[test]
-    fn battery_digits_are_tabular() {
-        // Every character gets a cell of the same width, so "111" and "888" take the same room and no digit
-        // moves sideways when the charge changes; the caller centres each glyph in its cell.
-        let cell = 7;
-        for s in ["1", "64", "100", "88"] {
-            let v = tabular_digits(s, cell);
-            assert_eq!(v.len(), s.chars().count());
-            assert!(v.iter().enumerate().all(|(i, (_, x))| *x == i as i32 * cell), "{s}");
+    fn battery_pill_is_a_wide_low_pill() {
+        // Apple-style body: about 2.2:1, corner radius about a third of the height, never taller than
+        // the 16 px system icons, a whole-pixel outline and a bolt about as tall as the body.
+        for dpi in [96, 120, 144, 192] {
+            let m = Metrics { dpi };
+            let p = BattPill::new(m);
+            assert!(p.body_w * 10 >= p.body_h * 20 && p.body_w * 10 <= p.body_h * 24, "{dpi}");
+            assert!((p.radius * 3 - p.body_h).abs() <= p.body_h / 4, "{dpi}");
+            assert!(p.body_h < m.px(SYS_ICON) && p.line >= 1 && p.nub_h < p.body_h, "{dpi}");
+            let bolt_h = 5.6 * p.bolt_box as f32 / 16.0;
+            assert!((bolt_h - p.body_h as f32).abs() <= p.body_h as f32 * 0.25, "{dpi}");
+            assert_eq!(p.width(true) - p.width(false), p.bolt_w + p.bolt_gap);
         }
-        assert_eq!(tabular_digits("100", cell).iter().map(|(c, _)| *c).collect::<String>(), "100");
     }
 
     #[test]
