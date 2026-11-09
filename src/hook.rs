@@ -58,6 +58,9 @@ pub const INJECT_TAG: usize = 0x4B43_4F44;
 /// Beyond this interval (ms) from the last Win event the "Win held" state is considered
 /// stuck (e.g. Win+L: the release goes to the secure desktop). Auto-repeat keeps renewing it.
 const REPEAT_WINDOW_MS: u32 = 1500;
+/// A lone Win press (no other key) is cleared by the watchdog only beyond this age (ms): it may be
+/// held with no auto-repeat, but a release lost on the secure desktop must still be repaired.
+const LONE_STUCK_MS: u32 = 10_000;
 /// Double tap: a lone Win press that starts within this interval (ms) of the previous lone Win
 /// release posts WM_DOCK_START_MENU instead of WM_DOCK_TOGGLE.
 pub const DOUBLE_TAP_MS: u32 = 300;
@@ -182,15 +185,21 @@ enum Repair {
     Skip,
 }
 
-/// What the watchdog does given the tracked `WIN_DOWN`, the async state of the Win keys and whether the
-/// press is stale (no Win event, auto-repeat included, for more than `REPEAT_WINDOW_MS`).
+/// What the watchdog does given the tracked `WIN_DOWN`, the async state of the Win keys, `WIN_OTHER` and
+/// the age (ms) of the last Win event (auto-repeat included).
 /// The async state alone is not trusted: a Win-down our hook swallowed never reaches it, so a Win held
-/// alone reads as "up". Only a press that is both unseen by the async state and stale is cleared.
-fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool, press_stale: bool) -> Repair {
-    match (win_down, lwin_pressed || rwin_pressed || !press_stale) {
-        (false, _) => Repair::Go,
-        (true, true) => Repair::Skip,
-        (true, false) => Repair::ClearThenGo,
+/// alone reads as "up". A press unseen by the async state and older than `REPEAT_WINDOW_MS` is cleared
+/// only if a chord was injected (Win+L) or it is older than `LONE_STUCK_MS`: a lone Win can be held
+/// with no auto-repeat reaching the hook, and its release must still toggle.
+fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool, win_other: bool, age_ms: u32) -> Repair {
+    if !win_down {
+        return Repair::Go;
+    }
+    let over = age_ms > REPEAT_WINDOW_MS && (win_other || age_ms > LONE_STUCK_MS);
+    if lwin_pressed || rwin_pressed || !over {
+        Repair::Skip
+    } else {
+        Repair::ClearThenGo
     }
 }
 
@@ -200,7 +209,7 @@ fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool, press_sta
 /// skipped while Win is held, so as not to touch the hook in the middle of a combination. "Held" is
 /// judged from the async key state AND the age of the last Win event, because a Win-down our hook
 /// swallowed never reaches the async state. If `WIN_DOWN` is set, no Win key is down and the press
-/// is stale (Win+L: the release went to the secure desktop), the stale state is cleared first.
+/// is over (Win+L: the release went to the secure desktop; see `repair_plan`), the state is cleared first.
 fn reinstall() {
     if HOOK_RAW.load(Relaxed) == 0 {
         return;
@@ -208,8 +217,8 @@ fn reinstall() {
     // SAFETY: GetAsyncKeyState has no preconditions; the high bit (negative) means "down".
     let (l, r) = unsafe { (GetAsyncKeyState(VK_LWIN.0 as i32) < 0, GetAsyncKeyState(VK_RWIN.0 as i32) < 0) };
     // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
-    let stale = unsafe { GetTickCount() }.wrapping_sub(WIN_LAST_TIME.load(Relaxed)) > REPEAT_WINDOW_MS;
-    match repair_plan(WIN_DOWN.load(Relaxed), l, r, stale) {
+    let age = unsafe { GetTickCount() }.wrapping_sub(WIN_LAST_TIME.load(Relaxed));
+    match repair_plan(WIN_DOWN.load(Relaxed), l, r, WIN_OTHER.load(Relaxed), age) {
         Repair::Skip => return,
         Repair::ClearThenGo => {
             WIN_DOWN.store(false, Relaxed);
@@ -457,11 +466,18 @@ mod tests {
     #[test]
     fn watchdog_repairs_a_stale_win_state() {
         use Repair::*;
-        assert_eq!(repair_plan(false, false, false, false), Go);
-        assert_eq!(repair_plan(false, true, false, true), Go, "not tracked as held: nothing to protect");
-        assert_eq!(repair_plan(true, true, false, true), Skip, "Win really held: do not touch the hook mid-combination");
-        assert_eq!(repair_plan(true, false, true, true), Skip);
-        assert_eq!(repair_plan(true, false, false, false), Skip, "swallowed Win-down never reaches async state");
-        assert_eq!(repair_plan(true, false, false, true), ClearThenGo, "Win+L left WIN_DOWN stuck");
+        const STALE: u32 = REPEAT_WINDOW_MS + 1;
+        const LONG: u32 = LONE_STUCK_MS + 1;
+        assert_eq!(repair_plan(false, false, false, false, 0), Go);
+        assert_eq!(repair_plan(false, true, false, true, LONG), Go, "not tracked as held: nothing to protect");
+        assert_eq!(repair_plan(true, true, false, true, STALE), Skip, "Win really held: do not touch the hook mid-combination");
+        assert_eq!(repair_plan(true, false, true, true, STALE), Skip);
+        assert_eq!(repair_plan(true, true, false, false, LONG), Skip, "async state says held: never clear");
+        assert_eq!(repair_plan(true, false, false, false, 0), Skip, "swallowed Win-down never reaches async state");
+        assert_eq!(repair_plan(true, false, false, true, REPEAT_WINDOW_MS), Skip, "chord still within the repeat window");
+        assert_eq!(repair_plan(true, false, false, true, STALE), ClearThenGo, "Win+L left WIN_DOWN stuck");
+        assert_eq!(repair_plan(true, false, false, false, STALE), Skip, "lone Win held with no auto-repeat");
+        assert_eq!(repair_plan(true, false, false, false, LONE_STUCK_MS), Skip, "lone Win at the limit: still held");
+        assert_eq!(repair_plan(true, false, false, false, LONG), ClearThenGo, "lone release lost on the secure desktop");
     }
 }
