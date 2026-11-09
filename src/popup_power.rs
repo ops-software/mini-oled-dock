@@ -1,5 +1,5 @@
-//! POWER popup: Sleep, Lock, Restart, Shut down, separator, "Settings" (switches to the Settings
-//! popup, `popup_settings`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
+//! POWER popup: Sleep, Lock, Restart, Shut down, separator, "Settings" (closes the popup and opens the
+//! Settings window, `settings_window`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
 //! (user's choice, no confirmation). Actions in `power::run`.
 //!
 //! The items, labels, glyphs and the choice behind each one are shared (`pub(crate)` helpers below)
@@ -15,6 +15,8 @@ use crate::i18n::tr;
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub(crate) const ID_SLEEP: u32 = 1;
 pub(crate) const ID_LOCK: u32 = 2;
@@ -35,7 +37,7 @@ pub(crate) const DOCK_ITEMS: [u32; 2] = [ID_SETTINGS, ID_EXIT];
 pub(crate) enum Choice {
     /// Run the action after the popup closes (`power::run`).
     Run(PowerAction),
-    /// Switch to the Settings popup.
+    /// Close the popup, then open the Settings window.
     Settings,
 }
 
@@ -79,6 +81,23 @@ pub(crate) fn run(a: PowerAction) {
     power::run(a);
 }
 
+/// Asks the UI thread to open (or activate) the Settings window. Any thread.
+pub(crate) fn open_settings_window() {
+    // SAFETY: PostMessageW is thread-safe; if the dock window no longer exists it just fails.
+    let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) };
+    if let Err(e) = r {
+        log!("settings: could not post the open request: {e}");
+    }
+}
+
+/// Carries out a choice after the popup that offered it has closed.
+pub(crate) fn run_choice(c: Choice) {
+    match c {
+        Choice::Run(a) => run(a),
+        Choice::Settings => open_settings_window(),
+    }
+}
+
 /// State of the "Start with Windows" toggle (shared with the threads that query/modify the task).
 const AS_UNKNOWN: u8 = 0;
 const AS_OFF: u8 = 1;
@@ -87,8 +106,8 @@ const AS_BUSY: u8 = 3;
 
 pub(crate) struct PowerPopup {
     hits: HitMap,
-    /// Action to run after closing.
-    pending: Option<PowerAction>,
+    /// Choice to carry out after closing.
+    pending: Option<Choice>,
     /// Cached geometry: separator and padding (physical px).
     sep_y: i32,
     pad_text: i32,
@@ -259,9 +278,8 @@ impl Content for PowerPopup {
             return self.toggle_autostart();
         }
         match choice(id) {
-            Some(Choice::Settings) => Reply::Switch(PopupKind::Settings),
-            Some(Choice::Run(a)) => {
-                self.pending = Some(a);
+            Some(c) => {
+                self.pending = Some(c);
                 Reply::Close
             }
             None => Reply::None,
@@ -269,8 +287,8 @@ impl Content for PowerPopup {
     }
 
     fn after_close(&mut self) {
-        if let Some(a) = self.pending.take() {
-            run(a);
+        if let Some(c) = self.pending.take() {
+            run_choice(c);
         }
     }
 }
@@ -314,6 +332,25 @@ impl PowerPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_closes_the_popup_then_opens_the_window() {
+        let mut p = PowerPopup {
+            hits: HitMap::default(),
+            pending: None,
+            sep_y: 0,
+            pad_text: 0,
+            width: 0,
+            autostart: Arc::new(AtomicU8::new(AS_OFF)),
+            seen: AS_OFF,
+            badge: 0,
+            forced_badge: Some(0),
+        };
+        assert_eq!(p.click(ID_SETTINGS), Reply::Close);
+        assert_eq!(p.pending, Some(Choice::Settings));
+        assert_eq!(p.click(ID_LOCK), Reply::Close);
+        assert_eq!(p.pending, Some(Choice::Run(PowerAction::Lock)));
+    }
 
     #[test]
     fn settings_badge_text() {

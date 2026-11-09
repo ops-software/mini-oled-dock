@@ -189,6 +189,8 @@ pub struct Args {
     pub update_check: bool,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
+    /// `--settings`: ask the running dock to open its Settings window and exit.
+    pub settings: bool,
 }
 
 static ARGS: OnceLock<Args> = OnceLock::new();
@@ -232,6 +234,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--remove" => a.remove = true,
             "--purge-data" => a.purge_data = true,
             "--update-check" => a.update_check = true,
+            "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -959,6 +962,28 @@ fn version_line() -> String {
     format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// `--settings`: posts `WM_DOCK_OPEN_SETTINGS` to the running dock. 0 = posted, 1 = no dock or post failed.
+fn open_settings_cli() -> u8 {
+    use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetWindowThreadProcessId};
+    // SAFETY: static literal class; FindWindowW has no other preconditions.
+    let Ok(h) = (unsafe { FindWindowW(CLASS_NAME, PCWSTR::null()) }) else {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "dock: no running dock found");
+        return 1;
+    };
+    let mut pid = 0u32;
+    // SAFETY: `h` was just found; `pid` is a valid out pointer. Both calls fail harmlessly if the window is gone.
+    unsafe {
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        let _ = AllowSetForegroundWindow(pid);
+    }
+    // SAFETY: PostMessageW is thread-safe; if the window no longer exists it just fails.
+    match unsafe { PostMessageW(Some(h), WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 fn usage() {
     use std::io::Write;
     let mut e = std::io::stderr();
@@ -966,7 +991,7 @@ fn usage() {
         e,
         "usage: dock [--top | --bottom] [--no-autohide] [--keep-taskbar] [--diag] [--restore] \
          [--install [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
-         [--version] [--update-check] [--update-install <tag>] [--autostart] [--console] \
+         [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] [--console] \
          [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] [--list-apps]"
     );
 }
@@ -1081,6 +1106,12 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
 
+    // --settings mode: asks the running dock to open the Settings window.
+    if args.settings {
+        attach_console();
+        return std::process::ExitCode::from(open_settings_cli());
+    }
+
     // --update-check mode: asks GitHub once, prints the result and exits.
     if args.update_check {
         if attach_console() {
@@ -1150,6 +1181,14 @@ mod tests {
         assert!(auto_install_busy(true, false, false), "popup open");
         assert!(auto_install_busy(false, false, true), "fullscreen app");
         assert!(!auto_install_busy(false, false, false));
+    }
+
+    #[test]
+    fn settings_flag_parses() {
+        let a = p(&["--settings"]).unwrap();
+        assert!(a.settings && !a.install);
+        assert!(!p(&[]).unwrap().settings);
+        assert!(p(&["--setings"]).is_err());
     }
 
     #[test]

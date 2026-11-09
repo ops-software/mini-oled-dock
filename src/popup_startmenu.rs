@@ -551,7 +551,7 @@ pub(crate) struct StartMenu {
     flyout: bool,
     fly: Flyout,
     /// Power action chosen in the flyout, run after the popup closes.
-    power_pending: Option<PowerAction>,
+    power_pending: Option<Choice>,
     /// Largest panel size (physical px): the work area minus the margins, set by `limit`.
     max: (i32, i32),
 }
@@ -760,12 +760,11 @@ impl StartMenu {
         Reply::Redraw
     }
 
-    /// A row of the flyout was chosen: an action runs after the popup closes, "Settings" switches.
+    /// A row of the flyout was chosen: the action (or the Settings window) runs after the popup closes.
     fn choose_power(&mut self, item: u32) -> Reply {
         match popup_power::choice(item) {
-            Some(Choice::Settings) => Reply::Switch(PopupKind::Settings),
-            Some(Choice::Run(a)) => {
-                self.power_pending = Some(a);
+            Some(c) => {
+                self.power_pending = Some(c);
                 Reply::Close
             }
             None => Reply::None,
@@ -1245,8 +1244,8 @@ impl Content for StartMenu {
 
     fn after_close(&mut self) {
         crate::popup::arm_start_release();
-        if let Some(a) = self.power_pending.take() {
-            popup_power::run(a);
+        if let Some(c) = self.power_pending.take() {
+            popup_power::run_choice(c);
             return;
         }
         if let Some(id) = self.pending.take() {
@@ -1433,11 +1432,13 @@ mod tests {
         c.click(ID_POWER);
         c.click(ID_POWER);
         assert!(!c.flyout);
-        // Settings switches; an action closes the Start and waits for `after_close`.
+        // Settings and every action close the Start and wait for `after_close`.
         c.click(ID_POWER);
-        assert_eq!(c.click(ID_FLY + popup_power::ID_SETTINGS), Reply::Switch(PopupKind::Settings));
+        assert_eq!(c.click(ID_FLY + popup_power::ID_SETTINGS), Reply::Close);
+        assert_eq!(c.power_pending, Some(Choice::Settings));
+        c.power_pending = None;
         assert_eq!(c.click(ID_FLY + popup_power::ID_LOCK), Reply::Close);
-        assert_eq!(c.power_pending, Some(PowerAction::Lock));
+        assert_eq!(c.power_pending, Some(Choice::Run(PowerAction::Lock)));
         c.power_pending = None;
         // The vertical style has no power button: no flyout.
         let mut v = make();

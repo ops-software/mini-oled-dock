@@ -30,6 +30,8 @@ enum Act {
     WinKey(VIRTUAL_KEY),
     /// Sign out (`power::run(PowerAction::SignOut)`).
     SignOut,
+    /// Open the dock's own Settings window.
+    DockSettings,
 }
 
 const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
@@ -39,7 +41,7 @@ const VK_R: VIRTUAL_KEY = VIRTUAL_KEY(0x52);
 type Row = (Act, &'static str, &'static str);
 
 /// Rows in the order of the native Win+X menu (`None` = separator). The row id is its index + 1.
-const ROWS: [Option<Row>; 18] = [
+const ROWS: [Option<Row>; 19] = [
     Some((Act::Launch("ms-settings:appsfeatures"), "Installed apps", "App installate")),
     Some((Act::Launch("ms-settings:powersleep"), "Power Options", "Opzioni spegnimento")),
     Some((Act::Launch("eventvwr.msc"), "Event Viewer", "Visualizzatore eventi")),
@@ -53,6 +55,7 @@ const ROWS: [Option<Row>; 18] = [
     None,
     Some((Act::Launch("taskmgr.exe"), "Task Manager", "Gestione attivit\u{e0}")),
     Some((Act::Launch("ms-settings:"), "Settings", "Impostazioni")),
+    Some((Act::DockSettings, "Dock settings", "Impostazioni dock")),
     Some((Act::Launch("explorer.exe"), "File Explorer", "Esplora file")),
     Some((Act::WinKey(VK_S), "Search", "Cerca")),
     Some((Act::WinKey(VK_R), "Run", "Esegui")),
@@ -141,7 +144,22 @@ impl Content for StartPopup {
             Some(Act::Admin(tool)) => shell_thread::request(ShellRequest::LaunchAdmin(tool)),
             Some(Act::WinKey(vk)) => crate::ui::send_win_key(vk),
             Some(Act::SignOut) => power::run(PowerAction::SignOut),
+            Some(Act::DockSettings) => crate::popup_power::open_settings_window(),
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_settings_follows_windows_settings() {
+        let i = ROWS.iter().position(|r| matches!(r, Some((Act::DockSettings, _, _)))).expect("row");
+        assert!(matches!(ROWS[i - 1], Some((Act::Launch("ms-settings:"), _, _))));
+        let mut p = StartPopup { hits: HitMap::default(), pending: None, width: 0 };
+        assert_eq!(p.click(i as u32 + 1), Reply::Close);
+        assert!(matches!(p.pending, Some(Act::DockSettings)));
     }
 }
