@@ -51,7 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{self, Background, Config, SETTINGS_WINDOW_MIN};
 use crate::i18n::tr;
 use crate::log;
-use crate::msg::{TIMER_SETTINGS_APPLY, TIMER_SETTINGS_TICK, WM_DOCK_CONFIG_APPLY};
+use crate::msg::{TIMER_SETTINGS_APPLY, TIMER_SETTINGS_BAR, TIMER_SETTINGS_TICK, WM_DOCK_CONFIG_APPLY};
 use crate::popup_tray::TrayRow;
 use crate::render::Metrics;
 use crate::settings_pages::{
@@ -210,6 +210,14 @@ impl Pending {
     }
 }
 
+/// ms until a stale mini bar may be rebuilt (it was last built at `built`), or None = now. Each
+/// rebuild paints a whole bar offscreen, so a drag or a live resize rebuilds it at most every
+/// `APPLY_THROTTLE_MS`; meanwhile the old bar stays, unless it no longer `fits` the card.
+fn bar_wait(built: u64, now: u64, fits: bool) -> Option<u32> {
+    let since = now.saturating_sub(built);
+    (fits && since < APPLY_THROTTLE_MS).then(|| (APPLY_THROTTLE_MS - since + 5) as u32)
+}
+
 // ------------------------------------------------------------------ state
 
 /// The mini bar of the Appearance card and what it was drawn for.
@@ -249,6 +257,8 @@ struct Win {
     log_path: Option<String>,
     pending: Pending,
     bar: Option<MiniBar>,
+    /// `tick_ms` of the last mini bar rebuild (see `bar_wait`).
+    bar_built: u64,
 }
 
 #[derive(Default)]
@@ -428,7 +438,7 @@ impl Win {
     }
 
     /// The mini bar: only on the Appearance page, redrawn when the config, the DPI or the card width
-    /// changed.
+    /// changed, at most every `APPLY_THROTTLE_MS` (`TIMER_SETTINGS_BAR` redraws the skipped one).
     fn sync_bar(&mut self) {
         let card = self.geo.preview;
         if self.page != Page::Appearance || card.right <= card.left {
@@ -440,9 +450,20 @@ impl Win {
         let cfg = config::get();
         let fresh =
             self.bar.as_ref().is_some_and(|b| Arc::ptr_eq(&b.cfg, &cfg) && b.dpi == self.dpi && b.max_w == max_w);
-        if !fresh {
-            self.bar = settings_view::mini_bar(m, &cfg, max_w).map(|px| MiniBar { cfg, dpi: self.dpi, max_w, px });
+        if fresh {
+            return;
         }
+        let now = crate::popup::tick_ms();
+        let old = self.bar.as_ref().filter(|b| b.dpi == self.dpi);
+        if let Some(ms) = old.and_then(|b| bar_wait(self.bar_built, now, b.px.w <= max_w)) {
+            // SAFETY: our window, on its thread.
+            if unsafe { SetTimer(Some(self.hwnd), TIMER_SETTINGS_BAR, ms, None) } != 0 {
+                return;
+            }
+            log!("settings: SetTimer(bar) failed");
+        }
+        self.bar = settings_view::mini_bar(m, &cfg, max_w).map(|px| MiniBar { cfg, dpi: self.dpi, max_w, px });
+        self.bar_built = now;
     }
 
     fn paint(&mut self) {
@@ -744,6 +765,7 @@ fn open_window(inst: HINSTANCE) -> Result<(), String> {
         log_path: crate::datadir::log_path().map(|p| p.display().to_string()),
         pending: Pending::default(),
         bar: None,
+        bar_built: 0,
     };
     win.refresh();
     with(|st| st.win = Some(win));
@@ -776,6 +798,7 @@ pub fn close(reason: &str) {
         let h = w.hwnd;
         kill(h, TIMER_SETTINGS_TICK);
         kill(h, TIMER_SETTINGS_APPLY);
+        kill(h, TIMER_SETTINGS_BAR);
         drop(w);
         // SAFETY: window created by this module on the UI thread.
         if let Err(e) = unsafe { DestroyWindow(h) } {
@@ -1180,6 +1203,13 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         }
                     });
                 }
+                TIMER_SETTINGS_BAR => {
+                    kill(h, TIMER_SETTINGS_BAR);
+                    with_win(|w| {
+                        w.sync_bar();
+                        w.paint();
+                    });
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1267,5 +1297,13 @@ mod tests {
         p.apply_pending = true; // only a skipped rebuild left: finish applies it
         assert_eq!(p.finish(), Finish::Apply);
         assert_eq!(p.flush_in(330), 25); // 30 ms after the last rebuild (320), plus 5
+    }
+
+    #[test]
+    fn mini_bar_rebuilds_are_throttled() {
+        assert_eq!(bar_wait(0, 1000, true), None); // never built: now
+        assert_eq!(bar_wait(1000, 1040, true), None); // 30 ms passed: now
+        assert_eq!(bar_wait(1000, 1010, true), Some(25)); // inside the throttle: the old bar stays
+        assert_eq!(bar_wait(1000, 1010, false), None); // the old bar no longer fits the card: now
     }
 }

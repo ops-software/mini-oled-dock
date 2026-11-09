@@ -151,12 +151,14 @@ pub const TIMER_POPUP_FOCUS: usize = 32;
 pub const TIMER_POPUP_START_RELEASE: usize = 33;
 
 // SETTINGS window timers (`DockSettings` hwnd; handled only by `settings_window`). Timer ids are per
-// HWND, so they could not clash with the dock window's private ones (`ui.rs`: 40, 41, 42), but 50 and
-// 51 keep this registry unambiguous.
+// HWND, so they could not clash with the dock window's private ones (`ui.rs`: 40, 41, 42), but 50 to
+// 52 keep this registry unambiguous.
 /// 1 s, ONLY while the Settings window is open: import and update status, memory figures.
 pub const TIMER_SETTINGS_TICK: usize = 50;
 /// One-shot: sends the bar rebuild (`WM_DOCK_CONFIG_APPLY`) that the drag throttle skipped.
 pub const TIMER_SETTINGS_APPLY: usize = 51;
+/// One-shot: redraws the mini bar of the Appearance page that its throttle skipped (drag, resize).
+pub const TIMER_SETTINGS_BAR: usize = 52;
 
 // --------------------------------------------- context menu command ids
 
