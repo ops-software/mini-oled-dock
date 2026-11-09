@@ -64,7 +64,7 @@ impl BatteryStatus {
     }
 
     /// Colour class of the fill: plugged in or charging is never alarming; on battery 10 % and
-    /// below is `Critical`, below 20 % is `Low`.
+    /// below is `Critical` (red), below 20 % is `Low` (orange).
     pub fn tint(&self) -> Tint {
         if self.ac || self.charging {
             Tint::Normal

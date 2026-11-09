@@ -380,8 +380,17 @@ const BATT_DIGIT_PX: i32 = 11;
 /// and gap to the body.
 const BATT_BOLT_BOX: i32 = 30;
 const BATT_BOLT_GAP: i32 = 2;
-/// Fill colour on battery below 20 %.
-pub(crate) const BATT_LOW_RGB: (u32, u32, u32) = (255, 69, 58);
+/// Fill colour on battery at 10 % and below (critical).
+pub(crate) const BATT_CRITICAL_RGB: (u32, u32, u32) = (255, 69, 58);
+
+/// Fill colour of the battery glyph for a tint: white, the attention orange below 20 %, red at 10 % and below.
+pub(crate) fn batt_tint_rgb(t: Tint) -> (u32, u32, u32) {
+    match t {
+        Tint::Normal => WHITE,
+        Tint::Low => ATTENTION_RGB,
+        Tint::Critical => BATT_CRITICAL_RGB,
+    }
+}
 
 /// Physical geometry of the battery pill (percentage-inside mode) at module metrics `m`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1452,11 +1461,7 @@ fn paint_inner(g: &Gfx, scene: &Scene<'_>, layout: &Layout) {
                         continue;
                     }
                     let text = battery_text(&b);
-                    let tint = match st.tint() {
-                        Tint::Normal => WHITE,
-                        Tint::Low => BATT_LOW_RGB,
-                        Tint::Critical => ATTENTION_RGB,
-                    };
+                    let tint = batt_tint_rgb(st.tint());
                     let x = r.left + sys_pad;
                     if let BatteryText::Inside(s) = &text {
                         paint_batt_pill(g, &mut cv, mm, x, mcy, st, s, tint, glyph_a);
@@ -1517,6 +1522,13 @@ pub(crate) fn paint_offscreen(scene: &Scene<'_>) -> Option<(i32, i32, Vec<u32>)>
 mod tests {
     use super::*;
     use crate::config::{BatteryShow, Config};
+
+    #[test]
+    fn battery_low_is_orange_and_critical_is_red() {
+        assert_eq!(batt_tint_rgb(Tint::Normal), WHITE);
+        assert_eq!(batt_tint_rgb(Tint::Low), (255, 140, 0));
+        assert_eq!(batt_tint_rgb(Tint::Critical), (255, 69, 58));
+    }
 
     #[test]
     fn transparent_bar_keeps_the_mouse() {

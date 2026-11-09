@@ -82,7 +82,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - **Notifications:** click one to switch to the app that sent it, X or **Clear all** remove them from Windows' notification history too; Do not disturb.
 - **Audio:** volume, mute, output device, spatial sound formats available on the current output (Windows Sonic, Dolby Atmos, ...) and a per-app mixer. Sections can be collapsed, hidden and reordered; a collapsed or hidden section loads nothing.
 - **Network:** Wi-Fi signal bars or ethernet, with a globe badge when the internet is reachable; click for name, IPv4 and signal.
-- **Battery** (laptops): an Apple-style battery icon with the fill proportional to the charge, a bolt while charging, and the percentage beside the icon or inside it. Red fill under 20 %, orange at 10 % and below. Shown automatically only when Windows reports a battery, so a desktop sees no change; click for charge, state, time remaining on battery and the power plan.
+- **Battery** (laptops): an Apple-style battery icon with the fill proportional to the charge, a bolt while charging, and the percentage beside the icon or inside it. Orange fill under 20 %, red at 10 % and below. Shown automatically only when Windows reports a battery, so a desktop sees no change; click for charge, state, time remaining on battery and the power plan.
 - **System metrics** (off by default): CPU and RAM usage; click opens Task Manager.
 - **Calendar**, **power** menu and an **app menu** (new window, pin / unpin, close).
 - **Tray icon hosting**, with an overflow popup and a view to choose which icons stay in the bar.

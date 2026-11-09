@@ -3,10 +3,10 @@
 //! (`ms-settings:batterysaver`, de-elevated through the shell thread). Data: `battery::BatteryStatus`
 //! (last known on open, then `DataEvent::Battery` from the samples of the visible bar).
 
-use crate::battery::{BatteryStatus, ChargeState, PowerMode, Tint};
+use crate::battery::{BatteryStatus, ChargeState, PowerMode};
 use crate::glyphs;
 use crate::popup::{center_y, hline, launch, lift, row_plate, Content, DataEvent, HitMap, PopupKind, Reply};
-use crate::render::{ATTENTION_RGB, BATT_LOW_RGB};
+use crate::render::batt_tint_rgb;
 use crate::surface::{rect_wh, Font, Surface, PANEL_PAD, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, TEXT_COL, WHITE};
 
 const ID_SETTINGS: u32 = 1;
@@ -84,11 +84,7 @@ fn battery_glyph(s: &mut Surface, x: i32, y: i32, size: i32, st: &BatteryStatus)
         s.glyph(x, y, size, TEXT_ALPHA, &glyphs::battery_off_shape);
         return;
     }
-    let tint = match st.tint() {
-        Tint::Normal => WHITE,
-        Tint::Low => BATT_LOW_RGB,
-        Tint::Critical => ATTENTION_RGB,
-    };
+    let tint = batt_tint_rgb(st.tint());
     let (pct, bolt) = (st.percent, st.charging);
     s.glyph_rgb(x, y, size, tint, TEXT_ALPHA, &move |u, v| glyphs::battery_fill_shape(u, v, pct, bolt));
     s.glyph(x, y, size, TEXT_ALPHA, &glyphs::battery_outline_shape);
