@@ -11,7 +11,7 @@ A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust
 It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), the bar shows program names only (window titles appear in the hover previews), tray icons of other apps are hosted in the bar, and every popup is drawn by hand.
 
 - **Tiny:** the executable is about 0.7 MB and uses roughly 10 MB of RAM, trimmed to under 1 MB while hidden (numbers from the author's machine).
-- **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
+- **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network, battery and metrics modules are polled only while the bar is visible.
 - **Safe to try:** a watchdog process always restores the native taskbar, and `dock.exe --restore` works even when no dock is running.
 - **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it.
 
@@ -34,6 +34,10 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 | Calendar | Network | Power |
 |---|---|---|
 | ![](docs/screenshots/popup_calendar.png) | ![](docs/screenshots/popup_network.png) | ![](docs/screenshots/popup_power.png) |
+
+| Battery bar (percent beside) | Battery bar (percent inside, charging) | Battery popup |
+|---|---|---|
+| ![](docs/screenshots/bar_battery.png) | ![](docs/screenshots/bar_battery_inside.png) | ![](docs/screenshots/popup_battery.png) |
 
 | Window previews | Tray: choose visible icons | Settings |
 |---|---|---|
@@ -74,6 +78,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - **Notifications:** click one to switch to the app that sent it, X or **Clear all** remove them from Windows' notification history too; Do not disturb.
 - **Audio:** volume, mute, output device, spatial sound formats available on the current output (Windows Sonic, Dolby Atmos, ...) and a per-app mixer. Sections can be collapsed, hidden and reordered; a collapsed or hidden section loads nothing.
 - **Network:** Wi-Fi signal bars or ethernet, with a globe badge when the internet is reachable; click for name, IPv4 and signal.
+- **Battery** (laptops): an Apple-style battery icon with the fill proportional to the charge, a bolt while charging, and the percentage beside the icon or inside it. Red fill under 20 %, orange at 10 % and below. Shown automatically only when Windows reports a battery, so a desktop sees no change; click for charge, state, time remaining on battery and the power plan.
 - **System metrics** (off by default): CPU and RAM usage; click opens Task Manager.
 - **Calendar**, **power** menu and an **app menu** (new window, pin / unpin, close).
 - **Tray icon hosting**, with an overflow popup and a view to choose which icons stay in the bar.
@@ -128,6 +133,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 - **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu; resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup (output, spatial sound, per-app mixer). Click a section header to collapse it; the pencil at the bottom enters Customize mode (eye = hide / show, drag a header to reorder).
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
+- **Battery:** left click opens the battery popup (charge, state, time remaining on battery, power plan, "Power & battery settings"); right click opens Windows' battery saver settings. The wheel is not used.
 - **System metrics:** click opens Task Manager.
 - **Settings:** power button, then **Settings**: position, screen (with two or more displays: **Main**, the display number or **Pointer**), display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
   - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
@@ -151,7 +157,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `app_icon_size` | `16` | App icon size in logical px, 14-32 |
 | `app_text_size` | `13` | App name text size in logical px, 10-18 |
 | `tray_icon_size` | `16` | Tray icon size in logical px, 12-24 |
-| `module_size` | `100` | Scale of the Start button and the system modules (notifications, volume, network, metrics, clock, show desktop, power) in percent, 75-150 |
+| `module_size` | `100` | Scale of the Start button and the system modules (notifications, volume, network, battery, metrics, clock, show desktop, power) in percent, 75-150 |
 | `background` | `"#000000"` | Background colour of the bar and the popups, `"#RRGGBB"` (the old values `"black"` and `"dark"` are still accepted) |
 | `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
@@ -162,6 +168,9 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `show_volume_percent` | `true` | Show `NN%` next to the speaker |
 | `show_tray` | `true` | Host other apps' tray icons (switching it off stops the tray host; the icons go back to Explorer) |
 | `show_network` | `true` | Network module: Wi-Fi bars / ethernet, internet badge, details popup |
+| `show_battery` | `"auto"` | Battery module: `"auto"` (only when the PC has a battery), `true` (always) or `false` (never) |
+| `battery_percent` | `true` | Show the charge percentage with the battery icon |
+| `battery_percent_inside` | `false` | Draw the percentage inside a larger battery icon instead of beside it |
 | `show_metrics` | `false` | CPU / RAM usage module (click opens Task Manager) |
 | `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
 | `show_start_button` | `true` | Start button at the left end of the bar (a fixed item, not a movable module) |
