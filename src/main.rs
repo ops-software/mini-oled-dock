@@ -34,6 +34,7 @@ mod apps;
 mod arp;
 mod audio;
 mod autostart;
+mod battery;
 mod calendar;
 mod clock;
 mod config;
