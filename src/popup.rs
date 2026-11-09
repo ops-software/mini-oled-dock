@@ -1367,6 +1367,11 @@ pub(crate) fn tick_soon(ms: u32) {
     }
 }
 
+/// The Start menu is useless without the keyboard (type to search): close it once the last retry fails.
+fn focus_giveup(kind: PopupKind, tries_left: u8, focused: bool) -> bool {
+    kind == PopupKind::StartMenu && tries_left == 0 && !focused
+}
+
 /// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
 /// the foreground is still the window that was in front at open time (or null, or ours): if the
 /// user has meanwhile moved to another window, the popup is not pushed in front of it (the tick
@@ -1390,12 +1395,19 @@ fn on_focus_retry(hwnd: HWND) {
             return None;
         }
         o.focus_tries -= 1;
-        Some(o.focus_tries)
+        Some((o.focus_tries, o.kind))
     })
     .flatten();
-    let Some(left) = go else { return };
+    let Some((left, kind)) = go else { return };
     let ok = crate::ui::force_foreground(hwnd);
     log!("popup: foreground retry ({left} left) -> {ok}");
+    // SAFETY: no preconditions.
+    let focused = ok || unsafe { GetForegroundWindow() } == hwnd;
+    if focus_giveup(kind, left, focused) {
+        log!("popup: Start menu has no keyboard focus after the last retry, closing");
+        close_inner("no keyboard focus");
+        return;
+    }
     if !ok && left > 0 {
         // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
         if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
@@ -1546,5 +1558,13 @@ mod tests {
             "20 - 32 < 0: never zero or negative"
         );
         assert_eq!(fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 10, bottom: 10 }, 16), (1, 1), "never zero");
+    }
+
+    #[test]
+    fn start_menu_never_stays_open_unfocused() {
+        assert!(focus_giveup(PopupKind::StartMenu, 0, false));
+        assert!(!focus_giveup(PopupKind::StartMenu, 0, true));
+        assert!(!focus_giveup(PopupKind::StartMenu, 2, false), "retries left: keep trying");
+        assert!(!focus_giveup(PopupKind::Power, 0, false), "only the Start menu needs the keyboard");
     }
 }
