@@ -664,6 +664,21 @@ fn create() -> Result<(), String> {
         }
         with(|st| st.registered = true);
     }
+    // A failed open leaves nothing behind: the class goes with the window that never was.
+    open_window(inst).inspect_err(|_| {
+        if with(|st| std::mem::replace(&mut st.registered, false)).unwrap_or(false) {
+            unregister_class(Some(inst));
+        }
+    })
+}
+
+/// Unregisters the `DockSettings` class (no window of it may survive).
+fn unregister_class(inst: Option<HINSTANCE>) {
+    // SAFETY: class registered by `create` with this module; no window of it survives.
+    let _ = unsafe { UnregisterClassW(CLASS_W, inst) };
+}
+
+fn open_window(inst: HINSTANCE) -> Result<(), String> {
     let hmon = crate::ui::dock_hmonitor();
     let dpi = monitor_dpi(hmon);
     let work = crate::ui::monitor_info(hmon).map(|mi| mi.rcWork).ok_or("GetMonitorInfoW failed")?;
@@ -769,8 +784,7 @@ pub fn close(reason: &str) {
         log!("settings: window closed ({reason})");
     }
     if registered {
-        // SAFETY: class registered by `create` with this module; no window of it survives.
-        let _ = unsafe { UnregisterClassW(CLASS_W, module()) };
+        unregister_class(module());
     }
 }
 
