@@ -1,4 +1,4 @@
-//! Mini OLED popup (notifications, audio, calendar, power, settings, tray overflow, network): a layered window
+//! Mini OLED popup (notifications, audio, calendar, power, tray overflow, network, battery, start menu): a layered window
 //! SEPARATE from the bar, only one open at a time.
 //!
 //! WINDOW: class `DockPopup`, `WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`
