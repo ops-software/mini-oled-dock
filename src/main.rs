@@ -69,6 +69,7 @@ mod tray_host;
 mod ui;
 mod update_release;
 mod watchdog;
+mod winhttp;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
