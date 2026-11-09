@@ -1478,4 +1478,28 @@ mod tests {
         assert_eq!(layout(Metrics { dpi: 96 }, 12, UNCAPPED).h, H);
         assert_eq!(layout_h(Metrics { dpi: 96 }, 18, 0, false, Some(90), UNCAPPED).page_size, H_PAGE);
     }
+
+    #[test]
+    fn short_work_area_drops_pin_rows_and_tile_rows() {
+        let m = Metrics { dpi: 96 };
+        // Vertical: with both pin rows the list header ends at 288 px and 3 list rows need h >= 416;
+        // one pin row needs h >= 336.
+        let full = layout(m, 12, (i32::MAX, 416));
+        assert_eq!(full.tiles.len(), COLS * MAX_PIN_ROWS, "416 keeps both pin rows");
+        let g = layout(m, 12, (i32::MAX, 380));
+        assert_eq!(g.tiles.len(), COLS, "380 keeps one pin row");
+        assert!(g.h <= 380 && g.rows >= MIN_LIST_ROWS && g.list.bottom <= g.h, "{g:?}");
+        let none = layout(m, 12, (i32::MAX, 300));
+        assert!(none.tiles.is_empty() && none.pins_header.is_none() && none.rows >= MIN_LIST_ROWS, "{none:?}");
+        // Horizontal: tile row r needs h >= 178 + 96 r (grid top 108, bar 60 + gap 10 below).
+        let two = layout_h(m, 20, 0, false, Some(90), (i32::MAX, 400));
+        assert_eq!((two.page_size, two.tiles.len()), (2 * H_COLS, 2 * H_COLS));
+        assert!(two.h <= 400 && two.grid.bottom <= two.bar.unwrap().top);
+        let one = layout_h(m, 20, 0, false, Some(90), (i32::MAX, 300));
+        assert_eq!((one.page_size, one.tiles.len()), (H_COLS, H_COLS));
+        assert!(one.h <= 300 && one.grid.bottom <= one.bar.unwrap().top);
+        // Pages follow the smaller page: 20 pins on 6-tile pages = 4 dots, and page 3 holds the last 2.
+        assert_eq!(one.dots.len(), 4);
+        assert_eq!(layout_h(m, 20, 3, false, Some(90), (i32::MAX, 300)).tiles.len(), 2);
+    }
 }
