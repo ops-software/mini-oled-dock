@@ -103,15 +103,22 @@ The exe asks for administrator rights (UAC prompt): a non-elevated process canno
 To start with Windows (or use the toggle in the power popup):
 
 ```powershell
-.\target\release\dock.exe --install     # copies the exe to %ProgramFiles%\mini-oled-dock and registers a logon task
-.\target\release\dock.exe --uninstall   # removes the logon task
+.\target\release\dock.exe --install     # copies the exe to %ProgramFiles%\mini-oled-dock, registers a logon task and an Add/Remove Programs entry, starts the dock
+.\target\release\dock.exe --uninstall   # removes the logon task and the Add/Remove Programs entry
+.\target\release\dock.exe --version     # prints "mini-oled-dock X.Y.Z"
 ```
+
+`--install` replaces the installed `dock.exe` in one step: the new copy is first written next to it as `dock.exe.new`, so a failed copy never leaves a half-written file. A running dock is asked to exit, and the installer waits up to 35 s until neither the dock nor its taskbar-restoring watchdog is left. Then the new copy is started (`--no-relaunch` skips that). If a dock is still running when `--install` ends (for example, `--install` run from the installed copy while it runs), it is left running and nothing is restarted. `--quiet` shows no message box, for scripts and unattended runs. Exit codes: `0` success, `1` failure, `2` bad arguments, `3` the running dock could not be stopped.
 
 The logon task runs the dock elevated, so the installed copy lives in an admin-only folder (`%ProgramFiles%\mini-oled-dock\dock.exe`, inheriting the Program Files permissions) that normal programs cannot modify. Its data lives in `%ProgramData%\mini-oled-dock` (see [Data folder](#data-folder)).
 
-**Update:** run `--install` again after rebuilding; if the installed dock is running it is asked to exit and restarted from the new copy. If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
+**Update:** the dock checks GitHub Releases once a day (`update_check`, one request to api.github.com, nothing is downloaded by the check). When a newer version exists, an orange dot with a count on **Settings** in the power popup shows it. Nothing is installed unless you set `update_auto_install` to `true`: then a verified release is installed when no popup is open and no fullscreen app is in front. The installer downloads `dock.exe` and its `.sha256` into the admin-only folder `%ProgramData%\mini-oled-dock\update\<tag>\`, checks the hash, runs the new exe's `--version`, and then runs its `--install --quiet`. No UAC prompt is shown, and the dock restarts from the new copy by itself. Trust rests on HTTPS to github.com and on the hash published with the same release; the exe is not code-signed.
 
-**Uninstall:** `--uninstall` removes the logon task but keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). Delete that folder from an elevated prompt if you no longer need it, and `%ProgramData%\mini-oled-dock` (also elevated) to remove your settings, logs and icons.
+Manual updating still works: run `--install` from a downloaded `dock.exe`. Diagnostics: `dock.exe --update-check` makes one check and prints the result (exit `0` when GitHub answered, `1` when it could not be checked); `dock.exe --update-install <tag>` verifies and installs a release already staged in `update\<tag>\`, and accepts no other path.
+
+If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
+
+**Uninstall:** `--uninstall` removes the logon task and the Add/Remove Programs entry and keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). `--uninstall --remove`, which Settings → Apps → Installed apps also runs, stops the dock, restores the taskbar, deletes `%ProgramFiles%\mini-oled-dock` (a file still in use goes at the next restart) and the downloaded updates, and keeps your settings, logs and icons. `--uninstall --remove --purge-data` also deletes `%ProgramData%\mini-oled-dock`. Add `--quiet` to either form for a silent run.
 
 ## Usage
 
@@ -127,6 +134,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
   - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
 
   Sliders follow a drag or a click on the track, and the mouse wheel (opacity and modules in steps of 5 %, the others 1 px). Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button.
+- **Updates:** an orange dot on Settings in the power popup means a new release is available.
 - **Exit:** `Ctrl+Alt+Q`, or the power popup, or `dock.exe --restore`.
 
 ## Configuration
@@ -217,6 +225,7 @@ Everything the dock stores is in `%ProgramData%\mini-oled-dock`:
 | `config.json` (+ `config.json.bak`) | settings | you (edit in place) and administrators; the `.bak` copy is admin-only |
 | `icons\` | your custom PNGs | you can add, replace and delete files |
 | `cache\` | extracted icon cache (PNG) | administrators only |
+| `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), deleted once that version or a newer one runs | administrators only |
 | `dock.log`, `dock.log.1` | log, rotated at 2 MB | administrators only |
 | `taskbar-state` | the original taskbar state, used to restore it | administrators only |
 
