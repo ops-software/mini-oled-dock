@@ -268,4 +268,12 @@ mod tests {
         assert_eq!(HttpError::TooLarge.to_string(), "response too large");
         assert_eq!(HttpError::Network("WinHttpOpen: x".into()).to_string(), "WinHttpOpen: x");
     }
+
+    #[test]
+    #[ignore = "network: run with --ignored"]
+    fn live_latest_release() {
+        let r =
+            get(crate::update_release::LATEST_API_URL, &[("Accept", "application/vnd.github+json")], 1 << 20).unwrap();
+        assert!(r.status == 200 || r.status == 403, "{}", r.status);
+    }
 }
