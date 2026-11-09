@@ -323,6 +323,72 @@ pub fn net_badge_shape(u: f32, v: f32, online: bool) -> bool {
     }
 }
 
+/// Even-odd point-in-polygon test.
+fn in_polygon(u: f32, v: f32, pts: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = pts.len() - 1;
+    for i in 0..pts.len() {
+        let ((xi, yi), (xj, yj)) = (pts[i], pts[j]);
+        if (yi > v) != (yj > v) && u < (xj - xi) * (v - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Signed distance to a rounded rectangle (negative inside).
+fn rrect_sd(u: f32, v: f32, rect: (f32, f32, f32, f32), rad: f32) -> f32 {
+    let (l, t, r, b) = rect;
+    let (cx, cy) = ((l + r) / 2.0, (t + b) / 2.0);
+    let (hx, hy) = ((r - l) / 2.0 - rad, (b - t) / 2.0 - rad);
+    let (qx, qy) = ((u - cx).abs() - hx, (v - cy).abs() - hy);
+    (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - rad
+}
+
+/// Battery: rounded body outline (same stroke as the other icons) plus the filled nub on the right.
+/// The charge is a separate layer (`battery_fill_shape`).
+pub fn battery_outline_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let rect = (snap(1.5), snap(4.5), snap(13.0), snap(11.5));
+    let body = rrect_sd(u, v, rect, 2.0).abs() <= st;
+    let nub = u >= edge(13.5) && u <= edge(15.0) && v >= edge(6.5) && v <= edge(9.5);
+    body || nub
+}
+
+/// Charge inside the battery body, from the left up to `percent`; with `bolt` the bolt and a margin
+/// around it are cut out so the bolt can be drawn on top in another colour.
+pub fn battery_fill_shape(u: f32, v: f32, percent: u8, bolt: bool) -> bool {
+    let rect = (edge(3.0), edge(6.0), edge(11.5), edge(10.0));
+    let end = edge(3.0 + 8.5 * percent.min(100) as f32 / 100.0);
+    if u > end || rrect_sd(u, v, rect, 1.0) > 0.0 {
+        return false;
+    }
+    !(bolt && near_bolt(u, v, 0.9))
+}
+
+const BOLT: [(f32, f32); 6] = [(8.6, 5.2), (6.0, 8.2), (7.6, 8.2), (6.8, 10.8), (9.4, 7.6), (7.8, 7.6)];
+
+fn near_bolt(u: f32, v: f32, margin: f32) -> bool {
+    in_polygon(u, v, &BOLT)
+        || (0..BOLT.len()).any(|i| {
+            let (a, b) = (BOLT[i], BOLT[(i + 1) % BOLT.len()]);
+            dist_seg(u, v, a.0, a.1, b.0, b.1) <= margin
+        })
+}
+
+/// Lightning bolt (charging), drawn over the fill.
+pub fn bolt_shape(u: f32, v: f32) -> bool {
+    in_polygon(u, v, &BOLT)
+}
+
+/// Battery crossed out (no battery): the outline with a diagonal bar and an empty halo around it.
+pub fn battery_off_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let d = dist_seg(u, v, 2.0, 2.0, 14.0, 14.0);
+    (battery_outline_shape(u, v) && d > st + 1.0) || d <= st
+}
+
 /// Chevron pointing up (tray overflow with the bar at the bottom).
 pub fn chevron_up_shape(u: f32, v: f32) -> bool {
     let c = ax();
@@ -460,6 +526,19 @@ pub fn eye_shape(u: f32, v: f32, off: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_shapes_hit_expected_points() {
+        assert!(battery_outline_shape(1.5, 8.0) && battery_outline_shape(7.0, 4.5)); // left edge, top edge
+        assert!(!battery_outline_shape(7.0, 8.0)); // hollow body
+        assert!(battery_outline_shape(14.3, 8.0) && !battery_outline_shape(14.3, 5.0)); // nub
+        assert!(battery_fill_shape(5.0, 8.0, 50, false) && !battery_fill_shape(9.0, 8.0, 50, false));
+        assert!(battery_fill_shape(11.0, 8.0, 100, false) && !battery_fill_shape(3.5, 8.0, 0, false));
+        assert!(!battery_fill_shape(3.5, 5.2, 100, false)); // never outside the interior
+        assert!(battery_fill_shape(7.7, 7.9, 100, false) && !battery_fill_shape(7.7, 7.9, 100, true)); // bolt cut-out
+        assert!(bolt_shape(7.7, 7.9) && !bolt_shape(3.5, 8.0));
+        assert!(battery_off_shape(8.0, 8.0) && battery_off_shape(1.5, 8.0));
+    }
 
     #[test]
     fn shapes_hit_expected_points() {
