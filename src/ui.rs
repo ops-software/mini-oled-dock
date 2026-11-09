@@ -2451,7 +2451,11 @@ fn click_left(id: ItemId) {
                     Some(t) => shell_thread::request(ShellRequest::Launch { target: t, args: None }),
                     None => log!("click: no launch target for '{}'", e.key),
                 },
-                ClickOutcome::Activated(_) | ClickOutcome::Minimized(_) => {}
+                // A minimized window must not get the foreground back when the bar hides.
+                ClickOutcome::Minimized(h) => {
+                    let _ = PREV_FG.compare_exchange(h, 0, Relaxed, Relaxed);
+                }
+                ClickOutcome::Activated(_) => {}
             }
         }
         // Without a popup (class not registered) fall back to the direct actions.
@@ -3085,6 +3089,28 @@ fn restore_prev_foreground() {
     }
 }
 
+/// Foreground window as the app buttons see it: while the bar (or a popup) holds the foreground it
+/// took by the Win key, the window that had it before (`PREV_FG`), so a click on that app still
+/// minimizes or cycles it. UI thread.
+pub fn effective_foreground() -> HWND {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    let prev = PREV_FG.load(Relaxed);
+    // SAFETY: IsWindow accepts any handle value.
+    let prev_alive = prev != 0 && unsafe { IsWindow(Some(HWND(prev as *mut std::ffi::c_void))) }.as_bool();
+    let own = !fg.0.is_null() && is_own_window(fg);
+    HWND(effective_fg(fg.0 as isize, own, prev, prev_alive) as *mut std::ffi::c_void)
+}
+
+/// `effective_foreground` decision: `prev` if the foreground `fg` is ours and `prev` is alive, else `fg`.
+fn effective_fg(fg: isize, fg_own: bool, prev: isize, prev_alive: bool) -> isize {
+    if fg_own && prev != 0 && prev_alive {
+        prev
+    } else {
+        fg
+    }
+}
+
 /// Gives the foreground back to `prev` only if it now belongs to nobody else (null or ours).
 fn restore_foreground(prev: HWND) {
     // SAFETY: no preconditions.
@@ -3452,6 +3478,15 @@ mod tests {
         assert_eq!(prev_to_remember(0, 9, false, 0), 0, "edge show: nothing to give back");
         assert_eq!(prev_to_remember(0, 0, true, 5), 5, "foreground ours (linked Start reversed): kept");
         assert_eq!(prev_to_remember(0, 0, false, 0), 0);
+    }
+
+    #[test]
+    fn effective_foreground_choice() {
+        assert_eq!(effective_fg(3, true, 9, true), 9, "bar focused by Win: the previous window");
+        assert_eq!(effective_fg(3, false, 9, true), 3, "foreign foreground: itself");
+        assert_eq!(effective_fg(3, true, 9, false), 3, "previous window closed");
+        assert_eq!(effective_fg(3, true, 0, false), 3, "nothing remembered");
+        assert_eq!(effective_fg(0, false, 9, true), 0, "null foreground: not ours");
     }
 
     #[test]

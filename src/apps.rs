@@ -263,7 +263,8 @@ pub fn refresh(own: HWND) -> bool {
             live.push(h);
         }
     }
-    let mut fg = foreground_target(&live);
+    // The active app stays highlighted while the bar holds the foreground it took by Win.
+    let mut fg = foreground_target_of(crate::ui::effective_foreground(), &live);
     // A window that just came to the foreground (e.g. a UWP frame restored long after the dock
     // started) gets one forced re-check if its identity is still provisional.
     let fg_changed = STATE.with(|s| s.borrow().last_fg) != fg;
@@ -838,9 +839,14 @@ pub fn aumid_from_launch(launch: &str) -> Option<String> {
 /// may be a popup owned by a tracked window (we walk up to the root owner).
 /// 0 if the foreground window is not tracked (desktop, Start menu, the dock itself...).
 fn foreground_target(live: &[isize]) -> isize {
-    // SAFETY: no preconditions; GetAncestor accepts arbitrary HWNDs.
+    // SAFETY: no preconditions.
+    foreground_target_of(unsafe { GetForegroundWindow() }, live)
+}
+
+/// `foreground_target` for the foreground `fg` (e.g. `ui::effective_foreground`).
+fn foreground_target_of(fg: HWND, live: &[isize]) -> isize {
+    // SAFETY: GetAncestor accepts arbitrary HWNDs.
     let (fg, root_owner, root) = unsafe {
-        let fg = GetForegroundWindow();
         if fg.0.is_null() {
             return 0;
         }
@@ -901,7 +907,8 @@ pub fn click_group(key: &str) -> ClickOutcome {
     }
 
     let handles: Vec<isize> = wins.iter().map(|w| w.0).collect();
-    let fg = foreground_target(&handles); // 0 if no window of the group is in the foreground
+    // 0 if no window of the group is in the foreground (the bar focused by Win counts as the window before).
+    let fg = foreground_target_of(crate::ui::effective_foreground(), &handles);
 
     if fg == 0 {
         // Inactive group: the most recent one.
