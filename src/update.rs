@@ -8,9 +8,6 @@
 //! `init`/`sync_timer`/`on_timer` drive the daily check (`TIMER_UPDATE_CHECK` on the dock window);
 //! `on_idle` installs a staged release when `update_auto_install` is on and nothing is open.
 
-// Wired into the dock by later tasks; until then some items are unused.
-#![allow(dead_code)]
-
 use std::io::Read;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;

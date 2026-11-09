@@ -4,9 +4,6 @@
 //! `click` maps a click on a part of a row to an `Effect`. Adding an option means adding a row.
 //! `settings_view` lays the rows out and paints them, `settings_window` applies the effects.
 
-// The consumers (`settings_view`, `settings_window`) land in the next tasks.
-#![allow(dead_code)]
-
 use crate::config::{
     self, Background, BatteryShow, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE,
     APP_TEXT_SIZE, BACKGROUND_PRESETS, MODULE_SIZE, TRAY_ICON_SIZE,
@@ -357,15 +354,15 @@ pub(crate) fn flip(c: &mut Config, s: Setting) {
 
 // ------------------------------------------------------------------ sliders
 
-/// `(min, max, wheel step, unit)` of a slider.
-pub(crate) fn slider_range(sl: Slider) -> (i32, i32, i32, &'static str) {
-    let r = |s: SizeRange, step: i32, unit| (s.min as i32, s.max as i32, step, unit);
+/// `(min, max, unit)` of a slider.
+pub(crate) fn slider_range(sl: Slider) -> (i32, i32, &'static str) {
+    let r = |s: SizeRange, unit| (s.min as i32, s.max as i32, unit);
     match sl {
-        Slider::Opacity => (0, 100, 5, "%"),
-        Slider::AppIcon => r(APP_ICON_SIZE, 1, " px"),
-        Slider::AppText => r(APP_TEXT_SIZE, 1, " px"),
-        Slider::TrayIcon => r(TRAY_ICON_SIZE, 1, " px"),
-        Slider::Module => r(MODULE_SIZE, 5, "%"),
+        Slider::Opacity => (0, 100, "%"),
+        Slider::AppIcon => r(APP_ICON_SIZE, " px"),
+        Slider::AppText => r(APP_TEXT_SIZE, " px"),
+        Slider::TrayIcon => r(TRAY_ICON_SIZE, " px"),
+        Slider::Module => r(MODULE_SIZE, "%"),
     }
 }
 
@@ -382,7 +379,7 @@ pub(crate) fn slider_value(c: &Config, sl: Slider) -> i32 {
 
 /// Sets slider `sl` to `v` (clamped to its range).
 pub(crate) fn set_slider(c: &mut Config, sl: Slider, v: i32) {
-    let (lo, hi, _, _) = slider_range(sl);
+    let (lo, hi, _) = slider_range(sl);
     let v = v.clamp(lo, hi) as u8;
     match sl {
         Slider::Opacity => c.bar_opacity = v,
@@ -462,6 +459,7 @@ pub(crate) fn preset_index(bg: Background) -> Option<usize> {
 }
 
 /// Swatch `k` (presets, then the custom one) is the current colour.
+#[cfg(test)]
 pub(crate) fn swatch_selected(bg: Background, k: usize) -> bool {
     match preset_index(bg) {
         Some(p) => p == k,
@@ -580,7 +578,7 @@ fn choice(icon: Glyph, label: &str, desc: Option<&str>, c: &Config, setting: Set
 }
 
 fn slider_row(icon: Glyph, label: &str, c: &Config, slider: Slider) -> Row {
-    let (min, max, _, unit) = slider_range(slider);
+    let (min, max, unit) = slider_range(slider);
     row(icon, label, None, Control::Slider { slider, value: slider_value(c, slider), min, max, unit })
 }
 
@@ -1028,7 +1026,7 @@ mod tests {
     fn sliders_clamp_and_reset() {
         let mut c = Config::default();
         for sl in [Slider::Opacity, Slider::AppIcon, Slider::AppText, Slider::TrayIcon, Slider::Module] {
-            let (lo, hi, _, _) = slider_range(sl);
+            let (lo, hi, _) = slider_range(sl);
             apply_edit(&mut c, Edit::Slider(sl, hi + 50), &[]);
             assert_eq!(slider_value(&c, sl), hi);
             apply_edit(&mut c, Edit::Slider(sl, lo - 50), &[]);

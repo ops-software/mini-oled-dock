@@ -70,7 +70,6 @@ pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
 pub const WM_DOCK_OPEN_SETTINGS: u32 = WM_APP + 40;
 /// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
 /// Consecutive posts may be coalesced: re-read `update::status()`.
-#[allow(dead_code)] // posted by `update::notify`; the UI side is wired by the Settings window
 pub const WM_DOCK_UPDATE: u32 = WM_APP + 17;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)

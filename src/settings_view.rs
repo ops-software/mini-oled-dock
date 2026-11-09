@@ -12,9 +12,6 @@
 //!
 //! Every pixel of the client is written (opaque config background), as `Surface::copy_to` needs.
 
-// The consumer (`settings_window`) lands in the next task.
-#![allow(dead_code)]
-
 use windows::Win32::Foundation::RECT;
 
 use crate::audio::VolumeState;
@@ -227,6 +224,7 @@ pub(crate) fn clamp_scroll(scroll: i32, content_h: i32, viewport_h: i32) -> i32 
 }
 
 /// Right end of `label` in `row`.
+#[cfg(test)]
 pub(crate) fn label_right(s: &Surface, row: &RECT, label: &str) -> i32 {
     row.left + s.metrics().px(TEXT_X) + s.text_width(label, Font::Normal)
 }
@@ -237,6 +235,7 @@ fn seg_widths(s: &Surface, options: &[&str]) -> Vec<i32> {
 }
 
 /// Left end of the segments of a choice right-aligned in `row`.
+#[cfg(test)]
 pub(crate) fn segments_left(s: &Surface, row: &RECT, options: &[&str]) -> i32 {
     row.right - s.metrics().px(CTL_INSET) - seg_widths(s, options).iter().sum::<i32>()
 }
@@ -988,6 +987,7 @@ pub(crate) fn mini_bar(m: Metrics, c: &Config, max_w: i32) -> Option<BarPixels> 
 
 /// The window as `--preview` shows it: a client of 860 x 600 logical px under a fake caption, with a
 /// 1 px border; navigation focus, nothing hovered.
+#[cfg(test)]
 pub(crate) fn preview_pixels(m: Metrics, page: Page, c: &Config, ctx: &Ctx<'_>) -> Option<(i32, i32, Vec<u32>)> {
     window_pixels(m, page, c, ctx, None, Focus::Nav, (860, 600))
 }
