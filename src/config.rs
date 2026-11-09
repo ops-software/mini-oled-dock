@@ -414,6 +414,13 @@ pub const MODULE_SIZE: SizeRange = SizeRange { min: 75, max: 150, default: 100 }
 /// Default opacity of the bar background (percent).
 pub const DEFAULT_BAR_OPACITY: u8 = 95;
 
+/// Smallest Settings window client area (logical px at 96 DPI).
+pub const SETTINGS_WINDOW_MIN: (i32, i32) = (640, 460);
+/// Default Settings window client area (logical px at 96 DPI).
+pub const SETTINGS_WINDOW_DEFAULT: (i32, i32) = (860, 600);
+/// Largest sane Settings window dimension; anything above is treated as corrupt.
+const SETTINGS_WINDOW_MAX: u16 = 16384;
+
 /// An app pinned to the dock.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
@@ -497,6 +504,8 @@ pub struct Config {
     pub background: Background,
     /// Opacity of the bar background in percent (0..=100; text and icons stay fully opaque).
     pub bar_opacity: u8,
+    /// Size of the Settings window in logical pixels (96 DPI), [width, height]. Use `settings_size`.
+    pub settings_window_size: [u16; 2],
     /// Clock picture for GetTimeFormatEx (default "HH:mm").
     pub time_format: String,
     /// If true and `time_format` has no "s", ":ss" is appended.
@@ -589,6 +598,7 @@ impl Default for Config {
             module_size: MODULE_SIZE.default,
             background: Background::BLACK,
             bar_opacity: DEFAULT_BAR_OPACITY,
+            settings_window_size: [SETTINGS_WINDOW_DEFAULT.0 as u16, SETTINGS_WINDOW_DEFAULT.1 as u16],
             time_format: "HH:mm".to_string(),
             show_seconds: false,
             date_format: "ddd d MMM".to_string(),
@@ -813,6 +823,10 @@ fn render(c: &Config) -> String {
   // bar still reacts to the mouse). Text and icons always stay fully opaque.
   "bar_opacity": {opacity},
 
+  // Size of the Settings window in logical pixels (96 DPI), [width, height]. Remembered when you
+  // resize it; at least [640, 460]; clamped to the display it opens on.
+  "settings_window_size": {settings_size},
+
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
   "autohide": {autohide},
 
@@ -961,6 +975,7 @@ fn render(c: &Config) -> String {
 "#,
         monitor = js(&c.monitor),
         opacity = c.bar_opacity.min(100),
+        settings_size = js(&c.settings_window_size),
         icon_size = c.app_icon_size,
         text_size = c.app_text_size,
         tray_size = c.tray_icon_size,
@@ -1263,6 +1278,20 @@ impl Config {
         (self.bar_opacity.min(100) as u32 * 255 + 50) / 100
     }
 
+    /// Settings window client size in logical px: a dimension that is 0 or above 16384 falls back to
+    /// its default, then the result is raised to the minimum.
+    pub fn settings_size(&self) -> (i32, i32) {
+        let dim = |v: u16, default: i32, min: i32| {
+            let v = if v == 0 || v > SETTINGS_WINDOW_MAX { default } else { v as i32 };
+            v.max(min)
+        };
+        let [w, h] = self.settings_window_size;
+        (
+            dim(w, SETTINGS_WINDOW_DEFAULT.0, SETTINGS_WINDOW_MIN.0),
+            dim(h, SETTINGS_WINDOW_DEFAULT.1, SETTINGS_WINDOW_MIN.1),
+        )
+    }
+
     /// The four sizes clamped to their ranges: (app icon px, app text px, tray icon px, module %).
     pub fn sizes(&self) -> (u8, u8, u8, u8) {
         (
@@ -1408,6 +1437,19 @@ mod tests {
     }
 
     #[test]
+    fn settings_window_size_defaults_and_clamps() {
+        let c = Config::default();
+        assert_eq!(c.settings_window_size, [860, 600]);
+        assert_eq!(c.settings_size(), (860, 600));
+        let r = render(&c);
+        assert!(r.contains("\"settings_window_size\": [860,600]"));
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(parse("{\"settings_window_size\": [100, 100]}").unwrap().settings_size(), (640, 460));
+        assert_eq!(parse("{\"settings_window_size\": [0, 20000]}").unwrap().settings_size(), (860, 600));
+        assert_eq!(parse("{}").unwrap().settings_window_size, [860, 600]);
+    }
+
+    #[test]
     fn template_roundtrip() {
         let mut c = Config::default();
         c.pinned.push(PinnedApp {
@@ -1427,6 +1469,7 @@ mod tests {
         c.module_size = 125;
         c.background = Background(0x2E1119);
         c.bar_opacity = 0;
+        c.settings_window_size = [1000, 700];
         c.window_previews = false;
         c.win_opens_start = true;
         c.language = Language::It;
