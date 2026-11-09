@@ -747,11 +747,16 @@ pub fn on_changed(h: HWND) {
         }
     }
     // An open power popup redraws its badge.
-    crate::popup::tick_soon(10);
+    if crate::popup::is_open() {
+        crate::popup::tick_soon(10);
+    }
 }
 
 /// A verified release waits for a quiet moment and the user asked for automatic installs.
 pub fn auto_install_pending() -> bool {
+    if !config::get().update_auto_install {
+        return false;
+    }
     let st = status();
     let tried = AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner());
     let fresh = st.available.as_ref().is_some_and(|a| *tried != a.tag);
@@ -772,9 +777,10 @@ pub fn on_idle(busy: bool) {
         return;
     }
     let Some(a) = st.available else { return };
-    *AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner()) = a.tag.clone();
-    crate::log!("update: auto-install {}", a.tag);
-    install_now();
+    if install_now() {
+        *AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner()) = a.tag.clone();
+        crate::log!("update: auto-install {}", a.tag);
+    }
 }
 
 #[cfg(test)]
