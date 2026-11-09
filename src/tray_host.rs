@@ -2141,6 +2141,7 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         &senders,
         own,
         elevated,
+        pid_at_most_medium,
         resolve_shared_atom,
         open_holder,
         |p: &HolderProcess| process_at_most_medium(p.0),
@@ -2168,7 +2169,9 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
 /// process holding it. The holder must not be the dock itself (allowed only while the dock is not elevated,
 /// i.e. a `DOCK_NO_MANIFEST=1` developer build; unknown elevation counts as elevated). When the message names
 /// sender windows (`senders`: the pids of `wParam` and of the APPBARDATA `hWnd`, windows of the dock left
-/// out), each must belong to the holder, and a window whose process is gone (pid 0) rejects. The holder
+/// out), each must be alive (pid != 0) and its process must run at most at medium (`sender_medium`; the
+/// holder's own windows are covered by the holder check). Like the real taskbar, a window of another
+/// process than the holder is allowed (shell window, frame host, helper). The holder
 /// process is opened once (`open`), and that
 /// same process handle is used for the integrity check (at most medium, `medium`) and for the duplication of
 /// its section handle with `DUPLICATE_SAME_ACCESS` (`dup`), so no right is added that the holder did not have;
@@ -2177,7 +2180,7 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
 /// `AllocationAttributes == SEC_COMMIT` and `MaximumSize == 0x1000`. Then that same duplicate is mapped
 /// (`map`, read/write, no more than granted) and its header must give a payload size in `0x28..=0xFF0`.
 /// Without any sender window (`ABM_GETTASKBARPOS` with a NULL `hWnd`, or the dock's own window) the holder
-/// cannot be tied to the sender and the holder rule alone applies; the dock then writes, for
+/// rule alone applies. In every case the dock writes, for
 /// `ABM_GETTASKBARPOS`, only `edge` (view bytes 0x1C..0x20) and `rc` (0x20..0x30), and for
 /// `ABM_QUERYPOS` / `ABM_SETPOS` Explorer's 0x28-byte APPBARDATA answer at 0x10..0x38, into a block whose
 /// holder had map-write access to it already. Pure: the Win32 steps are injected for tests.
@@ -2187,6 +2190,7 @@ fn appbar_gate<P, B>(
     senders: &[u32],
     own: u32,
     own_elevated: Option<bool>,
+    sender_medium: impl Fn(u32) -> bool,
     resolve: impl Fn(u64) -> Result<(u64, u32), String>,
     open: impl Fn(u32) -> Result<P, String>,
     medium: impl Fn(&P) -> bool,
@@ -2204,8 +2208,13 @@ fn appbar_gate<P, B>(
     if holder == own && own_elevated != Some(false) {
         return Err(fail("block held by the dock itself"));
     }
-    if let Some(s) = senders.iter().find(|&&s| s != holder) {
-        return Err(fail(&format!("sender window belongs to process {s}, not to the holder")));
+    for &s in senders {
+        if s == 0 {
+            return Err(fail("sender window's process is gone"));
+        }
+        if s != holder && !sender_medium(s) {
+            return Err(fail(&format!("sender window's process {s} runs above medium integrity or cannot be checked")));
+        }
     }
     let p = open(holder).map_err(|e| fail(&e))?;
     if holder != own && !medium(&p) {
@@ -2861,23 +2870,30 @@ mod tests {
         const OTHER: u32 = 9000;
         // The "process handle" of the tests is the pid itself.
         let medium = |p: &u32| *p != 0 && *p != ELEV;
+        let sender_medium = |p: u32| p != 0 && p != ELEV;
         let good = SharedBlock { granted: 0x000F_001F, is_section: true, attrs: SEC_COMMIT, size: APPBAR_SECTION_SIZE };
         let rights = |granted: u32| SharedBlock { granted, ..good };
         // (holder, dock elevated, sender window pids, section, None = accept / Some(reason))
-        let rows: [(u32, bool, &[u32], SharedBlock, Option<&str>); 19] = [
+        let rows: [(u32, bool, &[u32], SharedBlock, Option<&str>); 24] = [
             (OWN, true, &[], good, Some("held by the dock itself")),
             (OWN, true, &[APP], good, Some("held by the dock itself")),
-            (OWN, false, &[], good, None), // unelevated developer build (DOCK_NO_MANIFEST=1)
+            // Unelevated developer build (DOCK_NO_MANIFEST=1): shell32 makes the dock the holder.
+            (OWN, false, &[], good, None),
+            (OWN, false, &[APP], good, None),
+            (OWN, false, &[ELEV], good, Some("sender window's process 666 runs above medium")),
             (ELEV, true, &[], good, Some("above medium")),
             (ELEV, true, &[ELEV], good, Some("above medium")),
             // No sender window: the holder rule alone.
             (APP, true, &[], good, None),
-            // Sender known: the holder must be that window's process.
+            // Sender known: alive and at most medium; it need not be the holder (shell window, frame host).
             (APP, true, &[APP], good, None),
             (APP, true, &[APP, APP], good, None),
-            (APP, true, &[OTHER], good, Some("belongs to process 9000, not to the holder")),
-            (APP, true, &[APP, OTHER], good, Some("belongs to process 9000, not to the holder")),
-            (APP, true, &[0], good, Some("belongs to process 0, not to the holder")),
+            (APP, true, &[OTHER], good, None),
+            (APP, true, &[APP, OTHER], good, None),
+            (APP, true, &[0], good, Some("sender window's process is gone")),
+            (APP, true, &[APP, 0], good, Some("sender window's process is gone")),
+            (APP, true, &[ELEV], good, Some("sender window's process 666 runs above medium")),
+            (APP, true, &[OTHER, ELEV], good, Some("sender window's process 666 runs above medium")),
             // Only the access the holder's own handle was granted counts.
             (APP, true, &[], rights(SECTION_NEEDED), None),
             (APP, true, &[], rights(SECTION_QUERY.0 | SECTION_MAP_READ.0), Some("lacks query, map-read or map-write")),
@@ -2897,6 +2913,7 @@ mod tests {
                     senders,
                     OWN,
                     Some(elevated),
+                    sender_medium,
                     |s| {
                         assert_eq!(s, 0x1234, "the value received is resolved, and only once");
                         Ok((0x9B0, holder))
@@ -2928,7 +2945,7 @@ mod tests {
                         let pids = text.contains("claimed pid 100") && text.contains(&format!("holder pid {holder}"));
                         assert!(pids, "{text}");
                         assert_eq!(maps.get(), 0, "{row}: rejected blocks are never mapped");
-                        let early = why.contains("dock itself") || why.contains("not to the holder");
+                        let early = why.contains("dock itself") || why.contains("sender window");
                         assert_eq!(opens.get(), usize::from(!early), "{row}: holder process opened only when needed");
                         let pre_dup = early || why.contains("medium");
                         assert_eq!(dups.get(), usize::from(!pre_dup), "{row}: integrity checked before duplicating");
@@ -2941,7 +2958,8 @@ mod tests {
         // Elevation unknown (token unreadable) + block held by the dock: rejected like an elevated dock.
         let never = |_: u32| -> Result<u32, String> { panic!("the holder is not opened") };
         let dock_block = |_: u64| Ok((0x9B0, OWN));
-        let text = appbar_gate(&m, &[], OWN, None, dock_block, never, medium, |_, _| Ok((7u8, good)), |b| Ok(b));
+        let text =
+            appbar_gate(&m, &[], OWN, None, sender_medium, dock_block, never, medium, |_, _| Ok((7u8, good)), |b| Ok(b));
         assert!(text.is_err_and(|t| t.contains("held by the dock itself")), "unknown elevation fails closed");
         let ok_resolve = |_: u64| Ok((0x9B0, APP));
         let ok_open = |p: u32| Ok(p);
@@ -2951,7 +2969,7 @@ mod tests {
                     open: &dyn Fn(u32) -> Result<u32, String>,
                     dup: &dyn Fn(&u32, u64) -> Result<(u8, SharedBlock), String>,
                     map: &dyn Fn(u8) -> Result<u8, String>| {
-            appbar_gate(&m, &[], OWN, Some(true), resolve, open, medium, dup, map).unwrap_err()
+            appbar_gate(&m, &[], OWN, Some(true), sender_medium, resolve, open, medium, dup, map).unwrap_err()
         };
         let text = gate(&|_| Err("no atom".into()), &ok_open, &ok_dup, &ok_map);
         assert!(text.contains("holder pid -") && text.contains("no atom"), "{text}");
@@ -3058,10 +3076,11 @@ mod tests {
                 Some(HWND_MESSAGE), None, None, None)
         }
         .expect("message-only window");
-        // (wParam, sender tied to the holder): no window, the holder's own window, another process's window.
+        // (wParam, sender allowed): no window, the holder's own window, another process's window (allowed when
+        // that process runs at most at medium, as Explorer normally does).
         let mut wps = vec![(WPARAM(0), true), (WPARAM(mine.0 as usize), true)];
         match shell_window() {
-            Some((wp, _)) => wps.push((wp, false)),
+            Some((wp, pid)) => wps.push((wp, pid_at_most_medium(pid))),
             None => eprintln!("no shell window: a sender window of another process not exercised"),
         }
         let sentinel = AppBarData32 { cb_size: 0x28, hwnd: 0x10, callback: 0x20, edge: 0xEE, rc: [-7; 4], lparam: 9 };
@@ -3075,7 +3094,7 @@ mod tests {
             (0x2000, COMMIT, Some(0x28), false, false),
             (0x1000, SEC_RESERVE, None, false, false),
         ];
-        for (wp, tied) in wps {
+        for (wp, allowed) in wps {
             for (size, flags, header, accepted, mapped) in cases {
                 let row = format!("size {size:#X}, flags {:#X}, header {header:?}, wp {:#X}", flags.0, wp.0);
                 let h = own_section(size, flags);
@@ -3094,8 +3113,8 @@ mod tests {
                 let maps = SENDER_MAPS.with(|c| c.get());
                 let bytes = appbar_bytes(&AppBarMsg { shared: u64::from(atom), ..crafted(ABM_GETTASKBARPOS, own) });
                 let ret = handle_appbar(wp, LPARAM(0), &bytes).0;
-                assert_eq!(ret, isize::from(accepted && holder_ok && tied), "{row}");
-                assert_eq!(SENDER_MAPS.with(|c| c.get()) - maps, usize::from(mapped && holder_ok && tied), "{row}");
+                assert_eq!(ret, isize::from(accepted && holder_ok && allowed), "{row}");
+                assert_eq!(SENDER_MAPS.with(|c| c.get()) - maps, usize::from(mapped && holder_ok && allowed), "{row}");
                 if header.is_some() {
                     // SAFETY: as above.
                     let got = unsafe { p.add(BLOCK_HEADER).cast::<AppBarData32>().read() };
