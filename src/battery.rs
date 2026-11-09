@@ -103,11 +103,23 @@ pub enum Tint {
     Critical,
 }
 
-/// Reads the system power status. `None` only if the call fails.
+/// True when Windows does not know the battery status right now (flag 255, or percent 255 without
+/// the "no system battery" bit 128), as some firmware reports for a moment after resume or during
+/// calibration. Not the same as "no battery" (bit 128 alone; 255 has that bit set too, so it is
+/// checked first).
+pub fn raw_unknown(flag: u8, percent: u8) -> bool {
+    flag == 255 || (flag & 128 == 0 && percent > 100)
+}
+
+/// Reads the system power status. `None` if the call fails or the status is unknown right now
+/// (`raw_unknown`): the caller keeps its last reading instead of dropping the battery.
 pub fn query() -> Option<BatteryStatus> {
     let mut s = SYSTEM_POWER_STATUS::default();
     // SAFETY: `s` is a valid, writable SYSTEM_POWER_STATUS for the duration of the call.
     unsafe { GetSystemPowerStatus(&mut s) }.ok()?;
+    if raw_unknown(s.BatteryFlag, s.BatteryLifePercent) {
+        return None;
+    }
     Some(BatteryStatus::from_raw(s.ACLineStatus, s.BatteryFlag, s.BatteryLifePercent, s.BatteryLifeTime))
 }
 
@@ -173,6 +185,14 @@ mod tests {
         assert_eq!((b.present, b.percent, b.ac, b.charging, b.seconds_left), (true, 64, false, false, Some(11520)));
         assert_eq!(BatteryStatus::from_raw(0, 1, 64, u32::MAX).seconds_left, None); // time unknown
         assert_eq!(BatteryStatus::from_raw(1, 9, 80, 5000).seconds_left, None); // no estimate while plugged in
+    }
+
+    #[test]
+    fn unknown_is_not_absent() {
+        assert!(raw_unknown(255, 255)); // status unknown
+        assert!(raw_unknown(1, 255)); // percent unknown
+        assert!(!raw_unknown(128, 255)); // desktop: "no system battery" is a real answer
+        assert!(!raw_unknown(1, 64) && !raw_unknown(9, 100));
     }
 
     #[test]

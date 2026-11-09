@@ -3043,7 +3043,8 @@ fn arm_clock(h: HWND) {
 const BATTERY_POLL_MS: u32 = 30_000;
 
 /// The battery status to store: `Off` clears it (sample not taken); a hidden bar takes no sample and
-/// keeps the last value; otherwise a fresh sample (`None` = unreadable = no battery).
+/// keeps the last value; otherwise a fresh sample (`None` = unreadable or unknown right now: the last
+/// value is kept, so a brief "unknown" from the firmware neither drops the module nor stops the polling).
 fn next_battery(
     show: config::BatteryShow,
     visible: bool,
@@ -3056,7 +3057,7 @@ fn next_battery(
     } else if !visible {
         current
     } else {
-        sample().unwrap_or(BatteryStatus::NONE)
+        sample().unwrap_or(current)
     }
 }
 
@@ -3632,7 +3633,10 @@ mod tests {
         assert_eq!(next_battery(Off, false, b, boom), BatteryStatus::NONE); // ... and nothing is sampled
         assert_eq!(next_battery(Auto, false, b, boom), b); // bar hidden: no sample, last value kept
         assert_eq!(next_battery(Auto, true, BatteryStatus::NONE, || Some(b)), b);
-        assert_eq!(next_battery(On, true, b, || None), BatteryStatus::NONE); // failed sample: no battery
+        assert_eq!(next_battery(On, true, b, || None), b); // failed or unknown sample: last value kept
+        assert!(next_battery(Auto, true, b, || None).present); // ... so the module and its timer stay
+        assert_eq!(next_battery(Auto, true, BatteryStatus::NONE, || None), BatteryStatus::NONE); // desktop stays empty
+        assert_eq!(next_battery(Auto, true, b, || Some(BatteryStatus::NONE)), BatteryStatus::NONE); // battery removed
     }
 
     #[test]
