@@ -262,6 +262,9 @@ pub(crate) trait Content {
     /// Computes (and caches) the layout given the surface's metrics/fonts; returns the
     /// desired size (physical px).
     fn size(&mut self, s: &Surface) -> (i32, i32);
+    /// Largest size (physical px) the popup may take: the work area minus the margins. Contents with a
+    /// long list lay themselves out inside it; the others are only clipped by `fit_to_work`.
+    fn limit(&mut self, _max: (i32, i32)) {}
     /// Draws everything (panel included).
     fn paint(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>);
     /// Control under the point.
@@ -823,6 +826,17 @@ pub(crate) fn work_area(bar: &RECT) -> RECT {
     crate::ui::monitor_info(mon).map_or(*bar, |mi| mi.rcWork)
 }
 
+/// `w` x `h` capped to the work area minus `margin` on each side (never below 1 px).
+pub(crate) fn fit_to_work(w: i32, h: i32, work: &RECT, margin: i32) -> (i32, i32) {
+    (w.min(work.right - work.left - 2 * margin).max(1), h.min(work.bottom - work.top - 2 * margin).max(1))
+}
+
+/// Largest popup size for the monitor of `a`.
+pub(crate) fn max_size(a: &Anchor) -> (i32, i32) {
+    let margin = Metrics { dpi: a.dpi }.px(POPUP_SCREEN_MARGIN);
+    fit_to_work(i32::MAX, i32::MAX, &work_area(&a.bar), margin)
+}
+
 /// Top-left corner position of a `w` x `h` popup (also used by the window picker).
 pub(crate) fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
     let m = Metrics { dpi: a.dpi };
@@ -969,7 +983,10 @@ fn render(relayout: bool) -> bool {
         let mut surf = o.surf.take()?;
         // A previous failed resize leaves the surface without a DIB (0 x 0): retry the layout.
         if relayout || surf.size() == (0, 0) {
+            o.content.limit(max_size(&o.anchor));
             let (w, h) = o.content.size(&surf);
+            let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
+            let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
             if let Err(e) = surf.resize(w.max(1), h.max(1)) {
                 log!("popup: resize failed: {e}");
                 // The surface goes back into the state: the next render retries instead of staying
@@ -1510,4 +1527,24 @@ pub(crate) fn launch(target: &str) {
 /// Monotonic milliseconds (for deadlines and content throttling).
 pub(crate) fn tick_ms() -> u64 {
     now_ms()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_is_clamped_to_the_work_area() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(fit_to_work(1000, 600, &work, 16), (1000, 600), "fits: unchanged");
+        assert_eq!(fit_to_work(1280, 1240, &work, 16), (1280, 1008), "1080p at 200 %: 640x620 logical");
+        assert_eq!(fit_to_work(5000, 5000, &work, 16), (1888, 1008));
+        assert_eq!(fit_to_work(50, 50, &RECT { left: 0, top: 0, right: 40, bottom: 40 }, 16), (8, 8), "40 - 2 * 16");
+        assert_eq!(
+            fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 20, bottom: 20 }, 16),
+            (1, 1),
+            "20 - 32 < 0: never zero or negative"
+        );
+        assert_eq!(fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 10, bottom: 10 }, 16), (1, 1), "never zero");
+    }
 }

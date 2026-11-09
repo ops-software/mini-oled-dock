@@ -62,6 +62,10 @@ pub(crate) struct TrayPopup {
     sep_y: i32,
     width: i32,
     empty_rc: Option<RECT>,
+    /// Largest height (physical px) the popup may take, set by `limit`.
+    max_h: i32,
+    /// Chooser rows shown at once (`chooser_rows`, set by `size`).
+    visible: usize,
 }
 
 /// Icons outside the bar: those that the last layout put behind the chevron (`Layout::tray_hidden`)
@@ -92,6 +96,11 @@ fn customize_rows() -> Vec<Row> {
     rows
 }
 
+/// Chooser rows that fit under `max_h` next to the `fixed_h` of everything else (1..=`MAX_ROWS`).
+fn chooser_rows(max_h: i32, fixed_h: i32, row_h: i32) -> usize {
+    ((max_h - fixed_h) / row_h.max(1)).clamp(1, MAX_ROWS as i32) as usize
+}
+
 /// Creates the content (initial state).
 pub(crate) fn new() -> Box<dyn Content> {
     Box::new(TrayPopup {
@@ -106,6 +115,8 @@ pub(crate) fn new() -> Box<dyn Content> {
         sep_y: 0,
         width: 0,
         empty_rc: None,
+        max_h: i32::MAX,
+        visible: MAX_ROWS,
     })
 }
 
@@ -123,12 +134,18 @@ pub(crate) fn new_chooser() -> Box<dyn Content> {
         sep_y: 0,
         width: 0,
         empty_rc: None,
+        max_h: i32::MAX,
+        visible: MAX_ROWS,
     })
 }
 
 impl Content for TrayPopup {
     fn kind(&self) -> PopupKind {
         PopupKind::TrayOverflow
+    }
+
+    fn limit(&mut self, max: (i32, i32)) {
+        self.max_h = max.1;
     }
 
     fn size(&mut self, s: &Surface) -> (i32, i32) {
@@ -141,8 +158,9 @@ impl Content for TrayPopup {
             let (w, row) = (m.px(264), m.px(34));
             self.width = w;
             let mut y = pad;
-            self.scroll = self.scroll.min(self.rows.len().saturating_sub(MAX_ROWS));
-            let end = self.rows.len().min(self.scroll + MAX_ROWS);
+            self.visible = chooser_rows(self.max_h, 2 * pad + 2 * m.px(4) + m.px(1) + m.px(32), row);
+            self.scroll = self.scroll.min(self.rows.len().saturating_sub(self.visible));
+            let end = self.rows.len().min(self.scroll + self.visible);
             for i in self.scroll..end {
                 self.hits.add(ROW_BASE + i as u32, rect_wh(pad, y, w - 2 * pad, row));
                 y += row;
@@ -274,7 +292,7 @@ impl Content for TrayPopup {
     }
 
     fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
-        let max = self.rows.len().saturating_sub(MAX_ROWS);
+        let max = self.rows.len().saturating_sub(self.visible);
         if !self.customize || max == 0 {
             return Reply::None;
         }
@@ -338,5 +356,20 @@ pub(crate) fn preview_new(
         sep_y: 0,
         width: 0,
         empty_rc: None,
+        max_h: i32::MAX,
+        visible: MAX_ROWS,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_chooser_rows_follow_the_cap() {
+        // 200 %: row 68, fixed part 16 + 18 + 64 + 16 = 114, 1080p work area minus margins 1008.
+        assert_eq!(chooser_rows(1008, 114, 68), 13);
+        assert_eq!(chooser_rows(i32::MAX, 114, 68), MAX_ROWS, "uncapped: today's 14 rows");
+        assert_eq!(chooser_rows(100, 114, 68), 1, "never zero");
+    }
 }
