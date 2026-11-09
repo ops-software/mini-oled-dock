@@ -3,22 +3,30 @@
 //! `status()` is the snapshot the UI reads; `check_now()` runs one check on a throwaway
 //! `update` thread (the UI thread never blocks on the network). Everything the worker learns is
 //! kept in `STATE` and mirrored into `config.json` (`last_update_check`, `update_available`).
-//! The download, install handoff and timer are added by later tasks.
+//! `stage()` downloads a release into the admin-only `<data>\update\<tag>\` folder and verifies it
+//! (SHA-256, then `--version`). The install handoff and timer are added by later tasks.
 
 // Wired into the dock by later tasks; until then some items are unused.
 #![allow(dead_code)]
 
+use std::io::Read;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{self, Config};
+use crate::datadir;
 use crate::msg::WM_DOCK_UPDATE;
 use crate::shell_thread::{self, ShellRequest};
 use crate::update_release::{
-    self, host_allowed, is_newer, parse_release, parse_tag, release_page_url, rfc3339_utc, Release, Version,
-    API_MAX_BYTES, LATEST_API_URL,
+    self, host_allowed, is_newer, parse_release, parse_sha256_file, parse_tag, release_page_url, rfc3339_utc,
+    version_output_matches, Asset, Release, Version, API_MAX_BYTES, EXE_ASSET, EXE_MAX_BYTES, LATEST_API_URL,
+    SHA_ASSET, SHA_MAX_BYTES,
 };
 use crate::winhttp;
 
@@ -283,6 +291,184 @@ pub fn open_release_page() {
     shell_thread::request(ShellRequest::Launch { target: url, args: None });
 }
 
+#[derive(Debug)]
+pub(crate) enum StageError {
+    /// Nothing (or only part) is staged, or the download failed: the folder is kept for a retry.
+    Download(String),
+    /// The staged files are complete but wrong: the folder has been deleted.
+    Verify(String),
+}
+
+impl std::fmt::Display for StageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StageError::Download(e) => write!(f, "download failed: {e}"),
+            StageError::Verify(e) => write!(f, "failed verification: {e}"),
+        }
+    }
+}
+
+/// Largest `--version` output read back from a staged exe.
+const CAPTURE_MAX_BYTES: u64 = 4096;
+/// How long a staged exe may take to answer `--version`.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `exe` must hash to the value published in the release's `.sha256` asset.
+pub(crate) fn verify_bytes(exe: &[u8], sha_file: &[u8]) -> Result<(), String> {
+    let want = parse_sha256_file(sha_file).ok_or("unreadable .sha256 file")?;
+    let got = crate::sha256::sha256(exe)?;
+    if got == want {
+        Ok(())
+    } else {
+        Err("SHA-256 mismatch".into())
+    }
+}
+
+/// Runs `exe args` without a window and returns its exit code and stdout (at most 4 KB). A child
+/// that does not exit within `timeout` is killed and reported as `Err("timeout")`.
+pub(crate) fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<(i32, Vec<u8>), String> {
+    let mut child = std::process::Command::new(exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    let t = Instant::now();
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.code().unwrap_or(-1),
+            Ok(None) => {
+                if t.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("timeout".into());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for {} failed: {e}", exe.display()));
+            }
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(CAPTURE_MAX_BYTES)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("reading the output of {}: {e}", exe.display()))?;
+    }
+    Ok((code, out))
+}
+
+/// Downloads `dock.exe` and `dock.exe.sha256` of `rel` into `<data>\update\<tag>\`. Each asset must
+/// come back with 200, from an allowed host, at exactly the size the release JSON announced.
+fn download(rel: &Release) -> Result<(), StageError> {
+    let fail = StageError::Download;
+    for (asset, name, cap) in [(&rel.exe, EXE_ASSET, EXE_MAX_BYTES), (&rel.sha256, SHA_ASSET, SHA_MAX_BYTES)] {
+        let Asset { url, size } = asset;
+        let resp = winhttp::get(url, &[("Accept", "application/octet-stream")], cap)
+            .map_err(|e| fail(format!("{name}: {e}")))?;
+        if resp.status != 200 {
+            return Err(fail(format!("{name}: HTTP {}", resp.status)));
+        }
+        if !winhttp::split_https_url(&resp.final_url).is_some_and(|(h, _)| host_allowed(&h)) {
+            return Err(fail(format!("{name}: unexpected host")));
+        }
+        if resp.body.len() as u64 != *size {
+            return Err(fail(format!("{name}: {} bytes, expected {size}", resp.body.len())));
+        }
+        datadir::update_stage_dir(&rel.tag).map_err(fail)?;
+        datadir::write_stage_file(&rel.tag, name, &resp.body).map_err(|e| fail(format!("{name}: {e}")))?;
+        // `resp` (and its body) is dropped here, before the next asset is fetched.
+    }
+    crate::log!("update: {} downloaded", rel.tag);
+    Ok(())
+}
+
+/// Checks the staged `<data>\update\<tag>\dock.exe` and returns its path: hash equal to the staged
+/// `.sha256`, then `dock.exe --version` must print exactly `mini-oled-dock <tag version>`.
+///
+/// Running the staged exe for `--version` is safe: its SHA-256 matched the `.sha256` of the same
+/// release, both fetched over HTTPS from the allowed GitHub hosts; `datadir` has checked that the
+/// folder is admin-only and not a reparse point and that the file is a single-link regular file
+/// inside it; the folder was created by this elevated process, so no user can swap the file after
+/// the check.
+///
+/// A missing file is `Download` (the caller downloads); any other failure deletes the folder and
+/// is `Verify`.
+pub(crate) fn verify_stage(tag: &str) -> Result<PathBuf, StageError> {
+    let Some(version) = parse_tag(tag) else {
+        return Err(StageError::Verify(format!("{tag:?} is not a canonical tag")));
+    };
+    let read = |name: &str, cap: u64| datadir::read_stage_file(tag, name, cap);
+    let files = match (read(EXE_ASSET, EXE_MAX_BYTES), read(SHA_ASSET, SHA_MAX_BYTES)) {
+        (Ok(exe), Ok(sha)) => Ok((exe, sha)),
+        (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StageError::Download(format!("not staged: {e}")));
+        }
+        (Err(e), _) | (_, Err(e)) => Err(format!("cannot read the staged files: {e}")),
+    };
+    let checked = files.and_then(|(exe, sha)| {
+        verify_bytes(&exe, &sha)?;
+        drop(exe);
+        let path = datadir::checked_stage_path(tag, EXE_ASSET).map_err(|e| format!("staged exe: {e}"))?;
+        let (code, out) = run_capture(&path, &["--version"], VERSION_TIMEOUT)?;
+        if code != 0 {
+            return Err(format!("--version exited with {code}"));
+        }
+        if !version_output_matches(&out, version) {
+            return Err(format!("--version printed {:?}", String::from_utf8_lossy(&out).trim()));
+        }
+        Ok(path)
+    });
+    checked.map_err(|why| {
+        crate::log!("update: {tag} failed verification: {why}");
+        if let Err(e) = datadir::remove_update_stage(tag) {
+            crate::log!("update: cannot remove the stage {tag}: {e}");
+        }
+        StageError::Verify(why)
+    })
+}
+
+fn set_phase(phase: Phase) {
+    with_state(|s| s.phase = phase);
+    notify();
+}
+
+/// Reuses a stage of `rel` that verifies, else downloads and verifies it. Returns the path of the
+/// verified staged `dock.exe`. The only place that sets `UpdateStatus.staged = true` and the
+/// `Ready` / `DownloadFailed` / `VerifyFailed` outcomes.
+fn stage(rel: &Release) -> Result<PathBuf, StageError> {
+    set_phase(Phase::Verifying);
+    let mut r = verify_stage(&rel.tag);
+    if matches!(r, Err(StageError::Download(_))) {
+        set_phase(Phase::Downloading);
+        r = download(rel).and_then(|()| {
+            set_phase(Phase::Verifying);
+            verify_stage(&rel.tag)
+        });
+    }
+    match &r {
+        Ok(p) => crate::log!("update: {} staged at {}", rel.tag, p.display()),
+        Err(e) => crate::log!("update: {} not staged ({e})", rel.tag),
+    }
+    with_state(|s| {
+        s.phase = Phase::Idle;
+        s.staged = r.is_ok();
+        s.outcome = match &r {
+            Ok(_) => Outcome::Ready,
+            Err(StageError::Download(_)) => Outcome::DownloadFailed,
+            Err(StageError::Verify(_)) => Outcome::VerifyFailed,
+        };
+    });
+    notify();
+    r
+}
+
 /// `--update-check`: one synchronous check, no config write. Exit 0 = answered, 1 = could not check.
 pub fn run_check_cli() -> i32 {
     let cur = Version::current();
@@ -344,5 +530,28 @@ mod tests {
         let same = Release { tag: "v1.4.0".into(), version: cur, ..rel };
         apply_check(&mut s, &Ok(same), cur, 1_794_300_000);
         assert_eq!((s.outcome.clone(), s.badge()), (Outcome::UpToDate, 0));
+    }
+
+    #[test]
+    fn verify_bytes_compares_the_published_hash() {
+        let sha = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  dock.exe\r\n";
+        assert!(verify_bytes(b"abc", sha).is_ok());
+        assert!(verify_bytes(b"abd", sha).is_err());
+        assert!(verify_bytes(b"abc", b"not a hash").is_err());
+    }
+
+    fn system32(exe: &str) -> PathBuf {
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join(exe)
+    }
+
+    #[test]
+    fn run_capture_reads_stdout_and_times_out() {
+        let (code, out) =
+            run_capture(&system32("cmd.exe"), &["/c", "echo mini-oled-dock 1.4.1"], Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 0);
+        assert!(crate::update_release::version_output_matches(&out, Version::parse("1.4.1").unwrap()));
+        let t = Instant::now();
+        assert!(run_capture(&system32("ping.exe"), &["-n", "6", "127.0.0.1"], Duration::from_millis(300)).is_err());
+        assert!(t.elapsed() < Duration::from_secs(3)); // killed, not waited for
     }
 }
