@@ -97,10 +97,27 @@ pub(crate) struct PowerPopup {
     autostart: Arc<AtomicU8>,
     /// Last state seen by `tick` (to redraw only when it changes).
     seen: u8,
+    /// Update badge of the Settings row (`update::status().badge()`), re-read by `tick`.
+    badge: u32,
+    /// Preview only: a fixed badge that `tick` never overwrites.
+    forced_badge: Option<u32>,
+}
+
+/// Text of the update badge on the Settings row: nothing for 0, the count, "9+" above 9.
+pub(crate) fn settings_badge(count: u32) -> Option<String> {
+    match count {
+        0 => None,
+        1..=9 => Some(count.to_string()),
+        _ => Some("9+".to_string()),
+    }
 }
 
 /// Creates the content (initial state).
 pub(crate) fn new() -> Box<dyn Content> {
+    build(None)
+}
+
+fn build(forced_badge: Option<u32>) -> Box<dyn Content> {
     let autostart = Arc::new(AtomicU8::new(AS_UNKNOWN));
     // The schtasks.exe query can take hundreds of ms: keep it off the UI thread.
     let a = Arc::clone(&autostart);
@@ -119,7 +136,14 @@ pub(crate) fn new() -> Box<dyn Content> {
         width: 0,
         autostart,
         seen: AS_UNKNOWN,
+        badge: forced_badge.unwrap_or_else(|| crate::update::status().badge()),
+        forced_badge,
     })
+}
+
+/// Preview: the popup with a fixed update badge.
+pub(crate) fn preview_with_badge(count: u32) -> Box<dyn Content> {
+    build(Some(count))
 }
 
 /// Label of item `id` in the dock language.
@@ -181,7 +205,20 @@ impl Content for PowerPopup {
             s.text(txt, rc.left + self.pad_text + icon + m.px(8), y, font, WHITE, lift(alpha, h));
             if id == ID_SETTINGS {
                 let cw = s.text_width("\u{203A}", font);
-                s.text("\u{203A}", rc.right - self.pad_text - cw, y, font, WHITE, lift(TEXT3_ALPHA, h));
+                let cx = rc.right - self.pad_text - cw;
+                s.text("\u{203A}", cx, y, font, WHITE, lift(TEXT3_ALPHA, h));
+                if let Some(text) = settings_badge(self.badge) {
+                    // Orange dot that carries the count, right-aligned before the chevron.
+                    let m = s.metrics();
+                    let tw = s.text_width(&text, Font::Small);
+                    let (bh, gap) = (m.px(16), m.px(6));
+                    let bw = bh.max(tw + m.px(8));
+                    let left = cx - gap - bw;
+                    let top = rc.top + ((rc.bottom - rc.top) - bh) / 2;
+                    s.fill_rr(rect_wh(left, top, bw, bh), m.px(8), crate::render::ATTENTION_RGB, 255);
+                    let ty = center_y(&rect_wh(left, top, bw, bh), s.line_height(Font::Small));
+                    s.text(&text, left + (bw - tw) / 2, ty, Font::Small, WHITE, TEXT_ALPHA);
+                }
             }
             if id == ID_AUTOSTART {
                 let st = self.autostart.load(SeqCst);
@@ -202,8 +239,10 @@ impl Content for PowerPopup {
 
     fn tick(&mut self) -> Reply {
         let cur = self.autostart.load(SeqCst);
-        if cur != self.seen {
+        let badge = self.forced_badge.unwrap_or_else(|| crate::update::status().badge());
+        if cur != self.seen || badge != self.badge {
             self.seen = cur;
+            self.badge = badge;
             return Reply::Redraw;
         }
         Reply::None
@@ -263,5 +302,17 @@ impl PowerPopup {
             self.autostart.store(cur, SeqCst);
         }
         Reply::Redraw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_badge_text() {
+        assert_eq!(settings_badge(0), None);
+        assert_eq!(settings_badge(1).as_deref(), Some("1"));
+        assert_eq!(settings_badge(12).as_deref(), Some("9+"));
     }
 }

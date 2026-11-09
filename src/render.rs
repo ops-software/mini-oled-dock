@@ -99,7 +99,7 @@ const INDICATOR_EDGE: i32 = 2;
 /// Indicator height (logical px).
 const INDICATOR_H: i32 = 2;
 /// Colour of the attention indicator (a window asked for attention): the only colour in the UI.
-const ATTENTION_RGB: (u32, u32, u32) = (255, 140, 0);
+pub(crate) const ATTENTION_RGB: (u32, u32, u32) = (255, 140, 0);
 /// Distance of the indicator from the icon's bottom edge with the bar at the top (logical px).
 const INDICATOR_BELOW_ICON: i32 = 2;
 /// Radius of the app icon placeholder (logical px).

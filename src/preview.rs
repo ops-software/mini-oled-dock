@@ -559,6 +559,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             ..Default::default()
         }),
         "popup_power" => crate::popup_power::new(),
+        "popup_power_update" => crate::popup_power::preview_with_badge(1),
         // No displays passed: no "Screen" row, whatever monitors this machine has.
         "popup_settings" => crate::popup_settings::preview_with_screens(Vec::new()),
         // Italian texts: the caller lifts the preview's forced English around this one.
@@ -820,6 +821,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_network", 0),
             ("popup_network_offline", 9),
             ("popup_power", 4),
+            ("popup_power_update", 4),
             ("popup_settings", 3),
             ("popup_settings_navy", 2),
             ("popup_settings_screen", 2),
