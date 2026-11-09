@@ -36,19 +36,19 @@ struct Cell {
     bitmap: Option<Arc<IconBitmap>>,
 }
 
-struct Row {
-    key: String,
-    name: String,
-    bitmap: Option<Arc<IconBitmap>>,
+pub(crate) struct TrayRow {
+    pub(crate) key: String,
+    pub(crate) name: String,
+    pub(crate) bitmap: Option<Arc<IconBitmap>>,
     /// true = visible in the bar (toggle on).
-    visible: bool,
+    pub(crate) visible: bool,
     /// true = visible and really in the bar (false if it did not fit the bar width).
-    in_bar: bool,
+    pub(crate) in_bar: bool,
 }
 
 pub(crate) struct TrayPopup {
     cells: Vec<Cell>,
-    rows: Vec<Row>,
+    rows: Vec<TrayRow>,
     /// First row shown of "Customize" (scrolling).
     scroll: usize,
     customize: bool,
@@ -80,11 +80,11 @@ fn overflow_cells() -> Vec<Cell> {
 }
 
 /// Rows of the "Customize" list: all tray apps, sorted by name.
-fn customize_rows() -> Vec<Row> {
+pub(crate) fn customize_rows() -> Vec<TrayRow> {
     let behind = crate::ui::tray_hidden_ids();
-    let mut rows: Vec<Row> = tray_host::snapshot_all()
+    let mut rows: Vec<TrayRow> = tray_host::snapshot_all()
         .into_iter()
-        .map(|v: TrayView| Row {
+        .map(|v: TrayView| TrayRow {
             key: v.key,
             name: v.name,
             bitmap: v.bitmap,
@@ -345,7 +345,7 @@ pub(crate) fn preview_new(
         cells: cells.into_iter().map(|(id, bitmap)| Cell { id, bitmap }).collect(),
         rows: rows
             .into_iter()
-            .map(|(key, name, bitmap, visible)| Row { key, name, bitmap, visible, in_bar: true })
+            .map(|(key, name, bitmap, visible)| TrayRow { key, name, bitmap, visible, in_bar: true })
             .collect(),
         scroll: 0,
         customize,
