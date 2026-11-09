@@ -66,6 +66,7 @@ mod surface;
 mod taskbar;
 mod tray_host;
 mod ui;
+mod update_release;
 mod watchdog;
 
 use std::cell::RefCell;
