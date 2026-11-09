@@ -182,9 +182,12 @@ enum Repair {
     Skip,
 }
 
-/// What the watchdog does given the tracked `WIN_DOWN` and the physical state of the Win keys.
-fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool) -> Repair {
-    match (win_down, lwin_pressed || rwin_pressed) {
+/// What the watchdog does given the tracked `WIN_DOWN`, the async state of the Win keys and whether the
+/// press is stale (no Win event, auto-repeat included, for more than `REPEAT_WINDOW_MS`).
+/// The async state alone is not trusted: a Win-down our hook swallowed never reaches it, so a Win held
+/// alone reads as "up". Only a press that is both unseen by the async state and stale is cleared.
+fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool, press_stale: bool) -> Repair {
+    match (win_down, lwin_pressed || rwin_pressed || !press_stale) {
         (false, _) => Repair::Go,
         (true, true) => Repair::Skip,
         (true, false) => Repair::ClearThenGo,
@@ -194,16 +197,19 @@ fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool) -> Repair
 /// Watchdog (run on the hook thread): Windows silently removes an LL hook that exceeds
 /// LowLevelHooksTimeout several times. We ALWAYS reinstall (first the new one, then remove the
 /// old one: no instant without a hook). The Win state is in a static, so it survives. It is
-/// skipped if Win is physically held, so as not to touch the hook in the middle of a combination;
-/// if `WIN_DOWN` is set but neither Win key is down (Win+L: the release went to the secure
-/// desktop) the stale state is cleared first.
+/// skipped while Win is held, so as not to touch the hook in the middle of a combination. "Held" is
+/// judged from the async key state AND the age of the last Win event, because a Win-down our hook
+/// swallowed never reaches the async state. If `WIN_DOWN` is set, no Win key is down and the press
+/// is stale (Win+L: the release went to the secure desktop), the stale state is cleared first.
 fn reinstall() {
     if HOOK_RAW.load(Relaxed) == 0 {
         return;
     }
     // SAFETY: GetAsyncKeyState has no preconditions; the high bit (negative) means "down".
     let (l, r) = unsafe { (GetAsyncKeyState(VK_LWIN.0 as i32) < 0, GetAsyncKeyState(VK_RWIN.0 as i32) < 0) };
-    match repair_plan(WIN_DOWN.load(Relaxed), l, r) {
+    // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
+    let stale = unsafe { GetTickCount() }.wrapping_sub(WIN_LAST_TIME.load(Relaxed)) > REPEAT_WINDOW_MS;
+    match repair_plan(WIN_DOWN.load(Relaxed), l, r, stale) {
         Repair::Skip => return,
         Repair::ClearThenGo => {
             WIN_DOWN.store(false, Relaxed);
@@ -451,10 +457,11 @@ mod tests {
     #[test]
     fn watchdog_repairs_a_stale_win_state() {
         use Repair::*;
-        assert_eq!(repair_plan(false, false, false), Go);
-        assert_eq!(repair_plan(false, true, false), Go, "not tracked as held: nothing to protect");
-        assert_eq!(repair_plan(true, true, false), Skip, "Win really held: do not touch the hook mid-combination");
-        assert_eq!(repair_plan(true, false, true), Skip);
-        assert_eq!(repair_plan(true, false, false), ClearThenGo, "Win+L left WIN_DOWN stuck");
+        assert_eq!(repair_plan(false, false, false, false), Go);
+        assert_eq!(repair_plan(false, true, false, true), Go, "not tracked as held: nothing to protect");
+        assert_eq!(repair_plan(true, true, false, true), Skip, "Win really held: do not touch the hook mid-combination");
+        assert_eq!(repair_plan(true, false, true, true), Skip);
+        assert_eq!(repair_plan(true, false, false, false), Skip, "swallowed Win-down never reaches async state");
+        assert_eq!(repair_plan(true, false, false, true), ClearThenGo, "Win+L left WIN_DOWN stuck");
     }
 }
