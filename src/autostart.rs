@@ -27,6 +27,8 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use windows::core::HSTRING;
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Threading::{GetCurrentProcessId, CREATE_NO_WINDOW};
@@ -38,9 +40,68 @@ use crate::log;
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_BAD_ARGS: i32 = 2;
-/// The old instance could not be stopped (used by the installer rework).
-#[allow(dead_code)]
+/// The old instance (or its watchdog) did not release the installed exe in time.
 pub const EXIT_STOP_FAILED: i32 = 3;
+
+/// What `copy_self` did with the installed exe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyOutcome {
+    /// This process already runs from the installed copy: nothing to copy.
+    AlreadyInstalled,
+    Copied,
+    /// The installed exe (if any) is unchanged.
+    Failed,
+}
+
+/// Why an install did not complete.
+#[derive(Debug)]
+pub(crate) enum InstallError {
+    Failed(String),
+    /// The running dock or its watchdog kept the exe past `STOP_WAIT`.
+    CouldNotStop(String),
+}
+
+impl InstallError {
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            InstallError::Failed(_) => EXIT_FAILED,
+            InstallError::CouldNotStop(_) => EXIT_STOP_FAILED,
+        }
+    }
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallError::Failed(m) | InstallError::CouldNotStop(m) => f.write_str(m),
+        }
+    }
+}
+
+/// Result of `enable`: the copy and the first error, if any (the copy may succeed and the task fail).
+#[derive(Debug)]
+pub(crate) struct InstallReport {
+    pub copy: CopyOutcome,
+    /// The stop event of a running dock was signalled.
+    pub stop_signalled: bool,
+    pub error: Option<InstallError>,
+}
+
+impl InstallReport {
+    fn failed(error: InstallError) -> Self {
+        InstallReport { copy: CopyOutcome::Failed, stop_signalled: false, error: Some(error) }
+    }
+
+    pub(crate) fn exit_code(&self) -> i32 {
+        self.error.as_ref().map_or(EXIT_OK, InstallError::exit_code)
+    }
+}
+
+/// Whether `--install` starts the installed exe at the end. Pure. It always does, unless
+/// `--no-relaunch` or a dock is still running (re-run over itself, or it could not be stopped).
+pub(crate) fn should_relaunch(still_running: bool, no_relaunch: bool) -> bool {
+    !still_running && !no_relaunch
+}
 
 /// Name of the task in the scheduler.
 const TASK_NAME: &str = "Dock";
@@ -281,7 +342,23 @@ fn exe_in_use_by_other(dest: &Path) -> bool {
         .any(|path| same_file(Path::new(&path), dest))
 }
 
-/// Retry loop of `copy_self`, with the copy (sleep included), the `(instance_up, exe_in_use)` check
+/// `<dir>\dock.exe.new`: the new exe is copied here, then renamed over `dest`. Pure.
+fn staging_path(dest: &Path) -> PathBuf {
+    let mut s = dest.as_os_str().to_os_string();
+    s.push(".new");
+    PathBuf::from(s)
+}
+
+/// Renames `src` over `dest` in one step (`MoveFileExW`, same volume). `dest` is never written in
+/// place: a running image (opened without delete sharing) makes the rename fail and stays intact.
+fn replace_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let (s, d) = (HSTRING::from(src.as_os_str()), HSTRING::from(dest.as_os_str()));
+    // SAFETY: both strings are NUL-terminated and live for the call.
+    unsafe { MoveFileExW(&s, &d, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+}
+
+/// Retry loop of `copy_self`, with the replace (sleep included), the `(instance_up, exe_in_use)` check
 /// and the clock passed in. `Err((old_alive, last copy error))` when it gives up.
 fn retry_copy(
     mut copy: impl FnMut() -> std::io::Result<()>,
@@ -300,61 +377,94 @@ fn retry_copy(
     }
 }
 
-/// Copies the current exe to `dest`. If the destination is locked and `allow_stop` is set, asks
-/// the running instance to exit (`signal_stop_to_instance`) and retries while `keep_waiting` says
-/// so: up to `STOP_WAIT` (35 s) while the old instance or its watchdog still runs the exe.
-/// Returns `true` if it had to stop an instance.
-fn copy_self(dest: &Path, allow_stop: bool) -> Result<bool, String> {
-    let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+/// Copies the current exe to `dest` through `dock.exe.new` and a rename (`dest` is never written in
+/// place). If the rename is refused and `allow_stop` is set, signals the running instance to exit
+/// (`signal_stop_to_instance`; with no instance, e.g. after a crash, its watchdog may still hold the
+/// exe) and retries while `keep_waiting` says so: up to `STOP_WAIT` (35 s) while the old instance or
+/// its watchdog still runs the exe. Never relaunches: `run_install_cli` decides that.
+fn copy_self(dest: &Path, allow_stop: bool) -> InstallReport {
+    let fail = |m: String| InstallReport::failed(InstallError::Failed(m));
+    let me = match std::env::current_exe() {
+        Ok(m) => m,
+        Err(e) => return fail(format!("current_exe: {e}")),
+    };
     if same_file(&me, dest) {
-        return Ok(false); // already running from the installed copy
+        // Already running from the installed copy.
+        return InstallReport { copy: CopyOutcome::AlreadyInstalled, stop_signalled: false, error: None };
     }
     if let Some(d) = dest.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("creating {}: {e}", d.display()))?;
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return fail(format!("creating {}: {e}", d.display()));
+        }
     }
-    let first = match std::fs::copy(&me, dest) {
-        Ok(_) => return Ok(false),
+    let new = staging_path(dest);
+    match std::fs::remove_file(&new) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return fail(format!("removing the stale {}: {e}", new.display()));
+        }
+        _ => {}
+    }
+    if let Err(e) = std::fs::copy(&me, &new) {
+        let _ = std::fs::remove_file(&new);
+        return fail(format!("copy to {} failed: {e}", new.display()));
+    }
+    let copied = |stop_signalled| InstallReport { copy: CopyOutcome::Copied, stop_signalled, error: None };
+    let first = match replace_file(&new, dest) {
+        Ok(()) => return copied(false),
         Err(e) => e,
     };
     if !allow_stop {
-        return Err(format!("copy to {} failed: {first}", dest.display()));
+        let _ = std::fs::remove_file(&new);
+        return fail(format!("replacing {} failed: {first}", dest.display()));
     }
-    log!("autostart: copy failed ({first}), asking the running instance to exit");
-    let stopped = crate::watchdog::signal_stop_to_instance();
-    if !stopped {
-        return Err(format!("copy to {} failed: {first}", dest.display()));
+    log!("autostart: replace failed ({first}), asking the running instance to exit");
+    let signalled = crate::watchdog::signal_stop_to_instance();
+    if !signalled {
+        log!("autostart: no running instance answered the stop event, waiting for its watchdog if any");
     }
     let t = Instant::now();
-    let copy = || {
+    let replace = || {
         std::thread::sleep(Duration::from_millis(250));
-        std::fs::copy(&me, dest).map(|_| ())
+        replace_file(&new, dest)
     };
     let check = || (crate::watchdog::instance_running(), exe_in_use_by_other(dest));
-    let Err((old_alive, last)) = retry_copy(copy, check, || t.elapsed()) else {
-        return Ok(true);
+    let Err((old_alive, last)) = retry_copy(replace, check, || t.elapsed()) else {
+        log!("autostart: {} replaced after {} ms", dest.display(), t.elapsed().as_millis());
+        return copied(signalled);
     };
-    // The instance was stopped but the copy did not succeed: restart the already installed version,
-    // so the user is not left without a dock.
-    if dest.exists() {
-        relaunch(dest);
-    }
-    let why = if old_alive {
-        format!("the old instance or its watchdog did not exit within {} s", STOP_WAIT.as_secs())
+    let _ = std::fs::remove_file(&new);
+    let error = if old_alive {
+        InstallError::CouldNotStop(format!(
+            "replacing {} failed: the old instance or its watchdog did not exit within {} s: {last}",
+            dest.display(),
+            STOP_WAIT.as_secs()
+        ))
     } else {
-        "the file is locked by something else".to_string()
+        InstallError::Failed(format!(
+            "replacing {} failed: the file is locked by something else: {last}",
+            dest.display()
+        ))
     };
-    Err(format!("copy to {} failed: {why}: {last}", dest.display()))
+    InstallReport { copy: CopyOutcome::Failed, stop_signalled: signalled, error: Some(error) }
 }
 
 /// Installs the exe copy and registers the task. `allow_stop`: may stop an instance that locks
 /// the destination (only from `--install`; the popup toggle must not close itself).
-/// Returns `true` if an instance was stopped.
-pub fn enable(allow_stop: bool) -> Result<bool, String> {
-    let dest = installed_exe()?;
-    let stopped = copy_self(&dest, allow_stop)?;
-    register_task(&dest)?;
-    log!("autostart: task '{TASK_NAME}' registered -> {}", dest.display());
-    Ok(stopped)
+/// A task error after a good copy keeps `copy`, so the new exe is still relaunched.
+pub(crate) fn enable(allow_stop: bool) -> InstallReport {
+    let dest = match installed_exe() {
+        Ok(d) => d,
+        Err(e) => return InstallReport::failed(InstallError::Failed(e)),
+    };
+    let mut report = copy_self(&dest, allow_stop);
+    if report.copy == CopyOutcome::Failed {
+        return report;
+    }
+    match register_task(&dest) {
+        Ok(()) => log!("autostart: task '{TASK_NAME}' registered -> {}", dest.display()),
+        Err(e) => report.error = Some(InstallError::Failed(e)),
+    }
+    report
 }
 
 /// Tells the user about a leftover legacy copy `%LOCALAPPDATA%\Dock\bin\dock.exe`. It is never deleted
@@ -403,13 +513,14 @@ fn relaunch(exe: &Path) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_) => crate::logger::say("Dock restarted from the installed copy."),
-        Err(e) => crate::logger::say(&format!("Unable to restart the dock: {e}")),
+        Ok(_) => crate::logger::say("Dock started from the installed copy."),
+        Err(e) => crate::logger::say(&format!("Unable to start the dock: {e}")),
     }
 }
 
-/// `--install`: returns the exit code.
-pub fn run_install_cli() -> i32 {
+/// `--install`: returns the exit code. Always starts the installed exe at the end (the new copy, or
+/// the old one after a failed copy), unless `no_relaunch` or a dock is still running.
+pub fn run_install_cli(no_relaunch: bool) -> i32 {
     let dest = match installed_exe() {
         Ok(d) => d,
         Err(e) => {
@@ -418,22 +529,29 @@ pub fn run_install_cli() -> i32 {
             return EXIT_FAILED;
         }
     };
-    match enable(true) {
-        Ok(stopped) => {
+    let report = enable(true);
+    // Sampled after `enable`: true only when re-run over its own running dock or the stop gave up.
+    let still_running = crate::watchdog::instance_running();
+    log!(
+        "autostart: --install copy={:?} stop_signalled={} still_running={still_running} no_relaunch={no_relaunch}",
+        report.copy,
+        report.stop_signalled
+    );
+    match &report.error {
+        None => {
             crate::logger::say(&format!("Installed to {}", dest.display()));
             crate::logger::say("Automatic start at logon enabled (scheduled task 'Dock', elevated).");
             report_legacy_copy();
-            if stopped {
-                relaunch(&dest);
-            }
-            EXIT_OK
         }
-        Err(e) => {
+        Some(e) => {
             log!("autostart: --install failed: {e}");
             crate::logger::say(&format!("Installation failed: {e}"));
-            EXIT_FAILED
         }
     }
+    if should_relaunch(still_running, no_relaunch) && dest.exists() {
+        relaunch(&dest);
+    }
+    report.exit_code()
 }
 
 /// `--uninstall`: returns the exit code.
@@ -521,5 +639,60 @@ mod tests {
         assert!(seen, "a process running the destination exe is detected");
         assert!(!exe_in_use_by_other(&std::env::current_exe().unwrap()), "the installer itself does not count");
         assert!(!exe_in_use_by_other(Path::new(r"C:\no\such\dock.exe")));
+    }
+
+    #[test]
+    fn relaunch_rules() {
+        // --install always relaunches, unless --no-relaunch or a dock is still running at the end
+        // (the installed exe re-run over its own running dock, or a dock that could not be stopped).
+        assert!(should_relaunch(false, false));
+        assert!(!should_relaunch(true, false));
+        assert!(!should_relaunch(false, true), "--no-relaunch wins");
+        assert!(!should_relaunch(true, true));
+    }
+
+    #[test]
+    fn install_stages_next_to_the_destination() {
+        assert_eq!(
+            staging_path(Path::new(r"C:\Program Files\mini-oled-dock\dock.exe")),
+            PathBuf::from(r"C:\Program Files\mini-oled-dock\dock.exe.new")
+        );
+        assert_eq!(InstallError::Failed("x".into()).exit_code(), EXIT_FAILED);
+        assert_eq!(InstallError::CouldNotStop("x".into()).exit_code(), EXIT_STOP_FAILED);
+        assert_eq!(InstallError::CouldNotStop("held".into()).to_string(), "held");
+    }
+
+    #[test]
+    fn install_report_exit_codes() {
+        let r = |copy, error| InstallReport { copy, stop_signalled: false, error };
+        assert_eq!(r(CopyOutcome::Copied, None).exit_code(), EXIT_OK);
+        assert_eq!(r(CopyOutcome::AlreadyInstalled, None).exit_code(), EXIT_OK);
+        // Copied, but schtasks failed: the new exe is relaunched and the exit code is 1.
+        assert_eq!(r(CopyOutcome::Copied, Some(InstallError::Failed("schtasks".into()))).exit_code(), EXIT_FAILED);
+        assert_eq!(
+            r(CopyOutcome::Failed, Some(InstallError::CouldNotStop("held".into()))).exit_code(),
+            EXIT_STOP_FAILED
+        );
+    }
+
+    #[test]
+    fn replace_is_refused_while_the_destination_is_held() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("dock-replace-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dest, new) = (dir.join("dock.exe"), dir.join("dock.exe.new"));
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        // A running image is open without FILE_SHARE_DELETE: a rename over it is refused.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&dest).unwrap();
+        let refused = replace_file(&new, &dest).is_err();
+        drop(held);
+        let replaced = replace_file(&new, &dest);
+        let (content, new_left) = (std::fs::read(&dest).unwrap(), new.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refused, "the held file is never written");
+        assert!(replaced.is_ok(), "{replaced:?}");
+        assert_eq!(content, b"new");
+        assert!(!new_left, "the staged copy is moved, not copied");
     }
 }

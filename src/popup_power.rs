@@ -244,7 +244,14 @@ impl PowerPopup {
         }
         let a = Arc::clone(&self.autostart);
         let spawned = std::thread::Builder::new().name("autostart-set".into()).spawn(move || {
-            let r = if want_on { crate::autostart::enable(false).map(|_| ()) } else { crate::autostart::disable() };
+            let r = if want_on {
+                match crate::autostart::enable(false).error {
+                    None => Ok(()),
+                    Some(e) => Err(e.to_string()),
+                }
+            } else {
+                crate::autostart::disable()
+            };
             if let Err(e) = &r {
                 log!("autostart: operation failed: {e}");
             }

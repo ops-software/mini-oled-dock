@@ -988,7 +988,8 @@ fn main() -> std::process::ExitCode {
         for n in notes.iter().filter(|n| !n.starts_with("data: created")) {
             logger::say(n);
         }
-        let code = if args.install { autostart::run_install_cli() } else { autostart::run_uninstall_cli() };
+        let code =
+            if args.install { autostart::run_install_cli(args.no_relaunch) } else { autostart::run_uninstall_cli() };
         if report == CliReport::LogOnly {
             // Keep the messages in the log, then keep buffering whatever is said later (nobody shows it).
             for line in logger::take_say_buffer().lines() {
