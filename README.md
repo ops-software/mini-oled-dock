@@ -39,13 +39,17 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|---|
 | ![](docs/screenshots/bar_battery.png) | ![](docs/screenshots/bar_battery_inside.png) | ![](docs/screenshots/popup_battery.png) |
 
-| Window previews | Tray: choose visible icons | Settings |
+| Window previews | Tray: choose visible icons | Settings: Appearance |
 |---|---|---|
-| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_settings.png) |
+| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/settings_appearance.png) |
 
-| Settings: screen | Settings: follow the pointer | Settings: Start menu | Settings in Italian |
-|---|---|---|---|
-| ![](docs/screenshots/popup_settings_screen.png) | ![](docs/screenshots/popup_settings_pointer.png) | ![](docs/screenshots/popup_settings_startmenu.png) | ![](docs/screenshots/popup_settings_it.png) |
+| Settings: Bar | Settings: Start | Settings: Modules |
+|---|---|---|
+| ![](docs/screenshots/settings_bar.png) | ![](docs/screenshots/settings_start.png) | ![](docs/screenshots/settings_modules.png) |
+
+| Settings: Screen | Settings: Updates | Settings: About |
+|---|---|---|
+| ![](docs/screenshots/settings_screen.png) | ![](docs/screenshots/settings_updates.png) | ![](docs/screenshots/settings_about.png) |
 
 ## Features
 
@@ -85,7 +89,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 
 ### Settings and system
 
-- **Settings popup** (from the power button): every option, applied live and saved to a commented JSON config that also reloads on its own when edited by hand.
+- **Settings window** (power button → **Settings**, Start quick links → **Dock settings**, or `dock.exe --settings`): seven pages (Appearance, Bar, Start, Modules, Screen, Updates, About), every option applied live and saved to the commented `config.json`, which also reloads on its own when edited by hand.
 - **Language:** System (follows Windows), English or Italian, applied at once, clock and calendar included.
 - Autostart without UAC prompts (scheduled task).
 - Watchdog process that always restores the native taskbar.
@@ -135,11 +139,16 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **Battery:** left click opens the battery popup (charge, state, time remaining on battery, power plan, "Power & battery settings"); right click opens Windows' battery saver settings. The wheel is not used.
 - **System metrics:** click opens Task Manager.
-- **Settings:** power button, then **Settings**: position, screen (with two or more displays: **Main**, the display number or **Pointer**), display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
-  - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
-  - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
+- **Settings window:** power button, then **Settings** (or Start quick links → **Dock settings**, or `dock.exe --settings`). Resizable, with a dark title bar in the bar's colour and a navigation on the left; `Esc` closes, `Tab` moves between the navigation and the page, `Up`/`Down` change page.
+  - **Appearance:** a live preview of the bar, the background colour (seven dark presets: Black, Graphite, Slate, Navy, Plum, Wine, Forest, and a custom swatch that opens a colour picker with saturation/value square, hue strip, preview and hex code), the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse), sliders for app icons, app names, tray icons and modules, **Reset sizes**, and the language.
+  - **Bar:** position, display mode, auto-hide, window previews, clock seconds, volume percent.
+  - **Start:** the Start button, the Start layout, Win key opens Start, and the import of pinned apps from Windows Start.
+  - **Modules:** one switch per module, the **Battery** group (show: Auto, On or Off; percentage; percentage inside the icon) and the tray icon chooser, inline.
+  - **Screen:** which display the bar sits on (**Main**, the display number, or **Pointer**).
+  - **Updates:** installed and available version, last check, **Check now**, **Release notes**, **Update now**, and the switches for the daily check and the automatic install.
+  - **About:** version, memory, the data folder and the log, and **Exit the dock** (restores the Windows taskbar).
 
-  Sliders follow a drag or a click on the track, and the mouse wheel (opacity and modules in steps of 5 %, the others 1 px). Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button.
+  Sliders follow a drag or a click on the track; the mouse wheel scrolls the page. Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button. The window remembers its size (`settings_window_size`).
 - **Updates:** an orange dot on Settings in the power popup means a new release is available.
 - **Exit:** `Ctrl+Alt+Q`, or the power popup, or `dock.exe --restore`.
 

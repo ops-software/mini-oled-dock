@@ -7,6 +7,8 @@
 //! build with `DOCK_NO_MANIFEST=1` (manifest without `requireAdministrator`).
 //!
 //! Files produced for each preview: `<name>.png` (DPI 120) and `<name>_96.png` (DPI 96).
+//! The Settings window pages are `settings_<page>.png` (DPI 144), `settings_<page>_96.png` (DPI 96) and
+//! `settings_<page>_it.png` (144, Italian).
 //! Errors go to stderr (the async logger is not started in this mode).
 //!
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
