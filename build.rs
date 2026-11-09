@@ -39,8 +39,11 @@ fn main() {
             // A missing manifest must not fail the build, but it must be reported.
             println!("cargo:warning=cannot embed the manifest: {e}");
         }
-        // Version resource (Task Manager name, file properties). No manifest here: embed-manifest owns it.
+        // Version resource (Task Manager name, file properties) and the application icon (id 1: Explorer,
+        // Installed apps, the Settings window; regenerate it with tools/make-icon.ps1). No manifest
+        // here: embed-manifest owns it.
         let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/dock.ico");
         res.set("ProductName", "mini-oled-dock")
             .set("FileDescription", "mini-oled-dock")
             .set("LegalCopyright", "MIT")
@@ -58,5 +61,6 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=assets/dock.ico");
     println!("cargo:rerun-if-env-changed=DOCK_NO_MANIFEST");
 }

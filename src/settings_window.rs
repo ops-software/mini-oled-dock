@@ -16,7 +16,8 @@
 //!   Down change page (navigation) or scroll one row (page). The wheel scrolls the page, over a slider
 //!   too.
 //! * Nothing exists while it is closed: the state is dropped, the surface freed, the class
-//!   unregistered and its timers killed.
+//!   unregistered, its icons (the exe's icon resource, loaded only here) destroyed and its timers
+//!   killed.
 //!
 //! THREADING: UI thread only. State is thread-local and taken with `try_borrow_mut`; a re-entry is
 //! logged and ignored. No borrow is held across `SetWindowPos`, `ShowWindow`, `DestroyWindow`,
@@ -33,16 +34,19 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, ScreenToClient, HMONITOR, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_ESCAPE, VK_SHIFT,
     VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, IsIconic, KillTimer, LoadCursorW,
-    PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, UnregisterClassW,
-    CS_HREDRAW, CS_VREDRAW, HTCLIENT, IDC_ARROW, IDC_HAND, MINMAXINFO, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_RESTORE, SW_SHOW, WHEEL_DELTA, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_DISPLAYCHANGE,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect, GetCursorPos, IsIconic, KillTimer,
+    LoadCursorW, LoadImageW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, UnregisterClassW, CS_HREDRAW, CS_VREDRAW, HICON, HTCLIENT, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    LR_DEFAULTCOLOR, MINMAXINFO, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE,
+    SW_SHOW, WHEEL_DELTA, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_MAXIMIZEBOX,
     WS_OVERLAPPEDWINDOW,
@@ -267,6 +271,49 @@ struct Win {
 struct State {
     win: Option<Win>,
     registered: bool,
+    /// Class icons, alive exactly while the class is registered (the bar never loads them).
+    icons: Option<Icons>,
+}
+
+/// The exe's own icon (resource id 1, `assets/dock.ico`) at the big and small sizes, used as the
+/// class icons (title bar, Alt+Tab). Not shared (`LR_SHARED` is not used): destroyed on drop, after
+/// the class is unregistered.
+struct Icons {
+    big: HICON,
+    small: HICON,
+}
+
+impl Icons {
+    /// Sizes for `dpi` (the display the window opens on); a failed load leaves a null icon (the
+    /// system default is drawn instead).
+    fn load(inst: HINSTANCE, dpi: u32) -> Self {
+        let one = |metric| -> HICON {
+            // SAFETY: no preconditions.
+            let cx = unsafe { GetSystemMetricsForDpi(metric, dpi) };
+            // SAFETY: `inst` is this module; `PCWSTR(1)` is MAKEINTRESOURCE(1), never dereferenced as a
+            // string by the API; a sized load (`cx`) of a non-shared icon, owned by the result.
+            match unsafe { LoadImageW(Some(inst), PCWSTR(1 as *const u16), IMAGE_ICON, cx, cx, LR_DEFAULTCOLOR) } {
+                Ok(h) => HICON(h.0),
+                Err(e) => {
+                    log!("settings: LoadImageW(icon 1, {cx} px) failed: {e}");
+                    HICON::default()
+                }
+            }
+        };
+        Icons { big: one(SM_CXICON), small: one(SM_CXSMICON) }
+    }
+}
+
+impl Drop for Icons {
+    fn drop(&mut self) {
+        for h in [self.big, self.small] {
+            if !h.is_invalid() {
+                // SAFETY: icon loaded by `Icons::load` without LR_SHARED and destroyed once; the class that
+                // used it is already unregistered (or was never registered).
+                let _ = unsafe { DestroyIcon(h) };
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -672,21 +719,28 @@ pub fn open() {
 fn create() -> Result<(), String> {
     let inst = module().ok_or("no module handle")?;
     if !with(|st| st.registered).unwrap_or(true) {
+        let icons = Icons::load(inst, monitor_dpi(crate::ui::dock_hmonitor()));
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: inst,
+            hIcon: icons.big,
+            hIconSm: icons.small,
             // SAFETY: loads a system cursor (null hInstance), no pointers to manage.
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
             lpszClassName: CLASS_W,
             ..Default::default()
         };
-        // SAFETY: `wc` is fully initialized; the class name is a static literal.
+        // SAFETY: `wc` is fully initialized; the class name is a static literal; the icons stay alive
+        // in `State::icons` until the class is unregistered.
         if unsafe { RegisterClassExW(&wc) } == 0 {
             return Err("RegisterClassExW(DockSettings) failed".into());
         }
-        with(|st| st.registered = true);
+        with(|st| {
+            st.registered = true;
+            st.icons = Some(icons);
+        });
     }
     // A failed open leaves nothing behind: the class goes with the window that never was.
     open_window(inst).inspect_err(|_| {
@@ -696,10 +750,11 @@ fn create() -> Result<(), String> {
     })
 }
 
-/// Unregisters the `DockSettings` class (no window of it may survive).
+/// Unregisters the `DockSettings` class (no window of it may survive), then frees its icons.
 fn unregister_class(inst: Option<HINSTANCE>) {
     // SAFETY: class registered by `create` with this module; no window of it survives.
     let _ = unsafe { UnregisterClassW(CLASS_W, inst) };
+    drop(with(|st| st.icons.take()));
 }
 
 fn open_window(inst: HINSTANCE) -> Result<(), String> {

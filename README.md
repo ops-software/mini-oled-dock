@@ -1,4 +1,4 @@
-# mini-oled-dock
+# <img src="assets/icon-256.png" alt="" width="40" height="40" align="absmiddle"> mini-oled-dock
 
 [![CI](https://github.com/ops-software/mini-oled-dock/actions/workflows/ci.yml/badge.svg)](https://github.com/ops-software/mini-oled-dock/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/ops-software/mini-oled-dock)](https://github.com/ops-software/mini-oled-dock/releases/latest)
