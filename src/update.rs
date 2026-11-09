@@ -416,14 +416,25 @@ fn download(rel: &Release) -> Result<(), StageError> {
 /// inside it; the folder was created by this elevated process, so no user can swap the file after
 /// the check.
 ///
+/// `expected` = the asset sizes of a freshly fetched release (`None` only for `--update-install`,
+/// which installs what is staged): a stage of another upload of the same tag is deleted and is
+/// `Download`, so the caller fetches the current assets.
+///
 /// A missing file is `Download` (the caller downloads); any other failure deletes the folder and
 /// is `Verify`.
-pub(crate) fn verify_stage(tag: &str) -> Result<PathBuf, StageError> {
+pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<PathBuf, StageError> {
     let Some(version) = parse_tag(tag) else {
         return Err(StageError::Verify(format!("{tag:?} is not a canonical tag")));
     };
     let read = |name: &str, cap: u64| datadir::read_stage_file(tag, name, cap);
     let files = match (read(EXE_ASSET, EXE_MAX_BYTES), read(SHA_ASSET, SHA_MAX_BYTES)) {
+        (Ok(exe), Ok(sha)) if !stage_sizes_match(&exe, &sha, expected) => {
+            crate::log!("update: the stage of {tag} does not match the release assets, downloading again");
+            if let Err(e) = datadir::remove_update_stage(tag) {
+                crate::log!("update: cannot remove the stage {tag}: {e}");
+            }
+            return Err(StageError::Download("stale stage".into()));
+        }
         (Ok(exe), Ok(sha)) => Ok((exe, sha)),
         (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(StageError::Download(format!("not staged: {e}")));
@@ -452,6 +463,12 @@ pub(crate) fn verify_stage(tag: &str) -> Result<PathBuf, StageError> {
     })
 }
 
+/// true when the staged files have the sizes `expected` (exe, sha256) announces, or no sizes are
+/// expected.
+fn stage_sizes_match(exe: &[u8], sha: &[u8], expected: Option<(u64, u64)>) -> bool {
+    expected.is_none_or(|(e, s)| exe.len() as u64 == e && sha.len() as u64 == s)
+}
+
 fn set_phase(phase: Phase) {
     with_state(|s| s.phase = phase);
     notify();
@@ -462,12 +479,13 @@ fn set_phase(phase: Phase) {
 /// `Ready` / `DownloadFailed` / `VerifyFailed` outcomes.
 fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     set_phase(Phase::Verifying);
-    let mut r = verify_stage(&rel.tag);
+    let sizes = Some((rel.exe.size, rel.sha256.size));
+    let mut r = verify_stage(&rel.tag, sizes);
     if matches!(r, Err(StageError::Download(_))) {
         set_phase(Phase::Downloading);
         r = download(rel).and_then(|()| {
             set_phase(Phase::Verifying);
-            verify_stage(&rel.tag)
+            verify_stage(&rel.tag, sizes)
         });
     }
     match &r {
@@ -597,7 +615,7 @@ pub fn run_install_cli(tag: &str) -> i32 {
         say("the data folder is not writable (run elevated)");
         return 1;
     }
-    let path = match verify_stage(tag) {
+    let path = match verify_stage(tag, None) {
         Ok(p) => p,
         Err(e) => {
             say(&format!("{tag}: {e}"));
@@ -844,6 +862,14 @@ mod tests {
         assert!(verify_bytes(b"abc", sha).is_ok());
         assert!(verify_bytes(b"abd", sha).is_err());
         assert!(verify_bytes(b"abc", b"not a hash").is_err());
+    }
+
+    #[test]
+    fn a_stage_must_match_the_fetched_asset_sizes() {
+        assert!(stage_sizes_match(b"abc", b"0123", Some((3, 4))));
+        assert!(stage_sizes_match(b"abc", b"0123", None)); // --update-install: staged only
+        assert!(!stage_sizes_match(b"abcd", b"0123", Some((3, 4)))); // re-uploaded exe
+        assert!(!stage_sizes_match(b"abc", b"012", Some((3, 4)))); // re-uploaded .sha256
     }
 
     fn system32(exe: &str) -> PathBuf {
