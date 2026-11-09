@@ -104,7 +104,6 @@ pub enum Tint {
 }
 
 /// Reads the system power status. `None` only if the call fails.
-#[allow(dead_code)] // wired to the UI sampler in the next commits
 pub fn query() -> Option<BatteryStatus> {
     let mut s = SYSTEM_POWER_STATUS::default();
     // SAFETY: `s` is a valid, writable SYSTEM_POWER_STATUS for the duration of the call.

@@ -126,9 +126,12 @@ pub const TIMER_HOVER_PICKER: usize = 11;
 /// 300 ms one-shot on the PICKER window: the pointer left the picker and the app item; closes the
 /// picker unless the pointer came back. Armed and handled only by `picker`.
 pub const TIMER_PICKER_LEAVE: usize = 12;
+/// 30 s on the dock window, ONLY while the bar is visible, a battery is present and the module is not
+/// off; armed and killed by `ui::battery_sync`. Handled by `ui`.
+pub const TIMER_BATTERY: usize = 13;
 /// Dock window, armed only while `update_check` is on (`update::sync_timer`): first 60 s after start,
 /// then the remaining time to 24 h since `last_update_check`, 24 h after a check, 1 h after a failed
-/// scheduled check. Handled by `main` -> `update::on_timer`. (13 is kept for the battery timer.)
+/// scheduled check. Handled by `main` -> `update::on_timer`.
 pub const TIMER_UPDATE_CHECK: usize = 14;
 
 // POPUP window timers (different hwnd from the dock's; handled only by `popup`).

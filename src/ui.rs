@@ -26,6 +26,8 @@
 //!    `popup_startmenu`, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
+//!  * Battery (`TIMER_BATTERY`, `battery_refresh`, `battery_sync`): `GetSystemPowerStatus` every 30 s only while the
+//!    bar is visible and a battery is present, plus `WM_POWERBROADCAST`; a hidden bar takes no sample.
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
 //!    (`config::pin/unpin`), New window, Close all windows (`apps::close_group`).
 //!    While the popup is open, auto-hide is suspended (`popup::is_open`).
@@ -70,10 +72,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
     KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
     SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HTCLIENT,
-    HWND_TOPMOST, IDC_HAND,
+    HWND_TOPMOST, IDC_HAND, PBT_APMPOWERSTATUSCHANGE,
     MA_NOACTIVATE, SC_CLOSE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -82,8 +84,8 @@ use crate::config::{self, PinnedApp};
 use crate::icons::IconBitmap;
 use crate::log;
 use crate::msg::{
-    ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK,
-    TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD,
+    ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_BATTERY,
+    TIMER_CLOCK, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD,
     WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
 };
 use crate::popup::{self, Anchor, AppMenuInfo, PopupKind};
@@ -471,6 +473,13 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
     }
     match msg {
         WM_TIMER => on_timer(h, wp.0),
+        WM_POWERBROADCAST => {
+            if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize {
+                battery_tick();
+            }
+            // TRUE grants the event.
+            Some(LRESULT(1))
+        }
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
         // The bar can hold the foreground (Win key): Alt+F4 must not reach WM_CLOSE, which exits the dock.
         WM_SYSCOMMAND if wp.0 & 0xFFF0 == SC_CLOSE as usize => {
@@ -584,6 +593,7 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
         TIMER_ATTN => on_attn_tick(h),
         TIMER_VIS => on_vis_tick(h),
         TIMER_SYSMON => sysmon_tick(),
+        TIMER_BATTERY => battery_tick(),
         TIMER_HOVER_PICKER => on_hover_picker_timer(h),
         TIMER_CLOCK => {
             if VISIBLE.load(Relaxed) && config::get().show_clock {
@@ -761,6 +771,8 @@ pub fn on_config_changed() {
     redraw();
     // Modules switched on/off: start/stop their polling and free their state.
     sysmon_sync();
+    battery_refresh(VISIBLE.load(Relaxed));
+    battery_sync();
     if VISIBLE.load(Relaxed) {
         // `show_seconds` / `show_clock` may have changed: re-align the clock timer.
         arm_clock(hwnd());
@@ -2903,6 +2915,10 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
         // Before the redraw, so the first present is already at alpha 0 / slid out.
         start_vis_anim(1.0, SHOW_ANIM_MS);
     }
+    if !was_visible {
+        // One sample just before the first frame, so the battery module is already in it.
+        battery_refresh(true);
+    }
     // List from the cache: no EnumWindows in the hook path.
     redraw();
     // The geometry is reread AFTER the redraw: the width may have changed.
@@ -2921,6 +2937,7 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
         // The clock and sysmon timers are off while hidden: redraw happened above, re-arm them now.
         arm_clock(hwnd());
         sysmon_sync();
+        battery_sync();
     }
     if hide_after_ms >= u64::MAX / 4 {
         log!("SHOW ({reason}), autohide off");
@@ -2986,6 +3003,7 @@ fn hide(reason: &str, now: bool) {
     reset_hover();
     kill_timer(hwnd(), TIMER_CLOCK);
     sysmon_sync();
+    battery_sync();
     let was_animating = UI.with(|u| std::mem::replace(&mut u.borrow_mut().wanim.running, false));
     kill_timer(hwnd(), TIMER_WIDTH);
     if was_animating {
@@ -3009,6 +3027,61 @@ fn arm_clock(h: HWND) {
     } else {
         kill_timer(h, TIMER_CLOCK);
     }
+}
+
+// ------------------------------------------------------- battery
+
+/// `TIMER_BATTERY` period.
+const BATTERY_POLL_MS: u32 = 30_000;
+
+/// The battery status to store: `Off` clears it (sample not taken); a hidden bar takes no sample and
+/// keeps the last value; otherwise a fresh sample (`None` = unreadable = no battery).
+fn next_battery(
+    show: config::BatteryShow,
+    visible: bool,
+    current: crate::battery::BatteryStatus,
+    sample: impl FnOnce() -> Option<crate::battery::BatteryStatus>,
+) -> crate::battery::BatteryStatus {
+    use crate::battery::BatteryStatus;
+    if show == config::BatteryShow::Off {
+        BatteryStatus::NONE
+    } else if !visible {
+        current
+    } else {
+        sample().unwrap_or(BatteryStatus::NONE)
+    }
+}
+
+/// The only caller of `battery::query`. `visible` is a parameter because `show_dock` samples before
+/// it sets `VISIBLE`. Redraws the bar when the stored value changed.
+fn battery_refresh(visible: bool) {
+    let show = config::get().show_battery;
+    let changed = UI.with(|u| {
+        let st = &mut *u.borrow_mut();
+        let next = next_battery(show, visible, st.battery, crate::battery::query);
+        std::mem::replace(&mut st.battery, next) != next
+    });
+    if changed {
+        redraw_if_visible();
+    }
+}
+
+/// Arms `TIMER_BATTERY` while the bar is visible, a battery is present and the module is not off;
+/// kills it otherwise. Takes no sample.
+fn battery_sync() {
+    let present = UI.with(|u| u.borrow().battery.present);
+    if crate::battery::polling_wanted(config::get().show_battery, present, VISIBLE.load(Relaxed)) {
+        set_timer(hwnd(), TIMER_BATTERY, BATTERY_POLL_MS);
+    } else {
+        kill_timer(hwnd(), TIMER_BATTERY);
+    }
+}
+
+/// Timer tick and power broadcast: sample (if visible), then re-evaluate the timer (a battery can
+/// appear or vanish between two samples).
+fn battery_tick() {
+    battery_refresh(VISIBLE.load(Relaxed));
+    battery_sync();
 }
 
 // ------------------------------------------------------- system monitor (network, metrics)
@@ -3524,6 +3597,19 @@ mod tests {
         assert_eq!(order(1, 0), [1, 0, 2, 3]);
         assert_eq!(order(2, 2), [0, 1, 2, 3]);
         assert_eq!(order(0, 3), [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn next_battery_follows_show_and_visibility() {
+        use crate::battery::BatteryStatus;
+        use crate::config::BatteryShow::*;
+        let b = BatteryStatus::from_raw(0, 1, 64, 600);
+        let boom = || -> Option<BatteryStatus> { panic!("a sample was taken") };
+        assert_eq!(next_battery(Off, true, b, || Some(b)), BatteryStatus::NONE); // switched off: nothing stale is drawn
+        assert_eq!(next_battery(Off, false, b, boom), BatteryStatus::NONE); // ... and nothing is sampled
+        assert_eq!(next_battery(Auto, false, b, boom), b); // bar hidden: no sample, last value kept
+        assert_eq!(next_battery(Auto, true, BatteryStatus::NONE, || Some(b)), b);
+        assert_eq!(next_battery(On, true, b, || None), BatteryStatus::NONE); // failed sample: no battery
     }
 
     #[test]
