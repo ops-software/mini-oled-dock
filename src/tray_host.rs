@@ -2084,23 +2084,11 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         return forward_sync(wp, lp);
     }
     let m: AppBarMsg = from_prefix(bytes);
-    // These three use `SHLockShared(m.shared, m.pid)`, i.e. they duplicate a handle from process `m.pid`
-    // and write into it: from an elevated process this is accepted only if `m.pid` owns the
-    // AppBar window (when given) and does not run above medium, otherwise a medium sender could
-    // make us write into a section of an elevated process.
-    if matches!(m.message, ABM_GETTASKBARPOS | ABM_QUERYPOS | ABM_SETPOS) {
-        let wnd_pid = if wp.0 == 0 { None } else { Some(window_pid(HWND(wp.0 as *mut c_void))) };
-        // SAFETY: no preconditions.
-        let own = unsafe { GetCurrentProcessId() };
-        if !appbar_block_allowed(m.pid, own, wnd_pid, pid_at_most_medium) {
-            log!(
-                "tray: AppBar {} rejected (block pid {}, window pid {} not verified)",
-                m.message,
-                m.pid,
-                wnd_pid.map_or_else(|| "-".to_string(), |p| p.to_string())
-            );
-            return LRESULT(0);
-        }
+    let wnd_pid = if wp.0 == 0 { None } else { Some(window_pid(HWND(wp.0 as *mut c_void))) };
+    // SAFETY: no preconditions.
+    if let Some(text) = appbar_gate(&m, wnd_pid, unsafe { GetCurrentProcessId() }, pid_at_most_medium) {
+        log!("{text}");
+        return LRESULT(0);
     }
     match m.message {
         ABM_GETTASKBARPOS => get_taskbar_pos(&m),
@@ -2109,16 +2097,35 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
     }
 }
 
+/// Gate for the AppBar messages that use `SHLockShared(m.shared, m.pid)` (`ABM_GETTASKBARPOS`,
+/// `ABM_QUERYPOS`, `ABM_SETPOS`): they duplicate a handle from process `m.pid` and write into it, and
+/// `m.pid` is chosen by the sender. `None` = forward; `Some(text)` = reject, `text` is the log line.
+/// Every other message is not gated. Pure: `medium` is injected for tests.
+fn appbar_gate(m: &AppBarMsg, wnd_pid: Option<u32>, own: u32, medium: impl Fn(u32) -> bool) -> Option<String> {
+    let gated = matches!(m.message, ABM_GETTASKBARPOS | ABM_QUERYPOS | ABM_SETPOS);
+    if !gated || appbar_block_allowed(m.pid, own, wnd_pid, medium) {
+        return None;
+    }
+    Some(format!(
+        "tray: AppBar {} rejected (block pid {}, window pid {} not verified, claims_own = {})",
+        m.message,
+        m.pid,
+        wnd_pid.map_or_else(|| "-".to_string(), |p| p.to_string()),
+        m.pid == own
+    ))
+}
+
 /// Whether an AppBar shared block may be locked/written. `block_pid` is the process holding the
 /// handle (`m.pid`), `own` this process, `wnd_pid` the owner of the AppBar window (`None` = no window).
-/// shell32 allocates the block directly for the tray window's process, so for a real AppBar
-/// `block_pid == own` and the window belongs to the app: in that case the app (window owner) is what
-/// must not run above medium. A block living in another process keeps the original rule (it must be
-/// the window owner's and at most medium). Pure: `medium` is injected for tests.
+/// A claimed own pid is never trusted: `SHLockShared` would resolve the sender-chosen handle value in
+/// the dock's own (elevated) handle table. Otherwise the block must live in the window owner's process
+/// (when a window is given) and that process must not run above medium. Pure: `medium` is injected for tests.
 fn appbar_block_allowed(block_pid: u32, own: u32, wnd_pid: Option<u32>, medium: impl Fn(u32) -> bool) -> bool {
+    if block_pid == own {
+        return false;
+    }
     match wnd_pid {
         None => medium(block_pid),
-        Some(w) if block_pid == own => w != 0 && w != own && medium(w),
         Some(w) => w == block_pid && medium(block_pid),
     }
 }
@@ -2432,23 +2439,53 @@ mod tests {
         assert_eq!(guid_string(&items[0].guid.unwrap_or(GUID::zeroed())), "7820ae73-23e3-4229-82c1-e41cb67d5b9c");
     }
 
+    fn crafted(message: u32, pid: u32) -> AppBarMsg {
+        let mut m: AppBarMsg = from_prefix(&[]); // all zero
+        m.message = message;
+        m.shared = 0x1234; // a guessed handle value: must never be locked
+        m.pid = pid;
+        m
+    }
+
+    fn appbar_bytes(m: &AppBarMsg) -> Vec<u8> {
+        // SAFETY: AppBarMsg is repr(C), Copy and made only of integers (explicit _pad fields, size asserted 0x40).
+        unsafe { std::slice::from_raw_parts((m as *const AppBarMsg).cast::<u8>(), std::mem::size_of::<AppBarMsg>()) }
+            .to_vec()
+    }
+
     #[test]
-    fn appbar_block_gating() {
+    fn crafted_appbar_message_with_the_dock_pid_is_rejected() {
+        // SAFETY: no preconditions.
+        let own = unsafe { GetCurrentProcessId() };
+        let medium = |_: u32| true;
+        for msg in [ABM_GETTASKBARPOS, ABM_QUERYPOS, ABM_SETPOS] {
+            let m = crafted(msg, own);
+            let why = appbar_gate(&m, None, own, medium).expect("a claimed own pid is rejected");
+            assert!(why.contains(&format!("block pid {own}")) && why.contains("claims_own = true"), "{why}");
+            // The real entry point answers 0 for the same bytes and never reaches SHLockShared (m.shared is garbage).
+            assert_eq!(handle_appbar(WPARAM(0), LPARAM(0), &appbar_bytes(&m)).0, 0);
+        }
+        // A legitimate medium sender passes the gate; a message that is not gated is never rejected by it.
+        assert!(appbar_gate(&crafted(ABM_SETPOS, 8120), Some(8120), own, medium).is_none());
+        assert!(appbar_gate(&crafted(4 /* ABM_GETSTATE */, own), None, own, medium).is_none());
+    }
+
+    #[test]
+    fn appbar_gate_rejects_a_claimed_own_pid() {
         const OWN: u32 = 100;
         let medium = |p: u32| p != 0 && p != 666; // 666 = elevated process
-        // Real case: block allocated for us, window of a medium app -> allowed (was rejected).
-        assert!(appbar_block_allowed(OWN, OWN, Some(8120), medium));
-        // Block for us but window of an elevated app, dead window, or our own window -> rejected.
+        // Crafted message: block pid = the dock's pid, window of any medium process -> rejected.
+        assert!(!appbar_block_allowed(OWN, OWN, Some(8120), medium));
         assert!(!appbar_block_allowed(OWN, OWN, Some(666), medium));
-        assert!(!appbar_block_allowed(OWN, OWN, Some(0), medium));
         assert!(!appbar_block_allowed(OWN, OWN, Some(OWN), |_| true));
-        // Block in another process: must be the window owner's and at most medium (unchanged).
+        assert!(!appbar_block_allowed(OWN, OWN, None, |_| true), "no window + own pid is rejected too");
+        // Unchanged: the block lives in the window owner's process and that process is at most medium.
         assert!(appbar_block_allowed(8120, OWN, Some(8120), medium));
         assert!(!appbar_block_allowed(666, OWN, Some(8120), medium));
         assert!(!appbar_block_allowed(666, OWN, Some(666), medium));
-        // No window: only the block's process is checked (unchanged).
-        assert!(appbar_block_allowed(OWN, OWN, None, |p| p == OWN));
-        assert!(!appbar_block_allowed(666, OWN, None, medium));
+        assert!(!appbar_block_allowed(8120, OWN, Some(9000), medium), "block pid must be the window owner's");
+        assert!(appbar_block_allowed(8120, OWN, None, medium));
+        assert!(!appbar_block_allowed(0, OWN, None, medium));
     }
 
     #[test]
