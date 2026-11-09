@@ -142,16 +142,6 @@ pub(crate) fn start() -> bool {
 
 // ------------------------------------------------------------------ the job (import thread)
 
-/// Folder of the layout file: the data folder when the dock can write it, else the temp folder.
-fn work_dir() -> PathBuf {
-    if crate::datadir::writable() {
-        if let Some(dir) = crate::datadir::config_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
-            return dir;
-        }
-    }
-    std::env::temp_dir()
-}
-
 /// Next step of the wait for the de-elevated export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Poll {
@@ -641,5 +631,14 @@ mod tests {
         // positive assertion (the owner test in Step 6 covers it); keep the three above.
         let dir = shell_user_local_appdata(std::process::id()).expect("own token");
         assert!(dir.is_absolute() && dir.ends_with("mini-oled-dock"), "{dir:?}");
+    }
+
+    #[test]
+    fn elevated_code_has_no_temp_folder_and_no_work_dir() {
+        // Source guard for finding 2. The needles are built with concat! so this test does not match itself.
+        let src = include_str!("start_import.rs");
+        assert!(!src.contains(concat!("temp", "_dir()")), "no %TEMP% fallback");
+        assert!(!src.contains(concat!("fn work", "_dir")), "no elevated work dir");
+        assert!(!src.contains(concat!("remove", "_file(")), "the dock never deletes in the shell user's folder");
     }
 }
