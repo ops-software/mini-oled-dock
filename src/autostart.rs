@@ -28,15 +28,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::System::ProcessStatus::EnumProcesses;
+use windows::Win32::System::Threading::{GetCurrentProcessId, CREATE_NO_WINDOW};
 use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 use crate::log;
 
 /// Name of the task in the scheduler.
 const TASK_NAME: &str = "Dock";
-/// Maximum wait for a running instance to exit before retrying the copy.
-const STOP_WAIT: Duration = Duration::from_secs(8);
+/// Maximum wait for the old instance and its watchdog to release the exe (outlasts the watchdog's
+/// `RESTORE_WAIT` for Explorer).
+const STOP_WAIT: Duration = Duration::from_secs(35);
+/// After the stop signal, retry for at least this long even if nothing of the old instance is seen.
+const STOP_GRACE: Duration = Duration::from_secs(3);
 /// Maximum time for `schtasks.exe` before giving up on it.
 const SCHTASKS_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -227,8 +231,51 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether `copy_self` keeps retrying the copy, `elapsed` after the stop signal. Pure.
+/// Past `STOP_GRACE`, with neither the instance nor any process running the destination exe left,
+/// something else holds the file: stop waiting and report.
+fn keep_waiting(elapsed: Duration, instance_up: bool, exe_in_use: bool) -> bool {
+    if elapsed >= STOP_WAIT {
+        false
+    } else if elapsed < STOP_GRACE {
+        true
+    } else {
+        instance_up || exe_in_use
+    }
+}
+
+/// true if a process other than this one runs the image file `dest` (the old dock or its
+/// `--watchdog` child, of any version: none needs to cooperate or create a named object).
+/// Known limit: a process whose image path cannot be queried (a protected process) is invisible
+/// here; such a holder is not a dock process, and the copy then fails after `STOP_GRACE` with the
+/// "locked by something else" error.
+fn exe_in_use_by_other(dest: &Path) -> bool {
+    let mut pids = vec![0u32; 1024];
+    let mut bytes = 0u32;
+    loop {
+        let cap = (pids.len() * std::mem::size_of::<u32>()) as u32;
+        // SAFETY: `pids` has `cap` writable bytes; `bytes` receives the number of bytes written.
+        if unsafe { EnumProcesses(pids.as_mut_ptr(), cap, &mut bytes) }.is_err() {
+            log!("autostart: EnumProcesses failed");
+            return false;
+        }
+        if bytes < cap {
+            break;
+        }
+        pids.resize(pids.len() * 2, 0); // buffer full: the list may be truncated, grow and retry
+    }
+    pids.truncate(bytes as usize / std::mem::size_of::<u32>());
+    // SAFETY: no preconditions.
+    let me = unsafe { GetCurrentProcessId() };
+    pids.into_iter()
+        .filter(|&pid| pid != me)
+        .filter_map(crate::apps::exe_path_of_pid)
+        .any(|path| same_file(Path::new(&path), dest))
+}
+
 /// Copies the current exe to `dest`. If the destination is locked and `allow_stop` is set, asks
-/// the running instance to exit (`signal_stop_to_instance`), waits up to 3 s and retries.
+/// the running instance to exit (`signal_stop_to_instance`) and retries while `keep_waiting` says
+/// so: up to `STOP_WAIT` (35 s) while the old instance or its watchdog still runs the exe.
 /// Returns `true` if it had to stop an instance.
 fn copy_self(dest: &Path, allow_stop: bool) -> Result<bool, String> {
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -252,7 +299,13 @@ fn copy_self(dest: &Path, allow_stop: bool) -> Result<bool, String> {
     }
     let t = Instant::now();
     let mut last = first;
-    while t.elapsed() < STOP_WAIT {
+    let mut old_alive;
+    loop {
+        let (up, in_use) = (crate::watchdog::instance_running(), exe_in_use_by_other(dest));
+        old_alive = up || in_use;
+        if !keep_waiting(t.elapsed(), up, in_use) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(250));
         match std::fs::copy(&me, dest) {
             Ok(_) => return Ok(true),
@@ -264,7 +317,12 @@ fn copy_self(dest: &Path, allow_stop: bool) -> Result<bool, String> {
     if dest.exists() {
         relaunch(dest);
     }
-    Err(format!("copy to {} failed after waiting: {last}", dest.display()))
+    let why = if old_alive {
+        format!("the old instance or its watchdog did not exit within {} s", STOP_WAIT.as_secs())
+    } else {
+        "the file is locked by something else".to_string()
+    };
+    Err(format!("copy to {} failed: {why}: {last}", dest.display()))
 }
 
 /// Installs the exe copy and registers the task. `allow_stop`: may stop an instance that locks
@@ -391,5 +449,38 @@ mod tests {
         assert!(!is_under(r"C:\Users\u\AppData\Local\Dock\bin\dock.exe", pf));
         assert!(!is_under(pf, pf));
         assert!(!is_under(r"C:\x.exe", ""));
+    }
+
+    #[test]
+    fn install_waits_longer_than_the_watchdog_restore() {
+        assert!(STOP_WAIT >= crate::watchdog::RESTORE_WAIT + Duration::from_secs(5));
+        assert_eq!(STOP_WAIT, Duration::from_secs(35));
+    }
+
+    #[test]
+    fn keep_waiting_while_the_old_instance_or_watchdog_lives() {
+        let s = Duration::from_secs;
+        assert!(keep_waiting(s(0), false, false), "grace right after the stop signal");
+        assert!(!keep_waiting(s(10), false, false), "both gone and the copy still fails: report, do not wait");
+        assert!(keep_waiting(s(10), true, false));
+        assert!(keep_waiting(s(34), false, true), "watchdog still waiting for Explorer");
+        assert!(!keep_waiting(s(35), true, true), "hard limit");
+    }
+
+    #[test]
+    fn an_old_watchdog_is_seen_by_its_image_not_by_a_mutex() {
+        // A 1.3.0 watchdog is just a process running the installed exe; any running exe stands in for it.
+        let ping = crate::shell_thread::system_dir().expect("system dir").join("ping.exe");
+        let mut child = std::process::Command::new(&ping)
+            .args(["-n", "8", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping.exe");
+        let seen = exe_in_use_by_other(&ping);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "a process running the destination exe is detected");
+        assert!(!exe_in_use_by_other(&std::env::current_exe().unwrap()), "the installer itself does not count");
+        assert!(!exe_in_use_by_other(Path::new(r"C:\no\such\dock.exe")));
     }
 }

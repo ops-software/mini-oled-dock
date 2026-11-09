@@ -56,7 +56,7 @@ pub const STOP_EVENT_NAME: &str = "Local\\DockStop";
 /// Name of the dock's single-instance mutex.
 const INSTANCE_MUTEX_NAME: &str = "Local\\DockInstance";
 /// Maximum wait for `Shell_TrayWnd` before a restore by the watchdog.
-const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Timeout of each watchdog wait (slightly above the heartbeat period).
 const WAIT_MS: u32 = 1100;
