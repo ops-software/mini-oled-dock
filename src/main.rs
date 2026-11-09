@@ -60,6 +60,7 @@ mod popup_tray;
 mod power;
 mod preview;
 mod render;
+mod sha256;
 mod shell_thread;
 mod start_import;
 mod surface;
