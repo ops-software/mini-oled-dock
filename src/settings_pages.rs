@@ -16,7 +16,7 @@ use crate::i18n::tr;
 use crate::popup_tray::TrayRow;
 use crate::start_import;
 use crate::ui::Screen;
-use crate::update::UpdateStatus;
+use crate::update::{Outcome, Phase, UpdateStatus};
 
 /// A monochrome icon shape: `(u, v)` in a 16 x 16 box -> inside.
 pub(crate) type Glyph = fn(f32, f32) -> bool;
@@ -523,7 +523,7 @@ pub(crate) enum Effect {
 }
 
 /// Effect of a click on part `part` of `row` (a segment, a swatch or a button).
-pub(crate) fn click(row: &Row, part: Option<usize>, _ctx: &Ctx<'_>) -> Effect {
+pub(crate) fn click(row: &Row, part: Option<usize>, ctx: &Ctx<'_>) -> Effect {
     match &row.control {
         Control::Choice { setting, options, selected } => match part {
             Some(j) if j < options.len() && *selected != Some(j) => Effect::Save(Edit::Choose(*setting, j)),
@@ -550,6 +550,11 @@ pub(crate) fn click(row: &Row, part: Option<usize>, _ctx: &Ctx<'_>) -> Effect {
             },
             _ => Effect::None,
         },
+        Control::Chooser { .. } => Effect::ToggleChooser,
+        // The row carries the app's key; it acts only while that app is still in the live list.
+        Control::TrayApp { key, visible } if ctx.tray.iter().any(|t| t.key == *key) => {
+            Effect::TrayVisible { key: key.clone(), hidden: *visible }
+        }
         _ => Effect::None,
     }
 }
@@ -582,15 +587,214 @@ fn buttons(icon: Glyph, label: &str, desc: Option<&str>, list: Vec<Button>) -> R
     row(icon, label, desc, Control::Buttons(list))
 }
 
-/// Rows of `page`. Modules, Updates and About are added with the next task.
+/// Modules with a plain on/off row on the Modules page (explicit: `config::MODULE_NAMES` also holds "tray").
+pub(crate) const MODULE_TOGGLES: [&str; 6] = ["notifications", "volume", "network", "metrics", "clock", "show_desktop"];
+
+/// `YYYY-MM-DD` of an RFC 3339 time; anything else is returned unchanged.
+pub(crate) fn short_date(rfc3339: &str) -> &str {
+    let d = rfc3339.get(..10).unwrap_or("");
+    let b = d.as_bytes();
+    let shaped = b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() });
+    if shaped {
+        d
+    } else {
+        rfc3339
+    }
+}
+
+/// `"{:.1} MB"` of `bytes`.
+pub(crate) fn mb(bytes: usize) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+}
+
+/// Only GitHub release pages of this project are opened from the window.
+pub(crate) fn safe_release_url(url: &str) -> bool {
+    let prefix = format!("https://github.com/{}/releases/", crate::update_release::REPO);
+    url.starts_with(&prefix) && !url.chars().any(|c| c.is_whitespace() || c == '"')
+}
+
+/// Rows of `page`.
 pub(crate) fn rows(page: Page, c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     match page {
         Page::Appearance => appearance(c, ctx),
         Page::Bar => bar(c, ctx),
         Page::Start => start(c, ctx),
+        Page::Modules => modules(c, ctx),
         Page::Screen => screen(c, ctx),
-        Page::Modules | Page::Updates | Page::About => Vec::new(),
+        Page::Updates => updates(c, ctx),
+        Page::About => about(ctx),
     }
+}
+
+fn modules(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
+    let icon = |n: &str| -> Glyph {
+        match n {
+            "notifications" => glyphs::bell_shape,
+            "volume" => glyphs::speaker_icon,
+            "network" => glyphs::wifi_icon,
+            "metrics" => glyphs::bars_shape,
+            "clock" => glyphs::clock_shape,
+            _ => glyphs::show_desktop_shape,
+        }
+    };
+    let mut v = vec![header(tr("Modules", "Moduli"), None)];
+    for n in MODULE_TOGGLES {
+        v.push(toggle(icon(n), module_label(n), None, c, Setting::Module(n)));
+    }
+    v.push(header(tr("Battery", "Batteria"), None));
+    v.push(choice(
+        glyphs::battery_icon,
+        tr("Show battery", "Mostra batteria"),
+        Some(tr("Shown automatically on laptops", "Mostrata automaticamente sui portatili")),
+        c,
+        Setting::BatteryShow,
+        ctx.screens,
+    ));
+    v.push(toggle(glyphs::text_shape, tr("Percentage", "Percentuale"), None, c, Setting::BatteryPercent));
+    v.push(row(
+        glyphs::battery_icon,
+        tr("Percentage inside the icon", "Percentuale dentro l'icona"),
+        Some(tr("Apple style", "Stile Apple")),
+        Control::Toggle { setting: Setting::BatteryInside, on: c.battery_percent_inside, enabled: c.battery_percent },
+    ));
+    v.push(header(tr("Tray", "Area di notifica"), None));
+    v.push(toggle(glyphs::ring_shape, module_label("tray"), None, c, Setting::Module("tray")));
+    if c.module_visible("tray") {
+        v.push(row(
+            glyphs::eye_icon,
+            tr("Choose visible icons", "Scegli le icone visibili"),
+            None,
+            Control::Chooser { open: ctx.chooser_open },
+        ));
+        if ctx.chooser_open {
+            if ctx.tray.is_empty() {
+                v.push(Row {
+                    icon: None,
+                    label: tr("No tray apps", "Nessuna app nell'area di notifica").to_string(),
+                    desc: None,
+                    control: Control::Note,
+                });
+            }
+            for t in ctx.tray {
+                let no_room = t.visible && !t.in_bar;
+                v.push(Row {
+                    icon: None,
+                    label: t.name.clone(),
+                    desc: no_room.then(|| tr("No room in the bar", "Spazio insufficiente nella barra").to_string()),
+                    control: Control::TrayApp { key: t.key.clone(), visible: t.visible },
+                });
+            }
+        }
+    }
+    v
+}
+
+fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
+    let st = ctx.update;
+    let idle = st.phase == Phase::Idle;
+    let available = match &st.available {
+        Some(a) if a.date.is_empty() => a.tag.clone(),
+        Some(a) => format!("{} \u{b7} {}", a.tag, short_date(&a.date)),
+        None if st.last_check.is_empty() && st.outcome == Outcome::None => {
+            tr("Not checked yet", "Non ancora controllato").to_string()
+        }
+        None => tr("Up to date", "Aggiornato").to_string(),
+    };
+    let last_check =
+        if st.last_check.is_empty() { tr("Never", "Mai").to_string() } else { short_date(&st.last_check).to_string() };
+    // The outcome of the last action stays after the phase returns to Idle.
+    let last_action = if st.outcome == Outcome::None { tr("None yet", "Nessuna").to_string() } else { st.line() };
+    let notes_ok =
+        st.available.as_ref().is_some_and(|a| safe_release_url(&crate::update_release::release_page_url(Some(&a.tag))));
+    let mut v = vec![
+        header(tr("Status", "Stato"), None),
+        row(
+            glyphs::info_shape,
+            tr("Installed version", "Versione installata"),
+            None,
+            Control::Status(st.installed.to_string()),
+        ),
+        row(glyphs::refresh_shape, tr("Available", "Disponibile"), None, Control::Status(available)),
+        row(glyphs::clock_shape, tr("Last check", "Ultimo controllo"), None, Control::Status(last_check)),
+        row(glyphs::log_shape, tr("Last action", "Ultima operazione"), None, Control::Status(last_action)),
+        row(
+            glyphs::refresh_shape,
+            "",
+            None,
+            Control::Buttons(vec![
+                Button { action: Action::CheckUpdates, text: tr("Check now", "Controlla ora"), enabled: idle },
+                Button {
+                    action: Action::ReleaseNotes,
+                    text: tr("Release notes", "Note di rilascio"),
+                    enabled: notes_ok,
+                },
+                Button {
+                    action: Action::InstallUpdate,
+                    text: tr("Update now", "Aggiorna ora"),
+                    enabled: idle && st.available.is_some(),
+                },
+            ]),
+        ),
+    ];
+    if !idle {
+        v.push(Row { icon: None, label: st.line(), desc: None, control: Control::Note });
+    }
+    v.push(header(tr("Automatic", "Automatico"), None));
+    v.push(toggle(
+        glyphs::refresh_shape,
+        tr("Check automatically", "Controlla automaticamente"),
+        Some(tr("Once a day on GitHub", "Una volta al giorno su GitHub")),
+        c,
+        Setting::UpdateCheck,
+    ));
+    v.push(toggle(
+        glyphs::download_shape,
+        tr("Install automatically", "Installa automaticamente"),
+        Some(tr("When the dock is idle", "Quando il dock \u{e8} inattivo")),
+        c,
+        Setting::UpdateAutoInstall,
+    ));
+    v
+}
+
+fn about(ctx: &Ctx<'_>) -> Vec<Row> {
+    let mem = |b: Option<usize>, none: &str| b.map_or_else(|| none.to_string(), mb);
+    let files = |icon: Glyph, label: &str, path: Option<&str>, action| {
+        buttons(icon, label, path, vec![Button { action, text: tr("Open", "Apri"), enabled: path.is_some() }])
+    };
+    vec![
+        header(tr("Dock", "Dock"), None),
+        row(
+            glyphs::info_shape,
+            &format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION")),
+            Some(tr("Ops Software \u{b7} MIT licence", "Ops Software \u{b7} licenza MIT")),
+            Control::Note,
+        ),
+        header(tr("Memory", "Memoria"), None),
+        row(
+            glyphs::bars_shape,
+            tr("Memory now", "Memoria ora"),
+            None,
+            Control::Status(mem(ctx.memory.now, "\u{2014}")),
+        ),
+        row(
+            glyphs::bars_shape,
+            tr("After trimming", "Dopo la pulizia"),
+            Some(tr("While the bar is hidden", "Mentre la barra \u{e8} nascosta")),
+            Control::Status(mem(ctx.memory.trimmed, tr("Not trimmed yet", "Non ancora eseguita"))),
+        ),
+        header(tr("Files", "File"), None),
+        files(glyphs::folder_shape, tr("Data folder", "Cartella dati"), ctx.data_dir, Action::OpenDataFolder),
+        files(glyphs::log_shape, "Log", ctx.log_path, Action::OpenLog),
+        header(tr("Taskbar", "Barra delle applicazioni"), None),
+        buttons(
+            glyphs::power_shape,
+            tr("Restore the Windows taskbar", "Ripristina la barra di Windows"),
+            Some(tr("Exits the dock", "Chiude il dock")),
+            vec![Button { action: Action::ExitDock, text: tr("Exit the dock", "Esci dal dock"), enabled: true }],
+        ),
+    ]
 }
 
 fn appearance(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
@@ -979,5 +1183,184 @@ mod tests {
         assert_eq!(click(&b, Some(0), &cx), Effect::Save(Edit::ResetSizes));
         assert_eq!(click(&b, Some(1), &cx), Effect::None);
         assert_eq!(click(&b, Some(2), &cx), Effect::None);
+    }
+
+    fn tray_rows() -> Vec<TrayRow> {
+        let r = |key: &str, name: &str, visible, in_bar| TrayRow {
+            key: key.into(),
+            name: name.into(),
+            bitmap: None,
+            visible,
+            in_bar,
+        };
+        vec![
+            r("dropbox.exe#1", "Dropbox", true, true),
+            r("slack.exe#1", "Slack", true, false),
+            r("teams.exe#1", "Teams", false, false),
+        ]
+    }
+
+    #[test]
+    fn modules_page_lists_toggles_battery_and_tray() {
+        let st = idle();
+        let mut c = Config::default();
+        let r = rows(Page::Modules, &c, &ctx(&[], &st));
+        let names: Vec<&str> = r
+            .iter()
+            .filter_map(|r| match r.control {
+                Control::Toggle { setting: Setting::Module(n), .. } => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["notifications", "volume", "network", "metrics", "clock", "show_desktop", "tray"]);
+        let bat =
+            r.iter().find(|r| matches!(r.control, Control::Choice { setting: Setting::BatteryShow, .. })).unwrap();
+        assert!(matches!(&bat.control, Control::Choice { options, selected: Some(0), .. } if options.len() == 3));
+        assert!(bat.desc.is_some());
+        assert!(r
+            .iter()
+            .any(|r| r.control == Control::Toggle { setting: Setting::BatteryInside, on: false, enabled: true }));
+        assert!(r.iter().any(|r| r.control == Control::Chooser { open: false }));
+        c.battery_percent = false;
+        c.set_module_visible("tray", false);
+        let r = rows(Page::Modules, &c, &ctx(&[], &st));
+        assert!(r
+            .iter()
+            .any(|r| r.control == Control::Toggle { setting: Setting::BatteryInside, on: false, enabled: false }));
+        assert!(!r.iter().any(|r| matches!(r.control, Control::Chooser { .. })));
+    }
+
+    #[test]
+    fn battery_choice_roundtrip() {
+        let mut c = Config::default();
+        for j in 0..3 {
+            apply_edit(&mut c, Edit::Choose(Setting::BatteryShow, j), &[]);
+            assert_eq!(selected(&c, Setting::BatteryShow, &[]), Some(j));
+        }
+    }
+
+    #[test]
+    fn tray_chooser_rows_are_inline() {
+        let st = idle();
+        let tray = tray_rows();
+        let mut cx = ctx(&[], &st);
+        cx.tray = &tray;
+        cx.chooser_open = true;
+        let r = rows(Page::Modules, &Config::default(), &cx);
+        let k = r.iter().position(|r| r.control == Control::Chooser { open: true }).unwrap();
+        assert_eq!(r[k + 1].control, Control::TrayApp { key: "dropbox.exe#1".into(), visible: true });
+        assert_eq!(r[k + 2].label, "Slack");
+        assert!(r[k + 2].desc.is_some()); // visible but no room in the bar
+        assert_eq!(click(&r[k], None, &cx), Effect::ToggleChooser);
+        assert_eq!(click(&r[k + 2], None, &cx), Effect::TrayVisible { key: "slack.exe#1".into(), hidden: true });
+        // Slack (the middle app) exits while the rows on screen are still [Dropbox, Slack, Teams].
+        let mid: Vec<TrayRow> = tray_rows().into_iter().filter(|t| t.name != "Slack").collect();
+        let mut cx2 = ctx(&[], &st);
+        cx2.tray = &mid;
+        assert_eq!(click(&r[k + 2], None, &cx2), Effect::None); // never Teams, its new neighbour
+        assert_eq!(click(&r[k + 3], None, &cx2), Effect::TrayVisible { key: "teams.exe#1".into(), hidden: false });
+        // The tail shrank: the last row acts on nothing.
+        cx2.tray = &tray[..2];
+        assert_eq!(click(&r[k + 3], None, &cx2), Effect::None);
+        cx2.tray = &[];
+        cx2.chooser_open = true;
+        let empty = rows(Page::Modules, &Config::default(), &cx2);
+        assert_eq!(empty.last().unwrap().control, Control::Note);
+    }
+
+    fn release(tag: &str) -> crate::update::Available {
+        crate::update::Available {
+            tag: tag.into(),
+            version: Version { major: 1, minor: 4, patch: 1 },
+            date: "2026-11-20".into(),
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn updates_page_follows_the_status() {
+        let buttons = |r: &[Row]| {
+            r.iter()
+                .find_map(|r| match &r.control {
+                    Control::Buttons(b) if b.len() == 3 => Some(b.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let mut st = idle();
+        let c = Config::default();
+        let r = rows(Page::Updates, &c, &ctx(&[], &st));
+        assert_eq!(
+            buttons(&r).iter().map(|b| (b.action, b.enabled)).collect::<Vec<_>>(),
+            [(Action::CheckUpdates, true), (Action::ReleaseNotes, false), (Action::InstallUpdate, false)]
+        );
+        assert!(r.iter().any(|r| r.control == Control::Status("1.4.0".into())));
+        assert!(r.iter().any(|r| r.control == Control::Status("Not checked yet".into())));
+        assert!(r.iter().any(|r| r.control == Control::Status("Never".into())));
+        assert!(r.iter().any(|r| r.control == Control::Status("None yet".into())));
+        st.available = Some(release("v1.4.1"));
+        st.outcome = Outcome::Available;
+        st.last_check = "2026-11-20T10:00:00Z".into();
+        let r = rows(Page::Updates, &c, &ctx(&[], &st));
+        assert!(r
+            .iter()
+            .any(|r| matches!(&r.control, Control::Status(s) if s.contains("v1.4.1") && s.contains("2026-11-20"))));
+        assert!(buttons(&r).iter().all(|b| b.enabled));
+        // A running operation disables Check and Update and shows its line.
+        st.phase = Phase::Checking;
+        let r = rows(Page::Updates, &c, &ctx(&[], &st));
+        assert!(!buttons(&r)[0].enabled && !buttons(&r)[2].enabled);
+        assert!(r.iter().any(|r| r.control == Control::Note && r.label == st.line()));
+        // Back to Idle after a failure: no note, the outcome stays as the last action.
+        st.phase = Phase::Idle;
+        st.outcome = Outcome::CouldNotCheck(crate::update::CheckFail::Http(403));
+        let r = rows(Page::Updates, &c, &ctx(&[], &st));
+        assert!(buttons(&r)[0].enabled);
+        assert!(!r.iter().any(|r| r.control == Control::Note));
+        assert!(r.iter().any(|r| r.control == Control::Status(st.line())));
+        assert!(r
+            .iter()
+            .any(|r| r.control == Control::Toggle { setting: Setting::UpdateCheck, on: true, enabled: true }));
+        assert!(r
+            .iter()
+            .any(|r| r.control == Control::Toggle { setting: Setting::UpdateAutoInstall, on: false, enabled: true }));
+        // Checked, nothing newer.
+        st.available = None;
+        st.outcome = Outcome::UpToDate;
+        let r = rows(Page::Updates, &c, &ctx(&[], &st));
+        assert!(r.iter().any(|r| r.control == Control::Status("Up to date".into())));
+    }
+
+    #[test]
+    fn about_page_rows() {
+        let st = idle();
+        let mut cx = ctx(&[], &st);
+        cx.memory = Memory { now: Some(10_276_044), trimmed: None };
+        let r = rows(Page::About, &Config::default(), &cx);
+        assert!(r.iter().any(|r| r.label.contains(env!("CARGO_PKG_VERSION"))));
+        assert!(r.iter().any(|r| r.control == Control::Status("9.8 MB".into())));
+        let open = r.iter().find_map(|r| match &r.control {
+            Control::Buttons(b) if b[0].action == Action::OpenDataFolder => Some(b[0].enabled),
+            _ => None,
+        });
+        assert_eq!(open, Some(false));
+        assert!(r
+            .iter()
+            .any(|r| matches!(&r.control, Control::Buttons(b) if b[0].action == Action::ExitDock && b[0].enabled)));
+    }
+
+    #[test]
+    fn small_formatters() {
+        assert_eq!(short_date("2026-11-20T10:00:00Z"), "2026-11-20");
+        assert_eq!(short_date(""), "");
+        assert_eq!(short_date("garbage"), "garbage");
+        assert_eq!(mb(10_276_044), "9.8 MB");
+        assert_eq!(mb(0), "0.0 MB");
+        assert!(safe_release_url("https://github.com/ops-software/mini-oled-dock/releases/tag/v1.4.1"));
+        assert!(!safe_release_url("https://evil.example/releases/"));
+        assert!(!safe_release_url("C:\\Windows\\System32\\cmd.exe"));
+        assert!(!safe_release_url("https://github.com/ops-software/mini-oled-dock/releases/x\" --flag"));
+        // The page URL built from a tag is always acceptable.
+        assert!(safe_release_url(&crate::update_release::release_page_url(Some("v1.4.1"))));
     }
 }
