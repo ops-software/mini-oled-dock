@@ -696,15 +696,17 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let available = match &st.available {
         Some(a) if a.date.is_empty() => a.tag.clone(),
         Some(a) => format!("{} \u{b7} {}", a.tag, short_date(&a.date)),
-        None if st.last_check.is_empty() && st.outcome == Outcome::None => {
-            tr("Not checked yet", "Non ancora controllato").to_string()
-        }
+        None if st.last_check.is_empty() => tr("Not checked yet", "Non ancora controllato").to_string(),
         None => tr("Up to date", "Aggiornato").to_string(),
     };
     let last_check =
         if st.last_check.is_empty() { tr("Never", "Mai").to_string() } else { short_date(&st.last_check).to_string() };
-    // The outcome of the last action stays after the phase returns to Idle.
-    let last_action = if st.outcome == Outcome::None { tr("None yet", "Nessuna").to_string() } else { st.line() };
+    // The outcome of the last action, never the running phase (the Note row shows that).
+    let last_action = if st.outcome == Outcome::None {
+        tr("None yet", "Nessuna").to_string()
+    } else {
+        UpdateStatus { phase: Phase::Idle, ..st.clone() }.line()
+    };
     let notes_ok =
         st.available.as_ref().is_some_and(|a| safe_release_url(&crate::update_release::release_page_url(Some(&a.tag))));
     let mut v = vec![
@@ -1311,6 +1313,10 @@ mod tests {
         let r = rows(Page::Updates, &c, &ctx(&[], &st));
         assert!(!buttons(&r)[0].enabled && !buttons(&r)[2].enabled);
         assert!(r.iter().any(|r| r.control == Control::Note && r.label == st.line()));
+        // The Last action row keeps the previous outcome while the phase runs.
+        let kept = UpdateStatus { phase: Phase::Idle, ..st.clone() }.line();
+        assert_ne!(kept, st.line());
+        assert!(r.iter().any(|r| r.control == Control::Status(kept.clone())));
         // Back to Idle after a failure: no note, the outcome stays as the last action.
         st.phase = Phase::Idle;
         st.outcome = Outcome::CouldNotCheck(crate::update::CheckFail::Http(403));
@@ -1318,6 +1324,13 @@ mod tests {
         assert!(buttons(&r)[0].enabled);
         assert!(!r.iter().any(|r| r.control == Control::Note));
         assert!(r.iter().any(|r| r.control == Control::Status(st.line())));
+        // A first check that failed leaves last_check empty: still "Not checked yet".
+        st.available = None;
+        st.last_check = String::new();
+        st.outcome = Outcome::CouldNotCheck(crate::update::CheckFail::NoConnection);
+        let r = rows(Page::Updates, &c, &ctx(&[], &st));
+        assert!(r.iter().any(|r| r.control == Control::Status("Not checked yet".into())));
+        assert!(!r.iter().any(|r| r.control == Control::Status("Up to date".into())));
         assert!(r
             .iter()
             .any(|r| r.control == Control::Toggle { setting: Setting::UpdateCheck, on: true, enabled: true }));
