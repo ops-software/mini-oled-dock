@@ -12,6 +12,9 @@
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
 //! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`,
 //! `popup_settings::preview_new`, `picker::preview_pixels`.
+//!
+//! The default bar has no battery (existing bar PNGs stay unchanged); `bar_battery*` and `popup_battery`
+//! show the mock battery (`mock_battery`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +23,7 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::audio::{DeviceKind, OutputDevice, VolumeState};
+use crate::battery::{BatteryStatus, PowerMode};
 use crate::config::{Background, Config, DisplayMode};
 use crate::icons::{self, IconBitmap};
 use crate::metrics::Usage;
@@ -35,6 +39,8 @@ thread_local! {
     /// Bar style of the next `render_bar` (sizes, background, opacity): applied to the config of the
     /// bar; a no-op except for the style variants.
     static STYLE: std::cell::Cell<Style> = const { std::cell::Cell::new(no_style) };
+    /// Battery of the next `render_bar`: none by default, so every existing bar PNG is unchanged.
+    static BATTERY: std::cell::Cell<BatteryStatus> = const { std::cell::Cell::new(BatteryStatus::NONE) };
 }
 
 /// A bar style variant: edits the config the bar is drawn with.
@@ -314,6 +320,11 @@ fn mock_net() -> NetInfo {
     }
 }
 
+/// Mock battery: on battery, 64 %, 3 h 12 min left.
+fn mock_battery() -> BatteryStatus {
+    BatteryStatus::from_raw(0, 1, 64, 11520)
+}
+
 // ------------------------------------------------------------------ bar
 
 /// Moves the app items of `layout` as in the middle of a drag: Steam (app 1) is lifted and hovers
@@ -356,7 +367,10 @@ fn render_bar(
     let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
     STYLE.with(|s| s.get())(&mut cfg);
     let sizes = BarSizes::from_config(&cfg);
-    let modules = render::visible_modules(&cfg, false);
+    let battery = BATTERY.with(|b| b.get());
+    let modules = render::visible_modules(&cfg, battery.present);
+    let battery_view =
+        render::BatteryView { status: battery, percent: cfg.battery_percent, inside: cfg.battery_percent_inside };
     let cfg_start = cfg.show_start_button;
     crate::config::set(cfg);
     if let Err(e) = render::init(m, sizes) {
@@ -395,7 +409,7 @@ fn render_bar(
             bell_dnd: false,
             net,
             usage: Usage { cpu: 12, ram: 48 },
-            battery: render::BatteryView::default(),
+            battery: battery_view,
         },
         plate: None,
         modules: &modules,
@@ -552,6 +566,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         }
         "popup_calendar" => crate::popup_calendar::new(),
         "popup_network" => crate::popup_network::new(mock_net()),
+        "popup_battery" => crate::popup_battery::new(mock_battery(), Some(PowerMode::Balanced)),
         "popup_network_offline" => crate::popup_network::new(NetInfo {
             kind: NetKind::Ethernet,
             name: "Ethernet".to_string(),
@@ -764,6 +779,29 @@ pub fn run(dir: &str) -> i32 {
                 net,
             ));
         }
+        // Battery variants: on battery with the percentage beside, charging with it inside.
+        let styles: [(&str, BatteryStatus, Style); 2] = [
+            ("bar_battery", mock_battery(), no_style),
+            ("bar_battery_inside", BatteryStatus::from_raw(1, 9, 100, u32::MAX), |c| {
+                c.battery_percent_inside = true
+            }),
+        ];
+        for (name, status, style) in styles {
+            BATTERY.with(|b| b.set(status));
+            STYLE.with(|s| s.set(style));
+            failures += i32::from(!bar_png(
+                dir,
+                &format!("{name}{suffix}.png"),
+                m,
+                None,
+                DisplayMode::IconText,
+                None,
+                false,
+                wifi,
+            ));
+            BATTERY.with(|b| b.set(BatteryStatus::NONE));
+            STYLE.with(|s| s.set(no_style));
+        }
         // Style variants: transparent background, coloured background, independent sizes.
         let styles: [(&str, Style); 5] = [
             ("bar_opacity_0", |c| c.bar_opacity = 0),
@@ -821,6 +859,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_calendar", 8),
             ("popup_network", 0),
             ("popup_network_offline", 9),
+            ("popup_battery", 0),
             ("popup_power", 4),
             ("popup_power_update", 4),
             ("popup_settings", 3),
@@ -863,4 +902,18 @@ pub fn run(dir: &str) -> i32 {
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn battery_mock_shows_the_module_and_the_default_does_not() {
+        let cfg = Config::default();
+        assert!(!render::visible_modules(&cfg, BatteryStatus::NONE.present).contains(&ItemId::Battery));
+        assert!(render::visible_modules(&cfg, mock_battery().present).contains(&ItemId::Battery));
+        let b = mock_battery();
+        assert_eq!((b.percent, b.ac, b.charging, b.seconds_left), (64, false, false, Some(11520)));
+    }
 }
