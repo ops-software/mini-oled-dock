@@ -612,6 +612,18 @@ pub fn run_install_cli(tag: &str) -> i32 {
             return 1;
         }
     };
+    // Run from the installed dock.exe, waiting would keep that image mapped: the installer's rename
+    // over it fails and `exe_in_use_by_other` counts this process as a holder, so the install could
+    // never succeed. Let it run on its own; it logs its outcome.
+    let from_installed = match (std::env::current_exe(), crate::autostart::installed_exe()) {
+        (Ok(me), Ok(dest)) => crate::autostart::same_file(&me, &dest),
+        _ => false,
+    };
+    if from_installed {
+        drop(child);
+        say("Installer started; see dock.log.");
+        return 0;
+    }
     match wait_exit(&child, INSTALL_WAIT) {
         Some(0) => {
             say(&format!("Installed {tag}."));
@@ -619,12 +631,22 @@ pub fn run_install_cli(tag: &str) -> i32 {
         }
         Some(code) => {
             say(&format!("Installer exited with {code}."));
-            code
+            cli_code(code)
         }
         None => {
             say(&format!("The installer did not finish within {} s.", INSTALL_WAIT.as_secs()));
             1
         }
+    }
+}
+
+/// Process exit code for the installer's `code`: 0..=255 is kept, anything else (an NTSTATUS from a
+/// crash such as 0xC0000005, or a value above 255) becomes 1, so it is never clamped to 0. Pure.
+fn cli_code(code: i32) -> i32 {
+    if (0..=255).contains(&code) {
+        code
+    } else {
+        1
     }
 }
 
@@ -759,6 +781,15 @@ pub fn on_idle(busy: bool) {
 mod tests {
     use super::*;
     use crate::update_release::{parse_release, Release, Version, RELEASE_FIXTURE};
+
+    #[test]
+    fn cli_code_never_turns_a_failure_into_success() {
+        assert_eq!(cli_code(0), 0);
+        assert_eq!(cli_code(3), 3);
+        assert_eq!(cli_code(255), 255);
+        assert_eq!(cli_code(256), 1);
+        assert_eq!(cli_code(-1073741819), 1); // 0xC0000005
+    }
 
     #[test]
     fn status_from_config_trusts_only_newer_tags() {
