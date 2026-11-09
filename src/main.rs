@@ -98,9 +98,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
     KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
-    UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
+    UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MSGFLT_ALLOW, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
     WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
@@ -592,7 +592,15 @@ fn create_window(inst: HINSTANCE, g: &ui::Geom) -> Option<HWND> {
         )
     };
     match r {
-        Ok(h) => Some(h),
+        Ok(h) => {
+            // `dock --settings` posts from a medium-integrity terminal to this elevated window; UIPI would
+            // drop the message. It only opens the dock's own Settings window, so allowing it is harmless.
+            // SAFETY: `h` is the window just created by this thread; no optional struct.
+            if let Err(e) = unsafe { ChangeWindowMessageFilterEx(h, WM_DOCK_OPEN_SETTINGS, MSGFLT_ALLOW, None) } {
+                log!("ChangeWindowMessageFilterEx(WM_DOCK_OPEN_SETTINGS) failed: {e}");
+            }
+            Some(h)
+        }
         Err(e) => {
             log!("CreateWindowExW failed: {e}");
             None
@@ -979,7 +987,11 @@ fn open_settings_cli() -> u8 {
     // SAFETY: PostMessageW is thread-safe; if the window no longer exists it just fails.
     match unsafe { PostMessageW(Some(h), WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) } {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(e) => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "dock: could not reach the dock (access denied?): {e}");
+            1
+        }
     }
 }
 
