@@ -164,6 +164,10 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `win_opens_start` | `false` | One tap of Win opens the dock and the Start menu together |
 | `start_style` | `"vertical"` | Start menu layout: `"vertical"` or `"horizontal"` |
 | `audio_layout` | `"MOSX"` | Volume popup sections in order (M master, O output, S spatial, X mixer; lowercase = collapsed, `-` in front = hidden); normally set from the popup |
+| `update_check` | `true` | Ask GitHub once a day whether a newer release exists (badge only) |
+| `update_auto_install` | `false` | Download, verify and install new releases by themselves |
+
+`last_update_check` and `update_available` are written by the dock itself.
 
 The bar height follows the tallest content; the defaults give the original 36 px bar. An old `bar_size` value (`"small"`, `"medium"`, `"large"`) is converted once into the four sizes.
 

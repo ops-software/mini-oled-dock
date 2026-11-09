@@ -463,6 +463,14 @@ pub struct Config {
     /// true once the `notif` thread has already asked for notification access once
     /// (`RequestAccessAsync`): the prompt is not shown again on every start.
     pub notif_prompted: bool,
+    /// true = once a day ask GitHub whether a newer release exists (badge only).
+    pub update_check: bool,
+    /// true = also download, verify and install a new release by itself when it is quiet.
+    pub update_auto_install: bool,
+    /// Internal: UTC time (RFC 3339) of the last successful update check, "" = never.
+    pub last_update_check: String,
+    /// Internal: tag of the newest release found by the last check, "" = none.
+    pub update_available: String,
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -525,6 +533,10 @@ impl Default for Config {
             modules_order: DEFAULT_MODULES_ORDER.iter().map(|s| s.to_string()).collect(),
             audio_layout: AudioLayout::default(),
             notif_prompted: false,
+            update_check: true,
+            update_auto_install: false,
+            last_update_check: String::new(),
+            update_available: String::new(),
         }
     }
 }
@@ -853,6 +865,19 @@ fn render(c: &Config) -> String {
   // value = the name to show. Example: {{ "code.exe": "VS Code" }}
   "names": {names},
 
+  // Updates. Once a day the dock asks GitHub (api.github.com) whether a newer release exists and
+  // shows a badge on Settings; nothing is downloaded until you choose "Update now" in Settings ->
+  // Updates. false = never ask by itself ("Check now" still works).
+  "update_check": {update_check},
+
+  // true = also download, verify (SHA-256 + version) and install a new release by itself, the next
+  // time no popup or Settings window is open and no fullscreen app is in front.
+  "update_auto_install": {update_auto_install},
+
+  // Internal: time of the last successful check (UTC) and the newest release found. Leave as is.
+  "last_update_check": {last_update_check},
+  "update_available": {update_available},
+
   // Internal: set once the notification-access prompt has been shown. Leave as is.
   "notif_prompted": {notif}
 }}
@@ -891,6 +916,10 @@ fn render(c: &Config) -> String {
         start_pins = js_block(&c.start_pins),
         names = js_block(&c.names),
         notif = c.notif_prompted,
+        update_check = c.update_check,
+        update_auto_install = c.update_auto_install,
+        last_update_check = js(&c.last_update_check),
+        update_available = js(&c.update_available),
     )
 }
 
@@ -1274,6 +1303,28 @@ mod tests {
         let t = "// hi\n{ /* b */ \"names\": {\"a\": \"x // y \\\" /* z */\"} } // end";
         let c = parse(t).unwrap();
         assert_eq!(c.names["a"], "x // y \" /* z */");
+    }
+
+    #[test]
+    fn update_keys_default_and_roundtrip() {
+        let d = Config::default();
+        assert!(d.update_check && !d.update_auto_install);
+        assert!(d.last_update_check.is_empty() && d.update_available.is_empty());
+        let c = Config {
+            update_check: false,
+            update_auto_install: true,
+            last_update_check: "2026-11-09T12:34:56Z".into(),
+            update_available: "v1.4.1".into(),
+            ..Config::default()
+        };
+        let r = render(&c);
+        assert!(r.contains("\"update_check\": false") && r.contains("\"update_auto_install\": true"));
+        assert!(
+            r.contains("\"last_update_check\": \"2026-11-09T12:34:56Z\"")
+                && r.contains("\"update_available\": \"v1.4.1\"")
+        );
+        assert_eq!(parse(&r).unwrap(), c);
+        assert!(parse("{}").unwrap().update_check); // an old config.json gets the default
     }
 
     #[test]
