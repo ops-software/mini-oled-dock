@@ -219,7 +219,7 @@ impl<'de> Deserialize<'de> for Background {
     }
 }
 
-/// Preset background colours offered by the Settings popup: dark tones that keep white text readable.
+/// Preset background colours offered by the Settings window: dark tones that keep white text readable.
 pub const BACKGROUND_PRESETS: [(&str, Background); 7] = [
     ("Black", Background::BLACK),
     ("Graphite", Background::DARK),
@@ -816,7 +816,7 @@ fn render(c: &Config) -> String {
   "module_size": {module_size},
 
   // Background colour of the bar and the popups as a hex code, #RRGGBB (e.g. #000000, pure black,
-  // ideal for OLED). The Settings popup offers dark presets and a colour picker.
+  // ideal for OLED). The Settings window offers dark presets and a colour picker.
   "background": "{bg}",
 
   // Opacity of the bar background in percent, 0-100 (0 = only text and icons are visible; the

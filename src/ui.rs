@@ -2696,7 +2696,7 @@ pub struct Screen {
     pub primary: bool,
 }
 
-/// Displays offered by the Settings popup (more are ignored: the segments would not fit).
+/// Displays offered by the Settings window (more are ignored: the segments would not fit).
 const MAX_SCREENS: usize = 6;
 const SCREEN_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 

@@ -13,7 +13,7 @@
 //! header can be dragged vertically to reorder the sections: the press / move / release path of the
 //! sliders (`Content::drag` / `release`, mouse captured by `popup`) drives it, an insertion line
 //! marks the drop slot. A press without movement still expands / collapses. Every change is saved at
-//! once (`config::modify`, the path the Settings popup uses), the hint of the hovered control is
+//! once (`config::modify`, the path the Settings window uses), the hint of the hovered control is
 //! shown in the link row.
 //!
 //! Loading (memory budget): a section reads its data from Windows ONLY while it is on screen with
@@ -412,7 +412,7 @@ impl AudioPopup {
         }
     }
 
-    /// The layout changed: saved now (like the Settings popup; in memory only if the file cannot be
+    /// The layout changed: saved now (like the Settings window; in memory only if the file cannot be
     /// written), the loading follows, relayout.
     fn commit(&mut self) -> Reply {
         let l = self.layout;

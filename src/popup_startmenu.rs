@@ -28,10 +28,11 @@
 //! popup itself over its own surface (no second window), right-aligned to the button and just above
 //! it, like the native Windows 11 one. It offers the entries of the power popup (`popup_power`:
 //! labels, glyphs and actions shared from there, without the autostart toggle): a system action runs
-//! after the Start closes, "Settings" switches to the Settings popup. While it is open a backdrop
-//! hit covers the rest of the menu: a click anywhere else, a right click or Esc closes only the
-//! flyout (Esc does not close the Start); typing closes it and goes on searching. It lives in the
-//! content, so it is gone when the Start closes.
+//! after the Start closes, "Settings" closes the Start menu and opens the Settings window
+//! (`popup_power::run_choice`). While it is open a backdrop hit covers the rest of the menu: a
+//! click anywhere else, a right click or Esc closes only the flyout (Esc does not close the Start);
+//! typing closes it and goes on searching. It lives in the content, so it is gone when the Start
+//! closes.
 //!
 //! DATA: the catalog and the icons live in a UI-thread store (`STORE`) filled only while a Start menu
 //! is open. Every open asks the shell thread for a fresh catalog (`ShellRequest::ListStartApps`);
