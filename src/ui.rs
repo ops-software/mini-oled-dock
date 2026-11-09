@@ -3213,6 +3213,19 @@ fn fullscreen_window(mon: &RECT) -> Option<HWND> {
     full.then_some(fg)
 }
 
+/// A fullscreen or borderless app has the foreground on its monitor (the auto-installer must not
+/// interrupt it).
+pub fn foreground_is_fullscreen() -> bool {
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return false;
+    }
+    // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
+    let hm = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
+    monitor_info(hm).is_some_and(|mi| fullscreen_window(&mi.rcMonitor).is_some())
+}
+
 /// `EVENT_SYSTEM_FOREGROUND` (forwarded by `WM_DOCK_APPS_DIRTY`): if the dock is over a fullscreen
 /// app and the foreground moves to another window that is not ours (the user went back to the game),
 /// the dock hides immediately. A fullscreen app taking the foreground while the dock is

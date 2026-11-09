@@ -103,9 +103,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use msg::{
     TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
-    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG, WM_DOCK_NOTIF,
-    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE,
-    WM_DOCK_TRAY_CHANGED, WM_DOCK_WINKEY,
+    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG,
+    WM_DOCK_NOTIF, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT,
+    WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -359,8 +359,16 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 if config::poll_changed() {
                     tray_host::invalidate_trust_cache();
                     ui::on_config_changed();
+                    update::sync_timer(h);
                 }
                 trim_tick();
+                if update::auto_install_pending() {
+                    update::on_idle(popup::is_open() || ui::foreground_is_fullscreen());
+                }
+                LRESULT(0)
+            }
+            TIMER_UPDATE_CHECK => {
+                update::on_timer(h);
                 LRESULT(0)
             }
             TIMER_RAM => {
@@ -442,6 +450,11 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_CONFIG_APPLY => {
             ui::on_config_changed();
+            update::sync_timer(h);
+            LRESULT(0)
+        }
+        WM_DOCK_UPDATE => {
+            update::on_changed(h);
             LRESULT(0)
         }
         WM_DOCK_TASKBAR_EVENT => {
@@ -737,6 +750,7 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
         TIMER_CLOCK,
         TIMER_TRAY_REANNOUNCE,
         TIMER_HOVER_PICKER,
+        TIMER_UPDATE_CHECK,
     ] {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), id) };
@@ -901,6 +915,7 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     set_timer(h, TIMER_HOUSEKEEPING, 2000);
     set_timer(h, TIMER_RAM, 30_000);
     set_timer(h, TIMER_SECOND, 1000);
+    update::init(h);
     mem::log_memory();
 
     // The window already exists (HWND_RAW set): the callback can post messages to it.

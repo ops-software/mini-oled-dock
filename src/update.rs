@@ -5,7 +5,8 @@
 //! kept in `STATE` and mirrored into `config.json` (`last_update_check`, `update_available`).
 //! `stage()` downloads a release into the admin-only `<data>\update\<tag>\` folder and verifies it
 //! (SHA-256, then `--version`); `install_now()` hands the verified exe to `--install --quiet`.
-//! The timer is added by a later task.
+//! `init`/`sync_timer`/`on_timer` drive the daily check (`TIMER_UPDATE_CHECK` on the dock window);
+//! `on_idle` installs a staged release when `update_auto_install` is on and nothing is open.
 
 // Wired into the dock by later tasks; until then some items are unused.
 #![allow(dead_code)]
@@ -18,18 +19,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
 
 use crate::config::{self, Config};
 use crate::datadir;
-use crate::msg::WM_DOCK_UPDATE;
+use crate::msg::{TIMER_UPDATE_CHECK, WM_DOCK_UPDATE};
 use crate::shell_thread::{self, ShellRequest};
 use crate::update_release::{
-    self, host_allowed, is_newer, parse_release, parse_sha256_file, parse_tag, release_page_url, rfc3339_utc,
-    version_output_matches, Asset, Release, Version, API_MAX_BYTES, EXE_ASSET, EXE_MAX_BYTES, LATEST_API_URL,
-    SHA_ASSET, SHA_MAX_BYTES,
+    self, host_allowed, is_newer, next_check_delay_ms, parse_release, parse_sha256_file, parse_tag, release_page_url,
+    rfc3339_utc, version_output_matches, Asset, Release, Version, API_MAX_BYTES, CHECK_PERIOD_MS, EXE_ASSET,
+    EXE_MAX_BYTES, FIRST_CHECK_MS, LATEST_API_URL, RETRY_MS, SHA_ASSET, SHA_MAX_BYTES,
 };
 use crate::winhttp;
 
@@ -257,7 +258,16 @@ fn now_unix() -> u64 {
 
 /// Starts a check on the worker thread. false = an update operation is already running.
 pub fn check_now() -> bool {
-    spawn_worker(check_once)
+    spawn_worker(|| {
+        check_once();
+        // With `update_auto_install` on, a newer release is downloaded and verified right away, so
+        // the idle gate (`on_idle`) only has to start the installer. With it off nothing is downloaded.
+        if config::get().update_auto_install {
+            if let Some(rel) = latest_target(Version::current()) {
+                let _ = stage(&rel);
+            }
+        }
+    })
 }
 
 /// One check, on the worker thread: asks GitHub, folds the answer into the status and the config.
@@ -640,6 +650,109 @@ pub fn run_check_cli() -> i32 {
     }
 }
 
+// ------------------------------------------------------------ timer and auto-install
+
+/// true while `TIMER_UPDATE_CHECK` is armed.
+static ARMED: AtomicBool = AtomicBool::new(false);
+/// true while the check that is running was started by the timer (not by the user).
+static SCHEDULED: AtomicBool = AtomicBool::new(false);
+/// The tag `on_idle` last tried to install: one automatic attempt per release, so a failing
+/// installer is not restarted every 2 s.
+static AUTO_TRIED: Mutex<String> = Mutex::new(String::new());
+
+/// Dock start: status from the (now loaded) config, old stages cleaned, timer armed.
+pub fn init(h: HWND) {
+    let st = status_from_config(&config::get(), Version::current());
+    with_state(|s| *s = st);
+    let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(cleanup_stages);
+    if let Err(e) = spawned {
+        crate::log!("update: cannot start the cleanup thread: {e}");
+    }
+    sync_timer(h);
+}
+
+/// Arms or kills the check timer according to `update_check`.
+pub fn sync_timer(h: HWND) {
+    let on = config::get().update_check;
+    if on && !ARMED.load(Ordering::Relaxed) {
+        // SAFETY: `h` is the dock window, owned by the calling (UI) thread.
+        if unsafe { SetTimer(Some(h), TIMER_UPDATE_CHECK, FIRST_CHECK_MS, None) } == 0 {
+            crate::log!("update: SetTimer failed");
+            return;
+        }
+        ARMED.store(true, Ordering::Relaxed);
+        crate::log!("update: automatic check on");
+    } else if !on && ARMED.load(Ordering::Relaxed) {
+        // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+        let _ = unsafe { KillTimer(Some(h), TIMER_UPDATE_CHECK) };
+        ARMED.store(false, Ordering::Relaxed);
+        crate::log!("update: automatic check off");
+    }
+}
+
+/// `TIMER_UPDATE_CHECK`: checks when 24 h have passed since the last check, else waits for the rest.
+pub fn on_timer(h: HWND) {
+    let last = update_release::parse_rfc3339_utc(&config::get().last_update_check);
+    let delay = next_check_delay_ms(now_unix(), last);
+    let next = if delay == 0 {
+        SCHEDULED.store(true, Ordering::Relaxed);
+        if !check_now() {
+            SCHEDULED.store(false, Ordering::Relaxed);
+        }
+        CHECK_PERIOD_MS
+    } else {
+        delay
+    };
+    // Re-arming replaces the interval: still one timer.
+    // SAFETY: `h` is the dock window, owned by the calling (UI) thread.
+    if unsafe { SetTimer(Some(h), TIMER_UPDATE_CHECK, next, None) } == 0 {
+        crate::log!("update: SetTimer failed");
+    }
+}
+
+/// `WM_DOCK_UPDATE` on the UI thread.
+pub fn on_changed(h: HWND) {
+    let st = status();
+    if SCHEDULED.load(Ordering::Relaxed) && st.phase != Phase::Checking {
+        SCHEDULED.store(false, Ordering::Relaxed);
+        if matches!(st.outcome, Outcome::CouldNotCheck(_)) && ARMED.load(Ordering::Relaxed) {
+            // SAFETY: `h` is the dock window, owned by the calling (UI) thread.
+            if unsafe { SetTimer(Some(h), TIMER_UPDATE_CHECK, RETRY_MS, None) } == 0 {
+                crate::log!("update: SetTimer failed");
+            }
+        }
+    }
+    // An open power popup redraws its badge.
+    crate::popup::tick_soon(10);
+}
+
+/// A verified release waits for a quiet moment and the user asked for automatic installs.
+pub fn auto_install_pending() -> bool {
+    let st = status();
+    let tried = AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = st.available.as_ref().is_some_and(|a| *tried != a.tag);
+    config::get().update_auto_install && st.staged && st.phase == Phase::Idle && fresh
+}
+
+/// Pure gate: install only when the option is on, a verified release is staged, the worker is idle
+/// and nothing (popup, fullscreen app) would be interrupted.
+pub(crate) fn auto_install_due(auto_install: bool, staged: bool, phase: Phase, busy: bool) -> bool {
+    auto_install && staged && phase == Phase::Idle && !busy
+}
+
+/// From `TIMER_HOUSEKEEPING` when `auto_install_pending()`; `busy` = a popup is open or a fullscreen
+/// app has the foreground.
+pub fn on_idle(busy: bool) {
+    let st = status();
+    if !auto_install_due(config::get().update_auto_install, st.staged, st.phase, busy) {
+        return;
+    }
+    let Some(a) = st.available else { return };
+    *AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner()) = a.tag.clone();
+    crate::log!("update: auto-install {}", a.tag);
+    install_now();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +813,15 @@ mod tests {
         let t = Instant::now();
         assert!(run_capture(&system32("ping.exe"), &["-n", "6", "127.0.0.1"], Duration::from_millis(300)).is_err());
         assert!(t.elapsed() < Duration::from_secs(3)); // killed, not waited for
+    }
+
+    #[test]
+    fn auto_install_gate() {
+        assert!(auto_install_due(true, true, Phase::Idle, false));
+        assert!(!auto_install_due(false, true, Phase::Idle, false)); // option off
+        assert!(!auto_install_due(true, false, Phase::Idle, false)); // nothing verified yet
+        assert!(!auto_install_due(true, true, Phase::Downloading, false));
+        assert!(!auto_install_due(true, true, Phase::Idle, true)); // popup / fullscreen app
     }
 
     #[test]
