@@ -668,6 +668,11 @@ enum Txt {
 /// Creates the GDI resources (memory DCs, Segoe UI Variable Text fonts -> Segoe UI fallback, see
 /// `Fonts`) for the given `metrics` and `sizes`. The DIB is born with the first `resize`.
 pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
+    init_inner(metrics, sizes, true)
+}
+
+/// `init` with the log line optional: `paint_offscreen` runs it on every mini bar rebuild.
+fn init_inner(metrics: Metrics, sizes: BarSizes, log: bool) -> Result<(), String> {
     destroy();
     let gdi = Gdi::new()?;
     // On error `gdi` is dropped, which deletes the DCs.
@@ -675,7 +680,9 @@ pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
     GFX.with(|c| {
         *c.borrow_mut() = Some(Gfx { metrics, gdi, sizes, fonts, pill_w: 0 });
     });
-    log!("render::init: dpi={} {sizes:?}", metrics.dpi);
+    if log {
+        log!("render::init: dpi={} {sizes:?}", metrics.dpi);
+    }
     Ok(())
 }
 
@@ -1490,11 +1497,11 @@ pub(crate) fn snapshot_pixels() -> Option<(i32, i32, Vec<u32>)> {
 /// bar's size, for the mini live preview of the Settings window. Goes through the real `layout`,
 /// `resize` and `paint` at `scene.metrics` / `scene.sizes`. The bar's own `Gfx` is taken out of `GFX`
 /// first and always put back, so the bar is untouched; works with no bar `Gfx` at all (preview mode).
-/// Never pumps messages.
+/// Never pumps messages and writes nothing to the log.
 pub(crate) fn paint_offscreen(scene: &Scene<'_>) -> Option<(i32, i32, Vec<u32>)> {
     let saved = GFX.with(|c| c.borrow_mut().take());
     let out = (|| {
-        init(scene.metrics, scene.sizes).ok()?;
+        init_inner(scene.metrics, scene.sizes, false).ok()?;
         let lay = layout(scene);
         let h = bar_height(scene.metrics, scene.sizes);
         resize(lay.width, h).ok()?;
