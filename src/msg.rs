@@ -65,6 +65,9 @@ pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
 /// dock's Start menu (`popup_startmenu`). wParam = 0, lParam = 0. Posted by the `hook` thread
 /// INSTEAD of the second `WM_DOCK_TOGGLE`. `main` calls `ui::open_start_menu()`.
 pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
+/// Popups, the quick-links menu and `--settings` -> dock window: open the Settings window (or bring
+/// the open one to the front). wParam = lParam = 0. `main` calls `settings_window::open()`.
+pub const WM_DOCK_OPEN_SETTINGS: u32 = WM_APP + 40;
 /// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
 /// Consecutive posts may be coalesced: re-read `update::status()`.
 #[allow(dead_code)] // posted by `update::notify`; the UI side is wired by the Settings window
@@ -146,6 +149,14 @@ pub const TIMER_POPUP_FOCUS: usize = 32;
 /// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
 /// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
 pub const TIMER_POPUP_START_RELEASE: usize = 33;
+
+// SETTINGS window timers (`DockSettings` hwnd; handled only by `settings_window`). Timer ids are per
+// HWND, so they could not clash with the dock window's private ones (`ui.rs`: 40, 41, 42), but 50 and
+// 51 keep this registry unambiguous.
+/// 1 s, ONLY while the Settings window is open: import and update status, memory figures.
+pub const TIMER_SETTINGS_TICK: usize = 50;
+/// One-shot: sends the bar rebuild (`WM_DOCK_CONFIG_APPLY`) that the drag throttle skipped.
+pub const TIMER_SETTINGS_APPLY: usize = 51;
 
 // --------------------------------------------- context menu command ids
 

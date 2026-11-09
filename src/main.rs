@@ -64,6 +64,7 @@ mod preview;
 mod render;
 mod settings_pages;
 mod settings_view;
+mod settings_window;
 mod sha256;
 mod shell_thread;
 mod start_import;
@@ -108,8 +109,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use msg::{
     TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
     TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG,
-    WM_DOCK_NOTIF, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT,
-    WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
+    WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU,
+    WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -311,7 +312,8 @@ thread_local! {
 fn trim_tick() {
     let now = Instant::now();
     let visible = ui::is_visible();
-    let popup = popup::is_open();
+    // An open Settings window counts like an open popup: no trim under the user's hands.
+    let popup = popup::is_open() || settings_window::is_open();
     let go = TRIM.with(|s| {
         let mut s = s.borrow_mut();
         let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
@@ -346,6 +348,12 @@ fn trim_tick() {
     }
 }
 
+/// `busy` of `update::on_idle`: an automatic install would interrupt an open popup, the open Settings
+/// window or a fullscreen app.
+fn auto_install_busy(popup: bool, settings: bool, fullscreen: bool) -> bool {
+    popup || settings || fullscreen
+}
+
 // ------------------------------------------------------------ window proc
 
 /// "Core" messages handled here (exit, keyboard hook, service timers, taskbar, session);
@@ -367,7 +375,13 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 }
                 trim_tick();
                 if update::auto_install_pending() {
-                    update::on_idle(popup::is_open() || ui::foreground_is_fullscreen());
+                    // No automatic install while a popup or the Settings window is open, or over a
+                    // fullscreen app.
+                    update::on_idle(auto_install_busy(
+                        popup::is_open(),
+                        settings_window::is_open(),
+                        ui::foreground_is_fullscreen(),
+                    ));
                 }
                 LRESULT(0)
             }
@@ -441,6 +455,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_DOCK_TRAY_CHANGED => {
             ui::on_tray_changed(wp.0);
             popup::on_tray_changed();
+            settings_window::on_tray_changed();
             LRESULT(0)
         }
         WM_DOCK_NOTIF => {
@@ -457,8 +472,13 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             update::sync_timer(h);
             LRESULT(0)
         }
+        WM_DOCK_OPEN_SETTINGS => {
+            settings_window::open();
+            LRESULT(0)
+        }
         WM_DOCK_UPDATE => {
             update::on_changed(h);
+            settings_window::on_update_changed();
             LRESULT(0)
         }
         WM_DOCK_TASKBAR_EVENT => {
@@ -765,6 +785,8 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
     // The native taskbar right after: it is the thing that must not stay hidden.
     taskbar::shutdown();
     picker::shutdown();
+    // A drag still held in the Settings window is saved before the window goes.
+    settings_window::shutdown();
     popup::shutdown();
     // SAFETY: as above.
     let _ = unsafe { UnregisterHotKey(Some(h), HOTKEY_ID) };
@@ -1120,6 +1142,14 @@ mod tests {
 
     fn p(a: &[&str]) -> Result<Args, String> {
         parse_args_from(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_auto_install_while_settings_is_open() {
+        assert!(auto_install_busy(false, true, false), "Settings window open");
+        assert!(auto_install_busy(true, false, false), "popup open");
+        assert!(auto_install_busy(false, false, true), "fullscreen app");
+        assert!(!auto_install_busy(false, false, false));
     }
 
     #[test]

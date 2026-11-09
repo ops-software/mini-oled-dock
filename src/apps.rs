@@ -1072,10 +1072,7 @@ pub fn is_taskbar_window(h: HWND, own: HWND) -> bool {
         let mut cls = [0u16; 64];
         let n = GetClassNameW(h, &mut cls).max(0) as usize;
         let class = String::from_utf16_lossy(&cls[..n.min(cls.len())]);
-        if matches!(
-            class.as_str(),
-            "Progman" | "WorkerW" | "Windows.UI.Core.CoreWindow" | "Windows.Internal.Shell.TabProxyWindow"
-        ) {
+        if excluded_class(&class) {
             return false;
         }
         // Property set by Explorer on windows removed from the taskbar.
@@ -1094,9 +1091,28 @@ pub fn is_taskbar_window(h: HWND, own: HWND) -> bool {
     true
 }
 
+/// Window classes that are never bar apps: the desktop, shell `CoreWindow`s, Edge's tab proxies and
+/// the dock's own Settings window (a dock window, not an app).
+fn excluded_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman"
+            | "WorkerW"
+            | "Windows.UI.Core.CoreWindow"
+            | "Windows.Internal.Shell.TabProxyWindow"
+            | crate::settings_window::CLASS
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_window_is_not_an_app() {
+        assert!(excluded_class("DockSettings") && excluded_class("Progman") && excluded_class("WorkerW"));
+        assert!(!excluded_class("Notepad"));
+    }
 
     #[test]
     fn key_normalization() {

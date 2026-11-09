@@ -22,7 +22,7 @@
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
 //!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
-//!    (Task Manager), battery (interim: `ms-settings:batterysaver`), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
+//!    (Task Manager), battery (popup `popup_battery`; without popups `ms-settings:batterysaver`), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
 //!    `popup_startmenu`, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
@@ -794,6 +794,8 @@ pub fn on_config_changed() {
     if let Some(a) = popup::current().and_then(item_for_popup).and_then(anchor_for) {
         popup::reanchor(a);
     }
+    // Last: the Settings window shows the values the bar now uses.
+    crate::settings_window::on_config_changed();
 }
 
 /// Starts or stops the notification thread and the audio controller to match `show_notifications` /
@@ -2745,7 +2747,8 @@ pub fn screens() -> Vec<Screen> {
 }
 
 /// The display the bar belongs on: `config.monitor` if it is connected, otherwise the primary one.
-fn dock_hmonitor() -> HMONITOR {
+/// `pub(crate)`: the Settings window opens centred on it.
+pub(crate) fn dock_hmonitor() -> HMONITOR {
     let want = config::get().monitor.clone();
     if want.eq_ignore_ascii_case(config::MONITOR_POINTER) {
         return followed_hmonitor();
@@ -3230,13 +3233,23 @@ fn restore_foreground(prev: HWND) {
     log!("  foreground returned to the previous window -> {}", ok.as_bool());
 }
 
-/// true if `h` belongs to our process (dock, popups).
+/// true if `h` is one of the dock's own surfaces (bar, popups, picker, tray host). The Settings
+/// window lives in this process too but counts as a normal app window: the bar remembers it as the
+/// previous foreground (`PREV_FG`) and gives the focus back to it, never takes the focus from it on
+/// hide, a popup is not pushed in front of it, and over a fullscreen app activating it is like
+/// going to any other window.
 pub fn is_own_window(h: HWND) -> bool {
     let mut pid = 0u32;
     // SAFETY: `pid` is writable; `h` can be any HWND (fails with pid 0).
     unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
     // SAFETY: no preconditions.
-    pid != 0 && pid == unsafe { GetCurrentProcessId() }
+    let in_process = pid != 0 && pid == unsafe { GetCurrentProcessId() };
+    dock_surface(in_process, in_process && crate::settings_window::is_window(h))
+}
+
+/// `is_own_window` decision: a window of this process that is not the Settings window.
+fn dock_surface(in_process: bool, settings: bool) -> bool {
+    in_process && !settings
 }
 
 /// true if the left or right mouse button is pressed right now.
@@ -3603,6 +3616,13 @@ mod tests {
         assert_eq!(effective_fg(3, true, 9, false), 3, "previous window closed");
         assert_eq!(effective_fg(3, true, 0, false), 3, "nothing remembered");
         assert_eq!(effective_fg(0, false, 9, true), 0, "null foreground: not ours");
+    }
+
+    #[test]
+    fn settings_window_is_not_a_dock_surface() {
+        assert!(dock_surface(true, false), "bar, popups, picker, tray host");
+        assert!(!dock_surface(true, true), "the Settings window is treated like an app window");
+        assert!(!dock_surface(false, false), "another process");
     }
 
     #[test]

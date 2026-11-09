@@ -802,8 +802,8 @@ pub(crate) fn auto_install_due(auto_install: bool, staged: bool, phase: Phase, b
     auto_install && staged && phase == Phase::Idle && !busy
 }
 
-/// From `TIMER_HOUSEKEEPING` when `auto_install_pending()`; `busy` = a popup is open or a fullscreen
-/// app has the foreground.
+/// From `TIMER_HOUSEKEEPING` when `auto_install_pending()`; `busy` = a popup or the Settings window is
+/// open, or a fullscreen app has the foreground.
 pub fn on_idle(busy: bool) {
     let st = status();
     if !auto_install_due(config::get().update_auto_install, st.staged, st.phase, busy) {

@@ -97,8 +97,9 @@ const SWATCH_RIM_ALPHA: u32 = 70;
 const SV_H: i32 = 112;
 const HUE_H: i32 = 12;
 const HEX_ROW_H: i32 = 28;
-const PART_SV: usize = 0;
-const PART_HUE: usize = 1;
+/// Parts of the picker row: the saturation/value area and the hue strip (dragged by the window).
+pub(crate) const PART_SV: usize = 0;
+pub(crate) const PART_HUE: usize = 1;
 /// Buttons.
 const BTN_H: i32 = 28;
 const BTN_PAD: i32 = 14;
