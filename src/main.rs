@@ -165,6 +165,8 @@ pub struct Args {
     pub autostart: bool,
     /// `--console`: attach the parent console (log on stdout, Ctrl+C) in normal runs.
     pub console: bool,
+    /// `--version`: print "mini-oled-dock X.Y.Z" and exit 0.
+    pub version: bool,
 }
 
 static ARGS: OnceLock<Args> = OnceLock::new();
@@ -199,6 +201,7 @@ fn parse_args() -> Result<Args, String> {
             "--uninstall" => a.uninstall = true,
             "--autostart" => a.autostart = true,
             "--console" => a.console = true,
+            "--version" => a.version = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -839,6 +842,11 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
 
 // ------------------------------------------------------------------ main
 
+/// First line of `--version`.
+fn version_line() -> String {
+    format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn usage() {
     use std::io::Write;
     let mut e = std::io::stderr();
@@ -876,6 +884,13 @@ fn main() -> std::process::ExitCode {
         }
     };
     let args = ARGS.get_or_init(|| args);
+
+    // --version: no data folder, logger or mutex.
+    if args.version {
+        attach_console();
+        println!("{}", version_line());
+        return std::process::ExitCode::SUCCESS;
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -961,4 +976,14 @@ fn main() -> std::process::ExitCode {
     };
     logger::stop(log_thread);
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_line_matches_cargo() {
+        assert_eq!(version_line(), format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION")));
+    }
 }

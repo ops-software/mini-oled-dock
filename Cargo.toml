@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.87"
 description = "A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with no UI framework."
 license = "MIT"
-repository = "https://github.com/gitgiovik/mini-oled-dock"
+repository = "https://github.com/ops-software/mini-oled-dock"
 readme = "README.md"
 keywords = ["windows", "dock", "taskbar", "oled", "win32"]
 categories = ["os::windows-apis", "gui"]
@@ -75,6 +75,7 @@ windows = { version = "0.62.2", features = [
 
 [build-dependencies]
 embed-manifest = "1.5.1"
+winresource = "0.1.19"
 
 [profile.release]
 opt-level = "z"

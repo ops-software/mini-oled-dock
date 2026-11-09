@@ -38,6 +38,16 @@ fn main() {
             // A missing manifest must not fail the build, but it must be reported.
             println!("cargo:warning=cannot embed the manifest: {e}");
         }
+        // Version resource (Task Manager name, file properties). No manifest here: embed-manifest owns it.
+        let mut res = winresource::WindowsResource::new();
+        res.set("ProductName", "mini-oled-dock")
+            .set("FileDescription", "mini-oled-dock")
+            .set("LegalCopyright", "MIT")
+            .set("OriginalFilename", "dock.exe")
+            .set("InternalName", "dock");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=cannot embed the version resource: {e}");
+        }
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             for dll in DELAY_LOAD {
                 println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
@@ -46,5 +56,6 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=DOCK_NO_MANIFEST");
 }
