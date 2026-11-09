@@ -22,7 +22,7 @@
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
 //!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
-//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
+//!    (Task Manager), battery (interim: `ms-settings:batterysaver`), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
 //!    `popup_startmenu`, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
@@ -322,6 +322,8 @@ struct UiState {
     monitor_dpi: u32,
     entries: Vec<Entry>,
     layout: Layout,
+    /// Last battery sample (`battery::BatteryStatus::NONE` until the module is sampled).
+    battery: crate::battery::BatteryStatus,
     volume: VolumeState,
     hover: Option<ItemId>,
     pressed: Option<ItemId>,
@@ -1020,7 +1022,8 @@ pub fn redraw() {
     let wa = mi.rcWork;
     let max_width = (wa.right - wa.left - 2 * m.px(render::EDGE_MARGIN)).max(0);
     let date = if cfg.show_date && !clock.date.is_empty() { Some(clock.date.as_str()) } else { None };
-    let modules = render::visible_modules(&cfg);
+    let battery = UI.with(|u| u.borrow().battery);
+    let modules = render::visible_modules(&cfg, battery.present);
 
     let now = now_ms();
     let attn: Vec<isize> = ATTN.with(|a| a.borrow().clone());
@@ -1072,6 +1075,11 @@ pub fn redraw() {
                 bell_dnd: st.notif_dnd == Some(true),
                 net: st.net,
                 usage: st.usage,
+                battery: render::BatteryView {
+                    status: battery,
+                    percent: cfg.battery_percent,
+                    inside: cfg.battery_percent_inside,
+                },
             },
             plate: None,
             modules: &modules,
@@ -1963,6 +1971,8 @@ fn on_rbutton_up(lp: LPARAM) {
         }
         Some(ItemId::Volume) => launch_target_str("ms-settings:apps-volume"),
         Some(ItemId::Network) => launch_target_str("ms-settings:network"),
+        // Interim (replaced by the battery popup): the Windows battery page.
+        Some(ItemId::Battery) => launch_target_str("ms-settings:batterysaver"),
         Some(ItemId::Start) => toggle_popup(PopupKind::Start, ItemId::Start),
         Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Right),
         Some(ItemId::Notifications)
@@ -2057,6 +2067,7 @@ fn zone_of(id: ItemId) -> Option<Zone> {
         | ItemId::ShowDesktop
         | ItemId::Power
         | ItemId::Network
+        | ItemId::Battery
         | ItemId::Metrics => Some(Zone::Modules),
     }
 }
@@ -2512,6 +2523,10 @@ fn click_left(id: ItemId) {
         ItemId::Metrics => {
             popup::close("task manager");
             launch_target_str("taskmgr.exe");
+        }
+        ItemId::Battery => {
+            popup::close("battery settings");
+            launch_target_str("ms-settings:batterysaver");
         }
     }
 }
@@ -3516,7 +3531,7 @@ mod tests {
         let old: Vec<String> = ["notifications", "volume", "clock", "show_desktop", "power"].map(String::from).to_vec();
         // Old 5-module config: network / metrics come back next to their default neighbours.
         let full = render::modules_from_names(&old);
-        assert_eq!(full.len(), 7);
+        assert_eq!(full.len(), 8);
         assert_eq!(full[0], ItemId::Metrics);
         assert_eq!(full[2], ItemId::Network);
         // A "start" written by an earlier version is ignored: the Start button is not a module any more.
@@ -3526,7 +3541,7 @@ mod tests {
         let vis: Vec<String> =
             ["power", "notifications", "network", "volume", "clock", "show_desktop"].map(String::from).to_vec();
         let out = reorder_visible_modules(&old, &vis);
-        assert_eq!(out, ["metrics", "power", "notifications", "network", "volume", "clock", "show_desktop"]);
+        assert_eq!(out, ["metrics", "power", "notifications", "network", "battery", "volume", "clock", "show_desktop"]);
     }
 
     #[test]

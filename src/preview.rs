@@ -356,7 +356,7 @@ fn render_bar(
     let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
     STYLE.with(|s| s.get())(&mut cfg);
     let sizes = BarSizes::from_config(&cfg);
-    let modules = render::visible_modules(&cfg);
+    let modules = render::visible_modules(&cfg, false);
     let cfg_start = cfg.show_start_button;
     crate::config::set(cfg);
     if let Err(e) = render::init(m, sizes) {
@@ -395,6 +395,7 @@ fn render_bar(
             bell_dnd: false,
             net,
             usage: Usage { cpu: 12, ram: 48 },
+            battery: render::BatteryView::default(),
         },
         plate: None,
         modules: &modules,
