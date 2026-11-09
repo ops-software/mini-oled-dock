@@ -1073,6 +1073,8 @@ const PLACE_WINDOW_MS: u64 = 3000;
 const PLACE_MAX_MOVES: u32 = 6;
 const TIMER_PLACE: usize = 3;
 const WM_HOST_PLACE_ARM: u32 = WM_APP + 4;
+/// Posted by the WinEvent callback: wparam = window, lparam = event id.
+const WM_HOST_PLACE_MOVE: u32 = WM_APP + 5;
 
 /// Pending placement: the next context menu / flyout shown by `pid` is moved so that it is centered
 /// on the clicked icon, `POPUP_GAP` above (or below) the bar, exactly like the dock's own popups.
@@ -1187,6 +1189,22 @@ fn place_target(p: &Placement, w: i32, h: i32) -> (i32, i32) {
     crate::popup::compute_pos(&a, w, h)
 }
 
+/// Pure filter for a placement event: false when the armed window expired, the window belongs to another
+/// process, or the event is not the one this placement still wants (see `Placement::placed`).
+fn place_should_handle(p: &Placement, event: u32, raw_hwnd: isize, pid_matches: bool, now: u64) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_LOCATIONCHANGE;
+    if now > p.until_ms || !pid_matches {
+        return false;
+    }
+    if event == EVENT_OBJECT_LOCATIONCHANGE {
+        raw_hwnd == p.placed && p.moves < PLACE_MAX_MOVES
+    } else {
+        p.placed == 0
+    }
+}
+
+/// Out-of-context hook callback: it runs on the host thread, so it only forwards the event; the real work is
+/// in `place_move` (a foreign window call here could block `Shell_NotifyIcon` / AppBar handling).
 unsafe extern "system" fn place_winevent_proc(
     _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
     event: u32,
@@ -1196,26 +1214,28 @@ unsafe extern "system" fn place_winevent_proc(
     _thread: u32,
     _time: u32,
 ) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_MENUPOPUPSTART, OBJID_WINDOW,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{CHILDID_SELF, EVENT_SYSTEM_MENUPOPUPSTART, OBJID_WINDOW};
     if hwnd.0.is_null() {
         return;
     }
     if event != EVENT_SYSTEM_MENUPOPUPSTART && (id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32) {
         return;
     }
+    let h = HOST_HWND.load(Relaxed);
+    if h != 0 {
+        // SAFETY: PostMessageW is thread-safe; if the window is gone it merely fails.
+        let _ = unsafe {
+            PostMessageW(Some(hwnd_of(h)), WM_HOST_PLACE_MOVE, WPARAM(hwnd.0 as usize), LPARAM(event as isize))
+        };
+    }
+}
+
+/// Host thread: handles one forwarded placement event and moves the foreign window asynchronously.
+fn place_move(event: u32, hwnd: HWND) {
     let mut guard = placement();
     let Some(p) = guard.as_mut() else { return };
-    if now_ms() > p.until_ms || window_pid(hwnd) != p.pid {
-        return;
-    }
     let raw = hwnd.0 as isize;
-    if event == EVENT_OBJECT_LOCATIONCHANGE {
-        if raw != p.placed || p.moves >= PLACE_MAX_MOVES {
-            return;
-        }
-    } else if p.placed != 0 {
+    if !place_should_handle(p, event, raw, window_pid(hwnd) == p.pid, now_ms()) {
         return;
     }
     let work = crate::popup::work_area(&p.bar);
@@ -1229,8 +1249,10 @@ unsafe extern "system" fn place_winevent_proc(
     p.moves += 1;
     let p_copy = *p;
     drop(guard);
-    // SAFETY: moving another process's top-level window; no size/Z-order/activation change.
-    if let Err(e) = unsafe { SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) } {
+    let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS;
+    // SAFETY: moving another process's top-level window; no size/Z-order/activation change. ASYNCWINDOWPOS
+    // queues the move so a hung owner cannot stall this thread.
+    if let Err(e) = unsafe { SetWindowPos(hwnd, None, x, y, 0, 0, flags) } {
         log!("tray: placing menu of pid {} failed: {e}", p_copy.pid);
     } else if p_copy.moves == 1 {
         log!("tray: menu of pid {} placed at ({x},{y}) {w}x{h} (was {},{})", p_copy.pid, rc.left, rc.top);
@@ -1668,6 +1690,10 @@ unsafe extern "system" fn host_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         WM_HOST_PLACE_ARM => {
             place_arm(hwnd, wp.0 as u32);
+            LRESULT(0)
+        }
+        WM_HOST_PLACE_MOVE => {
+            place_move(lp.0 as u32, hwnd_of(wp.0 as isize));
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -2301,6 +2327,24 @@ fn forward_main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_events_are_filtered_before_any_window_call() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EVENT_OBJECT_LOCATIONCHANGE as LOC, EVENT_OBJECT_SHOW as SHOW,
+        };
+        let rc = RECT { left: 0, top: 0, right: 10, bottom: 10 };
+        let p = Placement { pid: 7, item: rc, bar: rc, top: false, until_ms: 5_000, placed: 0, moves: 0 };
+        assert!(place_should_handle(&p, SHOW, 0x10, true, 1_000));
+        assert!(!place_should_handle(&p, SHOW, 0x10, true, 5_001), "armed window expired");
+        assert!(!place_should_handle(&p, SHOW, 0x10, false, 1_000), "other process");
+        assert!(!place_should_handle(&p, LOC, 0x10, true, 1_000), "location change before any placement");
+        let placed = Placement { placed: 0x10, moves: 1, ..p };
+        assert!(place_should_handle(&placed, LOC, 0x10, true, 1_000));
+        assert!(!place_should_handle(&placed, LOC, 0x20, true, 1_000), "a different window");
+        assert!(!place_should_handle(&placed, SHOW, 0x20, true, 1_000), "only the first menu is taken");
+        assert!(!place_should_handle(&Placement { moves: PLACE_MAX_MOVES, ..placed }, LOC, 0x10, true, 1_000));
+    }
 
     #[test]
     fn elevated_owner_gating() {
