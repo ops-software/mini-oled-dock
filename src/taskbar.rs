@@ -819,6 +819,11 @@ pub fn is_hidden() -> bool {
     HIDDEN.load(Relaxed)
 }
 
+/// true while our tray host is paused for an Explorer restart (`explorer_gone` until resume).
+pub fn host_paused() -> bool {
+    HOST_PAUSED_AT.load(Relaxed) != 0
+}
+
 /// true for a `Shell_TrayWnd` created by the tray host of ANY dock process (property
 /// `tray_host::PROP_DOCK_TRAY_HOST`) or by this process. Used by `native_taskbars()`,
 /// `on_winevent` and by the tray host to tell Explorer's taskbar apart.
@@ -869,13 +874,8 @@ pub fn on_reannounce_timer() {
             return;
         }
         log!("taskbar: Explorer back after {waited} ms, starting our tray host again");
-        let hook = crate::popup::suspend_mouse_hook();
-        let started = crate::tray_host::start(crate::hwnd());
-        crate::popup::resume_mouse_hook(hook);
-        match started {
-            Ok(()) => announce_tray(),
-            Err(e) => log!("taskbar: tray host not restarted (icons stay in Explorer's tray): {e}"),
-        }
+        // The current `show_tray` decides (it may have been switched off during the pause).
+        crate::ui::tray_sync();
         return;
     }
     if HIDDEN.load(Relaxed) && crate::tray_host::is_running() {

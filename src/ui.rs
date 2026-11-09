@@ -794,23 +794,52 @@ fn modules_sync() {
 /// Starts the tray host when `show_tray` is switched on (native taskbar hidden), stops it when switched
 /// off; in both cases `TaskbarCreated` is announced so apps re-register their icons with whoever now owns
 /// the tray (our host, or Explorer). Blocks the UI thread for at most ~2 s, only on a real switch.
-fn tray_sync() {
-    let on = config::get().show_tray;
-    let started = tray_host::is_started();
-    if on && !started && crate::taskbar::is_hidden() {
-        // The wait below must not run under the popup's low-level mouse hook (it would stall the mouse).
-        let hook = popup::suspend_mouse_hook();
-        match tray_host::start(hwnd()) {
-            Ok(()) => crate::taskbar::announce_tray(),
-            Err(e) => log!("tray host not started: {e}"),
+/// Never starts during the Explorer-restart pause (`taskbar::host_paused`): the resume path calls it.
+pub(crate) fn tray_sync() {
+    let action = tray_sync_action(
+        config::get().show_tray,
+        tray_host::is_started(),
+        crate::taskbar::is_hidden(),
+        crate::taskbar::host_paused(),
+    );
+    match action {
+        TraySync::Start => {
+            // The wait below must not run under the popup's low-level mouse hook (it would stall the mouse).
+            let hook = popup::suspend_mouse_hook();
+            match tray_host::start(hwnd()) {
+                Ok(()) => crate::taskbar::announce_tray(),
+                Err(e) => log!("tray host not started: {e}"),
+            }
+            popup::resume_mouse_hook(hook);
         }
-        popup::resume_mouse_hook(hook);
-    } else if !on && started {
-        let hook = popup::suspend_mouse_hook();
-        tray_host::stop();
-        crate::taskbar::announce_tray();
-        popup::resume_mouse_hook(hook);
-        log!("tray: host stopped (show_tray off)");
+        TraySync::Stop => {
+            let hook = popup::suspend_mouse_hook();
+            tray_host::stop();
+            crate::taskbar::announce_tray();
+            popup::resume_mouse_hook(hook);
+            log!("tray: host stopped (show_tray off)");
+        }
+        TraySync::Nothing => {}
+    }
+}
+
+/// What `tray_sync` must do with the tray host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraySync {
+    Start,
+    Stop,
+    Nothing,
+}
+
+/// Start only when wanted, not running, native taskbar hidden by us and Explorer not restarting
+/// (a host started then would own `Shell_TrayWnd` and Explorer would never register its desktop).
+fn tray_sync_action(show_tray: bool, started: bool, hidden: bool, paused: bool) -> TraySync {
+    if show_tray && !started && hidden && !paused {
+        TraySync::Start
+    } else if !show_tray && started {
+        TraySync::Stop
+    } else {
+        TraySync::Nothing
     }
 }
 
@@ -3317,6 +3346,20 @@ fn on_poll() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_sync_waits_for_explorer() {
+        use TraySync::*;
+        //                          show   started hidden paused
+        assert_eq!(tray_sync_action(true,  false,  true,  false), Start);
+        assert_eq!(tray_sync_action(true,  false,  true,  true),  Nothing,
+            "Explorer restarting: no Shell_TrayWnd of ours");
+        assert_eq!(tray_sync_action(true,  false,  false, false), Nothing, "native taskbar not hidden by us");
+        assert_eq!(tray_sync_action(false, true,   true,  false), Stop);
+        assert_eq!(tray_sync_action(false, true,   true,  true),  Stop, "switching off is always allowed");
+        assert_eq!(tray_sync_action(false, false,  true,  false), Nothing);
+        assert_eq!(tray_sync_action(true,  true,   true,  false), Nothing);
+    }
 
     #[test]
     fn slot_items_follow_the_drop_slot() {
