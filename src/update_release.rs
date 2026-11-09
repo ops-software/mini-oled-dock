@@ -83,6 +83,12 @@ pub fn release_page_url(tag: Option<&str>) -> String {
     }
 }
 
+/// Only GitHub release pages of this project are opened from the dock.
+pub(crate) fn safe_release_url(url: &str) -> bool {
+    let prefix = format!("https://github.com/{REPO}/releases/");
+    url.starts_with(&prefix) && !url.chars().any(|c| c.is_whitespace() || c == '"')
+}
+
 /// `api.github.com`, `github.com` and `*.githubusercontent.com`, any case.
 pub fn host_allowed(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
@@ -324,6 +330,16 @@ pub(crate) const RELEASE_FIXTURE: &str = r#"{"tag_name":"v1.4.1","name":"mini-ol
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_project_release_pages_are_safe() {
+        assert!(safe_release_url("https://github.com/ops-software/mini-oled-dock/releases/tag/v1.4.1"));
+        assert!(!safe_release_url("https://evil.example/releases/"));
+        assert!(!safe_release_url("C:\\Windows\\System32\\cmd.exe"));
+        assert!(!safe_release_url("https://github.com/ops-software/mini-oled-dock/releases/x\" --flag"));
+        // The page URL built from a tag is always acceptable.
+        assert!(safe_release_url(&release_page_url(Some("v1.4.1"))));
+    }
 
     #[test]
     fn version_parse_and_order() {

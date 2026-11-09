@@ -17,6 +17,7 @@ use crate::popup_tray::TrayRow;
 use crate::start_import;
 use crate::ui::Screen;
 use crate::update::{Outcome, Phase, UpdateStatus};
+use crate::update_release::{release_page_url, safe_release_url};
 
 /// A monochrome icon shape: `(u, v)` in a 16 x 16 box -> inside.
 pub(crate) type Glyph = fn(f32, f32) -> bool;
@@ -608,12 +609,6 @@ pub(crate) fn mb(bytes: usize) -> String {
     format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
-/// Only GitHub release pages of this project are opened from the window.
-pub(crate) fn safe_release_url(url: &str) -> bool {
-    let prefix = format!("https://github.com/{}/releases/", crate::update_release::REPO);
-    url.starts_with(&prefix) && !url.chars().any(|c| c.is_whitespace() || c == '"')
-}
-
 /// Rows of `page`.
 pub(crate) fn rows(page: Page, c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     match page {
@@ -707,8 +702,7 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     } else {
         UpdateStatus { phase: Phase::Idle, ..st.clone() }.line()
     };
-    let notes_ok =
-        st.available.as_ref().is_some_and(|a| safe_release_url(&crate::update_release::release_page_url(Some(&a.tag))));
+    let notes_ok = st.available.as_ref().is_some_and(|a| safe_release_url(&release_page_url(Some(&a.tag))));
     let mut v = vec![
         header(tr("Status", "Stato"), None),
         row(
@@ -1369,11 +1363,5 @@ mod tests {
         assert_eq!(short_date("garbage"), "garbage");
         assert_eq!(mb(10_276_044), "9.8 MB");
         assert_eq!(mb(0), "0.0 MB");
-        assert!(safe_release_url("https://github.com/ops-software/mini-oled-dock/releases/tag/v1.4.1"));
-        assert!(!safe_release_url("https://evil.example/releases/"));
-        assert!(!safe_release_url("C:\\Windows\\System32\\cmd.exe"));
-        assert!(!safe_release_url("https://github.com/ops-software/mini-oled-dock/releases/x\" --flag"));
-        // The page URL built from a tag is always acceptable.
-        assert!(safe_release_url(&crate::update_release::release_page_url(Some("v1.4.1"))));
     }
 }

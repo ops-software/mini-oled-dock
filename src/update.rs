@@ -29,7 +29,7 @@ use crate::msg::{TIMER_UPDATE_CHECK, WM_DOCK_UPDATE};
 use crate::shell_thread::{self, ShellRequest};
 use crate::update_release::{
     self, host_allowed, is_newer, next_check_delay_ms, parse_release, parse_sha256_file, parse_tag, release_page_url,
-    rfc3339_utc, version_output_matches, Asset, Release, Version, API_MAX_BYTES, CHECK_PERIOD_MS, EXE_ASSET,
+    rfc3339_utc, safe_release_url, version_output_matches, Asset, Release, Version, API_MAX_BYTES, CHECK_PERIOD_MS, EXE_ASSET,
     EXE_MAX_BYTES, FIRST_CHECK_MS, LATEST_API_URL, RETRY_MS, SHA_ASSET, SHA_MAX_BYTES,
 };
 use crate::winhttp;
@@ -318,10 +318,15 @@ fn check_once() {
     notify();
 }
 
-/// Opens the release page (or the latest-release page) de-elevated through the shell thread.
+/// Opens the release page (or the latest-release page) de-elevated through the shell thread; any
+/// URL that is not a release page of this project is refused.
 pub fn open_release_page() {
     let url = release_page_url(status().available.as_ref().map(|a| a.tag.as_str()));
-    shell_thread::request(ShellRequest::Launch { target: url, args: None });
+    if safe_release_url(&url) {
+        shell_thread::request(ShellRequest::Launch { target: url, args: None });
+    } else {
+        crate::log!("update: release page URL refused: {url}");
+    }
 }
 
 #[derive(Debug)]

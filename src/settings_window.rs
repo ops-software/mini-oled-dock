@@ -55,7 +55,7 @@ use crate::msg::{TIMER_SETTINGS_APPLY, TIMER_SETTINGS_BAR, TIMER_SETTINGS_TICK, 
 use crate::popup_tray::TrayRow;
 use crate::render::Metrics;
 use crate::settings_pages::{
-    self, apply_edit, background_of, preset_index, rgb_to_hsv, safe_release_url, same_rows, Action, Control, Ctx, Edit,
+    self, apply_edit, background_of, preset_index, rgb_to_hsv, same_rows, Action, Control, Ctx, Edit,
     Effect, Memory, Page, Row,
 };
 use crate::settings_view::{self, decode, hue_at, sv_at, BarPixels, Focus, Frame, Geometry, Hit, PART_HUE, PART_SV};
@@ -907,15 +907,7 @@ fn run_action(a: Action) {
         Action::InstallUpdate => {
             let _ = crate::update::install_now();
         }
-        Action::ReleaseNotes => {
-            let tag = with_win(|w| w.update.available.as_ref().map(|a| a.tag.clone())).flatten();
-            let url = crate::update_release::release_page_url(tag.as_deref());
-            if safe_release_url(&url) {
-                crate::ui::launch_target_str(&url);
-            } else {
-                log!("settings: release page URL refused: {url}");
-            }
-        }
+        Action::ReleaseNotes => crate::update::open_release_page(),
         Action::OpenDataFolder => {
             if let Some(dir) = with_win(|w| w.data_dir.clone()).flatten() {
                 shell_thread::request(ShellRequest::Launch {
