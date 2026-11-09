@@ -54,7 +54,6 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
 use crate::popup_power::{self, Choice};
-use crate::power::PowerAction;
 use crate::render::Metrics;
 use crate::shell_thread::{self, ShellRequest, StartApp};
 use crate::surface::{
@@ -1258,6 +1257,7 @@ impl Content for StartMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::power::PowerAction;
 
     const M: Metrics = Metrics { dpi: 96 };
 

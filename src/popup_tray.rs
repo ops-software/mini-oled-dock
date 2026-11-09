@@ -7,8 +7,8 @@
 //!    (the app menu must be able to take the foreground).
 //!  * CUSTOMIZE: list of ALL tray apps (16 px icon, short name, pill toggle
 //!    "visible in the bar"). A click flips the choice (`tray_host::set_user_hidden`: atomic config
-//!    write and immediate bar update) and the popup stays open. "Done" returns to the grid, or closes the popup when
-//!    it was opened directly in this mode (`popup::next_tray_chooser`, from the Settings popup).
+//!    write and immediate bar update) and the popup stays open. "Done" returns to the grid. (The
+//!    Settings window has its own inline chooser built on `customize_rows`.)
 
 use std::sync::Arc;
 
@@ -52,8 +52,6 @@ pub(crate) struct TrayPopup {
     /// First row shown of "Customize" (scrolling).
     scroll: usize,
     customize: bool,
-    /// true if opened directly in CUSTOMIZE mode: "Done" closes the popup instead of showing the grid.
-    direct: bool,
     hits: HitMap,
     /// Click to forward after closing.
     pending: Option<(u64, TrayClick)>,
@@ -108,26 +106,6 @@ pub(crate) fn new() -> Box<dyn Content> {
         rows: Vec::new(),
         scroll: 0,
         customize: false,
-        direct: false,
-        hits: HitMap::default(),
-        pending: None,
-        icon: 16,
-        sep_y: 0,
-        width: 0,
-        empty_rc: None,
-        max_h: i32::MAX,
-        visible: MAX_ROWS,
-    })
-}
-
-/// Creates the content directly in the "choose visible icons" mode (no overflow grid).
-pub(crate) fn new_chooser() -> Box<dyn Content> {
-    Box::new(TrayPopup {
-        cells: Vec::new(),
-        rows: customize_rows(),
-        scroll: 0,
-        customize: true,
-        direct: true,
         hits: HitMap::default(),
         pending: None,
         icon: 16,
@@ -250,7 +228,6 @@ impl Content for TrayPopup {
 
     fn click(&mut self, id: u32) -> Reply {
         match id {
-            ID_DONE if self.direct => Reply::Close,
             ID_DONE => {
                 self.customize = false;
                 self.cells = overflow_cells();
@@ -349,7 +326,6 @@ pub(crate) fn preview_new(
             .collect(),
         scroll: 0,
         customize,
-        direct: false,
         hits: HitMap::default(),
         pending: None,
         icon: 16,

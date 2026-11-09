@@ -11,7 +11,7 @@
 //!
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
 //! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`,
-//! `popup_settings::preview_new`, `picker::preview_pixels`.
+//! `picker::preview_pixels`.
 //!
 //! The default bar has no battery (existing bar PNGs stay unchanged); `bar_battery*` and `popup_battery`
 //! show the mock battery (`mock_battery`).
@@ -30,7 +30,6 @@ use crate::metrics::Usage;
 use crate::net::{NetInfo, NetKind, NetStatus};
 use crate::notif::{self, NotifAccess, NotifItem, NotifState};
 use crate::popup::{Content, DataEvent};
-use crate::popup_settings::Page;
 use crate::render::{self, AppView, BarSizes, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
 use crate::surface::Surface;
 use crate::ui::Screen;
@@ -669,49 +668,6 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         }),
         "popup_power" => crate::popup_power::new(),
         "popup_power_update" => crate::popup_power::preview_with_badge(1),
-        // No displays passed: no "Screen" row, whatever monitors this machine has.
-        "popup_settings" => crate::popup_settings::preview_with_screens(Vec::new()),
-        // Italian texts: the caller lifts the preview's forced English around this one.
-        "popup_settings_it" => {
-            crate::config::set(Config { language: crate::config::Language::It, ..Config::default() });
-            crate::popup_settings::preview_with_screens(Vec::new())
-        }
-        "popup_settings_navy" => {
-            crate::config::set(Config {
-                background: Background(0x0E1A33),
-                bar_opacity: 80,
-                show_metrics: true,
-                autohide: false,
-                ..Config::default()
-            });
-            crate::popup_settings::preview_with_screens(Vec::new())
-        }
-        "popup_settings_screen" | "popup_settings_pointer" => {
-            // Two mock displays, bar moved to the second one (or following the pointer).
-            let monitor = if name == "popup_settings_pointer" {
-                crate::config::MONITOR_POINTER.to_string()
-            } else {
-                "\\\\.\\DISPLAY2".to_string()
-            };
-            crate::config::set(Config { monitor, ..Config::default() });
-            let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
-            crate::popup_settings::preview_with_screens(vec![
-                d("\\\\.\\DISPLAY1", "1", true),
-                d("\\\\.\\DISPLAY2", "2", false),
-            ])
-        }
-        "popup_settings_background" => {
-            crate::config::set(Config { background: Background(0x2A1F3D), bar_opacity: 60, ..Config::default() });
-            crate::popup_settings::preview_new(Page::Background, true)
-        }
-        "popup_settings_presets" => {
-            crate::config::set(Config { background: Background(0x1A222D), ..Config::default() });
-            crate::popup_settings::preview_new(Page::Background, false)
-        }
-        "popup_settings_sizes" => {
-            crate::config::set(Config { app_icon_size: 24, module_size: 125, ..Config::default() });
-            crate::popup_settings::preview_new(Page::Sizes, false)
-        }
         "popup_app" => crate::popup::popup_app::new(crate::popup::AppMenuInfo {
             key: "discord".to_string(),
             name: "Discord".to_string(),
@@ -720,7 +676,6 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             can_launch: true,
         }),
         "popup_start" => crate::popup::popup_start::new(),
-        "popup_settings_startmenu" => crate::popup_settings::preview_new(Page::StartMenu, false),
         "popup_startmenu"
         | "popup_startmenu_search"
         | "popup_startmenu_h"
@@ -948,21 +903,12 @@ pub fn run(dir: &str) -> i32 {
             ("popup_notif", 1),
             ("popup_audio", 3),
             ("popup_audio_customize", 2),
-            ("popup_settings_it", 3),
             ("popup_calendar", 8),
             ("popup_network", 0),
             ("popup_network_offline", 9),
             ("popup_battery", 0),
             ("popup_power", 4),
             ("popup_power_update", 4),
-            ("popup_settings", 3),
-            ("popup_settings_navy", 2),
-            ("popup_settings_screen", 2),
-            ("popup_settings_pointer", 2),
-            ("popup_settings_background", 4),
-            ("popup_settings_presets", 3),
-            ("popup_settings_sizes", 5),
-            ("popup_settings_startmenu", 1),
             ("popup_app", 1),
             ("popup_start", 4),
             ("popup_startmenu", 12),

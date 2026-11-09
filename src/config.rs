@@ -1227,7 +1227,9 @@ fn write_file(c: &Config) -> Result<(), String> {
 /// Names accepted by `Config::module_visible` / `set_module_visible`: the `modules_order` names
 /// plus "tray" (`show_tray`). The power button is not listed: it is always shown. The Start button
 /// ("start", `show_start_button`) is a fixed item, not a module: the two methods accept it but it is
-/// not listed here (the settings popup adds its switch by hand).
+/// not listed here (the Settings window adds its switch by hand). The Settings window lists its toggles
+/// explicitly (`settings_pages::MODULE_TOGGLES`), so only the tests use this one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const MODULE_NAMES: [&str; 7] = ["notifications", "volume", "network", "metrics", "clock", "show_desktop", "tray"];
 
 impl Config {

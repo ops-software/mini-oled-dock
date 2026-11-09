@@ -57,7 +57,6 @@ mod popup_calendar;
 mod popup_network;
 mod popup_notif;
 mod popup_power;
-mod popup_settings;
 mod popup_tray;
 mod power;
 mod preview;

@@ -86,7 +86,7 @@ pub enum PopupKind {
     TrayOverflow = 5,
     AppMenu = 6,
     Network = 7,
-    Settings = 8,
+    // 8 was Settings (removed in 1.4.0; the Settings window is `settings_window`).
     /// Quick-links menu of the Start button (right click).
     Start = 9,
     /// Full Start menu (all apps, search, pins) opened by the Win double tap (`popup_startmenu`).
@@ -160,12 +160,6 @@ pub fn open_app_menu(anchor: Anchor, info: AppMenuInfo) {
     open(PopupKind::AppMenu, anchor);
 }
 
-/// The next tray popup opens directly in the "choose visible icons" mode (the Settings popup sets it
-/// and then replies `Reply::Switch(PopupKind::TrayOverflow)`).
-pub(crate) fn next_tray_chooser() {
-    TRAY_CHOOSER.store(true, Ordering::Relaxed);
-}
-
 /// Key of the app chosen last in the context menu (consumes it). UI thread.
 pub fn take_app_menu_key() -> Option<String> {
     APP_CHOSEN_KEY.with(|k| k.try_borrow_mut().ok().and_then(|mut g| g.take()))
@@ -184,9 +178,6 @@ pub(crate) fn set_app_menu_key(key: String) {
         }
     });
 }
-
-/// The next `TrayOverflow` content opens in chooser mode (consumed by `make_content`).
-static TRAY_CHOOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// Key of the item for which the app menu is (or was) open.
@@ -210,8 +201,6 @@ pub(crate) enum Reply {
     Relayout,
     /// Close the popup (action performed).
     Close,
-    /// Close this popup and open `kind` at the same anchor (power -> settings -> tray chooser).
-    Switch(PopupKind),
 }
 
 impl Reply {
@@ -223,7 +212,6 @@ impl Reply {
                 Reply::Redraw => 1,
                 Reply::Relayout => 2,
                 Reply::Close => 3,
-                Reply::Switch(_) => 4,
             }
         }
         if rank(other) > rank(self) {
@@ -469,8 +457,7 @@ pub fn toggle(kind: PopupKind, anchor: Anchor) {
             return Plan::Skip;
         }
         let open = st.open.as_ref().map(|o| o.kind);
-        // Settings is opened from the power popup and shares its item: the power button closes it too.
-        if open == Some(kind) || (kind == PopupKind::Power && open == Some(PopupKind::Settings)) {
+        if open == Some(kind) {
             return Plan::Close;
         }
         if let Some((k, t)) = st.last_inactive {
@@ -782,17 +769,10 @@ fn make_content(
         PopupKind::Audio => crate::popup_audio::new(volume),
         PopupKind::Calendar => crate::popup_calendar::new(),
         PopupKind::Power => crate::popup_power::new(),
-        PopupKind::TrayOverflow => {
-            if TRAY_CHOOSER.swap(false, Ordering::Relaxed) {
-                crate::popup_tray::new_chooser()
-            } else {
-                crate::popup_tray::new()
-            }
-        }
+        PopupKind::TrayOverflow => crate::popup_tray::new(),
         PopupKind::AppMenu => popup_app::new(take_app_info().unwrap_or_default()),
         PopupKind::Network => crate::popup_network::new(net),
         PopupKind::Battery => crate::popup_battery::new(battery, crate::battery::power_mode()),
-        PopupKind::Settings => crate::popup_settings::new(),
         PopupKind::Start => popup_start::new(),
         PopupKind::StartMenu => popup_startmenu::new(),
     }
@@ -1056,13 +1036,6 @@ fn apply(reply: Reply) {
             render(true);
         }
         Reply::Close => close_inner("action"),
-        Reply::Switch(kind) => {
-            let anchor = with(|st| st.open.as_ref().map(|o| o.anchor)).flatten();
-            close_inner("switch");
-            if let Some(a) = anchor {
-                open(kind, a);
-            }
-        }
     }
 }
 
@@ -1562,7 +1535,7 @@ const SLIDER_TRACK_H: i32 = 4;
 
 /// Value in `lo..=hi` (rounded to the nearest step) for pointer x on slider `rc`. The center of
 /// the knob (radius `knob_r`) travels between `rc.left + knob_r` and `rc.right - knob_r`.
-/// Shared by the Settings and Audio popups.
+/// Shared by the Settings window and the Audio popup.
 pub(crate) fn slider_value_at(rc: &RECT, knob_r: i32, lo: i32, hi: i32, x: i32) -> i32 {
     let (l, r) = (rc.left + knob_r, rc.right - knob_r);
     let span = (r - l).max(1);

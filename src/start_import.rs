@@ -1,4 +1,4 @@
-//! "Import from Windows Start" (Settings -> Appearance): replaces `config.start_pins` with the pins
+//! "Import from Windows Start" (Settings -> Start): replaces `config.start_pins` with the pins
 //! of the native Start menu, in the Windows order.
 //!
 //! JOB: one short-lived thread per click (`start`), ended when the job ends. The dock runs elevated
@@ -16,7 +16,7 @@
 //! AppsFolder catalog (`shell_thread::enum_apps_folder`) is enumerated on that same thread and only
 //! when a `.lnk` entry needs it, so nothing stays in memory afterwards.
 //!
-//! RESULT: one atomic word (`STATUS`), read by the Settings popup on its 1 s tick (the popup's own
+//! RESULT: one atomic word (`STATUS`), read by the Settings window on its 1 s tick (the window's own
 //! timer, alive only while it is open). No new timer, no thread left running.
 
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
@@ -101,7 +101,7 @@ fn finish_word(r: &Result<usize, JobError>) -> u32 {
     }
 }
 
-/// Raw status word (cheap change detection for the popup tick).
+/// Raw status word (cheap change detection for the window tick).
 pub(crate) fn status_word() -> u32 {
     STATUS.load(SeqCst)
 }
@@ -110,7 +110,7 @@ pub(crate) fn status() -> Status {
     decode(status_word())
 }
 
-/// Forgets the result of a finished import (the Settings popup opens with the plain label).
+/// Forgets the result of a finished import (the Settings window opens with the plain label).
 pub(crate) fn reset() {
     let cur = STATUS.load(SeqCst);
     if cur != RUNNING {
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(finish_word(&Err(JobError::TimedOut)), TIMEDOUT);
         assert_eq!(finish_word(&Err(JobError::Failed("x".into()))), FAILED);
         // A failing setup step (random id, shell user folder, Explorer not reachable) is reported like any
-        // other failure: the `String` converts to `Failed`, the popup shows "Import failed".
+        // other failure: the `String` converts to `Failed`, the Settings window shows "Import failed".
         let setup: Result<usize, JobError> = Err(String::from("BCryptGenRandom failed").into());
         assert_eq!(finish_word(&setup), FAILED);
     }

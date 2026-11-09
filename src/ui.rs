@@ -927,7 +927,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Notifications => Some(ItemId::Notifications),
         PopupKind::Audio => Some(ItemId::Volume),
         PopupKind::Calendar => Some(ItemId::Clock),
-        PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
+        PopupKind::Power => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
         PopupKind::Network => Some(ItemId::Network),
         PopupKind::Battery => Some(ItemId::Battery),

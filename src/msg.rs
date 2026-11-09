@@ -57,7 +57,7 @@ pub const WM_DOCK_APP_MENU_CMD: u32 = WM_APP + 13;
 /// POPUP window (not the dock's): a mouse button went down outside the popup. wParam = lParam = 0.
 /// Posted (never handled inside the hook callback); the popup closes itself.
 pub const WM_POPUP_OUTSIDE: u32 = WM_APP + 14;
-/// Settings popup (UI thread, popup window) -> dock window: a setting was changed and saved
+/// Settings window (UI thread, `DockSettings` window) -> dock window: a setting was changed and saved
 /// (`config::modify`). wParam = lParam = 0. Posted so the bar is rebuilt OUTSIDE the popup's
 /// wnd_proc (no re-entry). `main` calls `ui::on_config_changed()`.
 pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
