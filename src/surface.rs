@@ -72,6 +72,10 @@ pub enum Font {
     Bold,
     /// 32 px, weight 300: big time of the calendar popup.
     Big,
+    /// 20 px, weight 600: page title of the Settings window.
+    Title,
+    /// 12 px, weight 400: descriptions under the options of the Settings window.
+    Caption,
 }
 
 impl Font {
@@ -81,6 +85,8 @@ impl Font {
             Font::Normal => 1,
             Font::Bold => 2,
             Font::Big => 3,
+            Font::Title => 4,
+            Font::Caption => 5,
         }
     }
 }
@@ -486,26 +492,29 @@ pub(crate) fn present_layered(
 pub struct Surface {
     metrics: Metrics,
     gdi: Gdi,
-    fonts: [HFONT; 4],
-    lhs: [i32; 4],
+    fonts: [HFONT; 6],
+    lhs: [i32; 6],
     /// Clipping rectangle (physical px) applied to every write; `None` = the whole DIB.
     clip: Option<RECT>,
 }
 
-fn delete_fonts(fonts: &[HFONT; 4]) {
+fn delete_fonts(fonts: &[HFONT; 6]) {
     for f in fonts {
         delete_font(*f);
     }
 }
 
-fn build_fonts(dc: HDC, m: Metrics) -> Result<([HFONT; 4], [i32; 4]), String> {
+fn build_fonts(dc: HDC, m: Metrics) -> Result<([HFONT; 6], [i32; 6]), String> {
     let display = ["Segoe UI Variable Display", "Segoe UI Light"];
-    let mut fonts = [HFONT::default(); 4];
-    let specs: [(&[&str], i32, i32); 4] = [
+    let title = ["Segoe UI Variable Display", "Segoe UI"];
+    let mut fonts = [HFONT::default(); 6];
+    let specs: [(&[&str], i32, i32); 6] = [
         (&TEXT_FACES, m.px(11), 400),
         (&TEXT_FACES, m.px(13), 400),
         (&TEXT_FACES, m.px(13), 600),
         (&display, m.px(32), 300),
+        (&title, m.px(20), 600),
+        (&TEXT_FACES, m.px(12), 400),
     ];
     for (i, (faces, px, weight)) in specs.iter().enumerate() {
         match create_font(dc, faces, *px, *weight) {
@@ -516,13 +525,12 @@ fn build_fonts(dc: HDC, m: Metrics) -> Result<([HFONT; 4], [i32; 4]), String> {
             }
         }
     }
-    let lhs =
-        [line_height(dc, fonts[0]), line_height(dc, fonts[1]), line_height(dc, fonts[2]), line_height(dc, fonts[3])];
+    let lhs = fonts.map(|f| line_height(dc, f));
     Ok((fonts, lhs))
 }
 
 impl Surface {
-    /// Creates the memory DC and the four fonts for `m`. The DIB is created by `resize`.
+    /// Creates the memory DC and the six fonts for `m`. The DIB is created by `resize`.
     pub fn new(m: Metrics) -> Result<Surface, String> {
         let gdi = Gdi::new()?;
         // On error `gdi` is dropped, which deletes the DCs.
@@ -691,6 +699,20 @@ impl Surface {
         // SAFETY: `hdc` comes from BeginPaint of the caller; `dc_main` holds our DIB of `w` x `h`.
         if let Err(e) = unsafe { BitBlt(hdc, x, y, w, h, Some(self.gdi.dc_main()), 0, 0, SRCCOPY) } {
             log!("surface: BitBlt failed: {e}");
+        }
+    }
+
+    /// Composites the premultiplied 0xAARRGGBB pixels `px` (`w` x `h`, row-major) source-over at
+    /// `(x, y)`; honours the clip and the DIB bounds. Does nothing if `px` is shorter than `w * h`.
+    pub fn blend_pixels(&mut self, x: i32, y: i32, w: i32, h: i32, px: &[u32]) {
+        if w <= 0 || h <= 0 || px.len() < (w as usize) * (h as usize) {
+            return;
+        }
+        let Some(mut cv) = self.gdi.canvas(self.clip) else { return };
+        for row in 0..h {
+            for col in 0..w {
+                cv.blend(x + col, y + row, px[(row * w + col) as usize]);
+            }
         }
     }
 
@@ -966,5 +988,35 @@ pub fn in_rect(rc: &RECT, x: i32, y: i32) -> bool {
 impl Surface {
     pub(crate) fn snapshot_pixels(&self) -> Option<(i32, i32, Vec<u32>)> {
         self.gdi.snapshot_pixels()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const M: Metrics = Metrics { dpi: 96 };
+
+    #[test]
+    fn title_and_caption_fonts_exist() {
+        let s = Surface::new(M).expect("surface");
+        assert!(s.line_height(Font::Title) > s.line_height(Font::Normal));
+        let c = s.line_height(Font::Caption);
+        assert!(c >= s.line_height(Font::Small) && c <= s.line_height(Font::Normal));
+        assert!(s.text_width("Appearance", Font::Title) > s.text_width("Appearance", Font::Bold));
+    }
+
+    #[test]
+    fn blend_pixels_composites_and_clips() {
+        let mut s = Surface::new(M).expect("surface");
+        s.resize(4, 4).unwrap();
+        s.fill_rr(rect_wh(0, 0, 4, 4), 0, (0, 0, 0), 255);
+        s.blend_pixels(2, 2, 3, 3, &[0xFFFF_FFFF; 9]); // partly outside the DIB
+        s.blend_pixels(0, 0, 2, 2, &[0x8000_0000; 4]); // half-transparent black over black
+        let (_, _, px) = s.snapshot_pixels().unwrap();
+        assert_eq!(px[0], 0xFF00_0000);
+        assert_eq!(px[2 * 4 + 2], 0xFFFF_FFFF);
+        assert_eq!(px[3 * 4 + 3], 0xFFFF_FFFF);
+        s.blend_pixels(0, 0, 4, 4, &[0xFFFF_FFFF; 3]); // short buffer: ignored
+        assert_eq!(s.snapshot_pixels().unwrap().2[0], 0xFF00_0000);
     }
 }
