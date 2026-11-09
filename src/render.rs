@@ -1486,6 +1486,26 @@ pub(crate) fn snapshot_pixels() -> Option<(i32, i32, Vec<u32>)> {
     GFX.with(|c| c.borrow().as_ref()?.gdi.snapshot_pixels())
 }
 
+/// Paints `scene` into a fresh set of GDI resources and returns the premultiplied pixels with the
+/// bar's size, for the mini live preview of the Settings window. Goes through the real `layout`,
+/// `resize` and `paint` at `scene.metrics` / `scene.sizes`. The bar's own `Gfx` is taken out of `GFX`
+/// first and always put back, so the bar is untouched; works with no bar `Gfx` at all (preview mode).
+/// Never pumps messages.
+pub(crate) fn paint_offscreen(scene: &Scene<'_>) -> Option<(i32, i32, Vec<u32>)> {
+    let saved = GFX.with(|c| c.borrow_mut().take());
+    let out = (|| {
+        init(scene.metrics, scene.sizes).ok()?;
+        let lay = layout(scene);
+        let h = bar_height(scene.metrics, scene.sizes);
+        resize(lay.width, h).ok()?;
+        paint(scene, &lay);
+        snapshot_pixels()
+    })();
+    destroy();
+    GFX.with(|c| *c.borrow_mut() = saved);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1617,6 +1637,25 @@ mod tests {
         // With no apps the Start button still gets its separator; without it there is none.
         assert!(on.separator_x > start.right);
         assert_eq!(off.separator_x, -1);
+    }
+
+    #[test]
+    fn paint_offscreen_leaves_the_bar_untouched() {
+        let m = Metrics { dpi: 96 };
+        let sizes = BarSizes::default();
+        render_init_for_test(m, sizes);
+        resize(40, bar_height(m, sizes)).unwrap();
+        let before = snapshot_pixels();
+        let big = Metrics { dpi: 144 };
+        let modules = [ItemId::Volume, ItemId::Clock];
+        let scene = test_scene(big, sizes, &modules, false);
+        let (w, h, px) = paint_offscreen(&scene).expect("offscreen bar");
+        assert_eq!(h, bar_height(big, sizes));
+        assert_eq!(px.len(), (w * h) as usize);
+        assert_eq!(snapshot_pixels(), before);
+        destroy();
+        assert!(paint_offscreen(&scene).is_some());
+        assert!(snapshot_pixels().is_none());
     }
 
     fn test_scene<'a>(m: Metrics, sizes: BarSizes, modules: &'a [ItemId], start_button: bool) -> Scene<'a> {

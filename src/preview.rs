@@ -86,7 +86,7 @@ fn rounded_cov(x: i32, y: i32, size: i32, radius: f32) -> f32 {
 }
 
 /// Mock icon `size` x `size`: rounded square `rgb` with a white letter. Premultiplied.
-fn mock_icon(letter: char, rgb: u32, size: i32) -> IconBitmap {
+pub(crate) fn mock_icon(letter: char, rgb: u32, size: i32) -> IconBitmap {
     let size = size.max(8);
     let mut bmp = IconBitmap::new(size as u32, size as u32);
     let (r, g, b) = (((rgb >> 16) & 255) as f32, ((rgb >> 8) & 255) as f32, (rgb & 255) as f32);
