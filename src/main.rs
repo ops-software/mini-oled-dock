@@ -67,6 +67,7 @@ mod surface;
 mod taskbar;
 mod tray_host;
 mod ui;
+mod update;
 mod update_release;
 mod watchdog;
 mod winhttp;
@@ -1035,6 +1036,17 @@ fn main() -> std::process::ExitCode {
         }
         let (log_thread, _) = start_logging("");
         let code = taskbar::run_restore_cli();
+        logger::stop(log_thread);
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+
+    // --update-check mode: asks GitHub once, prints the result and exits.
+    if args.update_check {
+        if attach_console() {
+            logger::enable_stdout();
+        }
+        let (log_thread, _) = start_logging("");
+        let code = update::run_check_cli();
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }

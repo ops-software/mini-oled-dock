@@ -65,6 +65,10 @@ pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
 /// dock's Start menu (`popup_startmenu`). wParam = 0, lParam = 0. Posted by the `hook` thread
 /// INSTEAD of the second `WM_DOCK_TOGGLE`. `main` calls `ui::open_start_menu()`.
 pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
+/// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
+/// Consecutive posts may be coalesced: re-read `update::status()`.
+#[allow(dead_code)] // posted by `update::notify`; the UI side is wired by the Settings window
+pub const WM_DOCK_UPDATE: u32 = WM_APP + 17;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
