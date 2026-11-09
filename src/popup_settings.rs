@@ -4,6 +4,7 @@
 //!    opening the Start menu page), position and display mode (segmented choices drawn by hand), then
 //!    "Background ›" and "Sizes ›" (sub-pages). Behavior: auto-hide, window previews, clock seconds (switches).
 //!    Modules: the Start button switch, one switch per system module (`config::MODULE_NAMES` mechanism)
+//!    the battery rows (show: auto / on / off, percentage, percentage inside) before the Tray switch
 //!    and, with the tray on, "Choose tray icons" (switches to the tray popup in chooser mode).
 //!  * Background page: preset swatches (`config::BACKGROUND_PRESETS`) plus a custom swatch that opens
 //!    a hand-drawn colour picker (saturation/value square, hue strip, preview and hex code), and the
@@ -27,7 +28,7 @@ use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{
-    self, Background, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
+    self, Background, BatteryShow, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
     MODULE_SIZE, TRAY_ICON_SIZE,
 };
 use crate::glyphs;
@@ -102,6 +103,12 @@ enum Setting {
     /// `config.win_opens_start`: Win opens / closes the Start menu together with the bar.
     WinStart,
     Seconds,
+    /// `config.show_battery`: Auto / On / Off.
+    Battery,
+    /// `config.battery_percent`: the percentage next to (or inside) the battery icon.
+    BatteryPercent,
+    /// `config.battery_percent_inside`: the percentage inside a larger icon.
+    BatteryInside,
     /// `Config::module_visible` name.
     Module(&'static str),
 }
@@ -172,7 +179,15 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
                 // The Start button is a fixed item at the left end of the bar, not part of `MODULE_NAMES`.
                 Item::Toggle(Setting::Module("start"), module_label("start")),
             ]);
-            v.extend(config::MODULE_NAMES.iter().map(|n| Item::Toggle(Setting::Module(n), module_label(n))));
+            // The battery rows go before the Tray toggle, which must stay directly above its chooser link.
+            let others = config::MODULE_NAMES.iter().filter(|n| **n != "tray");
+            v.extend(others.map(|n| Item::Toggle(Setting::Module(n), module_label(n))));
+            v.extend([
+                Item::Choice(Setting::Battery, tr("Battery", "Batteria")),
+                Item::Toggle(Setting::BatteryPercent, tr("Battery percentage", "Percentuale batteria")),
+                Item::Toggle(Setting::BatteryInside, tr("Percentage inside", "Percentuale dentro")),
+                Item::Toggle(Setting::Module("tray"), module_label("tray")),
+            ]);
             if c.show_tray {
                 v.push(Item::TrayChooser);
             }
@@ -229,6 +244,7 @@ fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
                 .collect()
         }
         Setting::Display => vec![tr("Icon + name", "Icona + nome"), tr("Icon", "Icona"), tr("Name", "Nome")],
+        Setting::Battery => vec!["Auto", tr("On", "S\u{ec}"), tr("Off", "No")],
         _ => Vec::new(),
     }
 }
@@ -256,6 +272,11 @@ fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
             DisplayMode::Icon => 1,
             DisplayMode::Text => 2,
         },
+        Setting::Battery => match c.show_battery {
+            BatteryShow::Auto => 0,
+            BatteryShow::On => 1,
+            BatteryShow::Off => 2,
+        },
         _ => return None,
     })
 }
@@ -277,6 +298,7 @@ fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
         Setting::Display => {
             c.display_mode = [DisplayMode::IconText, DisplayMode::Icon, DisplayMode::Text][j.min(2)];
         }
+        Setting::Battery => c.show_battery = [BatteryShow::Auto, BatteryShow::On, BatteryShow::Off][j.min(2)],
         _ => {}
     }
 }
@@ -287,6 +309,8 @@ fn is_on(c: &Config, s: Setting) -> bool {
         Setting::Previews => c.window_previews,
         Setting::WinStart => c.win_opens_start,
         Setting::Seconds => c.show_seconds,
+        Setting::BatteryPercent => c.battery_percent,
+        Setting::BatteryInside => c.battery_percent_inside,
         Setting::Module(n) => c.module_visible(n),
         _ => false,
     }
@@ -298,6 +322,8 @@ fn flip(c: &mut Config, s: Setting) {
         Setting::Previews => c.window_previews = !c.window_previews,
         Setting::WinStart => c.win_opens_start = !c.win_opens_start,
         Setting::Seconds => c.show_seconds = !c.show_seconds,
+        Setting::BatteryPercent => c.battery_percent = !c.battery_percent,
+        Setting::BatteryInside => c.battery_percent_inside = !c.battery_percent_inside,
         Setting::Module(n) => {
             let on = c.module_visible(n);
             c.set_module_visible(n, !on);
@@ -1088,7 +1114,8 @@ mod tests {
     fn choices_roundtrip() {
         let mut c = Config::default();
         let sc = test_screens();
-        for set in [Setting::Language, Setting::StartStyle, Setting::Position, Setting::Monitor, Setting::Display] {
+        for set in [Setting::Language, Setting::StartStyle, Setting::Position, Setting::Monitor, Setting::Display, Setting::Battery]
+        {
             for j in 0..options(set, &sc).len() {
                 choose(&mut c, set, j, &sc);
                 assert_eq!(selected(&c, set, &sc), Some(j));
@@ -1136,6 +1163,8 @@ mod tests {
             Setting::Previews,
             Setting::WinStart,
             Setting::Seconds,
+            Setting::BatteryPercent,
+            Setting::BatteryInside,
             Setting::Module("metrics"),
             Setting::Module("tray"),
         ] {
@@ -1144,6 +1173,26 @@ mod tests {
             assert_eq!(is_on(&c, set), !was);
         }
         assert!(!items(&c, Page::Main, false, &[]).iter().any(|i| matches!(i, Item::TrayChooser)));
+    }
+
+    #[test]
+    fn battery_rows_are_in_the_modules_section() {
+        let c = Config { show_tray: true, ..Config::default() };
+        let v = items(&c, Page::Main, false, &[]);
+        let at = |f: fn(&Item) -> bool| v.iter().position(f).unwrap();
+        let choice = at(|i| matches!(i, Item::Choice(Setting::Battery, _)));
+        let pct = at(|i| matches!(i, Item::Toggle(Setting::BatteryPercent, _)));
+        let inside = at(|i| matches!(i, Item::Toggle(Setting::BatteryInside, _)));
+        let modules = at(|i| matches!(i, Item::Section(s) if *s == "Modules"));
+        let tray = at(|i| matches!(i, Item::Toggle(Setting::Module("tray"), _)));
+        let chooser = at(|i| matches!(i, Item::TrayChooser));
+        assert!(modules < choice && choice < pct && pct < inside && inside < tray);
+        assert_eq!(chooser, tray + 1); // the Tray toggle stays directly above its "Choose visible icons" link
+        assert_eq!(options(Setting::Battery, &[]), ["Auto", "On", "Off"]);
+        let mut d = Config::default();
+        choose(&mut d, Setting::Battery, 2, &[]);
+        assert_eq!(d.show_battery, BatteryShow::Off);
+        assert!(is_on(&c, Setting::BatteryPercent) && !is_on(&c, Setting::BatteryInside)); // defaults
     }
 
     #[test]
