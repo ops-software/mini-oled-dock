@@ -450,7 +450,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_QUIT_REQUEST => {
             taskbar::begin_exit();
-            log!("quit request from --restore: exiting");
+            log!("quit request (stop event: --restore, --install or --uninstall): exiting");
             // SAFETY: no preconditions.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -1047,6 +1047,17 @@ fn main() -> std::process::ExitCode {
         }
         let (log_thread, _) = start_logging("");
         let code = update::run_check_cli();
+        logger::stop(log_thread);
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+
+    // --update-install <tag> mode: hands an already staged, verified release to --install --quiet.
+    if let Some(tag) = &args.update_install {
+        if attach_console() {
+            logger::enable_stdout();
+        }
+        let (log_thread, _) = start_logging("");
+        let code = update::run_install_cli(tag);
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }

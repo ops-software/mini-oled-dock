@@ -4,19 +4,22 @@
 //! `update` thread (the UI thread never blocks on the network). Everything the worker learns is
 //! kept in `STATE` and mirrored into `config.json` (`last_update_check`, `update_available`).
 //! `stage()` downloads a release into the admin-only `<data>\update\<tag>\` folder and verifies it
-//! (SHA-256, then `--version`). The install handoff and timer are added by later tasks.
+//! (SHA-256, then `--version`); `install_now()` hands the verified exe to `--install --quiet`.
+//! The timer is added by a later task.
 
 // Wired into the dock by later tasks; until then some items are unused.
 #![allow(dead_code)]
 
 use std::io::Read;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{self, Config};
@@ -254,35 +257,38 @@ fn now_unix() -> u64 {
 
 /// Starts a check on the worker thread. false = an update operation is already running.
 pub fn check_now() -> bool {
-    spawn_worker(|| {
-        with_state(|s| s.phase = Phase::Checking);
-        notify();
-        let installed = Version::current();
-        let r = fetch_latest();
-        match &r {
-            Ok(rel) if rel.version > installed => crate::log!("update: {} available", rel.tag),
-            Ok(rel) => crate::log!("update: up to date (latest {})", rel.tag),
-            Err(e) => crate::log!("update: could not check ({e})"),
+    spawn_worker(check_once)
+}
+
+/// One check, on the worker thread: asks GitHub, folds the answer into the status and the config.
+fn check_once() {
+    with_state(|s| s.phase = Phase::Checking);
+    notify();
+    let installed = Version::current();
+    let r = fetch_latest();
+    match &r {
+        Ok(rel) if rel.version > installed => crate::log!("update: {} available", rel.tag),
+        Ok(rel) => crate::log!("update: up to date (latest {})", rel.tag),
+        Err(e) => crate::log!("update: could not check ({e})"),
+    }
+    if let Ok(rel) = &r {
+        *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = is_newer(&rel.tag, installed).then(|| rel.clone());
+    }
+    let (last, tag) = with_state(|s| {
+        apply_check(s, &r, installed, now_unix());
+        s.phase = Phase::Idle;
+        (s.last_check.clone(), s.available.as_ref().map(|a| a.tag.clone()).unwrap_or_default())
+    });
+    let c = config::get();
+    if c.last_update_check != last || c.update_available != tag {
+        if let Err(e) = config::modify(|c| {
+            c.last_update_check = last;
+            c.update_available = tag;
+        }) {
+            crate::log!("update: cannot save the check result: {e}");
         }
-        if let Ok(rel) = &r {
-            *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = is_newer(&rel.tag, installed).then(|| rel.clone());
-        }
-        let (last, tag) = with_state(|s| {
-            apply_check(s, &r, installed, now_unix());
-            s.phase = Phase::Idle;
-            (s.last_check.clone(), s.available.as_ref().map(|a| a.tag.clone()).unwrap_or_default())
-        });
-        let c = config::get();
-        if c.last_update_check != last || c.update_available != tag {
-            if let Err(e) = config::modify(|c| {
-                c.last_update_check = last;
-                c.update_available = tag;
-            }) {
-                crate::log!("update: cannot save the check result: {e}");
-            }
-        }
-        notify();
-    })
+    }
+    notify();
 }
 
 /// Opens the release page (or the latest-release page) de-elevated through the shell thread.
@@ -469,6 +475,147 @@ fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     r
 }
 
+/// Arguments the staged exe is started with: it stops this dock through `Local\DockStop`, replaces
+/// the installed exe, re-registers the task, writes the ARP key and relaunches.
+pub(crate) const INSTALL_ARGS: &str = "--install --quiet";
+/// How long the dock (or `--update-install`) waits for the installer child.
+const INSTALL_WAIT: Duration = Duration::from_secs(120);
+
+/// The release to install: only a freshly fetched one (`LATEST`), and only if newer than
+/// `installed`. A badge restored from `config.json` alone never installs anything.
+pub(crate) fn install_target(latest: Option<&Release>, installed: Version) -> Option<Release> {
+    latest.filter(|r| r.version > installed).cloned()
+}
+
+fn latest_target(installed: Version) -> Option<Release> {
+    install_target(LATEST.lock().unwrap_or_else(|e| e.into_inner()).as_ref(), installed)
+}
+
+/// Waits up to `timeout` for `process` to exit: `Some(exit code)`, or `None` on timeout or error.
+fn wait_exit(process: &OwnedHandle, timeout: Duration) -> Option<i32> {
+    let h = HANDLE(process.as_raw_handle());
+    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: `h` is a valid process handle owned by `process` for the whole call.
+    if unsafe { WaitForSingleObject(h, ms) } != WAIT_OBJECT_0 {
+        return None;
+    }
+    let mut code = 0u32;
+    // SAFETY: valid process handle and output pointer.
+    unsafe { GetExitCodeProcess(h, &mut code) }.ok()?;
+    Some(code as i32)
+}
+
+/// Installs the newest release on the worker thread: check if nothing fresh is known, stage (download +
+/// verify), then hand the verified exe to `--install --quiet`. The child stops this dock through its
+/// normal stop path (`WM_DOCK_QUIT_REQUEST`, cleanup, taskbar restored, exit 0). false = an update
+/// operation is already running.
+pub fn install_now() -> bool {
+    spawn_worker(|| {
+        let installed = Version::current();
+        let rel = match latest_target(installed) {
+            Some(r) => r,
+            None => {
+                // `check_once` sets the outcome itself: UpToDate on an answer, CouldNotCheck otherwise.
+                check_once();
+                match latest_target(installed) {
+                    Some(r) => r,
+                    None => return,
+                }
+            }
+        };
+        let Ok(path) = stage(&rel) else { return };
+        set_phase(Phase::Installing);
+        crate::log!("update: installing {} from {}", rel.tag, path.display());
+        let failed = |code: i32| {
+            with_state(|s| {
+                s.phase = Phase::Idle;
+                s.outcome = Outcome::InstallFailed(code);
+            });
+            notify();
+        };
+        let child = match crate::watchdog::spawn_breakaway(&path, INSTALL_ARGS) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log!("update: cannot start the installer: {e}");
+                return failed(-1);
+            }
+        };
+        match wait_exit(&child, INSTALL_WAIT) {
+            Some(0) => {
+                crate::log!("update: the installer finished but the dock is still running");
+                set_phase(Phase::Idle);
+            }
+            Some(code) => {
+                crate::log!("update: the installer exited with {code}; the stage {} is kept", rel.tag);
+                failed(code);
+            }
+            None => {
+                crate::log!("update: the installer did not finish within {} s", INSTALL_WAIT.as_secs());
+                set_phase(Phase::Idle);
+            }
+        }
+    })
+}
+
+/// Deletes staging folders of canonical tags at or below the running version (failed installs and
+/// the version now running). Run once at startup on a thread named `update-cleanup`; the installer
+/// that just finished may still run from the current version's folder, so a failure is only logged
+/// and the next start retries.
+fn cleanup_stages() {
+    if !datadir::writable() {
+        return;
+    }
+    for tag in update_release::stale_stages(&datadir::update_stage_names(), Version::current()) {
+        match datadir::remove_update_stage(&tag) {
+            Ok(()) => crate::log!("update: removed the old stage {tag}"),
+            Err(e) => crate::log!("update: cannot remove the old stage {tag}: {e}"),
+        }
+    }
+}
+
+/// `--update-install <tag>`: installs an already staged release. The only input is a canonical tag,
+/// mapped to `<data>\update\<tag>\`; there is no path argument. Returns the installer's exit code.
+pub fn run_install_cli(tag: &str) -> i32 {
+    let say = crate::logger::say;
+    if parse_tag(tag).is_none() {
+        say(&format!("invalid tag {tag:?} (expected vX.Y.Z)"));
+        return crate::autostart::EXIT_BAD_ARGS;
+    }
+    if !datadir::writable() {
+        say("the data folder is not writable (run elevated)");
+        return 1;
+    }
+    let path = match verify_stage(tag) {
+        Ok(p) => p,
+        Err(e) => {
+            say(&format!("{tag}: {e}"));
+            return 1;
+        }
+    };
+    crate::log!("update: installing {tag} from {}", path.display());
+    let child = match crate::watchdog::spawn_breakaway(&path, INSTALL_ARGS) {
+        Ok(c) => c,
+        Err(e) => {
+            say(&format!("cannot start the installer: {e}"));
+            return 1;
+        }
+    };
+    match wait_exit(&child, INSTALL_WAIT) {
+        Some(0) => {
+            say(&format!("Installed {tag}."));
+            0
+        }
+        Some(code) => {
+            say(&format!("Installer exited with {code}."));
+            code
+        }
+        None => {
+            say(&format!("The installer did not finish within {} s.", INSTALL_WAIT.as_secs()));
+            1
+        }
+    }
+}
+
 /// `--update-check`: one synchronous check, no config write. Exit 0 = answered, 1 = could not check.
 pub fn run_check_cli() -> i32 {
     let cur = Version::current();
@@ -553,5 +700,15 @@ mod tests {
         let t = Instant::now();
         assert!(run_capture(&system32("ping.exe"), &["-n", "6", "127.0.0.1"], Duration::from_millis(300)).is_err());
         assert!(t.elapsed() < Duration::from_secs(3)); // killed, not waited for
+    }
+
+    #[test]
+    fn install_target_needs_a_fresh_newer_release() {
+        let cur = Version::parse("1.4.0").unwrap();
+        let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(install_target(None, cur), None); // a badge from config.json alone never installs
+        assert_eq!(install_target(Some(&rel), cur), Some(rel.clone()));
+        assert_eq!(install_target(Some(&rel), Version::parse("1.4.1").unwrap()), None);
+        assert_eq!(INSTALL_ARGS, "--install --quiet");
     }
 }

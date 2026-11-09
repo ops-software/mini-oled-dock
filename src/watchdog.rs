@@ -28,6 +28,7 @@
 //! `run_watchdog` is the main of the watchdog process (no window, no hook, no COM).
 
 use std::ffi::c_void;
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
@@ -185,8 +186,17 @@ pub fn spawn() -> Result<(), String> {
 /// `CreateProcessW` of `current_exe --watchdog <pid> <event>`, with a fallback without breakaway.
 fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // The process handle is not needed by the dock: dropping it closes it.
+    spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}")).map(drop)
+}
+
+/// `CreateProcessW` of `"<exe>" <args>` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW`, falling
+/// back to `CREATE_NO_WINDOW` if breakaway is denied. Breakaway lets the child outlive the dock when
+/// the dock runs inside the Task Scheduler job (the watchdog, the updater's installer). Returns the
+/// process handle; the thread handle is closed at once.
+pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<OwnedHandle, String> {
     let exe_str = exe.to_string_lossy().into_owned();
-    let cmdline = format!("\"{exe_str}\" --watchdog {pid} {ev_name}");
+    let cmdline = format!("\"{exe_str}\" {args}");
     let app = HSTRING::from(exe_str.as_str());
 
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
@@ -214,15 +224,16 @@ fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
         };
         match r {
             Ok(()) => {
-                // SAFETY: handles returned by CreateProcessW, not needed by the dock.
-                unsafe {
-                    let _ = CloseHandle(pi.hProcess);
+                // SAFETY: both handles were just returned by CreateProcessW and are owned here; the
+                // thread handle is closed once, the process handle is moved into the OwnedHandle.
+                let process = unsafe {
                     let _ = CloseHandle(pi.hThread);
-                }
-                return Ok(());
+                    OwnedHandle::from_raw_handle(pi.hProcess.0)
+                };
+                return Ok(process);
             }
             Err(e) => {
-                log!("watchdog: CreateProcessW ({label}) failed: {e}");
+                log!("spawn: CreateProcessW of {exe_str} ({label}) failed: {e}");
                 if flags == CREATE_NO_WINDOW {
                     return Err(format!("CreateProcessW: {e}"));
                 }
