@@ -123,18 +123,18 @@ pub struct Release {
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct RawAsset {
-    name: String,
+    name: Option<String>,
     size: u64,
-    browser_download_url: String,
+    browser_download_url: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct RawRelease {
     tag_name: String,
-    name: String,
-    body: String,
-    published_at: String,
+    name: Option<String>,
+    body: Option<String>,
+    published_at: Option<String>,
     draft: bool,
     prerelease: bool,
     assets: Vec<RawAsset>,
@@ -155,31 +155,38 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
         let a = raw
             .assets
             .iter()
-            .find(|a| a.name == name)
+            .find(|a| a.name.as_deref() == Some(name))
             .ok_or_else(|| format!("asset {name} missing"))?;
-        if a.browser_download_url != asset_url(&raw.tag_name, name) {
+        let url = a.browser_download_url.as_deref().unwrap_or_default();
+        if url != asset_url(&raw.tag_name, name) {
             return Err(format!("asset {name} has an unexpected URL"));
         }
         if a.size == 0 || a.size > max {
             return Err(format!("asset {name} has an unacceptable size"));
         }
         Ok(Asset {
-            url: a.browser_download_url.clone(),
+            url: url.to_string(),
             size: a.size,
         })
     };
     let exe = find(EXE_ASSET, EXE_MAX_BYTES)?;
     let sha256 = find(SHA_ASSET, SHA_MAX_BYTES)?;
-    let published = if parse_rfc3339_utc(&raw.published_at).is_some() {
-        raw.published_at.clone()
+    let published_at = raw.published_at.unwrap_or_default();
+    let published = if parse_rfc3339_utc(&published_at).is_some() {
+        published_at
     } else {
         String::new()
     };
     Ok(Release {
         tag: raw.tag_name,
         version,
-        name: raw.name,
-        notes: raw.body.chars().take(NOTES_MAX_CHARS).collect(),
+        name: raw.name.unwrap_or_default(),
+        notes: raw
+            .body
+            .unwrap_or_default()
+            .chars()
+            .take(NOTES_MAX_CHARS)
+            .collect(),
         published,
         exe,
         sha256,
@@ -419,6 +426,11 @@ mod tests {
             }
         );
         assert_eq!(r.sha256.url, asset_url("v1.4.1", SHA_ASSET));
+        let nulls = RELEASE_FIXTURE
+            .replace("\"body\":\"Fixes\"", "\"body\":null")
+            .replace("\"name\":\"mini-oled-dock 1.4.1\"", "\"name\":null");
+        let r = parse_release(nulls.as_bytes()).unwrap();
+        assert_eq!((r.notes.as_str(), r.name.as_str()), ("", ""));
     }
 
     #[test]
