@@ -450,7 +450,8 @@ fn copy_self(dest: &Path, allow_stop: bool) -> InstallReport {
 
 /// Installs the exe copy and registers the task. `allow_stop`: may stop an instance that locks
 /// the destination (only from `--install`; the popup toggle must not close itself).
-/// A task error after a good copy keeps `copy`, so the new exe is still relaunched.
+/// Then writes the Add/Remove Programs entry (`arp::write`).
+/// A task or ARP error after a good copy keeps `copy`, so the new exe is still relaunched.
 pub(crate) fn enable(allow_stop: bool) -> InstallReport {
     let dest = match installed_exe() {
         Ok(d) => d,
@@ -463,6 +464,15 @@ pub(crate) fn enable(allow_stop: bool) -> InstallReport {
     match register_task(&dest) {
         Ok(()) => log!("autostart: task '{TASK_NAME}' registered -> {}", dest.display()),
         Err(e) => report.error = Some(InstallError::Failed(e)),
+    }
+    let arp = install_dir().and_then(|dir| crate::arp::write(&dir));
+    match arp {
+        Ok(()) => log!("autostart: Add/Remove Programs entry written"),
+        Err(e) => {
+            log!("autostart: Add/Remove Programs entry failed: {e}");
+            // The first error wins (a task failure is reported before this one).
+            report.error.get_or_insert(InstallError::Failed(format!("Add/Remove Programs entry: {e}")));
+        }
     }
     report
 }

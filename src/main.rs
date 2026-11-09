@@ -31,6 +31,7 @@
 #![windows_subsystem = "windows"]
 
 mod apps;
+mod arp;
 mod audio;
 mod autostart;
 mod calendar;
