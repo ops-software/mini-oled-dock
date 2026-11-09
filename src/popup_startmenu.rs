@@ -36,8 +36,10 @@
 //! DATA: the catalog and the icons live in a UI-thread store (`STORE`) filled only while a Start menu
 //! is open. Every open asks the shell thread for a fresh catalog (`ShellRequest::ListStartApps`);
 //! the icons are extracted in small batches (behind every other shell request) and arrive as
-//! `ShellEvent::StartIcons`. `after_close` empties the store and sends `ShellRequest::StartRelease`
-//! (the shell thread forgets what it sent); events that arrive after the close are dropped.
+//! `ShellEvent::StartIcons`. `after_close` keeps the store and arms a 60 s
+//! one-shot (`popup::arm_start_release`); a reopen before it fires draws at once. When it fires with
+//! no Start menu open, `release` empties the store and sends `ShellRequest::StartRelease` (the shell
+//! thread forgets what it sent); events that arrive after that are dropped.
 //!
 //! Declared as a child module of `popup` (`#[path]`). UI thread only.
 
@@ -179,7 +181,7 @@ struct Store {
     /// Icons by lowercase id, `icon_px` square.
     icons: HashMap<String, IconBitmap>,
     icon_px: u32,
-    /// true between `request_catalog` and `after_close`; late shell events are dropped otherwise.
+    /// true between `request_catalog` and `release`; late shell events are dropped otherwise.
     open: bool,
 }
 
@@ -187,7 +189,7 @@ thread_local! {
     static STORE: RefCell<Store> = RefCell::new(Store::default());
 }
 
-/// Empties the store when the menu closes. Returns the bytes of icon bitmaps freed.
+/// Empties the store (60 s after the menu closed). Returns the bytes of icon bitmaps freed.
 fn release_store() -> usize {
     STORE.with(|s| {
         let Ok(mut s) = s.try_borrow_mut() else { return 0 };
@@ -197,6 +199,12 @@ fn release_store() -> usize {
         log!("startmenu: freed {} KB of icons ({apps} apps)", bytes / 1024);
         bytes
     })
+}
+
+/// Frees the store and tells the shell thread to forget what it sent.
+pub(crate) fn release() {
+    release_store();
+    shell_thread::request(ShellRequest::StartRelease);
 }
 
 /// `ShellEvent::StartApps`: replaces the catalog (sorted by name).
@@ -1236,8 +1244,7 @@ impl Content for StartMenu {
     }
 
     fn after_close(&mut self) {
-        release_store();
-        shell_thread::request(ShellRequest::StartRelease);
+        crate::popup::arm_start_release();
         if let Some(a) = self.power_pending.take() {
             popup_power::run(a);
             return;
@@ -1256,7 +1263,7 @@ mod tests {
     const M: Metrics = Metrics { dpi: 96 };
 
     #[test]
-    fn closing_frees_the_store_and_late_events_are_dropped() {
+    fn releasing_frees_the_store_and_late_events_are_dropped() {
         let apps = vec![
             ("a".to_string(), "Alpha".to_string(), IconBitmap::new(32, 32)),
             ("b".to_string(), "Beta".to_string(), IconBitmap::new(32, 32)),

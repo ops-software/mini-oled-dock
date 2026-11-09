@@ -56,7 +56,7 @@ pub(crate) mod popup_startmenu;
 
 use crate::audio::{OutputDevice, VolumeState};
 use crate::log;
-use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
+use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
 use crate::render::Metrics;
 use crate::surface::Surface;
 
@@ -639,6 +639,10 @@ pub fn on_start_icons(icon_px: u32, icons: Vec<(String, Option<crate::icons::Ico
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {
     close_inner("shutdown");
+    if let Some(h) = with(|st| st.hwnd).filter(|h| !h.0.is_null()) {
+        // SAFETY: our window.
+        let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
+    }
     let Some((hwnd, registered)) = with(|st| {
         let r = (st.hwnd, st.registered);
         st.hwnd = HWND::default();
@@ -857,6 +861,10 @@ fn open(kind: PopupKind, anchor: Anchor) {
     close_inner("popup switch");
     crate::picker::close("popup opened");
     let Some(hwnd) = ensure_window() else { return };
+    if kind == PopupKind::StartMenu {
+        // SAFETY: our window; fails harmlessly if the timer is not armed.
+        let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
+    }
     let metrics = Metrics { dpi: anchor.dpi.max(96) };
     let surf = match Surface::new(metrics) {
         Ok(s) => s,
@@ -1128,6 +1136,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 TIMER_POPUP_ANIM => on_anim(hwnd),
                 TIMER_POPUP_TICK => on_tick(hwnd),
                 TIMER_POPUP_FOCUS => on_focus_retry(hwnd),
+                TIMER_POPUP_START_RELEASE => on_start_release(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -1367,9 +1376,33 @@ pub(crate) fn tick_soon(ms: u32) {
     }
 }
 
-/// The Start menu is useless without the keyboard (type to search): close it once the last retry fails.
-fn focus_giveup(kind: PopupKind, tries_left: u8, focused: bool) -> bool {
-    kind == PopupKind::StartMenu && tries_left == 0 && !focused
+/// Delay after a Start menu close before its catalog and icons are released (`TIMER_POPUP_START_RELEASE`).
+const START_RELEASE_MS: u32 = 60_000;
+
+/// Whether the release timer may free the Start data: not while a Start menu is open.
+fn start_release_due(open: Option<PopupKind>) -> bool {
+    open != Some(PopupKind::StartMenu)
+}
+
+/// Arms (or restarts) the one-shot that releases the Start menu data; called when it closes.
+pub(crate) fn arm_start_release() {
+    let Some(hwnd) = with(|st| st.hwnd) else { return };
+    if hwnd.0.is_null() {
+        return;
+    }
+    // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
+    if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_START_RELEASE, START_RELEASE_MS, None) } == 0 {
+        log!("popup: SetTimer(start release) failed");
+    }
+}
+
+/// `TIMER_POPUP_START_RELEASE`: frees the Start menu data unless a Start menu is open again.
+fn on_start_release(hwnd: HWND) {
+    // SAFETY: timer of our window.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
+    if start_release_due(current()) {
+        popup_startmenu::release();
+    }
 }
 
 /// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
@@ -1395,19 +1428,12 @@ fn on_focus_retry(hwnd: HWND) {
             return None;
         }
         o.focus_tries -= 1;
-        Some((o.focus_tries, o.kind))
+        Some((o.focus_tries, ()))
     })
     .flatten();
-    let Some((left, kind)) = go else { return };
+    let Some((left, _)) = go else { return };
     let ok = crate::ui::force_foreground(hwnd);
     log!("popup: foreground retry ({left} left) -> {ok}");
-    // SAFETY: no preconditions.
-    let focused = ok || unsafe { GetForegroundWindow() } == hwnd;
-    if focus_giveup(kind, left, focused) {
-        log!("popup: Start menu has no keyboard focus after the last retry, closing");
-        close_inner("no keyboard focus");
-        return;
-    }
     if !ok && left > 0 {
         // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
         if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
@@ -1561,10 +1587,9 @@ mod tests {
     }
 
     #[test]
-    fn start_menu_never_stays_open_unfocused() {
-        assert!(focus_giveup(PopupKind::StartMenu, 0, false));
-        assert!(!focus_giveup(PopupKind::StartMenu, 0, true));
-        assert!(!focus_giveup(PopupKind::StartMenu, 2, false), "retries left: keep trying");
-        assert!(!focus_giveup(PopupKind::Power, 0, false), "only the Start menu needs the keyboard");
+    fn start_data_is_released_only_when_no_start_menu_is_open() {
+        assert!(start_release_due(None));
+        assert!(start_release_due(Some(PopupKind::Power)));
+        assert!(!start_release_due(Some(PopupKind::StartMenu)));
     }
 }

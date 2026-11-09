@@ -132,6 +132,9 @@ pub const TIMER_POPUP_TICK: usize = 31;
 /// Short one-shot retries (`FOCUS_RETRY_MS`) after open while the popup did NOT get the foreground
 /// (keyboard focus: the Start menu search box). Off once it is foreground, after the last try, on close.
 pub const TIMER_POPUP_FOCUS: usize = 32;
+/// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
+/// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
+pub const TIMER_POPUP_START_RELEASE: usize = 33;
 
 // --------------------------------------------- context menu command ids
 
