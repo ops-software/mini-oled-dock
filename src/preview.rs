@@ -589,6 +589,7 @@ fn settings_png_with(
         memory: Memory { now: Some(10_276_044), trimmed: Some(6_396_314) },
         data_dir: Some("C:\\ProgramData\\mini-oled-dock"),
         log_path: Some("C:\\ProgramData\\mini-oled-dock\\dock.log"),
+        trust_elevated: false,
     };
     // The mini bar is drawn by the bar renderer, which reads the global config.
     crate::config::set(c.clone());
@@ -945,6 +946,11 @@ pub fn run(dir: &str) -> i32 {
             failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
         }
     }
+    // The whole Modules page, down to the Tray section (elevated-apps switch).
+    let (m, modules) = (Metrics { dpi: 144 }, crate::settings_pages::Page::Modules);
+    let c = Config::default();
+    let tall = settings_png_with(dir, "settings_modules_tray.png", m, modules, &c, (false, false), None, (860, 900));
+    failures += i32::from(!tall);
     crate::i18n::set_preview(false);
     for page in crate::settings_pages::Page::ALL {
         let c = Config { language: crate::config::Language::It, ..Config::default() };

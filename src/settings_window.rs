@@ -255,6 +255,8 @@ struct Win {
     memory: Memory,
     data_dir: Option<String>,
     log_path: Option<String>,
+    /// `tray_host::trust_elevated_tray_icons`, re-read when the window opens and after a toggle.
+    trust_elevated: bool,
     pending: Pending,
     bar: Option<MiniBar>,
     /// `tick_ms` of the last mini bar rebuild (see `bar_wait`).
@@ -408,6 +410,7 @@ impl Win {
             memory: self.memory,
             data_dir: self.data_dir.as_deref(),
             log_path: self.log_path.as_deref(),
+            trust_elevated: self.trust_elevated,
         }
     }
 
@@ -763,6 +766,7 @@ fn open_window(inst: HINSTANCE) -> Result<(), String> {
         memory: Memory { now: crate::mem::private_bytes(), trimmed: crate::mem::last_hidden_trim() },
         data_dir,
         log_path: crate::datadir::log_path().map(|p| p.display().to_string()),
+        trust_elevated: crate::tray_host::trust_elevated_tray_icons(),
         pending: Pending::default(),
         bar: None,
         bar_built: 0,
@@ -883,6 +887,16 @@ fn run_effect(e: Effect) {
             crate::tray_host::set_user_hidden(&key, hidden);
             with_win(|w| {
                 w.tray = crate::popup_tray::customize_rows();
+                w.refresh();
+            });
+        }
+        Effect::TrustElevated(on) => {
+            match crate::tray_host::set_trust_elevated_tray_icons(on) {
+                Ok(()) => log!("settings: tray icons of elevated apps {}", if on { "allowed" } else { "blocked" }),
+                Err(e) => log!("settings: TrustElevatedTrayIcons not written: {e}"),
+            }
+            with_win(|w| {
+                w.trust_elevated = crate::tray_host::trust_elevated_tray_icons();
                 w.refresh();
             });
         }

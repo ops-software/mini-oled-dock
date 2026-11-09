@@ -116,6 +116,9 @@ pub(crate) enum Setting {
     BatteryInside,
     UpdateCheck,
     UpdateAutoInstall,
+    /// Admin-only `HKLM\SOFTWARE\mini-oled-dock\TrustElevatedTrayIcons`, NOT in the config: the state
+    /// comes from `Ctx::trust_elevated` and a click gives `Effect::TrustElevated`.
+    TrustElevatedTray,
 }
 
 /// A value set by a slider.
@@ -223,6 +226,8 @@ pub(crate) struct Ctx<'a> {
     pub memory: Memory,
     pub data_dir: Option<&'a str>,
     pub log_path: Option<&'a str>,
+    /// `tray_host::trust_elevated_tray_icons` (the HKLM switch).
+    pub trust_elevated: bool,
 }
 
 // ------------------------------------------------------------------ helpers moved from the old popup
@@ -518,6 +523,7 @@ pub(crate) enum Effect {
     TogglePicker,
     ToggleChooser,
     TrayVisible { key: String, hidden: bool },
+    TrustElevated(bool),
     Run(Action),
 }
 
@@ -528,6 +534,7 @@ pub(crate) fn click(row: &Row, part: Option<usize>, ctx: &Ctx<'_>) -> Effect {
             Some(j) if j < options.len() && *selected != Some(j) => Effect::Save(Edit::Choose(*setting, j)),
             _ => Effect::None,
         },
+        Control::Toggle { setting: Setting::TrustElevatedTray, on, enabled: true } => Effect::TrustElevated(!*on),
         Control::Toggle { setting, enabled, .. } => {
             if *enabled {
                 Effect::Save(Edit::Flip(*setting))
@@ -654,6 +661,15 @@ fn modules(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     v.push(header(tr("Tray", "Area di notifica"), None));
     v.push(toggle(glyphs::ring_shape, module_label("tray"), None, c, Setting::Module("tray")));
     if c.module_visible("tray") {
+        v.push(row(
+            glyphs::lock_shape,
+            tr("Icons of apps run as administrator", "Icone delle app avviate come amministratore"),
+            Some(tr(
+                "Allow clicks on their icons, for example MSI Afterburner",
+                "Consenti i clic sulle loro icone, ad esempio MSI Afterburner",
+            )),
+            Control::Toggle { setting: Setting::TrustElevatedTray, on: ctx.trust_elevated, enabled: true },
+        ));
         v.push(row(
             glyphs::eye_icon,
             tr("Choose visible icons", "Scegli le icone visibili"),
@@ -952,6 +968,7 @@ mod tests {
             memory: Memory::default(),
             data_dir: None,
             log_path: None,
+            trust_elevated: false,
         }
     }
 
@@ -1222,6 +1239,36 @@ mod tests {
             .iter()
             .any(|r| r.control == Control::Toggle { setting: Setting::BatteryInside, on: false, enabled: false }));
         assert!(!r.iter().any(|r| matches!(r.control, Control::Chooser { .. })));
+    }
+
+    #[test]
+    fn elevated_tray_toggle_reflects_and_flips_the_hklm_switch() {
+        let st = idle();
+        let mut c = Config::default();
+        let find = |r: &[Row]| {
+            r.iter().position(|r| matches!(r.control, Control::Toggle { setting: Setting::TrustElevatedTray, .. }))
+        };
+        for on in [false, true] {
+            let mut cx = ctx(&[], &st);
+            cx.trust_elevated = on;
+            let r = rows(Page::Modules, &c, &cx);
+            let k = find(&r).unwrap();
+            assert_eq!(r[k].control, Control::Toggle { setting: Setting::TrustElevatedTray, on, enabled: true });
+            assert!(r[k].desc.is_some());
+            // In the Tray section, between the module toggle and the chooser.
+            assert_eq!(r[k - 1].control, Control::Toggle { setting: Setting::Module("tray"), on: true, enabled: true });
+            assert_eq!(r[k + 1].control, Control::Chooser { open: false });
+            // The click asks for the HKLM write, never a config edit.
+            assert_eq!(click(&r[k], None, &cx), Effect::TrustElevated(!on));
+        }
+        // The config never holds it: flipping the setting does nothing.
+        let before = c.clone();
+        flip(&mut c, Setting::TrustElevatedTray);
+        assert!(!is_on(&c, Setting::TrustElevatedTray));
+        assert_eq!(format!("{before:?}"), format!("{c:?}"));
+        // Hidden with the tray module.
+        c.set_module_visible("tray", false);
+        assert!(find(&rows(Page::Modules, &c, &ctx(&[], &st))).is_none());
     }
 
     #[test]

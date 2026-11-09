@@ -42,7 +42,10 @@ use windows::Win32::System::Memory::{
     MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, SECTION_MAP_READ,
     SECTION_MAP_WRITE, SECTION_QUERY,
 };
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE,
+    KEY_WOW64_64KEY, REG_DWORD, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
     PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -287,6 +290,9 @@ struct TrayItem {
     bitmap: Option<Arc<IconBitmap>>,
     /// Owner's exe name (diagnostics and `tray_hidden` key).
     exe: String,
+    /// Full image path of the owner process when the icon was registered (empty if unknown); an
+    /// elevated owner is trusted only while its process still runs this image.
+    image: String,
     /// Short app name (FileDescription), empty if unavailable.
     name: String,
 }
@@ -457,15 +463,17 @@ fn apply_fields(t: &mut TrayItem, nid: &NotifyIconData32, icon: IconUpdate) -> b
     changed
 }
 
-/// Core of `dwData == 1` (pure, tested). `owner_pid` = owner's pid if the window exists.
+/// Core of `dwData == 1` (pure, tested). `owner_pid` = owner's pid if the window exists; `image` = full
+/// image path of that process (read for `NIM_ADD` only, empty if unknown).
 fn apply_nim(
     items: &mut Vec<TrayItem>,
     next_id: &mut u64,
     d: &ShellTrayData,
     owner_pid: Option<u32>,
     icon: IconUpdate,
-    exe: &str,
+    image: &str,
 ) -> NimResult {
+    let exe = file_name_of(image);
     let nid = &d.nid;
     let owner = ext(nid.hwnd);
     let guid = (nid.flags & NIF_GUID != 0 && !guid_is_zero(&nid.guid)).then_some(nid.guid);
@@ -481,7 +489,8 @@ fn apply_nim(
                 t.owner = owner;
                 t.pid = pid;
                 t.uid = nid.uid;
-                t.exe = exe.to_string();
+                t.exe = exe;
+                t.image = image.to_string();
                 touched = apply_fields(t, nid, icon);
                 true
             }
@@ -509,7 +518,8 @@ fn apply_nim(
                     tip: String::new(),
                     src: None,
                     bitmap: None,
-                    exe: exe.to_string(),
+                    exe,
+                    image: image.to_string(),
                     name: String::new(),
                 };
                 *next_id += 1;
@@ -593,6 +603,7 @@ struct Target {
     callback: u32,
     version: u32,
     exe: String,
+    image: String,
 }
 
 fn target_of(id: u64) -> Option<Target> {
@@ -605,6 +616,7 @@ fn target_of(id: u64) -> Option<Target> {
         callback: t.callback,
         version: t.version,
         exe: t.exe.clone(),
+        image: t.image.clone(),
     })
 }
 
@@ -657,21 +669,73 @@ fn allow_foreground(pid: u32) {
     }
 }
 
+/// Facts about an icon's owner gathered when the dock is about to send it a message.
+#[derive(Clone, Copy, Debug)]
+struct OwnerFacts<'a> {
+    /// The owner window still exists and belongs to the pid recorded for the icon.
+    same_process: bool,
+    /// That process runs at integrity not higher than medium.
+    at_most_medium: bool,
+    /// Image path recorded when the icon was registered (empty if it could not be read).
+    recorded_image: &'a str,
+    /// Image path of the process now (`None` if not read or unreadable).
+    current_image: Option<&'a str>,
+}
+
+/// Outcome of `callback_verdict`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    Allowed,
+    /// The window is gone or belongs to another process: nothing is sent (no log).
+    NotOwner,
+    /// Elevated owner and the admin switch is off.
+    ElevatedNotTrusted,
+    /// Elevated owner, switch on, but the callback is not an application message.
+    SystemMessage,
+    /// Elevated owner, switch on, but its process no longer runs the image recorded at registration.
+    ImageMismatch,
+}
+
+/// true if `callback` is in the ranges a tray icon legitimately uses: private and `WM_APP` messages
+/// (`WM_USER..=0xBFFF`) and `RegisterWindowMessage` strings (`0xC000..=0xFFFF`). Never a system message
+/// below `WM_USER` (e.g. WM_COMMAND, WM_SYSCOMMAND), never the reserved range above 0xFFFF.
+fn is_app_message(callback: u32) -> bool {
+    (WM_USER..=0xFFFF).contains(&callback)
+}
+
 /// Pure gating decision for any message the dock sends on behalf of a tray registration
 /// (callback clicks, hover `WM_MOUSEMOVE`, `NIN_*`, `WM_CONTEXTMENU`).
 ///
 /// UIPI: any medium-integrity process can register an icon whose owner HWND belongs to an elevated
-/// process. Our elevated dock would then deliver attacker-chosen messages across the integrity
-/// boundary. So owners above medium (or of unknown integrity) are refused, unless an administrator
-/// opted in (`trust_elevated_tray_icons`, HKLM registry); even then, system messages (`callback < WM_USER`, e.g.
-/// WM_COMMAND/WM_SYSCOMMAND) are never sent to them.
-fn callback_permitted(owner_at_most_medium: bool, callback: u32, trust_elevated: bool) -> bool {
-    owner_at_most_medium || (trust_elevated && callback >= WM_USER)
+/// process (a registration is a WM_COPYDATA whose sender cannot be identified, and it names the owner
+/// window and the callback message itself). Our elevated dock would then deliver attacker-chosen
+/// messages across the integrity boundary. So owners above medium (or of unknown integrity) are
+/// refused unless an administrator opted in (`trust_elevated`, HKLM registry), and even then only
+/// application messages (`is_app_message`) are sent, and only while the owner process still runs the
+/// image recorded when the icon was registered. Owners at most medium are not affected.
+fn callback_verdict(o: &OwnerFacts<'_>, callback: u32, trust_elevated: bool) -> Verdict {
+    if !o.same_process {
+        return Verdict::NotOwner;
+    }
+    if o.at_most_medium {
+        return Verdict::Allowed;
+    }
+    if !trust_elevated {
+        return Verdict::ElevatedNotTrusted;
+    }
+    if !is_app_message(callback) {
+        return Verdict::SystemMessage;
+    }
+    match o.current_image {
+        Some(now) if !o.recorded_image.is_empty() && now.eq_ignore_ascii_case(o.recorded_image) => Verdict::Allowed,
+        _ => Verdict::ImageMismatch,
+    }
 }
 
 /// Admin-only opt-in: `HKLM\SOFTWARE\mini-oled-dock`, DWORD `TrustElevatedTrayIcons` (1 = trust).
 /// Deliberately NOT in config.json, which any medium-integrity process can write (the gate would
-/// fail open). HKLM\SOFTWARE is writable only by administrators.
+/// fail open). HKLM\SOFTWARE is writable only by administrators. The Settings window (elevated, like
+/// the whole dock) writes it through `set_trust_elevated_tray_icons`.
 const TRUST_KEY: PCWSTR = w!("SOFTWARE\\mini-oled-dock");
 const TRUST_VALUE: PCWSTR = w!("TrustElevatedTrayIcons");
 /// Maximum age of the cached registry value.
@@ -701,7 +765,7 @@ fn read_trust_elevated_tray_icons() -> bool {
 
 /// Cached opt-in, re-read from the registry at most every `TRUST_CACHE_TTL` (or after
 /// `invalidate_trust_cache`).
-fn trust_elevated_tray_icons() -> bool {
+pub fn trust_elevated_tray_icons() -> bool {
     let mut c = TRUST_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((t, v)) = *c {
         if t.elapsed() < TRUST_CACHE_TTL {
@@ -711,6 +775,8 @@ fn trust_elevated_tray_icons() -> bool {
     let v = read_trust_elevated_tray_icons();
     if c.is_none_or(|(_, old)| old != v) {
         log!("tray: TrustElevatedTrayIcons (HKLM) = {v}");
+        // A new value can refuse for a new reason: log blocked owners again.
+        BLOCKED_LOGGED.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
     *c = Some((Instant::now(), v));
     v
@@ -727,20 +793,71 @@ pub fn invalidate_trust_cache() {
     };
 }
 
+/// Writes the opt-in (1 or 0) to the 64-bit view of HKLM, creating the key if needed, and makes it
+/// take effect at once. Needs administrator rights (the dock runs elevated); returns the error text
+/// otherwise. Called from the Settings window only.
+pub fn set_trust_elevated_tray_icons(on: bool) -> Result<(), String> {
+    let mut key = HKEY::default();
+    // SAFETY: `TRUST_KEY` is a static NUL-terminated wide string; `key` is a writable HKEY, closed below.
+    let r = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            TRUST_KEY,
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_WOW64_64KEY,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return Err(format!("opening HKLM\\SOFTWARE\\mini-oled-dock: {}", windows::core::Error::from(r.to_hresult())));
+    }
+    let data = u32::from(on).to_le_bytes();
+    // SAFETY: `key` is open with KEY_SET_VALUE; the value name is a static NUL-terminated wide string
+    // and `data` (4 bytes, REG_DWORD) lives for the call.
+    let w = unsafe { RegSetValueExW(key, TRUST_VALUE, None, REG_DWORD, Some(&data)) };
+    // SAFETY: `key` was opened above and is closed exactly once.
+    let _ = unsafe { RegCloseKey(key) };
+    if w != ERROR_SUCCESS {
+        return Err(format!("writing TrustElevatedTrayIcons: {}", windows::core::Error::from(w.to_hresult())));
+    }
+    invalidate_trust_cache();
+    trust_elevated_tray_icons();
+    Ok(())
+}
+
 /// Owners for which a blocked callback was already logged (log once per owner). Bounded.
 static BLOCKED_LOGGED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 const BLOCKED_LOGGED_CAP: usize = 256;
 
-/// true if the dock may send messages on behalf of icon `t`: the owner HWND still belongs to the
-/// registered pid and `callback_permitted` allows it. Logs once per owner when blocked.
+/// Log text of a refusal, after "owner runs above medium integrity".
+const NOT_TRUSTED_HINT: &str = " (allow it in Settings > Modules > Tray, \"Icons of apps run as administrator\", \
+                                or set HKLM\\SOFTWARE\\mini-oled-dock TrustElevatedTrayIcons = 1)";
+
+/// true if the dock may send messages on behalf of icon `t` (`callback_verdict`). Logs once per owner
+/// when blocked.
 fn callback_allowed(t: &Target) -> bool {
-    if !owner_alive(t.owner, t.pid) {
-        return false;
-    }
-    let trust = trust_elevated_tray_icons();
-    if callback_permitted(pid_at_most_medium(t.pid), t.callback, trust) {
-        return true;
-    }
+    let same_process = owner_alive(t.owner, t.pid);
+    let at_most_medium = same_process && pid_at_most_medium(t.pid);
+    let trust = same_process && !at_most_medium && trust_elevated_tray_icons();
+    // The image is read only for an elevated owner the switch may allow.
+    let current = if trust && is_app_message(t.callback) { crate::apps::exe_path_of_pid(t.pid) } else { None };
+    let facts =
+        OwnerFacts { same_process, at_most_medium, recorded_image: &t.image, current_image: current.as_deref() };
+    let why = match callback_verdict(&facts, t.callback, trust) {
+        Verdict::Allowed => return true,
+        Verdict::NotOwner => return false,
+        Verdict::ElevatedNotTrusted => NOT_TRUSTED_HINT.to_string(),
+        Verdict::SystemMessage => " and the callback is not an application message".to_string(),
+        Verdict::ImageMismatch => format!(
+            " and its process image ({}) is not the one recorded at registration ({})",
+            current.as_deref().unwrap_or("?"),
+            if t.image.is_empty() { "?" } else { &t.image }
+        ),
+    };
     let mut logged = BLOCKED_LOGGED.lock().unwrap_or_else(|p| p.into_inner());
     if !logged.contains(&t.owner) {
         if logged.len() >= BLOCKED_LOGGED_CAP {
@@ -748,17 +865,12 @@ fn callback_allowed(t: &Target) -> bool {
         }
         logged.push(t.owner);
         log!(
-            "tray: messages of icon #{} ({}, callback 0x{:X}) to owner 0x{:X} (pid {}) blocked: owner runs above medium integrity{}",
+            "tray: messages of icon #{} ({}, callback 0x{:X}) to owner 0x{:X} (pid {}) blocked: owner runs above medium integrity{why}",
             t.id,
             t.exe,
             t.callback,
             t.owner,
             t.pid,
-            if trust {
-                " and the callback is a system message"
-            } else {
-                " (see HKLM\\SOFTWARE\\mini-oled-dock TrustElevatedTrayIcons)"
-            }
         );
     }
     false
@@ -2043,11 +2155,10 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         IconUpdate::Keep
     };
     let exe_path = if msg == NIM_ADD && pid != 0 { crate::apps::exe_path_of_pid(pid).unwrap_or_default() } else { String::new() };
-    let exe = file_name_of(&exe_path);
     let res = {
         let mut st = state();
         let TrayState { items, next_id, .. } = &mut *st;
-        apply_nim(items, next_id, &d, (pid != 0).then_some(pid), icon, &exe)
+        apply_nim(items, next_id, &d, (pid != 0).then_some(pid), icon, &exe_path)
     };
     if msg == NIM_ADD && res.ret && !exe_path.is_empty() {
         // Short name for the chooser: reading version resources is disk I/O, so it stays outside
@@ -2077,6 +2188,7 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         }
     }
     if msg == NIM_ADD {
+        let exe = file_name_of(&exe_path);
         let guid = if nid.flags & NIF_GUID != 0 { guid_string(&nid.guid) } else { "-".into() };
         log!(
             "tray: NIM_ADD exe={} guid={guid} tip=\"{}\" hwnd=0x{:X} uid={} ret={}",
@@ -2635,17 +2747,57 @@ mod tests {
 
     #[test]
     fn elevated_owner_gating() {
-        // Medium (or lower) owners: always allowed, system callbacks included.
-        assert!(callback_permitted(true, WM_USER + 1, false));
-        assert!(callback_permitted(true, 0x0111, false));
-        // Elevated / unknown owners: blocked by default.
-        assert!(!callback_permitted(false, WM_USER + 1, false));
-        assert!(!callback_permitted(false, 0x0111, false));
-        // Opt-in: only private callbacks (>= WM_USER), never system messages.
-        assert!(callback_permitted(false, WM_USER, true));
-        assert!(callback_permitted(false, 0xC123, true));
-        assert!(!callback_permitted(false, 0x0111, true));
-        assert!(!callback_permitted(false, WM_USER - 1, true));
+        const AB: &str = r"C:\Program Files (x86)\MSI Afterburner\MSIAfterburner.exe";
+        let facts = |same_process, at_most_medium, recorded_image, current_image| OwnerFacts {
+            same_process,
+            at_most_medium,
+            recorded_image,
+            current_image,
+        };
+        let elevated = facts(true, false, AB, Some(AB));
+        // Medium (or lower) owners: always allowed, system callbacks included, image never consulted.
+        let medium = facts(true, true, "", None);
+        for trust in [false, true] {
+            assert_eq!(callback_verdict(&medium, WM_USER + 1, trust), Verdict::Allowed);
+            assert_eq!(callback_verdict(&medium, 0x0111, trust), Verdict::Allowed);
+            assert_eq!(callback_verdict(&medium, 0x1_0000, trust), Verdict::Allowed);
+        }
+        // The window no longer belongs to the registered process: nothing, whatever the rest says.
+        for trust in [false, true] {
+            assert_eq!(callback_verdict(&facts(false, true, AB, Some(AB)), 0x8001, trust), Verdict::NotOwner);
+            assert_eq!(callback_verdict(&facts(false, false, AB, Some(AB)), 0x8001, trust), Verdict::NotOwner);
+        }
+        // Elevated / unknown owners: blocked while the switch is off.
+        assert_eq!(callback_verdict(&elevated, 0x8001, false), Verdict::ElevatedNotTrusted);
+        assert_eq!(callback_verdict(&elevated, 0x0111, false), Verdict::ElevatedNotTrusted);
+        // Switch on: application ranges only (private, WM_APP, RegisterWindowMessage).
+        for cb in [WM_USER, 0x7FFF, 0x8000, 0x8001, 0xBFFF, 0xC000, 0xC123, 0xFFFF] {
+            assert_eq!(callback_verdict(&elevated, cb, true), Verdict::Allowed, "0x{cb:X}");
+        }
+        for cb in [0, 0x0111, 0x0112, 0x007B, WM_USER - 1, 0x1_0000, u32::MAX] {
+            assert_eq!(callback_verdict(&elevated, cb, true), Verdict::SystemMessage, "0x{cb:X}");
+        }
+        // Switch on: the process must still run the image recorded at registration (case-insensitive).
+        let upper = AB.to_uppercase();
+        assert_eq!(callback_verdict(&facts(true, false, AB, Some(&upper)), 0x8001, true), Verdict::Allowed);
+        let other = facts(true, false, AB, Some(r"C:\Users\x\AppData\Local\Temp\MSIAfterburner.exe"));
+        assert_eq!(callback_verdict(&other, 0x8001, true), Verdict::ImageMismatch);
+        assert_eq!(callback_verdict(&facts(true, false, AB, None), 0x8001, true), Verdict::ImageMismatch);
+        assert_eq!(callback_verdict(&facts(true, false, "", Some(AB)), 0x8001, true), Verdict::ImageMismatch);
+        assert_eq!(callback_verdict(&facts(true, false, "", Some("")), 0x8001, true), Verdict::ImageMismatch);
+        // The refusal hint names the Settings option and the registry value.
+        assert!(NOT_TRUSTED_HINT.contains("Settings > Modules > Tray"));
+        assert!(NOT_TRUSTED_HINT.contains("TrustElevatedTrayIcons"));
+    }
+
+    #[test]
+    fn nim_add_records_the_owner_image() {
+        let mut items = Vec::new();
+        let mut next = 1;
+        let d = nid(0x10, 1, NIF_MESSAGE);
+        let path = r"C:\Program Files (x86)\MSI Afterburner\MSIAfterburner.exe";
+        assert!(apply_nim(&mut items, &mut next, &d, Some(10), IconUpdate::Keep, path).ret);
+        assert_eq!((items[0].exe.as_str(), items[0].image.as_str()), ("MSIAfterburner.exe", path));
     }
 
     fn nid(hwnd: u32, uid: u32, flags: u32) -> ShellTrayData {

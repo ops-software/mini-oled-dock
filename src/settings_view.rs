@@ -1101,6 +1101,7 @@ mod tests {
             memory: Memory::default(),
             data_dir: None,
             log_path: None,
+            trust_elevated: false,
         }
     }
 
