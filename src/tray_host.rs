@@ -2100,7 +2100,8 @@ fn handle_appbar(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
 /// Gate for the AppBar messages that use `SHLockShared(m.shared, m.pid)` (`ABM_GETTASKBARPOS`,
 /// `ABM_QUERYPOS`, `ABM_SETPOS`): they duplicate a handle from process `m.pid` and write into it, and
 /// `m.pid` is chosen by the sender. `None` = forward; `Some(text)` = reject, `text` is the log line.
-/// Every other message is not gated. Pure: `medium` is injected for tests.
+/// Every other message is not gated. A claimed own pid is never trusted (it would resolve the handle in
+/// the dock's own table): see `appbar_block_allowed`. Pure: `medium` is injected for tests.
 fn appbar_gate(m: &AppBarMsg, wnd_pid: Option<u32>, own: u32, medium: impl Fn(u32) -> bool) -> Option<String> {
     let gated = matches!(m.message, ABM_GETTASKBARPOS | ABM_QUERYPOS | ABM_SETPOS);
     if !gated || appbar_block_allowed(m.pid, own, wnd_pid, medium) {
@@ -2130,6 +2131,12 @@ fn appbar_block_allowed(block_pid: u32, own: u32, wnd_pid: Option<u32>, medium: 
     }
 }
 
+// Test probe: counts `SHLockShared` calls on a sender-supplied handle, per thread (tests run in parallel).
+#[cfg(test)]
+thread_local! {
+    static SENDER_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `ABM_GETTASKBARPOS`: answers with the dock's tray area and edge, in our own shared block.
 fn get_taskbar_pos(m: &AppBarMsg) -> LRESULT {
     if m.shared == 0 {
@@ -2137,6 +2144,8 @@ fn get_taskbar_pos(m: &AppBarMsg) -> LRESULT {
     }
     let g = state().geom;
     let a = area_rect(&g);
+    #[cfg(test)]
+    SENDER_LOCKS.with(|c| c.set(c.get() + 1));
     // SAFETY: the shared block was allocated by the sender for our process (`m.pid`).
     let p = unsafe { SHLockShared(HANDLE(m.shared as usize as *mut c_void), m.pid) };
     if p.is_null() {
@@ -2163,6 +2172,8 @@ fn forward_with_shared(wp: WPARAM, m: AppBarMsg) -> LRESULT {
     if ex_pid == 0 || m.shared == 0 {
         return LRESULT(0);
     }
+    #[cfg(test)]
+    SENDER_LOCKS.with(|c| c.set(c.get() + 1));
     // SAFETY: block allocated by the sender for our process (`m.pid`).
     let old = unsafe { SHLockShared(HANDLE(m.shared as usize as *mut c_void), m.pid) };
     if old.is_null() {
@@ -2462,8 +2473,10 @@ mod tests {
             let m = crafted(msg, own);
             let why = appbar_gate(&m, None, own, medium).expect("a claimed own pid is rejected");
             assert!(why.contains(&format!("block pid {own}")) && why.contains("claims_own = true"), "{why}");
-            // The real entry point answers 0 for the same bytes and never reaches SHLockShared (m.shared is garbage).
+            // The real entry point rejects the same bytes before any SHLockShared on the sender's handle.
+            let locks = SENDER_LOCKS.with(|c| c.get());
             assert_eq!(handle_appbar(WPARAM(0), LPARAM(0), &appbar_bytes(&m)).0, 0);
+            assert_eq!(SENDER_LOCKS.with(|c| c.get()), locks, "AppBar {msg} reached SHLockShared");
         }
         // A legitimate medium sender passes the gate; a message that is not gated is never rejected by it.
         assert!(appbar_gate(&crafted(ABM_SETPOS, 8120), Some(8120), own, medium).is_none());
@@ -2485,6 +2498,7 @@ mod tests {
         assert!(!appbar_block_allowed(666, OWN, Some(666), medium));
         assert!(!appbar_block_allowed(8120, OWN, Some(9000), medium), "block pid must be the window owner's");
         assert!(appbar_block_allowed(8120, OWN, None, medium));
+        assert!(!appbar_block_allowed(666, OWN, None, medium));
         assert!(!appbar_block_allowed(0, OWN, None, medium));
     }
 
