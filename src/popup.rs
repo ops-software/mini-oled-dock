@@ -899,7 +899,9 @@ fn open(kind: PopupKind, anchor: Anchor) {
     };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
-    let Some((volume, net, battery)) = with(|st| (st.last_volume, st.last_net.clone(), st.last_battery)) else { return };
+    let Some((volume, net, battery)) = with(|st| (st.last_volume, st.last_net.clone(), st.last_battery)) else {
+        return;
+    };
     let content = make_content(kind, volume, net, battery);
     debug_assert_eq!(content.kind(), kind);
     let installed = with(|st| {

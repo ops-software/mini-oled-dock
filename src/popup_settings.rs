@@ -28,8 +28,8 @@ use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{
-    self, Background, BatteryShow, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
-    MODULE_SIZE, TRAY_ICON_SIZE,
+    self, Background, BatteryShow, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE,
+    APP_TEXT_SIZE, BACKGROUND_PRESETS, MODULE_SIZE, TRAY_ICON_SIZE,
 };
 use crate::glyphs;
 use crate::i18n::tr;
@@ -1114,8 +1114,14 @@ mod tests {
     fn choices_roundtrip() {
         let mut c = Config::default();
         let sc = test_screens();
-        for set in [Setting::Language, Setting::StartStyle, Setting::Position, Setting::Monitor, Setting::Display, Setting::Battery]
-        {
+        for set in [
+            Setting::Language,
+            Setting::StartStyle,
+            Setting::Position,
+            Setting::Monitor,
+            Setting::Display,
+            Setting::Battery,
+        ] {
             for j in 0..options(set, &sc).len() {
                 choose(&mut c, set, j, &sc);
                 assert_eq!(selected(&c, set, &sc), Some(j));
