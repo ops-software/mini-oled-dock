@@ -1580,14 +1580,10 @@ pub(crate) fn desktop_registered() -> bool {
 /// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
 fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> windows::core::Result<()> {
+    let (desktop, hwnd) = find_desktop()?;
     // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
     // thread and released when it goes out of scope. The VARIANTs passed by pointer outlive the calls.
     unsafe {
-        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
-        let loc = OwnedVariant::i4(CSIDL_DESKTOP as i32);
-        let root = OwnedVariant::empty();
-        let mut hwnd = 0i32;
-        let desktop: IDispatch = windows.FindWindowSW(&loc.0, &root.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
         let sp: IServiceProvider = desktop.cast()?;
         let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
         let view = browser.QueryActiveShellView()?;
@@ -1599,7 +1595,7 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
         // Grant them to Explorer (desktop window owner), which passes them on to the process it
         // starts; ASFW_ANY as a fallback. Both expire at the next user input.
         let mut explorer_pid = 0u32;
-        GetWindowThreadProcessId(HWND(hwnd as isize as *mut c_void), Some(&mut explorer_pid));
+        GetWindowThreadProcessId(hwnd, Some(&mut explorer_pid));
         if explorer_pid == 0 || AllowSetForegroundWindow(explorer_pid).is_err() {
             let _ = AllowSetForegroundWindow(ASFW_ANY);
         }
@@ -1612,6 +1608,47 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
             &OwnedVariant::i4(SW_SHOWNORMAL.0).0,
         )
     }
+}
+
+/// Explorer's desktop (`IShellWindows::FindWindowSW(CSIDL_DESKTOP)`) and its window.
+/// Must be called on a COM STA thread.
+fn find_desktop() -> windows::core::Result<(IDispatch, HWND)> {
+    // SAFETY: COM STA initialized by the caller; the interfaces are released when they go out of
+    // scope and the VARIANTs outlive the call.
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let loc = OwnedVariant::i4(CSIDL_DESKTOP as i32);
+        let root = OwnedVariant::empty();
+        let mut hwnd = 0i32;
+        let desktop: IDispatch = windows.FindWindowSW(&loc.0, &root.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        Ok((desktop, HWND(hwnd as isize as *mut c_void)))
+    }
+}
+
+/// Pid of the Explorer process that owns the desktop window. Must be called on a COM STA thread.
+pub(crate) fn explorer_pid() -> windows::core::Result<u32> {
+    let (_, hwnd) = find_desktop()?;
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale `hwnd` only yields 0.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return Err(windows::Win32::Foundation::E_FAIL.into());
+    }
+    Ok(pid)
+}
+
+/// `file` opened through the desktop shell, de-elevated (see `desktop_shell_execute`).
+/// Must be called on a COM STA thread.
+pub(crate) fn desktop_open(file: &str, args: Option<&str>, dir: Option<&str>) -> windows::core::Result<()> {
+    desktop_shell_execute(file, args, dir, Verb::Open)
+}
+
+/// `System32` from `GetSystemDirectoryW` (never from an environment variable).
+pub(crate) fn system_dir() -> Option<std::path::PathBuf> {
+    let mut buf = [0u16; 260];
+    // SAFETY: `buf` is writable and its length is passed by the wrapper.
+    let n = unsafe { windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
 // ------------------------------------------------------------------ show desktop
@@ -1771,5 +1808,11 @@ mod tests {
         assert_eq!(strip_paren_suffix("PowerToys (Preview)"), "PowerToys");
         assert_eq!(strip_paren_suffix("Steam"), "Steam");
         assert_eq!(expand_env("%NOPE_X%\\a"), "%NOPE_X%\\a");
+    }
+
+    #[test]
+    fn system_dir_comes_from_the_api() {
+        let d = system_dir().expect("GetSystemDirectoryW");
+        assert!(d.is_absolute() && d.join("kernel32.dll").is_file());
     }
 }

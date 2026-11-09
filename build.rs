@@ -17,6 +17,7 @@ const DELAY_LOAD: &[&str] = &[
     "dwmapi.dll",
     "powrprof.dll",
     "psapi.dll",
+    "bcrypt.dll",
     "api-ms-win-shcore-scaling-l1-1-1.dll",
     "api-ms-win-core-winrt-l1-1-0.dll",
 ];

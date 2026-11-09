@@ -457,6 +457,9 @@ fn import_label(st: start_import::Status) -> String {
         start_import::Status::Idle => tr("Import from Windows Start", "Importa dallo Start di Windows").to_string(),
         start_import::Status::Running => tr("Importing\u{2026}", "Importazione\u{2026}").to_string(),
         start_import::Status::Failed => tr("Import failed", "Importazione non riuscita").to_string(),
+        start_import::Status::TimedOut => {
+            tr("Import failed (timeout)", "Importazione non riuscita (timeout)").to_string()
+        }
         start_import::Status::Imported(n) => {
             if crate::i18n::italian() {
                 format!("Importate {n} app")
@@ -1169,7 +1172,13 @@ mod tests {
             let seg_left = m.px(WIDTH) - m.px(8) - m.px(ARROW_W) - m.px(ARROW_GAP) - segs;
             assert!(m.px(TEXT_COL) + s.text_width(label, Font::Normal) + m.px(6) <= seg_left, "{label} overlaps its choice");
         }
-        for st in [start_import::Status::Idle, start_import::Status::Running, start_import::Status::Failed, start_import::Status::Imported(3)] {
+        for st in [
+            start_import::Status::Idle,
+            start_import::Status::Running,
+            start_import::Status::Failed,
+            start_import::Status::TimedOut,
+            start_import::Status::Imported(3),
+        ] {
             assert!(!import_label(st).is_empty());
         }
         assert_eq!(import_label(start_import::Status::Imported(1)), "Imported 1 app");
