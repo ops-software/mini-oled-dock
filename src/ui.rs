@@ -1404,7 +1404,12 @@ fn rebuild_entries() {
             };
             // The app runs from another versioned folder than the one the pin stores (it updated
             // itself): launch from where it is now, and store that (below, outside the borrow).
-            if gi.is_some() && apps::same_exe_other_version(&p.launch, &e.exe_path) {
+            // Only once the stored file is gone: while an old version still runs next to the
+            // new one, the pin does not go back and forth.
+            if gi.is_some()
+                && apps::same_exe_other_version(&p.launch, &e.exe_path)
+                && !std::path::Path::new(&p.launch).exists()
+            {
                 e.launch = Some(e.exe_path.clone());
                 moved.push((p.key.clone(), e.exe_path.clone()));
             }
@@ -1487,7 +1492,7 @@ fn rebuild_entries() {
     });
     for (key, exe) in moved {
         match config::sync_pinned_launch(&key, &exe) {
-            Ok(()) => log!("pin '{key}': the app moved, launch target is now '{exe}'"),
+            Ok(()) => log!("pin '{key}': the app moved to '{exe}'"),
             Err(e) => log!("pin '{key}': cannot store the new launch target: {e}"),
         }
     }

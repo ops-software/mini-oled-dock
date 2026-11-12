@@ -4,8 +4,8 @@
 //!
 //! SOURCE: `<Recent>\CustomDestinations\<hash>.customDestinations-ms`, written by Windows when an
 //! app calls `ICustomDestinationList`. `<hash>` is a CRC-64 of the app's AppUserModelID
-//! (`app_id_hash`). An app whose id is not known (a pin that is not running) is found by its exe:
-//! the one file whose links all start that exe (`scan`).
+//! (`app_id_hash`). An app whose id is not known (a pin that is not running, a window that
+//! publishes none) is found by its exe: the one file whose links all start that exe (`scan`).
 //!
 //! SECURITY: the dock runs elevated and these files are writable by any program of the user, so
 //! they are untrusted input. They are read through `datadir::read_file` (no reparse points, capped)
@@ -28,9 +28,11 @@ use windows::Win32::UI::Shell::{FOLDERID_Recent, SHGetKnownFolderPath, KF_FLAG_D
 
 /// Largest jump list file read for a known app id.
 const MAX_FILE: u64 = 1 << 20;
-/// Largest file looked at, and most files looked at, when searching by exe (`scan`).
-const MAX_SCAN_FILE: u64 = 256 * 1024;
-const MAX_SCAN: usize = 400;
+/// Largest file looked at, most files looked at and most bytes read in all, when searching by
+/// exe (`scan`): the search runs when the menu opens, so it is kept short whatever is in the folder.
+const MAX_SCAN_FILE: u64 = 64 * 1024;
+const MAX_SCAN: usize = 256;
+const MAX_SCAN_BYTES: usize = 8 << 20;
 /// Most categories and links per category parsed from one file.
 const MAX_CATEGORIES: usize = 16;
 const MAX_LINKS: usize = 64;
@@ -100,9 +102,8 @@ pub fn load(app_id: Option<&str>, exe: &str) -> Vec<Group> {
     let Some(dir) = dir() else { return Vec::new() };
     if let Some(id) = app_id.map(str::trim).filter(|s| !s.is_empty()) {
         let file = dir.join(format!("{:x}.customDestinations-ms", app_id_hash(id)));
-        if let Ok(bytes) = crate::datadir::read_file(&file, MAX_FILE, false) {
-            return tidy(parse(&bytes));
-        }
+        // The id is known: its file, or the app registered no jump list (no search by exe).
+        return crate::datadir::read_file(&file, MAX_FILE, true).map(|b| tidy(parse(&b))).unwrap_or_default();
     }
     tidy(scan(&dir, exe))
 }
@@ -118,8 +119,13 @@ fn scan(dir: &Path, exe: &str) -> Vec<Group> {
         e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".customdestinations-ms")
             && e.metadata().is_ok_and(|m| m.is_file() && m.len() <= MAX_SCAN_FILE)
     });
+    let mut read = 0usize;
     for e in files.take(MAX_SCAN) {
-        let Ok(bytes) = crate::datadir::read_file(&e.path(), MAX_SCAN_FILE, false) else { continue };
+        let Ok(bytes) = crate::datadir::read_file(&e.path(), MAX_SCAN_FILE, true) else { continue };
+        read += bytes.len();
+        if read > MAX_SCAN_BYTES {
+            break;
+        }
         let groups = parse(&bytes);
         let mut targets = groups.iter().flat_map(|g| &g.entries).filter_map(|e| match e {
             Entry::Link { target, .. } => Some(target),
@@ -133,8 +139,8 @@ fn scan(dir: &Path, exe: &str) -> Vec<Group> {
     Vec::new()
 }
 
-/// Order and limits of the menu: categories before the tasks, no separator at an edge or doubled,
-/// no empty category.
+/// Order and limits of the menu: categories before the tasks (one group, whatever the file says),
+/// no separator at an edge or doubled, no empty category.
 fn tidy(groups: Vec<Group>) -> Vec<Group> {
     let (tasks, mut others): (Vec<Group>, Vec<Group>) = groups.into_iter().partition(|g| g.name.is_empty());
     let mut left = MAX_OTHER;
@@ -143,7 +149,8 @@ fn tidy(groups: Vec<Group>) -> Vec<Group> {
         g.entries.truncate(left);
         left -= g.entries.len();
     }
-    for mut g in tasks {
+    let all: Vec<Entry> = tasks.into_iter().flat_map(|g| g.entries).collect();
+    for mut g in [Group { name: String::new(), entries: all }] {
         g.entries.dedup_by(|a, b| *a == Entry::Separator && *b == Entry::Separator);
         if g.entries.first() == Some(&Entry::Separator) {
             g.entries.remove(0);
@@ -614,6 +621,9 @@ mod tests {
         assert_eq!(t.len(), MAX_TASKS);
         assert_eq!(t.iter().filter(|e| **e == Entry::Separator).count(), 1, "no doubled or leading separator");
         assert!(tidy(vec![Group { name: String::new(), entries: vec![Entry::Separator] }]).is_empty());
+        // Several task categories in one file are one group under the same limit.
+        let split = tidy((0..16).map(|_| Group { name: String::new(), entries: many(9) }).collect());
+        assert_eq!((split.len(), split[0].entries.len()), (1, MAX_TASKS));
     }
 
     /// Reads the REAL jump lists of this machine (run by hand:
