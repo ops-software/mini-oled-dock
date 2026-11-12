@@ -3,7 +3,7 @@
 //! separators. A click closes the popup and THEN runs the action (`after_close`).
 //!
 //! Every launch goes through `ShellRequest::Launch`, i.e. the desktop shell as the normal user (never
-//! elevated). The two "(admin)" entries go through `ShellRequest::LaunchAdmin`: Explorer runs a fixed
+//! elevated). The "(admin)" entry goes through `ShellRequest::LaunchAdmin`: Explorer runs a fixed
 //! tool with the `runas` verb and Windows shows the UAC prompt (the dock's own token is never used).
 //! "Search" and "Run" are a synthetic Win+S / Win+R tagged with `INJECT_TAG`; "Sign out" is the
 //! `power::PowerAction::SignOut` action. The entries are static strings: no state, timer or allocation
@@ -50,8 +50,8 @@ const ROWS: [Option<Row>; 19] = [
     Some((Act::Launch("ms-settings:network"), "Network Connections", "Connessioni di rete")),
     Some((Act::Launch("diskmgmt.msc"), "Disk Management", "Gestione disco")),
     Some((Act::Launch("compmgmt.msc"), "Computer Management", "Gestione computer")),
+    Some((Act::Launch(r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"), "Terminal", "Terminale")),
     Some((Act::Admin(AdminTool::Terminal), "Terminal (admin)", "Terminale (admin)")),
-    Some((Act::Admin(AdminTool::PowerShell), "PowerShell (admin)", "PowerShell (admin)")),
     None,
     Some((Act::Launch("taskmgr.exe"), "Task Manager", "Gestione attivit\u{e0}")),
     Some((Act::Launch("ms-settings:"), "Settings", "Impostazioni")),
