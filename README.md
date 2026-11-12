@@ -266,6 +266,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
+| [1.4.2](.github/release-notes/v1.4.2.md) | 2026-11-12 | Hotfix: the self-updater can download its first update |
 | [1.4.1](.github/release-notes/v1.4.1.md) | 2026-11-12 | Start menu rework, the app's jump list on right click, pins survive app updates |
 | [1.4.0](.github/release-notes/v1.4.0.md) | 2026-11-09 | Self-updater, battery module, Settings window, review fixes |
 | [1.3.0](.github/release-notes/v1.3.0.md) | 2026-10-29 | Keeps working across Explorer restarts, multi-monitor edge fix, −511 lines de-duplication |

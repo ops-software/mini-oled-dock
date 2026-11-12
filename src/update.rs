@@ -416,7 +416,6 @@ fn download(rel: &Release) -> Result<(), StageError> {
         if resp.body.len() as u64 != *size {
             return Err(fail(format!("{name}: {} bytes, expected {size}", resp.body.len())));
         }
-        datadir::update_stage_dir(&rel.tag).map_err(fail)?;
         datadir::write_stage_file(&rel.tag, name, &resp.body).map_err(|e| fail(format!("{name}: {e}")))?;
         // `resp` (and its body) is dropped here, before the next asset is fetched.
     }

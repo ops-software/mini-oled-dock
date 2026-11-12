@@ -631,6 +631,19 @@ pub fn write_stage_file(tag: &str, name: &str, bytes: &[u8]) -> Result<(), Strin
     write_atomic(&dir.join(name), bytes, FileAcl::Inherit)
 }
 
+/// `NotFound` when the stage folder (or `update\` above it) does not exist, i.e. nothing is staged
+/// yet and the caller must download. The admin-only checks would report a missing folder as
+/// PermissionDenied, which `verify_stage` treats as a failed verification: the first update of a
+/// fresh install then never downloaded (1.4.0 and 1.4.1).
+fn stage_missing(stage: &Path) -> Option<io::Error> {
+    match std::fs::symlink_metadata(stage) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Some(io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", stage.display())))
+        }
+        _ => None,
+    }
+}
+
 /// Opens a staged file like `read_icon`: the stage folder (and `update\`) must be admin-only real
 /// folders, the file a single-link regular file (no reparse point) whose final path is exactly
 /// `<stage folder>\<name>`.
@@ -638,6 +651,9 @@ fn open_stage_file(tag: &str, name: &str) -> io::Result<(File, PathBuf)> {
     let denied = |e: String| io::Error::new(io::ErrorKind::PermissionDenied, e);
     let r = writable_root().map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
     check_stage_names(tag, Some(name)).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if let Some(e) = stage_missing(&r.path.join(UPDATE_NAME).join(tag)) {
+        return Err(e);
+    }
     let dir = checked_update_dir(r).map_err(denied)?.join(tag);
     let dir_final = checked_dir(&dir).map_err(denied)?;
     let path = dir.join(name);
@@ -1271,6 +1287,22 @@ mod tests {
         assert!(remove_update_stage("v1.4.0").is_err());
         assert!(remove_update_dir().is_err());
         assert!(purge().is_err());
+    }
+
+    #[test]
+    fn missing_stage_folder_is_not_found() {
+        let base = std::env::temp_dir().join(format!("dock_stage_missing_{}", std::process::id()));
+        let stage = base.join(UPDATE_NAME).join("v1.4.2");
+        let kind = |p: &Path| stage_missing(p).map(|e| e.kind());
+        // Fresh install: neither `update\` nor the tag folder exists.
+        assert_eq!(kind(&stage), Some(io::ErrorKind::NotFound));
+        // `update\` left by an earlier release, tag folder missing.
+        assert!(std::fs::create_dir_all(stage.parent().unwrap_or(&base)).is_ok());
+        assert_eq!(kind(&stage), Some(io::ErrorKind::NotFound));
+        // Present: the admin-only checks decide.
+        assert!(std::fs::create_dir(&stage).is_ok());
+        assert_eq!(kind(&stage), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
