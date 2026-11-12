@@ -32,8 +32,6 @@ use crate::render::Metrics;
 
 /// Corner radius of the panel (logical px).
 pub const PANEL_RADIUS: i32 = 14;
-/// Alpha of the panel's black background (more opaque than the bar: it holds long text).
-pub const PANEL_BG_ALPHA: u32 = 245;
 /// Alpha of the 1 px white border.
 pub const PANEL_BORDER_ALPHA: u32 = 22;
 /// Inner padding of the panel (logical px).
@@ -560,7 +558,8 @@ impl Surface {
         self.gdi.size().unwrap_or((0, 0))
     }
 
-    /// Background panel over the whole DIB: config `background` tone (black by default) at `PANEL_BG_ALPHA`, 1 px border `PANEL_BORDER_ALPHA`,
+    /// Background panel over the whole DIB: config `background` tone (black by default) at the bar's opacity
+    /// (`Config::bar_alpha`, at least 1 so the panel stays clickable at 0 %), 1 px border `PANEL_BORDER_ALPHA`,
     /// antialiased `PANEL_RADIUS` corners, transparent outside the corners. Replaces all pixels.
     pub fn panel(&mut self) {
         let Some(cv) = self.gdi.canvas(None) else { return };
@@ -568,7 +567,9 @@ impl Surface {
         let buf = cv.buf;
         let radius = self.metrics.px(PANEL_RADIUS);
         let bw = 1.max(self.metrics.px(1));
-        let (r, g, b) = crate::config::get().background.rgb();
+        let cfg = crate::config::get();
+        let (r, g, b) = cfg.background.rgb();
+        let bg_alpha = cfg.bar_alpha().max(1);
         for y in 0..h {
             for x in 0..w {
                 let outer = rr_cov(x, y, 0, 0, w, h, radius);
@@ -578,7 +579,7 @@ impl Surface {
                     continue;
                 }
                 let inner = rr_cov(x, y, bw, bw, w - bw, h - bw, radius - bw);
-                let base = argb((PANEL_BG_ALPHA as f32 * outer + 0.5) as u32, r, g, b);
+                let base = argb((bg_alpha as f32 * outer + 0.5) as u32, r, g, b);
                 let ring = (outer - inner).max(0.0);
                 let ba = (PANEL_BORDER_ALPHA as f32 * ring + 0.5) as u32;
                 buf[i] = over(base, white(ba));

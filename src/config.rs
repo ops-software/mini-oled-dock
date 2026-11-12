@@ -502,7 +502,7 @@ pub struct Config {
     pub module_size: u8,
     /// Background colour of the bar and the popups ("#RRGGBB").
     pub background: Background,
-    /// Opacity of the bar background in percent (0..=100; text and icons stay fully opaque).
+    /// Opacity of the bar and popup backgrounds in percent (0..=100; text and icons stay fully opaque).
     pub bar_opacity: u8,
     /// Size of the Settings window in logical pixels (96 DPI), [width, height]. Use `settings_size`.
     pub settings_window_size: [u16; 2],
@@ -819,8 +819,8 @@ fn render(c: &Config) -> String {
   // ideal for OLED). The Settings window offers dark presets and a colour picker.
   "background": "{bg}",
 
-  // Opacity of the bar background in percent, 0-100 (0 = only text and icons are visible; the
-  // bar still reacts to the mouse). Text and icons always stay fully opaque.
+  // Opacity of the bar and popup backgrounds in percent, 0-100 (0 = only text and icons are
+  // visible; they still react to the mouse). Text and icons always stay fully opaque.
   "bar_opacity": {opacity},
 
   // Size of the Settings window in logical pixels (96 DPI), [width, height]. Remembered when you

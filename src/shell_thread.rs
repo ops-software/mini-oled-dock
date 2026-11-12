@@ -105,18 +105,14 @@ pub struct StartApp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminTool {
     Terminal,
-    PowerShell,
 }
 
 impl AdminTool {
-    /// What Explorer is asked to run: PowerShell by absolute path under `system_dir`, the Store app
-    /// Windows Terminal by its AUMID.
-    fn target(self, system_dir: &std::path::Path) -> String {
+    /// What Explorer is asked to run: the Store app Windows Terminal by its AUMID. `_system_dir` is
+    /// for tools addressed by absolute System32 path (none at the moment).
+    fn target(self, _system_dir: &std::path::Path) -> String {
         match self {
             AdminTool::Terminal => r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(),
-            AdminTool::PowerShell => {
-                system_dir.join(r"WindowsPowerShell\v1.0\powershell.exe").to_string_lossy().into_owned()
-            }
         }
     }
 }
@@ -1760,9 +1756,8 @@ mod tests {
     #[test]
     fn admin_tools_launch_by_absolute_path_or_aumid() {
         let sys = std::path::Path::new(r"C:\Windows\System32");
-        assert_eq!(AdminTool::PowerShell.target(sys), r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
         assert_eq!(AdminTool::Terminal.target(sys), r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
-        for tool in [AdminTool::Terminal, AdminTool::PowerShell] {
+        for tool in [AdminTool::Terminal] {
             let s = tool.target(sys);
             assert!(s.contains('\\'), "never a bare executable name: {s}");
             assert!(!s.eq_ignore_ascii_case("wt.exe") && !s.eq_ignore_ascii_case("powershell.exe"));
