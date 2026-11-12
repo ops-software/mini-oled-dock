@@ -677,7 +677,26 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             pinned: false,
             windows: 2,
             can_launch: true,
+            jump: Vec::new(),
         }),
+        "popup_app_jump" => {
+            use crate::jumplist::{Entry, Group};
+            let link = |t: &str| Entry::Link { title: t.to_string(), target: String::new(), args: String::new() };
+            crate::popup::popup_app::new(crate::popup::AppMenuInfo {
+                key: "steam".to_string(),
+                name: "Steam".to_string(),
+                pinned: true,
+                windows: 1,
+                can_launch: true,
+                jump: vec![
+                    Group { name: "Recent".to_string(), entries: vec![link("Deadlock"), link("The Witcher 3: Wild Hunt")] },
+                    Group {
+                        name: String::new(),
+                        entries: vec![link("Store"), link("Library"), link("Friends"), Entry::Separator, link("Exit Steam")],
+                    },
+                ],
+            })
+        }
         "popup_start" => crate::popup::popup_start::new(),
         "popup_startmenu"
         | "popup_startmenu_search"
@@ -926,6 +945,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_power", 4),
             ("popup_power_update", 4),
             ("popup_app", 1),
+            ("popup_app_jump", 2),
             ("popup_start", 4),
             ("popup_startmenu", 12),
             ("popup_startmenu_search", 1),

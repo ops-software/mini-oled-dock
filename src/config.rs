@@ -1384,6 +1384,27 @@ fn set_pinned_name(c: &mut Config, key: &str, name: &str) {
     }
 }
 
+/// Self-heal of a pin whose app updated itself into a new versioned folder (Discord: `app-1.0.9265`
+/// -> `app-1.0.9267`): stores `exe`, the path the app has now, as the pin's launch target. Only
+/// when the stored target is the same exe in another versioned folder (`apps::same_exe_other_version`):
+/// an AppsFolder target or a launcher chosen by hand is never touched.
+pub fn sync_pinned_launch(key: &str, exe: &str) -> Result<(), String> {
+    if !pinned_launch_outdated(&get(), key, exe) || external_edit_pending() {
+        return Ok(());
+    }
+    modify(|c| {
+        if pinned_launch_outdated(c, key, exe) {
+            if let Some(i) = c.pinned_index(key) {
+                c.pinned[i].launch = exe.to_string();
+            }
+        }
+    })
+}
+
+fn pinned_launch_outdated(c: &Config, key: &str, exe: &str) -> bool {
+    c.pinned_index(key).is_some_and(|i| crate::apps::same_exe_other_version(&c.pinned[i].launch, exe))
+}
+
 /// Removes the pin with this key and saves. If it does not exist nothing is written (Ok).
 pub fn unpin(key: &str) -> Result<(), String> {
     if !get().is_pinned(key) {

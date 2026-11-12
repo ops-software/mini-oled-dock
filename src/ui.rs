@@ -1360,11 +1360,12 @@ fn compute_launch(exe: &str, aumid: Option<&str>) -> Option<String> {
 fn rebuild_entries() {
     let cfg = config::get();
     let groups = apps::groups();
-    UI.with(|u| {
+    let moved = UI.with(|u| {
         let st = &mut *u.borrow_mut();
         let old = std::mem::take(&mut st.entries);
         let mut used = vec![false; groups.len()];
         let mut out: Vec<Entry> = Vec::with_capacity(cfg.pinned.len() + groups.len());
+        let mut moved: Vec<(String, String)> = Vec::new();
         for p in &cfg.pinned {
             if out.iter().any(|e| same_key(&e.key, &p.key)) {
                 continue;
@@ -1401,6 +1402,17 @@ fn rebuild_entries() {
             } else {
                 Some(p.launch.clone())
             };
+            // The app runs from another versioned folder than the one the pin stores (it updated
+            // itself): launch from where it is now, and store that (below, outside the borrow).
+            // Only once the stored file is gone: while an old version still runs next to the
+            // new one, the pin does not go back and forth.
+            if gi.is_some()
+                && apps::same_exe_other_version(&p.launch, &e.exe_path)
+                && !std::path::Path::new(&p.launch).exists()
+            {
+                e.launch = Some(e.exe_path.clone());
+                moved.push((p.key.clone(), e.exe_path.clone()));
+            }
             out.push(e);
         }
         // Unpinned apps: `app_order` first (its order), then the rest in first-seen order (stable sort).
@@ -1476,7 +1488,14 @@ fn rebuild_entries() {
         if act_started {
             set_timer(hwnd(), TIMER_ANIM, ANIM_TICK_MS);
         }
+        moved
     });
+    for (key, exe) in moved {
+        match config::sync_pinned_launch(&key, &exe) {
+            Ok(()) => log!("pin '{key}': the app moved to '{exe}'"),
+            Err(e) => log!("pin '{key}': cannot store the new launch target: {e}"),
+        }
+    }
     // An open window picker whose app gained or lost windows closes (no live re-layout).
     if let Some(k) = crate::picker::open_key() {
         let wins = UI.with(|u| u.borrow().entries.iter().find(|e| e.group_key == k).map(|e| e.windows.clone()));
@@ -2632,6 +2651,9 @@ fn show_app_menu(e: &Entry, id: ItemId) {
         return;
     };
     let name = if e.name.is_empty() { e.key.clone() } else { e.name.clone() };
+    // The id the app's jump list is stored under: the entry's, or the one its window publishes
+    // (a helper window grouped under its root exe, like Steam's, has dropped it).
+    let app_id = e.aumid.clone().or_else(|| e.windows.first().and_then(|h| apps::window_app_id(*h)));
     popup::open_app_menu(
         anchor,
         AppMenuInfo {
@@ -2640,6 +2662,7 @@ fn show_app_menu(e: &Entry, id: ItemId) {
             pinned: e.pinned,
             windows: e.windows.len(),
             can_launch: launch_target(e).is_some(),
+            jump: crate::jumplist::load(app_id.as_deref(), &e.exe_path),
         },
     );
 }

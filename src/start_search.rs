@@ -59,10 +59,12 @@ const SETTINGS_APP: &str =
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Keys(String);
 
+#[cfg(test)]
 static NO_KEYS: Keys = Keys(String::new());
 
 impl Keys {
     /// No keywords, for an entry that has none.
+    #[cfg(test)]
     pub(crate) fn none() -> &'static Keys {
         &NO_KEYS
     }
@@ -87,6 +89,7 @@ impl Keys {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
