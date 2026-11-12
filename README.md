@@ -10,7 +10,7 @@ A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust
 
 It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), the bar shows program names only (window titles appear in the hover previews), tray icons of other apps are hosted in the bar, and every popup is drawn by hand.
 
-- **Tiny:** the executable is about 0.7 MB and uses roughly 10 MB of RAM, trimmed to under 1 MB while hidden (numbers from the author's machine).
+- **Tiny:** the executable is about 1.4 MB and uses roughly 11 MB of RAM (about 18 MB while the Start menu is open, freed a minute after it closes), trimmed to under 1 MB while hidden (numbers from the author's machine).
 - **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network, battery and metrics modules are polled only while the bar is visible.
 - **Safe to try:** a watchdog process always restores the native taskbar, and `dock.exe --restore` works even when no dock is running.
 - **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it.
