@@ -640,6 +640,14 @@ pub fn on_start_icons(icon_px: u32, icons: Vec<(String, Option<crate::icons::Ico
     }
 }
 
+/// `ShellEvent::StartSettings` reached the UI: the settings catalog is ready, so an open Start menu
+/// searches again (what was typed may match a setting).
+pub fn on_start_settings() {
+    if current() == Some(PopupKind::StartMenu) {
+        dispatch(DataEvent::StartMenuChanged);
+    }
+}
+
 /// Destroys the popup window and the surface, unregisters the class. In `cleanup`, before
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {

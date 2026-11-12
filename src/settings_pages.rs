@@ -95,7 +95,7 @@ impl Page {
 pub(crate) enum Setting {
     /// `config.language`: System / English / Italiano.
     Language,
-    /// `config.start_style`: Vertical / Horizontal.
+    /// `config.start_style`: Compact / Windows 11.
     StartStyle,
     Position,
     /// `config.monitor`: the screen choice, labelled "Display" on the Screen page.
@@ -252,7 +252,7 @@ pub(crate) fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
         // Each language in its own name, so it can be found whatever the current one is.
         Setting::Language => vec![tr("System", "Sistema"), "English", "Italiano"],
-        Setting::StartStyle => vec![tr("Vertical", "Verticale"), tr("Horizontal", "Orizzontale")],
+        Setting::StartStyle => vec![tr("Compact", "Compatto"), tr("Windows 11", "Windows 11")],
         Setting::Position => vec![tr("Top", "In alto"), tr("Bottom", "In basso")],
         Setting::Monitor => {
             // Last segment: follow the pointer (`config::MONITOR_POINTER`).
@@ -277,7 +277,7 @@ pub(crate) fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
             Language::En => 1,
             Language::It => 2,
         },
-        Setting::StartStyle => usize::from(c.start_style == StartStyle::Horizontal),
+        Setting::StartStyle => usize::from(c.start_style == StartStyle::Windows11),
         Setting::Position => usize::from(c.position == Position::Bottom),
         Setting::Monitor => {
             if c.monitor.eq_ignore_ascii_case(config::MONITOR_POINTER) {
@@ -305,7 +305,7 @@ pub(crate) fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
 pub(crate) fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
     match s {
         Setting::Language => c.language = [Language::Auto, Language::En, Language::It][j.min(2)],
-        Setting::StartStyle => c.start_style = if j == 0 { StartStyle::Vertical } else { StartStyle::Horizontal },
+        Setting::StartStyle => c.start_style = if j == 0 { StartStyle::Compact } else { StartStyle::Windows11 },
         Setting::Position => c.position = if j == 0 { Position::Top } else { Position::Bottom },
         Setting::Monitor => {
             c.monitor = if j == sc.len() {

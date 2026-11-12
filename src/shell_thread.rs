@@ -117,7 +117,8 @@ impl AdminTool {
     }
 }
 
-/// Verb for `IShellDispatch2::ShellExecute`. Closed on purpose: `RunAs` is built only by `launch_admin`.
+/// Verb for `IShellDispatch2::ShellExecute`. Closed on purpose: `RunAs` is built only by `launch_admin`
+/// and `launch_app_admin`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verb {
     Open,
@@ -143,8 +144,16 @@ pub enum ShellRequest {
     Launch { target: String, args: Option<String> },
     /// Start menu "(admin)" entries: asks the desktop shell (Explorer, medium integrity) to run a FIXED
     /// tool with the `runas` verb, so Windows shows its UAC prompt. The dock's own token is never used;
-    /// without the desktop shell the launch is refused. Only this request carries `runas`.
+    /// without the desktop shell the launch is refused. Only this request and `LaunchAppAdmin` carry
+    /// `runas`.
     LaunchAdmin(AdminTool),
+    /// Start menu "Run as administrator" on an app of the catalog: the desktop shell runs
+    /// `shell:AppsFolder\<id>` with the `runas` verb (UAC prompt, the dock's token never used), as
+    /// the native Start menu does. `id` is an AppsFolder id the menu got from `StartApps`.
+    LaunchAppAdmin { id: String },
+    /// Start menu "Open file location": selects the target of the app `id` in a File Explorer
+    /// window (de-elevated). Nothing for a Store app, which has no file to show.
+    RevealApp { id: String },
     /// Change the volume by `delta_percent` points (wheel: +-`audio::WHEEL_STEP_PERCENT`).
     VolumeAdjust { delta_percent: i32 },
     /// Toggle mute.
@@ -190,6 +199,9 @@ pub enum ShellRequest {
     StartIcons { icon_px: u32, ids: Vec<String> },
     /// The Start menu closed: forget the icons sent and drop the queued `StartIcons` batches.
     StartRelease,
+    /// Sent by the thread of `start_search::load_settings` when the settings catalog is ready
+    /// -> `ShellEvent::StartSettings` (this thread is the one that can wake the UI).
+    StartSettingsReady,
     /// Click on a notification whose app has no open window: launches the app that sent it, found in
     /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
     OpenNotifApp { aumid: String, name: String },
@@ -218,6 +230,8 @@ pub enum ShellEvent {
     StartApps(Vec<StartApp>),
     /// Icons of Start menu apps at `icon_px` (`None` = the app has none: the menu keeps a placeholder).
     StartIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
+    /// The settings catalog of the Start menu search is ready (`start_search::settings`).
+    StartSettings,
 }
 
 /// Shell thread handle; passed to `stop`.
@@ -514,6 +528,8 @@ impl Shell {
                 }
             }
             ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
+            ShellRequest::LaunchAppAdmin { id } => launch_app_admin(&id),
+            ShellRequest::RevealApp { id } => reveal_app(&id),
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
                 let st = self.audio.as_mut().map(|a| a.adjust(delta_percent));
@@ -586,7 +602,11 @@ impl Shell {
                 }
             }
             ShellRequest::ListStartApps { icon_px, first } => self.list_start_apps(icon_px, &first),
-            ShellRequest::StartRelease => start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending),
+            ShellRequest::StartSettingsReady => push_event(self.ui, ShellEvent::StartSettings),
+            ShellRequest::StartRelease => {
+                start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending);
+                crate::start_search::release_app_index();
+            }
             ShellRequest::StartIcons { icon_px, ids } => {
                 // A batch queued for a previous size: its ids were forgotten with that size.
                 if icon_px != self.start_px {
@@ -622,6 +642,8 @@ impl Shell {
         // Pins first (stable sort: the catalog order is kept inside each group).
         missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
         self.start_sent.extend(missing.iter().cloned());
+        // The search data the menu attaches to the catalog (read here, never on the UI thread).
+        crate::start_search::load_app_index();
         push_event(self.ui, ShellEvent::StartApps(apps));
         for chunk in missing.chunks(START_ICON_BATCH) {
             self.pending.push_back(ShellRequest::StartIcons { icon_px, ids: chunk.to_vec() });
@@ -990,6 +1012,18 @@ fn lnk_target(link: &IShellLinkW, file: &IPersistFile, lnk: &Path) -> Option<Str
     Some(s).filter(|s| !s.is_empty())
 }
 
+/// Display name of a `.lnk` as the shell shows it: localized, without the extension.
+fn lnk_display_name(lnk: &Path) -> Option<String> {
+    let wide = HSTRING::from(lnk.as_os_str());
+    // SAFETY: COM STA initialized on this thread; `wide` lives for the call.
+    let item: IShellItem = unsafe { SHCreateItemFromParsingName(&wide, None::<&IBindCtx>) }.ok()?;
+    // SAFETY: `item` is valid; the returned PWSTR is freed by `take_pwstr`.
+    let name = take_pwstr(unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.ok()?)?;
+    let name = name.trim();
+    let name = if name.len() > 4 && name.to_lowercase().ends_with(".lnk") { &name[..name.len() - 4] } else { name };
+    Some(name.to_string()).filter(|n| !n.is_empty())
+}
+
 /// Scans the common and per-user Start Menu `.lnk` files; keeps only `exe path -> name` pairs.
 fn build_start_index() -> HashMap<String, String> {
     let mut files = Vec::new();
@@ -1012,9 +1046,15 @@ fn build_start_index() -> HashMap<String, String> {
             continue;
         }
         let Some(stem) = lnk.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
-        let name = strip_paren_suffix(&stem);
-        let lower = name.to_lowercase();
-        if name.is_empty() || lower.contains("uninstall") || lower.contains("readme") {
+        let lower = stem.to_lowercase();
+        if lower.contains("uninstall") || lower.contains("readme") {
+            continue;
+        }
+        // The name the shell shows (Windows' own shortcuts are localized through `desktop.ini`:
+        // "Remote Desktop Connection.lnk" is "Connessione Desktop remoto" in Italian, as in the
+        // Start menu), else the file name.
+        let name = strip_paren_suffix(&lnk_display_name(lnk).unwrap_or(stem));
+        if name.is_empty() {
             continue;
         }
         let key = norm_path(&target);
@@ -1523,6 +1563,47 @@ fn launch_admin(tool: AdminTool) {
     }
 }
 
+/// `ShellRequest::LaunchAppAdmin`: like `launch_admin`, for an app of the AppsFolder catalog.
+fn launch_app_admin(id: &str) {
+    let id = id.trim();
+    if id.is_empty() {
+        return;
+    }
+    let target = format!("shell:AppsFolder\\{id}");
+    match desktop_shell_execute(&target, None, None, Verb::RunAs, SW_SHOWNORMAL.0) {
+        Ok(()) => log!("shell: LaunchAppAdmin '{target}' via the desktop shell (runas, UAC prompt)"),
+        Err(e) => log!("shell: LaunchAppAdmin '{target}' through the desktop shell failed ({e}): REFUSED"),
+    }
+}
+
+/// `PKEY_Link_TargetParsingPath` ({B9B4B3FC-2B51-4A42-B5D8-324146AFCF25}, 2).
+const PKEY_LINK_TARGET: PROPERTYKEY =
+    PROPERTYKEY { fmtid: GUID::from_u128(0xb9b4b3fc_2b51_4a42_b5d8_324146afcf25), pid: 2 };
+
+/// File an AppsFolder app starts, as the catalog knows it (`None` for a Store app or a target that
+/// is not an existing absolute path).
+fn app_target_path(id: &str) -> Option<String> {
+    let name = HSTRING::from(format!("shell:AppsFolder\\{}", id.trim()));
+    // SAFETY: COM STA initialized on the shell thread; `name` lives for the call.
+    let item: IShellItem2 = unsafe { SHCreateItemFromParsingName(&name, None::<&IBindCtx>) }.ok()?;
+    // SAFETY: `item` is valid; the returned PWSTR is freed by `take_pwstr`.
+    let path = take_pwstr(unsafe { item.GetString(&PKEY_LINK_TARGET) }.ok()?)?;
+    let p = Path::new(&path);
+    (p.is_absolute() && !path.contains('"') && p.exists()).then_some(path)
+}
+
+/// `ShellRequest::RevealApp`: File Explorer (from the Windows folder) with the app's file selected.
+fn reveal_app(id: &str) {
+    let Some(path) = app_target_path(id) else {
+        log!("shell: RevealApp '{id}': no file to show");
+        return;
+    };
+    let Some(explorer) = system_dir().and_then(|s| s.parent().map(|w| w.join("explorer.exe"))) else { return };
+    if let Err(e) = launch(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\""))) {
+        log!("shell: RevealApp '{path}' not executed: {e}");
+    }
+}
+
 /// Owned `VARIANT` that is released with `VariantClear` on drop.
 struct OwnedVariant(VARIANT);
 
@@ -1590,7 +1671,8 @@ pub(crate) fn desktop_registered() -> bool {
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
 /// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, show)`
 /// (`SW_SHOWNORMAL` except the hidden PowerShell export, see `desktop_open_hidden`).
-/// `verb` is `Open` for every launch except `launch_admin` (`RunAs`: Explorer asks UAC, not the dock).
+/// `verb` is `Open` for every launch except `launch_admin` / `launch_app_admin` (`RunAs`: Explorer asks
+/// UAC, not the dock).
 /// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
 fn desktop_shell_execute(
@@ -1818,6 +1900,26 @@ mod tests {
         assert_eq!(find_notif_app(&apps, "Telegram.TelegramDesktop", "telegram"), Some(2));
         assert_eq!(find_notif_app(&apps, "Some-App", "Unknown"), None);
         assert_eq!(find_notif_app(&apps, "", ""), None);
+    }
+
+    /// Reads the REAL Start Menu shortcuts of this machine: the bar name of a Windows program is the
+    /// one the Start menu shows (localized), not the `.lnk` file name.
+    #[test]
+    #[ignore]
+    fn start_index_uses_the_shell_display_name() {
+        // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let map = build_start_index();
+        let apps = enum_apps_folder();
+        let sys = system_dir().expect("system dir");
+        let name = map.get(&norm_path(&sys.join("mstsc.exe").to_string_lossy())).expect("mstsc shortcut");
+        println!("mstsc.exe -> '{name}'");
+        assert!(apps.iter().any(|a| &a.name == name), "same name as the Start menu catalog");
+        assert!(!name.to_lowercase().ends_with(".lnk"));
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
     }
 
     /// Reads the REAL AppsFolder of this machine (run by hand: `cargo test -- --ignored --nocapture`).

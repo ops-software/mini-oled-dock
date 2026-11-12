@@ -29,32 +29,34 @@ pub enum Language {
     It,
 }
 
-/// Layout of the dock's own Start menu (`popup_startmenu`). Written as "vertical" / "horizontal";
-/// an unknown value falls back to vertical instead of rejecting the whole file.
+/// Layout of the dock's own Start menu (`popup_startmenu`). Written as "compact" / "windows11"
+/// (read also as "vertical" / "horizontal", the names up to 1.4.0); an unknown value falls back to
+/// compact instead of rejecting the whole file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum StartStyle {
     /// Search, two rows of pins and the alphabetical list in one column (the original menu).
     #[default]
-    Vertical,
+    Compact,
     /// Windows 11 organization: pages of pinned tiles, "All apps" on its own page, user and power bar.
-    Horizontal,
+    Windows11,
 }
 
 impl StartStyle {
     /// The config value.
     pub fn as_str(self) -> &'static str {
         match self {
-            StartStyle::Vertical => "vertical",
-            StartStyle::Horizontal => "horizontal",
+            StartStyle::Compact => "compact",
+            StartStyle::Windows11 => "windows11",
         }
     }
 
-    /// Parses the config value (any case); anything else is `Vertical`.
+    /// Parses the config value (any case, old names included); anything else is `Compact`.
     pub fn parse(s: &str) -> StartStyle {
-        if s.trim().eq_ignore_ascii_case("horizontal") {
-            StartStyle::Horizontal
+        let t = s.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "windows11" | "windows 11" | "win11" | "horizontal") {
+            StartStyle::Windows11
         } else {
-            StartStyle::Vertical
+            StartStyle::Compact
         }
     }
 }
@@ -436,6 +438,15 @@ pub struct PinnedApp {
     pub icon: Option<String>,
 }
 
+/// A folder of the Start menu pinned grid (`Config::start_folders`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct StartFolder {
+    pub name: String,
+    /// AppsFolder ids of the pinned apps inside, in order.
+    pub apps: Vec<String>,
+}
+
 /// Contents of `config.json`. Missing fields = defaults (`#[serde(default)]`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
@@ -460,8 +471,13 @@ pub struct Config {
     /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
     /// in order: AppsFolder ids (`shell_thread::StartApp::id`). Separate from the bar's `pinned`.
     pub start_pins: Vec<String>,
-    /// Layout of that Start menu: "vertical" (default) or "horizontal" (`StartStyle`).
+    /// Folders of that pinned grid: each groups some of the `start_pins` under one tile, shown where
+    /// its first pinned app is. An app listed here but not pinned is ignored.
+    pub start_folders: Vec<StartFolder>,
+    /// Layout of that Start menu: "compact" (default) or "windows11" (`StartStyle`).
     pub start_style: StartStyle,
+    /// Windows 11 layout: "All apps" as a grid of icons instead of a list.
+    pub start_grid: bool,
     /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
     /// value = name to show.
     pub names: BTreeMap<String, String>,
@@ -575,7 +591,9 @@ impl Default for Config {
             hide_native_taskbar: true,
             pinned: Vec::new(),
             start_pins: Vec::new(),
-            start_style: StartStyle::Vertical,
+            start_folders: Vec::new(),
+            start_style: StartStyle::Compact,
+            start_grid: false,
             names: BTreeMap::new(),
             show_date: true,
             show_volume_percent: true,
@@ -838,10 +856,15 @@ fn render(c: &Config) -> String {
   // (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.
   "win_opens_start": {win_opens_start},
 
-  // Layout of the dock's Start menu: "vertical" (search, pinned apps and the list of all apps in one
-  // column) or "horizontal" (Windows 11 style: pages of pinned apps, "All apps" on its own page,
-  // user name and power button at the bottom). Normally chosen in Settings. Other values = "vertical".
+  // Layout of the dock's Start menu: "compact" (a quick launcher: search, one strip of pinned icons,
+  // the list of all apps) or "windows11" (the full menu: one scrolling page with the pinned tiles
+  // and all apps, user name and folder shortcuts at the bottom). Normally chosen in Settings. The old names "vertical" and
+  // "horizontal" are still read; other values = "compact".
   "start_style": "{start_style}",
+
+  // "All apps" in the "windows11" layout: false = a list, true = a grid of icons. Normally chosen
+  // with the button next to "All apps" in the menu.
+  "start_grid": {start_grid},
 
   // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
   "hide_native_taskbar": {hide_native},
@@ -932,6 +955,11 @@ fn render(c: &Config) -> String {
   // the app's id inside shell:AppsFolder (an AUMID for Store apps); see:  Get-StartApps  (PowerShell)
   "start_pins": {start_pins},
 
+  // Folders of those pins: each one shows some of the pinned apps under a single tile, placed where
+  // its first app is. Normally managed by dragging a pinned app onto another one in the menu.
+  // Example: [{{ "name": "Games", "apps": ["<id>", "<id>"] }}]
+  "start_folders": {start_folders},
+
   // Order of the open apps that are NOT pinned (their keys). Pinned apps follow the "pinned" order
   // above. Normally managed by dragging an entry in the bar; apps not listed go last, in the order
   // they were first seen. At most 64 keys are kept.
@@ -984,6 +1012,7 @@ fn render(c: &Config) -> String {
         window_previews = c.window_previews,
         win_opens_start = c.win_opens_start,
         start_style = c.start_style.as_str(),
+        start_grid = c.start_grid,
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
         time_format = js(&c.time_format),
@@ -1009,6 +1038,7 @@ fn render(c: &Config) -> String {
         tray_guids = js_block(&c.tray_hidden_guids),
         pinned = js_block(&c.pinned),
         start_pins = js_block(&c.start_pins),
+        start_folders = js_block(&c.start_folders),
         names = js_block(&c.names),
         notif = c.notif_prompted,
         update_check = c.update_check,
@@ -1367,12 +1397,142 @@ impl Config {
     pub fn is_start_pinned(&self, id: &str) -> bool {
         self.start_pins.iter().any(|p| p.eq_ignore_ascii_case(id))
     }
+
+    /// Index of the Start menu folder holding the app `id` (case-insensitive), if any.
+    pub fn start_folder_of(&self, id: &str) -> Option<usize> {
+        self.start_folders.iter().position(|f| f.apps.iter().any(|a| a.eq_ignore_ascii_case(id)))
+    }
+}
+
+/// Longest Start menu folder name kept (chars).
+const START_FOLDER_NAME_MAX: usize = 32;
+
+/// Takes the app `id` out of every Start menu folder; a folder left empty is dropped.
+fn start_folder_remove_in(c: &mut Config, id: &str) {
+    for f in &mut c.start_folders {
+        f.apps.retain(|a| !a.eq_ignore_ascii_case(id));
+    }
+    c.start_folders.retain(|f| !f.apps.is_empty());
+}
+
+/// The pin that places the folder `folder` in the grid: its first app in `start_pins` order.
+fn start_folder_anchor(c: &Config, folder: usize) -> Option<String> {
+    let f = c.start_folders.get(folder)?;
+    c.start_pins.iter().find(|p| f.apps.iter().any(|a| a.eq_ignore_ascii_case(p))).cloned()
+}
+
+/// Moves the pins `ids` (kept in their order) next to the pin `anchor`: right after it when
+/// `after`, else right before it. Ids that are not pinned are ignored; nothing moves when the
+/// anchor is one of them or is not pinned.
+fn start_pin_move_in(c: &mut Config, ids: &[String], anchor: &str, after: bool) {
+    let is_moved = |p: &str| ids.iter().any(|i| i.eq_ignore_ascii_case(p));
+    if is_moved(anchor) || !c.is_start_pinned(anchor) {
+        return;
+    }
+    let (moved, mut rest): (Vec<String>, Vec<String>) = c.start_pins.drain(..).partition(|p| is_moved(p));
+    let at = rest.iter().position(|p| p.eq_ignore_ascii_case(anchor)).map_or(rest.len(), |i| i + usize::from(after));
+    rest.splice(at..at, moved);
+    c.start_pins = rest;
+}
+
+/// The pinned app `src` was dropped on the pinned app `target`: it joins the folder of `target`,
+/// or the two make a new folder called `new_name`. The folder keeps the place of `target` (the
+/// pin of `src` moves right after the folder's first app). Nothing when either is not pinned.
+fn start_folder_join_in(c: &mut Config, src: &str, target: &str, new_name: &str) {
+    if src.eq_ignore_ascii_case(target) || !c.is_start_pinned(src) || !c.is_start_pinned(target) {
+        return;
+    }
+    start_folder_remove_in(c, src);
+    // The pin that places the folder, taken before `src` is one of its apps.
+    let anchor = match c.start_folder_of(target) {
+        Some(f) => {
+            let anchor = start_folder_anchor(c, f);
+            c.start_folders[f].apps.push(src.to_string());
+            anchor
+        }
+        None => {
+            let name = new_name.trim().chars().take(START_FOLDER_NAME_MAX).collect();
+            c.start_folders.push(StartFolder { name, apps: vec![target.to_string(), src.to_string()] });
+            Some(target.to_string())
+        }
+    };
+    if let Some(anchor) = anchor {
+        start_pin_move_in(c, &[src.to_string()], &anchor, true);
+    }
+}
+
+/// Takes the app `id` out of its folder: it stays pinned, right after the folder it left.
+fn start_folder_leave_in(c: &mut Config, id: &str) {
+    let Some(f) = c.start_folder_of(id) else { return };
+    let name = c.start_folders[f].name.clone();
+    start_folder_remove_in(c, id);
+    // By name: the folder may have been dropped (it was its last app) and the indices shifted.
+    let anchor = c.start_folders.iter().position(|x| x.name == name).and_then(|i| start_folder_anchor(c, i));
+    if let Some(anchor) = anchor {
+        start_pin_move_in(c, &[id.to_string()], &anchor, true);
+    }
+}
+
+/// Inside the folder `folder`: moves the app `id` next to the app `anchor` (after it when `after`).
+fn start_folder_reorder_in(c: &mut Config, folder: usize, id: &str, anchor: &str, after: bool) {
+    let Some(f) = c.start_folders.get_mut(folder) else { return };
+    let find = |apps: &[String], x: &str| apps.iter().position(|a| a.eq_ignore_ascii_case(x));
+    let (Some(from), Some(_)) = (find(&f.apps, id), find(&f.apps, anchor)) else { return };
+    if id.eq_ignore_ascii_case(anchor) {
+        return;
+    }
+    let app = f.apps.remove(from);
+    let at = find(&f.apps, anchor).map_or(f.apps.len(), |i| i + usize::from(after));
+    f.apps.insert(at, app);
+}
+
+/// Renames the folder `folder` (trimmed, at most `START_FOLDER_NAME_MAX` chars; an empty name is refused).
+fn start_folder_rename_in(c: &mut Config, folder: usize, name: &str) {
+    let name: String = name.trim().chars().take(START_FOLDER_NAME_MAX).collect();
+    if let (Some(f), false) = (c.start_folders.get_mut(folder), name.is_empty()) {
+        f.name = name;
+    }
+}
+
+/// Start menu drag: moves pins next to another pin (see `start_pin_move_in`) and saves.
+pub fn start_pin_move(ids: Vec<String>, anchor: &str, after: bool) -> Result<(), String> {
+    modify(|c| start_pin_move_in(c, &ids, anchor, after))
+}
+
+/// Start menu drag: a pinned app dropped on another (see `start_folder_join_in`); saves.
+pub fn start_folder_join(src: &str, target: &str, new_name: &str) -> Result<(), String> {
+    modify(|c| start_folder_join_in(c, src, target, new_name))
+}
+
+/// Start menu: takes the app `id` out of its folder (it stays pinned) and saves.
+pub fn start_folder_leave(id: &str) -> Result<(), String> {
+    modify(|c| start_folder_leave_in(c, id))
+}
+
+/// Start menu drag inside an open folder (see `start_folder_reorder_in`); saves.
+pub fn start_folder_reorder(folder: usize, id: &str, anchor: &str, after: bool) -> Result<(), String> {
+    modify(|c| start_folder_reorder_in(c, folder, id, anchor, after))
+}
+
+/// Start menu: renames a folder (see `start_folder_rename_in`) and saves.
+pub fn start_folder_rename(folder: usize, name: &str) -> Result<(), String> {
+    modify(|c| start_folder_rename_in(c, folder, name))
+}
+
+/// Start menu: drops the folder `folder` (its apps stay pinned) and saves.
+pub fn start_folder_dissolve(folder: usize) -> Result<(), String> {
+    modify(|c| {
+        if folder < c.start_folders.len() {
+            c.start_folders.remove(folder);
+        }
+    })
 }
 
 /// Pins (appended last) or unpins the AppsFolder app `id` in the Start menu and saves.
 fn toggle_start_pin_in(c: &mut Config, id: &str) {
     if c.is_start_pinned(id) {
         c.start_pins.retain(|p| !p.eq_ignore_ascii_case(id));
+        start_folder_remove_in(c, id);
     } else if !id.trim().is_empty() {
         c.start_pins.push(id.to_string());
     }
@@ -1592,23 +1752,79 @@ mod tests {
     }
 
     #[test]
-    fn start_style_roundtrip_and_fallback() {
-        assert_eq!(Config::default().start_style, StartStyle::Vertical);
-        let r = render(&Config::default());
-        assert!(r.contains("\"start_style\": \"vertical\""));
+    fn start_folders_group_pins_and_roundtrip() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut c = Config::default();
-        c.start_style = StartStyle::Horizontal;
+        for id in ["a", "b", "c", "d", "e"] {
+            toggle_start_pin_in(&mut c, id);
+        }
+        // Only pinned apps make a folder; an app on itself does nothing.
+        start_folder_join_in(&mut c, "zzz", "a", "Games");
+        start_folder_join_in(&mut c, "a", "a", "Games");
+        assert!(c.start_folders.is_empty());
+        // "d" dropped on "b": a folder at the place of "b", the pin of "d" right after it.
+        start_folder_join_in(&mut c, "d", "b", "Games");
+        assert_eq!(c.start_folders, vec![StartFolder { name: "Games".into(), apps: ids(&["b", "d"]) }]);
+        assert_eq!(c.start_pins, ids(&["a", "b", "d", "c", "e"]));
+        // "A" dropped on the folder (on any of its apps): it joins, the folder stays where it is.
+        start_folder_join_in(&mut c, "A", "d", "unused");
+        assert_eq!(c.start_folders[0].apps, ids(&["b", "d", "A"]));
+        assert_eq!(c.start_pins, ids(&["b", "a", "d", "c", "e"]));
+        assert_eq!((c.start_folder_of("a"), c.start_folder_of("c")), (Some(0), None));
+        assert_eq!(parse(&render(&c)).unwrap(), c);
+        // Order inside the folder, and its name.
+        start_folder_reorder_in(&mut c, 0, "a", "b", false);
+        assert_eq!(c.start_folders[0].apps, ids(&["A", "b", "d"]));
+        start_folder_reorder_in(&mut c, 0, "a", "d", true);
+        assert_eq!(c.start_folders[0].apps, ids(&["b", "d", "A"]));
+        start_folder_reorder_in(&mut c, 0, "a", "nope", true);
+        start_folder_reorder_in(&mut c, 9, "a", "b", true);
+        assert_eq!(c.start_folders[0].apps, ids(&["b", "d", "A"]));
+        start_folder_rename_in(&mut c, 0, "  Work  ");
+        start_folder_rename_in(&mut c, 0, "   ");
+        start_folder_rename_in(&mut c, 0, &"x".repeat(100));
+        assert_eq!(c.start_folders[0].name.len(), START_FOLDER_NAME_MAX);
+        // Moving pins: "e" before "c"; the whole folder (its pins) after "e".
+        start_pin_move_in(&mut c, &ids(&["e"]), "c", false);
+        assert_eq!(c.start_pins, ids(&["b", "a", "d", "e", "c"]));
+        start_pin_move_in(&mut c, &ids(&["b", "a", "d"]), "e", true);
+        assert_eq!(c.start_pins, ids(&["e", "b", "a", "d", "c"]));
+        // An anchor that is moved or not pinned: nothing changes.
+        start_pin_move_in(&mut c, &ids(&["e"]), "e", true);
+        start_pin_move_in(&mut c, &ids(&["e"]), "nope", true);
+        assert_eq!(c.start_pins, ids(&["e", "b", "a", "d", "c"]));
+        // Leaving the folder keeps the pin, right after the folder; unpinning leaves the folder
+        // too; a folder left empty goes.
+        start_folder_leave_in(&mut c, "D");
+        assert!(c.is_start_pinned("d") && c.start_folder_of("d").is_none());
+        assert_eq!(c.start_pins, ids(&["e", "b", "d", "a", "c"]));
+        toggle_start_pin_in(&mut c, "b");
+        start_folder_leave_in(&mut c, "a");
+        assert!(c.start_folders.is_empty() && c.is_start_pinned("a"));
+        assert!(parse("{}").unwrap().start_folders.is_empty());
+    }
+
+    #[test]
+    fn start_style_roundtrip_and_fallback() {
+        assert_eq!(Config::default().start_style, StartStyle::Compact);
+        let r = render(&Config::default());
+        assert!(r.contains("\"start_style\": \"compact\""));
+        let mut c = Config::default();
+        c.start_style = StartStyle::Windows11;
         let r = render(&c);
-        assert!(r.contains("\"start_style\": \"horizontal\""));
+        assert!(r.contains("\"start_style\": \"windows11\""));
         assert_eq!(parse(&r).unwrap(), c);
         assert_eq!(parse(&serde_json::to_string(&c).unwrap()).unwrap(), c);
-        // Any case is read; unknown values fall back to vertical without rejecting the file.
-        assert_eq!(parse("{\"start_style\": \"Horizontal\"}").unwrap().start_style, StartStyle::Horizontal);
+        // Any case is read, and the names used up to 1.4.0; unknown values fall back to compact
+        // without rejecting the file.
+        assert_eq!(parse("{\"start_style\": \"Windows11\"}").unwrap().start_style, StartStyle::Windows11);
+        assert_eq!(parse("{\"start_style\": \"Horizontal\"}").unwrap().start_style, StartStyle::Windows11);
+        assert_eq!(parse("{\"start_style\": \"vertical\"}").unwrap().start_style, StartStyle::Compact);
         let odd = parse("{\"start_style\": \"diagonal\", \"autohide\": false}").unwrap();
-        assert_eq!(odd.start_style, StartStyle::Vertical);
+        assert_eq!(odd.start_style, StartStyle::Compact);
         assert!(!odd.autohide);
         // An old config without the key gets the original menu.
-        assert_eq!(parse("{}").unwrap().start_style, StartStyle::Vertical);
+        assert_eq!(parse("{}").unwrap().start_style, StartStyle::Compact);
     }
 
     #[test]
