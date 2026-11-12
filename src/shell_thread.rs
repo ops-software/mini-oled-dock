@@ -652,7 +652,16 @@ impl Shell {
 
     // -------------------------------------------------------------- name and icon
 
-    fn resolve_app(&mut self, r: ResolveApp) {
+    fn resolve_app(&mut self, mut r: ResolveApp) {
+        // A pin whose exe is gone because the app updated itself into a new versioned folder:
+        // name, icon and the stored launch target follow it.
+        if let Some(now) = crate::apps::updated_exe_path(&r.exe_path) {
+            log!("shell: '{}' moved to '{now}'", r.exe_path);
+            if let Err(e) = crate::config::sync_pinned_launch(&r.key, &now) {
+                log!("shell: cannot update the launch target of '{}': {e}", r.key);
+            }
+            r.exe_path = now;
+        }
         let (name, overridden) = self.resolve_name(&r);
         // Self-heal: a pin's stored name is only a fallback; keep it in sync with the live resolver
         // (an explicit `names` override is the user's choice, never written into the pin).
@@ -1526,6 +1535,9 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
     if target.is_empty() {
         return Err("empty target".into());
     }
+    // An exe that is gone because the app updated itself into a new versioned folder.
+    let moved = crate::apps::updated_exe_path(target);
+    let target = moved.as_deref().unwrap_or(target);
     let args = args.map(str::trim).filter(|a| !a.is_empty());
     let dir = Path::new(target)
         .parent()

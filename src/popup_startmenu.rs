@@ -1946,6 +1946,9 @@ impl Content for StartMenu {
             Some(_) => false,
         };
         if !draggable {
+            // A press on something else: a drop whose click never came (it ended away from its
+            // tile) must not swallow this one.
+            self.dropped = false;
             self.drag = None;
             return Reply::None;
         }
@@ -2313,8 +2316,9 @@ mod tests {
         c.dropped = true;
         c.drag(ID_PIN, 10, 10);
         assert!(!c.dropped);
+        c.dropped = true;
         assert_eq!(c.drag(ID_ROW + 1, 10, 10), Reply::None);
-        assert!(c.drag.is_none());
+        assert!(c.drag.is_none() && !c.dropped, "so does a press on a row: its click is not swallowed");
         release_store();
     }
 

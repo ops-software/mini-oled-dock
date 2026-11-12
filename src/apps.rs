@@ -793,6 +793,12 @@ fn window_aumid(hwnd: HWND) -> Option<String> {
     }
 }
 
+/// AppUserModelID the window `h` published itself, if any (the id its jump list is stored under,
+/// also for a helper window grouped under its root exe). UI thread.
+pub fn window_app_id(h: isize) -> Option<String> {
+    window_aumid(hw(h))
+}
+
 fn is_application_frame_host(exe_path: &str) -> bool {
     exe_path.rsplit(['\\', '/']).next().is_some_and(|f| f.eq_ignore_ascii_case("applicationframehost.exe"))
 }
@@ -818,6 +824,47 @@ pub fn key_from_exe_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\\")
+}
+
+/// True for a Squirrel-style versioned folder name (`app-1.0.9265`).
+fn is_version_dir(seg: &str) -> bool {
+    seg.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("app-"))
+        && seg.len() > 4
+        && seg[4..].chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// True when `a` and `b` are the same exe in two versioned folders of one app
+/// (`...\app-1.0.9265\Discord.exe` and `...\app-1.0.9267\Discord.exe`).
+pub fn same_exe_other_version(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && norm_path(a) != norm_path(b) && key_from_exe_path(a) == key_from_exe_path(b)
+}
+
+/// Where the exe `path` lives now, when it is gone because the app updated itself into a new
+/// versioned folder (Discord, Slack...: `app-1.0.9265` is deleted, `app-1.0.9267` appears): the same
+/// file inside the highest `app-<version>` folder next to the old one. `None` when `path` still
+/// exists, has no versioned folder, or no other version holds the file.
+pub fn updated_exe_path(path: &str) -> Option<String> {
+    use std::path::Path;
+    let p = Path::new(path);
+    if !p.is_absolute() || p.exists() {
+        return None;
+    }
+    let segs: Vec<&str> = path.split(['\\', '/']).collect();
+    let i = segs.iter().rposition(|s| is_version_dir(s))?;
+    let (base, rest) = (segs[..i].join("\\"), segs[i + 1..].join("\\"));
+    if rest.is_empty() {
+        return None;
+    }
+    let version = |name: &str| name[4..].split('.').map(|n| n.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    std::fs::read_dir(format!("{base}\\"))
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| is_version_dir(name))
+        .map(|name| (version(&name), format!("{base}\\{name}\\{rest}")))
+        .filter(|(_, cand)| Path::new(cand).is_file())
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, cand)| cand)
 }
 
 /// Extracts the AUMID from a launch target `shell:AppsFolder\<AUMID>`; `None` if it does not have that form.
@@ -1122,6 +1169,37 @@ mod tests {
             "c:\\users\\x\\appdata\\local\\discord\\app-*\\discord.exe"
         );
         assert_eq!(key_from_exe_path("C:\\app-store\\a.exe"), "c:\\app-store\\a.exe");
+    }
+
+    #[test]
+    fn versioned_folders() {
+        assert!(is_version_dir("app-1.0.9265") && is_version_dir("APP-2"));
+        assert!(!is_version_dir("app-") && !is_version_dir("app-store"));
+        let (a, b) = ("C:\\x\\Discord\\app-1.0.9265\\Discord.exe", "c:/x/discord/app-1.0.9267/discord.exe");
+        assert!(same_exe_other_version(a, b));
+        assert!(!same_exe_other_version(a, a) && !same_exe_other_version(a, "C:\\x\\Discord\\Update.exe"));
+        assert!(!same_exe_other_version(a, "") && !same_exe_other_version("shell:AppsFolder\\A!B", a));
+    }
+
+    #[test]
+    fn updated_exe_path_follows_the_newest_version() {
+        let root = std::env::temp_dir().join(format!("dock-test-versions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for v in ["app-1.0.9", "app-1.0.10", "app-1.0.11"] {
+            std::fs::create_dir_all(root.join(v)).unwrap();
+        }
+        // 1.0.11 does not hold the file (an update still being unpacked): 1.0.10 wins, not "1.0.9".
+        for v in ["app-1.0.9", "app-1.0.10"] {
+            std::fs::write(root.join(v).join("App.exe"), b"x").unwrap();
+        }
+        let r = root.to_string_lossy().into_owned();
+        assert_eq!(updated_exe_path(&format!("{r}\\app-1.0.3\\App.exe")), Some(format!("{r}\\app-1.0.10\\App.exe")));
+        assert_eq!(updated_exe_path(&format!("{r}\\app-1.0.9\\App.exe")), None, "still there: untouched");
+        assert_eq!(updated_exe_path(&format!("{r}\\app-1.0.3\\Other.exe")), None);
+        assert_eq!(updated_exe_path(&format!("{r}\\gone\\App.exe")), None, "no versioned folder");
+        assert_eq!(updated_exe_path("app-1.0.3\\App.exe"), None, "relative");
+        assert_eq!(updated_exe_path("shell:AppsFolder\\A!B"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

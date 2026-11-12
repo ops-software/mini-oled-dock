@@ -139,7 +139,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 - **Show / hide:** Win key alone, or the screen edge. With Settings → Screen → **Pointer** the Win key brings the bar to the display under the pointer (if the bar is visible on another display it moves there instead of hiding).
 - **Start menu:** double tap the Win key (second tap within 300 ms; the first tap is not delayed) or left click the Start button. Type to search, Enter launches the first result, arrows and the wheel scroll, right click opens the menu of an app (pin / unpin, run as administrator, open file location, uninstall), dragging a pinned app reorders it or (Windows 11 layout) groups it into a folder, a click on a letter of "All apps" opens the letter grid, a click on a folder opens it, the **Grid** / **List** button next to "All apps" (Windows 11 layout) switches the view, Esc closes the open menu, then clears the search, then closes. Right click on the Start button still opens the quick-links menu.
 - **Notifications:** click one to switch to its app, X removes it, **Clear all** empties the list and the Windows history.
-- **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu; resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
+- **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu (the app's own jump list as in the Windows taskbar - its tasks and categories, without the Recent / Frequent files - then New window, Pin / Unpin, Close); resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup (output, spatial sound, per-app mixer). Click a section header to collapse it; the pencil at the bottom enters Customize mode (eye = hide / show, drag a header to reorder).
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **Battery:** left click opens the battery popup (charge, state, time remaining on battery, power plan, "Power & battery settings"); right click opens Windows' battery saver settings. The wheel is not used.
@@ -266,7 +266,8 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
-| [1.4.0](.github/release-notes/v1.4.0.md) | unreleased | Self-updater, battery module, Settings window, review fixes |
+| [1.4.1](.github/release-notes/v1.4.1.md) | 2026-11-12 | Start menu rework, the app's jump list on right click, pins survive app updates |
+| [1.4.0](.github/release-notes/v1.4.0.md) | 2026-11-09 | Self-updater, battery module, Settings window, review fixes |
 | [1.3.0](.github/release-notes/v1.3.0.md) | 2026-10-29 | Keeps working across Explorer restarts, multi-monitor edge fix, −511 lines de-duplication |
 | [1.2.1](.github/release-notes/v1.2.1.md) | 2026-10-29 | Hotfix: the first click on a popup is no longer lost |
 | [1.2.0](.github/release-notes/v1.2.0.md) | 2026-10-29 | Horizontal Start, Win opens Start, IT/EN language, spatial sound and mixer, customizable volume popup |

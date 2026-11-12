@@ -120,6 +120,8 @@ pub struct AppMenuInfo {
     pub windows: usize,
     /// true if the item has a launch target ("New window" enabled).
     pub can_launch: bool,
+    /// The app's own jump list (`jumplist::load`), shown above the dock's rows; empty if none.
+    pub jump: Vec<crate::jumplist::Group>,
 }
 
 /// Opens the themed context menu for an app item (same style as the popups). The choice reaches the
