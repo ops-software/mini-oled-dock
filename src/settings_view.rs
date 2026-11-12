@@ -1147,8 +1147,8 @@ mod tests {
         for (label, opts) in [
             ("Display mode", vec!["Icon + name", "Icon", "Name"]),
             ("Mostra", vec!["Icona + nome", "Icona", "Nome"]),
-            ("Start layout", vec!["Vertical", "Horizontal"]),
-            ("Layout Start", vec!["Verticale", "Orizzontale"]),
+            ("Start layout", vec!["Compact", "Windows 11"]),
+            ("Layout Start", vec!["Compatto", "Windows 11"]),
             ("Mostra batteria", vec!["Automatica", "S\u{ec}", "No"]),
             ("Lingua", vec!["Sistema", "English", "Italiano"]),
             ("Posizione", vec!["In alto", "In basso"]),

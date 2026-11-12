@@ -10,7 +10,7 @@ A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust
 
 It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), the bar shows program names only (window titles appear in the hover previews), tray icons of other apps are hosted in the bar, and every popup is drawn by hand.
 
-- **Tiny:** the executable is about 0.7 MB and uses roughly 10 MB of RAM, trimmed to under 1 MB while hidden (numbers from the author's machine).
+- **Tiny:** the executable is about 1.4 MB and uses roughly 11 MB of RAM (about 18 MB while the Start menu is open, mostly released a minute after it closes), trimmed to under 1 MB while hidden (numbers from the author's machine).
 - **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network, battery and metrics modules are polled only while the bar is visible.
 - **Safe to try:** a watchdog process always restores the native taskbar, and `dock.exe --restore` works even when no dock is running.
 - **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it.
@@ -19,13 +19,13 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 
 *Rendered offscreen by `dock.exe --preview` with mock data.*
 
-| Start menu | Start menu: search | Horizontal Start |
+| Start menu (compact) | Start menu: search | Start menu (Windows 11) |
 |---|---|---|
-| ![](docs/screenshots/popup_startmenu.png) | ![](docs/screenshots/popup_startmenu_search.png) | ![](docs/screenshots/popup_startmenu_h.png) |
+| ![](docs/screenshots/popup_startmenu.png) | ![](docs/screenshots/popup_startmenu_search.png) | ![](docs/screenshots/popup_startmenu_win11.png) |
 
-| Horizontal Start: all apps | Horizontal Start: power | Quick-links menu |
+| Windows 11 layout: all apps as a grid | Windows 11 layout: a folder | Quick-links menu |
 |---|---|---|
-| ![](docs/screenshots/popup_startmenu_h_all.png) | ![](docs/screenshots/popup_startmenu_h_power.png) | ![](docs/screenshots/popup_start.png) |
+| ![](docs/screenshots/popup_startmenu_win11_grid.png) | ![](docs/screenshots/popup_startmenu_win11_folder.png) | ![](docs/screenshots/popup_start.png) |
 
 | Notifications | Audio: spatial sound and mixer | Audio: customize mode |
 |---|---|---|
@@ -67,8 +67,13 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 ### Win key and Start menu
 
 - **Win toggles the dock** (Win+other-key shortcuts still work), including over fullscreen games.
-- **Start menu written from scratch**, on any display: a quick double tap of Win, or a left click on the Start button, opens it next to the Start button on the display under the pointer. It lists every app of the native Start menu (classic programs and Store apps); type to search, right-click an app to pin it at the top.
-- **Horizontal Start** (optional): a Windows 11-style layout with search on top, a paged 6×3 pinned grid, an alphabetical "All apps" list and a power flyout. **Import from Windows Start** copies your Windows pins in the same order.
+- **Start menu written from scratch**, on any display: a quick double tap of Win, or a left click on the Start button, opens it next to the Start button on the display under the pointer. It lists every app of the native Start menu (classic programs and Store apps); type to search, right-click an app for its menu (pin, run as administrator, open file location, uninstall).
+- **Search like the native Start**: it reads the search data Windows itself ships, so `rdp` finds Remote Desktop Connection and `lol` finds League of Legends, typos are understood, the more popular app comes first, and settings are found too (`bluetooth` opens that page of Settings; apps are always listed before settings). Nothing is a list of ours; where Windows has no entry there is no match.
+- **Two Start layouts with different jobs**:
+  - *Compact* (the default), a quick launcher: search, one strip of pinned icons (the name shows when the pointer is on one; the wheel slides the strip) and the list of all apps.
+  - *Windows 11*, the full menu: one scrolling page with the pinned tiles and, under them, all apps as a list or as a grid; at the bottom the user name and shortcuts to Settings, File Explorer, Documents and Downloads.
+  - Neither has a power button: the bar always has one.
+- **Folders and letters**: in the Windows 11 layout drag a pinned app onto another to make a folder, onto a folder to add it, out of an open folder to take it out; click a folder's name to rename it. In both layouts drag a pin to the side of another to reorder, and click a letter of "All apps" to jump to another one. **Import from Windows Start** copies your Windows pins in the same order.
 - **Win opens Start** (optional): one tap of Win opens the dock and Start together in a single animation.
 - **Quick-links menu** on right click of the Start button, like the native Win+X one (Installed apps, Device Manager, Terminal (admin), Task Manager, Run, Sign out, ...).
 
@@ -132,7 +137,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 ## Usage
 
 - **Show / hide:** Win key alone, or the screen edge. With Settings → Screen → **Pointer** the Win key brings the bar to the display under the pointer (if the bar is visible on another display it moves there instead of hiding).
-- **Start menu:** double tap the Win key (second tap within 300 ms; the first tap is not delayed) or left click the Start button. Type to search, Enter launches the first result, arrows and the wheel scroll, right click pins / unpins an app, Esc clears the search and then closes. Right click on the Start button still opens the quick-links menu.
+- **Start menu:** double tap the Win key (second tap within 300 ms; the first tap is not delayed) or left click the Start button. Type to search, Enter launches the first result, arrows and the wheel scroll, right click opens the menu of an app (pin / unpin, run as administrator, open file location, uninstall), dragging a pinned app reorders it or (Windows 11 layout) groups it into a folder, a click on a letter of "All apps" opens the letter grid, a click on a folder opens it, the **Grid** / **List** button next to "All apps" (Windows 11 layout) switches the view, Esc closes the open menu, then clears the search, then closes. Right click on the Start button still opens the quick-links menu.
 - **Notifications:** click one to switch to its app, X removes it, **Clear all** empties the list and the Windows history.
 - **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu; resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup (output, spatial sound, per-app mixer). Click a section header to collapse it; the pencil at the bottom enters Customize mode (eye = hide / show, drag a header to reorder).
@@ -185,10 +190,12 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `show_start_button` | `true` | Start button at the left end of the bar (a fixed item, not a movable module) |
 | `pinned` | `[]` | Pinned apps, in display order |
 | `start_pins` | `[]` | Apps pinned at the top of the dock's Start menu (separate from `pinned`; right click an app in the menu to add or remove it) |
+| `start_folders` | `[]` | Folders of those pins: `[{ "name": "Games", "apps": ["<id>", ...] }]`. Managed by dragging pinned apps in the menu |
 | `names` | `{}` | Display-name overrides (key: lowercase exe name or AUMID) |
 | `language` | `"auto"` | Dock language: `"auto"` (Windows display language), `"en"` or `"it"` |
 | `win_opens_start` | `false` | One tap of Win opens the dock and the Start menu together |
-| `start_style` | `"vertical"` | Start menu layout: `"vertical"` or `"horizontal"` |
+| `start_style` | `"compact"` | Start menu layout: `"compact"` (quick launcher) or `"windows11"` (full menu); the old names `"vertical"` / `"horizontal"` are still read |
+| `start_grid` | `false` | Windows 11 layout: "All apps" as a grid of icons instead of a list (the button next to "All apps") |
 | `audio_layout` | `"MOSX"` | Volume popup sections in order (M master, O output, S spatial, X mixer; lowercase = collapsed, `-` in front = hidden); normally set from the popup |
 | `update_check` | `true` | Ask GitHub once a day whether a newer release exists (badge only) |
 | `update_auto_install` | `false` | Download, verify and install new releases by themselves |

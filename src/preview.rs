@@ -681,9 +681,11 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         "popup_start" => crate::popup::popup_start::new(),
         "popup_startmenu"
         | "popup_startmenu_search"
-        | "popup_startmenu_h"
-        | "popup_startmenu_h_all"
-        | "popup_startmenu_h_power" => {
+        | "popup_startmenu_win11"
+        | "popup_startmenu_win11_grid"
+        | "popup_startmenu_menu"
+        | "popup_startmenu_letters"
+        | "popup_startmenu_win11_folder" => {
             const APPS: [(&str, char, u32); 20] = [
                 ("Adobe Acrobat", 'A', 0xB30B00),
                 ("Calculator", 'C', 0x3A3A3C),
@@ -716,24 +718,35 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 "file explorer",
                 "settings",
             ];
+            use crate::popup::popup_startmenu::PreviewOver;
+            let (over, folders) = match name {
+                "popup_startmenu_menu" => (Some(PreviewOver::Menu), Vec::new()),
+                "popup_startmenu_letters" => (Some(PreviewOver::Letters), Vec::new()),
+                "popup_startmenu_win11_folder" => {
+                    let apps = ["spotify", "steam", "discord"].map(str::to_string).to_vec();
+                    (Some(PreviewOver::Folder), vec![crate::config::StartFolder { name: "Games".to_string(), apps }])
+                }
+                _ => (None, Vec::new()),
+            };
             crate::config::set(Config {
                 start_pins: pins.iter().map(|p| p.to_string()).collect(),
+                start_folders: folders,
+                start_grid: name == "popup_startmenu_win11_grid",
                 ..Config::default()
             });
             let apps =
                 APPS.iter().map(|&(n, l, c)| (n.to_lowercase(), n.to_string(), mock_icon(l, c, m.px(32)))).collect();
             let query = if name == "popup_startmenu_search" { "te" } else { "" };
-            let style = if name.starts_with("popup_startmenu_h") {
-                crate::config::StartStyle::Horizontal
+            let style = if name.starts_with("popup_startmenu_win11") {
+                crate::config::StartStyle::Windows11
             } else {
-                crate::config::StartStyle::Vertical
+                crate::config::StartStyle::Compact
             };
             crate::popup::popup_startmenu::preview_new(
                 apps,
                 query,
                 style,
-                name == "popup_startmenu_h_all",
-                name == "popup_startmenu_h_power",
+                over,
             )
         }
         "popup_tray" | "popup_tray_customize" => {
@@ -916,10 +929,12 @@ pub fn run(dir: &str) -> i32 {
             ("popup_start", 4),
             ("popup_startmenu", 12),
             ("popup_startmenu_search", 1),
-            ("popup_startmenu_h", 5),
-            ("popup_startmenu_h_all", 6),
-            // Flyout open: control 0 is its backdrop, then the flyout rows (2 = "Lock").
-            ("popup_startmenu_h_power", 2),
+            ("popup_startmenu_win11", 5),
+            ("popup_startmenu_win11_grid", 6),
+            // Overlays open: control 0 is the backdrop, then their rows / cells.
+            ("popup_startmenu_menu", 2),
+            ("popup_startmenu_letters", 3),
+            ("popup_startmenu_win11_folder", 1),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
         ] {

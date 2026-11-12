@@ -1528,6 +1528,10 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::on_start_icons(icon_px, icons);
             return false;
         }
+        ShellEvent::StartSettings => {
+            popup::on_start_settings();
+            return false;
+        }
         // Spatial sound and per-app mixer data: only the audio popup uses them.
         ShellEvent::Spatial(state) => {
             popup::on_audio_spatial(state);
@@ -1573,6 +1577,7 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             ShellEvent::Network(_)
             | ShellEvent::StartApps(_)
             | ShellEvent::StartIcons { .. }
+            | ShellEvent::StartSettings
             | ShellEvent::Spatial(_)
             | ShellEvent::AudioSessions(_) => false,
         }

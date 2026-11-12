@@ -2,9 +2,8 @@
 //! Settings window, `settings_window`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
 //! (user's choice, no confirmation). Actions in `power::run`.
 //!
-//! The items, labels, glyphs and the choice behind each one are shared (`pub(crate)` helpers below)
-//! with the power flyout of the horizontal Start menu (`popup_startmenu`), which offers the same
-//! entries except the autostart toggle.
+//! The only place with the power actions: the dock's Start menu has no power button (this module
+//! cannot be hidden from the bar).
 
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 use std::sync::Arc;
@@ -28,9 +27,6 @@ pub(crate) const ID_SETTINGS: u32 = 7;
 
 /// Items above the separator (the system actions), in menu order.
 pub(crate) const SYSTEM_ITEMS: [u32; 4] = [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN];
-/// Items of the Start menu's power flyout below the separator (no autostart toggle there: its state
-/// needs a schtasks query on open).
-pub(crate) const DOCK_ITEMS: [u32; 2] = [ID_SETTINGS, ID_EXIT];
 
 /// What choosing a power item does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

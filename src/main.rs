@@ -67,6 +67,7 @@ mod settings_window;
 mod sha256;
 mod shell_thread;
 mod start_import;
+mod start_search;
 mod surface;
 mod taskbar;
 mod tray_host;
