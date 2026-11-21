@@ -29,7 +29,7 @@ use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowRect,
     GetWindowThreadProcessId,
-    IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
+    IsWindow, IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
     SendNotifyMessageW,
     SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
     HWND_BOTTOM,
@@ -80,6 +80,11 @@ const ABS_AUTOHIDE: u32 = 1;
 const ABS_ALWAYSONTOP: u32 = 2;
 const ABS_MASK: u32 = ABS_AUTOHIDE | ABS_ALWAYSONTOP;
 
+/// Timeout of the AppBar messages sent straight to Explorer (`appbar_direct`), in ms.
+const APPBAR_TIMEOUT_MS: u32 = 2000;
+/// Timeout of the advisory `ABM_GETAUTOHIDEBAREX` query, in ms: it blocks the UI thread before the auto-hide
+/// request, and without an answer the request is sent anyway, so a busy Explorer costs at most this.
+const EDGE_QUERY_TIMEOUT_MS: u32 = 500;
 /// Quiet window during which our own `TaskbarCreated` broadcast is ignored.
 const OWN_BROADCAST_WINDOW_MS: u64 = 2000;
 /// Longest wait for a restarted Explorer's desktop before our tray host is started again anyway (ms).
@@ -205,11 +210,12 @@ const _: () = assert!(std::mem::size_of::<AppBarData32>() == 0x28 && std::mem::s
 /// (`hwnd`), so it does not depend on which `Shell_TrayWnd` is first in the Z-order (our tray
 /// host is first). `Some(result)` if the message was delivered, `None` otherwise.
 fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Option<usize> {
-    appbar_direct_at(msg, hwnd, 0, [0; 4], lparam)
+    appbar_direct_at(msg, hwnd, 0, [0; 4], lparam, APPBAR_TIMEOUT_MS)
 }
 
-/// `appbar_direct` with the APPBARDATA `uEdge` and `rc` filled in (`ABM_GETAUTOHIDEBAREX` needs both).
-fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32) -> Option<usize> {
+/// `appbar_direct` with the APPBARDATA `uEdge` and `rc` filled in (`ABM_GETAUTOHIDEBAREX` needs both) and
+/// a timeout of its own (ms).
+fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, timeout_ms: u32) -> Option<usize> {
     let mut m = AppBarMsg {
         abd: AppBarData32 { cb_size: 0x28, hwnd: hwnd.0 as usize as u32, callback: 0, edge, rc, lparam: lparam as i64 },
         message: msg,
@@ -233,7 +239,7 @@ fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32) 
             WPARAM(hwnd.0 as usize),
             LPARAM(&cds as *const COPYDATASTRUCT as isize),
             SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-            2000,
+            timeout_ms,
             Some(&mut res),
         )
     };
@@ -287,25 +293,48 @@ fn edge_of(bar: RECT, mon: RECT) -> u32 {
 /// The window Explorer has registered as the auto-hide bar on the screen edge of taskbar `tray` (primary
 /// or secondary), when that window is NOT `tray`. Explorer allows one auto-hide bar per edge and per
 /// monitor: asking it to auto-hide a taskbar on an edge another window already holds makes it show
-/// "There is already an auto-hide toolbar on this side of your screen" and refuse. `None` = the edge is
-/// free, held by `tray` itself, or the question could not be asked (then the caller behaves as before).
-fn autohide_edge_owner(tray: HWND) -> Option<isize> {
+/// "There is already an auto-hide toolbar on this side of your screen" and refuse. See `EdgeOwner`.
+fn autohide_edge_owner(tray: HWND) -> EdgeOwner {
     let mut bar = RECT::default();
     // SAFETY: `bar` is writable; for an invalid window the call fails.
-    unsafe { GetWindowRect(tray, &mut bar) }.ok()?;
+    if unsafe { GetWindowRect(tray, &mut bar) }.is_err() {
+        return EdgeOwner::NoAnswer;
+    }
     // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
     let hm = unsafe { MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has the right `cbSize` and is writable.
     if !unsafe { GetMonitorInfoW(hm, &mut mi) }.as_bool() {
-        return None;
+        return EdgeOwner::NoAnswer;
     }
     let mon = mi.rcMonitor;
     let rc = [mon.left, mon.top, mon.right, mon.bottom];
-    let raw = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge_of(bar, mon), rc, 0)?;
+    let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge_of(bar, mon), rc, 0, EDGE_QUERY_TIMEOUT_MS);
+    // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
+    edge_owner_from_reply(reply, tray.0 as isize, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool())
+}
+
+/// Who holds the auto-hide slot on a taskbar's screen edge, as far as Explorer's answer tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeOwner {
+    /// Nobody, the taskbar itself, or a handle that is no longer a window.
+    Free,
+    /// Another live window (raw handle): asking for auto-hide would make Explorer refuse with its message box.
+    Held(isize),
+    /// The question could not be asked or got no answer in time: treated like `Free` (fail open, as 1.4.2).
+    NoAnswer,
+}
+
+/// Decodes the reply to `ABM_GETAUTOHIDEBAREX` sent for taskbar `tray` (`None` = not delivered). Pure.
+fn edge_owner_from_reply(reply: Option<usize>, tray: isize, is_window: impl Fn(isize) -> bool) -> EdgeOwner {
+    let Some(raw) = reply else { return EdgeOwner::NoAnswer };
     // Window handles travel as 32-bit values and are sign-extended back.
     let owner = raw as u32 as i32 as isize;
-    (owner != 0 && owner != tray.0 as isize).then_some(owner)
+    if owner != 0 && owner != tray && is_window(owner) {
+        EdgeOwner::Held(owner)
+    } else {
+        EdgeOwner::Free
+    }
 }
 
 /// `ABM_SETSTATE`; true if the message reached Explorer. A delivered direct send is enough;
@@ -645,7 +674,10 @@ pub fn hide_all() {
         // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
         // the foreground: the taskbar is hidden below with SW_HIDE anyway, so hold the request back.
         // The state covers every taskbar (primary and secondary), so any of them can hit the conflict.
-        if let Some((bar, owner)) = list.iter().find_map(|&h| autohide_edge_owner(h).map(|o| (h, o))) {
+        // The first answer decides: a holder holds the request back, no answer sends it as 1.4.2 did (fail
+        // open, and nothing else is asked), a free edge moves on to the next taskbar.
+        let answer = list.iter().map(|&h| (h, autohide_edge_owner(h))).find(|&(_, o)| o != EdgeOwner::Free);
+        if let Some((bar, EdgeOwner::Held(owner))) = answer {
             if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
                 log!(
                     "taskbar: auto-hide off (state {state}) but window 0x{owner:X} already holds the edge of \
@@ -1080,5 +1112,23 @@ mod tests {
         assert_eq!(edge_of(r(3840, 1679, 6400, 1727), side), ABE_BOTTOM);
         assert_eq!(edge_of(r(3840, 287, 6400, 335), side), ABE_TOP);
         assert_eq!(edge_of(r(-62, 0, 0, 1080), r(-1920, 0, 0, 1080)), ABE_RIGHT);
+    }
+
+    #[test]
+    fn edge_owner_reply_decoding() {
+        let tray = 0x1_0040isize;
+        let live = |h: isize| h != 0xDEAD;
+        assert_eq!(edge_owner_from_reply(None, tray, live), EdgeOwner::NoAnswer);
+        assert_eq!(edge_owner_from_reply(Some(0), tray, live), EdgeOwner::Free);
+        assert_eq!(edge_owner_from_reply(Some(0x1_0040), tray, live), EdgeOwner::Free, "the taskbar itself");
+        assert_eq!(edge_owner_from_reply(Some(0xDEAD), tray, live), EdgeOwner::Free, "a dead handle");
+        assert_eq!(edge_owner_from_reply(Some(0x2_0080), tray, live), EdgeOwner::Held(0x2_0080));
+        // A handle with the high bit set comes back sign-extended, whichever form the reply has, and it is
+        // that value that is checked for being a window and compared with the taskbar.
+        let high = 0x8001_0234u32 as i32 as isize;
+        let only_high = move |h: isize| h == high;
+        assert_eq!(edge_owner_from_reply(Some(0x8001_0234), tray, only_high), EdgeOwner::Held(high));
+        assert_eq!(edge_owner_from_reply(Some(high as usize), tray, only_high), EdgeOwner::Held(high));
+        assert_eq!(edge_owner_from_reply(Some(0x8001_0234), high, only_high), EdgeOwner::Free, "the taskbar itself");
     }
 }
