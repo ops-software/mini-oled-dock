@@ -337,6 +337,29 @@ fn edge_owner_from_reply(reply: Option<usize>, tray: isize, is_window: impl Fn(i
     }
 }
 
+/// What `hide_all` does about Explorer's auto-hide setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoHideAction {
+    /// Auto-hide is already on.
+    Nothing,
+    /// Send `ABM_SETSTATE(ABS_AUTOHIDE)`.
+    Send,
+    /// Hold the request back: this window (raw handle) holds the edge and Explorer would refuse with its box.
+    HoldBack(isize),
+}
+
+/// The auto-hide decision for taskbar state `state` (`ABS_*`) and the owner of its edge. Pure.
+/// `NoAnswer` sends like `Free` (fail open): a slow Explorer at logon must still get auto-hide.
+fn autohide_action(state: u32, owner: EdgeOwner) -> AutoHideAction {
+    if state & ABS_AUTOHIDE != 0 {
+        return AutoHideAction::Nothing;
+    }
+    match owner {
+        EdgeOwner::Held(h) => AutoHideAction::HoldBack(h),
+        EdgeOwner::Free | EdgeOwner::NoAnswer => AutoHideAction::Send,
+    }
+}
+
 /// `ABM_SETSTATE`; true if the message reached Explorer. A delivered direct send is enough;
 /// if it fails we fall back to `SHAppBarMessage` (which always returns TRUE, so it tells us nothing) and
 /// confirm by re-reading the state with a direct send.
@@ -669,15 +692,22 @@ pub fn hide_all() {
         return;
     }
     let state = get_state(first);
-    if state & ABS_AUTOHIDE == 0 {
-        // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
-        // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
-        // the foreground: the taskbar is hidden below with SW_HIDE anyway, so hold the request back.
-        // The state covers every taskbar (primary and secondary), so any of them can hit the conflict.
-        // The first answer decides: a holder holds the request back, no answer sends it as 1.4.2 did (fail
-        // open, and nothing else is asked), a free edge moves on to the next taskbar.
+    // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
+    // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
+    // the foreground: the taskbar is hidden below with SW_HIDE anyway, so hold the request back.
+    // The state covers every taskbar (primary and secondary), so any of them can hit the conflict.
+    // The first answer decides: a holder holds the request back, no answer sends it as 1.4.2 did (fail
+    // open, and nothing else is asked), a free edge moves on to the next taskbar. The edge is asked about
+    // only when auto-hide is off.
+    let (bar, owner) = if state & ABS_AUTOHIDE == 0 {
         let answer = list.iter().map(|&h| (h, autohide_edge_owner(h))).find(|&(_, o)| o != EdgeOwner::Free);
-        if let Some((bar, EdgeOwner::Held(owner))) = answer {
+        answer.unwrap_or((first, EdgeOwner::Free))
+    } else {
+        (first, EdgeOwner::Free)
+    };
+    match autohide_action(state, owner) {
+        AutoHideAction::Nothing => {}
+        AutoHideAction::HoldBack(owner) => {
             if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
                 log!(
                     "taskbar: auto-hide off (state {state}) but window 0x{owner:X} already holds the edge of \
@@ -685,12 +715,25 @@ pub fn hide_all() {
                     bar.0 as isize
                 );
             }
-        } else {
+        }
+        AutoHideAction::Send => {
+            // A restore can have run while the messages above waited for Explorer: nested in this very call
+            // (SendMessageTimeoutW without SMTO_BLOCK handles incoming sent messages, so WM_ENDSESSION can run
+            // begin_exit + restore inside the query), or from the watchdog, which deletes the state file. Auto-hide
+            // sent after that restore stays on in Explorer and becomes the "original" at the next start.
+            if RESTORING.load(Relaxed) || restored_externally() {
+                return;
+            }
             EDGE_CONFLICT_LOGGED.store(false, Relaxed);
             log!("taskbar: auto-hide off (state {state}), sending ABM_SETSTATE");
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
             appbar(ABM_SETSTATE, first, ABS_AUTOHIDE);
         }
+    }
+    // The same race for the hide below: a restore that ran during the waits above has shown the taskbars and
+    // removed their DockHidden mark; hiding them again would leave them hidden with no mark and no state file.
+    if RESTORING.load(Relaxed) || restored_externally() {
+        return;
     }
     let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS;
     for &h in &list {
@@ -1130,5 +1173,29 @@ mod tests {
         assert_eq!(edge_owner_from_reply(Some(0x8001_0234), tray, only_high), EdgeOwner::Held(high));
         assert_eq!(edge_owner_from_reply(Some(high as usize), tray, only_high), EdgeOwner::Held(high));
         assert_eq!(edge_owner_from_reply(Some(0x8001_0234), high, only_high), EdgeOwner::Free, "the taskbar itself");
+    }
+
+    #[test]
+    fn autohide_action_for_every_state_and_owner() {
+        use AutoHideAction::*;
+        use EdgeOwner::{Free, Held, NoAnswer};
+        let held = Held(0x2_0080);
+        let cases = [
+            (0, Free, Send),
+            (0, held, HoldBack(0x2_0080)),
+            (0, NoAnswer, Send),
+            (ABS_ALWAYSONTOP, Free, Send),
+            (ABS_ALWAYSONTOP, held, HoldBack(0x2_0080)),
+            (ABS_ALWAYSONTOP, NoAnswer, Send),
+            (ABS_AUTOHIDE, Free, Nothing),
+            (ABS_AUTOHIDE, held, Nothing),
+            (ABS_AUTOHIDE, NoAnswer, Nothing),
+            (ABS_MASK, Free, Nothing),
+            (ABS_MASK, held, Nothing),
+            (ABS_MASK, NoAnswer, Nothing),
+        ];
+        for (state, owner, want) in cases {
+            assert_eq!(autohide_action(state, owner), want, "state {state}, {owner:?}");
+        }
     }
 }
