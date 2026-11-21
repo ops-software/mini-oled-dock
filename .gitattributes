@@ -1,0 +1,5 @@
+tests/fixtures/** -text
+*.png binary
+tests/golden/** binary
+budgets.json text eol=lf
+tests/ratchet.txt text eol=lf
