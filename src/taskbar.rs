@@ -825,7 +825,16 @@ pub fn hide_all() {
             let unanswered = if owner == EdgeOwner::NoAnswer { " (edge check unanswered)" } else { "" };
             log!("taskbar: {}{unanswered}, sending ABM_SETSTATE", autohide_off_text(read));
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
-            appbar(ABM_SETSTATE, first, ABS_AUTOHIDE);
+            // The direct send waits up to APPBAR_TIMEOUT_MS, so the same race is checked again before the
+            // fallback: a restore nested in that wait has already sent the original state, and the fallback
+            // would put auto-hide back on after it.
+            if appbar_direct(ABM_SETSTATE, first, ABS_AUTOHIDE).is_none() {
+                if RESTORING.load(Relaxed) || restored_externally() {
+                    return;
+                }
+                log!("taskbar: direct AppBar {ABM_SETSTATE} send failed, falling back to SHAppBarMessage");
+                appbar_shell(ABM_SETSTATE, first, ABS_AUTOHIDE);
+            }
         }
     }
     // The same race for the hide below: a restore that ran during the waits above has shown the taskbars and
