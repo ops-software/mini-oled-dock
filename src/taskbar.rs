@@ -290,8 +290,9 @@ fn edge_of(bar: RECT, mon: RECT) -> u32 {
     }
 }
 
-/// The window Explorer has registered as the auto-hide bar on the screen edge of taskbar `tray` (primary
-/// or secondary), when that window is NOT `tray`. Explorer allows one auto-hide bar per edge and per
+/// The window Explorer has registered as the auto-hide bar on the screen edge of taskbar `tray`, when that
+/// window is NOT `tray`. `tray` must be Explorer's primary `Shell_TrayWnd`: the query is sent to it, and it is
+/// the window that serves AppBar messages. Explorer allows one auto-hide bar per edge and per
 /// monitor: asking it to auto-hide a taskbar on an edge another window already holds makes it show
 /// "There is already an auto-hide toolbar on this side of your screen" and refuse. See `EdgeOwner`.
 fn autohide_edge_owner(tray: HWND) -> EdgeOwner {
@@ -675,7 +676,8 @@ pub fn hide_all() {
     let list = native_taskbars();
     let Some(&first) = list.first() else { return };
     HIDDEN.store(true, Relaxed);
-    if class_of(first) == "Shell_TrayWnd" {
+    let primary = class_of(first) == "Shell_TrayWnd";
+    if primary {
         EXPLORER_TRAY.store(first.0 as isize, Relaxed);
     }
     for &h in &list {
@@ -695,16 +697,11 @@ pub fn hide_all() {
     // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
     // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
     // the foreground: the taskbar is hidden below with SW_HIDE anyway, so hold the request back.
-    // The state covers every taskbar (primary and secondary), so any of them can hit the conflict.
-    // The first answer decides: a holder holds the request back, no answer sends it as 1.4.2 did (fail
-    // open, and nothing else is asked), a free edge moves on to the next taskbar. The edge is asked about
-    // only when auto-hide is off.
-    let (bar, owner) = if state & ABS_AUTOHIDE == 0 {
-        let answer = list.iter().map(|&h| (h, autohide_edge_owner(h))).find(|&(_, o)| o != EdgeOwner::Free);
-        answer.unwrap_or((first, EdgeOwner::Free))
-    } else {
-        (first, EdgeOwner::Free)
-    };
+    // Only the primary taskbar's edge is asked about, and only when auto-hide is off: Explorer's primary
+    // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
+    // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
+    // list nothing is asked. No answer sends the request as 1.4.2 did (fail open).
+    let owner = if state & ABS_AUTOHIDE == 0 && primary { autohide_edge_owner(first) } else { EdgeOwner::Free };
     match autohide_action(state, owner) {
         AutoHideAction::Nothing => {}
         AutoHideAction::HoldBack(owner) => {
@@ -712,7 +709,7 @@ pub fn hide_all() {
                 log!(
                     "taskbar: auto-hide off (state {state}) but window 0x{owner:X} already holds the edge of \
                      taskbar 0x{:X}, ABM_SETSTATE held back",
-                    bar.0 as isize
+                    first.0 as isize
                 );
             }
         }
