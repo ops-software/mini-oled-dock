@@ -20,13 +20,15 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowThreadProcessId,
+    ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowRect,
+    GetWindowThreadProcessId,
     IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
     SendNotifyMessageW,
     SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
@@ -60,12 +62,20 @@ static EXPLORER_TRAY: AtomicIsize = AtomicIsize::new(0);
 /// `now_ms()` when `explorer_gone` stopped our tray host (0 = not paused): it is started again once the
 /// new Explorer has registered its desktop (`on_reannounce_timer`).
 static HOST_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
+/// true once `hide_all` has logged that it held back `ABM_SETSTATE` because of an edge conflict;
+/// cleared when the state is sent again, so a lasting conflict is logged once, not every second.
+static EDGE_CONFLICT_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Monotonic time reference of the process.
 static START: OnceLock<Instant> = OnceLock::new();
 
 // SHAppBarMessage constants (documented values; they avoid depending on the type of the crate's constants).
 const ABM_GETSTATE: u32 = 4;
 const ABM_SETSTATE: u32 = 10;
+const ABM_GETAUTOHIDEBAREX: u32 = 11;
+const ABE_LEFT: u32 = 0;
+const ABE_TOP: u32 = 1;
+const ABE_RIGHT: u32 = 2;
+const ABE_BOTTOM: u32 = 3;
 const ABS_AUTOHIDE: u32 = 1;
 const ABS_ALWAYSONTOP: u32 = 2;
 const ABS_MASK: u32 = ABS_AUTOHIDE | ABS_ALWAYSONTOP;
@@ -195,15 +205,13 @@ const _: () = assert!(std::mem::size_of::<AppBarData32>() == 0x28 && std::mem::s
 /// (`hwnd`), so it does not depend on which `Shell_TrayWnd` is first in the Z-order (our tray
 /// host is first). `Some(result)` if the message was delivered, `None` otherwise.
 fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Option<usize> {
+    appbar_direct_at(msg, hwnd, 0, [0; 4], lparam)
+}
+
+/// `appbar_direct` with the APPBARDATA `uEdge` and `rc` filled in (`ABM_GETAUTOHIDEBAREX` needs both).
+fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32) -> Option<usize> {
     let mut m = AppBarMsg {
-        abd: AppBarData32 {
-            cb_size: 0x28,
-            hwnd: hwnd.0 as usize as u32,
-            callback: 0,
-            edge: 0,
-            rc: [0; 4],
-            lparam: lparam as i64,
-        },
+        abd: AppBarData32 { cb_size: 0x28, hwnd: hwnd.0 as usize as u32, callback: 0, edge, rc, lparam: lparam as i64 },
         message: msg,
         _pad0: 0,
         shared: 0,
@@ -257,6 +265,47 @@ fn appbar_shell(msg: u32, hwnd: HWND, lparam: u32) -> usize {
 
 fn get_state(tray: HWND) -> u32 {
     (appbar(ABM_GETSTATE, tray, 0) as u32) & ABS_MASK
+}
+
+/// Screen edge (`ABE_*`) a taskbar rectangle sits on within its monitor rectangle. Pure. A wide bar is
+/// top or bottom, a tall one left or right, decided by which half of the monitor its centre is in
+/// (an auto-hidden bar is pushed almost off screen, but its centre stays on the right side).
+fn edge_of(bar: RECT, mon: RECT) -> u32 {
+    if bar.right - bar.left >= bar.bottom - bar.top {
+        if bar.top + bar.bottom < mon.top + mon.bottom {
+            ABE_TOP
+        } else {
+            ABE_BOTTOM
+        }
+    } else if bar.left + bar.right < mon.left + mon.right {
+        ABE_LEFT
+    } else {
+        ABE_RIGHT
+    }
+}
+
+/// The window Explorer has registered as the auto-hide bar on the screen edge of taskbar `tray` (primary
+/// or secondary), when that window is NOT `tray`. Explorer allows one auto-hide bar per edge and per
+/// monitor: asking it to auto-hide a taskbar on an edge another window already holds makes it show
+/// "There is already an auto-hide toolbar on this side of your screen" and refuse. `None` = the edge is
+/// free, held by `tray` itself, or the question could not be asked (then the caller behaves as before).
+fn autohide_edge_owner(tray: HWND) -> Option<isize> {
+    let mut bar = RECT::default();
+    // SAFETY: `bar` is writable; for an invalid window the call fails.
+    unsafe { GetWindowRect(tray, &mut bar) }.ok()?;
+    // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
+    let hm = unsafe { MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: `mi` has the right `cbSize` and is writable.
+    if !unsafe { GetMonitorInfoW(hm, &mut mi) }.as_bool() {
+        return None;
+    }
+    let mon = mi.rcMonitor;
+    let rc = [mon.left, mon.top, mon.right, mon.bottom];
+    let raw = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge_of(bar, mon), rc, 0)?;
+    // Window handles travel as 32-bit values and are sign-extended back.
+    let owner = raw as u32 as i32 as isize;
+    (owner != 0 && owner != tray.0 as isize).then_some(owner)
 }
 
 /// `ABM_SETSTATE`; true if the message reached Explorer. A delivered direct send is enough;
@@ -590,9 +639,26 @@ pub fn hide_all() {
     if RESTORING.load(Relaxed) {
         return;
     }
-    if get_state(first) & ABS_AUTOHIDE == 0 {
-        // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
-        appbar(ABM_SETSTATE, first, ABS_AUTOHIDE);
+    let state = get_state(first);
+    if state & ABS_AUTOHIDE == 0 {
+        // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
+        // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
+        // the foreground: the taskbar is hidden below with SW_HIDE anyway, so hold the request back.
+        // The state covers every taskbar (primary and secondary), so any of them can hit the conflict.
+        if let Some((bar, owner)) = list.iter().find_map(|&h| autohide_edge_owner(h).map(|o| (h, o))) {
+            if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
+                log!(
+                    "taskbar: auto-hide off (state {state}) but window 0x{owner:X} already holds the edge of \
+                     taskbar 0x{:X}, ABM_SETSTATE held back",
+                    bar.0 as isize
+                );
+            }
+        } else {
+            EDGE_CONFLICT_LOGGED.store(false, Relaxed);
+            log!("taskbar: auto-hide off (state {state}), sending ABM_SETSTATE");
+            // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
+            appbar(ABM_SETSTATE, first, ABS_AUTOHIDE);
+        }
     }
     let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS;
     for &h in &list {
@@ -997,5 +1063,22 @@ mod tests {
         assert_eq!(pause_step(1000, 1000 + max, false, false), Resume, "stop waiting, start anyway");
         assert_eq!(pause_step(1000, 1500, true, true), GiveUp, "exit began: never start a host");
         assert_eq!(pause_step(1000, 1500, false, true), GiveUp);
+    }
+
+    #[test]
+    fn taskbar_edge_from_rect() {
+        let r = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let mon = r(0, 0, 2560, 1440);
+        assert_eq!(edge_of(r(0, 1392, 2560, 1440), mon), ABE_BOTTOM);
+        // Auto-hidden: pushed down to a 2 px sliver, still the bottom edge.
+        assert_eq!(edge_of(r(0, 1438, 2560, 1486), mon), ABE_BOTTOM);
+        assert_eq!(edge_of(r(0, -46, 2560, 2), mon), ABE_TOP);
+        assert_eq!(edge_of(r(0, 0, 62, 1440), mon), ABE_LEFT);
+        assert_eq!(edge_of(r(2498, 0, 2560, 1440), mon), ABE_RIGHT);
+        // Secondary monitor with a negative / offset origin.
+        let side = r(3840, 287, 6400, 1727);
+        assert_eq!(edge_of(r(3840, 1679, 6400, 1727), side), ABE_BOTTOM);
+        assert_eq!(edge_of(r(3840, 287, 6400, 335), side), ABE_TOP);
+        assert_eq!(edge_of(r(-62, 0, 0, 1080), r(-1920, 0, 0, 1080)), ABE_RIGHT);
     }
 }
