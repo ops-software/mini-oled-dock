@@ -315,6 +315,21 @@ fn autohide_off_text(read: Option<u32>) -> String {
     }
 }
 
+/// What the send line of `hide_all` adds about the edge check (`asked` from `autohide_edge_owner`): why the
+/// edge was not asked, or that the question got no answer. Nothing only when Explorer answered. Pure.
+fn edge_check_text(owner: EdgeOwner, asked: &Result<(u32, RECT), String>) -> String {
+    match asked {
+        Err(why) => format!(" (edge not asked: {why})"),
+        Ok(_) if owner == EdgeOwner::NoAnswer => " (edge check unanswered)".to_string(),
+        Ok(_) => String::new(),
+    }
+}
+
+/// A rectangle as `(left, top)-(right, bottom)` for the log. Pure.
+fn rect_text(r: RECT) -> String {
+    format!("({}, {})-({}, {})", r.left, r.top, r.right, r.bottom)
+}
+
 /// Name of a screen edge (`ABE_*`) for the log. Pure.
 fn edge_name(edge: u32) -> &'static str {
     match edge {
@@ -354,39 +369,48 @@ fn docked_inside(bar: RECT, mon: RECT) -> bool {
         && bar.bottom <= mon.bottom
 }
 
+/// The edge (`ABE_*`) and monitor rectangle to ask Explorer about for taskbar rectangle `bar` on monitor `mon`,
+/// or why not to ask: only a bar docked inside its monitor tells its edge (`docked_inside`). Pure.
+fn edge_to_ask(bar: RECT, mon: RECT) -> Result<(u32, RECT), String> {
+    if !docked_inside(bar, mon) {
+        return Err(format!("taskbar {} not inside monitor {}", rect_text(bar), rect_text(mon)));
+    }
+    Ok((edge_of(bar, mon), mon))
+}
+
 /// The window Explorer has registered as the auto-hide bar on the screen edge of taskbar `tray`, when that
 /// window is NOT `tray`. `tray` must be Explorer's primary `Shell_TrayWnd`: the query is sent to it, and it is
 /// the window that serves AppBar messages. Explorer allows one auto-hide bar per edge and per
 /// monitor: asking it to auto-hide a taskbar on an edge another window already holds makes it show
 /// "There is already an auto-hide toolbar on this side of your screen" and refuse. See `EdgeOwner`.
-/// Also returns the edge (`ABE_*`) and monitor rectangle the question named, for the log (zero if not asked).
-fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, u32, RECT) {
+/// Also returns, for the log, the edge (`ABE_*`) and monitor rectangle the question named, or why it was not
+/// asked.
+fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, Result<(u32, RECT), String>) {
     let mut bar = RECT::default();
     // SAFETY: `bar` is writable; for an invalid window the call fails.
     if unsafe { GetWindowRect(tray, &mut bar) }.is_err() {
-        return (EdgeOwner::NoAnswer, 0, RECT::default());
+        return (EdgeOwner::NoAnswer, Err("GetWindowRect failed".to_string()));
     }
     // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
     let hm = unsafe { MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has the right `cbSize` and is writable.
     if !unsafe { GetMonitorInfoW(hm, &mut mi) }.as_bool() {
-        return (EdgeOwner::NoAnswer, 0, RECT::default());
+        return (EdgeOwner::NoAnswer, Err("GetMonitorInfoW failed".to_string()));
     }
-    let mon = mi.rcMonitor;
     // Edge and monitor come from the live window (MonitorFromWindow picks the largest intersection), while
     // Explorer uses its stored ones: a bar that is not docked inside its monitor (auto-hidden, moving, mid
     // display change) could name the wrong edge, so the edge then counts as free (fail open).
-    if !docked_inside(bar, mon) {
-        return (EdgeOwner::Free, 0, RECT::default());
-    }
-    let edge = edge_of(bar, mon);
+    let (edge, mon) = match edge_to_ask(bar, mi.rcMonitor) {
+        Ok(q) => q,
+        Err(why) => return (EdgeOwner::Free, Err(why)),
+    };
     let rc = [mon.left, mon.top, mon.right, mon.bottom];
     let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge, rc, 0, EDGE_QUERY_TIMEOUT_MS);
     // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
     let owner =
         edge_owner_from_reply(reply, tray.0 as isize, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
-    (owner, edge, mon)
+    (owner, Ok((edge, mon)))
 }
 
 /// Who holds the auto-hide slot on a taskbar's screen edge, as far as Explorer's answer tells.
@@ -786,15 +810,19 @@ pub fn hide_all() {
     // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
     // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
     // list nothing is asked. No answer sends the request as 1.4.2 did (fail open).
-    let (owner, edge, mon) = if state & ABS_AUTOHIDE == 0 && primary {
-        autohide_edge_owner(first)
+    let (owner, asked) = if state & ABS_AUTOHIDE != 0 {
+        (EdgeOwner::Free, Err("auto-hide on".to_string()))
+    } else if !primary {
+        (EdgeOwner::Free, Err("first taskbar is not Shell_TrayWnd".to_string()))
     } else {
-        (EdgeOwner::Free, 0, RECT::default())
+        autohide_edge_owner(first)
     };
     match autohide_action(state, owner) {
         AutoHideAction::Nothing => {}
         AutoHideAction::HoldBack(owner) => {
             if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
+                // `Held` comes only from an answered question, which named the edge and monitor.
+                let (edge, mon) = asked.as_ref().map_or((u32::MAX, RECT::default()), |&q| q);
                 let holder = HWND(owner as *mut c_void);
                 let mut pid = 0u32;
                 // SAFETY: `pid` is writable; for a handle that is no longer a window the call fails, pid stays 0.
@@ -822,8 +850,7 @@ pub fn hide_all() {
                 return;
             }
             EDGE_CONFLICT_LOGGED.store(false, Relaxed);
-            let unanswered = if owner == EdgeOwner::NoAnswer { " (edge check unanswered)" } else { "" };
-            log!("taskbar: {}{unanswered}, sending ABM_SETSTATE", autohide_off_text(read));
+            log!("taskbar: {}{}, sending ABM_SETSTATE", autohide_off_text(read), edge_check_text(owner, &asked));
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
             // The direct send waits up to APPBAR_TIMEOUT_MS, so the same race is checked again before the
             // fallback: a restore nested in that wait has already sent the original state, and the fallback
@@ -1325,6 +1352,35 @@ mod tests {
         assert!(docked_inside(r(3840, 1679, 6400, 1727), side));
         assert!(!docked_inside(r(3840, 1679, 6400, 1727), mon));
         assert!(docked_inside(r(-62, 0, 0, 1080), r(-1920, 0, 0, 1080)));
+    }
+
+    #[test]
+    fn send_line_tells_why_the_edge_was_not_asked() {
+        let r = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let mon = r(0, 0, 2560, 1440);
+        assert_eq!(edge_to_ask(r(0, 1392, 2560, 1440), mon), Ok((ABE_BOTTOM, mon)));
+        assert_eq!(edge_to_ask(r(0, 0, 62, 1440), mon), Ok((ABE_LEFT, mon)));
+        let slid_off = edge_to_ask(r(0, 1438, 2560, 1486), mon);
+        assert_eq!(
+            slid_off.as_ref().unwrap_err(),
+            "taskbar (0, 1438)-(2560, 1486) not inside monitor (0, 0)-(2560, 1440)"
+        );
+        assert_eq!(rect_text(r(-1920, -8, 0, 1080)), "(-1920, -8)-(0, 1080)");
+        // Only an answered question that found the edge free adds nothing to the send line.
+        let asked = Ok((ABE_BOTTOM, mon));
+        assert_eq!(edge_check_text(EdgeOwner::Free, &asked), "");
+        assert_eq!(edge_check_text(EdgeOwner::NoAnswer, &asked), " (edge check unanswered)");
+        assert_eq!(
+            edge_check_text(EdgeOwner::Free, &slid_off),
+            " (edge not asked: taskbar (0, 1438)-(2560, 1486) not inside monitor (0, 0)-(2560, 1440))"
+        );
+        let not_primary = Err("first taskbar is not Shell_TrayWnd".to_string());
+        assert_eq!(
+            edge_check_text(EdgeOwner::Free, &not_primary),
+            " (edge not asked: first taskbar is not Shell_TrayWnd)"
+        );
+        let no_rect = Err("GetWindowRect failed".to_string());
+        assert_eq!(edge_check_text(EdgeOwner::NoAnswer, &no_rect), " (edge not asked: GetWindowRect failed)");
     }
 
     #[test]
