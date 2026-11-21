@@ -28,6 +28,11 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::render::Metrics;
 
+/// PREVIEW-HOOK (golden tests, set by preview.rs): when set, `Gdi::text` and `Gdi::text_mask` draw nothing.
+/// Widths are still measured, so every layout is identical; the difference between a normal render and a
+/// no-text render is exactly the set of pixels that text touches.
+pub(crate) static NO_TEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // --------------------------------------------------------------- style
 
 /// Corner radius of the panel (logical px).
@@ -353,6 +358,9 @@ impl Gdi {
         alpha: u32,
     ) {
         let Some(txt) = self.txt.as_ref() else { return };
+        if NO_TEXT.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         if s.is_empty() || alpha == 0 {
             return;
         }
@@ -393,6 +401,9 @@ impl Gdi {
     /// composite the text per pixel (e.g. knocked out of a fill). `None` without the scratch DIB.
     pub(crate) fn text_mask(&self, s: &str, font: (HFONT, i32), w: i32) -> Option<(i32, i32, Vec<u8>)> {
         let txt = self.txt.as_ref()?;
+        if NO_TEXT.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
         let (fnt, lh) = font;
         let (w, h) = (w.min(txt.w), lh.min(txt.h));
         if s.is_empty() || w <= 0 || h <= 0 {
