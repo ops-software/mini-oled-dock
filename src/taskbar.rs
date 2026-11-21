@@ -273,9 +273,9 @@ fn get_state(tray: HWND) -> u32 {
     (appbar(ABM_GETSTATE, tray, 0) as u32) & ABS_MASK
 }
 
-/// Screen edge (`ABE_*`) a taskbar rectangle sits on within its monitor rectangle. Pure. A wide bar is
-/// top or bottom, a tall one left or right, decided by which half of the monitor its centre is in
-/// (an auto-hidden bar is pushed almost off screen, but its centre stays on the right side).
+/// Screen edge (`ABE_*`) a docked taskbar rectangle sits on within its monitor rectangle. Pure. A wide bar
+/// is top or bottom, a tall one left or right, decided by which half of the monitor its centre is in. Only
+/// for docked bars (`docked_inside`): an auto-hidden or moving bar can lie partly on another monitor.
 fn edge_of(bar: RECT, mon: RECT) -> u32 {
     if bar.right - bar.left >= bar.bottom - bar.top {
         if bar.top + bar.bottom < mon.top + mon.bottom {
@@ -288,6 +288,17 @@ fn edge_of(bar: RECT, mon: RECT) -> u32 {
     } else {
         ABE_RIGHT
     }
+}
+
+/// true if `bar` is non-empty and lies fully inside `mon`: a docked bar, whose rectangle and monitor tell
+/// its edge. Pure.
+fn docked_inside(bar: RECT, mon: RECT) -> bool {
+    bar.left < bar.right
+        && bar.top < bar.bottom
+        && bar.left >= mon.left
+        && bar.top >= mon.top
+        && bar.right <= mon.right
+        && bar.bottom <= mon.bottom
 }
 
 /// The window Explorer has registered as the auto-hide bar on the screen edge of taskbar `tray`, when that
@@ -309,6 +320,12 @@ fn autohide_edge_owner(tray: HWND) -> EdgeOwner {
         return EdgeOwner::NoAnswer;
     }
     let mon = mi.rcMonitor;
+    // Edge and monitor come from the live window (MonitorFromWindow picks the largest intersection), while
+    // Explorer uses its stored ones: a bar that is not docked inside its monitor (auto-hidden, moving, mid
+    // display change) could name the wrong edge, so the edge then counts as free (fail open).
+    if !docked_inside(bar, mon) {
+        return EdgeOwner::Free;
+    }
     let rc = [mon.left, mon.top, mon.right, mon.bottom];
     let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge_of(bar, mon), rc, 0, EDGE_QUERY_TIMEOUT_MS);
     // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
@@ -318,7 +335,8 @@ fn autohide_edge_owner(tray: HWND) -> EdgeOwner {
 /// Who holds the auto-hide slot on a taskbar's screen edge, as far as Explorer's answer tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EdgeOwner {
-    /// Nobody, the taskbar itself, or a handle that is no longer a window.
+    /// Nobody, the taskbar itself, a handle that is no longer a window, or a taskbar not docked inside its
+    /// monitor (its edge is then not asked about: fail open).
     Free,
     /// Another live window (raw handle): asking for auto-hide would make Explorer refuse with its message box.
     Held(isize),
@@ -696,7 +714,9 @@ pub fn hide_all() {
     let state = get_state(first);
     // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
     // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
-    // the foreground: the taskbar is hidden below with SW_HIDE anyway, so hold the request back.
+    // the foreground: the request is held back then. The taskbar is still hidden below with SW_HIDE, but a
+    // taskbar without auto-hide keeps its work area reserved, so its strip stays empty until the next re-show
+    // re-checks.
     // Only the primary taskbar's edge is asked about, and only when auto-hide is off: Explorer's primary
     // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
     // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
@@ -1142,9 +1162,7 @@ mod tests {
         let r = |left, top, right, bottom| RECT { left, top, right, bottom };
         let mon = r(0, 0, 2560, 1440);
         assert_eq!(edge_of(r(0, 1392, 2560, 1440), mon), ABE_BOTTOM);
-        // Auto-hidden: pushed down to a 2 px sliver, still the bottom edge.
-        assert_eq!(edge_of(r(0, 1438, 2560, 1486), mon), ABE_BOTTOM);
-        assert_eq!(edge_of(r(0, -46, 2560, 2), mon), ABE_TOP);
+        assert_eq!(edge_of(r(0, 0, 2560, 48), mon), ABE_TOP);
         assert_eq!(edge_of(r(0, 0, 62, 1440), mon), ABE_LEFT);
         assert_eq!(edge_of(r(2498, 0, 2560, 1440), mon), ABE_RIGHT);
         // Secondary monitor with a negative / offset origin.
@@ -1194,5 +1212,27 @@ mod tests {
         for (state, owner, want) in cases {
             assert_eq!(autohide_action(state, owner), want, "state {state}, {owner:?}");
         }
+    }
+
+    #[test]
+    fn docked_bar_lies_inside_its_monitor() {
+        let r = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let mon = r(0, 0, 2560, 1440);
+        assert!(docked_inside(r(0, 1392, 2560, 1440), mon));
+        assert!(docked_inside(r(0, 0, 62, 1440), mon));
+        assert!(docked_inside(mon, mon), "touching every side is still inside");
+        // Auto-hidden or sliding: partly off its monitor.
+        assert!(!docked_inside(r(0, 1438, 2560, 1486), mon));
+        assert!(!docked_inside(r(0, -46, 2560, 2), mon));
+        // On another monitor (mid display change), empty or inverted.
+        assert!(!docked_inside(r(2560, 1392, 5120, 1440), mon));
+        assert!(!docked_inside(r(0, 1440, 2560, 1440), mon), "empty");
+        assert!(!docked_inside(r(0, 0, 0, 0), mon), "empty");
+        assert!(!docked_inside(r(10, 10, 5, 20), mon), "inverted");
+        // Monitors with an offset or negative origin.
+        let side = r(3840, 287, 6400, 1727);
+        assert!(docked_inside(r(3840, 1679, 6400, 1727), side));
+        assert!(!docked_inside(r(3840, 1679, 6400, 1727), mon));
+        assert!(docked_inside(r(-62, 0, 0, 1080), r(-1920, 0, 0, 1080)));
     }
 }
