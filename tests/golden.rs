@@ -2,6 +2,120 @@
 
 mod common;
 
+use std::env;
+use std::path::{Path, PathBuf};
+
+use common::compare::{compare, mask_union, text_mask, write_diff, Limits, Mismatch};
+use common::run_preview;
+use common::wic::{decode_png, Image};
+
+// ------------------------------------------------------------------ the cells
+
+fn png_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir({}): {e}", dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".png"))
+        .collect();
+    v.sort();
+    v
+}
+
+fn decode(path: &Path) -> Image {
+    decode_png(path).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Replaces the PNGs at the top level of `to` with those of `from` (sub-folders of `to` stay).
+fn replace_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for old in png_names(to) {
+        std::fs::remove_file(to.join(old)).unwrap();
+    }
+    for n in png_names(from) {
+        std::fs::copy(from.join(&n), to.join(&n)).unwrap();
+    }
+}
+
+fn refuse_in_ci() {
+    if env::var_os("CI").is_some() && env::var_os("GOLDEN_CI_REGEN").is_none() {
+        panic!("UPDATE_GOLDEN is refused on CI");
+    }
+}
+
+fn case(lang: &str, dpi: u32) {
+    if env::var_os("GOLDEN_SKIP").is_some() {
+        eprintln!("golden {lang}-{dpi}: skipped (GOLDEN_SKIP)");
+        return;
+    }
+    // TextTile and TextOutliers only warn; Size and Exact still fail.
+    let advisory = env::var_os("GOLDEN_TEXT_ADVISORY").is_some();
+    // "base" = committed, made on the runner image; anything else = a set of this machine (a folder name
+    // under tests/golden, or a relative path to an untracked place).
+    let set = env::var("GOLDEN_SET").unwrap_or_else(|_| "base".into());
+    let tmp: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join("golden").join(format!("{lang}-{dpi}"));
+    run_preview(&tmp.join("actual"), lang, dpi, false);
+    run_preview(&tmp.join("notext"), lang, dpi, true);
+    let gold = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(&set).join(format!("{lang}-{dpi}"));
+    if env::var_os("UPDATE_GOLDEN").is_some() {
+        refuse_in_ci();
+        replace_dir(&tmp.join("actual"), &gold);
+        // The golden's own text twin: the mask of the golden is made from it.
+        replace_dir(&tmp.join("notext"), &gold.join("notext"));
+        return;
+    }
+    assert!(gold.is_dir(), "no goldens for set {set}: run with UPDATE_GOLDEN=1, then look at the PNGs");
+    assert_eq!(
+        png_names(&gold),
+        png_names(&tmp.join("actual")),
+        "the set of images changed: UPDATE_GOLDEN=1, then look"
+    );
+    let mut bad = vec![];
+    for n in png_names(&gold) {
+        let (g, a, t) =
+            (decode(&gold.join(&n)), decode(&tmp.join("actual").join(&n)), decode(&tmp.join("notext").join(&n)));
+        let gt = decode(&gold.join("notext").join(&n));
+        let same = |x: &Image, y: &Image| (x.w, x.h) == (y.w, y.h);
+        let mask = if same(&g, &a) && same(&a, &t) && same(&g, &gt) {
+            // Text of either render is text.
+            mask_union(&text_mask(&a, &t, Limits::DEFAULT.grow), &text_mask(&g, &gt, Limits::DEFAULT.grow))
+        } else {
+            // A size change is reported as Size by compare.
+            vec![false; (a.w * a.h) as usize]
+        };
+        if let Err(m) = compare(&g, &a, &mask, &Limits::DEFAULT) {
+            if advisory && matches!(m, Mismatch::TextTile { .. } | Mismatch::TextOutliers { .. }) {
+                eprintln!("golden {lang}-{dpi}/{n}: text tolerance exceeded (advisory): {m:?}");
+                continue;
+            }
+            write_diff(&tmp.join("diff").join(&n), &g, &a, &mask);
+            bad.push(format!("{lang}-{dpi}/{n}: {m:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "golden mismatch, diffs in {}:\n{}", tmp.join("diff").display(), bad.join("\n"));
+}
+
+macro_rules! cells {
+    ($($name:ident: $lang:literal, $dpi:literal;)*) => { $( #[test] fn $name() { case($lang, $dpi); } )* };
+}
+
+cells! {
+    en_96: "en", 96;
+    en_120: "en", 120;
+    en_144: "en", 144;
+    en_192: "en", 192;
+    it_96: "it", 96;
+    it_120: "it", 120;
+    it_144: "it", 144;
+    it_192: "it", 192;
+}
+
+#[test]
+fn the_child_gets_only_preview_and_a_folder() {
+    let args = common::preview_args(Path::new("some/dir"));
+    assert_eq!(args, vec![std::ffi::OsString::from("--preview"), std::ffi::OsString::from("some/dir")]);
+}
+
 // ------------------------------------------------------------------ comparator tests
 
 #[cfg(test)]
