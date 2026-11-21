@@ -62,9 +62,13 @@ static EXPLORER_TRAY: AtomicIsize = AtomicIsize::new(0);
 /// `now_ms()` when `explorer_gone` stopped our tray host (0 = not paused): it is started again once the
 /// new Explorer has registered its desktop (`on_reannounce_timer`).
 static HOST_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
-/// true once `hide_all` has logged that it held back `ABM_SETSTATE` because of an edge conflict;
-/// cleared when the state is sent again, so a lasting conflict is logged once, not every second.
+/// true once `hide_all` has logged that it held back `ABM_SETSTATE` because of an edge conflict; cleared when
+/// the state is sent again, when auto-hide reads on and on an Explorer restart, so a lasting conflict is
+/// logged once, not every second.
 static EDGE_CONFLICT_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Taskbar state (`ABS_*`) of the last `ABM_GETSTATE` read by `hide_all`, or `STATE_UNREAD` / `STATE_UNKNOWN`:
+/// a change is logged once, so the log tells whether Explorer turned auto-hide off by itself or kept it off.
+static LAST_STATE: AtomicU32 = AtomicU32::new(STATE_UNREAD);
 /// Monotonic time reference of the process.
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -79,6 +83,10 @@ const ABE_BOTTOM: u32 = 3;
 const ABS_AUTOHIDE: u32 = 1;
 const ABS_ALWAYSONTOP: u32 = 2;
 const ABS_MASK: u32 = ABS_AUTOHIDE | ABS_ALWAYSONTOP;
+/// `LAST_STATE` before the first read.
+const STATE_UNREAD: u32 = u32::MAX;
+/// `LAST_STATE` after a read that failed.
+const STATE_UNKNOWN: u32 = u32::MAX - 1;
 
 /// Timeout of the AppBar messages sent straight to Explorer (`appbar_direct`), in ms.
 const APPBAR_TIMEOUT_MS: u32 = 2000;
@@ -270,7 +278,52 @@ fn appbar_shell(msg: u32, hwnd: HWND, lparam: u32) -> usize {
 }
 
 fn get_state(tray: HWND) -> u32 {
-    (appbar(ABM_GETSTATE, tray, 0) as u32) & ABS_MASK
+    try_get_state(tray).unwrap_or(0)
+}
+
+/// `ABM_GETSTATE` like `get_state` (direct send, then `SHAppBarMessage`), but `None` when the read failed: the
+/// direct send was not delivered and the fallback answered 0, which is also what a failed forward returns.
+fn try_get_state(tray: HWND) -> Option<u32> {
+    if let Some(v) = appbar_direct(ABM_GETSTATE, tray, 0) {
+        return Some(v as u32 & ABS_MASK);
+    }
+    log!("taskbar: direct AppBar {ABM_GETSTATE} send failed, falling back to SHAppBarMessage");
+    let v = appbar_shell(ABM_GETSTATE, tray, 0);
+    (v != 0).then_some(v as u32 & ABS_MASK)
+}
+
+/// The log line for a new state read by `hide_all` (`None` = the read failed) after `prev` (a `LAST_STATE`
+/// value), `None` when nothing changed. Pure.
+fn state_change_line(prev: u32, read: Option<u32>) -> Option<String> {
+    if read.unwrap_or(STATE_UNKNOWN) == prev {
+        return None;
+    }
+    Some(match (prev, read) {
+        (_, None) => "taskbar: auto-hide state unknown (read failed)".to_string(),
+        (STATE_UNREAD, Some(s)) => format!("taskbar: auto-hide state {s} (first read)"),
+        (STATE_UNKNOWN, Some(s)) => format!("taskbar: auto-hide state unknown -> {s}"),
+        (p, Some(s)) => format!("taskbar: auto-hide state {p} -> {s}"),
+    })
+}
+
+/// How the hold-back and send lines of `hide_all` name a state read with auto-hide off (`None` = the read
+/// failed, then counted as off). Pure.
+fn autohide_off_text(read: Option<u32>) -> String {
+    match read {
+        Some(s) => format!("auto-hide off (state {s})"),
+        None => "auto-hide state unknown (read failed)".to_string(),
+    }
+}
+
+/// Name of a screen edge (`ABE_*`) for the log. Pure.
+fn edge_name(edge: u32) -> &'static str {
+    match edge {
+        ABE_LEFT => "left",
+        ABE_TOP => "top",
+        ABE_RIGHT => "right",
+        ABE_BOTTOM => "bottom",
+        _ => "unknown",
+    }
 }
 
 /// Screen edge (`ABE_*`) a docked taskbar rectangle sits on within its monitor rectangle. Pure. A wide bar
@@ -306,30 +359,34 @@ fn docked_inside(bar: RECT, mon: RECT) -> bool {
 /// the window that serves AppBar messages. Explorer allows one auto-hide bar per edge and per
 /// monitor: asking it to auto-hide a taskbar on an edge another window already holds makes it show
 /// "There is already an auto-hide toolbar on this side of your screen" and refuse. See `EdgeOwner`.
-fn autohide_edge_owner(tray: HWND) -> EdgeOwner {
+/// Also returns the edge (`ABE_*`) and monitor rectangle the question named, for the log (zero if not asked).
+fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, u32, RECT) {
     let mut bar = RECT::default();
     // SAFETY: `bar` is writable; for an invalid window the call fails.
     if unsafe { GetWindowRect(tray, &mut bar) }.is_err() {
-        return EdgeOwner::NoAnswer;
+        return (EdgeOwner::NoAnswer, 0, RECT::default());
     }
     // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
     let hm = unsafe { MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has the right `cbSize` and is writable.
     if !unsafe { GetMonitorInfoW(hm, &mut mi) }.as_bool() {
-        return EdgeOwner::NoAnswer;
+        return (EdgeOwner::NoAnswer, 0, RECT::default());
     }
     let mon = mi.rcMonitor;
     // Edge and monitor come from the live window (MonitorFromWindow picks the largest intersection), while
     // Explorer uses its stored ones: a bar that is not docked inside its monitor (auto-hidden, moving, mid
     // display change) could name the wrong edge, so the edge then counts as free (fail open).
     if !docked_inside(bar, mon) {
-        return EdgeOwner::Free;
+        return (EdgeOwner::Free, 0, RECT::default());
     }
+    let edge = edge_of(bar, mon);
     let rc = [mon.left, mon.top, mon.right, mon.bottom];
-    let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge_of(bar, mon), rc, 0, EDGE_QUERY_TIMEOUT_MS);
+    let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge, rc, 0, EDGE_QUERY_TIMEOUT_MS);
     // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
-    edge_owner_from_reply(reply, tray.0 as isize, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool())
+    let owner =
+        edge_owner_from_reply(reply, tray.0 as isize, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
+    (owner, edge, mon)
 }
 
 /// Who holds the auto-hide slot on a taskbar's screen edge, as far as Explorer's answer tells.
@@ -711,7 +768,15 @@ pub fn hide_all() {
     if RESTORING.load(Relaxed) {
         return;
     }
-    let state = get_state(first);
+    let read = try_get_state(first);
+    if let Some(line) = state_change_line(LAST_STATE.swap(read.unwrap_or(STATE_UNKNOWN), Relaxed), read) {
+        log!("{line}");
+    }
+    // A failed read counts as auto-hide off: the request is sent as 1.4.2 did (fail open).
+    let state = read.unwrap_or(0);
+    if state & ABS_AUTOHIDE != 0 {
+        EDGE_CONFLICT_LOGGED.store(false, Relaxed); // a conflict after this one is logged again
+    }
     // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
     // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
     // the foreground: the request is held back then. The taskbar is still hidden below with SW_HIDE, but a
@@ -721,15 +786,30 @@ pub fn hide_all() {
     // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
     // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
     // list nothing is asked. No answer sends the request as 1.4.2 did (fail open).
-    let owner = if state & ABS_AUTOHIDE == 0 && primary { autohide_edge_owner(first) } else { EdgeOwner::Free };
+    let (owner, edge, mon) = if state & ABS_AUTOHIDE == 0 && primary {
+        autohide_edge_owner(first)
+    } else {
+        (EdgeOwner::Free, 0, RECT::default())
+    };
     match autohide_action(state, owner) {
         AutoHideAction::Nothing => {}
         AutoHideAction::HoldBack(owner) => {
             if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
+                let holder = HWND(owner as *mut c_void);
+                let mut pid = 0u32;
+                // SAFETY: `pid` is writable; for a handle that is no longer a window the call fails, pid stays 0.
+                unsafe { GetWindowThreadProcessId(holder, Some(&mut pid)) };
                 log!(
-                    "taskbar: auto-hide off (state {state}) but window 0x{owner:X} already holds the edge of \
-                     taskbar 0x{:X}, ABM_SETSTATE held back",
-                    first.0 as isize
+                    "taskbar: {} but window 0x{owner:X} (class {:?}, pid {pid}) already holds the {} edge of \
+                     taskbar 0x{:X} on monitor ({}, {})-({}, {}), ABM_SETSTATE held back",
+                    autohide_off_text(read),
+                    class_of(holder),
+                    edge_name(edge),
+                    first.0 as isize,
+                    mon.left,
+                    mon.top,
+                    mon.right,
+                    mon.bottom
                 );
             }
         }
@@ -742,7 +822,8 @@ pub fn hide_all() {
                 return;
             }
             EDGE_CONFLICT_LOGGED.store(false, Relaxed);
-            log!("taskbar: auto-hide off (state {state}), sending ABM_SETSTATE");
+            let unanswered = if owner == EdgeOwner::NoAnswer { " (edge check unanswered)" } else { "" };
+            log!("taskbar: {}{unanswered}, sending ABM_SETSTATE", autohide_off_text(read));
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
             appbar(ABM_SETSTATE, first, ABS_AUTOHIDE);
         }
@@ -864,6 +945,7 @@ fn arm_reannounce(ms: u32) {
 /// does not broadcast `TaskbarCreated` on restart, so the window event is what actually fires.
 fn explorer_restarted(why: &str) {
     log!("taskbar: Explorer restarted ({why}), redoing self-heal and hide");
+    EDGE_CONFLICT_LOGGED.store(false, Relaxed); // the new Explorer's conflicts are news
     self_heal();
     if !ensure_state_saved(None) {
         log!("taskbar: state not saveable after the Explorer restart, not hiding");
@@ -1234,5 +1316,24 @@ mod tests {
         assert!(docked_inside(r(3840, 1679, 6400, 1727), side));
         assert!(!docked_inside(r(3840, 1679, 6400, 1727), mon));
         assert!(docked_inside(r(-62, 0, 0, 1080), r(-1920, 0, 0, 1080)));
+    }
+
+    #[test]
+    fn state_reads_are_logged_on_change_only() {
+        let line = |prev, read| state_change_line(prev, read);
+        assert_eq!(line(STATE_UNREAD, Some(2)).as_deref(), Some("taskbar: auto-hide state 2 (first read)"));
+        assert_eq!(line(2, Some(2)), None, "an unchanged state is not logged again");
+        assert_eq!(line(3, Some(2)).as_deref(), Some("taskbar: auto-hide state 3 -> 2"));
+        assert_eq!(line(0, Some(1)).as_deref(), Some("taskbar: auto-hide state 0 -> 1"));
+        assert_eq!(line(2, None).as_deref(), Some("taskbar: auto-hide state unknown (read failed)"));
+        assert_eq!(line(STATE_UNREAD, None).as_deref(), Some("taskbar: auto-hide state unknown (read failed)"));
+        assert_eq!(line(STATE_UNKNOWN, None), None, "a lasting read failure is logged once");
+        assert_eq!(line(STATE_UNKNOWN, Some(3)).as_deref(), Some("taskbar: auto-hide state unknown -> 3"));
+        // The text of the hold-back and send lines: never "state 0" for a failed read.
+        assert_eq!(autohide_off_text(Some(0)), "auto-hide off (state 0)");
+        assert_eq!(autohide_off_text(Some(ABS_ALWAYSONTOP)), "auto-hide off (state 2)");
+        assert_eq!(autohide_off_text(None), "auto-hide state unknown (read failed)");
+        let edges = [ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM, 7].map(edge_name);
+        assert_eq!(edges, ["left", "top", "right", "bottom", "unknown"]);
     }
 }
