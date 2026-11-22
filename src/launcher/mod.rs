@@ -24,4 +24,6 @@ pub mod web;
 #[cfg(test)]
 mod lints;
 #[cfg(test)]
+mod rank_table;
+#[cfg(test)]
 pub(crate) mod testkit;

@@ -52,7 +52,7 @@ use crate::log;
 /// Largest index file read.
 const MAX_FILE: u64 = 16 * 1024 * 1024;
 /// Penalty of a keyword of the settings catalog (the value Windows Search uses for them).
-const KEYWORD_PENALTY: u32 = 500;
+pub(crate) const KEYWORD_PENALTY: u32 = 500;
 /// The Settings app inside `shell:AppsFolder`.
 const SETTINGS_APP: &str =
     r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
