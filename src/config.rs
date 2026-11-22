@@ -551,7 +551,8 @@ impl LauncherConfig {
             self.providers.insert("apps".into(), true);
         }
         // prefixes: 1-5 characters, known provider, unique, a word prefix ends with a space
-        let mut seen = std::collections::BTreeSet::new();
+        // sorted, each prefix once (lower case)
+        let mut seen: Vec<String> = Vec::new();
         let mut dropped = false;
         self.prefixes.retain(|p, name| {
             let chars = p.chars().count();
@@ -563,7 +564,14 @@ impl LauncherConfig {
                 && closed
                 && visible
                 && crate::launcher::model::ProviderId::from_name(name).is_some()
-                && seen.insert(p.to_ascii_lowercase());
+                && {
+                    let lower = p.to_ascii_lowercase();
+                    let at = seen.binary_search(&lower);
+                    if let Err(at) = at {
+                        seen.insert(at, lower);
+                    }
+                    at.is_err()
+                };
             dropped |= !ok;
             ok
         });

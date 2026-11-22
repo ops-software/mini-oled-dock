@@ -6,7 +6,7 @@
 
 use super::rank::{Cand, PrefixWalk, T_BAG_EQ, T_SYN_EQ, T_SYN_PREFIX};
 use crate::start_search::XML_KEYWORD_PENALTY;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 /// Sections of the buffer, in order (C.1's ids 3 to 9).
 const CUR: usize = 0;
@@ -111,7 +111,8 @@ pub(super) fn build_sections<'a>(
     let mut xml: Vec<(&str, u32)> = Vec::new();
     let mut targets: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
     let mut seen = [false; 128];
-    let mut other: BTreeSet<char> = BTreeSet::new();
+    // The characters above ASCII, sorted and each once (a handful in any catalogue).
+    let mut other: Vec<char> = Vec::new();
     let mut n = 0u32;
     for (e, c) in entries {
         n = n.max(e.saturating_add(1));
@@ -154,7 +155,9 @@ pub(super) fn build_sections<'a>(
             match seen.get_mut(ch as usize) {
                 Some(s) => *s = true,
                 None => {
-                    other.insert(ch);
+                    if let Err(at) = other.binary_search(&ch) {
+                        other.insert(at, ch);
+                    }
                 }
             }
         }
