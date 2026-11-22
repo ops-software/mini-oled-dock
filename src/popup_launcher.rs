@@ -2432,25 +2432,28 @@ pub(crate) fn on_pt_message(code: usize) {
     }
 }
 
-/// The PowerToys notice's answer, outside the content that showed it: the config keeps it (`powertoys_done` for every
-/// answer), and the controller follows the config at once.
+/// The PowerToys notice's answer, outside the content that showed it: the config keeps it (`apply_answer`), and the
+/// controller follows the config at once.
 fn apply_pt_answer(answer: Option<Choice>) {
-    let saved = crate::config::modify(|cfg| {
-        let l = &mut cfg.launcher;
-        l.powertoys_done = true;
-        match answer {
-            Some(Choice::TakeChord) => l.with_powertoys = "take".into(),
-            Some(Choice::LeaveChord) => l.with_powertoys = "yield".into(),
-            Some(Choice::UseAltShiftSpace) => l.chord = "alt+shift+space".into(),
-            None => {}
-        }
-    });
+    let saved = crate::config::modify(|cfg| apply_answer(&mut cfg.launcher, answer));
     match saved {
         Ok(()) => {
             log!("launcher: the PowerToys notice was answered ({kind:?})", kind = answer);
             on_config();
         }
         Err(e) => log!("launcher: cannot save the PowerToys answer: {e}"),
+    }
+}
+
+/// What the PowerToys notice's answer writes: Take and Leave set `with_powertoys`, Use Alt+Shift+Space sets the chord,
+/// and every answer (Don't show again included) sets `powertoys_done`, so the notice is not asked again.
+fn apply_answer(l: &mut LauncherConfig, answer: Option<Choice>) {
+    l.powertoys_done = true;
+    match answer {
+        Some(Choice::TakeChord) => l.with_powertoys = "take".into(),
+        Some(Choice::LeaveChord) => l.with_powertoys = "yield".into(),
+        Some(Choice::UseAltShiftSpace) => l.chord = "alt+shift+space".into(),
+        None => {}
     }
 }
 
@@ -4737,5 +4740,26 @@ mod tests {
         }
         assert_eq!(answer_of(0), None, "0 is an exit");
         assert_eq!(answer_of(5), None);
+    }
+
+    #[test]
+    fn the_notice_answers_write_values_the_config_keeps() {
+        let answers = [Some(Choice::TakeChord), Some(Choice::LeaveChord), Some(Choice::UseAltShiftSpace), None];
+        for start in ["yield", "take"] {
+            for a in answers {
+                let mut l =
+                    LauncherConfig { chord: "alt+space".into(), with_powertoys: start.into(), ..Default::default() };
+                apply_answer(&mut l, a);
+                let want = match a {
+                    Some(Choice::TakeChord) => ("alt+space", "take"),
+                    Some(Choice::LeaveChord) => ("alt+space", "yield"),
+                    Some(Choice::UseAltShiftSpace) => ("alt+shift+space", start),
+                    None => ("alt+space", start),
+                };
+                assert!(l.sanitize().is_empty(), "{a:?} from {start}: a value the config would fix");
+                assert_eq!((l.chord.as_str(), l.with_powertoys.as_str()), want, "{a:?} from {start}");
+                assert!(l.powertoys_done, "{a:?} from {start}: answered, so never asked again");
+            }
+        }
     }
 }
