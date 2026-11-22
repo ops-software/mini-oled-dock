@@ -59,9 +59,10 @@ static EXPLORER_TRAY: AtomicIsize = AtomicIsize::new(0);
 /// `now_ms()` when `explorer_gone` stopped our tray host (0 = not paused): it is started again once the
 /// new Explorer has registered its desktop (`on_reannounce_timer`).
 static HOST_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
-/// The window that held the taskbar's edge at the last hold-back (0 = no hold-back in effect): its DESTROY
-/// runs `hide_all` again. Cleared when the state is sent again, when auto-hide reads on and on an Explorer
-/// restart, so a lasting conflict is logged once, not every second.
+/// The window that held the taskbar's edge at the last hold-back (0 = no hold-back in effect): its DESTROY, or the
+/// safety timer once it is no longer a window (`holder_left`), runs `hide_all` again. Cleared when the state is
+/// sent again, when auto-hide reads on and on an Explorer restart, so a lasting conflict is logged once, not every
+/// second.
 static EDGE_HOLDER: AtomicIsize = AtomicIsize::new(0);
 /// Taskbar state (`ABS_*`) of the last `ABM_GETSTATE` read by `hide_all`, or `STATE_UNREAD` / `STATE_UNKNOWN`:
 /// a change is logged once, so the log tells whether Explorer turned auto-hide off by itself or kept it off.
@@ -760,6 +761,14 @@ fn hold_back_is_news(prev: isize, owner: isize) -> bool {
     prev != owner
 }
 
+/// true if the window of the hold-back in effect (`holder`, 0 = none) is no longer a window, so the safety timer
+/// asks for auto-hide again: its DESTROY event can arrive while its WM_DESTROY still runs, and a holder that lets go
+/// of the edge in there after other cleanup still held it when `on_winevent` asked. `is_window` runs only while a
+/// hold-back is in effect. Pure.
+fn holder_left(holder: isize, is_window: impl Fn(isize) -> bool) -> bool {
+    holder != 0 && !is_window(holder)
+}
+
 /// What a raw WinEvent means for the taskbar.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum RawKind {
@@ -857,8 +866,8 @@ pub fn hide_all() {
     // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
     // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
     // the foreground: the request is held back then. The taskbar is still hidden below with SW_HIDE, but a
-    // taskbar without auto-hide keeps its work area reserved, so its strip stays empty until the next re-show
-    // re-checks.
+    // taskbar without auto-hide keeps its work area reserved, so its strip stays empty until the holder is gone
+    // (`on_winevent`, `on_safety_timer`) or the next re-show re-checks.
     // Only the primary taskbar's edge is asked about, and only when auto-hide is off: Explorer's primary
     // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
     // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
@@ -983,10 +992,20 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
     hide_all();
 }
 
-/// 1 s safety timer (`TIMER_SECOND`): if a native taskbar is visible, redoes `hide_all()`.
+/// 1 s safety timer (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
+/// no longer a window (`holder_left`), redoes `hide_all()`.
 /// No-op if `HIDDEN` is false or if the taskbar was restored from outside (see `restored_externally`).
 pub fn on_safety_timer() {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
     if !HIDDEN.load(Relaxed) || restored_externally() {
+        return;
+    }
+    let holder = EDGE_HOLDER.load(Relaxed);
+    // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
+    if holder_left(holder, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool()) {
+        EDGE_HOLDER.store(0, Relaxed);
+        log!("taskbar: edge holder 0x{holder:X} is no longer a window, asking for auto-hide again");
+        hide_all();
         return;
     }
     if native_taskbars().into_iter().any(is_visible) {
@@ -1339,6 +1358,23 @@ mod tests {
         assert!(hold_back_is_news(0, 7));
         assert!(hold_back_is_news(5, 7), "a different holder is news");
         assert!(!hold_back_is_news(7, 7), "the same holder is logged once");
+    }
+
+    #[test]
+    fn a_holder_that_lets_go_after_its_destroy_event_is_rechecked() {
+        let calls = std::cell::Cell::new(0);
+        let alive = |up: bool| {
+            let calls = &calls;
+            move |_: isize| {
+                calls.set(calls.get() + 1);
+                up
+            }
+        };
+        assert!(!holder_left(0, alive(false)), "no hold-back in effect: nothing to ask");
+        assert_eq!(calls.get(), 0, "without a hold-back the check costs no call");
+        assert!(!holder_left(7, alive(true)), "a holder that is still a window keeps the request held back");
+        assert!(holder_left(7, alive(false)), "a holder that is no longer a window: ask again");
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]
