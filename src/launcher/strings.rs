@@ -1,7 +1,7 @@
 //! Every user-visible string of the launcher: one function each, English and Italian through `i18n::tr`.
 //! Later tasks append theirs.
 
-use super::model::ProviderId;
+use super::model::{KeyChord, Mods, ProviderId};
 use crate::i18n::tr;
 
 pub fn placeholder() -> &'static str {
@@ -41,37 +41,57 @@ pub fn hint_run_in_console() -> &'static str {
 }
 
 // ---- verb labels (the action list and the hints)
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_open() -> &'static str {
     tr("Open", "Apri")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_switch() -> &'static str {
     tr("Switch to", "Passa a")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_run_as_admin() -> &'static str {
     tr("Run as administrator", "Esegui come amministratore")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_reveal() -> &'static str {
     tr("Open file location", "Apri percorso file")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_copy() -> &'static str {
     tr("Copy", "Copia")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_close_window() -> &'static str {
     tr("Close window", "Chiudi finestra")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_forget() -> &'static str {
     tr("Forget", "Dimentica")
 }
-#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_run_in_console() -> &'static str {
     tr("Run in console", "Esegui nella console")
+}
+
+/// "New window": Open on a running app starts a new instance (the action list, Shift+Enter).
+pub fn verb_new_window() -> &'static str {
+    tr("New window", "Nuova finestra")
+}
+/// The notice's own entry of the action list.
+pub fn verb_dont_show_again() -> &'static str {
+    tr("Don't show again", "Non mostrare più")
+}
+
+/// The name of a key chord as the action list shows it (right-aligned, CAPTION): "Ctrl+Shift+Enter", "Shift+Del".
+pub fn key_name(c: KeyChord) -> String {
+    let mut s = String::new();
+    for (m, name) in [(Mods::ALT, "Alt"), (Mods::CTRL, "Ctrl"), (Mods::SHIFT, tr("Shift", "Maiusc"))] {
+        if c.mods.has(m) {
+            s.push_str(name);
+            s.push('+');
+        }
+    }
+    match c.vk {
+        0x0D => s.push_str(tr("Enter", "Invio")),
+        0x2E => s.push_str(tr("Del", "Canc")),
+        0x20 => s.push_str(tr("Space", "Spazio")),
+        vk @ (0x30..=0x39 | 0x41..=0x5A) => s.extend(char::from_u32(u32::from(vk))),
+        _ => s.push('?'),
+    }
+    s
 }
 
 // ---- detail lines and notices
@@ -169,5 +189,17 @@ mod tests {
             assert!(chip(p).is_some_and(|c| !c.is_empty()), "{p:?}");
         }
         assert_eq!(window_name(), "Launcher");
+    }
+
+    #[test]
+    fn key_names_of_the_verb_chords() {
+        use crate::launcher::verbs::VERBS;
+        let names: Vec<String> = VERBS.iter().filter_map(|v| v.chord).map(key_name).collect();
+        assert_eq!(
+            names,
+            ["Enter", "Enter", "Ctrl+Shift+Enter", "Ctrl+Enter", "Ctrl+C", "Ctrl+W", "Shift+Del", "Shift+Enter"]
+        );
+        assert_eq!(key_name(KeyChord { vk: 0x20, mods: Mods::ALT }), "Alt+Space");
+        assert!(verb_new_window().len() > 3 && verb_dont_show_again().len() > 3);
     }
 }

@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     KillTimer, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK,
 };
 
-use super::{center_y, Content, HitMap, PopupKind, Reply};
+use super::{center_y, Button, Content, HitMap, PopupKind, Reply};
 use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
@@ -25,13 +25,13 @@ use crate::launcher::field::KeyEvent;
 use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::history;
 use crate::launcher::model::{
-    Batch, CommandId, GlyphId, IconRef, Item, Kind, Mode, Mods, NumberStyle, Payload, ProviderId, ProviderMask,
-    SettingRow, Verb, WindowRow,
+    Batch, CommandId, GlyphId, IconRef, Item, KeyChord, Kind, Mode, Mods, NumberStyle, Payload, ProviderId,
+    ProviderMask, SettingRow, Verb, WindowRow,
 };
 use crate::launcher::providers::{self, Budget, Context, LauncherOpts};
 use crate::launcher::query::{self, PrefixTable};
 use crate::launcher::runline;
-use crate::launcher::session::{Effect, ReplayKey, Session};
+use crate::launcher::session::{Act, Effect, ReplayKey, Session};
 use crate::launcher::strings;
 use crate::launcher::style;
 use crate::launcher::verbs;
@@ -74,7 +74,25 @@ const WHEEL_ROWS: usize = 1;
 const MAX_LINES: usize = style::MAX_REVIEW_LINES;
 
 const ID_FIELD: u32 = 1;
+/// Covers the panel while the action list is open: a click on it closes only the list.
+const ID_BACKDROP: u32 = 2;
 const ID_ROW: u32 = 100;
+/// The entries of the action list: this plus their index.
+const ID_ACTION: u32 = 10_000;
+
+/// The action list (SPEC 5.3): 280 wide, its entries 6 px inside, its right edge 24 px from the panel's.
+const ACTION_W: i32 = 280;
+const ACTION_PAD: i32 = 6;
+/// Between the selected row and the list.
+const ACTION_GAP: i32 = 4;
+/// Entry-relative: the glyph, and the label.
+const ACTION_GLYPH_X: i32 = 6;
+const ACTION_LABEL_X: i32 = 34;
+/// Between the label and the key name.
+const ACTION_KEY_GAP: i32 = 8;
+/// The keyboard focus ring: 1.5 px wide, 2 px off the entry, radius 9.
+const FOCUS_GAP: i32 = 2;
+const FOCUS_RADIUS: i32 = 9;
 
 /// The panel keeps its height while keys come faster than this (`TIMER_LAUNCHER_SHRINK`, SPEC 5.3).
 const SHRINK_MS: u32 = 120;
@@ -253,6 +271,15 @@ struct Geo {
     first: usize,
     total: usize,
     track: RECT,
+    /// The action list over the selected row, when it is open.
+    actions: Option<ActionGeo>,
+}
+
+/// The action list's rectangle and its entries' (client px).
+#[derive(Clone)]
+struct ActionGeo {
+    rect: RECT,
+    items: Vec<RECT>,
 }
 
 #[derive(Clone)]
@@ -415,8 +442,8 @@ impl Launcher {
                 Effect::RequestRewrite { gen } => {
                     sys.shell(ShellRequest::LauncherConvert { gen, query: self.session.last_query() });
                 }
-                // Learned ranks (L1b) and files (L2).
-                Effect::Forget(_) | Effect::RequestFiles(_) => {}
+                // Learned ranks (L1b-3), the notices' choice (L1b-5) and files (L2).
+                Effect::Forget(_) | Effect::DismissNotice(_) | Effect::RequestFiles(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::Copy(_)
                 | Effect::Power(_)
@@ -770,14 +797,30 @@ impl Launcher {
         self.last_sel.set(sel);
         self.count.set(shown.len());
         let list_bottom = shown.last().map_or(top, |r| r.rect.bottom);
-        let h = list_bottom + inset;
+        let mut h = list_bottom + inset;
+        // The action list hangs under the selected row, or over it when it would not fit; the panel grows to hold it.
+        let actions = self.session.action_list().map(|list| {
+            let pad = m.px(ACTION_PAD);
+            let item_h = m.px(style::ROW_COMPACT);
+            let n = i32::try_from(list.items().len()).unwrap_or(0);
+            let (ow, oh) = (m.px(ACTION_W), 2 * pad + n * item_h);
+            let (row_top, row_bottom) =
+                shown.iter().find(|r| Some(r.idx) == sel).map_or((top, top), |r| (r.rect.top, r.rect.bottom));
+            let at =
+                overlay_top(row_top, row_bottom, oh, self.max_h, field.bottom + m.px(ACTION_GAP), m.px(ACTION_GAP));
+            let rect = rect_wh(w - m.px(style::HINT_RIGHT_INSET) - ow, at, ow, oh);
+            h = h.max(rect.bottom + inset);
+            let items =
+                (0..n).map(|k| rect_wh(rect.left + pad, rect.top + pad + k * item_h, ow - 2 * pad, item_h)).collect();
+            ActionGeo { rect, items }
+        });
         let track = RECT {
             left: w - m.px(style::SCROLLBAR_X_INSET) - m.px(style::SCROLLBAR_W),
             top,
             right: w - m.px(style::SCROLLBAR_X_INSET),
             bottom: list_bottom,
         };
-        Geo { w, h, field, rows: shown, first, total, track }
+        Geo { w, h, field, rows: shown, first, total, track, actions }
     }
 
     /// Keeps the caret inside the query's room (the field's width less the chip and the margins).
@@ -998,9 +1041,77 @@ impl Launcher {
             self.paint_row(s, rg, item, self.foreground && sel == Some(rg.idx), pressed == Some(id));
         }
         self.paint_scrollbar(s, &g, false);
+        self.paint_actions(s, &g, pressed);
         self.ask_icons(&g, sys);
         if let Ok(mut slot) = self.geo.try_borrow_mut() {
             *slot = g;
+        }
+    }
+
+    /// The action list over the panel (SPEC 5.3): opaque black, the control rim, its entries with their glyph, label and
+    /// key name; the highlighted one on a plate, with the focus ring after keyboard input.
+    fn paint_actions(&self, s: &mut Surface, g: &Geo, pressed: Option<u32>) {
+        let (Some(list), Some(ag)) = (self.session.action_list(), g.actions.as_ref()) else { return };
+        let m = s.metrics();
+        let bw = m.px(1).max(1);
+        s.fill_rr(ag.rect, m.px(style::R_M), (0, 0, 0), 255);
+        s.stroke_rr(ag.rect, m.px(style::R_M), bw, style::RIM_CONTROL);
+        let (lh, kh) = (s.line_height(Font::Normal), s.line_height(Font::Caption));
+        let gs = m.px(style::ICON_S);
+        for (k, (rc, e)) in ag.items.iter().zip(list.items()).enumerate() {
+            let id = ID_ACTION + u32::try_from(k).unwrap_or(0);
+            let lit = k == list.sel();
+            if pressed == Some(id) {
+                s.plate(*rc, m.px(style::R_S), style::FILL_PRESS);
+            } else if lit {
+                s.plate(*rc, m.px(style::R_S), style::FILL_HOVER);
+            }
+            let (label, glyph, chord) = match e.act {
+                Act::Verb(v) => {
+                    let spec = verbs::spec(v);
+                    let label = if e.new_window { strings::verb_new_window() } else { (spec.label)() };
+                    let chord =
+                        if e.new_window { Some(KeyChord { vk: VK_RETURN, mods: Mods::SHIFT }) } else { spec.chord };
+                    (label, spec.glyph, chord)
+                }
+                Act::DontShowAgain => (strings::verb_dont_show_again(), GlyphId::Info, None),
+            };
+            let name_alpha = if !e.enabled {
+                style::FG_DISABLED
+            } else if lit {
+                style::FG_HOT
+            } else {
+                style::FG_PRIMARY
+            };
+            let gx = rc.left + m.px(ACTION_GLYPH_X);
+            let gy = rc.top + (rc.bottom - rc.top - gs) / 2;
+            if !e.enabled {
+                s.glyph(gx, gy, gs, style::FG_DISABLED, glyph_shape(glyph));
+            } else if e.danger {
+                s.glyph_rgb(gx, gy, gs, style::ACCENT_DANGER, style::FG_HOT, glyph_shape(glyph));
+            } else {
+                s.glyph(gx, gy, gs, style::FG_SECONDARY, glyph_shape(glyph));
+            }
+            let mut label_right = rc.right - m.px(ACTION_GLYPH_X);
+            let lx = rc.left + m.px(ACTION_LABEL_X);
+            // The key name shows when the whole label still fits beside it: a label cut short says less than a
+            // missing hint (Italian "Esegui come amministratore" beside "Ctrl+Maiusc+Invio").
+            if let Some(c) = chord {
+                let key = strings::key_name(c);
+                let kw = s.text_width(&key, Font::Caption);
+                if s.text_width(label, Font::Normal) + kw + m.px(ACTION_KEY_GAP) <= label_right - lx {
+                    let alpha = if e.enabled { style::FG_TERTIARY } else { style::FG_DISABLED };
+                    s.text(&key, label_right - kw, center_y(rc, kh), Font::Caption, WHITE, alpha);
+                    label_right -= kw + m.px(ACTION_KEY_GAP);
+                }
+            }
+            let shown = s.ellipsize(label, Font::Normal, label_right - lx);
+            s.text(&shown, lx, center_y(rc, lh), Font::Normal, WHITE, name_alpha);
+            if lit && list.ring() {
+                let g2 = m.px(FOCUS_GAP);
+                let ring = RECT { left: rc.left - g2, top: rc.top - g2, right: rc.right + g2, bottom: rc.bottom + g2 };
+                s.stroke_rr(ring, m.px(FOCUS_RADIUS), ((m.px(3) + 1) / 2).max(1), style::RIM_FOCUS);
+            }
         }
     }
 
@@ -1022,6 +1133,20 @@ impl Launcher {
         let rc = RECT { top: y, bottom: y + thumb, ..t };
         s.fill_rr(rc, (t.right - t.left) / 2, WHITE, if hot { style::SCROLLBAR_HOT } else { style::SCROLLBAR_REST });
     }
+}
+
+/// The top of the action list (physical px): `gap` under the row, or over it when it would not fit below within `room`
+/// and still clears `min_top` (the field). When neither fits it sits as low as `room` allows, over the rows.
+fn overlay_top(row_top: i32, row_bottom: i32, h: i32, room: i32, min_top: i32, gap: i32) -> i32 {
+    let below = row_bottom + gap;
+    if below + h <= room {
+        return below;
+    }
+    let above = row_top - gap - h;
+    if above >= min_top {
+        return above;
+    }
+    (room - h).max(min_top)
 }
 
 /// The right edge of the hint and of the names (physical px): the panel's width less HINT_RIGHT_INSET.
@@ -1138,6 +1263,13 @@ impl Content for Launcher {
         for r in &g.rows {
             map.add(ID_ROW + u32::try_from(r.idx).unwrap_or(0), r.rect);
         }
+        // Over the open action list: the backdrop (a click there closes only the list), then its entries.
+        if let Some(a) = &g.actions {
+            map.add(ID_BACKDROP, rect_wh(0, 0, g.w, g.h));
+            for (k, rc) in a.items.iter().enumerate() {
+                map.add(ID_ACTION + u32::try_from(k).unwrap_or(0), *rc);
+            }
+        }
         map.at(x, y)
     }
 
@@ -1146,9 +1278,21 @@ impl Content for Launcher {
     }
 
     fn click(&mut self, id: u32) -> Reply {
-        let Some(row) = id.checked_sub(ID_ROW).and_then(|r| usize::try_from(r).ok()) else { return Reply::None };
         let mut sys = RealSys;
         let now = sys.now_ms();
+        if id == ID_BACKDROP || id >= ID_ACTION {
+            let entry = id.checked_sub(ID_ACTION).and_then(|k| usize::try_from(k).ok());
+            return ctx(|cx| {
+                let fx = match entry {
+                    Some(k) => self.session.action_click(k, cx),
+                    None => self.session.close_actions(),
+                };
+                let reply = self.run(fx, cx, &mut sys);
+                self.typed(reply, &mut sys)
+            })
+            .unwrap_or(Reply::None);
+        }
+        let Some(row) = id.checked_sub(ID_ROW).and_then(|r| usize::try_from(r).ok()) else { return Reply::None };
         ctx(|cx| {
             let fx = self.session.click(row, now, cx);
             self.run(fx, cx, &mut sys)
@@ -1156,7 +1300,34 @@ impl Content for Launcher {
         .unwrap_or(Reply::None)
     }
 
+    /// A right click on a row opens its action list; with the list open it only closes it.
+    fn button(&mut self, id: u32, which: Button) -> Reply {
+        if which != Button::Right {
+            return Reply::None;
+        }
+        let row = id.checked_sub(ID_ROW).filter(|_| id < ID_ACTION).and_then(|r| usize::try_from(r).ok());
+        let mut sys = RealSys;
+        ctx(|cx| {
+            let fx = match (self.session.action_list().is_some(), row) {
+                (true, _) => self.session.close_actions(),
+                (false, Some(r)) => self.session.context_menu(r),
+                (false, None) => Vec::new(),
+            };
+            let reply = self.run(fx, cx, &mut sys);
+            self.typed(reply, &mut sys)
+        })
+        .unwrap_or(Reply::None)
+    }
+
     fn pointer(&mut self, x: i32, y: i32) -> Reply {
+        if self.session.action_list().is_some() {
+            // Over the list the pointer lights an entry; the rows behind it are not hot.
+            let k = self.hit(x, y).and_then(|id| id.checked_sub(ID_ACTION)).and_then(|k| usize::try_from(k).ok());
+            return match k.map(|k| self.session.action_hover(k)) {
+                Some(fx) if !fx.is_empty() => Reply::Redraw,
+                _ => Reply::None,
+            };
+        }
         let row = self.hit(x, y).and_then(|id| id.checked_sub(ID_ROW)).and_then(|r| usize::try_from(r).ok());
         let mut sys = RealSys;
         let now = sys.now_ms();
@@ -1191,6 +1362,9 @@ impl Content for Launcher {
     }
 
     fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
+        if self.session.action_list().is_some() {
+            return Reply::None;
+        }
         let total = self.session.rows().len();
         let count = self.count.get();
         if total <= count || notches == 0 {
@@ -2216,6 +2390,8 @@ pub(crate) enum PreviewScene {
     Notice,
     Error,
     FieldPair,
+    /// The action list open over a running app's row (opened by Ctrl+K, so the focus ring shows).
+    Actions,
 }
 
 impl PreviewScene {
@@ -2233,6 +2409,7 @@ impl PreviewScene {
             "notice" => PreviewScene::Notice,
             "error" => PreviewScene::Error,
             "field_pair" => PreviewScene::FieldPair,
+            "actions" => PreviewScene::Actions,
             _ => return None,
         })
     }
@@ -2325,7 +2502,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         -Days 30 -Recurse -Verbose -LogFile \"C:\\Users\\Public\\Logs\\cleanup-temp-files-2026-11.log\" -Confirm:$false";
     let query: &str = match scene {
         PreviewScene::Empty => "",
-        PreviewScene::Inactive | PreviewScene::Running => "note",
+        PreviewScene::Inactive | PreviewScene::Running | PreviewScene::Actions => "note",
         PreviewScene::Apps => "calc",
         PreviewScene::Calc => tr("=2.5*4", "=2,5*4"),
         PreviewScene::Run => "> ping 1.1.1.1",
@@ -2337,6 +2514,10 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     };
     if !query.is_empty() {
         session.chars(query, &cx);
+    }
+    if scene == PreviewScene::Actions {
+        let ctrl_k = KeyEvent { vk: 0x4B, mods: Mods::CTRL, repeat: false, sys: false };
+        let _ = session.key(ctrl_k, None, &cx);
     }
     if scene == PreviewScene::Notice {
         let notice = Item {
@@ -2893,6 +3074,72 @@ mod tests {
         l.set_icon(calc, IconBitmap::new(24, 24));
         show(&mut l, &mut sys);
         assert!(asks(&sys).is_empty(), "{:?}", sys.ops);
+    }
+
+    #[test]
+    fn overlay_fits_above_when_needed() {
+        // Room below: under the row, 4 px away.
+        assert_eq!(overlay_top(100, 144, 250, 600, 64, 4), 148);
+        // Not enough room below, enough above: over the row, 4 px away.
+        assert_eq!(overlay_top(400, 444, 250, 600, 64, 4), 146);
+        // The first row that would clear the field above: the edge case on both sides.
+        assert_eq!(overlay_top(318, 362, 250, 600, 64, 4), 64);
+        assert_eq!(overlay_top(317, 361, 250, 600, 64, 4), 350);
+        // Neither fits: as low as the room allows, never into the field.
+        assert_eq!(overlay_top(100, 144, 250, 300, 64, 4), 64);
+        assert_eq!(overlay_top(100, 144, 250, 397, 64, 4), 147);
+    }
+
+    #[test]
+    fn the_action_list_is_laid_out_inside_the_panel_and_hit_by_entry() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "blocco");
+        let s = surface(96);
+        let (w0, h0) = l.size(&s);
+        assert!(l.geo.borrow().actions.is_none());
+        key(&mut l, &fx, &mut sys, 0x4B, Mods::CTRL);
+        let (w, h) = l.size(&s);
+        let g = l.geo.borrow().clone();
+        let a = g.actions.as_ref().unwrap();
+        assert_eq!(w, w0);
+        assert!(h >= h0, "the panel grows to hold the list: {h0} -> {h}");
+        // 7 entries of 34 px and 6 px of inset on each side; the right edge is 24 px from the panel's.
+        assert_eq!(a.items.len(), 7);
+        assert_eq!((a.rect.right - a.rect.left, a.rect.bottom - a.rect.top), (280, 2 * 6 + 7 * 34));
+        assert_eq!(a.rect.right, w - 24);
+        assert!(a.rect.top >= g.rows[0].rect.bottom - 1 && a.rect.bottom + 12 <= h);
+        // Entries are hit by index, the rest of the panel (rows included) by the backdrop.
+        for (k, rc) in a.items.iter().enumerate() {
+            assert_eq!(l.hit((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2), Some(ID_ACTION + k as u32));
+        }
+        let row = &g.rows[0].rect;
+        assert_eq!(l.hit(row.left + 4, row.top + 4), Some(ID_BACKDROP));
+        // Closing gives the room back.
+        key(&mut l, &fx, &mut sys, 0x1B, Mods::NONE);
+        assert!(l.session.action_list().is_none());
+        l.hold_shrink = false;
+        assert_eq!(l.size(&s), (w0, h0));
+        assert!(l.geo.borrow().actions.is_none());
+    }
+
+    #[test]
+    fn the_action_list_paints_and_closes_with_the_host_keys() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "blocco");
+        key(&mut l, &fx, &mut sys, 0x4B, Mods::CTRL);
+        for dpi in [96, 144] {
+            let mut s = surface(dpi);
+            l.size(&s);
+            l.paint_on(&mut s, None, None, &mut sys);
+        }
+        // Switch to: the list's Enter hides after the activation, as the row's Enter does.
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x0D, Mods::NONE), Reply::Close);
+        assert_eq!(l.switch, Some(0x1001));
+        assert!(l.session.action_list().is_none());
     }
 
     #[test]

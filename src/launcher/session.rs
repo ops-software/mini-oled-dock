@@ -39,6 +39,8 @@ pub enum Effect {
     OpenSettings,
     /// Forget a learned row (frecency, L1b).
     Forget(ItemKey),
+    /// "Don't show again" on a notice row: the row has left the list; the host remembers the choice (L1b-5).
+    DismissNotice(ItemKey),
     /// Forget a run-history line.
     ForgetRun(Box<str>),
     /// Ask the files provider for this generation (L2).
@@ -137,13 +139,16 @@ const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
 const VK_INSERT: u16 = 0x2D;
 const VK_DELETE: u16 = 0x2E;
+const VK_APPS: u16 = 0x5D;
 const VK_A: u16 = 0x41;
 const VK_C: u16 = 0x43;
 const VK_E: u16 = 0x45;
+const VK_K: u16 = 0x4B;
 const VK_V: u16 = 0x56;
 const VK_W: u16 = 0x57;
 const VK_X: u16 = 0x58;
 const VK_F4: u16 = 0x73;
+const VK_F10: u16 = 0x79;
 
 const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
 
@@ -173,6 +178,72 @@ pub struct Session {
     hover: Option<Hover>,
     /// Run as administrator acts only on a text the view has measured, for this row and this generation.
     review: Option<Review>,
+    /// The action list over the selected row (Ctrl+K, L1b-2).
+    actions: Option<ActionList>,
+}
+
+/// One entry of the action list: a verb of the row, or the notice's own "Don't show again".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Act {
+    Verb(Verb),
+    DontShowAgain,
+}
+
+/// An entry with what the view needs to draw it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ActEntry {
+    pub act: Act,
+    /// false: shown but inert (Enter does nothing). Run as administrator on a typed line or a file needs the hook's
+    /// proof of Ctrl+Shift+Enter, which a key inside the list cannot give.
+    pub enabled: bool,
+    /// The glyph is drawn in the danger colour (a destructive verb, or Open on a destructive row).
+    pub danger: bool,
+    /// Open on a running app starts a new instance: "New window", on Shift+Enter (5.2.8).
+    pub new_window: bool,
+}
+
+/// The action list over one row: its verbs in table order, the highlighted entry, and whether the highlight came from
+/// the keyboard (the focus ring shows only then).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ActionList {
+    row: ItemKey,
+    items: Vec<ActEntry>,
+    sel: usize,
+    ring: bool,
+}
+
+impl ActionList {
+    pub fn items(&self) -> &[ActEntry] {
+        &self.items
+    }
+
+    pub fn sel(&self) -> usize {
+        self.sel
+    }
+
+    pub fn ring(&self) -> bool {
+        self.ring
+    }
+}
+
+/// The entries of the action list of `item`: `verbs_for`'s set in `VERBS` order, then the notice's own.
+fn action_entries(item: &Item) -> Vec<ActEntry> {
+    let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
+    let primary = verbs::primary(item.kind, running);
+    let mut out: Vec<ActEntry> = verbs::VERBS
+        .iter()
+        .filter(|spec| item.verbs.has(spec.verb))
+        .map(|spec| ActEntry {
+            act: Act::Verb(spec.verb),
+            enabled: !(spec.verb == Verb::RunAsAdmin && matches!(item.kind, Kind::RunLine | Kind::File)),
+            danger: spec.destructive || (item.destructive && spec.verb == primary),
+            new_window: spec.verb == Verb::Open && item.kind == Kind::App && running,
+        })
+        .collect();
+    if item.kind == Kind::Notice && item.verbs.has(Verb::Open) {
+        out.push(ActEntry { act: Act::DontShowAgain, enabled: true, danger: false, new_window: false });
+    }
+    out
 }
 
 fn mru_window(cx: &Context, group: &str) -> Option<isize> {
@@ -232,6 +303,7 @@ impl Session {
             pointer_live: false,
             hover: None,
             review: None,
+            actions: None,
         }
     }
 
@@ -322,7 +394,16 @@ impl Session {
     /// A late batch (files, the typo rewrite): false when it belongs to another generation.
     pub fn late(&mut self, b: Batch, cx: &Context) -> bool {
         let _ = cx;
-        self.results.late(b, self.gen)
+        let took = self.results.late(b, self.gen);
+        if self.actions.as_ref().is_some_and(|a| self.selected().map(|i| i.key) != Some(a.row)) {
+            self.actions = None;
+        }
+        took
+    }
+
+    /// The action list, when it is open.
+    pub fn action_list(&self) -> Option<&ActionList> {
+        self.actions.as_ref()
     }
 
     /// Alt+F4, SC_CLOSE and WM_CLOSE: the final Esc.
@@ -342,6 +423,8 @@ impl Session {
         if text.is_empty() {
             return Vec::new();
         }
+        // Typing closes the action list and goes on searching.
+        self.actions = None;
         self.edit(Edit::Insert(text), cx)
     }
 
@@ -399,15 +482,25 @@ impl Session {
         let ctrl = m.has(Mods::CTRL);
         let shift = m.has(Mods::SHIFT);
         let motion = |by: Motion, word: Motion| Edit::Move { by: if ctrl { word } else { by }, extend: shift };
+        if ev.vk == VK_SPACE && m.has(Mods::ALT) {
+            return self.chord_again();
+        }
+        if ev.vk == VK_F4 && m == Mods::ALT {
+            return self.close_request();
+        }
+        if self.actions.is_some() {
+            return self.action_key(ev, gesture, cx);
+        }
         match ev.vk {
-            VK_SPACE if m.has(Mods::ALT) => self.chord_again(),
-            VK_F4 if m == Mods::ALT => self.close_request(),
+            VK_K if m == Mods::CTRL && !ev.repeat => self.open_actions(true),
+            VK_F10 if m == Mods::SHIFT && !ev.repeat => self.open_actions(true),
+            VK_APPS if plain && !ev.repeat => self.open_actions(true),
+            VK_X if m == Mods::CTRL => self.edit(Edit::Cut, cx),
             VK_ESCAPE if plain => self.escape(cx),
             VK_RETURN if ev.repeat => Vec::new(),
             VK_RETURN => self.enter(m, gesture, cx),
             VK_E if m == CTRL_SHIFT => self.reveal(cx),
             VK_C if m == Mods::CTRL => self.copy(cx),
-            VK_X if m == Mods::CTRL => self.edit(Edit::Cut, cx),
             VK_V if m == Mods::CTRL => vec![Effect::Paste],
             VK_INSERT if m == Mods::SHIFT => vec![Effect::Paste],
             VK_A if m == Mods::CTRL => self.edit(Edit::SelectAll, cx),
@@ -474,6 +567,9 @@ impl Session {
     /// A click on `row` runs its primary verb. A destructive row runs only when that row, of this generation, has been
     /// under the pointer for 300 ms; an earlier click (or one on a row that just moved there) only selects it.
     pub fn click(&mut self, row: usize, now_ms: u64, cx: &Context) -> Vec<Effect> {
+        if self.actions.is_some() {
+            return self.close_actions();
+        }
         self.hover_at(Some(row), now_ms);
         let Some(item) = self.rows().get(row).cloned() else { return Vec::new() };
         let selected = self.pick(row);
@@ -548,6 +644,7 @@ impl Session {
     fn requery(&mut self, cx: &Context) -> Vec<Effect> {
         self.gen += 1;
         self.picked = false;
+        self.actions = None;
         let raw = self.last_query();
         let q = query::parse_query(&raw, &cx.opts.prefixes, cx.num, self.gen);
         let top = providers::query_all(&q, cx, &mut self.budget);
@@ -563,7 +660,7 @@ impl Session {
         fx
     }
 
-    /// The Esc ladder: (the action list, L1b), then the query and the chip, then the final Esc.
+    /// The Esc ladder: (the action list closes first, `action_key`), then the query and the chip, then the final Esc.
     fn escape(&mut self, cx: &Context) -> Vec<Effect> {
         if !self.field.is_empty() || self.chip.is_some() {
             self.field.clear();
@@ -638,6 +735,152 @@ impl Session {
             vec![Effect::Redraw]
         } else {
             Vec::new()
+        }
+    }
+
+    // ---------------------------------------------------------------- the action list (L1b-2)
+
+    /// Opens the action list over the selected row: Ctrl+K, Shift+F10 and the Menu key (`ring`: the focus ring shows),
+    /// or a right click (`context_menu`). A row with nothing to offer, a replay and a list already open do nothing.
+    fn open_actions(&mut self, ring: bool) -> Vec<Effect> {
+        if self.replaying || self.actions.is_some() {
+            return Vec::new();
+        }
+        let Some(item) = self.selected() else { return Vec::new() };
+        let items = action_entries(item);
+        if items.is_empty() {
+            return Vec::new();
+        }
+        // The list opens on what Enter would do, so Ctrl+K and Enter repeat it.
+        let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
+        let primary = Act::Verb(verbs::primary(item.kind, running));
+        let sel = items.iter().position(|e| e.act == primary && e.enabled).unwrap_or(0);
+        self.actions = Some(ActionList { row: item.key, items, sel, ring });
+        vec![Effect::Relayout]
+    }
+
+    /// A right click on a row: it is selected and its action list opens (the focus ring stays off). With a list open the
+    /// click only closes it.
+    pub fn context_menu(&mut self, row: usize) -> Vec<Effect> {
+        if self.actions.is_some() {
+            return self.close_actions();
+        }
+        if self.results.select_index(row) {
+            self.picked = true;
+        }
+        self.open_actions(false)
+    }
+
+    /// Closes the action list (Esc, a click outside it, a second Ctrl+K).
+    pub fn close_actions(&mut self) -> Vec<Effect> {
+        if self.actions.take().is_some() {
+            vec![Effect::Relayout]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The pointer is over entry `k` of the list: it takes the highlight, without the focus ring.
+    pub fn action_hover(&mut self, k: usize) -> Vec<Effect> {
+        let Some(list) = self.actions.as_mut() else { return Vec::new() };
+        if k >= list.items.len() || (list.sel == k && !list.ring) {
+            return Vec::new();
+        }
+        list.sel = k;
+        list.ring = false;
+        vec![Effect::Redraw]
+    }
+
+    /// A click on entry `k` of the list.
+    pub fn action_click(&mut self, k: usize, cx: &Context) -> Vec<Effect> {
+        let Some(list) = self.actions.as_mut() else { return Vec::new() };
+        if k >= list.items.len() {
+            return Vec::new();
+        }
+        list.sel = k;
+        list.ring = false;
+        self.run_action(cx)
+    }
+
+    /// A key while the list is open: Up, Down, Home, End and Enter move and run inside it, Esc and the opening keys
+    /// close it, Backspace and Delete close it and edit the field; every other key waits.
+    fn action_key(&mut self, ev: KeyEvent, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        let m = ev.mods;
+        let plain = m == Mods::NONE;
+        match ev.vk {
+            VK_ESCAPE if plain => self.close_actions(),
+            VK_K if m == Mods::CTRL => self.close_actions(),
+            VK_F10 if m == Mods::SHIFT => self.close_actions(),
+            VK_APPS if plain => self.close_actions(),
+            VK_UP if plain => self.action_move(-1),
+            VK_DOWN if plain => self.action_move(1),
+            VK_HOME if plain => self.action_move(isize::MIN),
+            VK_END if plain => self.action_move(isize::MAX),
+            VK_RETURN if plain && !ev.repeat => self.run_action(cx),
+            VK_BACK | VK_DELETE if plain => {
+                self.actions = None;
+                let mut fx = self.key(ev, gesture, cx);
+                if !fx.contains(&Effect::Relayout) {
+                    fx.push(Effect::Relayout);
+                }
+                fx
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn action_move(&mut self, delta: isize) -> Vec<Effect> {
+        let Some(list) = self.actions.as_mut() else { return Vec::new() };
+        let last = list.items.len().saturating_sub(1);
+        let sel = list.sel.saturating_add_signed(delta).min(last);
+        let changed = sel != list.sel || !list.ring;
+        list.sel = sel;
+        list.ring = true;
+        if changed {
+            vec![Effect::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Runs the highlighted entry and closes the list.
+    fn run_action(&mut self, cx: &Context) -> Vec<Effect> {
+        let Some(list) = self.actions.as_ref() else { return Vec::new() };
+        let Some(entry) = list.items.get(list.sel).copied() else { return self.close_actions() };
+        if !entry.enabled {
+            return Vec::new();
+        }
+        let row = list.row;
+        self.actions = None;
+        let Some(item) = self.selected().filter(|i| i.key == row).cloned() else { return vec![Effect::Relayout] };
+        let mut fx = match entry.act {
+            Act::Verb(v) => self.run_verb(&item, v, cx),
+            Act::DontShowAgain => {
+                self.results.remove(item.key);
+                vec![Effect::DismissNotice(item.key)]
+            }
+        };
+        // The panel gives the list's room back, unless the launcher closes anyway.
+        if !fx.iter().any(|e| matches!(e, Effect::Hide { .. } | Effect::Relayout)) {
+            fx.push(Effect::Relayout);
+        }
+        fx
+    }
+
+    /// One verb on the selected row, by its menu entry rather than its chord.
+    fn run_verb(&mut self, item: &Item, v: Verb, cx: &Context) -> Vec<Effect> {
+        match v {
+            // A new instance for an app (also a running one); every other row opens as Enter does.
+            Verb::Open if item.kind == Kind::App => {
+                app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into())))
+            }
+            Verb::Open | Verb::Switch => self.primary(item, cx),
+            Verb::RunAsAdmin => self.run_as_admin(item, None, cx),
+            Verb::Reveal => self.reveal(cx),
+            Verb::Copy => self.copy_row(cx),
+            Verb::CloseWindow => self.close_window_of_selected(cx),
+            Verb::Forget => self.forget(),
+            Verb::RunInConsole => self.shift_enter(item),
         }
     }
 
@@ -746,6 +989,11 @@ impl Session {
         if let Some(sel) = self.field.selected_text() {
             return vec![Effect::CopyNow(sel.into())];
         }
+        self.copy_row(cx)
+    }
+
+    /// The selected row's text, after the hide.
+    fn copy_row(&mut self, cx: &Context) -> Vec<Effect> {
         let Some(item) = self.selected() else { return Vec::new() };
         if !item.verbs.has(Verb::Copy) {
             return Vec::new();
@@ -767,6 +1015,12 @@ impl Session {
         if !self.picked {
             return Vec::new();
         }
+        self.close_window_of_selected(cx)
+    }
+
+    /// WM_CLOSE to the window of the selected row (the action list's Close window is a choice of the user's, so it does
+    /// not need the arrow or pointer pick).
+    fn close_window_of_selected(&mut self, cx: &Context) -> Vec<Effect> {
         let Some(item) = self.selected() else { return Vec::new() };
         if !item.verbs.has(Verb::CloseWindow) {
             return Vec::new();
@@ -1450,6 +1704,8 @@ mod tests {
         assert_eq!(s.click(0, 1_300, &fx.cx()), [Effect::Hide { restore: false }, Effect::Power(CommandId::Restart)]);
     }
 
+    // ---------------------------------------------------------------- L1b-1 keys and L1b-2 action list
+
     #[test]
     fn shift_motions_select_and_ctrl_x_cuts_to_the_clipboard() {
         let fx = Fx::new();
@@ -1477,5 +1733,245 @@ mod tests {
         press(&mut s, &fx, VK_HOME, Mods::NONE);
         assert!(!press(&mut s, &fx, VK_DELETE, Mods::CTRL).is_empty());
         assert_eq!(s.query_text(), "two");
+    }
+
+    fn open_list(s: &mut Session, fx: &Fx) -> Vec<Effect> {
+        press(s, fx, 0x4B, Mods::CTRL)
+    }
+
+    fn acts(s: &Session) -> Vec<Act> {
+        s.action_list().map(|l| l.items().iter().map(|e| e.act).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn action_list_keys() {
+        use Act::Verb as V;
+        let fx = Fx::new();
+        let mut s = typed(&fx, "blocco");
+        assert_eq!(sel_title(&s), Some("Blocco note"));
+        // Ctrl+K opens it on the row's own Enter verb, with the focus ring (keyboard).
+        assert_eq!(open_list(&mut s, &fx), [Effect::Relayout]);
+        assert_eq!(
+            acts(&s),
+            [
+                V(Verb::Open),
+                V(Verb::Switch),
+                V(Verb::RunAsAdmin),
+                V(Verb::Reveal),
+                V(Verb::Copy),
+                V(Verb::CloseWindow),
+                V(Verb::Forget)
+            ]
+        );
+        let l = s.action_list().unwrap();
+        assert_eq!((l.sel(), l.ring()), (1, true));
+        // Ctrl+K again closes it; Shift+F10 and the Menu key open it.
+        assert_eq!(open_list(&mut s, &fx), [Effect::Relayout]);
+        assert!(s.action_list().is_none());
+        assert_eq!(press(&mut s, &fx, 0x79, Mods::SHIFT), [Effect::Relayout]);
+        assert_eq!(press(&mut s, &fx, 0x5D, Mods::NONE), [Effect::Relayout]);
+        assert!(s.action_list().is_none());
+        press(&mut s, &fx, 0x5D, Mods::NONE);
+        // Up, Down, Home, End move inside it and stop at the ends.
+        assert_eq!(press(&mut s, &fx, VK_DOWN, Mods::NONE), [Effect::Redraw]);
+        assert_eq!(s.action_list().map(ActionList::sel), Some(2));
+        assert_eq!(press(&mut s, &fx, VK_END, Mods::NONE), [Effect::Redraw]);
+        assert!(press(&mut s, &fx, VK_DOWN, Mods::NONE).is_empty());
+        assert_eq!(s.action_list().map(ActionList::sel), Some(6));
+        press(&mut s, &fx, VK_HOME, Mods::NONE);
+        assert!(press(&mut s, &fx, VK_UP, Mods::NONE).is_empty());
+        assert_eq!(s.action_list().map(ActionList::sel), Some(0));
+        // The row behind it did not move, and keys the list does not know wait.
+        assert_eq!(sel_title(&s), Some("Blocco note"));
+        assert!(press(&mut s, &fx, VK_LEFT, Mods::NONE).is_empty());
+        assert!(press(&mut s, &fx, VK_C, Mods::CTRL).is_empty());
+        assert!(s.action_list().is_some());
+        // A held Enter does nothing.
+        let held = KeyEvent { repeat: true, ..k(VK_RETURN, Mods::NONE) };
+        assert!(s.key(held, None, &fx.cx()).is_empty());
+        // Enter runs the entry and closes the list: Open on a running app is a new instance.
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App(NOTEPAD_ID.into()))]
+        );
+        assert!(s.action_list().is_none());
+        // Every other verb runs as its chord does.
+        let run = |s: &mut Session, k: usize| -> Vec<Effect> {
+            open_list(s, &fx);
+            press(s, &fx, VK_HOME, Mods::NONE);
+            for _ in 0..k {
+                press(s, &fx, VK_DOWN, Mods::NONE);
+            }
+            press(s, &fx, VK_RETURN, Mods::NONE)
+        };
+        assert_eq!(run(&mut s, 1), [Effect::Switch(0x1001), Effect::Hide { restore: false }]);
+        assert_eq!(
+            run(&mut s, 2),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::AppAdmin(NOTEPAD_ID.into()))]
+        );
+        assert_eq!(
+            run(&mut s, 3),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::RevealApp(NOTEPAD_ID.into()))]
+        );
+        assert_eq!(run(&mut s, 4), [Effect::Hide { restore: true }, Effect::Copy("Blocco note".into())]);
+        assert_eq!(run(&mut s, 6), [Effect::Forget(s.selected().unwrap().key), Effect::Relayout]);
+        // Close window needs no arrow pick here (the list is a choice) and the launcher stays.
+        assert_eq!(run(&mut s, 5), [Effect::CloseWindow(0x1001), Effect::Relayout]);
+        assert!(s.action_list().is_none());
+    }
+
+    #[test]
+    fn action_list_esc_typing_and_backspace() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "blocco");
+        open_list(&mut s, &fx);
+        // Esc closes only the list.
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout]);
+        assert_eq!(s.query_text(), "blocco");
+        // A letter closes it and goes on searching.
+        open_list(&mut s, &fx);
+        let out = s.chars("x", &fx.cx());
+        assert!(s.action_list().is_none() && out.contains(&Effect::Relayout), "{out:?}");
+        assert_eq!(s.query_text(), "bloccox");
+        // Backspace closes it and edits.
+        let mut s = typed(&fx, "blocco");
+        open_list(&mut s, &fx);
+        let out = press(&mut s, &fx, VK_BACK, Mods::NONE);
+        assert!(s.action_list().is_none() && out.contains(&Effect::Relayout), "{out:?}");
+        assert_eq!(s.query_text(), "blocc");
+        // The chord and Alt+F4 still close the launcher itself.
+        open_list(&mut s, &fx);
+        assert_eq!(press(&mut s, &fx, VK_SPACE, Mods::ALT), [Effect::Hide { restore: true }]);
+        assert_eq!(press(&mut s, &fx, VK_F4, Mods::ALT), [Effect::Hide { restore: true }]);
+        // Esc, once the list is closed, goes on down the ladder.
+        let mut s = typed(&fx, "blocco");
+        open_list(&mut s, &fx);
+        press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout]);
+        assert_eq!(s.query_text(), "");
+    }
+
+    #[test]
+    fn right_click_selects_and_opens_the_list_without_the_ring() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "note");
+        assert!(s.rows().len() > 1);
+        assert_eq!(s.context_menu(1), [Effect::Relayout]);
+        let l = s.action_list().unwrap();
+        assert!(!l.ring());
+        assert_eq!(s.selected_index(), Some(1));
+        // A pointer over entry 2 takes the highlight; a second right click closes only the list.
+        let other = (s.action_list().unwrap().sel() + 1) % s.action_list().unwrap().items().len();
+        assert_eq!(s.action_hover(other), [Effect::Redraw]);
+        assert!(s.action_hover(other).is_empty());
+        assert_eq!(s.action_list().map(ActionList::sel), Some(other));
+        assert_eq!(s.context_menu(0), [Effect::Relayout]);
+        assert!(s.action_list().is_none());
+        assert_eq!(s.selected_index(), Some(1));
+    }
+
+    #[test]
+    fn the_list_never_opens_without_something_to_offer_or_in_a_replay() {
+        let fx = Fx::new();
+        // No rows.
+        let mut s = open(&fx);
+        assert!(open_list(&mut s, &fx).is_empty());
+        // Typed blind before the launcher showed: a replayed Ctrl+K opens nothing.
+        let mut s = typed(&fx, "blocco");
+        let out = s.replay(&[ReplayKey::Key(k(0x4B, Mods::CTRL))], &fx.cx());
+        assert!(out.is_empty() && s.action_list().is_none(), "{out:?}");
+        // A notice with no verb (the refusal row) has no list.
+        let mut s = open(&fx);
+        s.set_notices(vec![notice(VerbSet::empty())]);
+        s.chars("z", &fx.cx());
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(sel_title(&s), Some("A notice"));
+        assert!(open_list(&mut s, &fx).is_empty());
+    }
+
+    fn notice(verbs: VerbSet) -> Item {
+        use crate::launcher::model::Score;
+        Item {
+            key: ItemKey::of(ProviderId::Apps, "a-notice"),
+            from: ProviderId::Apps,
+            kind: Kind::Notice,
+            title: "A notice".into(),
+            detail: None,
+            icon: IconRef::Glyph(crate::launcher::model::GlyphId::Info),
+            score: Score { tier: 0, learned: std::cmp::Reverse(0), idle: true, kind: 0, rank: 0, len: 0 },
+            verbs,
+            payload: Payload::None,
+            destructive: false,
+        }
+    }
+
+    #[test]
+    fn a_notice_with_an_action_offers_dont_show_again() {
+        let fx = Fx::new();
+        let mut s = open(&fx);
+        let n = notice(VerbSet::empty().with(Verb::Open));
+        let key = n.key;
+        s.set_notices(vec![n]);
+        s.chars("z", &fx.cx());
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(sel_title(&s), Some("A notice"));
+        open_list(&mut s, &fx);
+        assert_eq!(acts(&s), [Act::Verb(Verb::Open), Act::DontShowAgain]);
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        let out = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert_eq!(out, [Effect::DismissNotice(key), Effect::Relayout]);
+        assert!(s.rows().iter().all(|r| r.key != key), "the row is gone");
+        assert!(s.action_list().is_none());
+    }
+
+    #[test]
+    fn run_as_administrator_on_a_typed_line_is_listed_but_inert() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, ">ping 1.1.1.1");
+        assert_eq!(s.selected().unwrap().kind, Kind::RunLine);
+        open_list(&mut s, &fx);
+        let l = s.action_list().unwrap();
+        let admin = l.items().iter().position(|e| e.act == Act::Verb(Verb::RunAsAdmin));
+        if let Some(i) = admin {
+            assert!(!l.items()[i].enabled, "no gesture can come from a key inside the list");
+            press(&mut s, &fx, VK_HOME, Mods::NONE);
+            for _ in 0..i {
+                press(&mut s, &fx, VK_DOWN, Mods::NONE);
+            }
+            assert!(press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty());
+            assert!(s.action_list().is_some(), "an inert entry leaves the list open");
+        }
+        // The run line's own verbs run: Run in a console.
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        let last = s.action_list().map(ActionList::sel);
+        assert!(last.is_some());
+    }
+
+    #[test]
+    fn danger_marks_the_destructive_entries() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "blocco");
+        open_list(&mut s, &fx);
+        let danger: Vec<Act> =
+            s.action_list().unwrap().items().iter().filter(|e| e.danger).map(|e| e.act).collect();
+        assert_eq!(danger, [Act::Verb(Verb::CloseWindow), Act::Verb(Verb::Forget)]);
+        // Open on a destructive row (Shut down) is dangerous too.
+        let mut s = typed(&fx, "shut down");
+        assert!(s.selected().is_some_and(|i| i.destructive), "{:?}", sel_title(&s));
+        open_list(&mut s, &fx);
+        let open = s.action_list().unwrap().items().iter().find(|e| e.act == Act::Verb(Verb::Open)).copied();
+        assert_eq!(open.map(|e| e.danger), Some(true));
+    }
+
+    #[test]
+    fn a_late_batch_that_drops_the_row_closes_the_list() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "blocco");
+        open_list(&mut s, &fx);
+        // Closing the window of the row from outside (it vanished): the next late batch finds no row.
+        s.results.remove(s.selected().unwrap().key);
+        let b = Batch { gen: s.gen(), from: ProviderId::Files, items: Vec::new(), done: true };
+        s.late(b, &fx.cx());
+        assert!(s.action_list().is_none());
     }
 }

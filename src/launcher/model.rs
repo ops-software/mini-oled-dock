@@ -277,7 +277,6 @@ pub enum Payload {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GlyphId {
-    #[allow(dead_code)] // L1b-2: the action list's Open
     Magnifier,
     Equals,
     Prompt,
@@ -372,7 +371,6 @@ pub enum Verb {
 }
 
 /// Why a verb exists (5.1 scope tags).
-#[allow(dead_code)] // L1b-2: the action list reads the verb table
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tag {
     OwnerAsked,
@@ -425,7 +423,6 @@ impl Mods {
     }
 }
 
-#[allow(dead_code)] // L1b-2: the action list reads the verb table
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyChord {
     pub vk: u16,
@@ -453,7 +450,8 @@ impl ChordSpec {
     }
 }
 
-#[allow(dead_code)] // L1b-2: the action list reads the verb table
+// `tag` is the scope record of 5.1: only the tests read it.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct VerbSpec {
     pub verb: Verb,
