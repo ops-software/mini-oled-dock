@@ -1101,11 +1101,17 @@ impl Launcher {
                 }
             }
         }
-        if lit {
-            let x = tx + prefix_width(&extents, text, self.session.field().caret()) - scroll + m.px(1);
+        let caret = self.session.field().caret();
+        if lit && caret > 0 {
+            let x = tx + prefix_width(&extents, text, caret) - scroll + m.px(1);
             s.fill_rr(rect_wh(x, cy, m.px(1).max(1), ch), 0, WHITE, style::FG_HOT);
         }
         s.set_clip(None);
+        if lit && caret == 0 {
+            // Before the first character (or the placeholder): the clip starts at `tx`, so this one is drawn outside it.
+            let x = tx - m.px(1).max(1);
+            s.fill_rr(rect_wh(x, cy, m.px(1).max(1), ch), 0, WHITE, style::FG_HOT);
+        }
     }
 
     /// The icon column of a row: the icon, a placeholder, or a glyph; `box_y` is the top of the 24 px box.

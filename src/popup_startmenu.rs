@@ -1562,7 +1562,8 @@ impl StartMenu {
         let max_w = g.search.right - m.px(12) - tx;
         let caret_x = if self.query.is_empty() {
             s.text(labels().placeholder, tx, ty, Font::Normal, WHITE, TEXT3_ALPHA);
-            tx
+            // Before the placeholder, as the launcher's field (5.2.2).
+            tx - m.px(1).max(1)
         } else {
             let shown = tail_fit(s, &self.query, max_w);
             s.text(&shown, tx, ty, Font::Normal, WHITE, TEXT_ALPHA);
