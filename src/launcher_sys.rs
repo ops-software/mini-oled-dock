@@ -13,7 +13,9 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
 };
-use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_SDECIMAL, LOCALE_STHOUSAND};
+use windows::Win32::Globalization::{
+    GetLocaleInfoEx, LOCALE_ITIME, LOCALE_SDECIMAL, LOCALE_SSHORTDATE, LOCALE_STHOUSAND,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
@@ -36,6 +38,7 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     WT_EXECUTEONLYONCE,
 };
+use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, RegisterHotKey, SendInput, ToUnicodeEx, UnregisterHotKey, INPUT, INPUT_0,
@@ -270,6 +273,27 @@ fn locale_mark(lctype: u32) -> Option<char> {
     let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), lctype, Some(&mut buf)) };
     let len = usize::try_from(n).ok()?.saturating_sub(1);
     String::from_utf16_lossy(buf.get(..len)?).chars().next()
+}
+
+/// A string of the user locale (`LCTYPE`): at most 80 UTF-16 units, None when it cannot be read.
+fn locale_string(lctype: u32) -> Option<String> {
+    let mut buf = [0u16; 80];
+    // SAFETY: `buf` is writable and its length is passed; a null name is LOCALE_NAME_USER_DEFAULT.
+    let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), lctype, Some(&mut buf)) };
+    let len = usize::try_from(n).ok()?.saturating_sub(1);
+    Some(String::from_utf16_lossy(buf.get(..len)?))
+}
+
+/// The offset of local time from UTC in minutes, from the return value and the three biases of
+/// `GetTimeZoneInformation` (the bias is UTC minus local time): TIME_ZONE_ID_STANDARD (1) adds the standard bias,
+/// DAYLIGHT (2) the daylight bias, UNKNOWN (0, no daylight saving in the zone) neither; anything else is 0.
+fn offset_of(ret: u32, bias: i32, std: i32, dst: i32) -> i32 {
+    match ret {
+        1 => bias.saturating_add(std).saturating_neg(),
+        2 => bias.saturating_add(dst).saturating_neg(),
+        0 => bias.saturating_neg(),
+        _ => 0,
+    }
 }
 
 /// The power action of a command row.
@@ -511,6 +535,25 @@ impl SysPort for RealSys {
         let fallback = if decimal == ',' { '.' } else { ',' };
         let group = locale_mark(LOCALE_STHOUSAND).filter(|g| *g != decimal).unwrap_or(fallback);
         NumberStyle { decimal, group }
+    }
+
+    fn time_style(&self) -> crate::launcher::datetime::TimeStyle {
+        let itime = locale_string(LOCALE_ITIME).unwrap_or_default();
+        let short = locale_string(LOCALE_SSHORTDATE).unwrap_or_default();
+        crate::launcher::datetime::TimeStyle::from_locale(&itime, &short)
+    }
+
+    fn utc_offset_min(&self) -> i32 {
+        let mut tz = TIME_ZONE_INFORMATION::default();
+        // SAFETY: `tz` is a writable TIME_ZONE_INFORMATION for the call.
+        let ret = unsafe { GetTimeZoneInformation(&mut tz) };
+        if ret == 0xFFFF_FFFF {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Relaxed) {
+                log!("launcher: the time zone could not be read, dates show UTC");
+            }
+        }
+        offset_of(ret, tz.Bias, tz.StandardBias, tz.DaylightBias)
     }
 
     fn close_quiet(&mut self) {
@@ -997,6 +1040,21 @@ mod tests {
     use super::*;
     use crate::launcher::gesture::Gesture;
     use crate::launcher::runline;
+
+    #[test]
+    fn offset_of_vectors() {
+        // Rome in winter: standard time, bias -60 (UTC minus local).
+        assert_eq!(offset_of(1, -60, 0, -60), 60);
+        // Rome in summer.
+        assert_eq!(offset_of(2, -60, 0, -60), 120);
+        // New York in winter.
+        assert_eq!(offset_of(1, 300, 0, -60), -300);
+        // A zone without daylight saving time, and a call that failed.
+        assert_eq!(offset_of(0, -330, 0, 0), 330);
+        assert_eq!(offset_of(0xFFFF_FFFF, -60, 0, -60), 0);
+        assert_eq!(offset_of(7, i32::MIN, i32::MIN, i32::MIN), 0);
+        assert_eq!(offset_of(1, i32::MIN, 0, 0), i32::MAX);
+    }
 
     const CALC: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
     const SETTINGS: &str =

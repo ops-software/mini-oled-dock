@@ -208,6 +208,80 @@ pub fn window_name() -> &'static str {
     tr("Launcher", "Launcher")
 }
 
+// ---- date and time rows (5.4.10): the names of the days and months, and the label of each row
+
+/// The name of a weekday, 0 = Monday.
+pub fn day_name(wd: u8) -> &'static str {
+    match wd {
+        0 => tr("Monday", "lunedì"),
+        1 => tr("Tuesday", "martedì"),
+        2 => tr("Wednesday", "mercoledì"),
+        3 => tr("Thursday", "giovedì"),
+        4 => tr("Friday", "venerdì"),
+        5 => tr("Saturday", "sabato"),
+        _ => tr("Sunday", "domenica"),
+    }
+}
+
+/// The name of a month, 1 = January.
+pub fn month_name(mo: u8) -> &'static str {
+    match mo {
+        1 => tr("January", "gennaio"),
+        2 => tr("February", "febbraio"),
+        3 => tr("March", "marzo"),
+        4 => tr("April", "aprile"),
+        5 => tr("May", "maggio"),
+        6 => tr("June", "giugno"),
+        7 => tr("July", "luglio"),
+        8 => tr("August", "agosto"),
+        9 => tr("September", "settembre"),
+        10 => tr("October", "ottobre"),
+        11 => tr("November", "novembre"),
+        _ => tr("December", "dicembre"),
+    }
+}
+
+pub fn week_number(n: u8) -> String {
+    format!("{} {n}", tr("Week", "Settimana"))
+}
+
+pub fn day_of_year(n: u16) -> String {
+    if crate::i18n::italian() {
+        format!("Giorno {n} dell'anno")
+    } else {
+        format!("Day {n} of the year")
+    }
+}
+
+pub fn label_utc() -> &'static str {
+    "UTC"
+}
+
+pub fn label_unix() -> &'static str {
+    "Unix"
+}
+
+pub fn label_iso8601() -> &'static str {
+    "ISO 8601"
+}
+
+/// What the detail line of each date and time row says (the row's own title is the value).
+pub fn label_long_date() -> &'static str {
+    tr("Date and time", "Data e ora")
+}
+pub fn label_short_date() -> &'static str {
+    tr("Date", "Data")
+}
+pub fn label_time_seconds() -> &'static str {
+    tr("Time with seconds", "Ora con secondi")
+}
+pub fn label_iso_week() -> &'static str {
+    tr("ISO week", "Settimana ISO")
+}
+pub fn label_day_of_year() -> &'static str {
+    tr("Day of the year", "Giorno dell'anno")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {

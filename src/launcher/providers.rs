@@ -5,6 +5,7 @@
 
 use super::arena::CatalogView;
 use super::commands::{self, Command, COMMANDS};
+use super::datetime::{self, TimeStyle};
 use super::frecency::Frecency;
 use super::gesture::GESTURE_TIME_MATCHES;
 use super::index::{Hit, IndexView};
@@ -63,8 +64,11 @@ pub struct Context<'a> {
     pub num: NumberStyle,
     /// What the user picked (L1b-3); the clock of the keystroke ages it.
     pub learned: &'a Frecency,
-    #[allow(dead_code)] // L2-4 (date and time) reads the clock of the keystroke
     pub now_unix: i64,
+    /// The local time's offset from UTC in minutes, read at open (date and time rows).
+    pub utc_offset_min: i32,
+    /// The locale's 12/24-hour choice and date order, read at open.
+    pub time_style: TimeStyle,
     /// The window in front when the chord came can take the window menu: there, not the desktop, not one of the dock's
     /// own windows. Without one the Window menu row is disabled.
     pub window_target: bool,
@@ -156,10 +160,11 @@ impl TopK {
 
 // ---------------------------------------------------------------- the providers
 
-/// The synchronous providers in the order of 5.4.1 (DateTime joins in L2). In Mixed mode the open windows are merged
-/// into the apps; `Windows` runs only in its own mode ("<").
-pub const ORDER: [ProviderId; 8] = [
+/// The synchronous providers in the order of 5.4.1. In Mixed mode the open windows are merged into the apps; `Windows`
+/// runs only in its own mode ("<").
+pub const ORDER: [ProviderId; 9] = [
     ProviderId::Calc,
+    ProviderId::DateTime,
     ProviderId::Apps,
     ProviderId::Windows,
     ProviderId::Commands,
@@ -389,7 +394,11 @@ fn run_one(id: ProviderId, q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK,
             0
         }
         ProviderId::Registry => registry(q, fuzzy, top, s),
-        ProviderId::Units | ProviderId::DateTime | ProviderId::Files => 0,
+        ProviderId::DateTime => {
+            datetime(q, cx, top);
+            0
+        }
+        ProviderId::Units | ProviderId::Files => 0,
     }
 }
 
@@ -457,6 +466,46 @@ fn calc(q: &Query, top: &mut TopK) {
         payload: Payload::Value { shown: a.shown.into(), raw: a.raw.into() },
         destructive: false,
     });
+}
+
+// ---- date and time
+
+/// ")" mode lists the eight rows in their order (each at its own rank, so they sort as listed); Mixed mode answers an
+/// exact keyword with one row at the hidden-word tier with no learned boost, which a name always outranks.
+fn datetime(q: &Query, cx: &Context, top: &mut TopK) {
+    match q.mode {
+        Mode::Only(ProviderId::DateTime) => {
+            for i in 0..datetime::ROWS {
+                let score = Score { rank: index_u32(i), ..PINNED };
+                if let Some(r) = datetime::row(i, cx.now_unix, cx.utc_offset_min, cx.time_style) {
+                    top.push(datetime_item(r, score));
+                }
+            }
+        }
+        Mode::Mixed => {
+            let Some(i) = datetime::keyword_row(&q.folded) else { return };
+            let score = Score { tier: rank::T_SYN_EQ, learned: Reverse(0), kind: KIND_COMMAND, ..PINNED };
+            if let Some(r) = datetime::row(i, cx.now_unix, cx.utc_offset_min, cx.time_style) {
+                top.push(datetime_item(r, score));
+            }
+        }
+        Mode::Only(_) => {}
+    }
+}
+
+fn datetime_item(r: datetime::Row, score: Score) -> Item {
+    Item {
+        key: ItemKey::of(ProviderId::DateTime, r.id),
+        from: ProviderId::DateTime,
+        kind: Kind::Answer,
+        title: r.value.as_str().into(),
+        detail: Some(r.label.into()),
+        icon: IconRef::Glyph(GlyphId::Clock),
+        score,
+        verbs: verbs(Kind::Answer, false, None),
+        payload: Payload::Value { shown: r.value.as_str().into(), raw: r.value.into() },
+        destructive: false,
+    }
 }
 
 // ---- apps and the open windows merged into them
@@ -1048,7 +1097,8 @@ impl Results {
         for item in top.into_sorted() {
             if item.key == web_search_key() {
                 web = Some(item);
-            } else if item.kind == Kind::Answer {
+            } else if item.kind == Kind::Answer && item.score.tier == PINNED.tier {
+                // Only an answer of the best tier is lifted above the ranked rows; any other stays among them.
                 self.rows.push(item);
             } else {
                 ranked.push(item);
@@ -1274,6 +1324,8 @@ pub(crate) mod tests {
                 opts: &self.opts,
                 num: NUM_IT,
                 now_unix: 1_790_000_000,
+                utc_offset_min: 60,
+                time_style: TimeStyle::default(),
                 learned: &self.learned,
                 window_target: true,
             }
@@ -1707,15 +1759,94 @@ pub(crate) mod tests {
     #[test]
     fn query_all_order_is_5_4_1() {
         use ProviderId::*;
-        assert_eq!(ORDER, [Calc, Apps, Windows, Commands, Settings, Run, Web, Registry]);
+        assert_eq!(ORDER, [Calc, DateTime, Apps, Windows, Commands, Settings, Run, Web, Registry]);
         let fx = Fx::new();
-        assert_eq!(fx.query("x").1, [Calc, Apps, Commands, Settings, Run, Web, Registry]);
+        assert_eq!(fx.query("x").1, [Calc, DateTime, Apps, Commands, Settings, Run, Web, Registry]);
+        assert_eq!(fx.query(")").1, [DateTime]);
         assert_eq!(fx.query("<x").1, [Windows]);
         assert_eq!(fx.query("=1").1, [Calc]);
         assert_eq!(fx.query(">ping").1, [Run]);
         assert_eq!(fx.query("file explorer").1, [Apps], "a word prefix keeps the apps");
         // Rows of the same tier and kind keep the order of the providers: the answer of an expression comes first.
         assert_eq!(fx.rows("2+3")[0].kind, Kind::Answer);
+    }
+
+    #[test]
+    fn results_lift_only_pinned_answers() {
+        let mut fx = Fx::new();
+        fx.apps.push(CatApp::new("Vendor.Ora", "Ora", Keys::default(), 50));
+        let mut res = Results::default();
+        // A tier-0 answer (the calculator's) goes above the ranked rows.
+        fx.sync(&mut res, "2+3", 1);
+        assert_eq!(res.rows()[0].kind, Kind::Answer);
+        // A hidden-word answer (the date keyword) stays among them: an app named like it is above.
+        fx.sync(&mut res, "ora", 2);
+        let titles: Vec<&str> = res.rows().iter().map(|r| &*r.title).collect();
+        assert_eq!(titles[0], "Ora", "{titles:?}");
+        assert!(res.rows().iter().any(|r| r.from == ProviderId::DateTime));
+        assert_eq!(res.selected().unwrap().title.as_ref(), "Ora");
+    }
+
+    #[test]
+    fn datetime_rows_keep_their_order() {
+        let fx = Fx::new();
+        let mut res = Results::default();
+        fx.sync(&mut res, ")", 1);
+        let shown: Vec<String> =
+            res.rows().iter().filter(|r| r.from == ProviderId::DateTime).map(|r| r.title.to_string()).collect();
+        let want: Vec<String> =
+            datetime::rows(1_790_000_000, 60, TimeStyle::default()).into_iter().map(|r| r.value).collect();
+        assert_eq!(shown, want);
+        assert_eq!(shown.len(), 8);
+        assert!(res.rows().iter().all(|r| r.kind != Kind::Answer || r.from == ProviderId::DateTime));
+        // Whatever follows the prefix, the same eight rows.
+        fx.sync(&mut res, ")xyz", 2);
+        assert_eq!(res.rows().iter().filter(|r| r.from == ProviderId::DateTime).count(), 8);
+    }
+
+    #[test]
+    fn datetime_rows_in_their_mode() {
+        let mut fx = Fx::new();
+        let own = |fx: &Fx, raw: &str| fx.rows(raw).into_iter().filter(|r| r.from == ProviderId::DateTime).count();
+        assert_eq!(own(&fx, "ora"), 1);
+        assert_eq!(own(&fx, "date"), 1);
+        assert_eq!(own(&fx, "ora x"), 0, "only the exact keyword answers");
+        assert_eq!(own(&fx, "or"), 0);
+        assert_eq!(own(&fx, "= ora"), 0, "the calculator's mode runs no date row");
+        assert_eq!(own(&fx, ")"), 8);
+        let week = fx.rows("week");
+        assert!(week.iter().any(|r| r.from == ProviderId::DateTime && r.title.starts_with("Week ")));
+        fx.opts.mask = ProviderMask::all().with(ProviderId::DateTime, false);
+        assert_eq!(own(&fx, "ora"), 0);
+        assert_eq!(own(&fx, ")"), 0);
+        assert!(!fx.query("ora").1.contains(&ProviderId::DateTime));
+    }
+
+    #[test]
+    fn datetime_keyword_never_beats_a_name() {
+        let mut fx = Fx::new();
+        fx.settings.push(SettingRow::new(2, "Data e ora", Keys::default(), 3));
+        let rows = fx.rows("data");
+        let at = |f: &dyn Fn(&Item) -> bool| rows.iter().position(f).unwrap();
+        let setting = at(&|r| &*r.title == "Data e ora");
+        let date = at(&|r| r.from == ProviderId::DateTime);
+        assert!(setting < date, "{rows:#?}");
+        // A learned row of the keyword's tier stays above it too (no learned boost on the date row).
+        assert_eq!(rows[date].score.learned, Reverse(0));
+    }
+
+    #[test]
+    fn datetime_allocates_nothing_without_a_keyword() {
+        use crate::launcher::testkit::allocations_during;
+        let fx = Fx::new();
+        let cx = fx.cx();
+        let mut top = TopK::new(8);
+        for raw in ["calc", "", "x", "ora x", "= 1"] {
+            let q = query::parse_query(raw, &fx.opts.prefixes, NUM_IT, 1);
+            let (_, n) = allocations_during(|| datetime(&q, &cx, &mut top));
+            assert_eq!(n, 0, "{raw:?}");
+        }
+        assert!(top.is_empty());
     }
 
     #[test]
@@ -2013,6 +2144,8 @@ mod bench {
                 num: NUM,
                 learned: &self.learned,
                 now_unix: 1_790_000_000,
+                utc_offset_min: 60,
+                time_style: TimeStyle::default(),
                 window_target: true,
             }
         }
@@ -2028,7 +2161,7 @@ mod bench {
     fn queries() -> Vec<String> {
         let words = words();
         let mut r = XorShift::new(0xB0B + 4);
-        (0..QUERIES)
+        let mut qs: Vec<String> = (0..QUERIES)
             .map(|_| {
                 let len = 1 + (r.next_u64() % 12) as usize;
                 let text: String = if r.next_u64() % 10 < 7 {
@@ -2043,7 +2176,10 @@ mod bench {
                     text
                 }
             })
-            .collect()
+            .collect();
+        // The date and time provider: its prefix lists every row, a keyword answers one (DT-1).
+        qs.extend([")".to_string(), "ora".to_string()]);
+        qs
     }
 
     /// The most allocations one query of `qs` made inside `query_all`.

@@ -24,6 +24,7 @@ use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
 use crate::launcher::arena::{self, Arena, Caps, CatalogView, Kind as ArenaKind, SettingIn};
 use crate::launcher::catalog::{self, IconCache};
+use crate::launcher::datetime::TimeStyle;
 use crate::launcher::field::KeyEvent;
 use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
@@ -2336,6 +2337,14 @@ pub(crate) trait SysPort {
     fn now_ms(&self) -> u64;
     /// The user locale's decimal and thousands marks (`GetLocaleInfoEx`), read at each open.
     fn number_style(&self) -> NumberStyle;
+    /// The locale's 12/24-hour choice and the order of its short date (`GetLocaleInfoEx`), read at each open.
+    fn time_style(&self) -> TimeStyle {
+        TimeStyle::default()
+    }
+    /// The local time's offset from UTC in minutes (`GetTimeZoneInformation`), read at each open.
+    fn utc_offset_min(&self) -> i32 {
+        0
+    }
     /// Closes the launcher without the session's Hide (no restore).
     fn close_quiet(&mut self);
     /// Posts the close of the open of `seq` (`WM_DOCK_LAUNCHER_CLOSE`), to run outside the message being handled; false
@@ -2508,6 +2517,9 @@ struct Ctrl {
     /// The session's view of the config and the locale's number marks.
     opts: LauncherOpts,
     num: NumberStyle,
+    /// The locale's 12/24-hour choice and date order, and the UTC offset in minutes, read at each open like `num`.
+    time_style: TimeStyle,
+    utc_offset_min: i32,
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
     apps: Arc<Arena>,
     /// The settings cache file mapped at the open (`take_settings`), while the Settings provider is on; dropped at the close.
@@ -2615,6 +2627,8 @@ impl Ctrl {
             width: style::LAUNCHER_W,
             opts: LauncherOpts::default(),
             num: NumberStyle { decimal: '.', group: ',' },
+            time_style: TimeStyle::default(),
+            utc_offset_min: 0,
             apps: Arc::default(),
             settings: None,
             windows: Vec::new(),
@@ -2707,6 +2721,8 @@ impl Ctrl {
             num: self.num,
             learned: &self.frecency,
             now_unix: now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            utc_offset_min: self.utc_offset_min,
+            time_style: self.time_style,
             window_target: self.window_ok,
         }
     }
@@ -3171,12 +3187,16 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
         OpenPlan::TryOpen => {
             let fg = sys.foreground();
             let num = sys.number_style();
+            let time_style = sys.time_style();
+            let utc_offset_min = sys.utc_offset_min();
             let window_ok = sys.window_target(fg);
             with_ctrl(|c| {
                 c.open_seq = seq;
                 c.fg_at_open = fg;
                 c.window_ok = window_ok;
                 c.num = num;
+                c.time_style = time_style;
+                c.utc_offset_min = utc_offset_min;
                 // The first chord the dock sees while Command Palette runs opens with its notice (5.7).
                 if c.pt_on {
                     c.pt.on(PtEvent::FirstChord);
@@ -3213,6 +3233,8 @@ pub(crate) enum PreviewScene {
     Apps,
     Running,
     Calc,
+    /// The date and time rows (")").
+    Time,
     Run,
     RunReview,
     Windows,
@@ -3236,6 +3258,7 @@ impl PreviewScene {
             "apps" => PreviewScene::Apps,
             "running" => PreviewScene::Running,
             "calc" => PreviewScene::Calc,
+            "time" => PreviewScene::Time,
             "run" => PreviewScene::Run,
             "run_review" => PreviewScene::RunReview,
             "windows" => PreviewScene::Windows,
@@ -3340,6 +3363,8 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         },
         learned: &Frecency::new(),
         now_unix: 1_790_000_000,
+        utc_offset_min: 60,
+        time_style: Default::default(),
         window_target: true,
     };
     // The notepad window belongs to the Notepad app: its row shows the running indicator.
@@ -3351,6 +3376,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::Inactive | PreviewScene::Running | PreviewScene::Actions => "note",
         PreviewScene::Apps => "calc",
         PreviewScene::Calc => tr("=2.5*4", "=2,5*4"),
+        PreviewScene::Time => ")",
         PreviewScene::Run => "> ping 1.1.1.1",
         PreviewScene::RunReview => long_line,
         PreviewScene::Windows => "<",
@@ -5133,6 +5159,8 @@ mod tests {
             num: NumberStyle { decimal: '.', group: ',' },
             learned: LEARNED.get_or_init(Frecency::new),
             now_unix: 0,
+            utc_offset_min: 0,
+            time_style: Default::default(),
             window_target: true,
         }
     }
@@ -5490,6 +5518,7 @@ mod tests {
             "launcher_apps",
             "launcher_running",
             "launcher_calc",
+            "launcher_time",
             "launcher_run",
             "launcher_run_review",
             "launcher_windows",

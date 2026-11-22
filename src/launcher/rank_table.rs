@@ -202,6 +202,8 @@ impl World {
             opts: &self.opts,
             num: self.num,
             now_unix: 1_790_000_000,
+            utc_offset_min: 0,
+            time_style: Default::default(),
             learned: &self.learned,
             window_target: true,
         }
@@ -504,6 +506,12 @@ it|> notepad|run notepad|y|
 it|?? meteo roma|web|y|
 it|come fare la pizza|web|y|alone
 it|zzqxzzqx|web|y|alone
+en|)|answer Monday 21 September 2026, 14:13|y|
+it|)|answer lunedì 21 settembre 2026, 14:13|y|
+it|ora|answer lunedì 21 settembre 2026, 14:13|y|
+en|ora|Change or remove a program|-|2:Monday 21 September 2026, 14:13
+en|date|answer Monday 21 September 2026, 14:13|y|
+en|week|answer Week 39|y|
 "#;
 
 /// The rows as (ui, query, first, sel, checks).
