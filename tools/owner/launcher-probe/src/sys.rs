@@ -318,12 +318,15 @@ fn run_oledb(route: &str, conn: &str, sql: &str) -> Result<usize, String> {
         let mut first20_ms = None;
         while n < 50 {
             let mut got = 0usize;
-            let mut rows = [std::ptr::null_mut::<usize>(); 1];
+            // Ownership convention: the caller owns the HROW buffer. rows[0] is non-null, so the provider
+            // writes the row handle into h[0] and allocates nothing (no CoTaskMemFree needed).
+            let mut h = [0usize; 1];
+            let mut rows = [h.as_mut_ptr()];
             rowset.GetNextRows(0, 0, &mut got, &mut rows).map_err(|e| format!("GetNextRows: {e}"))?;
             if got == 0 {
                 break;
             }
-            let hrow = rows[0] as usize;
+            let hrow = h[0];
             let mut data = [Col { status: 0, length: 0, value: std::ptr::null() }; NCOLS];
             let r = rowset.GetData(hrow, hacc, data.as_mut_ptr().cast());
             let cells: Vec<String> = data
