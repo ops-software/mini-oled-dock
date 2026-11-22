@@ -299,6 +299,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
         // SAFETY: for HC_ACTION in a WH_KEYBOARD_LL hook, lparam points to a
         // KBDLLHOOKSTRUCT valid for the whole duration of the callback.
         let kb = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::key_seen(wp.0 as u32);
         let swallowed = handle_key(wp.0 as u32, kb);
         diag(wp.0 as u32, kb, swallowed);
         #[cfg(feature = "owner-probe")]

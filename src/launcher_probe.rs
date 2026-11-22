@@ -7,13 +7,14 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetMessageTime, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, WM_KEYDOWN, WM_SYSKEYDOWN};
 
 use crate::log;
 
@@ -106,7 +107,7 @@ struct OpenProbe {
     /// The end of the last step measured.
     mark: Instant,
     keys: u32,
-    /// From the entry of a key message to the return of `UpdateLayeredWindow` (us), and its wait in the queue (ms).
+    /// From the entry of a key message to the return of `UpdateLayeredWindow` (us), and its wait in the queue (us).
     work: Samples,
     queue: Samples,
     /// `HOOK_US` when the launcher opened.
@@ -238,11 +239,49 @@ pub fn won_foreground(hwnd: HWND) {
 }
 
 /// The entry of a `WM_KEYDOWN` or `WM_CHAR` handling: its start and its wait in the queue, while a launcher is open.
+/// The wait is read in microseconds from two QueryPerformanceCounter stamps (the tick clock moves in 15.6 ms steps, which
+/// cannot judge KEY-1's 4 ms): the keyboard hook's (`key_seen`) and this one.
 pub fn work_start() -> Option<(Instant, u32)> {
     with_open(|_| ())?;
-    // SAFETY: no preconditions; the time of the message being handled.
-    let queued = now().wrapping_sub(unsafe { GetMessageTime() } as u32);
+    let queued = qpc_us(qpc().wrapping_sub(LAST_KEY.load(Relaxed)));
     Some((Instant::now(), queued))
+}
+
+/// The newest key-down the keyboard hook saw, in QueryPerformanceCounter ticks (0 = none).
+static LAST_KEY: AtomicI64 = AtomicI64::new(0);
+
+fn qpc() -> i64 {
+    let mut t = 0i64;
+    // SAFETY: `t` is writable; the call cannot fail on Windows XP and later.
+    let _ = unsafe { QueryPerformanceCounter(&mut t) };
+    t
+}
+
+/// `ticks` of the counter in microseconds (0 for a stamp that was never set or a clock that does not answer).
+fn qpc_us(ticks: i64) -> u32 {
+    static FREQ: OnceLock<i64> = OnceLock::new();
+    let f = *FREQ.get_or_init(|| {
+        let mut f = 0i64;
+        // SAFETY: `f` is writable.
+        let _ = unsafe { QueryPerformanceFrequency(&mut f) };
+        f
+    });
+    ticks_to_us(ticks, f)
+}
+
+/// The pure part of `qpc_us`: a stamp that was never set (the wait would be the whole uptime) or a bad frequency reads 0.
+fn ticks_to_us(ticks: i64, freq: i64) -> u32 {
+    if freq <= 0 || ticks <= 0 {
+        return 0;
+    }
+    u32::try_from(i128::from(ticks) * 1_000_000 / i128::from(freq)).unwrap_or(u32::MAX)
+}
+
+/// The keyboard hook sees event `msg`: a key-down gives the first stamp of the queue measure.
+pub fn key_seen(msg: u32) {
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+        LAST_KEY.store(qpc(), Relaxed);
+    }
 }
 
 /// The handling of that key message ended (its frame presented).
@@ -287,8 +326,13 @@ pub fn closed() {
         let us = max;
         log!("launcher probe: work max {us} us");
     }
-    if let Some((_, ms, _)) = p.queue.percentiles() {
-        log!("launcher probe: queue p95 {ms} ms");
+    if let Some((p50, p95, max)) = p.queue.percentiles() {
+        let us = p50;
+        log!("launcher probe: queue p50 {us} us");
+        let us = p95;
+        log!("launcher probe: queue p95 {us} us");
+        let us = max;
+        log!("launcher probe: queue max {us} us");
     }
     if let Some(ms) = p.present_ms {
         let (queue, prepare, window, render) = (p.queue_ms, p.prepare_us, p.window_us, p.render_us);
@@ -480,6 +524,16 @@ pub fn freeze_ui_once() {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_ticks_read_in_microseconds() {
+        assert_eq!(ticks_to_us(10_000_000, 10_000_000), 1_000_000);
+        assert_eq!(ticks_to_us(2_500, 10_000_000), 250, "a 4 ms budget is judged to the microsecond");
+        assert_eq!(ticks_to_us(0, 10_000_000), 0, "no stamp yet");
+        assert_eq!(ticks_to_us(-5, 10_000_000), 0);
+        assert_eq!(ticks_to_us(5, 0), 0, "no clock");
+        assert_eq!(ticks_to_us(i64::MAX, 1), u32::MAX);
+    }
 
     #[test]
     fn mask_key_values() {
