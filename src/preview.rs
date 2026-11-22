@@ -1092,7 +1092,7 @@ pub fn run(dir: &str) -> i32 {
                 None => false,
             };
             if italian {
-                crate::i18n::set_preview(english_preview(&plan()));
+                crate::i18n::set_preview(english_preview(plan()));
             }
             failures += i32::from(!ok);
         }
