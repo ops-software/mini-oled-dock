@@ -286,6 +286,8 @@ struct Icons {
 impl Icons {
     /// Sizes for `dpi` (the display the window opens on); a failed load leaves a null icon (the
     /// system default is drawn instead).
+    // clippy: kept as is, no runtime change in 1.4.3 (ROADMAP 3.6); rewrite is a follow-up of the stream that owns this file
+    #[allow(clippy::manual_dangling_ptr)]
     fn load(inst: HINSTANCE, dpi: u32) -> Self {
         let one = |metric| -> HICON {
             // SAFETY: no preconditions.

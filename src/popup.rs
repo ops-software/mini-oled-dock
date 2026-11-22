@@ -538,6 +538,8 @@ pub fn is_open() -> bool {
 }
 
 /// Window of the open popup (None if no popup is open).
+// clippy: kept as is, no runtime change in 1.4.3 (ROADMAP 3.6); rewrite is a follow-up of the stream that owns this file
+#[allow(clippy::unnecessary_lazy_evaluations)]
 pub fn current_hwnd() -> Option<HWND> {
     let h = POPUP_HWND.load(std::sync::atomic::Ordering::Relaxed);
     (h != 0 && is_open()).then(|| HWND(h as *mut _))
