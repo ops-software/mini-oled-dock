@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod field;
+pub mod keywords;
 pub mod model;
 pub mod query;
 pub mod rank;
