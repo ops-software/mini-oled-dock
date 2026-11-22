@@ -79,44 +79,50 @@ fn module_name(base: usize) -> String {
     }
 }
 
+/// The `RAM modules` line for a module set: None for the first call (it only stores the baseline and its names) and
+/// when the set did not change. Names of kept and removed modules come from the stored list, `name_of` is asked only
+/// for new bases.
+fn module_line(
+    state: &mut Option<(Vec<usize>, Vec<String>)>,
+    now: Vec<usize>,
+    name_of: impl Fn(usize) -> String,
+) -> Option<String> {
+    let Some((prev, names)) = state.as_mut() else {
+        let names = now.iter().map(|&b| name_of(b)).collect();
+        *state = Some((now, names));
+        return None;
+    };
+    let (added, removed) = module_delta(prev, &now);
+    if added.is_empty() && removed.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(added.len() + removed.len());
+    let mut new_names: Vec<String> = Vec::with_capacity(now.len());
+    for &b in &now {
+        match prev.iter().position(|&p| p == b) {
+            Some(i) => new_names.push(std::mem::take(&mut names[i])),
+            None => new_names.push(name_of(b)),
+        }
+    }
+    for &b in &added {
+        let i = now.iter().position(|&x| x == b).unwrap_or(0);
+        parts.push(format!("+{}", new_names[i]));
+    }
+    for &b in &removed {
+        let i = prev.iter().position(|&x| x == b).unwrap_or(0);
+        parts.push(format!("-{}", names[i]));
+    }
+    *names = new_names;
+    *prev = now;
+    Some(parts.join(" "))
+}
+
 /// Logs `RAM modules +a.dll -b.dll` when the module set changed since the last call (the first call is a baseline).
 /// Returns the module count.
 fn log_module_changes() -> Option<usize> {
     let (total, now) = enum_modules()?;
     let mut guard = MODULES.lock().unwrap_or_else(|e| e.into_inner());
-    let line = match guard.as_mut() {
-        None => {
-            let names = now.iter().map(|&b| module_name(b)).collect();
-            *guard = Some((now, names));
-            None
-        }
-        Some((prev, names)) => {
-            let (added, removed) = module_delta(prev, &now);
-            if added.is_empty() && removed.is_empty() {
-                None
-            } else {
-                let mut parts: Vec<String> = Vec::with_capacity(added.len() + removed.len());
-                let mut new_names: Vec<String> = Vec::with_capacity(now.len());
-                for &b in &now {
-                    match prev.iter().position(|&p| p == b) {
-                        Some(i) => new_names.push(std::mem::take(&mut names[i])),
-                        None => new_names.push(module_name(b)),
-                    }
-                }
-                for &b in &added {
-                    let i = now.iter().position(|&x| x == b).unwrap_or(0);
-                    parts.push(format!("+{}", new_names[i]));
-                }
-                for &b in &removed {
-                    let i = prev.iter().position(|&x| x == b).unwrap_or(0);
-                    parts.push(format!("-{}", names[i]));
-                }
-                *names = new_names;
-                *prev = now;
-                Some(parts.join(" "))
-            }
-        }
-    };
+    let line = module_line(&mut guard, now, module_name);
     drop(guard);
     if let Some(l) = line {
         log!("RAM modules {l}");
@@ -226,28 +232,36 @@ fn free_com_libraries() {
             // SAFETY: paired with the successful CoInitializeEx above.
             unsafe { CoUninitialize() };
         }
+        // What the unloaded DLLs freed on detach is only returned to the system by a compaction after the unload.
+        compact_heaps();
     });
     if let Err(e) = spawned {
         log!("trim: cannot start the com-free thread: {e}");
     }
 }
 
-/// Compacts every process heap (decommits coalesced free blocks) and empties the working set.
-/// Call only while the dock is idle: the next show takes a few soft page faults.
-pub fn trim(reason: &str) {
-    let before = counters();
+/// Compacts every process heap; returns how many there are (0 when they cannot be listed, which is logged).
+/// Safe from any thread: compaction is thread-safe on serialized heaps and merely returns 0 on failure.
+fn compact_heaps() -> usize {
     let mut heaps = [HANDLE::default(); MAX_HEAPS];
     // SAFETY: the slice is writable and its length is the buffer capacity passed to the API.
     let n = unsafe { GetProcessHeaps(&mut heaps) } as usize;
     if n == 0 {
         log!("GetProcessHeaps returned no heaps: {}", windows::core::Error::from_thread());
     }
-    free_com_libraries();
     for h in heaps.iter().take(n.min(MAX_HEAPS)) {
-        // SAFETY: handle returned by GetProcessHeaps for this process; compaction is thread-safe
-        // on serialized heaps and merely returns 0 on failure.
+        // SAFETY: handle returned by GetProcessHeaps for this process.
         let _ = unsafe { HeapCompact(*h, HEAP_FLAGS(0)) };
     }
+    n
+}
+
+/// Compacts every process heap (decommits coalesced free blocks) and empties the working set.
+/// Call only while the dock is idle: the next show takes a few soft page faults.
+pub fn trim(reason: &str) {
+    let before = counters();
+    free_com_libraries();
+    let n = compact_heaps();
     // SAFETY: pseudo handle of the current process has the required access rights.
     if let Err(e) = unsafe { EmptyWorkingSet(GetCurrentProcess()) } {
         log!("EmptyWorkingSet failed: {e}");
@@ -285,6 +299,22 @@ mod tests {
         // Duplicates count once.
         assert_eq!(module_delta(&[1, 1], &[2, 2, 1]), (vec![2], vec![]));
         assert_eq!(module_delta(&[1, 1, 3], &[2]), (vec![2], vec![1, 3]));
+    }
+
+    #[test]
+    fn module_line_baseline_and_names() {
+        let mut st = None;
+        let names = |b: usize| ["?", "a.dll", "b.dll", "c.dll", "d.dll"][b].to_string();
+        // The first sample is a baseline: no line, names stored.
+        assert_eq!(module_line(&mut st, vec![1, 2, 3], names), None);
+        // The removed name comes from the stored list, not from name_of.
+        let line = module_line(&mut st, vec![1, 3, 4], |b| if b == 4 { "d.dll".into() } else { "?".into() });
+        assert_eq!(line.as_deref(), Some("+d.dll -b.dll"));
+        // Unchanged set: no line, and nothing asked for names.
+        assert_eq!(module_line(&mut st, vec![1, 3, 4], |_| unreachable!()), None);
+        // Kept names survived the move.
+        let line = module_line(&mut st, vec![1], |_| unreachable!());
+        assert_eq!(line.as_deref(), Some("-c.dll -d.dll"));
     }
 
     #[test]
