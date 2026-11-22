@@ -7,7 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{HWND, RECT};
@@ -270,6 +270,8 @@ pub(crate) struct Launcher {
     foreground: bool,
     /// App icons by lower-case id, the bar's by "bar:" and the lower-case group key.
     icons: HashMap<String, IconBitmap>,
+    /// The lower-case app ids whose icons this open asked the shell thread for (`ask_icons`), each once.
+    asked: RefCell<HashSet<String>>,
     /// First visible row, and the selection the last layout saw (the view follows a new selection, not a wheel).
     first: Cell<usize>,
     last_sel: Cell<Option<usize>>,
@@ -314,6 +316,7 @@ impl Launcher {
             max_h: i32::MAX,
             foreground: false,
             icons: HashMap::new(),
+            asked: RefCell::new(HashSet::new()),
             first: Cell::new(0),
             last_sel: Cell::new(None),
             scroll: Cell::new(0),
@@ -399,10 +402,6 @@ impl Launcher {
                         let more = self.session.paste(&text, cx);
                         reply = reply.merge(self.run(more, cx, sys));
                     }
-                }
-                Effect::RequestIcons(ids) => {
-                    let ids = ids.into_iter().map(String::from).collect();
-                    sys.shell(ShellRequest::StartIconsFor { icon_px: self.icon_px, ids });
                 }
                 Effect::ForgetRun(line) => self.forgotten.push(line),
                 // Nothing matched: Windows' typo rewrite is read on the shell thread (a 1.4 MB file) and comes back as a
@@ -950,6 +949,42 @@ impl Launcher {
         }
     }
 
+    /// The app rows of `g` whose icon is neither in hand nor asked for in this open: one `StartIconsFor` for them all
+    /// (its reply, `LauncherIcons`, fills the cache and the rows, `on_icons`). Painting is where the rows on screen are
+    /// final: a selection moved by an arrow scrolls them with a redraw, without a new size.
+    fn ask_icons(&self, g: &Geo, sys: &mut dyn SysPort) {
+        let Ok(mut asked) = self.asked.try_borrow_mut() else { return };
+        let mut ids = Vec::new();
+        for rg in &g.rows {
+            let Some(IconRef::App(id)) = self.session.rows().get(rg.idx).map(|i| &i.icon) else { continue };
+            let key = id.to_lowercase();
+            if !self.icons.contains_key(&key) && asked.insert(key) {
+                ids.push(id.to_string());
+            }
+        }
+        if !ids.is_empty() {
+            sys.shell(ShellRequest::StartIconsFor { icon_px: self.icon_px, ids });
+        }
+    }
+
+    /// `Content::paint` on a port: the rows on screen ask for the icons they lack.
+    fn paint_on(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>, sys: &mut dyn SysPort) {
+        s.panel();
+        let g = self.layout(s);
+        self.paint_field(s, &g, hot == Some(ID_FIELD));
+        let sel = self.session.selected_index();
+        for rg in &g.rows {
+            let Some(item) = self.session.rows().get(rg.idx) else { continue };
+            let id = ID_ROW + u32::try_from(rg.idx).unwrap_or(0);
+            self.paint_row(s, rg, item, self.foreground && sel == Some(rg.idx), pressed == Some(id));
+        }
+        self.paint_scrollbar(s, &g, false);
+        self.ask_icons(&g, sys);
+        if let Ok(mut slot) = self.geo.try_borrow_mut() {
+            *slot = g;
+        }
+    }
+
     fn paint_scrollbar(&self, s: &mut Surface, g: &Geo, hot: bool) {
         if g.total <= g.rows.len() || g.rows.is_empty() {
             return;
@@ -1070,19 +1105,7 @@ impl Content for Launcher {
     }
 
     fn paint(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>) {
-        s.panel();
-        let g = self.layout(s);
-        self.paint_field(s, &g, hot == Some(ID_FIELD));
-        let sel = self.session.selected_index();
-        for rg in &g.rows {
-            let Some(item) = self.session.rows().get(rg.idx) else { continue };
-            let id = ID_ROW + u32::try_from(rg.idx).unwrap_or(0);
-            self.paint_row(s, rg, item, self.foreground && sel == Some(rg.idx), pressed == Some(id));
-        }
-        self.paint_scrollbar(s, &g, false);
-        if let Ok(mut slot) = self.geo.try_borrow_mut() {
-            *slot = g;
-        }
+        self.paint_on(s, hot, pressed, &mut RealSys);
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
@@ -2818,6 +2841,38 @@ mod tests {
     /// The ops without the shrink timer the keystrokes arm.
     fn ops(sys: &EffectSys) -> Vec<String> {
         sys.ops.iter().filter(|o| !o.starts_with("Arm(")).cloned().collect()
+    }
+
+    #[test]
+    fn visible_rows_ask_once_for_their_missing_icons() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let show = |l: &mut Launcher, sys: &mut EffectSys| {
+            let mut s = surface(96);
+            l.size(&s);
+            l.paint_on(&mut s, None, None, sys);
+        };
+        let asks = |sys: &EffectSys| -> Vec<String> {
+            sys.ops.iter().filter(|o| o.starts_with("Shell(StartIconsFor")).cloned().collect()
+        };
+        let calc = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+        let want = format!("Shell({:?})", ShellRequest::StartIconsFor { icon_px: 24, ids: vec![calc.to_string()] });
+        // "calc": one request, for the app row on screen (the other rows draw glyphs).
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "calc");
+        show(&mut l, &mut sys);
+        assert_eq!(asks(&sys), [want], "{:?}", sys.ops);
+        // The next keystroke and a repaint show the same app: nothing is asked again in this open.
+        l.session.chars("o", &fx.cx());
+        show(&mut l, &mut sys);
+        show(&mut l, &mut sys);
+        assert_eq!(asks(&sys).len(), 1, "{:?}", sys.ops);
+        // A row whose icon is in hand never asks.
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "calc");
+        l.set_icon(calc, IconBitmap::new(24, 24));
+        show(&mut l, &mut sys);
+        assert!(asks(&sys).is_empty(), "{:?}", sys.ops);
     }
 
     #[test]

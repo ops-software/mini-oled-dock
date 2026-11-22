@@ -40,8 +40,6 @@ pub enum Effect {
     Forget(ItemKey),
     /// Forget a run-history line.
     ForgetRun(Box<str>),
-    /// Icons of these app ids (the view asks for the rows it shows).
-    RequestIcons(Vec<Box<str>>),
     /// Ask the files provider for this generation (L2).
     RequestFiles(u64),
     /// Nothing matched: ask Windows' typo rewrite for this generation (tier 7, L1a-15d).
