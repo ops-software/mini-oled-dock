@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod calc;
+pub mod commands;
 pub mod field;
 pub mod history;
 pub mod keywords;
@@ -14,6 +15,7 @@ pub mod runline;
 pub mod strings;
 pub mod style;
 pub mod verbs;
+pub mod web;
 
 #[cfg(test)]
 mod lints;
