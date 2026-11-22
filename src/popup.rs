@@ -115,6 +115,16 @@ pub struct Anchor {
     pub dpi: u32,
 }
 
+/// Where a centred popup opens (the launcher, SPEC 5.2.1): the work area (screen px) and DPI of its monitor, and the
+/// top edge as a percentage of the work height. The panel grows downward only.
+#[derive(Clone, Copy, Debug)]
+pub struct Centred {
+    pub work: RECT,
+    pub dpi: u32,
+    /// The top edge sits at `work.top` plus this percentage of the work height.
+    pub top_percent: u8,
+}
+
 /// Data of the app item for the themed context menu (`open_app_menu`).
 #[derive(Clone, Debug, Default)]
 pub struct AppMenuInfo {
@@ -166,7 +176,7 @@ pub fn open_app_menu(anchor: Anchor, info: AppMenuInfo) {
             *g = Some(info);
         }
     });
-    open(PopupKind::AppMenu, anchor);
+    open(PopupKind::AppMenu, anchor, None);
 }
 
 /// Key of the app chosen last in the context menu (consumes it). UI thread.
@@ -364,6 +374,8 @@ struct Open {
     wheel_acc: i32,
     /// Foreground retries still allowed (`TIMER_POPUP_FOCUS`) while the popup is not foreground.
     focus_tries: u8,
+    /// Set for a centred popup (the launcher): placed on that work area instead of next to `anchor`.
+    centred: Option<Centred>,
 }
 
 /// Delay between two foreground retries after open.
@@ -481,13 +493,26 @@ pub fn toggle(kind: PopupKind, anchor: Anchor) {
     match plan {
         Plan::Skip => {}
         Plan::Close => close_inner("toggle"),
-        Plan::Open => open(kind, anchor),
+        Plan::Open => {
+            open(kind, anchor, None);
+        }
     }
 }
 
 /// Closes the open popup (no-op if none). `reason` is for the log only.
 pub fn close(reason: &str) {
     close_inner(reason);
+}
+
+/// Opens popup `kind` centred on `c.work` (the launcher), first closing any other popup: the open path of `toggle`
+/// with the placement of `Centred`. false when nothing is shown (no popups, no surface, or the first render failed).
+// The launcher's chord flow (L1a-15) calls it; until then nothing does.
+#[allow(dead_code)]
+pub fn open_centred(kind: PopupKind, c: Centred) -> bool {
+    if !is_available() {
+        return false;
+    }
+    open(kind, Anchor { item: c.work, bar: c.work, top: false, dpi: c.dpi }, Some(c))
 }
 
 /// Links the open popup to the bar's show/hide animation (Win with `win_opens_start`): its own fade
@@ -889,11 +914,40 @@ pub(crate) fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
     (x, y)
 }
 
-fn open(kind: PopupKind, anchor: Anchor) {
+/// The top edge of a centred popup: `top_percent` of the work height below the work-area top.
+fn centred_top(c: &Centred) -> i32 {
+    c.work.top + (c.work.bottom - c.work.top) * i32::from(c.top_percent.min(100)) / 100
+}
+
+/// Largest size of a centred popup: the work width minus `margin` on each side, and from its top edge down to
+/// `margin` above the work-area bottom (it never moves up to make room).
+fn centred_max(c: &Centred, margin: i32) -> (i32, i32) {
+    ((c.work.right - c.work.left - 2 * margin).max(1), (c.work.bottom - margin - centred_top(c)).max(1))
+}
+
+/// Position and size `(x, y, w, h)` of a centred popup that wants `w` x `h`: capped by `centred_max`,
+/// horizontally centred on the work area, its top edge at `centred_top`.
+fn centred_place(c: &Centred, margin: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let (mw, mh) = centred_max(c, margin);
+    let (w, h) = (w.min(mw).max(1), h.min(mh).max(1));
+    (c.work.left + (c.work.right - c.work.left - w) / 2, centred_top(c), w, h)
+}
+
+/// Alpha a popup opens at: the launcher shows at once (its field takes the typing), every other kind fades in.
+fn initial_alpha(kind: PopupKind) -> u8 {
+    if kind == PopupKind::Launcher {
+        255
+    } else {
+        0
+    }
+}
+
+/// Opens `kind` (see `toggle` and `open_centred`); false when nothing is shown.
+fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     // Any other popup closes without a fade; so does the window picker.
     close_inner("popup switch");
     crate::picker::close("popup opened");
-    let Some(hwnd) = ensure_window() else { return };
+    let Some(hwnd) = ensure_window() else { return false };
     if kind == PopupKind::StartMenu {
         // SAFETY: our window; fails harmlessly if the timer is not armed.
         let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
@@ -903,13 +957,13 @@ fn open(kind: PopupKind, anchor: Anchor) {
         Ok(s) => s,
         Err(e) => {
             log!("popup: Surface::new failed: {e}");
-            return;
+            return false;
         }
     };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     let Some((volume, net, battery)) = with(|st| (st.last_volume, st.last_net.clone(), st.last_battery)) else {
-        return;
+        return false;
     };
     let content = make_content(kind, volume, net, battery);
     debug_assert_eq!(content.kind(), kind);
@@ -925,21 +979,22 @@ fn open(kind: PopupKind, anchor: Anchor) {
             pressed: None,
             tracking: false,
             fade_start: now_ms(),
-            alpha: 0,
+            alpha: initial_alpha(kind),
             linked: false,
             dy: 0,
             fg_at_open: fg,
             was_active: false,
             wheel_acc: 0,
             focus_tries: FOCUS_RETRIES,
+            centred,
         });
     });
     if installed.is_none() {
-        return;
+        return false;
     }
     if !render(true) {
         close_inner("initial render failed");
-        return;
+        return false;
     }
     log!("popup: opening {kind:?}");
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
@@ -963,7 +1018,7 @@ fn open(kind: PopupKind, anchor: Anchor) {
         if !focused && SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) == 0 {
             log!("popup: SetTimer(focus) failed");
         }
-        if SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
+        if initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
             log!("popup: SetTimer(anim) failed");
         }
         if SetTimer(Some(hwnd), TIMER_POPUP_TICK, 1000, None) == 0 {
@@ -975,6 +1030,7 @@ fn open(kind: PopupKind, anchor: Anchor) {
             o.fade_start = now_ms();
         }
     });
+    true
 }
 
 /// Closes the open popup. Idempotent.
@@ -1037,10 +1093,22 @@ fn render(relayout: bool) -> bool {
         let mut surf = o.surf.take()?;
         // A previous failed resize leaves the surface without a DIB (0 x 0): retry the layout.
         if relayout || surf.size() == (0, 0) {
-            o.content.limit(max_size(&o.anchor));
-            let (w, h) = o.content.size(&surf);
-            let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
-            let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
+            let (w, h, centred_at) = match o.centred {
+                Some(c) => {
+                    let margin = Metrics { dpi: c.dpi }.px(POPUP_SCREEN_MARGIN);
+                    o.content.limit(centred_max(&c, margin));
+                    let (w, h) = o.content.size(&surf);
+                    let (x, y, w, h) = centred_place(&c, margin, w, h);
+                    (w, h, Some((x, y)))
+                }
+                None => {
+                    o.content.limit(max_size(&o.anchor));
+                    let (w, h) = o.content.size(&surf);
+                    let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
+                    let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
+                    (w, h, None)
+                }
+            };
             if let Err(e) = surf.resize(w.max(1), h.max(1)) {
                 log!("popup: resize failed: {e}");
                 // The surface goes back into the state: the next render retries instead of staying
@@ -1048,7 +1116,7 @@ fn render(relayout: bool) -> bool {
                 o.surf = Some(surf);
                 return None;
             }
-            o.pos = compute_pos(&o.anchor, w.max(1), h.max(1));
+            o.pos = centred_at.unwrap_or_else(|| compute_pos(&o.anchor, w.max(1), h.max(1)));
         }
         o.content.paint(&mut surf, o.hot, o.pressed);
         Some((hwnd, surf, o.pos, o.alpha, o.dy))
@@ -1641,6 +1709,27 @@ mod tests {
         assert_eq!(window_name_for(PopupKind::Launcher), "Launcher");
         assert_eq!(window_name_for(PopupKind::StartMenu), "Dock popup");
         assert_eq!(window_name_for(PopupKind::Audio), "Dock popup");
+    }
+
+    #[test]
+    fn centred_position() {
+        let c = Centred { work: RECT { left: 0, top: 0, right: 1920, bottom: 1040 }, dpi: 96, top_percent: 24 };
+        assert_eq!(centred_max(&c, 8), (1904, 1040 - 8 - 249));
+        assert_eq!(centred_place(&c, 8, 640, 422), (640, 249, 640, 422), "1040 * 24 % = 249.6: the top edge at 249");
+        // 720 high: the panel grows down to 8 px above the work-area bottom and no further, it never moves up.
+        let small = Centred { work: RECT { left: 0, top: 0, right: 1280, bottom: 720 }, ..c };
+        assert_eq!(centred_place(&small, 8, 640, 600), (320, 172, 640, 540));
+        assert_eq!(centred_place(&small, 8, 2000, 100), (8, 172, 1264, 100), "never wider than the work area");
+        // A monitor left of the primary one with a work area that does not start at 0.
+        let left = Centred { work: RECT { left: -1280, top: 100, right: 0, bottom: 820 }, ..c };
+        assert_eq!(centred_place(&left, 8, 640, 62), (-960, 272, 640, 62));
+    }
+
+    #[test]
+    fn launcher_opens_at_full_alpha() {
+        assert_eq!(initial_alpha(PopupKind::Launcher), 255, "no fade: the field is there at once");
+        assert_eq!(initial_alpha(PopupKind::StartMenu), 0);
+        assert_eq!(initial_alpha(PopupKind::Audio), 0);
     }
 
     #[test]
