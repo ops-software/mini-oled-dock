@@ -1561,9 +1561,10 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             return false;
         }
         // The launcher's replies: it handles them from L1a-15; nothing asks for them yet.
-        ShellEvent::LaunchFailed { .. } | ShellEvent::LauncherIcons { .. } | ShellEvent::LauncherConverted { .. } => {
-            return false
-        }
+        ShellEvent::LaunchFailed { .. }
+        | ShellEvent::LauncherIcons { .. }
+        | ShellEvent::LauncherConverted { .. }
+        | ShellEvent::LauncherState { .. } => return false,
         other => other,
     };
     UI.with(|u| {
@@ -1605,7 +1606,8 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             | ShellEvent::AudioSessions(_)
             | ShellEvent::LaunchFailed { .. }
             | ShellEvent::LauncherIcons { .. }
-            | ShellEvent::LauncherConverted { .. } => false,
+            | ShellEvent::LauncherConverted { .. }
+            | ShellEvent::LauncherState { .. } => false,
         }
     })
 }

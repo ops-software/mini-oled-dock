@@ -291,7 +291,6 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// `<root>\cache\<sid>`, the launcher's history folder of the shell user `sid`, created or checked and
 /// re-secured with `user_cache_sddl` (elevated, verified root only). Anything that is not a SID string is
 /// refused before it reaches a path or an SDDL string.
-#[allow(dead_code)] // the shell thread's launcher state files (next commit)
 pub fn user_cache_dir(sid: &str) -> Result<PathBuf, String> {
     let sddl = user_cache_sddl(sid).ok_or_else(|| "not a SID".to_string())?;
     let r = writable_root()?;

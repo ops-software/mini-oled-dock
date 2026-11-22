@@ -253,6 +253,14 @@ pub enum ShellRequest {
     /// pending one.
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     LauncherConvert { gen: u64, query: String },
+    /// The launcher's first open of a session: the shell user's SID and history files ->
+    /// `ShellEvent::LauncherState`, read on this thread from that user's `cache\<SID>` only.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LauncherStateLoad,
+    /// Writes the launcher's history files (`Some` = this content, `None` = left as it is); `delete`
+    /// removes both instead ("learn" off, Forget history).
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LauncherStateSave { frecency: Option<Vec<u8>>, run: Option<Vec<u8>>, delete: bool },
 }
 
 /// The icons a `ListStartApps` queues.
@@ -303,6 +311,10 @@ pub enum ShellEvent {
     /// `None` = no rewrite.
     #[allow(dead_code)] // read by the launcher (L1a-15)
     LauncherConverted { gen: u64, meant: Option<String> },
+    /// The shell user's SID and the launcher's history files (reply to `LauncherStateLoad`); `None`
+    /// for what could not be found or read.
+    #[allow(dead_code)] // read by the launcher (L1a-15)
+    LauncherState { sid: Option<String>, frecency: Option<Vec<u8>>, run: Option<Vec<u8>> },
 }
 
 /// What a failed launcher launch was (`ShellEvent::LaunchFailed`).
@@ -622,6 +634,8 @@ impl Shell {
             | ShellRequest::LauncherRevealApp { .. }) => launcher_launch(self.ui, req),
             ShellRequest::StartIconsFor { icon_px, ids } => launcher_icons(self.ui, icon_px, ids),
             ShellRequest::LauncherConvert { gen, query } => launcher_convert(self.ui, gen, &query),
+            ShellRequest::LauncherStateLoad => launcher_state_load(self.ui),
+            ShellRequest::LauncherStateSave { frecency, run, delete } => launcher_state_save(frecency, run, delete),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -1832,6 +1846,140 @@ fn launcher_convert(ui: isize, gen: u64, query: &str) {
     push_event(ui, ShellEvent::LauncherConverted { gen, meant });
 }
 
+/// The launcher's history files, in the shell user's folder (`datadir::user_cache_dir`).
+const STATE_FILES: [&str; 2] = ["launcher-frecency.txt", "launcher-run.txt"];
+/// The largest history file read or written.
+const STATE_MAX_BYTES: u64 = 65_536;
+
+/// The SID of the shell's user: the token user of the process that owns the shell window (Explorer),
+/// so under Administrator protection the history is the person's at the keyboard, not the account's
+/// the elevated dock runs as. Only this SID's folder is ever opened.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn shell_user_sid() -> Result<String, String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{TokenUser, TOKEN_USER};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::UI::WindowsAndMessaging::GetShellWindow;
+
+    // SAFETY: no preconditions.
+    let shell = unsafe { GetShellWindow() };
+    if shell.0.is_null() {
+        return Err("no shell window".into());
+    }
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale window only yields 0.
+    unsafe { GetWindowThreadProcessId(shell, Some(&mut pid)) };
+    if pid == 0 {
+        return Err("no shell process".into());
+    }
+    // SAFETY: a query-only open of that pid; the handle is owned (and closed) by `_process`.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|e| format!("OpenProcess: {e}"))?;
+    // SAFETY: fresh valid handle, owned from here on.
+    let _process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is valid; `token` is writable.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.map_err(|e| format!("OpenProcessToken: {e}"))?;
+    // SAFETY: fresh valid token handle, owned from here on.
+    let _token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut len = 0u32;
+    // SAFETY: size query; `len` is writable. The expected "buffer too small" error is ignored.
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
+    if (len as usize) < std::mem::size_of::<TOKEN_USER>() {
+        return Err("TokenUser: no size".into());
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `len` writable, pointer-aligned bytes.
+    unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) }
+        .map_err(|e| format!("TokenUser: {e}"))?;
+    // SAFETY: the buffer starts with a TOKEN_USER whose SID points inside `buf`, alive until the end.
+    let tu = unsafe { std::ptr::read(buf.as_ptr().cast::<TOKEN_USER>()) };
+    let mut s = PWSTR::null();
+    // SAFETY: `tu.User.Sid` points to a valid SID inside `buf`; `s` receives a LocalAlloc'd string.
+    unsafe { ConvertSidToStringSidW(tu.User.Sid, &mut s) }.map_err(|e| format!("ConvertSidToStringSidW: {e}"))?;
+    // SAFETY: `s` is the NUL-terminated string returned above.
+    let out = unsafe { s.to_string() };
+    // SAFETY: allocated by ConvertSidToStringSidW with LocalAlloc; not used afterwards.
+    unsafe { LocalFree(Some(HLOCAL(s.0.cast()))) };
+    drop(buf);
+    out.map_err(|e| format!("SID string: {e}"))
+}
+
+/// The history files in `dir`: (frecency, run); `None` for a file that is missing, over 64 KiB or not a
+/// single-link regular file (opened without following reparse points).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn load_state_from(dir: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let read = |name: &str| match crate::datadir::read_file(&dir.join(name), STATE_MAX_BYTES, true) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log!("shell: a launcher history file is not used: {e}");
+            None
+        }
+    };
+    let [frecency, run] = STATE_FILES;
+    (read(frecency), read(run))
+}
+
+/// Writes (`Some`) or leaves (`None`) each history file in `dir`, atomically and with the folder's
+/// DACL; `delete` removes both instead.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn save_state_to(dir: &Path, frecency: Option<Vec<u8>>, run: Option<Vec<u8>>, delete: bool) -> Result<(), String> {
+    if delete {
+        for name in STATE_FILES {
+            match std::fs::remove_file(dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("removing a history file: {e}")),
+            }
+        }
+        return Ok(());
+    }
+    let [f_name, r_name] = STATE_FILES;
+    for (name, bytes) in [(f_name, frecency), (r_name, run)] {
+        let Some(bytes) = bytes else { continue };
+        if bytes.len() as u64 > STATE_MAX_BYTES {
+            return Err("a history file over 64 KiB".into());
+        }
+        crate::datadir::write_atomic(&dir.join(name), &bytes, crate::datadir::FileAcl::Inherit)?;
+    }
+    Ok(())
+}
+
+/// `LauncherStateLoad`: the shell user's SID and history files -> `ShellEvent::LauncherState`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launcher_state_load(ui: isize) {
+    let sid = match shell_user_sid() {
+        Ok(sid) => Some(sid),
+        Err(e) => {
+            log!("shell: LauncherStateLoad: no shell user ({e})");
+            None
+        }
+    };
+    let (frecency, run) = match sid.as_deref().map(crate::datadir::user_cache_dir) {
+        Some(Ok(dir)) => load_state_from(&dir),
+        Some(Err(e)) => {
+            log!("shell: LauncherStateLoad: no history folder ({e})");
+            (None, None)
+        }
+        None => (None, None),
+    };
+    push_event(ui, ShellEvent::LauncherState { sid, frecency, run });
+}
+
+/// `LauncherStateSave`: into the shell user's folder, nowhere else.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launcher_state_save(frecency: Option<Vec<u8>>, run: Option<Vec<u8>>, delete: bool) {
+    let r = shell_user_sid()
+        .and_then(|sid| crate::datadir::user_cache_dir(&sid))
+        .and_then(|dir| save_state_to(&dir, frecency, run, delete));
+    if let Err(e) = r {
+        log!("shell: LauncherStateSave not done ({e})");
+    }
+}
+
 /// `OpenPath`: refuses an empty path or one with a control character, then exactly one shell call
 /// with the path as it is: no `updated_exe_path`, no `is_dir`, no working directory, so nothing
 /// the launcher found or the user typed touches the file system from the elevated process.
@@ -2707,5 +2855,29 @@ mod tests {
         assert_eq!(pending.len(), 3);
         assert!(matches!(next_request(&mut pending), Some(ShellRequest::VolumeRefresh)));
         assert!(matches!(next_request(&mut pending), Some(ShellRequest::LauncherConvert { gen: 2, .. })));
+    }
+
+    #[test]
+    fn launcher_state_files_round_trip() {
+        let dir = std::env::temp_dir().join(format!("dock_launcher_state_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let b = |s: &[u8]| Some(s.to_vec());
+        assert_eq!(load_state_from(&dir), (None, None), "no files yet");
+        assert!(save_state_to(&dir, b(b"f1"), b(b"r1"), false).is_ok());
+        assert!(dir.join("launcher-frecency.txt").is_file() && dir.join("launcher-run.txt").is_file());
+        assert_eq!(load_state_from(&dir), (b(b"f1"), b(b"r1")));
+        // None leaves a file as it is.
+        assert!(save_state_to(&dir, None, b(b"r2"), false).is_ok());
+        assert_eq!(load_state_from(&dir), (b(b"f1"), b(b"r2")));
+        // Over 64 KiB: never written, never read.
+        assert!(save_state_to(&dir, Some(vec![b'x'; 65_537]), None, false).is_err());
+        assert_eq!(load_state_from(&dir).0, b(b"f1"));
+        assert!(std::fs::write(dir.join("launcher-run.txt"), vec![b'x'; 65_537]).is_ok());
+        assert_eq!(load_state_from(&dir).1, None);
+        // delete removes both, whatever else the request carries.
+        assert!(save_state_to(&dir, b(b"f3"), None, true).is_ok());
+        assert_eq!(load_state_from(&dir), (None, None));
+        assert!(save_state_to(&dir, None, None, true).is_ok(), "nothing to delete is no failure");
+        let _ = std::fs::remove_dir(&dir);
     }
 }
