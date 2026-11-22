@@ -12,7 +12,7 @@ use super::model::{
 };
 use super::query::{self, Implicit, PrefixTable};
 use super::rank::{self, Cand, Indexed};
-use super::runline::{self, Known, Source};
+use super::runline::{self, Source};
 use super::strings;
 use super::style;
 use super::verbs::{verbs_for, verbs_for_file};
@@ -54,10 +54,10 @@ pub struct Context<'a> {
     pub windows: &'a [WindowRow],
     /// Run history, newest first.
     pub history: &'a [Box<str>],
-    pub known: &'static [Known],
     pub opts: &'a LauncherOpts,
     /// The locale's number marks, read at open.
     pub num: NumberStyle,
+    #[allow(dead_code)] // L1b-3 (frecency) and L2-4 (date and time) read the clock of the keystroke
     pub now_unix: i64,
     /// The window in front when the chord came can take the window menu: there, not the desktop, not one of the dock's
     /// own windows. Without one the Window menu row is disabled.
@@ -84,6 +84,7 @@ impl TopK {
         TopK { cap, items: Vec::with_capacity(cap) }
     }
 
+    #[cfg(test)]
     pub fn cap(&self) -> usize {
         self.cap
     }
@@ -92,10 +93,12 @@ impl TopK {
         self.items.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
+    #[cfg(test)]
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -786,10 +789,6 @@ impl Results {
         &self.rows
     }
 
-    pub fn gen(&self) -> u64 {
-        self.gen
-    }
-
     pub fn selected(&self) -> Option<&Item> {
         let key = self.sel?;
         self.rows.iter().find(|r| r.key == key)
@@ -998,7 +997,6 @@ pub(crate) mod tests {
                 settings: &self.settings,
                 windows: &self.windows,
                 history: &self.history,
-                known: &runline::KNOWN,
                 opts: &self.opts,
                 num: NUM_IT,
                 now_unix: 1_790_000_000,

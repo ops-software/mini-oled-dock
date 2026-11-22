@@ -35,12 +35,14 @@ pub enum Effect {
     /// The window menu of the window of the open, after the restore.
     WindowMenu,
     /// Settings > Launcher (L1b).
+    #[allow(dead_code)] // L1b-7 builds it
     OpenSettings,
     /// Forget a learned row (frecency, L1b).
     Forget(ItemKey),
     /// Forget a run-history line.
     ForgetRun(Box<str>),
     /// Ask the files provider for this generation (L2).
+    #[allow(dead_code)] // L2-2 builds it
     RequestFiles(u64),
     /// Nothing matched: ask Windows' typo rewrite for this generation (tier 7, L1a-15d).
     RequestRewrite {
@@ -273,6 +275,7 @@ impl Session {
 
     /// The text the view shows whole under the selected row (the review detail of 5.3) before Run as administrator can
     /// act on it: the typed run line, or the path of a file row that offers Run as administrator.
+    #[cfg(test)]
     pub fn review_text(&self) -> Option<&str> {
         self.selected().and_then(review_text)
     }

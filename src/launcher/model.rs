@@ -45,6 +45,7 @@ impl ProviderId {
         })
     }
 
+    #[cfg(test)]
     pub fn name(self) -> &'static str {
         match self {
             ProviderId::Apps => "apps",
@@ -129,6 +130,7 @@ pub struct Query<'a> {
 }
 
 /// A query that a worker thread owns.
+#[allow(dead_code)] // L2-2: the files worker takes it
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OwnedQuery {
     pub text: String,
@@ -139,6 +141,7 @@ pub struct OwnedQuery {
 }
 
 impl Query<'_> {
+    #[allow(dead_code)] // L2-2: the files worker is sent it
     pub fn to_owned_query(&self) -> OwnedQuery {
         OwnedQuery {
             text: self.text.to_string(),
@@ -151,9 +154,11 @@ impl Query<'_> {
 }
 
 /// Checked between row fetches by an asynchronous provider.
+#[allow(dead_code)] // L2-2: the files worker checks it
 #[derive(Clone, Default, Debug)]
 pub struct CancelToken(Arc<AtomicBool>);
 
+#[allow(dead_code)] // L2-2: the files worker checks it
 impl CancelToken {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
@@ -220,6 +225,7 @@ pub enum CommandId {
     SignOut,
     Registry,
     WindowMenu,
+    #[allow(dead_code)] // L2-6: the Clipboard history command
     ClipboardHistory,
 }
 
@@ -235,8 +241,11 @@ pub struct RunLine {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileClass {
     Executable,
+    #[allow(dead_code)] // L2-1: the files provider's classes
     Document,
+    #[allow(dead_code)] // L2-1
     Image,
+    #[allow(dead_code)] // L2-1
     Archive,
     Other,
 }
@@ -268,16 +277,20 @@ pub enum Payload {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GlyphId {
+    #[allow(dead_code)] // L1b-2: the action list's Open
     Magnifier,
     Equals,
     Prompt,
     Window,
     Document,
+    #[allow(dead_code)] // L2-3: file rows
     Image,
+    #[allow(dead_code)] // L2-3: file rows
     Archive,
     Executable,
     Copy,
     Globe,
+    #[allow(dead_code)] // L2-4: date and time
     Clock,
     Folder,
     Info,
@@ -296,6 +309,7 @@ pub enum IconRef {
     /// The bar's icon of a group key.
     Bar(Box<str>),
     Glyph(GlyphId),
+    #[cfg(test)]
     Placeholder,
 }
 
@@ -323,6 +337,7 @@ pub struct Batch {
 }
 
 /// An asynchronous provider (files, L2): its own worker thread, abandon-and-replace.
+#[allow(dead_code)] // L2-2: the files worker implements it
 pub trait AsyncProvider: Send {
     fn id(&self) -> ProviderId;
     fn wants(&self, q: &Query) -> bool;
@@ -357,6 +372,7 @@ pub enum Verb {
 }
 
 /// Why a verb exists (5.1 scope tags).
+#[allow(dead_code)] // L1b-2: the action list reads the verb table
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tag {
     OwnerAsked,
@@ -409,6 +425,7 @@ impl Mods {
     }
 }
 
+#[allow(dead_code)] // L1b-2: the action list reads the verb table
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyChord {
     pub vk: u16,
@@ -436,6 +453,7 @@ impl ChordSpec {
     }
 }
 
+#[allow(dead_code)] // L1b-2: the action list reads the verb table
 #[derive(Clone, Copy)]
 pub struct VerbSpec {
     pub verb: Verb,

@@ -4,19 +4,27 @@ use super::gesture;
 use super::model::{FileClass, GlyphId, KeyChord, Kind, Mods, Tag, Verb, VerbSet, VerbSpec};
 use super::strings;
 
+// The verb table below is read by the action list (L1b-2); until then only the tests read it.
+#[allow(dead_code)]
 const VK_RETURN: u16 = 0x0D;
+#[allow(dead_code)]
 const VK_DELETE: u16 = 0x2E;
+#[allow(dead_code)]
 const VK_C: u16 = 0x43;
+#[allow(dead_code)]
 const VK_W: u16 = 0x57;
 
+#[allow(dead_code)]
 const fn chord(vk: u16, mods: Mods) -> Option<KeyChord> {
     Some(KeyChord { vk, mods })
 }
 
+#[allow(dead_code)]
 const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
 
 /// In the order of `Verb`: `VERBS[verb as usize]` is that verb's spec. Ctrl+Shift+E also reveals; the key handler of the session
 /// maps it, since a spec carries one chord.
+#[allow(dead_code)] // L1b-2: the action list
 pub static VERBS: [VerbSpec; 8] = [
     VerbSpec {
         verb: Verb::Open,
@@ -85,6 +93,7 @@ pub static VERBS: [VerbSpec; 8] = [
 ];
 
 /// The spec of a verb.
+#[allow(dead_code)] // L1b-2: the action list
 pub fn spec(v: Verb) -> &'static VerbSpec {
     // The table is in the order of the enum (tested), so the index cannot miss; the fallback is never taken.
     VERBS.get(v as usize).unwrap_or(&VERBS[0])

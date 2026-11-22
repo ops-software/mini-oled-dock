@@ -1,4 +1,7 @@
 //! Design tokens of the launcher (A05 section 7). Values that exist in code are aliases, never copies.
+// The whole table, on purpose: the tokens of L1b and L2 (compact rows, the width step of Settings > Launcher, the busy
+// mark, danger and disabled colours) are here before their users. Constants only, so nothing else can hide behind it.
+#![allow(dead_code)]
 
 use crate::surface;
 

@@ -21,8 +21,12 @@ pub enum Edit {
     Delete,
     DeleteWordLeft,
     DeleteWordRight,
-    Move { by: Motion, extend: bool },
+    Move {
+        by: Motion,
+        extend: bool,
+    },
     SelectAll,
+    #[allow(dead_code)] // Ctrl+X: the session maps it with the rest of the TextField (L1b-1)
     Cut,
 }
 
@@ -55,7 +59,6 @@ pub struct TextField {
     caret: usize,
     anchor: usize,
     max_chars: u16,
-    scroll_x: i32,
 }
 
 impl Default for TextField {
@@ -71,7 +74,7 @@ fn is_word(c: char) -> bool {
 
 impl TextField {
     pub fn new() -> TextField {
-        TextField { text: String::new(), caret: 0, anchor: 0, max_chars: MAX_CHARS, scroll_x: 0 }
+        TextField { text: String::new(), caret: 0, anchor: 0, max_chars: MAX_CHARS }
     }
 
     pub fn text(&self) -> &str {
@@ -123,15 +126,6 @@ impl TextField {
         }
         self.caret = at;
         self.anchor = at;
-    }
-
-    pub fn scroll_x(&self) -> i32 {
-        self.scroll_x
-    }
-
-    /// Set by the view so the caret stays visible; only stored here.
-    pub fn set_scroll(&mut self, px: i32) {
-        self.scroll_x = px;
     }
 
     fn char_count(&self) -> usize {
@@ -600,8 +594,6 @@ mod tests {
         assert_eq!(f.selection(), Some(0..3));
         f.set_text(&"z".repeat(400));
         assert_eq!((f.text().len(), f.caret(), f.selection()), (256, 256, None));
-        f.set_scroll(-17);
-        assert_eq!(f.scroll_x(), -17);
         f.clear();
         assert!(f.is_empty() && f.caret() == 0);
     }

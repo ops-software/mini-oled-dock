@@ -172,6 +172,7 @@ pub fn match_tiers(c: &Cand, q: &str) -> Option<u8> {
 
 /// The caller's policy in one place: every candidate through tiers 0-5; only when none matched, through tier 6.
 /// Pushes (index, tier) into `out` (cleared first).
+#[cfg(test)]
 pub fn match_all(cands: &[Cand], q: &str, out: &mut Vec<(usize, u8)>) {
     out.clear();
     out.extend(cands.iter().enumerate().filter_map(|(i, c)| match_tiers(c, q).map(|t| (i, t))));

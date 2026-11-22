@@ -41,27 +41,35 @@ pub fn hint_run_in_console() -> &'static str {
 }
 
 // ---- verb labels (the action list and the hints)
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_open() -> &'static str {
     tr("Open", "Apri")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_switch() -> &'static str {
     tr("Switch to", "Passa a")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_run_as_admin() -> &'static str {
     tr("Run as administrator", "Esegui come amministratore")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_reveal() -> &'static str {
     tr("Open file location", "Apri percorso file")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_copy() -> &'static str {
     tr("Copy", "Copia")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_close_window() -> &'static str {
     tr("Close window", "Chiudi finestra")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_forget() -> &'static str {
     tr("Forget", "Dimentica")
 }
+#[allow(dead_code)] // L1b-2: the action list
 pub fn verb_run_in_console() -> &'static str {
     tr("Run in console", "Esegui nella console")
 }
@@ -76,9 +84,6 @@ pub fn line_too_long() -> &'static str {
 }
 pub fn no_window_to_act_on() -> &'static str {
     tr("No window to act on", "Nessuna finestra su cui agire")
-}
-pub fn explorer_not_answering() -> &'static str {
-    tr("Couldn't start it: Explorer isn't answering", "Impossibile avviarlo: Esplora risorse non risponde")
 }
 pub fn thousands() -> &'static str {
     tr("(thousands)", "(migliaia)")

@@ -668,7 +668,9 @@ impl Launcher {
             Some(text) => {
                 let lines = wrap(s, text, Font::Caption, max_w, MAX_LINES);
                 if lines.len() > MAX_LINES {
-                    Vec::new()
+                    // Too long to show whole: Run as administrator is refused, and the detail says why (5.3).
+                    let why = self.session.admin_refusal().and_then(gesture::Refusal::detail);
+                    why.map(|d| vec![runs_of(d)]).unwrap_or_default()
                 } else {
                     lines
                 }
@@ -1037,7 +1039,11 @@ fn hint_for(item: &Item) -> Option<&'static str> {
         return None;
     }
     Some(match (item.kind, verb) {
-        (Kind::RunLine | Kind::RunSuggestion, _) => strings::hint_run(),
+        // A known console program runs in a console kept open (5.4.9), and says so.
+        (Kind::RunLine | Kind::RunSuggestion, _) => match &item.payload {
+            Payload::RunLine(r) if runline::runs_in_console(r) => strings::hint_run_in_console(),
+            _ => strings::hint_run(),
+        },
         (_, Verb::Switch) => strings::hint_switch(),
         (_, Verb::Copy) => strings::hint_copy(),
         _ => strings::hint_open(),
@@ -1925,7 +1931,6 @@ impl Ctrl {
             settings: &self.settings,
             windows: &self.windows,
             history: &self.history,
-            known: &runline::KNOWN,
             opts: &self.opts,
             num: self.num,
             now_unix: now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
@@ -2231,7 +2236,6 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     use crate::launcher::model::{ItemKey, NumberStyle, Score, SettingRow, VerbSet, WindowRow};
     use crate::launcher::providers::Context;
     use crate::launcher::rank;
-    use crate::launcher::runline;
     use crate::start_search::Keys;
     use std::cmp::Reverse;
 
@@ -2290,7 +2294,6 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         settings: &settings,
         windows: &windows,
         history: &history,
-        known: &runline::KNOWN,
         opts: &opts,
         num: NumberStyle {
             decimal: tr(".", ",").chars().next().unwrap_or('.'),
@@ -3566,7 +3569,6 @@ mod tests {
             settings: &[],
             windows: &[],
             history: &[],
-            known: &crate::launcher::runline::KNOWN,
             opts,
             num: NumberStyle { decimal: '.', group: ',' },
             now_unix: 0,
@@ -3615,6 +3617,10 @@ mod tests {
         l.size(&s);
         assert_eq!(l.session.admin_refusal(), Some(Refusal::TooLong));
         assert!(l.geo.borrow().rows.iter().all(|r| r.lines.len() <= 1), "no review: the refusal is the detail");
+        let sel = l.session.selected_index();
+        let g = l.geo.borrow();
+        let row = g.rows.iter().find(|r| Some(r.idx) == sel).unwrap();
+        assert_eq!(row.lines, [runs_of("Line too long to review")], "the detail says why");
     }
 
     #[test]
@@ -3689,7 +3695,14 @@ mod tests {
         let calc = scene_launcher(PreviewScene::Calc);
         assert_eq!(hint_for(calc.session.selected().unwrap()), Some("Copy · Enter"));
         let run = scene_launcher(PreviewScene::Run);
-        assert_eq!(hint_for(run.session.selected().unwrap()), Some("Run · Enter"));
+        assert_eq!(
+            hint_for(run.session.selected().unwrap()),
+            Some("Run in console · Enter"),
+            "ping: a console program"
+        );
+        let mut line = scene_launcher(PreviewScene::Empty);
+        line.session_mut().chars("> notepad", &scene_context_free());
+        assert_eq!(hint_for(line.session.selected().unwrap()), Some("Run · Enter"));
         let apps = scene_launcher(PreviewScene::Apps);
         assert_eq!(hint_for(apps.session.selected().unwrap()), Some("Open · Enter"));
     }

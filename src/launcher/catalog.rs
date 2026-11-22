@@ -60,13 +60,6 @@ impl CatApp {
     }
 }
 
-/// The resident catalogue: the apps and when they were listed (refreshed after a close when older than 10 minutes).
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct Catalog {
-    pub apps: Vec<CatApp>,
-    pub listed_at_ms: u64,
-}
-
 impl SettingRow {
     /// One setting folded at load; `keys` is the setting's folded copy of its keywords.
     pub fn new(index: u32, name: &str, keys: Keys, rank: u32) -> SettingRow {
@@ -173,12 +166,9 @@ impl IconCache {
         self.map.iter().map(|(k, (b, _))| (k.as_str(), b))
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    pub fn clear(&mut self) {
-        self.map = HashMap::new();
     }
 }
 
@@ -269,7 +259,5 @@ mod tests {
         assert!(c.get("app0").is_some(), "used last, kept");
         assert!(c.get("app1").is_none(), "the least recently used went");
         assert!(c.get("new").is_some());
-        c.clear();
-        assert_eq!(c.len(), 0);
     }
 }

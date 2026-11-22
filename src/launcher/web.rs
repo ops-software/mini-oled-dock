@@ -25,6 +25,7 @@ impl Engine {
         })
     }
 
+    #[cfg(test)]
     pub fn name(self) -> &'static str {
         match self {
             Engine::Google => "google",
@@ -54,10 +55,6 @@ pub struct Template {
 }
 
 impl Template {
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-
     /// The host the web row names ("Search www.google.com for ...").
     pub fn host(&self) -> &str {
         self.text.get(self.host.clone()).unwrap_or("")
