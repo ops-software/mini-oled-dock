@@ -478,6 +478,27 @@ mod tests {
         assert!(ingest(&list, None).iter().all(|a| a.start_keys.packed().is_empty() && a.start_rank == 0));
     }
 
+    /// L3 review: past the arena's caps a listing still gives Start a catalogue (house rule 7 of plan L3): 2,100 apps
+    /// keep the 2,000 best ranked by Start's rank (the rank of each app's own id), in name order, with what Start and
+    /// the launcher search them by.
+    #[test]
+    fn a_listing_past_the_caps_keeps_the_best_ranked() {
+        let mut index = AppIndex { default_rank: 5_000, ..AppIndex::default() };
+        let list: Vec<StartApp> =
+            (0..2_100).map(|i| StartApp { id: format!("App{i:04}.exe"), name: format!("App {i:04}") }).collect();
+        for i in 100..2_100 {
+            index.ranks.insert(format!("app{i:04}.exe"), i);
+        }
+        index.synonyms.insert("app 0100".into(), Keys::from(&[("Primo", 1)][..]));
+        let a = build_apps(&list, Some(&index)).unwrap();
+        let v = a.view();
+        assert_eq!(v.len(), Caps::APPS.entries);
+        assert_eq!((v.name(0), v.name(1_999)), ("App 0100", "App 2099"), "the 100 unranked apps went");
+        assert!((1..v.len()).all(|i| v.name(i - 1) < v.name(i)), "name order");
+        assert_eq!((v.start_keys(0), v.start_rank(0), v.id(0)), ("primo\t1\n", 100, "App0100.exe"));
+        assert_eq!(rank::match_tiers(&v.cand(0), "app 0100"), Some(0));
+    }
+
     #[test]
     fn icon_cache_drops_the_least_recently_used() {
         let icon = || Rc::new(IconBitmap::new(48, 48));

@@ -6,6 +6,7 @@
 //! reads it with checked sub-slices only. Pure: no Windows, no files, no `unsafe`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::catalog::CatApp;
 use super::index::{self, IndexView, Strs};
@@ -670,7 +671,7 @@ fn small(n: usize) -> Result<u32, ArenaError> {
     u32::try_from(n).map_err(|_| ArenaError::TooBig)
 }
 
-/// The buffer of the apps catalogue (apps already sorted as the dock shows them).
+/// The buffer of the apps catalogue (apps already sorted as the dock shows them), fitted to `caps` (`fit`).
 pub fn encode_apps(entries: &[CatApp], caps: Caps) -> Result<Vec<u8>, ArenaError> {
     let ents: Vec<Ent> = entries
         .iter()
@@ -689,11 +690,12 @@ pub fn encode_apps(entries: &[CatApp], caps: Caps) -> Result<Vec<u8>, ArenaError
             cand: a.cand(),
         })
         .collect();
-    encode(Kind::Apps, "", &ents, caps)
+    fit(Kind::Apps, "", ents, caps)
 }
 
-/// The buffer of the settings catalogue; `key` is the line that names what it was built from (printable ASCII, at most
-/// 2 KiB). The position of a setting in `entries` is its index.
+/// The buffer of the settings catalogue, fitted to `caps` (`fit`); `key` is the line that names what it was built from
+/// (printable ASCII, at most 2 KiB). The position of a setting in the buffer is its index (in `entries` too, unless the
+/// caps left some out).
 pub fn encode_settings(key: &str, entries: &[SettingIn], caps: Caps) -> Result<Vec<u8>, ArenaError> {
     let ents: Vec<Ent> = entries
         .iter()
@@ -712,7 +714,7 @@ pub fn encode_settings(key: &str, entries: &[SettingIn], caps: Caps) -> Result<V
             cand: s.row.cand(),
         })
         .collect();
-    encode(Kind::Settings, key, &ents, caps)
+    fit(Kind::Settings, key, ents, caps)
 }
 
 /// The word starts of `c` as C.2 wants them: increasing, inside the folded name, on character boundaries, at most 64.
@@ -729,7 +731,95 @@ fn normalized_words(c: &Cand) -> Vec<u16> {
     out
 }
 
-fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps) -> Result<Vec<u8>, ArenaError> {
+/// `encode`, made to fit the caps (L3 review: a cap is never why Start has no catalogue, house rule 7 of plan L3). Past
+/// `caps.entries` the best-ranked entries stay (`keep_ranked`). While the buffer would pass `caps.bytes`, Start's copies
+/// of the keywords (`start_keys`: Start then finds the entry by its name, as with no app index) are left out, the largest
+/// first, as many as the excess; with none left, the worst-ranked entries go, in proportion to the excess. Each round
+/// leaves out at least one text or one entry. A cut is logged once per kind (a child has no logger: there it is silent).
+fn fit(kind: Kind, key: &str, mut ents: Vec<Ent>, caps: Caps) -> Result<Vec<u8>, ArenaError> {
+    let (listed, mut keys_cut) = (ents.len(), 0usize);
+    if ents.len() > caps.entries {
+        keep_ranked(&mut ents, caps.entries);
+    }
+    loop {
+        let mut need = 0;
+        let excess = match encode(kind, key, &ents, caps, &mut need) {
+            Err(ArenaError::TooBig) if need > caps.bytes => need - caps.bytes,
+            done => {
+                if done.is_ok() && (keys_cut > 0 || ents.len() < listed) {
+                    log_fit(kind, keys_cut, listed - ents.len());
+                }
+                return done;
+            }
+        };
+        // The largest text left, from every entry that shares it (a shared text is stored once, so it frees its bytes
+        // once), until the excess is covered. No sort: this runs only past a cap, and a sort would grow the exe.
+        let mut freed = 0usize;
+        while freed < excess {
+            let largest = ents.iter().map(|e| e.start_keys).max_by_key(|s| s.len()).filter(|s| !s.is_empty());
+            let Some(t) = largest else { break };
+            freed = freed.saturating_add(t.len());
+            for e in &mut ents {
+                if e.start_keys == t {
+                    e.start_keys = "";
+                    keys_cut += 1;
+                }
+            }
+        }
+        if freed == 0 {
+            let n = ents.len();
+            if n == 0 {
+                return Err(ArenaError::TooBig);
+            }
+            keep_ranked(&mut ents, (n.saturating_mul(caps.bytes) / need).min(n - 1));
+        }
+    }
+}
+
+/// Keeps the `cap` best-ranked of `ents` (Start's rank), ties in their order (by name).
+fn keep_ranked(ents: &mut Vec<Ent>, cap: usize) {
+    let ranks: Vec<u32> = ents.iter().map(|e| e.start_rank).collect();
+    let keep = keep_best(&ranks, cap);
+    let mut it = keep.iter();
+    ents.retain(|_| it.next().copied().unwrap_or(false));
+}
+
+/// The one line of a catalogue cut to its caps, once per kind and process.
+fn log_fit(kind: Kind, n: usize, count: usize) {
+    static LOGGED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    if LOGGED.get(usize::from(kind == Kind::Settings)).is_some_and(|l| !l.swap(true, Ordering::Relaxed)) {
+        crate::log!(
+            "launcher: the {kind:?} catalogue was cut to its caps: {count} entries left out (the worst ranked), and \
+             Start's keywords of {n} more (the largest)"
+        );
+    }
+}
+
+/// Which of `ranks` (smaller is better, in the catalogue's order) a catalogue keeps when it may hold only `cap`: the `cap`
+/// best, ties in that order; all of them when they fit.
+fn keep_best(ranks: &[u32], cap: usize) -> Vec<bool> {
+    if ranks.len() <= cap {
+        return vec![true; ranks.len()];
+    }
+    let mut sorted = ranks.to_vec();
+    sorted.sort_unstable();
+    let Some(&bar) = cap.checked_sub(1).and_then(|i| sorted.get(i)) else { return vec![false; ranks.len()] };
+    // At least one: `bar` itself is among the `cap` best.
+    let mut ties = cap - sorted.iter().take_while(|&&r| r < bar).count();
+    ranks
+        .iter()
+        .map(|&r| {
+            let keep = r < bar || (r == bar && ties > 0);
+            if keep && r == bar {
+                ties -= 1;
+            }
+            keep
+        })
+        .collect()
+}
+
+/// The buffer of `ents`, in their order. Past `caps.bytes`: Err(TooBig), and `need` gets the bytes it would take.
+fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps, need: &mut usize) -> Result<Vec<u8>, ArenaError> {
     if ents.len() > caps.entries {
         return Err(ArenaError::TooManyEntries);
     }
@@ -821,6 +911,7 @@ fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps) -> Result<Vec<u8>, Ar
         .and_then(|t| t.checked_add(8))
         .ok_or(ArenaError::TooBig)?;
     if total > caps.bytes {
+        *need = total;
         return Err(ArenaError::TooBig);
     }
     let mut out: Vec<u8> = Vec::with_capacity(total);
@@ -1015,6 +1106,86 @@ mod tests {
         let empty = Arena::new(encode_apps(&[], Caps::APPS).unwrap(), Kind::Apps, None, Caps::APPS).unwrap();
         assert_eq!((empty.len(), empty.view().cand(0).folded), (0, ""));
         assert!(Arena::default().view().is_empty());
+    }
+
+    /// L3 review: a cap is never why Start has no catalogue. Past the entry cap the best-ranked entries stay (Start's
+    /// rank, ties in their order: by name); past the byte cap Start's copies of the keywords go first, the largest first
+    /// (a text two entries share counts once), then the worst-ranked entries. What is left passes `check` under the
+    /// same caps; only caps smaller than an empty buffer still fail.
+    #[test]
+    fn encoders_fit_the_caps() {
+        assert_eq!(keep_best(&[5, 1, 5, 3, 5, 0], 4), [true, true, false, true, false, true]);
+        assert_eq!((keep_best(&[2, 2], 2), keep_best(&[2, 2], 0)), (vec![true, true], vec![false, false]));
+        let packed = |i: usize, len: usize| (0..len / 12).map(|j| format!("w{i:02}x{j:05}\t1\n")).collect::<String>();
+        let shortest_gone_longest_kept = |lens: &[(usize, bool)]| {
+            let kept = lens.iter().filter(|l| l.1).map(|l| l.0).max().unwrap_or(0);
+            let gone = lens.iter().filter(|l| !l.1).map(|l| l.0).min().unwrap_or(usize::MAX);
+            (gone, kept)
+        };
+        // Apps: 60 of them with 1 to 60 KB of Start keywords (the last two share theirs), 512 KiB allowed.
+        let mut apps: Vec<CatApp> = (0..60)
+            .map(|i| {
+                let mut a = CatApp::new(&format!("App{i:02}.exe"), &format!("App {i:02}"), Keys::default(), 1);
+                a.start_keys = Keys::from_packed(&packed(i, (i + 1) * 1_000));
+                a
+            })
+            .collect();
+        apps[58].start_keys = apps[59].start_keys.clone();
+        let caps = Caps { entries: 100, bytes: 512 * 1024 };
+        assert!(apps.iter().map(|a| a.start_keys.packed().len()).sum::<usize>() > 3 * caps.bytes);
+        let a = Arena::new(encode_apps(&apps, caps).unwrap(), Kind::Apps, None, caps).unwrap();
+        let v = a.view();
+        assert_eq!(v.len(), 60, "every app stays");
+        assert!(a.bytes() > caps.bytes / 2, "only as many keywords go as the excess");
+        let lens: Vec<(usize, bool)> = apps
+            .iter()
+            .enumerate()
+            .map(|(i, app)| {
+                let k = v.start_keys(i);
+                assert!(k.is_empty() || k == app.start_keys.packed(), "a text is whole or gone");
+                (app.start_keys.packed().len(), !k.is_empty())
+            })
+            .collect();
+        let (gone, kept) = shortest_gone_longest_kept(&lens);
+        assert!(kept > 0 && kept < gone, "the largest went: kept up to {kept}, gone from {gone}");
+        // Settings: the same, and past the entry cap.
+        let ins: Vec<SettingIn> = (0..40)
+            .map(|i| SettingIn {
+                row: SettingRow::new(i as u32, &format!("Setting {i:02}"), Keys::default(), (i % 7) as u32),
+                target: "ms-settings:".into(),
+                args: None,
+                start_keys: packed(i, (i + 1) * 1_000),
+            })
+            .collect();
+        let caps = Caps { entries: 30, bytes: 256 * 1024 };
+        let s = Arena::new(encode_settings("k", &ins, caps).unwrap(), Kind::Settings, Some("k"), caps).unwrap();
+        let v = s.view();
+        let mut best: Vec<usize> = (0..40).collect();
+        best.sort_by_key(|&i| (i % 7, i));
+        best.truncate(30);
+        best.sort_unstable();
+        let names: Vec<&str> = (0..v.len()).map(|i| v.name(i)).collect();
+        assert_eq!(names, best.iter().map(|&i| &*ins[i].row.name).collect::<Vec<_>>(), "the 30 best ranked, in order");
+        let lens: Vec<(usize, bool)> =
+            best.iter().enumerate().map(|(at, &i)| (ins[i].start_keys.len(), !v.start_keys(at).is_empty())).collect();
+        let (gone, kept) = shortest_gone_longest_kept(&lens);
+        assert!(kept > 0 && kept < gone && gone < usize::MAX, "kept up to {kept}, gone from {gone}");
+        // No keywords left to drop: the worst-ranked entries go (3 KB names, 64 KiB allowed).
+        let big: Vec<CatApp> = (0..40)
+            .map(|i| {
+                let mut a =
+                    CatApp::new(&format!("Big{i:02}.exe"), &format!("{i:02}{}", "x".repeat(3_000)), Keys::default(), 1);
+                a.start_rank = 100 - i as u32;
+                a
+            })
+            .collect();
+        let caps = Caps { entries: 100, bytes: 64 * 1024 };
+        let b = Arena::new(encode_apps(&big, caps).unwrap(), Kind::Apps, None, caps).unwrap();
+        let n = b.len();
+        assert!(n > 0 && n < 40);
+        let ids: Vec<&str> = (0..n).map(|i| b.view().id(i)).collect();
+        assert_eq!(ids, big[40 - n..].iter().map(|a| &*a.id).collect::<Vec<_>>(), "the best ranked stay");
+        assert_eq!(encode_apps(&big, Caps { entries: 100, bytes: 16 }), Err(ArenaError::TooBig));
     }
 
     #[test]
