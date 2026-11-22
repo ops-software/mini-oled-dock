@@ -15,7 +15,7 @@
 //!  * `appsconversions.txt`: `spelling\t<typed>\t<meant>\t<score>`, query rewrites.
 //!
 //! The first two are in `<Windows>\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\Cortana.UI\
-//! ConstraintIndex\<version>\<language>\` (only administrators can write there). The conversions
+//! ConstraintIndex\<version>\<language>` (only administrators can write there). The conversions
 //! exist only as the copy Windows Search unpacks in the user's profile: read as untrusted input
 //! (`datadir::read_file`: no reparse points, capped) and used only to rewrite the typed text.
 //!
@@ -25,7 +25,7 @@
 //! display language (`SHLoadIndirectString`). A setting opens through its page name
 //! (`page=<name>` argument of the Settings app) or its Control Panel deep link. `settingssynonyms.txt`
 //! and `settingsglobals.txt` (same folders as above, plus `...Client.Photon...\SettingsSearchData\
-//! <language>\`) add the synonyms and the ranks.
+//! <language>`) add the synonyms and the ranks.
 //!
 //! All of it is undocumented: a missing or different file only means fewer results. The Windows
 //! folder comes from the API, never from the environment.
@@ -38,7 +38,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use windows::core::HSTRING;
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY};
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, SHLoadIndirectString, KF_FLAG_DEFAULT};
 
@@ -391,8 +394,8 @@ pub(crate) fn settings() -> Arc<Vec<Setting>> {
 /// Builds the settings catalog on a background thread, unless it is there or being built. It takes
 /// about a second (thousands of resource lookups), so it is never done on the UI or shell thread;
 /// the menu uses the catalog from the first search after it is ready.
-// ponytail: rebuilt after every release (a second of background-priority work for the first Start
-// menu opened after a minute without one); cache it on disk if that ever matters.
+// The build is kept on disk (see `load_or_build_settings`): only the first run after a Windows
+// update or a language change pays the second of resource lookups.
 pub(crate) fn load_settings() {
     if SETTINGS_STARTED.swap(true, Relaxed) {
         return;
@@ -404,8 +407,8 @@ pub(crate) fn load_settings() {
         // SAFETY: pseudo-handle of the current thread.
         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
         let t = Instant::now();
-        let list = build_settings();
-        log!("start search: {} settings in {} ms", list.len(), t.elapsed().as_millis());
+        let (list, cached) = load_or_build_settings();
+        log!("start search: {} settings in {} ms{}", list.len(), t.elapsed().as_millis(), if cached { " (disk cache)" } else { "" });
         // Released while it was being built: not kept.
         if SETTINGS_STARTED.load(Relaxed) {
             *SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(list));
@@ -505,10 +508,7 @@ fn build_settings() -> Vec<Setting> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().to_lowercase();
-            n.starts_with("allsystemsettings_") && n.ends_with(".xml")
-        })
+        .filter(|e| is_catalog_xml(&e.file_name().to_string_lossy()))
         .max_by_key(|e| e.metadata().map_or(0, |m| m.len()))
         .and_then(|e| read_text(&e.path()));
     let Some(xml) = xml else {
@@ -552,6 +552,217 @@ fn build_settings() -> Vec<Setting> {
     list.sort_by(|a, b| a.lower.cmp(&b.lower));
     list.shrink_to_fit();
     list
+}
+
+/// True for the name of one of the catalog's XML files.
+fn is_catalog_xml(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.starts_with("allsystemsettings_") && n.ends_with(".xml")
+}
+
+// ------------------------------------------------------------------ disk cache of the catalog
+
+/// First line of `<root>\cache\settings-catalog.bin`; the digit is the format version.
+const CACHE_HEADER: &str = "mini-oled-dock settings-catalog 1\n";
+/// Largest cache file read or written.
+const CACHE_MAX: u64 = 2 << 20;
+const CACHE_NAME: &str = "settings-catalog.bin";
+const NT_KEY: windows::core::PCWSTR = windows::core::w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+
+/// `CurrentBuildNumber` and `UBR` of the running Windows ("26100.1742"); empty where unreadable
+/// (`catalog_key_of` then gives no key: an unreadable build means no cache at all).
+fn windows_build() -> String {
+    let mut buf = [0u16; 32];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: `buf`/`size` are valid writable locals of the declared size (in bytes); the key and
+    // value names are static NUL-terminated wide strings; RRF_RT_REG_SZ makes the call add a NUL.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            NT_KEY,
+            windows::core::w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return String::new();
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let build = String::from_utf16_lossy(&buf[..n]);
+    let mut ubr = 0u32;
+    let mut size = 4u32;
+    // SAFETY: as above, a DWORD of 4 bytes.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            NT_KEY,
+            windows::core::w!("UBR"),
+            RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some((&mut ubr as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    if r == ERROR_SUCCESS {
+        format!("{build}.{ubr}")
+    } else {
+        build
+    }
+}
+
+/// What the cache depends on, one line: the Windows build, the UI language, and name, size and
+/// modification time of each `AllSystemSettings_*.xml`. `None` when the build is unknown or no XML
+/// file is there (nothing to key on: nothing cached).
+fn catalog_key_of(build: &str, lang: u16, files: &[(String, u64, u64)]) -> Option<String> {
+    if build.is_empty() || files.is_empty() {
+        return None;
+    }
+    let mut key = format!("{build}|{lang:04x}");
+    for (name, len, mtime) in files {
+        key.push('|');
+        key.extend(name.chars().filter(|c| !c.is_control() && *c != '|'));
+        key.push_str(&format!(":{len}:{mtime}"));
+    }
+    Some(key)
+}
+
+fn catalog_key(dir: &Path) -> Option<String> {
+    let mut files: Vec<(String, u64, u64)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| is_catalog_xml(&e.file_name().to_string_lossy()))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            Some((e.file_name().to_string_lossy().to_lowercase(), m.len(), t))
+        })
+        .collect();
+    files.sort();
+    // SAFETY: no arguments, no preconditions.
+    let lang = unsafe { GetUserDefaultUILanguage() };
+    catalog_key_of(&windows_build(), lang, &files)
+}
+
+fn fnv64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| (h ^ u64::from(c)).wrapping_mul(0x0100_0000_01b3))
+}
+
+fn put(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// The cache file: header, key line, entry count, the entries (name, keys, rank, target, args: each
+/// string length-prefixed, a missing `args` is the length `u32::MAX`), a 64-bit checksum of all
+/// of it. `None` if it would pass `CACHE_MAX`.
+fn encode_catalog(key: &str, list: &[Setting]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(list.len() * 96 + 256);
+    out.extend_from_slice(CACHE_HEADER.as_bytes());
+    out.extend_from_slice(key.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+    for s in list {
+        put(&mut out, &s.name);
+        put(&mut out, &s.keys.0);
+        out.extend_from_slice(&s.rank.to_le_bytes());
+        put(&mut out, &s.target);
+        match &s.args {
+            Some(a) => put(&mut out, a),
+            None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
+        }
+    }
+    let sum = fnv64(&out);
+    out.extend_from_slice(&sum.to_le_bytes());
+    (out.len() as u64 <= CACHE_MAX).then_some(out)
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn u32(&mut self) -> Option<u32> {
+        let (h, rest) = self.0.split_first_chunk::<4>()?;
+        self.0 = rest;
+        Some(u32::from_le_bytes(*h))
+    }
+    fn str(&mut self, len: u32) -> Option<&'a str> {
+        let len = len as usize;
+        if len > self.0.len() {
+            return None;
+        }
+        let (s, rest) = self.0.split_at(len);
+        self.0 = rest;
+        std::str::from_utf8(s).ok()
+    }
+    fn string(&mut self) -> Option<&'a str> {
+        let n = self.u32()?;
+        self.str(n)
+    }
+}
+
+/// The catalog of `bytes`, or `None` for anything that is not exactly what `encode_catalog` wrote
+/// for `key`: wrong header, key, checksum, count or lengths, bad UTF-8, trailing bytes. Every
+/// length is checked against what is left before it allocates. Entries are rebuilt as
+/// `build_settings` makes them (exact-size strings; the Settings app target is the shared constant).
+fn decode_catalog(bytes: &[u8], key: &str) -> Option<Vec<Setting>> {
+    let head = CACHE_HEADER.as_bytes();
+    let body_len = bytes.len().checked_sub(8)?;
+    let (body, sum) = bytes.split_at(body_len);
+    if fnv64(body).to_le_bytes() != sum || !body.starts_with(head) {
+        return None;
+    }
+    let rest = &body[head.len()..];
+    let nl = rest.iter().position(|&c| c == b'\n')?;
+    if &rest[..nl] != key.as_bytes() {
+        return None;
+    }
+    let mut r = Reader(&rest[nl + 1..]);
+    let count = r.u32()? as usize;
+    // An entry is at least 20 bytes (four lengths and the rank): a larger count cannot be true.
+    if count > r.0.len() / 20 {
+        return None;
+    }
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = r.string()?;
+        let keys = r.string()?;
+        let rank = r.u32()?;
+        let target = r.string()?;
+        let args = match r.u32()? {
+            u32::MAX => None,
+            n => Some(r.str(n)?.to_string()),
+        };
+        let target: Cow<'static, str> = if target == SETTINGS_APP { Cow::Borrowed(SETTINGS_APP) } else { Cow::Owned(target.to_string()) };
+        list.push(Setting { name: name.to_string(), lower: name.to_lowercase(), keys: Keys(keys.to_string()), rank, target, args });
+    }
+    r.0.is_empty().then_some(list)
+}
+
+/// The catalog: from the cache file when it matches this Windows build, language and XML files,
+/// else built (and the cache rewritten). The bool is true when it came from the cache. A cache that
+/// cannot be read, parsed or written only costs the build, as before.
+fn load_or_build_settings() -> (Vec<Setting>, bool) {
+    let Some(windir) = windows_dir() else { return (Vec::new(), false) };
+    let key = catalog_key(&windir.join(r"ImmersiveControlPanel\Settings"));
+    let path = crate::datadir::cache_dir().map(|d| d.join(CACHE_NAME));
+    if let (Some(key), Some(path)) = (&key, &path) {
+        if let Some(list) = crate::datadir::read_file(path, CACHE_MAX, true).ok().and_then(|b| decode_catalog(&b, key)) {
+            return (list, true);
+        }
+    }
+    let list = build_settings();
+    if let (Some(key), Some(path)) = (&key, &path) {
+        if !list.is_empty() {
+            if let Some(bytes) = encode_catalog(key, &list) {
+                if let Err(e) = crate::datadir::write_atomic(path, &bytes, crate::datadir::FileAcl::Inherit) {
+                    log!("start search: cannot write the settings cache: {e}");
+                }
+            }
+        }
+    }
+    (list, false)
 }
 
 #[cfg(test)]
@@ -650,8 +861,129 @@ mod tests {
         assert_eq!(split_keywords("Wi-Fi|rete ; LAN||"), vec!["wi-fi", "rete", "lan"]);
     }
 
-    /// Builds the REAL settings catalog and app index of this machine (run by hand:
-    /// `cargo test -- --ignored --nocapture real_search_data`).
+    fn sample(n: usize) -> Vec<Setting> {
+        (0..n)
+            .map(|i| {
+                let name = format!("Setting Ünï {i}");
+                let mut keys = Keys::default();
+                for k in 0..(i % 4) {
+                    keys.push(&format!("kw{i}x{k}"), KEYWORD_PENALTY);
+                }
+                Setting {
+                    lower: name.to_lowercase(),
+                    name,
+                    keys: keys.tidy(),
+                    rank: i as u32 * 7,
+                    target: if i % 3 == 0 { Cow::Owned(format!(r"C:\Windows\System32\t{i}.exe")) } else { Cow::Borrowed(SETTINGS_APP) },
+                    args: (i % 5 != 0).then(|| format!("page=p{i}")),
+                }
+            })
+            .collect()
+    }
+
+    const KEY: &str = "26100.1742|0409|allsystemsettings_x.xml:100:5";
+
+    #[test]
+    fn round_trip() {
+        let list = sample(300);
+        let bytes = encode_catalog(KEY, &list).unwrap();
+        assert!(bytes.starts_with(b"mini-oled-dock settings-catalog 1\n"));
+        let back = decode_catalog(&bytes, KEY).unwrap();
+        assert_eq!(back, list);
+        assert!(back.iter().filter(|s| matches!(s.target, Cow::Borrowed(_))).count() > 100, "the shared target stays shared");
+        assert_eq!(decode_catalog(&encode_catalog(KEY, &[]).unwrap(), KEY).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn invalidated_by_build_or_language() {
+        let files = vec![("allsystemsettings_a.xml".to_string(), 10u64, 20u64)];
+        let k = catalog_key_of("26100.1742", 0x409, &files).unwrap();
+        let bytes = encode_catalog(&k, &sample(5)).unwrap();
+        assert!(decode_catalog(&bytes, &k).is_some());
+        for other in [
+            catalog_key_of("26100.1743", 0x409, &files),
+            catalog_key_of("26200.1742", 0x409, &files),
+            catalog_key_of("26100.1742", 0x410, &files),
+            catalog_key_of("26100.1742", 0x409, &[("allsystemsettings_a.xml".to_string(), 11, 20)]),
+            catalog_key_of("26100.1742", 0x409, &[("allsystemsettings_a.xml".to_string(), 10, 21)]),
+            catalog_key_of("26100.1742", 0x409, &[("allsystemsettings_b.xml".to_string(), 10, 20)]),
+        ] {
+            let other = other.unwrap();
+            assert_ne!(other, k);
+            assert!(decode_catalog(&bytes, &other).is_none(), "{other}");
+        }
+        assert!(catalog_key_of("", 0x409, &files).is_none(), "unknown build: no cache");
+        assert!(catalog_key_of("26100.1", 0x409, &[]).is_none(), "no XML: no cache");
+    }
+
+    #[test]
+    fn corrupt_ignored() {
+        let bytes = encode_catalog(KEY, &sample(40)).unwrap();
+        assert!(decode_catalog(&[], KEY).is_none());
+        assert!(decode_catalog(&bytes[..bytes.len() - 1], KEY).is_none());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_catalog(&trailing, KEY).is_none());
+        for i in (0..bytes.len()).step_by(7) {
+            let mut b = bytes.clone();
+            b[i] ^= 0x55;
+            assert!(decode_catalog(&b, KEY).is_none(), "byte {i}");
+        }
+        // A forged file with a valid checksum but lies inside: an absurd count and a length past the end.
+        let forge = |tail: &[u8]| {
+            let mut b = CACHE_HEADER.as_bytes().to_vec();
+            b.extend_from_slice(KEY.as_bytes());
+            b.push(b'\n');
+            b.extend_from_slice(tail);
+            let sum = fnv64(&b);
+            b.extend_from_slice(&sum.to_le_bytes());
+            b
+        };
+        assert!(decode_catalog(&forge(&u32::MAX.to_le_bytes()), KEY).is_none());
+        assert!(decode_catalog(&forge(&[1, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f]), KEY).is_none());
+        assert!(decode_catalog(&forge(&[1, 0, 0, 0, 2, 0, 0, 0, 0xc3, 0x28]), KEY).is_none(), "bad UTF-8");
+        assert!(decode_catalog(&forge(&0u32.to_le_bytes()), KEY).is_some());
+    }
+
+    #[test]
+    fn corrupt_ignored_seeded_100000() {
+        let good = encode_catalog(KEY, &sample(12)).unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..100_000 {
+            let mut b = if next() % 4 == 0 { Vec::new() } else { good.clone() };
+            match next() % 4 {
+                0 => b.truncate((next() as usize) % (b.len() + 1)),
+                1 => (0..1 + next() % 4).for_each(|_| {
+                    if !b.is_empty() {
+                        let i = (next() as usize) % b.len();
+                        b[i] = next() as u8;
+                    }
+                }),
+                2 => (0..(next() % 64)).for_each(|_| b.push(next() as u8)),
+                _ => b = (0..(next() % 200)).map(|_| next() as u8).collect(),
+            }
+            // Must never panic; a result is only legal for the untouched file.
+            if let Some(list) = decode_catalog(&b, KEY) {
+                assert_eq!(b, good);
+                assert_eq!(list.len(), 12);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn real_windows_build() {
+        let b = windows_build();
+        println!("build {b}");
+        assert!(b.contains('.') && b.chars().next().is_some_and(|c| c.is_ascii_digit()));
+    }
+
     #[test]
     fn settings_freed_only_when_both_released() {
         let bits = AtomicU8::new(0);
@@ -665,6 +997,8 @@ mod tests {
         assert_eq!(holders_step(&bits, Holder::Launcher, false), 1);
     }
 
+    /// Builds the REAL settings catalog and app index of this machine (run by hand:
+    /// `cargo test -- --ignored --nocapture real_search_data`).
     #[test]
     #[ignore]
     fn real_search_data() {
