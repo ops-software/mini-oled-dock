@@ -29,7 +29,7 @@ use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowRect,
     GetWindowThreadProcessId,
-    IsWindow, IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
+    IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
     SendNotifyMessageW,
     SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
     HWND_BOTTOM,
@@ -387,6 +387,7 @@ fn edge_to_ask(bar: RECT, mon: RECT) -> Result<(u32, RECT), String> {
 /// Also returns, for the log, the edge (`ABE_*`) and monitor rectangle the question named, or why it was not
 /// asked.
 fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, Result<(u32, RECT), String>) {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
     let mut bar = RECT::default();
     // SAFETY: `bar` is writable; for an invalid window the call fails.
     if unsafe { GetWindowRect(tray, &mut bar) }.is_err() {
