@@ -13,9 +13,12 @@ pub fn accept(line: &str) -> bool {
     if line.is_empty() || line.starts_with(' ') || line.chars().count() > MAX_LINE_CHARS {
         return false;
     }
-    !line.chars().any(|c| {
-        c.is_control() || matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-    })
+    !line.chars().any(char::is_control) && !has_marker(line)
+}
+
+/// True when the text holds a bidi marker (U+200E, U+200F, U+202A-U+202E, U+2066-U+2069).
+pub fn has_marker(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
 }
 
 /// The lines of a history file, newest first. Empty for anything that is not exactly the format.

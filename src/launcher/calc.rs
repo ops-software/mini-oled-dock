@@ -63,7 +63,7 @@ fn number(run: &str, num: NumberStyle) -> Option<(f64, bool)> {
         let (frac, ints) = segs.split_last()?;
         if groups > 0 {
             let (first, rest) = ints.split_first()?;
-            if !((1..=3).contains(&first.len()) && rest.iter().all(three)) {
+            if !(lead_ok(first) && rest.iter().all(three)) {
                 return None;
             }
         }
@@ -396,7 +396,8 @@ mod tests {
 
     #[test]
     fn vectors_80() {
-        let it: [(&str, Option<&str>); 40] = [
+        let it: [(&str, Option<&str>); 41] = [
+            ("0.123,5", None),
             ("1.234", Some("1234")),
             ("3,5", Some("3,5")),
             ("1.5", Some("1,5")),
@@ -441,7 +442,9 @@ mod tests {
         for (t, want) in it {
             assert_eq!(shown(t, IT).as_deref(), want, "it {t:?}");
         }
-        let en: [(&str, Option<&str>); 40] = [
+        let en: [(&str, Option<&str>); 42] = [
+            ("0,123.5", None),
+            ("00,123.5", None),
             ("1,234", Some("1234")),
             ("3,5", Some("3.5")),
             ("3.5", Some("3.5")),

@@ -125,7 +125,10 @@ pub fn url_for(t: &Template, query: &str) -> String {
 /// No whitespace, no control character, something after the scheme.
 pub fn parse_typed_url(text: &str) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() || text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if text.is_empty() || super::history::has_marker(text) {
+        return None;
+    }
+    if text.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let lower = |n: usize| text.get(..n).map(str::to_ascii_lowercase);
@@ -234,6 +237,8 @@ mod tests {
             "www.a b",
             "javascript:alert(1)",
             "http://a\u{7}b",
+            "http://exa\u{202E}mple.com",
+            "www.exa\u{200F}mple.com",
         ] {
             assert_eq!(parse_typed_url(bad), None, "{bad:?}");
         }
