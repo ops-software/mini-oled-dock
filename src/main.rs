@@ -192,6 +192,9 @@ pub struct Args {
     pub purge_data: bool,
     /// `--update-check`: check for a new release, print the result and exit.
     pub update_check: bool,
+    /// `--update-fetch`: the update check's GET in a child of the dock, its answer on stdout
+    /// (`update::run_fetch_child`); combines with nothing.
+    pub update_fetch: bool,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -211,7 +214,9 @@ fn parse_args() -> Result<Args, String> {
 
 fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args::default();
+    let mut flags = 0usize;
     while let Some(s) = it.next() {
+        flags += 1;
         match s.as_str() {
             "--top" => a.top = Some(true),
             "--bottom" => a.top = Some(false),
@@ -239,11 +244,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--remove" => a.remove = true,
             "--purge-data" => a.purge_data = true,
             "--update-check" => a.update_check = true,
+            "--update-fetch" => a.update_fetch = true,
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    if a.update_fetch && flags > 1 {
+        return Err("--update-fetch cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
@@ -1056,6 +1065,11 @@ fn main() -> std::process::ExitCode {
         println!("{}", version_line());
         return std::process::ExitCode::SUCCESS;
     }
+    // --update-fetch: the update check's GET in a child of the dock (`update::fetch_latest`); stdout only,
+    // no data folder, logger, mutex or console.
+    if args.update_fetch {
+        return std::process::ExitCode::from(update::run_fetch_child().clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1263,11 +1277,14 @@ mod tests {
         assert_eq!(p(&["--update-install", "v1.4.1"]).unwrap().update_install.as_deref(), Some("v1.4.1"));
         assert!(p(&["--update-check"]).unwrap().update_check);
         assert!(p(&["--version"]).unwrap().version);
+        let f = p(&[update::FETCH_FLAG]).unwrap(); // the flag the dock starts its child with
+        assert!(f.update_fetch && !f.update_check);
+        assert!(!p(&["--update-check"]).unwrap().update_fetch);
     }
 
     #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 8] = [
+        let bad: [&[&str]; 12] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1276,6 +1293,10 @@ mod tests {
             &["--install", "--uninstall"],
             &["--uninstall", "--no-relaunch"],
             &["--update-install"],
+            &["--update-fetch", "--console"],
+            &["--update-check", "--update-fetch"],
+            &["--version", "--update-fetch"],
+            &["--update-fetch", "--update-fetch"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");

@@ -218,9 +218,23 @@ pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>
     }
 }
 
-fn fetch_latest() -> Result<Release, CheckError> {
-    let headers = [("Accept", "application/vnd.github+json"), ("X-GitHub-Api-Version", "2022-11-28")];
-    let resp = winhttp::get(LATEST_API_URL, &headers, API_MAX_BYTES).map_err(|e| CheckError::Network(e.to_string()))?;
+/// Headers of the latest-release request, the same in the dock and in the `--update-fetch` child.
+const CHECK_HEADERS: [(&str, &str); 2] =
+    [("Accept", "application/vnd.github+json"), ("X-GitHub-Api-Version", "2022-11-28")];
+
+/// Asks GitHub for the latest release. `in_child` (the dock's checks): the GET runs in an `--update-fetch`
+/// child, so the WinHTTP, Schannel and crypt32 state it loads (about +100 handles and +0.6 MB, kept for
+/// good) ends with the child (M1 F2); a child that cannot start, times out or prints anything
+/// `decode_fetch` refuses is logged and the GET runs here, as before. A network error the child reports
+/// is the answer, with no second try. The host, status and release checks run here on either path, so
+/// the child's bytes are trusted exactly as much as the network's.
+fn fetch_latest(in_child: bool) -> Result<Release, CheckError> {
+    let from_child = if in_child { fetch_in_child() } else { None };
+    let fetched = match from_child {
+        Some(r) => r,
+        None => winhttp::get(LATEST_API_URL, &CHECK_HEADERS, API_MAX_BYTES).map_err(|e| e.to_string()),
+    };
+    let resp = fetched.map_err(CheckError::Network)?;
     let host_ok = winhttp::split_https_url(&resp.final_url).is_some_and(|(h, _)| host_allowed(&h));
     if !host_ok {
         return Err(CheckError::Invalid("unexpected host".into()));
@@ -230,6 +244,146 @@ fn fetch_latest() -> Result<Release, CheckError> {
         return Err(CheckError::Http(resp.status));
     }
     parse_release(&resp.body).map_err(CheckError::Invalid)
+}
+
+/// The flag of the child mode that makes the check's GET (`run_fetch_child`); not combinable.
+pub(crate) const FETCH_FLAG: &str = "--update-fetch";
+/// First line of the child's output; the 1 is the format's version.
+const FETCH_HEADER: &[u8] = b"mini-oled-dock update-fetch 1\n";
+/// Second line of the child's output when the GET failed.
+const FETCH_ERROR_LINE: &[u8] = b"error";
+/// Longest final URL the dock accepts from the child.
+const FETCH_URL_MAX: usize = 2048;
+/// Longest error text the child writes and the dock accepts.
+const FETCH_ERROR_MAX: usize = 512;
+/// The most the dock reads back from the child: the body's cap plus room for the three lines before it.
+const FETCH_MAX_BYTES: u64 = API_MAX_BYTES + 4096;
+/// The child waits on WinHTTP's own timeouts (10 + 10 + 30 + 30 s); 100 s cover them.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(100);
+/// Exit code of `--update-fetch` with a response.
+const FETCH_EXIT_RESPONSE: i32 = 0;
+/// Exit code of `--update-fetch` with a network error.
+const FETCH_EXIT_ERROR: i32 = 2;
+
+/// The check's GET in an `--update-fetch` child (`run_capture`: no window, the dock's job, output
+/// capped). None = no usable answer, the reason logged: the caller asks in-process.
+fn fetch_in_child() -> Option<Result<winhttp::Response, String>> {
+    let answer = std::env::current_exe()
+        .map_err(|e| format!("no exe path: {e}"))
+        .and_then(|exe| run_capture(&exe, &[FETCH_FLAG], FETCH_TIMEOUT, FETCH_MAX_BYTES))
+        .and_then(|(code, out)| decode_fetch(code, out));
+    match answer {
+        Ok(r) => Some(r),
+        Err(why) => {
+            crate::log!("update: check process failed ({why}), checking in-process");
+            None
+        }
+    }
+}
+
+/// `--update-fetch`, in the child `fetch_latest(true)` starts: the check's one GET, framed by
+/// `encode_fetch` on stdout. It touches no data folder, logger, mutex or console, and writes nothing
+/// but stdout. Exit 0 = a response, 2 = a network error, 1 = stdout could not be written.
+pub fn run_fetch_child() -> i32 {
+    use std::io::Write;
+    let (code, out) =
+        encode_fetch(&winhttp::get(LATEST_API_URL, &CHECK_HEADERS, API_MAX_BYTES).map_err(|e| e.to_string()));
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(&out).and_then(|()| stdout.flush()) {
+        Ok(()) => code,
+        Err(_) => 1,
+    }
+}
+
+/// The child's output for `decode_fetch`, as (exit code, stdout). A response is `FETCH_HEADER`, the
+/// status and the final URL, each on its own line, then the body's bytes (exit 0); a network error is
+/// `FETCH_HEADER`, `error` and the error text on one line, control characters as spaces and at most
+/// 512 bytes (exit 2).
+pub(crate) fn encode_fetch(r: &Result<winhttp::Response, String>) -> (i32, Vec<u8>) {
+    let mut out = FETCH_HEADER.to_vec();
+    match r {
+        Ok(resp) => {
+            let lines = format!("{}\n{}\n", resp.status, resp.final_url);
+            out.reserve(lines.len() + resp.body.len());
+            out.extend_from_slice(lines.as_bytes());
+            out.extend_from_slice(&resp.body);
+            (FETCH_EXIT_RESPONSE, out)
+        }
+        Err(e) => {
+            let mut text = String::with_capacity(e.len().min(FETCH_ERROR_MAX));
+            for c in e.chars().map(|c| if c.is_control() { ' ' } else { c }) {
+                if text.len() + c.len_utf8() > FETCH_ERROR_MAX {
+                    break;
+                }
+                text.push(c);
+            }
+            out.extend_from_slice(FETCH_ERROR_LINE);
+            out.push(b'\n');
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
+            (FETCH_EXIT_ERROR, out)
+        }
+    }
+}
+
+/// The line before the first LF and everything after it; None without an LF.
+fn split_line(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let lf = b.iter().position(|&c| c == b'\n')?;
+    Some((b.get(..lf)?, b.get(lf + 1..)?))
+}
+
+/// Reads what an `--update-fetch` child printed, strictly (the elevated dock trusts none of it until
+/// this agrees): `Ok(Ok(response))`, `Ok(Err(the child's network error))`, or `Err(why the output is
+/// malformed)`, after which the caller checks in-process. The rules: the header exactly; a status of 3
+/// digits from 100 to 599; a final URL of 1 to 2048 bytes of visible ASCII; a body of at most
+/// `API_MAX_BYTES`; an error text of at most 512 bytes of UTF-8 without control characters, one line
+/// and nothing after it. The exit code must agree with the frame (0 a response, 2 an error), so a child
+/// that died while writing never passes a cut body off as a whole one. The output's buffer becomes the
+/// body, with no second copy.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn decode_fetch(code: i32, mut out: Vec<u8>) -> Result<Result<winhttp::Response, String>, String> {
+    let rest = out.strip_prefix(FETCH_HEADER).ok_or("no update-fetch header")?;
+    let (first, after) = split_line(rest).ok_or("the second line has no end")?;
+    if first == FETCH_ERROR_LINE {
+        if code != FETCH_EXIT_ERROR {
+            return Err(format!("an error with exit code {code}"));
+        }
+        let (text, tail) = split_line(after).ok_or("the error line has no end")?;
+        if !tail.is_empty() {
+            return Err("bytes after the error line".into());
+        }
+        if text.len() > FETCH_ERROR_MAX {
+            return Err("an error text over 512 bytes".into());
+        }
+        let text = std::str::from_utf8(text).map_err(|_| "an error text that is not UTF-8")?;
+        if text.chars().any(char::is_control) {
+            return Err("a control character in the error text".into());
+        }
+        return Ok(Err(text.to_owned()));
+    }
+    if code != FETCH_EXIT_RESPONSE {
+        return Err(format!("a response with exit code {code}"));
+    }
+    let status = match first {
+        [a, b, c] if first.iter().all(u8::is_ascii_digit) => {
+            u16::from(a - b'0') * 100 + u16::from(b - b'0') * 10 + u16::from(c - b'0')
+        }
+        _ => return Err("a status that is not 3 digits".into()),
+    };
+    if !(100..=599).contains(&status) {
+        return Err(format!("status {status}"));
+    }
+    let (url, body) = split_line(after).ok_or("the URL line has no end")?;
+    if url.is_empty() || url.len() > FETCH_URL_MAX || !url.iter().all(u8::is_ascii_graphic) {
+        return Err("a final URL that is empty, over 2048 bytes or not visible ASCII".into());
+    }
+    if body.len() as u64 > API_MAX_BYTES {
+        return Err(format!("a body over {API_MAX_BYTES} bytes"));
+    }
+    let final_url = String::from_utf8_lossy(url).into_owned();
+    let body_start = out.len() - body.len();
+    out.drain(..body_start);
+    Ok(Ok(winhttp::Response { status, body: out, final_url }))
 }
 
 /// Runs `f` on the shared status, filling an empty one from the config on first use.
@@ -298,7 +452,7 @@ fn check_once() {
     with_state(|s| s.phase = Phase::Checking);
     notify();
     let installed = Version::current();
-    let r = fetch_latest();
+    let r = fetch_latest(true);
     match &r {
         Ok(rel) if rel.version > installed => crate::log!("update: {} available", rel.tag),
         Ok(rel) => crate::log!("update: up to date (latest {})", rel.tag),
@@ -507,7 +661,9 @@ pub(crate) fn spawn_in_job(cmd: &mut Command) -> std::io::Result<Child> {
 }
 
 /// Downloads `dock.exe` and `dock.exe.sha256` of `rel` into `<data>\update\<tag>\`. Each asset must
-/// come back with 200, from an allowed host, at exactly the size the release JSON announced.
+/// come back with 200, from an allowed host, at exactly the size the release JSON announced. Unlike the
+/// check, this stays in-process: it runs only when an install follows (auto-install or "Install now"),
+/// and the installer replaces this dock, so the WinHTTP state it loads lives only until that restart.
 fn download(rel: &Release) -> Result<(), StageError> {
     let fail = StageError::Download;
     for (asset, name, cap) in [(&rel.exe, EXE_ASSET, EXE_MAX_BYTES), (&rel.sha256, SHA_ASSET, SHA_MAX_BYTES)] {
@@ -794,7 +950,8 @@ fn cli_code(code: i32) -> i32 {
 /// `--update-check`: one synchronous check, no config write. Exit 0 = answered, 1 = could not check.
 pub fn run_check_cli() -> i32 {
     let cur = Version::current();
-    match fetch_latest() {
+    // In-process: this is already a short-lived process, a child would only double the work.
+    match fetch_latest(false) {
         Ok(rel) if rel.version > cur => {
             let date = rel.published.get(..10).unwrap_or("");
             crate::logger::say(&format!(
@@ -1017,6 +1174,81 @@ mod tests {
         let r = run_capture(&system32("ping.exe"), &ping, Duration::from_millis(300), CAPTURE_MAX_BYTES);
         assert_eq!(r.err().as_deref(), Some("timeout"));
         assert!(t.elapsed() < Duration::from_secs(3)); // killed, not waited for
+    }
+
+    fn fetched(status: u16, url: &str, body: &[u8]) -> Result<winhttp::Response, String> {
+        Ok(winhttp::Response { status, body: body.to_vec(), final_url: url.into() })
+    }
+
+    /// What an `--update-fetch` child frames, the dock reads back unchanged.
+    #[test]
+    fn fetch_output_round_trip() {
+        let url = "https://api.github.com/repos/ops-software/mini-oled-dock/releases/latest";
+        let binary: &[u8] = b"line\nnext\r\n\0\xff";
+        for (status, body) in [(200, RELEASE_FIXTURE.as_bytes()), (403, &b""[..]), (200, binary)] {
+            let (code, out) = encode_fetch(&fetched(status, url, body));
+            assert_eq!(code, 0);
+            let Ok(r) = decode_fetch(code, out).unwrap() else { panic!("not a response") };
+            assert_eq!((r.status, r.final_url.as_str(), r.body.as_slice()), (status, url, body));
+        }
+        let why = "WinHttpSendRequest: the server name or address could not be resolved";
+        let (code, out) = encode_fetch(&Err(why.into()));
+        assert_eq!(code, 2);
+        assert_eq!(decode_fetch(code, out).unwrap().err().as_deref(), Some(why));
+        // An error is one line of at most 512 bytes: control characters become spaces, the cut keeps whole characters.
+        let (code, out) = encode_fetch(&Err(format!("a\r\nb\t{}", "\u{e9}".repeat(400))));
+        let text = decode_fetch(code, out).unwrap().err().expect("an error");
+        assert!(text.starts_with("a  b \u{e9}"), "{text:?}");
+        assert!((509..=512).contains(&text.len()), "{}", text.len());
+    }
+
+    /// Anything but the exact frame is refused, so the dock checks in-process instead of trusting it.
+    #[test]
+    fn fetch_output_rejected() {
+        let url = "https://api.github.com/x";
+        let frame = |status: &str, url: &str, body: &[u8]| {
+            let mut v = format!("mini-oled-dock update-fetch 1\n{status}\n{url}\n").into_bytes();
+            v.extend_from_slice(body);
+            v
+        };
+        let error = |text: &[u8]| [&b"mini-oled-dock update-fetch 1\nerror\n"[..], text].concat();
+        let cap = API_MAX_BYTES as usize;
+        let longest_url = format!("https://api.github.com/{}", "a".repeat(2048 - 23));
+        // The limits themselves pass.
+        assert!(decode_fetch(0, frame("100", url, b"")).is_ok());
+        assert!(decode_fetch(0, frame("599", &longest_url, &vec![b' '; cap])).is_ok());
+        assert!(decode_fetch(2, error(format!("{}\n", "a".repeat(512)).as_bytes())).is_ok());
+        let bad: [(i32, Vec<u8>, &str); 26] = [
+            (0, Vec::new(), "no output"),
+            (0, b"200\nhttps://api.github.com/x\n{}".to_vec(), "no header"),
+            (0, b"mini-oled-dock update-fetch 2\n200\nhttps://api.github.com/x\n{}".to_vec(), "another version"),
+            (0, b"mini-oled-dock update-fetch 1".to_vec(), "a header without its LF"),
+            (0, b"mini-oled-dock update-fetch 1\n200".to_vec(), "a status without its LF"),
+            (0, frame("99", url, b""), "status 99"),
+            (0, frame("600", url, b""), "status 600"),
+            (0, frame("2O0", url, b""), "a status that is not a number"),
+            (0, frame("+20", url, b""), "a signed status"),
+            (0, frame("0200", url, b""), "a status of 4 digits"),
+            (0, frame("200\r", url, b""), "a status with a CR"),
+            (0, frame("200", "https://api.github.com/\u{1}x", b""), "a URL with a control character"),
+            (0, frame("200", "https://api.github.com/a b", b""), "a URL with a space"),
+            (0, frame("200", "https://api.github.com/\u{e9}", b""), "a URL that is not ASCII"),
+            (0, frame("200", "", b""), "an empty URL"),
+            (0, frame("200", &format!("{longest_url}a"), b""), "a URL over 2048 bytes"),
+            (0, b"mini-oled-dock update-fetch 1\n200\nhttps://api.github.com/x".to_vec(), "a URL without its LF"),
+            (0, frame("200", url, &vec![b' '; cap + 1]), "a body over the cap"),
+            (2, frame("200", url, b"{}"), "a response with the error exit code"),
+            (1, frame("200", url, b"{}"), "a response from a child that failed while writing"),
+            (0, error(b"no route\n"), "an error with exit code 0"),
+            (2, error(b"no route"), "an error without its LF"),
+            (2, error(b"no route\nmore"), "bytes after the error line"),
+            (2, error(b"no\troute\n"), "an error with a control character"),
+            (2, error(format!("{}\n", "a".repeat(513)).as_bytes()), "an error over 512 bytes"),
+            (2, error(b"\xff\n"), "an error that is not UTF-8"),
+        ];
+        for (code, out, case) in bad {
+            assert!(decode_fetch(code, out).is_err(), "{case}");
+        }
     }
 
     /// A child that writes more than a pipe buffer neither blocks nor loses a byte; one that writes more
