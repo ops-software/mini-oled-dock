@@ -544,8 +544,12 @@ impl LauncherConfig {
         self.prefixes.retain(|p, name| {
             let chars = p.chars().count();
             let closed = !p.chars().any(char::is_alphabetic) || p.ends_with(' ');
+            // invisible prefixes (whitespace only, control or bidi/format marks) cannot be typed or seen
+            let visible = !p.trim().is_empty()
+                && !p.chars().any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'));
             let ok = (1..=5).contains(&chars)
                 && closed
+                && visible
                 && crate::launcher::model::ProviderId::from_name(name).is_some()
                 && seen.insert(p.to_ascii_lowercase());
             dropped |= !ok;
@@ -1857,7 +1861,20 @@ mod tests {
         assert!(!l.providers.contains_key("bogus"));
         let (l, _) = sane(|l| {
             l.prefixes.clear();
-            for (p, n) in [("x", "calc"), ("file", "files"), ("f ", "files"), ("toolong", "web"), ("", "web"), ("=", "calc"), ("%", "nope")] {
+            for (p, n) in [
+                ("x", "calc"),
+                ("file", "files"),
+                ("f ", "files"),
+                ("toolong", "web"),
+                ("", "web"),
+                ("=", "calc"),
+                ("%", "nope"),
+                (" ", "calc"),
+                ("\t", "calc"),
+                ("\n", "calc"),
+                ("\u{202e}", "calc"),
+                ("a\u{202e} ", "files"),
+            ] {
                 l.prefixes.insert(p.into(), n.into());
             }
         });
