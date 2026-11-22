@@ -9,14 +9,21 @@
 //! `on_idle` installs a staged release when `update_auto_install` is on and nothing is open.
 
 use std::io::Read;
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HWND, WAIT_OBJECT_0};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
 
@@ -361,44 +368,142 @@ pub(crate) fn verify_bytes(exe: &[u8], sha_file: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Runs `exe args` without a window and returns its exit code and stdout (at most 4 KB). A child
-/// that does not exit within `timeout` is killed and reported as `Err("timeout")`.
-pub(crate) fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<(i32, Vec<u8>), String> {
-    let mut child = std::process::Command::new(exe)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
-    let t = Instant::now();
+/// How often `run_capture` looks at its child.
+const CAPTURE_POLL: Duration = Duration::from_millis(50);
+/// How long `run_capture` waits for the end of a child's output once the child has exited.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// Runs `exe args` without a window, through `spawn_in_job`, and returns its exit code and stdout. The
+/// output is read on a short-lived `capture` thread while this one waits, so a child that writes more
+/// than a pipe buffer never blocks; at most `cap` bytes are kept. Every failure is an `Err`, with the
+/// child killed and reaped when it still runs: output over `cap` ("output larger than <cap> bytes"), no
+/// exit within `timeout` ("timeout"), an output still open 2 s after the exit. stdin and stderr are
+/// null: nothing is ever written to a child, so it can never block this thread on its input.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn run_capture(exe: &Path, args: &[&str], timeout: Duration, cap: u64) -> Result<(i32, Vec<u8>), String> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args).creation_flags(CREATE_NO_WINDOW.0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = spawn_in_job(&mut cmd).map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    let Some(stdout) = child.stdout.take() else {
+        return Err(stop(&mut child, "no output pipe".into()));
+    };
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::Builder::new().name("capture".into()).stack_size(64 * 1024).spawn(move || {
+        let mut out = Vec::new();
+        // One byte over the cap tells "too large" from "exactly the cap".
+        let read = stdout.take(cap.saturating_add(1)).read_to_end(&mut out).map(|_| out);
+        let _ = tx.send(read);
+    });
+    if let Err(e) = reader {
+        return Err(stop(&mut child, format!("cannot start the reader thread: {e}")));
+    }
+    let started = Instant::now();
+    let mut output: Option<std::io::Result<Vec<u8>>> = None;
     let code = loop {
+        match &output {
+            Some(Ok(out)) if out.len() as u64 > cap => {
+                return Err(stop(&mut child, format!("output larger than {cap} bytes")))
+            }
+            Some(Err(e)) => return Err(stop(&mut child, format!("reading the output of {}: {e}", exe.display()))),
+            _ => {}
+        }
         match child.try_wait() {
             Ok(Some(st)) => break st.code().unwrap_or(-1),
-            Ok(None) => {
-                if t.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("timeout".into());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("waiting for {} failed: {e}", exe.display()));
-            }
+            Ok(None) if started.elapsed() > timeout => return Err(stop(&mut child, "timeout".into())),
+            Ok(None) => {}
+            Err(e) => return Err(stop(&mut child, format!("waiting for {} failed: {e}", exe.display()))),
+        }
+        if output.is_some() {
+            std::thread::sleep(CAPTURE_POLL);
+            continue;
+        }
+        match rx.recv_timeout(CAPTURE_POLL) {
+            Ok(read) => output = Some(read),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => output = Some(Err(std::io::Error::other("the reader thread ended"))),
         }
     };
-    let mut out = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        stdout
-            .take(CAPTURE_MAX_BYTES)
-            .read_to_end(&mut out)
-            .map_err(|e| format!("reading the output of {}: {e}", exe.display()))?;
+    let output = match output {
+        Some(read) => read,
+        // Only something the child started can still hold the pipe; the reader is left to it.
+        None => rx.recv_timeout(READER_GRACE).map_err(|_| {
+            format!("the output of {} was still open {} s after it exited", exe.display(), READER_GRACE.as_secs())
+        })?,
+    };
+    let out = output.map_err(|e| format!("reading the output of {}: {e}", exe.display()))?;
+    if out.len() as u64 > cap {
+        return Err(format!("output larger than {cap} bytes"));
     }
     Ok((code, out))
+}
+
+/// Kills and reaps `child` (harmless when it has already exited) and hands `why` back.
+fn stop(child: &mut Child, why: String) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    why
+}
+
+/// The dock's job object (house rule 7 of plan L3): every child `spawn_in_job` starts joins it, so none
+/// outlives the dock, however it ends (a crash, the watchdog's restart, the installer's stop), and none
+/// holds the exe while an update replaces it. Created at the first spawn with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no security attributes, so its handle is not inherited and
+/// only the dock holds it; kept until the process ends, when Windows closes it and kills what is left.
+/// `None` = it could not be created (logged once): children then run outside it, as before.
+static JOB: OnceLock<Option<OwnedHandle>> = OnceLock::new();
+
+fn create_job() -> Option<OwnedHandle> {
+    // SAFETY: no attributes and no name; the handle returned is ours to own.
+    let job = match unsafe { CreateJobObjectW(None, PCWSTR::null()) } {
+        // SAFETY: a fresh handle, owned by nothing else.
+        Ok(h) => unsafe { OwnedHandle::from_raw_handle(h.0) },
+        Err(e) => {
+            crate::log!("children: cannot create the dock's job ({e}); child processes run outside it");
+            return None;
+        }
+    };
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+    // SAFETY: `job` is a valid job handle; `info` is readable and `size` bytes long.
+    let set = unsafe {
+        SetInformationJobObject(
+            HANDLE(job.as_raw_handle()),
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&info).cast(),
+            size,
+        )
+    };
+    if let Err(e) = set {
+        crate::log!("children: cannot set the dock's job to kill on close ({e}); child processes run outside it");
+        return None;
+    }
+    Some(job)
+}
+
+/// The dock's job, once a child has been started through `spawn_in_job` and the job could be made.
+#[cfg(test)]
+fn dock_job() -> Option<HANDLE> {
+    JOB.get().and_then(Option::as_ref).map(|j| HANDLE(j.as_raw_handle()))
+}
+
+/// Spawns `cmd` and puts the child into the dock's job (created at the first call). For short-lived
+/// children whose work belongs to the dock (`run_capture`'s, the icon child); never for the watchdog,
+/// an update's installer or anything the user launches, which must outlive the dock. A failed
+/// assignment is logged once and the child runs outside the job.
+pub(crate) fn spawn_in_job(cmd: &mut Command) -> std::io::Result<Child> {
+    let child = cmd.spawn()?;
+    if let Some(job) = JOB.get_or_init(create_job) {
+        // SAFETY: the job's handle is valid until the process ends, the child's until `child` is dropped.
+        let joined = unsafe { AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(child.as_raw_handle())) };
+        if let Err(e) = joined {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::log!("children: a child process could not join the dock's job ({e}); it runs outside it");
+            }
+        }
+    }
+    Ok(child)
 }
 
 /// Downloads `dock.exe` and `dock.exe.sha256` of `rel` into `<data>\update\<tag>\`. Each asset must
@@ -463,7 +568,7 @@ pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<Pa
         verify_bytes(&exe, &sha)?;
         drop(exe);
         let path = datadir::checked_stage_path(tag, EXE_ASSET).map_err(|e| format!("staged exe: {e}"))?;
-        let (code, out) = run_capture(&path, &["--version"], VERSION_TIMEOUT)?;
+        let (code, out) = run_capture(&path, &["--version"], VERSION_TIMEOUT, CAPTURE_MAX_BYTES)?;
         if code != 0 {
             return Err(format!("--version exited with {code}"));
         }
@@ -903,13 +1008,75 @@ mod tests {
 
     #[test]
     fn run_capture_reads_stdout_and_times_out() {
-        let (code, out) =
-            run_capture(&system32("cmd.exe"), &["/c", "echo mini-oled-dock 1.4.1"], Duration::from_secs(5)).unwrap();
+        let echo = ["/c", "echo mini-oled-dock 1.4.1"];
+        let (code, out) = run_capture(&system32("cmd.exe"), &echo, Duration::from_secs(5), CAPTURE_MAX_BYTES).unwrap();
         assert_eq!(code, 0);
         assert!(crate::update_release::version_output_matches(&out, Version::parse("1.4.1").unwrap()));
         let t = Instant::now();
-        assert!(run_capture(&system32("ping.exe"), &["-n", "6", "127.0.0.1"], Duration::from_millis(300)).is_err());
+        let ping = ["-n", "6", "127.0.0.1"];
+        let r = run_capture(&system32("ping.exe"), &ping, Duration::from_millis(300), CAPTURE_MAX_BYTES);
+        assert_eq!(r.err().as_deref(), Some("timeout"));
         assert!(t.elapsed() < Duration::from_secs(3)); // killed, not waited for
+    }
+
+    /// A child that writes more than a pipe buffer neither blocks nor loses a byte; one that writes more
+    /// than the cap is stopped at the cap, not at the timeout (the error names the cap).
+    #[test]
+    fn run_capture_reads_more_than_a_pipe_buffer() {
+        let dir = std::env::temp_dir().join(format!("dock_capture_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.txt");
+        let line: &[u8] = b"0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n";
+        let data: Vec<u8> = line.iter().copied().cycle().take(300_000).collect();
+        std::fs::write(&path, &data).unwrap();
+        let args = ["/c", "type", path.to_str().unwrap()];
+        let whole = run_capture(&system32("cmd.exe"), &args, Duration::from_secs(60), 1024 * 1024);
+        let capped = run_capture(&system32("cmd.exe"), &args, Duration::from_secs(60), 100_000);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (code, out) = whole.unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out.len(), data.len());
+        assert!(out == data, "the output differs from the file");
+        assert_eq!(capped.err().as_deref(), Some("output larger than 100000 bytes"));
+    }
+
+    /// Every child of `spawn_in_job` is in the dock's job, which kills what is left when the dock ends.
+    #[test]
+    fn children_join_the_job() {
+        use windows::core::BOOL;
+        use windows::Win32::System::JobObjects::{
+            IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        let mut cmd = std::process::Command::new(system32("ping.exe"));
+        cmd.args(["-n", "3", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_in_job(&mut cmd).unwrap();
+        let job = dock_job().expect("the job exists after a spawn");
+        let mut inside = BOOL(0);
+        // SAFETY: the child's handle is valid until `child` is dropped, the job's until the process ends.
+        let asked = unsafe { IsProcessInJob(HANDLE(child.as_raw_handle()), Some(job), &mut inside) };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        // SAFETY: `info` is writable and `size` bytes long.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                Some(job),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+                None,
+            )
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        asked.unwrap();
+        queried.unwrap();
+        assert!(inside.as_bool());
+        assert!(info.BasicLimitInformation.LimitFlags.contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE));
     }
 
     #[test]
