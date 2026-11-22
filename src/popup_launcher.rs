@@ -1579,6 +1579,8 @@ pub(crate) trait SysPort {
     fn translate(&mut self, rec: &KeyRec) -> Typed;
     /// `GetForegroundWindow`.
     fn foreground(&self) -> isize;
+    /// `h` can take the window menu: there, not the desktop (Progman, WorkerW), not one of the dock's own windows.
+    fn window_target(&self, h: isize) -> bool;
     /// A Switch: the bar's activation of one window (`apps::activate_window`).
     fn activate(&mut self, h: isize);
     /// The foreground back to `h` (`ui::force_foreground`), when it is still visible and not cloaked.
@@ -1757,6 +1759,8 @@ struct Ctrl {
     /// The sequence of the post being opened and the window in front when its chord came (read by `new`).
     open_seq: u32,
     fg_at_open: isize,
+    /// That window can take the window menu (`SysPort::window_target`).
+    window_ok: bool,
     /// `launcher.monitor`, `launcher.top_percent` and `launcher.over_fullscreen == "pass"`.
     pick: MonitorPick,
     top_percent: u8,
@@ -1832,6 +1836,7 @@ impl Ctrl {
         Ctrl {
             open_seq: 0,
             fg_at_open: 0,
+            window_ok: false,
             pick: MonitorPick::Pointer,
             top_percent: crate::config::LAUNCHER_TOP_PERCENT.2,
             over_fullscreen_pass: true,
@@ -1889,6 +1894,7 @@ impl Ctrl {
             opts: &self.opts,
             num: self.num,
             now_unix: now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            window_target: self.window_ok,
         }
     }
 }
@@ -2091,9 +2097,11 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
         OpenPlan::TryOpen => {
             let fg = sys.foreground();
             let num = sys.number_style();
+            let window_ok = sys.window_target(fg);
             with_ctrl(|c| {
                 c.open_seq = seq;
                 c.fg_at_open = fg;
+                c.window_ok = window_ok;
                 c.num = num;
             });
             sys.prepare_open();
@@ -2234,6 +2242,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
             group: tr(",", ".").chars().next().unwrap_or(','),
         },
         now_unix: 1_790_000_000,
+        window_target: true,
     };
     // The notepad window belongs to the Notepad app: its row shows the running indicator.
     let mut session = Session::open(&opts, None);
@@ -2464,6 +2473,8 @@ mod tests {
         fs: bool,
         open_ok: bool,
         is_open: bool,
+        /// The window in front can take the window menu.
+        menu_ok: bool,
         ops: Vec<Op>,
     }
 
@@ -2500,6 +2511,9 @@ mod tests {
         }
         fn foreground(&self) -> isize {
             0x5005
+        }
+        fn window_target(&self, h: isize) -> bool {
+            h != 0 && self.menu_ok
         }
         fn activate(&mut self, _h: isize) {}
         fn restore(&mut self, _h: isize) {}
@@ -2682,6 +2696,9 @@ mod tests {
         }
         fn foreground(&self) -> isize {
             0x7777
+        }
+        fn window_target(&self, h: isize) -> bool {
+            h != 0
         }
         fn activate(&mut self, h: isize) {
             self.ops.push(format!("Switch({h:#x})"));
@@ -2904,6 +2921,35 @@ mod tests {
         key(&mut l, &fx, &mut sys, 0x41, Mods::CTRL);
         assert_ne!(key(&mut l, &fx, &mut sys, 0x43, Mods::CTRL), Reply::Close);
         assert_eq!(ops(&sys), ["Copy(calc)"]);
+    }
+
+    #[test]
+    fn window_menu_needs_a_window() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // The chord came over no window, the desktop or one of the dock's: the row says so and Enter does nothing.
+        let cx = Context { window_target: false, ..fx.cx() };
+        let mut l = typed(&fx, "");
+        l.fg_at_open = 0;
+        l.session.chars("window menu", &cx);
+        let row = l.session.selected().unwrap();
+        assert_eq!(row.payload, Payload::Command(CommandId::WindowMenu));
+        assert_eq!(row.detail.as_deref(), Some(strings::no_window_to_act_on()), "disabled, with the reason");
+        assert_eq!(hint_for(row), None, "no Enter hint on a disabled row");
+        let mut sys = EffectSys::default();
+        let ev = KeyEvent { vk: VK_RETURN, mods: Mods::NONE, repeat: false, sys: false };
+        assert_eq!(l.on_key(ev, None, &cx, &mut sys), Reply::None, "the launcher stays");
+        assert!(ops(&sys).is_empty() && l.queued.is_empty(), "{:?} {:?}", sys.ops, l.queued);
+        // With a window in front the row is the usual one.
+        let l = typed(&fx, "window menu");
+        let row = l.session.selected().unwrap();
+        assert_eq!((row.detail.as_deref(), hint_for(row).is_some()), (None, true));
+        // The chord flow asks at each open whether the window in front can take it.
+        for ok in [false, true] {
+            let (plan, ..) = post(5, 1_010, 5, FakeSys { menu_ok: ok, ..fresh() });
+            assert_eq!(plan, OpenPlan::TryOpen);
+            assert_eq!(with_ctrl(|c| c.context().window_target), Some(ok));
+        }
     }
 
     #[test]
@@ -3393,6 +3439,7 @@ mod tests {
             opts,
             num: NumberStyle { decimal: '.', group: ',' },
             now_unix: 0,
+            window_target: true,
         }
     }
 

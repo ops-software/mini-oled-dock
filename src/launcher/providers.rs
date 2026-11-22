@@ -59,6 +59,9 @@ pub struct Context<'a> {
     /// The locale's number marks, read at open.
     pub num: NumberStyle,
     pub now_unix: i64,
+    /// The window in front when the chord came can take the window menu: there, not the desktop, not one of the dock's
+    /// own windows. Without one the Window menu row is disabled.
+    pub window_target: bool,
 }
 
 /// The best rows of a query: a fixed capacity of 3 x the visible rows, kept in result order.
@@ -277,7 +280,7 @@ fn run_one(id: ProviderId, q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK,
         }
         ProviderId::Apps => apps(q, cx, fuzzy, top, s),
         ProviderId::Windows => windows(q, cx, fuzzy, top, s),
-        ProviderId::Commands => commands(q, fuzzy, top, s),
+        ProviderId::Commands => commands(q, cx, fuzzy, top, s),
         ProviderId::Settings => settings(q, cx, fuzzy, top),
         ProviderId::Run => {
             run(q, cx, top);
@@ -518,7 +521,17 @@ fn command_item(cmd: &Command, from: ProviderId, title: &str, score: Score) -> I
     }
 }
 
-/// One command matched by its name in the dock language and by its keywords in both languages (rank `i`).
+/// One command matched by its name in the dock language and by its keywords in both languages (rank `i`): its score,
+/// None when it does not match.
+fn command_score(cmd: &Command, i: usize, q: &Query, fuzzy: bool, s: &mut Scratch) -> Option<Score> {
+    let no_keys = Keys::default();
+    s.name.reset(cmd.name());
+    let c = s.name.cand(&no_keys, cmd.keywords, index_u32(i));
+    let tier = tier_of(&c, &q.folded, fuzzy)?;
+    Some(c.score(tier, false, KIND_COMMAND))
+}
+
+/// One command row (`command_score`).
 fn command_row(
     cmd: &Command,
     i: usize,
@@ -528,26 +541,30 @@ fn command_row(
     top: &mut TopK,
     s: &mut Scratch,
 ) -> usize {
-    let no_keys = Keys::default();
-    let name = cmd.name();
-    s.name.reset(name);
-    let c = s.name.cand(&no_keys, cmd.keywords, index_u32(i));
-    let Some(tier) = tier_of(&c, &q.folded, fuzzy) else { return 0 };
-    let score = c.score(tier, false, KIND_COMMAND);
+    let Some(score) = command_score(cmd, i, q, fuzzy, s) else { return 0 };
     if top.accepts(&score) {
-        top.push(command_item(cmd, from, name, score));
+        top.push(command_item(cmd, from, cmd.name(), score));
     }
     1
 }
 
-/// The system commands; Registry Editor is the registry provider's.
-fn commands(q: &Query, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
-    COMMANDS
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.id != CommandId::Registry)
-        .map(|(i, c)| command_row(c, i, ProviderId::Commands, q, fuzzy, top, s))
-        .sum()
+/// The system commands; Registry Editor is the registry provider's. Window menu is disabled (no Enter, the reason as
+/// its detail) when the chord came over no window it can act on.
+fn commands(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
+    let mut hits = 0;
+    for (i, cmd) in COMMANDS.iter().enumerate().filter(|(_, c)| c.id != CommandId::Registry) {
+        let Some(score) = command_score(cmd, i, q, fuzzy, s) else { continue };
+        hits += 1;
+        if top.accepts(&score) {
+            let mut item = command_item(cmd, ProviderId::Commands, cmd.name(), score);
+            if cmd.id == CommandId::WindowMenu && !cx.window_target {
+                item.verbs = item.verbs.without(Verb::Open);
+                item.detail = Some(strings::no_window_to_act_on().into());
+            }
+            top.push(item);
+        }
+    }
+    hits
 }
 
 /// ":" shows one row "Open Registry Editor" whatever follows; in Mixed mode the command is matched like the others.
@@ -985,6 +1002,7 @@ pub(crate) mod tests {
                 opts: &self.opts,
                 num: NUM_IT,
                 now_unix: 1_790_000_000,
+                window_target: true,
             }
         }
 

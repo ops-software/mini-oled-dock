@@ -32,9 +32,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime, GetShellWindow,
-    InternalGetWindowText, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW, SetTimer, SC_KEYMENU, WM_CLOSE,
-    WM_SYSCOMMAND,
+    GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime,
+    GetShellWindow, InternalGetWindowText, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW, SetTimer,
+    SC_KEYMENU, WM_CLOSE, WM_SYSCOMMAND,
 };
 
 use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
@@ -125,14 +125,30 @@ fn cloaked(h: HWND) -> bool {
     r.is_ok() && v != 0
 }
 
-/// A window the window menu can act on: not null, not the desktop, still there.
+/// A window the window menu can act on: not null, still there, not the desktop (Progman, or the WorkerW that Win+D
+/// leaves in front) and not one of the dock's own windows (the bar after the Win key, the shared popup window when
+/// Start was open).
 fn acts_on(h: isize) -> bool {
     if h == 0 {
         return false;
     }
     let w = hw(h);
     // SAFETY: the three calls accept any handle and have no other preconditions.
-    unsafe { IsWindow(Some(w)).as_bool() && w != GetDesktopWindow() && w != GetShellWindow() }
+    let alive = unsafe { IsWindow(Some(w)).as_bool() && w != GetDesktopWindow() && w != GetShellWindow() };
+    alive && menu_target(&class_name(w), crate::ui::is_own_window(w))
+}
+
+/// The part of `acts_on` for a live window, pure: not a desktop class, not one of the dock's own windows.
+fn menu_target(class: &str, own: bool) -> bool {
+    !own && !matches!(class, "Progman" | "WorkerW")
+}
+
+/// The window class of `h` (at most 63 units); empty when it cannot be read.
+fn class_name(h: HWND) -> String {
+    let mut cls = [0u16; 64];
+    // SAFETY: `cls` is a writable buffer; a stale handle makes the call return 0.
+    let n = usize::try_from(unsafe { GetClassNameW(h, &mut cls) }).unwrap_or(0);
+    String::from_utf16_lossy(cls.get(..n).unwrap_or(&[]))
 }
 
 /// `text` to the clipboard as `CF_UNICODETEXT`, owned by the dock window (a clipboard opened without an owner refuses
@@ -355,6 +371,10 @@ impl SysPort for RealSys {
     fn foreground(&self) -> isize {
         // SAFETY: no preconditions.
         unsafe { GetForegroundWindow() }.0 as isize
+    }
+
+    fn window_target(&self, h: isize) -> bool {
+        acts_on(h)
     }
 
     fn activate(&mut self, h: isize) {
@@ -598,6 +618,16 @@ mod tests {
             LaunchReq::Url(_) => 9,
             LaunchReq::Registry => 10,
         }
+    }
+
+    #[test]
+    fn window_menu_targets() {
+        assert!(menu_target("Notepad", false));
+        assert!(menu_target("", false), "a class that could not be read is not the desktop");
+        assert!(!menu_target("WorkerW", false), "the desktop after Win+D");
+        assert!(!menu_target("Progman", false), "the desktop");
+        assert!(!menu_target("Notepad", true), "the bar, or the shared popup window when Start was open");
+        assert!(!acts_on(0), "no window");
     }
 
     #[test]
