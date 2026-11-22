@@ -2079,6 +2079,7 @@ pub(crate) enum PreviewScene {
     RunReview,
     Windows,
     Notice,
+    Error,
     FieldPair,
 }
 
@@ -2095,6 +2096,7 @@ impl PreviewScene {
             "run_review" => PreviewScene::RunReview,
             "windows" => PreviewScene::Windows,
             "notice" => PreviewScene::Notice,
+            "error" => PreviewScene::Error,
             "field_pair" => PreviewScene::FieldPair,
             _ => return None,
         })
@@ -2196,6 +2198,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::RunReview => long_line,
         PreviewScene::Windows => "<",
         PreviewScene::Notice => "zz",
+        PreviewScene::Error => "calc",
         PreviewScene::FieldPair => "",
     };
     if !query.is_empty() {
@@ -2222,6 +2225,11 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         };
         session.set_notices(vec![notice]);
         session.chars("z", &cx);
+    }
+    if scene == PreviewScene::Error {
+        // A refused launch that reopened the launcher over the same query (`reopen_with_error`).
+        session.set_notices(vec![failure_row()]);
+        let _ = session.refresh(&cx);
     }
     let mut l = Launcher::with_session(session);
     for (k, b) in icons {
@@ -3442,6 +3450,7 @@ mod tests {
             "launcher_run_review",
             "launcher_windows",
             "launcher_notice",
+            "launcher_error",
             "launcher_field_pair",
         ];
         let s = surface(96);

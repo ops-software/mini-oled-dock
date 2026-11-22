@@ -1083,6 +1083,16 @@ pub fn run(dir: &str) -> i32 {
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
             // Start's search control, the launcher's and the larger candidate, for the owner's Q7 choice.
+            ("launcher_empty", 0),
+            ("launcher_inactive", 0),
+            ("launcher_apps", 0),
+            ("launcher_running", 0),
+            ("launcher_calc", 0),
+            ("launcher_run", 0),
+            ("launcher_run_review", 0),
+            ("launcher_windows", 0),
+            ("launcher_notice", 0),
+            ("launcher_error", 0),
             ("launcher_field_pair", 0),
         ] {
             // Popups read the background tone from the config: every one starts from the defaults.
