@@ -75,6 +75,7 @@ mod start_import;
 mod start_search;
 mod surface;
 mod taskbar;
+mod tinysort;
 mod tray_host;
 mod ui;
 mod update;

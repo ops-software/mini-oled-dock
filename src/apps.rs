@@ -342,7 +342,7 @@ pub fn refresh(own: HWND) -> bool {
         // New groups: progressive first_seen in the order of appearance of their oldest window.
         let mut fresh: Vec<usize> =
             (0..accs.len()).filter(|&i| !old_first.contains_key(accs[i].key.as_str())).collect();
-        fresh.sort_by_key(|&i| accs[i].min_seq);
+        crate::tinysort::sort_by_key(&mut fresh, |&i| accs[i].min_seq);
         let mut assigned: HashMap<usize, u64> = HashMap::new();
         let mut next = st.next_group_seq;
         for i in fresh {
@@ -354,7 +354,7 @@ pub fn refresh(own: HWND) -> bool {
             .into_iter()
             .enumerate()
             .map(|(i, mut a)| {
-                a.wins.sort_by(|x, y| y.1.cmp(&x.1)); // decreasing stamp = MRU
+                crate::tinysort::sort_by(&mut a.wins, |x, y| y.1.cmp(&x.1)); // decreasing stamp = MRU
                 let windows: Vec<isize> = a.wins.iter().map(|w| w.0).collect();
                 let first_seen =
                     old_first.get(a.key.as_str()).copied().or_else(|| assigned.get(&i).copied()).unwrap_or(0);
@@ -362,7 +362,7 @@ pub fn refresh(own: HWND) -> bool {
                 AppGroup { key: a.key, exe_path: a.exe_path, aumid: a.aumid, windows, active, first_seen }
             })
             .collect();
-        new_groups.sort_by_key(|g| g.first_seen);
+        crate::tinysort::sort_by_key(&mut new_groups, |g| g.first_seen);
 
         st.next_group_seq = next;
         let changed = new_groups != st.groups;
@@ -981,7 +981,7 @@ pub fn click_group(key: &str) -> ClickOutcome {
     }
     // Active group with multiple windows: move to the next one in stable order of appearance.
     let mut by_seq = wins.clone();
-    by_seq.sort_by_key(|w| w.1);
+    crate::tinysort::sort_by_key(&mut by_seq, |w| w.1);
     let pos = by_seq.iter().position(|w| w.0 == fg).unwrap_or(0);
     let target = by_seq[(pos + 1) % by_seq.len()].0;
     activate_window(target);
@@ -998,7 +998,7 @@ pub fn windows_in_order(key: &str) -> Vec<isize> {
             .find(|g| g.key == key)
             .map(|g| g.windows.iter().map(|&h| (h, st.cache.get(&h).map(|e| e.seq).unwrap_or(0))).collect())
             .unwrap_or_default();
-        v.sort_by_key(|w| w.1);
+        crate::tinysort::sort_by_key(&mut v, |w| w.1);
         v.into_iter().map(|w| w.0).collect()
     })
 }

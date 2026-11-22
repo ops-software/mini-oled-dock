@@ -924,7 +924,9 @@ fn refresh_tray_state() {
     let cfg = config::get();
     if !cfg.tray_order.is_empty() {
         // Stable sort: icons missing from `tray_order` keep their registration order, at the end.
-        snap.sort_by_key(|t| cfg.tray_order.iter().position(|k| k.eq_ignore_ascii_case(&t.key)).unwrap_or(usize::MAX));
+        crate::tinysort::sort_by_key(&mut snap, |t| {
+            cfg.tray_order.iter().position(|k| k.eq_ignore_ascii_case(&t.key)).unwrap_or(usize::MAX)
+        });
     }
     let overflow = tray_host::any_user_hidden();
     UI.with(|u| {
@@ -1464,7 +1466,9 @@ fn rebuild_entries() {
         // Unpinned apps: `app_order` first (its order), then the rest in first-seen order (stable sort).
         let mut rest: Vec<usize> = (0..groups.len()).filter(|i| !used[*i]).collect();
         if !cfg.app_order.is_empty() {
-            rest.sort_by_key(|i| cfg.app_order.iter().position(|k| same_key(k, &groups[*i].key)).unwrap_or(usize::MAX));
+            crate::tinysort::sort_by_key(&mut rest, |i| {
+                cfg.app_order.iter().position(|k| same_key(k, &groups[*i].key)).unwrap_or(usize::MAX)
+            });
         }
         for i in rest {
             let g = &groups[i];
@@ -2863,7 +2867,7 @@ pub fn screens() -> Vec<Screen> {
         .iter()
         .map(|(_, mi)| (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0, device_name(mi)))
         .collect();
-    v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    crate::tinysort::sort_by(&mut v, |a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     v.truncate(MAX_SCREENS);
     v.into_iter()
         .enumerate()
