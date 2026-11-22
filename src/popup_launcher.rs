@@ -486,6 +486,13 @@ impl Launcher {
     }
 
     /// After a keystroke: a new layout waits to shrink until no key came for `SHRINK_MS`.
+    /// A notice row learned while this launcher is open: it shows after the others, over the same query.
+    fn show_notice(&mut self, row: Item, cx: &Context, sys: &mut dyn SysPort) -> Reply {
+        self.session.push_notice(row);
+        let fx = self.session.refresh(cx);
+        self.run(fx, cx, sys)
+    }
+
     fn typed(&mut self, reply: Reply, sys: &mut dyn SysPort) -> Reply {
         if reply == Reply::Relayout {
             self.hold_shrink = true;
@@ -1495,9 +1502,16 @@ fn new_launcher() -> Launcher {
         l
     });
     let mut l = made.unwrap_or_else(|| Launcher::with_session(Session::open(&LauncherOpts::default(), None)));
-    // The error of a launch refused while the launcher was away, and the PowerToys notice, show once, at this open.
-    let (failed, pt) = with_ctrl(|c| (c.notice.take(), c.pt.take_notice())).unwrap_or_default();
-    let notices: Vec<Item> = failed.map(|_| failure_row()).into_iter().chain(pt.map(pt_notice_row)).collect();
+    // The error of a launch refused while the launcher was away, a held Alt+Shift+Space and the PowerToys notice show
+    // once, at this open.
+    let (failed, held, pt) =
+        with_ctrl(|c| (c.notice.take(), std::mem::take(&mut c.chord_held), c.pt.take_notice())).unwrap_or_default();
+    let notices: Vec<Item> = failed
+        .map(|_| failure_row())
+        .into_iter()
+        .chain(held.then(chord_held_row))
+        .chain(pt.map(pt_notice_row))
+        .collect();
     let noticed = !notices.is_empty();
     if noticed {
         l.session.set_notices(notices);
@@ -1615,6 +1629,11 @@ pub(crate) fn after_failure(ms_since_hide: u64, fg_is_ours_or_null: bool) -> Fai
 /// The error row of a refused launch (no action: Enter on it only closes).
 fn failure_row() -> Item {
     notice_row("launch-failed", strings::launch_failed(), None)
+}
+
+/// The row of a refused "Use Alt+Shift+Space instead": another app holds that chord (no action).
+fn chord_held_row() -> Item {
+    notice_row("chord-held", strings::pt_alt_shift_space_held(), None)
 }
 
 /// A notice row (5.5.2): an info mark, the text, no verb.
@@ -2171,6 +2190,9 @@ struct Ctrl {
     failed_query: Option<String>,
     /// A refused launch that could not reopen the launcher: its notice row shows at the next open.
     notice: Option<LaunchKind>,
+    /// The PowerToys notice chose Alt+Shift+Space, another app holds it, and no launcher was open to say so: its notice
+    /// row shows at the next open.
+    chord_held: bool,
     /// PowerToys (L1b-5, 5.7): the chord is Alt+Space, so Command Palette and PowerToys Run are looked for; the policy;
     /// the one-shot 60 s check after the start has run.
     pt_on: bool,
@@ -2248,6 +2270,7 @@ impl Ctrl {
             hidden_at_ms: 0,
             failed_query: None,
             notice: None,
+            chord_held: false,
             pt_on: false,
             pt: Pt::new(),
             pt_late: false,
@@ -2435,6 +2458,13 @@ pub(crate) fn on_pt_message(code: usize) {
 /// The PowerToys notice's answer, outside the content that showed it: the config keeps it (`apply_answer`), and the
 /// controller follows the config at once.
 fn apply_pt_answer(answer: Option<Choice>) {
+    // Alt+Shift+Space only when no other app registered it (5.7, "Other holders"), as the Start offer: the probe runs
+    // here, on the dock window's message, outside the launcher's content.
+    if !answer_allowed(answer, &|| !crate::launcher_sys::chord_is_free(true)) {
+        log!("launcher: another app holds Alt+Shift+Space, the PowerToys answer is not saved");
+        show_chord_held();
+        return;
+    }
     let saved = crate::config::modify(|cfg| apply_answer(&mut cfg.launcher, answer));
     match saved {
         Ok(()) => {
@@ -2442,6 +2472,21 @@ fn apply_pt_answer(answer: Option<Choice>) {
             on_config();
         }
         Err(e) => log!("launcher: cannot save the PowerToys answer: {e}"),
+    }
+}
+
+/// The notice's answer may be written: Use Alt+Shift+Space only while no other app holds that chord (`held` runs the
+/// RegisterHotKey probe, for that answer only). A held chord leaves the chord and `powertoys_done` as they were.
+fn answer_allowed(answer: Option<Choice>, held: &dyn Fn() -> bool) -> bool {
+    answer != Some(Choice::UseAltShiftSpace) || !held()
+}
+
+/// Another app holds Alt+Shift+Space: an open launcher says so at once, otherwise its next open does (once).
+fn show_chord_held() {
+    let shown =
+        super::with_launcher(|l| ctx(|cx| l.show_notice(chord_held_row(), cx, &mut RealSys)).unwrap_or(Reply::None));
+    if !shown {
+        with_ctrl(|c| c.chord_held = true);
     }
 }
 
@@ -4740,6 +4785,35 @@ mod tests {
         }
         assert_eq!(answer_of(0), None, "0 is an exit");
         assert_eq!(answer_of(5), None);
+    }
+
+    #[test]
+    fn alt_shift_space_from_the_notice_waits_for_the_probe() {
+        let no_probe = || -> bool { panic!("the probe runs for Alt+Shift+Space only") };
+        for a in [Some(Choice::TakeChord), Some(Choice::LeaveChord), None] {
+            assert!(answer_allowed(a, &no_probe), "{a:?}");
+        }
+        assert!(answer_allowed(Some(Choice::UseAltShiftSpace), &|| false));
+        assert!(!answer_allowed(Some(Choice::UseAltShiftSpace), &|| true), "held: nothing is written");
+        // An open launcher says so at once, under the notices it already shows, over the same query.
+        let fx = crate::launcher::providers::tests::Fx::new();
+        let mut l = typed(&fx, "note");
+        l.session.set_notices(vec![failure_row()]);
+        let _ = l.session.refresh(&fx.cx());
+        assert_eq!(l.show_notice(chord_held_row(), &fx.cx(), &mut EffectSys::default()), Reply::Relayout);
+        let titles: Vec<&str> = l.session.rows().iter().take(2).map(|r| &*r.title).collect();
+        assert_eq!(titles, [strings::launch_failed(), strings::pt_alt_shift_space_held()]);
+        assert!(l.session.rows().iter().any(|r| r.kind != Kind::Notice), "the query's rows stay");
+        assert_eq!(
+            l.session.selected().map(|r| r.kind),
+            Some(Kind::App),
+            "a notice without an action is not the default"
+        );
+        // No launcher open: the next open shows it, once.
+        with_ctrl(|c| c.chord_held = true);
+        let l = new_launcher();
+        assert_eq!(l.session.rows().first().map(|r| &*r.title), Some(strings::pt_alt_shift_space_held()));
+        assert!(new_launcher().session.rows().iter().all(|r| r.kind != Kind::Notice), "once");
     }
 
     #[test]

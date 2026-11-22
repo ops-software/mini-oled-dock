@@ -183,6 +183,11 @@ pub fn choice_label(c: Choice) -> &'static str {
         Choice::UseAltShiftSpace => tr("Use Alt+Shift+Space instead", "Usa invece Alt+Maiusc+Spazio"),
     }
 }
+/// The notice after "Use Alt+Shift+Space instead" while another app holds that chord (the RegisterHotKey probe): the
+/// chord and the question stay as they were.
+pub fn pt_alt_shift_space_held() -> &'static str {
+    tr("Another app holds Alt+Shift+Space", "Un'altra app usa Alt+Maiusc+Spazio")
+}
 /// The notice after two passed chords that Command Palette did not answer.
 pub fn pt_took_over() -> &'static str {
     tr(
@@ -250,5 +255,6 @@ mod tests {
         assert!(pt_turn_off().starts_with("Turn its shortcut off in PowerToys > Command Palette"));
         assert!(pt_took_over().ends_with("so the launcher has it now"));
         assert_eq!(hint_pt_take(), "Take Alt+Space · Enter");
+        assert_eq!(pt_alt_shift_space_held(), "Another app holds Alt+Shift+Space");
     }
 }

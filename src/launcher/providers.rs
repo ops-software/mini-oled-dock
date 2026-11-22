@@ -837,6 +837,12 @@ impl Results {
         self.notices = notices;
     }
 
+    /// One more notice row, after the others (it replaces one with the same key), shown from the next `sync`.
+    pub fn push_notice(&mut self, notice: Item) {
+        self.notices.retain(|n| n.key != notice.key);
+        self.notices.push(notice);
+    }
+
     pub fn rows(&self) -> &[Item] {
         &self.rows
     }

@@ -397,6 +397,11 @@ impl Session {
         self.results.set_notices(notices);
     }
 
+    /// One more notice row after those already shown (an open that learns something new), from the next query.
+    pub fn push_notice(&mut self, notice: Item) {
+        self.results.push_notice(notice);
+    }
+
     /// Runs the query again as a new generation: the rows of a kept query at open.
     pub fn refresh(&mut self, cx: &Context) -> Vec<Effect> {
         self.requery(cx)
