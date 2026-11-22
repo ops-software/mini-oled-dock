@@ -232,6 +232,18 @@ pub enum ShellRequest {
     /// rebuilt from its parts before it reaches the shell (`rebuild_url`).
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     OpenUrl { url: String },
+    /// `Launch` for the launcher (a catalogue app as `shell:AppsFolder\<id>`, a setting's target, the
+    /// registry row): the same function, so the same updated-exe and folder logic, which exists for
+    /// these targets only; nothing typed reaches it. Unlike `Launch`, a failure pushes `LaunchFailed`.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LauncherLaunch { target: String, args: Option<String> },
+    /// `LaunchAppAdmin` for the launcher: a failure pushes `LaunchFailed`.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LauncherAppAdmin { id: String },
+    /// `RevealApp` for the launcher: a failure pushes `LaunchFailed` (an app with no file to show is
+    /// no failure).
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LauncherRevealApp { id: String },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -268,6 +280,7 @@ pub enum ShellEvent {
 /// What a failed launcher launch was (`ShellEvent::LaunchFailed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchKind {
+    App,
     Path,
     Command,
     Admin,
@@ -569,14 +582,21 @@ impl Shell {
                 }
             }
             ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
-            ShellRequest::LaunchAppAdmin { id } => launch_app_admin(&id),
-            ShellRequest::RevealApp { id } => reveal_app(&id),
+            ShellRequest::LaunchAppAdmin { id } => {
+                let _ = launch_app_admin(&id);
+            }
+            ShellRequest::RevealApp { id } => {
+                let _ = reveal_app(&id);
+            }
             // launcher arms: begin
             req @ (ShellRequest::OpenPath { .. }
             | ShellRequest::RunAsTyped { .. }
             | ShellRequest::LaunchCommand { .. }
             | ShellRequest::RevealPath { .. }
-            | ShellRequest::OpenUrl { .. }) => launcher_launch(self.ui, req),
+            | ShellRequest::OpenUrl { .. }
+            | ShellRequest::LauncherLaunch { .. }
+            | ShellRequest::LauncherAppAdmin { .. }
+            | ShellRequest::LauncherRevealApp { .. }) => launcher_launch(self.ui, req),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -1624,15 +1644,21 @@ fn launch_admin(tool: AdminTool) {
 }
 
 /// `ShellRequest::LaunchAppAdmin`: like `launch_admin`, for an app of the AppsFolder catalog.
-fn launch_app_admin(id: &str) {
+fn launch_app_admin(id: &str) -> Result<(), String> {
     let id = id.trim();
     if id.is_empty() {
-        return;
+        return Err("empty app id".into());
     }
     let target = format!("shell:AppsFolder\\{id}");
     match desktop_shell_execute(&target, None, None, Verb::RunAs, SW_SHOWNORMAL.0) {
-        Ok(()) => log!("shell: LaunchAppAdmin '{target}' via the desktop shell (runas, UAC prompt)"),
-        Err(e) => log!("shell: LaunchAppAdmin '{target}' through the desktop shell failed ({e}): REFUSED"),
+        Ok(()) => {
+            log!("shell: LaunchAppAdmin '{target}' via the desktop shell (runas, UAC prompt)");
+            Ok(())
+        }
+        Err(e) => {
+            log!("shell: LaunchAppAdmin '{target}' through the desktop shell failed ({e}): REFUSED");
+            Err(format!("desktop shell: {e}"))
+        }
     }
 }
 
@@ -1653,15 +1679,20 @@ fn app_target_path(id: &str) -> Option<String> {
 }
 
 /// `ShellRequest::RevealApp`: File Explorer (from the Windows folder) with the app's file selected.
-fn reveal_app(id: &str) {
+/// An app with no file to show (a Store app) is not a failure.
+fn reveal_app(id: &str) -> Result<(), String> {
     let Some(path) = app_target_path(id) else {
         log!("shell: RevealApp '{id}': no file to show");
-        return;
+        return Ok(());
     };
-    let Some(explorer) = system_dir().and_then(|s| s.parent().map(|w| w.join("explorer.exe"))) else { return };
-    if let Err(e) = launch(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\""))) {
+    let Some(explorer) = system_dir().and_then(|s| s.parent().map(|w| w.join("explorer.exe"))) else {
+        return Err("no Windows folder".into());
+    };
+    let r = launch(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")));
+    if let Err(e) = &r {
         log!("shell: RevealApp '{path}' not executed: {e}");
     }
+    r
 }
 
 // launcher requests: begin
@@ -1694,6 +1725,9 @@ fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
         ShellRequest::LaunchCommand { .. } => Some(LaunchKind::Command),
         ShellRequest::RevealPath { .. } => Some(LaunchKind::Reveal),
         ShellRequest::OpenUrl { .. } => Some(LaunchKind::Url),
+        ShellRequest::LauncherLaunch { .. } => Some(LaunchKind::App),
+        ShellRequest::LauncherAppAdmin { .. } => Some(LaunchKind::Admin),
+        ShellRequest::LauncherRevealApp { .. } => Some(LaunchKind::Reveal),
         _ => None,
     }
 }
@@ -1747,6 +1781,10 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             }
             r
         }
+        // Catalogue ids and settings targets: these functions log as they do for Start.
+        ShellRequest::LauncherLaunch { target, args } => launch(&target, args.as_deref()),
+        ShellRequest::LauncherAppAdmin { id } => launch_app_admin(&id),
+        ShellRequest::LauncherRevealApp { id } => reveal_app(&id),
         _ => return,
     };
     if let Err(err) = &r {
@@ -2495,5 +2533,44 @@ mod tests {
         assert!(open_url_with("HTTPS://a.it/\"", &mut recorder(&mut calls, true)).is_ok());
         assert!(open_url_with("ftp://a.it", &mut recorder(&mut calls, true)).is_err());
         assert_eq!(calls, [("https://a.it/%22".to_string(), None, None, Verb::Open)]);
+    }
+
+    #[test]
+    fn only_launcher_requests_report_failures() {
+        let err: Result<(), String> = Err("0x80004005".into());
+        let reported = |r: &ShellRequest| match launch_kind(r).and_then(|k| failure_event(k, &err)) {
+            Some(ShellEvent::LaunchFailed { kind }) => Some(kind),
+            _ => None,
+        };
+        let id = || "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_string();
+        let shared = [
+            ShellRequest::Launch { target: format!("shell:AppsFolder\\{}", id()), args: None },
+            ShellRequest::LaunchAppAdmin { id: id() },
+            ShellRequest::RevealApp { id: id() },
+            ShellRequest::LaunchAdmin(AdminTool::Terminal),
+            ShellRequest::OpenNotifApp { aumid: id(), name: "Calculator".into() },
+            ShellRequest::ToggleDesktop,
+        ];
+        for r in &shared {
+            assert_eq!(reported(r), None, "{r:?}");
+        }
+        let g = Gesture::for_test(1);
+        let twins = [
+            (
+                ShellRequest::LauncherLaunch { target: format!("shell:AppsFolder\\{}", id()), args: None },
+                LaunchKind::App,
+            ),
+            (ShellRequest::LauncherAppAdmin { id: id() }, LaunchKind::Admin),
+            (ShellRequest::LauncherRevealApp { id: id() }, LaunchKind::Reveal),
+            (ShellRequest::OpenPath { path: "C:\\a.txt".into() }, LaunchKind::Path),
+            (ShellRequest::RevealPath { path: "C:\\a.txt".into() }, LaunchKind::Reveal),
+            (ShellRequest::LaunchCommand { line: "ping x".into(), file: 0..4, console: true }, LaunchKind::Command),
+            (ShellRequest::RunAsTyped { line: "cmd".into(), file: 0..3, gesture: g }, LaunchKind::Admin),
+            (ShellRequest::OpenUrl { url: "https://a.it".into() }, LaunchKind::Url),
+        ];
+        for (r, kind) in &twins {
+            assert_eq!(reported(r), Some(*kind), "{r:?}");
+            assert!(launch_kind(r).and_then(|k| failure_event(k, &Ok(()))).is_none(), "{r:?}");
+        }
     }
 }
