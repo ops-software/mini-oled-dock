@@ -134,28 +134,28 @@
   // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces)
   // or "<exe name lowercase>#<icon id>", e.g. "discord.exe#1".
   "tray_hidden": [
-    "msiafterburner.exe#197480"
+    "alpha.exe#197480"
   ],
 
   // Order of the tray icons in the bar (same keys as "tray_hidden"). Normally managed by
   // dragging an icon in the bar; icons not listed go last, in the order they registered.
   "tray_order": [
-    "699e423d-73da-42ba-b94e-881ff8672467",
-    "razerappengine.exe#3",
-    "steam.exe#1",
-    "blip.exe#1",
-    "e5768d8b-6936-4f45-b1ad-4c5fb414cb35",
-    "wallpaper64.exe#1000",
-    "fbed1924-0f0e-4ae6-87d3-246dcd41eee1",
-    "powertoys.exe#1",
-    "msiafterburner.exe#132114",
-    "de1bec15-0ed1-3859-9497-fb8004042c23",
-    "fdm.exe#0",
-    "bootstrapper.exe#1",
-    "sensorpanel.exe#2",
-    "173fe6b0-4599-c2df-da9e-f5296eb20725",
-    "msiafterburner.exe#197562",
-    "2753843f-159d-d110-d927-eec24e4d97dd"
+    "11111111-2222-4333-8444-555555555551",
+    "bravo.exe#3",
+    "charlie.exe#1",
+    "delta.exe#1",
+    "11111111-2222-4333-8444-555555555552",
+    "echo.exe#1000",
+    "11111111-2222-4333-8444-555555555553",
+    "foxtrot.exe#1",
+    "alpha.exe#132114",
+    "11111111-2222-3333-8444-555555555554",
+    "golf.exe#0",
+    "hotel.exe#1",
+    "india.exe#2",
+    "11111111-2222-c333-8444-555555555555",
+    "alpha.exe#197562",
+    "11111111-2222-d333-8444-555555555556"
   ],
 
   // System tray icons the dock never shows (volume, network, power, location, microphone).
@@ -182,24 +182,24 @@
       "launch": "C:\\Windows\\explorer.exe"
     },
     {
-      "key": "F0DC299D809B9700",
-      "name": "Zen",
-      "launch": "C:\\Program Files\\Zen Browser\\zen.exe"
+      "key": "A1B2C3D4E5F60789",
+      "name": "Example Browser",
+      "launch": "C:\\Program Files\\Example Browser\\browser.exe"
     },
     {
-      "key": "c:\\users\\user\\appdata\\local\\discord\\app-*\\discord.exe",
-      "name": "Discord",
-      "launch": "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9269\\Discord.exe"
+      "key": "c:\\users\\user\\appdata\\local\\examplechat\\app-*\\examplechat.exe",
+      "name": "Example Chat",
+      "launch": "C:\\Users\\user\\AppData\\Local\\ExampleChat\\app-1.2.3456\\ExampleChat.exe"
     },
     {
-      "key": "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App",
-      "name": "WhatsApp",
-      "launch": "shell:AppsFolder\\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+      "key": "12345ABC.ExampleMessenger_abcdefgh12345!App",
+      "name": "Example Messenger",
+      "launch": "shell:AppsFolder\\12345ABC.ExampleMessenger_abcdefgh12345!App"
     },
     {
-      "key": "c:\\users\\user\\appdata\\local\\programs\\stremio\\stremio-shell-ng.exe",
-      "name": "Stremio",
-      "launch": "C:\\Users\\user\\AppData\\Local\\Programs\\Stremio\\stremio-shell-ng.exe"
+      "key": "c:\\users\\user\\appdata\\local\\programs\\exampleplayer\\exampleplayer.exe",
+      "name": "Example Player",
+      "launch": "C:\\Users\\user\\AppData\\Local\\Programs\\ExamplePlayer\\exampleplayer.exe"
     }
   ],
 
