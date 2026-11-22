@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -19,12 +20,13 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
-use crate::launcher::catalog::CatApp;
+use crate::launcher::catalog::{self, CatApp, IconCache};
 use crate::launcher::field::KeyEvent;
 use crate::launcher::gesture::{self, Gesture};
+use crate::launcher::history;
 use crate::launcher::model::{
-    Batch, CommandId, GlyphId, IconRef, Item, Kind, Mods, NumberStyle, Payload, ProviderId, ProviderMask, SettingRow,
-    Verb, WindowRow,
+    Batch, CommandId, GlyphId, IconRef, Item, Kind, Mode, Mods, NumberStyle, Payload, ProviderId, ProviderMask,
+    SettingRow, Verb, WindowRow,
 };
 use crate::launcher::providers::{self, Budget, Context, LauncherOpts};
 use crate::launcher::query::{self, PrefixTable};
@@ -37,7 +39,8 @@ use crate::launcher::web::{self, Engine, Template};
 use crate::launcher_sys::{RealHook, RealSys};
 use crate::log;
 use crate::render::Metrics;
-use crate::shell_thread::ShellRequest;
+use crate::shell_thread::{IconPlan, ShellRequest, StartApp};
+use crate::start_search::{self, AppIndex, Holder, Setting};
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
 /// Height of the empty panel, the field alone (logical px, SPEC 5.2.3).
@@ -296,6 +299,8 @@ pub(crate) struct Launcher {
     forgotten: Vec<Box<str>>,
     /// The icon size of the rows at the surface's DPI (`StartIconsFor`).
     icon_px: u32,
+    /// The titles of the windows were read for this open (the "<" mode, once).
+    titles_read: bool,
 }
 
 impl Launcher {
@@ -323,6 +328,7 @@ impl Launcher {
             switch: None,
             forgotten: Vec::new(),
             icon_px: style::ICON_M as u32,
+            titles_read: false,
         }
     }
 
@@ -474,7 +480,11 @@ impl Launcher {
             return;
         }
         let lines = std::mem::take(&mut self.forgotten);
-        with_ctrl(|c| c.history.retain(|h| !lines.contains(h)));
+        with_ctrl(|c| {
+            let before = c.history.len();
+            c.history.retain(|h| !lines.contains(h));
+            c.dirty |= c.history.len() != before;
+        });
     }
 
     /// The chord again while open (the controller's `OpenPlan::Close`): the final Esc.
@@ -495,13 +505,21 @@ impl Launcher {
             sys.restore(self.fg_at_open);
         }
         let mut elevated = false;
+        // A setting's target comes from the list the controller holds next to the rows.
+        let held = with_ctrl(|c| c.setting_list.clone()).unwrap_or_default();
+        let setting = |i: u32| {
+            let s = held.get(usize::try_from(i).ok()?)?;
+            Some((s.target.to_string(), s.args.clone()))
+        };
         for e in std::mem::take(&mut self.queued) {
             match e {
                 Effect::Launch(r) => {
                     let elevates = r.elevates();
                     elevated |= elevates;
-                    // A setting's target comes with the settings rows the controller holds (L1a-16).
-                    if let Some(req) = crate::launcher_sys::to_request(r, &|_| None) {
+                    if let Some(line) = run_line_of(&r) {
+                        with_ctrl(|c| c.dirty |= c.learn && history::push_front(&mut c.history, line));
+                    }
+                    if let Some(req) = crate::launcher_sys::to_request(r, &setting) {
                         sys.shell(req);
                     }
                     if elevates {
@@ -523,6 +541,55 @@ impl Launcher {
         });
     }
 
+    /// After a close, with the popup hidden (the host's `after_close`): the icons the rows used stay in the cache, the
+    /// 10-minute release of the settings is armed, a changed history is written 2 s later, and a catalogue older than
+    /// 10 minutes is listed again.
+    fn housekeeping(&mut self, sys: &mut dyn SysPort) {
+        let used: Vec<String> = self
+            .session
+            .rows()
+            .iter()
+            .take(self.max_rows)
+            .filter_map(|i| match &i.icon {
+                IconRef::App(id) => Some(id.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let now = sys.now_ms();
+        let plan = with_ctrl(|c| {
+            for id in &used {
+                c.icons.touch(id);
+            }
+            (c.dirty, c.catalogue_stale(now))
+        });
+        let (save, stale) = plan.unwrap_or_default();
+        sys.arm(crate::msg::TIMER_LAUNCHER_RELEASE, RELEASE_MS);
+        if save {
+            sys.arm(crate::msg::TIMER_LAUNCHER_SAVE, SAVE_MS);
+        }
+        if stale {
+            with_ctrl(|c| c.listing_since = Some(now));
+            sys.shell(list_request());
+        }
+    }
+
+    /// In the "<" mode the titles of the windows are read, once per open: the rows are searched again with them. In every
+    /// other mode no title is ever read.
+    fn read_titles(&mut self, reply: Reply, sys: &mut dyn SysPort) -> Reply {
+        if self.titles_read || self.session.mode() != Mode::Only(ProviderId::Windows) {
+            return reply;
+        }
+        if with_ctrl(|c| sys.fill_titles(&mut c.windows)).is_none() {
+            return reply;
+        }
+        self.titles_read = true;
+        let again = ctx(|cx| {
+            let fx = self.session.refresh(cx);
+            self.run(fx, cx, sys)
+        });
+        reply.merge(again.unwrap_or(Reply::None))
+    }
+
     /// The session the keys and the late batches go to (L1a-15).
     // The chord flow of L1a-15 reaches the session through it; until then only the tests do.
     #[allow(dead_code)]
@@ -538,8 +605,6 @@ impl Launcher {
     }
 
     /// An icon arrived: an app id, or "bar:" + group key, lower-case (L1a-16).
-    // The icon cache of L1a-16 fills it.
-    #[allow(dead_code)]
     pub(crate) fn set_icon(&mut self, key: &str, bmp: IconBitmap) {
         self.icons.insert(key.to_lowercase(), bmp);
     }
@@ -944,7 +1009,16 @@ impl Content for Launcher {
     }
 
     fn size(&mut self, s: &Surface) -> (i32, i32) {
-        self.icon_px = u32::try_from(s.metrics().px(style::ICON_M)).unwrap_or(24);
+        let px = u32::try_from(s.metrics().px(style::ICON_M)).unwrap_or(24);
+        if px != self.icon_px {
+            self.icon_px = px;
+            // The size the cache keeps new icons at (a silent try: the controller may be borrowed by the key being handled).
+            CTRL.with(|c| {
+                if let Ok(mut c) = c.try_borrow_mut() {
+                    c.icon_px = px;
+                }
+            });
+        }
         let g = self.layout(s);
         // The review of the selected row is measured with the real font, for the session's conditions.
         if let (Some(lines), Some(key)) = (self.review_lines(s), self.session.selected().map(|i| i.key)) {
@@ -1021,7 +1095,7 @@ impl Content for Launcher {
         let gesture = gesture_for(&ev, &mut RealHook, &sys);
         let reply = ctx(|cx| self.on_key(ev, gesture, cx, &mut sys));
         self.forget_runs();
-        reply
+        reply.map(|r| self.read_titles(r, &mut sys))
     }
 
     fn char(&mut self, c: char) -> Reply {
@@ -1032,7 +1106,7 @@ impl Content for Launcher {
             let reply = self.run(fx, cx, &mut sys);
             self.typed(reply, &mut sys)
         })
-        .unwrap_or(Reply::None)
+        .map_or(Reply::None, |r| self.read_titles(r, &mut sys))
     }
 
     fn close_request(&mut self) -> Reply {
@@ -1058,7 +1132,7 @@ impl Content for Launcher {
 
     fn focus(&mut self, active: bool) -> Reply {
         match ctx(|cx| self.on_focus(active, cx, &mut RealHook, &mut RealSys)) {
-            Some(r) => r,
+            Some(r) => self.read_titles(r, &mut RealSys),
             None => self.set_foreground(active),
         }
     }
@@ -1091,6 +1165,7 @@ impl Content for Launcher {
 
     fn after_close(&mut self) {
         self.finish(&mut RealHook, &mut RealSys);
+        self.housekeeping(&mut RealSys);
     }
 
     fn launcher(&mut self) -> Option<&mut Launcher> {
@@ -1111,6 +1186,10 @@ fn new_launcher() -> Launcher {
         l.open_seq = c.open_seq;
         l.fg_at_open = c.fg_at_open;
         l.set_shape(c.width, c.opts.rows);
+        // The icons kept between opens: rows that have one never ask again.
+        for (k, b) in c.icons.iter() {
+            l.icons.insert(k.to_string(), b.clone());
+        }
         l
     });
     let mut l = made.unwrap_or_else(|| Launcher::with_session(Session::open(&LauncherOpts::default(), None)));
@@ -1137,11 +1216,193 @@ pub(crate) fn shutdown() {
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
     // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
     let _ = unsafe { KillTimer(Some(hwnd), id) };
-    if id == crate::msg::TIMER_LAUNCHER_SHRINK {
-        super::with_launcher(|l| {
-            l.hold_shrink(false);
-            Reply::Relayout
+    match id {
+        crate::msg::TIMER_LAUNCHER_SHRINK => {
+            super::with_launcher(|l| {
+                l.hold_shrink(false);
+                Reply::Relayout
+            });
+        }
+        crate::msg::TIMER_LAUNCHER_WARM => {
+            if is_on() {
+                ask_catalogue();
+            }
+        }
+        crate::msg::TIMER_LAUNCHER_SAVE => save_state(),
+        crate::msg::TIMER_LAUNCHER_RELEASE => release_resident(),
+        _ => {}
+    }
+}
+
+/// A chord is set: the launcher's state exists.
+pub(crate) fn is_on() -> bool {
+    ON.with(Cell::get)
+}
+
+/// Asks the shell thread for the catalogue, unless an answer is on its way.
+fn ask_catalogue() {
+    let now = RealSys.now_ms();
+    let ask = with_ctrl(|c| {
+        let waiting = c.listing_since.is_some_and(|t| now.saturating_sub(t) < LISTING_RETRY_MS);
+        if !waiting {
+            c.listing_since = Some(now);
+        }
+        !waiting
+    });
+    if ask == Some(true) {
+        crate::shell_thread::request(list_request());
+    }
+}
+
+/// `ShellEvent::StartApps` (`popup::on_start_apps`, which took Windows' app index for this catalogue): the launcher keeps its
+/// own folded copy, swapped in at the next keystroke. Nothing happens without a chord.
+pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
+    if !is_on() {
+        return;
+    }
+    let apps = catalog::ingest(list, index);
+    let n = apps.len();
+    let now = RealSys.now_ms();
+    if with_ctrl(|c| {
+        c.apps = apps;
+        c.listed_at_ms = now.max(1);
+        c.listing_since = None;
+    })
+    .is_some()
+    {
+        log!("launcher: catalogue of {n} apps");
+    }
+}
+
+/// `ShellEvent::StartSettings`: the settings list is built; when the launcher holds it, its rows are folded now.
+pub(crate) fn on_settings_ready() {
+    if is_on() && start_search::holds_settings(Holder::Launcher) {
+        fold_held_settings();
+    }
+}
+
+/// Folds the held settings list into rows (once per load: names and keywords are folded here, not per keystroke).
+fn fold_held_settings() {
+    let list = start_search::settings();
+    if list.is_empty() {
+        return;
+    }
+    let rows = catalog::fold_settings(&list);
+    with_ctrl(|c| {
+        c.settings = rows;
+        c.setting_list = list;
+    });
+}
+
+/// `ShellEvent::LauncherIcons`: kept in the cache (at the size of the rows) and shown at once when the launcher is open.
+pub(crate) fn on_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>) {
+    if !is_on() {
+        return;
+    }
+    let mut ids = Vec::new();
+    let px = with_ctrl(|c| c.icon_px).unwrap_or(icon_px);
+    for (id, bmp) in icons {
+        let Some(b) = bmp else { continue };
+        let b = if icon_px != px && px != 0 { crate::icons::resize_area(&b, px) } else { b };
+        if !b.is_empty() {
+            with_ctrl(|c| c.icons.insert(&id, b));
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return;
+    }
+    super::with_launcher(|l| {
+        with_ctrl(|c| {
+            for id in &ids {
+                if let Some(b) = c.icons.get(&id.to_lowercase()) {
+                    l.set_icon(id, b.clone());
+                }
+            }
         });
+        Reply::Redraw
+    });
+}
+
+/// `ShellEvent::LauncherState`: the run history of the shell user (the learned ranks come in L1b). Lines added since the
+/// open stay first.
+pub(crate) fn on_state(run: Option<Vec<u8>>) {
+    if !is_on() {
+        return;
+    }
+    with_ctrl(|c| {
+        if !c.learn {
+            return;
+        }
+        let mut loaded = run.map_or_else(Vec::new, |b| history::parse_run(&b));
+        for line in c.history.iter().rev() {
+            history::push_front(&mut loaded, line);
+        }
+        c.history = loaded;
+    });
+}
+
+/// `TIMER_LAUNCHER_SAVE`: a changed history is written (the shell thread writes it for the shell user).
+fn save_state() {
+    let req = with_ctrl(|c| {
+        if !std::mem::take(&mut c.dirty) || !c.learn {
+            return None;
+        }
+        Some(ShellRequest::LauncherStateSave {
+            frecency: None,
+            run: Some(history::render_run(&c.history)),
+            delete: false,
+        })
+    })
+    .flatten();
+    if let Some(r) = req {
+        crate::shell_thread::request(r);
+    }
+}
+
+/// `TIMER_LAUNCHER_RELEASE`: 10 minutes after the last close the settings rows, their list and the window rows are freed
+/// (the catalogue and its icons stay: they are what the 0.42 MiB resident set is).
+fn release_resident() {
+    if super::current() == Some(PopupKind::Launcher) {
+        return;
+    }
+    let _ = with_ctrl(|c| {
+        c.settings = Vec::new();
+        c.setting_list = Arc::default();
+        c.windows = Vec::new();
+    });
+    start_search::release_settings_for(Holder::Launcher);
+    crate::mem::released_data();
+    log!("launcher: settings released");
+}
+
+/// What an open needs before its window shows (`SysPort::prepare_open`): the settings held (and folded when they are
+/// already loaded), the windows listed, the history asked for the first time, the catalogue listed when it has not been.
+pub(crate) fn prepare_open() {
+    if let Some(h) = super::last_hwnd() {
+        // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
+        let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
+    }
+    start_search::hold_settings(Holder::Launcher);
+    if with_ctrl(|c| c.settings.is_empty()) == Some(true) {
+        fold_held_settings();
+    }
+    let windows = crate::launcher_sys::window_rows();
+    let (state, listed) = with_ctrl(|c| {
+        c.windows = windows;
+        let state = (!std::mem::replace(&mut c.state_loaded, true)).then_some(c.learn);
+        (state, c.apps.is_empty() && c.listing_since.is_none())
+    })
+    .unwrap_or((None, false));
+    match state {
+        Some(true) => crate::shell_thread::request(ShellRequest::LauncherStateLoad),
+        Some(false) => {
+            crate::shell_thread::request(ShellRequest::LauncherStateSave { frecency: None, run: None, delete: true })
+        }
+        None => {}
+    }
+    if listed {
+        ask_catalogue();
     }
 }
 
@@ -1210,6 +1471,10 @@ pub(crate) trait SysPort {
     fn power(&mut self, id: CommandId);
     /// Settings > Launcher.
     fn open_settings(&mut self);
+    /// What an open needs before the window shows: the settings held, the open windows listed, the history asked for.
+    fn prepare_open(&mut self) {}
+    /// Reads the titles of the windows (`InternalGetWindowText`), once per open and only in the "<" mode.
+    fn fill_titles(&mut self, _rows: &mut [WindowRow]) {}
     /// One of the launcher's one-shot timers on the popup window.
     fn arm(&mut self, id: usize, ms: u32);
     /// `GetMessageTime` and `GetMessageExtraInfo` of the key message being handled.
@@ -1381,9 +1646,53 @@ struct Ctrl {
     settings: Vec<SettingRow>,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
+    /// The settings list the rows were folded from (the launch targets), and the icons kept between opens.
+    setting_list: Arc<Vec<Setting>>,
+    icons: IconCache,
+    /// The pixel size of the icons in `icons`: the size of the last open's rows.
+    icon_px: u32,
+    /// The tick when the catalogue was last stored (0: never) and when a listing was asked and not answered yet.
+    listed_at_ms: u64,
+    listing_since: Option<u64>,
+    /// `launcher.learn`; the history files were asked for (or deleted) in this session; the history changed since the
+    /// last write.
+    learn: bool,
+    state_loaded: bool,
+    dirty: bool,
+}
+
+/// A catalogue older than this is listed again after a close.
+const CATALOGUE_STALE_MS: u64 = 600_000;
+/// A listing nobody answered is asked again after this.
+const LISTING_RETRY_MS: u64 = 60_000;
+/// The settings rows are freed this long after a close (`TIMER_LAUNCHER_RELEASE`).
+const RELEASE_MS: u32 = 600_000;
+/// A changed history is written this long after the close (`TIMER_LAUNCHER_SAVE`).
+const SAVE_MS: u32 = 2_000;
+/// The first listing, this long after the dock starts or the chord is first set (`TIMER_LAUNCHER_WARM`).
+const WARM_MS: u32 = 10_000;
+
+/// The catalogue's listing: no icons (the rows ask for theirs), and what Start was sent is left alone.
+fn list_request() -> ShellRequest {
+    ShellRequest::ListStartApps { icon_px: style::ICON_M as u32, icons: IconPlan::None }
+}
+
+/// The typed line of a launch that goes to the run history (a line run as administrator is not recorded).
+fn run_line_of(r: &crate::launcher::session::LaunchReq) -> Option<&str> {
+    use crate::launcher::session::LaunchReq;
+    match r {
+        LaunchReq::Command(l) | LaunchReq::Console(l) => Some(&l.line),
+        _ => None,
+    }
 }
 
 impl Ctrl {
+    /// The catalogue was listed more than 10 minutes ago and no listing is waiting for its answer.
+    fn catalogue_stale(&self, now: u64) -> bool {
+        let waiting = self.listing_since.is_some_and(|t| now.saturating_sub(t) < LISTING_RETRY_MS);
+        self.listed_at_ms != 0 && now.saturating_sub(self.listed_at_ms) > CATALOGUE_STALE_MS && !waiting
+    }
+
     fn new() -> Ctrl {
         Ctrl {
             open_seq: 0,
@@ -1400,6 +1709,14 @@ impl Ctrl {
             settings: Vec::new(),
             windows: Vec::new(),
             history: Vec::new(),
+            setting_list: Arc::default(),
+            icons: IconCache::default(),
+            icon_px: style::ICON_M as u32,
+            listed_at_ms: 0,
+            listing_since: None,
+            learn: true,
+            state_loaded: false,
+            dirty: false,
         }
     }
 
@@ -1413,6 +1730,13 @@ impl Ctrl {
         self.top_percent = c.top_percent;
         self.over_fullscreen_pass = c.over_fullscreen != "open";
         self.width = i32::from(c.width);
+        if self.learn != c.learn {
+            // Off: what was learned is forgotten and the files are deleted at the next open; on: they are read again.
+            self.learn = c.learn;
+            self.history.clear();
+            self.dirty = false;
+            self.state_loaded = false;
+        }
     }
 
     /// The providers' context of one keystroke: borrowed, nothing copied.
@@ -1459,6 +1783,8 @@ pub(crate) fn on_config() {
             foreground_flow(&mut RealHook, &RealSys);
             if !was {
                 log!("launcher: chord on");
+                // The catalogue is listed 10 s from now, off the first open's path.
+                crate::launcher_sys::arm_once(crate::msg::TIMER_LAUNCHER_WARM, WARM_MS);
                 if !REGISTERED.with(|r| r.replace(true)) {
                     crate::launcher_sys::watch_sessions();
                 }
@@ -1610,6 +1936,7 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
                 c.fg_at_open = fg;
                 c.num = num;
             });
+            sys.prepare_open();
             hook.shown(true);
             #[cfg(feature = "owner-probe")]
             crate::launcher_probe::opened(sent_time);
@@ -2207,6 +2534,9 @@ mod tests {
         fn arm(&mut self, id: usize, ms: u32) {
             self.ops.push(format!("Arm({id}, {ms})"));
         }
+        fn fill_titles(&mut self, rows: &mut [WindowRow]) {
+            self.ops.push(format!("FillTitles({})", rows.len()));
+        }
         fn msg_time(&self) -> u32 {
             self.msg_time
         }
@@ -2255,6 +2585,73 @@ mod tests {
     /// The ops without the shrink timer the keystrokes arm.
     fn ops(sys: &EffectSys) -> Vec<String> {
         sys.ops.iter().filter(|o| !o.starts_with("Arm(")).cloned().collect()
+    }
+
+    #[test]
+    fn titles_only_in_windows_mode() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let fills = |sys: &EffectSys| sys.ops.iter().filter(|o| o.starts_with("FillTitles")).count();
+        // Mixed mode: never.
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "note");
+        assert_eq!(l.session.mode(), Mode::Mixed);
+        l.read_titles(Reply::None, &mut sys);
+        l.read_titles(Reply::None, &mut sys);
+        assert_eq!(fills(&sys), 0, "{:?}", sys.ops);
+        // The "<" mode: once, however many keys follow.
+        let mut l = typed(&fx, "<");
+        assert_eq!(l.session.mode(), Mode::Only(ProviderId::Windows));
+        l.read_titles(Reply::None, &mut sys);
+        assert_eq!(fills(&sys), 1, "{:?}", sys.ops);
+        l.session.chars("no", &fx.cx());
+        l.read_titles(Reply::None, &mut sys);
+        assert_eq!(fills(&sys), 1, "once per open: {:?}", sys.ops);
+        // A new open reads them again.
+        let mut again = typed(&fx, "<");
+        again.read_titles(Reply::None, &mut sys);
+        assert_eq!(fills(&sys), 2);
+    }
+
+    #[test]
+    fn save_armed_only_when_changed() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let arms = |sys: &EffectSys, id: usize| sys.ops.iter().filter(|o| o.starts_with(&format!("Arm({id},"))).count();
+        let mut l = typed(&fx, "x");
+        with_ctrl(|c| c.dirty = false);
+        let mut sys = EffectSys::default();
+        l.housekeeping(&mut sys);
+        assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_SAVE), 0, "{:?}", sys.ops);
+        assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_RELEASE), 1, "the release is armed at every close");
+        // A launched run line changes the history, and only a learning launcher records it.
+        for (learn, want) in [(false, false), (true, true)] {
+            with_ctrl(|c| {
+                c.learn = learn;
+                c.dirty = false;
+                c.history.clear();
+            });
+            let mut l = typed(&fx, "x");
+            l.queued.push(Effect::Launch(crate::launcher::session::LaunchReq::Command(
+                runline::classify("ping 1.1.1.1").unwrap(),
+            )));
+            let mut hook = FakeHook::default();
+            let mut sys = EffectSys::default();
+            l.finish(&mut hook, &mut sys);
+            assert_eq!(with_ctrl(|c| c.dirty).unwrap(), want, "learn {learn}");
+            l.housekeeping(&mut sys);
+            assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_SAVE), usize::from(want), "learn {learn}: {:?}", sys.ops);
+        }
+        // A stale catalogue is listed again after the close, a fresh one is not.
+        with_ctrl(|c| c.listed_at_ms = 1);
+        let mut l = typed(&fx, "x");
+        let mut sys = EffectSys { now: 0, ..EffectSys::default() };
+        l.housekeeping(&mut sys);
+        assert!(!sys.ops.iter().any(|o| o.contains("ListStartApps")), "{:?}", sys.ops);
+        with_ctrl(|c| c.listing_since = None);
+        sys.now = 700_000;
+        l.housekeeping(&mut sys);
+        assert!(sys.ops.iter().any(|o| o.contains("ListStartApps") && o.contains("None")), "{:?}", sys.ops);
     }
 
     #[test]

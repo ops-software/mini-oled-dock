@@ -244,15 +244,14 @@ pub(crate) fn release() {
 }
 
 /// `ShellEvent::StartApps`: replaces the catalog (sorted by name).
-pub(crate) fn store_apps(list: Vec<StartApp>) {
-    // Read by the shell thread before it sent the catalog (`None` only in tests and previews).
-    // Taken, not shared: the apps copy their own few keywords below and the rest is freed here.
-    let index = start_search::take_app_index();
+pub(crate) fn store_apps(list: Vec<StartApp>, index: Option<&start_search::AppIndex>) {
+    // `index`: read by the shell thread before it sent the catalog, taken by the caller (`popup::on_start_apps`; `None`
+    // in tests and previews). The apps copy their own few keywords below.
     let mut apps: Vec<App> = list
         .into_iter()
         .map(|a| {
             let lower = a.name.to_lowercase();
-            let (keys, rank) = index.as_ref().map_or((Keys::default(), 0), |x| {
+            let (keys, rank) = index.map_or((Keys::default(), 0), |x| {
                 let rank = x.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(x.default_rank);
                 (x.synonyms.get(&lower).cloned().unwrap_or_default(), rank)
             });
@@ -306,7 +305,7 @@ fn request_catalog(px: u32) {
     let first = crate::config::get().start_pins.clone();
     shell_thread::request(ShellRequest::ListStartApps { icon_px: px, icons: IconPlan::All { first } });
     // The settings the search also finds: built in the background, unless they are still there.
-    start_search::load_settings();
+    start_search::hold_settings(start_search::Holder::Start);
 }
 
 // ------------------------------------------------------------------ search (pure)
@@ -945,7 +944,7 @@ pub(crate) fn preview_new(
             *s = Store { icon_px: px, open: true, ..Store::default() };
         }
     });
-    store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect());
+    store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect(), None);
     store_icons(px, apps.into_iter().map(|(id, _, b)| (id, Some(b))).collect());
     let mut c = make();
     c.requested = true;
@@ -2143,7 +2142,7 @@ mod tests {
             let s = s.borrow();
             assert!(s.apps.is_empty() && s.icons.is_empty() && !s.loaded && !s.open);
         });
-        store_apps(vec![StartApp { id: "x".into(), name: "X".into() }]);
+        store_apps(vec![StartApp { id: "x".into(), name: "X".into() }], None);
         assert!(!store_icons(32, vec![("x".into(), Some(IconBitmap::new(32, 32)))]), "closed menu ignores late icons");
         STORE.with(|s| assert!(s.borrow().apps.is_empty()));
     }

@@ -5,7 +5,7 @@
 //! to the OS. `trim` does that; `log_memory` writes one line with the numbers to `dock.log`.
 
 use crate::log;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
 use windows::Win32::System::ProcessStatus::{
@@ -20,6 +20,9 @@ const MAX_HEAPS: usize = 64;
 
 /// Private bytes right after the last `trim("hidden")` (0 = none yet).
 static LAST_HIDDEN_TRIM: AtomicUsize = AtomicUsize::new(0);
+
+/// Set when data was just freed: the next hidden period trims again (`take_rearm`, consumed by `trim_tick`).
+static REARM: AtomicBool = AtomicBool::new(false);
 
 /// Snapshot of the process memory counters (bytes).
 struct Counters {
@@ -84,6 +87,26 @@ pub fn last_hidden_trim() -> Option<usize> {
     match LAST_HIDDEN_TRIM.load(Ordering::Relaxed) {
         0 => None,
         b => Some(b),
+    }
+}
+
+/// Asks the idle trim to run again in the next hidden period (data was freed, the earlier trim did not see it).
+pub fn rearm() {
+    REARM.store(true, Ordering::Relaxed);
+}
+
+/// Consumes the flag of `rearm`.
+pub fn take_rearm() -> bool {
+    REARM.swap(false, Ordering::Relaxed)
+}
+
+/// A release of resident data (Start's after 60 s, the launcher's after 10 minutes) is done: the memory goes back to the OS
+/// at once only while the bar is hidden and no popup or Settings window is open (never under the user's hands), and the
+/// idle trim is re-armed whatever happened (Open point 6).
+pub fn released_data() {
+    rearm();
+    if !crate::ui::is_visible() && !crate::popup::is_open() && !crate::settings_window::is_open() {
+        trim("release");
     }
 }
 

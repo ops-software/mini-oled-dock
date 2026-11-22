@@ -1585,10 +1585,16 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::popup_launcher::on_converted(gen, meant);
             return false;
         }
-        // Nothing asks for them yet (L1a-16, L1a-17).
-        ShellEvent::LaunchFailed { .. } | ShellEvent::LauncherIcons { .. } | ShellEvent::LauncherState { .. } => {
-            return false
+        ShellEvent::LauncherIcons { icon_px, icons } => {
+            popup::popup_launcher::on_icons(icon_px, icons);
+            return false;
         }
+        ShellEvent::LauncherState { run, .. } => {
+            popup::popup_launcher::on_state(run);
+            return false;
+        }
+        // Read by the launcher (L1a-17).
+        ShellEvent::LaunchFailed { .. } => return false,
         other => other,
     };
     UI.with(|u| {
@@ -2537,6 +2543,16 @@ pub(crate) fn paint_bar_icon(s: &mut crate::surface::Surface, key: &str, x: i32,
             }
             None => false,
         }
+    })
+}
+
+/// The name the bar shows for the program of group `group_key` (compared ignoring ASCII case), None when the bar has no such
+/// entry yet or its state is borrowed.
+pub(crate) fn bar_name(group_key: &str) -> Option<String> {
+    UI.with(|u| {
+        let st = u.try_borrow().ok()?;
+        let e = st.entries.iter().find(|e| e.group_key.eq_ignore_ascii_case(group_key))?;
+        (!e.name.is_empty()).then(|| e.name.clone())
     })
 }
 

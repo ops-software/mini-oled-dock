@@ -733,7 +733,11 @@ pub fn on_tray_changed() {
 
 /// `ShellEvent::StartApps` reached the UI: stores the catalog and refreshes the Start menu if open.
 pub fn on_start_apps(list: Vec<crate::shell_thread::StartApp>) {
-    popup_startmenu::store_apps(list);
+    // The index the shell thread read for this catalog: the launcher and the Start menu each copy what they need from it,
+    // then it is dropped here.
+    let index = crate::start_search::take_app_index();
+    popup_launcher::on_catalog(&list, index.as_ref());
+    popup_startmenu::store_apps(list, index.as_ref());
     if current() == Some(PopupKind::StartMenu) {
         dispatch(DataEvent::StartMenuChanged);
     }
@@ -749,6 +753,7 @@ pub fn on_start_icons(icon_px: u32, icons: Vec<(String, Option<crate::icons::Ico
 /// `ShellEvent::StartSettings` reached the UI: the settings catalog is ready, so an open Start menu
 /// searches again (what was typed may match a setting).
 pub fn on_start_settings() {
+    popup_launcher::on_settings_ready();
     if current() == Some(PopupKind::StartMenu) {
         dispatch(DataEvent::StartMenuChanged);
     }
@@ -1808,8 +1813,6 @@ pub(crate) fn last_hwnd() -> Option<HWND> {
 }
 
 /// The window the launcher's one-shots are armed on, created if needed, so they can be armed before the first open.
-// The launcher's timers (L1a-15, L1a-16) arm through it; until then nothing does.
-#[allow(dead_code)]
 pub(crate) fn popup_hwnd() -> Option<HWND> {
     ensure_window_for(PopupKind::Launcher)
 }
@@ -1852,6 +1855,10 @@ fn on_start_release(hwnd: HWND) {
     let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
     if start_release_due(current()) {
         popup_startmenu::release();
+        // Only with the launcher on: without a chord Start's release is what 1.4.3 did.
+        if popup_launcher::is_on() {
+            crate::mem::released_data();
+        }
     }
 }
 

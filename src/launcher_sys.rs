@@ -32,12 +32,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime, GetShellWindow, IsWindow,
-    IsWindowVisible, PostMessageW, SetTimer, SC_KEYMENU, WM_CLOSE, WM_SYSCOMMAND,
+    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime, GetShellWindow,
+    InternalGetWindowText, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW, SetTimer, SC_KEYMENU, WM_CLOSE,
+    WM_SYSCOMMAND,
 };
 
 use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
-use crate::launcher::model::{CommandId, Mods, NumberStyle};
+use crate::launcher::model::{CommandId, Mods, NumberStyle, WindowRow};
+use crate::launcher::rank;
 use crate::launcher::session::LaunchReq;
 use crate::log;
 use crate::popup::popup_launcher::{typed_of, HookPort, Launcher, MonitorPick, SysPort, Typed};
@@ -196,8 +198,9 @@ fn clipboard_text() -> Option<String> {
 
 /// The only `SetTimer` of the launcher (lint 7): a one-shot on the popup window; `popup_launcher::on_timer` kills it
 /// before it acts.
-fn arm_once(id: usize, ms: u32) {
-    let Some(hwnd) = popup::last_hwnd() else { return };
+pub(crate) fn arm_once(id: usize, ms: u32) {
+    // Before the first open the popup window may not exist yet: it is created so the warm timer can be armed at start.
+    let Some(hwnd) = popup::last_hwnd().or_else(popup::popup_hwnd) else { return };
     // SAFETY: our popup window (same thread); its wnd_proc forwards the launcher's ids to popup_launcher::on_timer.
     let armed = unsafe { SetTimer(Some(hwnd), id, ms, None) } != 0;
     if !armed {
@@ -404,6 +407,14 @@ impl SysPort for RealSys {
         }
     }
 
+    fn prepare_open(&mut self) {
+        popup::popup_launcher::prepare_open();
+    }
+
+    fn fill_titles(&mut self, rows: &mut [WindowRow]) {
+        fill_titles(rows);
+    }
+
     fn arm(&mut self, id: usize, ms: u32) {
         arm_once(id, ms);
     }
@@ -432,6 +443,60 @@ impl SysPort for RealSys {
 
     fn close_quiet(&mut self) {
         popup::close("session end");
+    }
+}
+
+/// Most windows the launcher lists (one row per window).
+const MAX_WINDOW_ROWS: usize = 128;
+
+/// The name a window row shows: the bar's name for its program, or the program file's name without its extension.
+pub(crate) fn row_name(bar: Option<&str>, exe_path: &str) -> String {
+    match bar.filter(|b| !b.is_empty()) {
+        Some(b) => b.to_string(),
+        None => {
+            std::path::Path::new(exe_path).file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+        }
+    }
+}
+
+/// One row per open window (at most 128), most recent first within each program group: the bar's data is read, no window
+/// is sent anything. Titles are left out (`fill_titles`).
+pub(crate) fn window_rows() -> Vec<WindowRow> {
+    let mut rows = Vec::new();
+    for g in crate::apps::groups() {
+        let name =
+            row_name(crate::ui::bar_name(&g.key).as_deref(), if g.exe_path.is_empty() { &g.key } else { &g.exe_path });
+        let mut folded = String::with_capacity(name.len());
+        rank::fold(&name, &mut folded);
+        for &h in &g.windows {
+            if rows.len() >= MAX_WINDOW_ROWS {
+                return rows;
+            }
+            // SAFETY: a plain query on a window handle; a stale one answers false.
+            let hung = unsafe { IsHungAppWindow(hw(h)) }.as_bool();
+            rows.push(WindowRow {
+                hwnd: h,
+                group_key: g.key.as_str().into(),
+                aumid: g.aumid.as_deref().map(Into::into),
+                name: name.as_str().into(),
+                name_folded: folded.as_str().into(),
+                title: None,
+                hung,
+            });
+        }
+    }
+    rows
+}
+
+/// Reads the title of every row with `InternalGetWindowText` (a 256-unit buffer): it sends no message, so a hung app
+/// cannot block the UI thread (the plain call asks the window itself and is never used here, lint 6).
+pub(crate) fn fill_titles(rows: &mut [WindowRow]) {
+    let mut buf = [0u16; 256];
+    for r in rows {
+        // SAFETY: `buf` is writable for its length; the call reads the title from the window's own record.
+        let n = unsafe { InternalGetWindowText(hw(r.hwnd), &mut buf) }.max(0) as usize;
+        let title = String::from_utf16_lossy(buf.get(..n.min(buf.len())).unwrap_or(&[]));
+        r.title = (!title.trim().is_empty()).then(|| title.into());
     }
 }
 
@@ -497,6 +562,14 @@ mod tests {
             LaunchReq::Url(_) => 9,
             LaunchReq::Registry => 10,
         }
+    }
+
+    #[test]
+    fn row_name_from_the_bar() {
+        assert_eq!(row_name(Some("Blocco note"), "C:\\Windows\\notepad.exe"), "Blocco note");
+        assert_eq!(row_name(None, "C:\\Windows\\notepad.exe"), "notepad");
+        assert_eq!(row_name(Some(""), "C:\\Windows\\System32\\Mmc.EXE"), "Mmc");
+        assert_eq!(row_name(None, ""), "");
     }
 
     #[test]

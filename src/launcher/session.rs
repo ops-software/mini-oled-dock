@@ -259,6 +259,11 @@ impl Session {
         self.chip.as_ref().map(|c| c.id)
     }
 
+    /// The mode of the last query: mixed, or one provider's ("<" is the windows).
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
     pub fn gen(&self) -> u64 {
         self.gen
     }

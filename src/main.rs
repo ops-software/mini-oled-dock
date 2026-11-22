@@ -324,6 +324,9 @@ fn trim_tick() {
     let popup = popup::is_open() || settings_window::is_open();
     let go = TRIM.with(|s| {
         let mut s = s.borrow_mut();
+        if mem::take_rearm() {
+            s.trimmed = false;
+        }
         let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
         let mut go = None;
         if !visible && !popup {

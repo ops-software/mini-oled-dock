@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -423,8 +423,50 @@ pub(crate) fn load_settings() {
     }
 }
 
+/// Who keeps the settings catalog loaded: the Start menu and the launcher share one copy, freed when the last of them
+/// lets go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Holder {
+    Start = 1,
+    Launcher = 2,
+}
+
+static HOLDERS: AtomicU8 = AtomicU8::new(0);
+
+/// `holders` with the bit of `h` set or cleared; the bits left.
+fn holders_step(holders: &AtomicU8, h: Holder, hold: bool) -> u8 {
+    let bit = h as u8;
+    if hold {
+        holders.fetch_or(bit, Relaxed) | bit
+    } else {
+        holders.fetch_and(!bit, Relaxed) & !bit
+    }
+}
+
+/// `h` needs the settings catalog: marks it and builds the catalog unless it is there.
+pub(crate) fn hold_settings(h: Holder) {
+    holders_step(&HOLDERS, h, true);
+    load_settings();
+}
+
+/// `h` lets the settings catalog go; it is freed only when no holder is left.
+pub(crate) fn release_settings_for(h: Holder) {
+    if holders_step(&HOLDERS, h, false) == 0 {
+        free_settings();
+    }
+}
+
+/// `h` still holds the catalog.
+pub(crate) fn holds_settings(h: Holder) -> bool {
+    HOLDERS.load(Relaxed) & h as u8 != 0
+}
+
 /// Frees the settings catalog (the Start menu data was released): the next Start menu builds it again.
 pub(crate) fn release_settings() {
+    release_settings_for(Holder::Start);
+}
+
+fn free_settings() {
     SETTINGS_STARTED.store(false, Relaxed);
     *SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
@@ -610,6 +652,19 @@ mod tests {
 
     /// Builds the REAL settings catalog and app index of this machine (run by hand:
     /// `cargo test -- --ignored --nocapture real_search_data`).
+    #[test]
+    fn settings_freed_only_when_both_released() {
+        let bits = AtomicU8::new(0);
+        assert_eq!(holders_step(&bits, Holder::Start, true), 1);
+        assert_eq!(holders_step(&bits, Holder::Launcher, true), 3);
+        assert_eq!(holders_step(&bits, Holder::Start, false), 2, "the launcher still holds it");
+        assert_eq!(holders_step(&bits, Holder::Start, false), 2, "releasing twice changes nothing");
+        assert_eq!(holders_step(&bits, Holder::Launcher, false), 0, "the last one frees it");
+        assert_eq!(holders_step(&bits, Holder::Launcher, true), 2);
+        assert_eq!(holders_step(&bits, Holder::Start, true), 3);
+        assert_eq!(holders_step(&bits, Holder::Launcher, false), 1);
+    }
+
     #[test]
     #[ignore]
     fn real_search_data() {
