@@ -2559,9 +2559,10 @@ const PT_LATE_MS: u32 = 60_000;
 /// the UI thread: one image query per process).
 const PT_RESCAN_MS: u64 = 30_000;
 
-/// The catalogue's listing: no icons (the rows ask for theirs), and what Start was sent is left alone.
+/// The catalogue's listing: from an `--start-apps` child, no icons (the rows ask for theirs), and what Start was sent is
+/// left alone.
 fn list_request() -> ShellRequest {
-    ShellRequest::ListStartApps { icon_px: style::ICON_M as u32, icons: IconPlan::None }
+    ShellRequest::ListStartApps { icon_px: style::ICON_M as u32, icons: IconPlan::None, child: true }
 }
 
 /// The typed line of a launch that goes to the run history (a line run as administrator is not recorded).
@@ -4130,7 +4131,8 @@ mod tests {
         with_ctrl(|c| c.listing_since = None);
         sys.now = 700_000;
         l.housekeeping(&mut sys);
-        assert!(sys.ops.iter().any(|o| o.contains("ListStartApps") && o.contains("None")), "{:?}", sys.ops);
+        let child = |o: &String| o.contains("ListStartApps") && o.contains("None") && o.contains("child: true");
+        assert!(sys.ops.iter().any(child), "{:?}", sys.ops);
     }
 
     #[test]

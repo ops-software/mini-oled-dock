@@ -292,6 +292,14 @@ pub(crate) fn store_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>
     })
 }
 
+/// What a Start open asks the shell thread for: the catalogue and the icons still missing at `px`, the pins (`first`)
+/// first. The catalogue comes from an `--start-apps` child only while a launcher chord is set (one listing then feeds
+/// the launcher too); with no chord it is listed in-process, as in M1.
+fn catalog_request(px: u32, first: Vec<String>) -> ShellRequest {
+    let child = crate::popup::popup_launcher::is_on();
+    ShellRequest::ListStartApps { icon_px: px, icons: IconPlan::All { first }, child }
+}
+
 /// Asks the shell thread for a fresh catalog (and the icons still missing) at `px`. A larger size
 /// than the stored one (a display with a higher DPI) starts the icons over; a smaller one reuses
 /// them (they are shrunk when drawn).
@@ -308,7 +316,7 @@ fn request_catalog(px: u32) {
         Err(_) => px,
     });
     let first = crate::config::get().start_pins.clone();
-    shell_thread::request(ShellRequest::ListStartApps { icon_px: px, icons: IconPlan::All { first } });
+    shell_thread::request(catalog_request(px, first));
     // The settings the search also finds: built in the background, unless they are still there.
     start_search::hold_settings(start_search::Holder::Start);
 }
@@ -2276,6 +2284,23 @@ mod tests {
     use super::*;
 
     const M: Metrics = Metrics { dpi: 96 };
+
+    /// With no launcher chord a Start open lists its apps in-process, as in M1: no `--start-apps` child.
+    #[test]
+    fn start_lists_in_process_with_the_chord_off() {
+        // A thread of its own: no chord was ever set on it.
+        std::thread::spawn(|| {
+            assert!(!crate::popup::popup_launcher::is_on());
+            let r = catalog_request(32, vec!["a".into()]);
+            let ShellRequest::ListStartApps { icon_px, icons: IconPlan::All { first }, child } = &r else {
+                panic!("{r:?}");
+            };
+            assert!(*icon_px == 32 && *first == ["a"], "{r:?}");
+            assert!(!child, "no chord: Start lists in-process, with no --start-apps child");
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn offer_row_only_when_due() {

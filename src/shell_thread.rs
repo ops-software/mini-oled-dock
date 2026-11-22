@@ -198,10 +198,11 @@ pub enum ShellRequest {
     NetworkRelease,
     /// Volume module disabled: shuts the `AudioController` down and drops it.
     AudioRelease,
-    /// Start menu (Win double tap) and the launcher: lists `shell:AppsFolder` (in an `--start-apps`
-    /// child, `list_apps_arena`) -> `ShellEvent::StartApps`; then, as `icons` says, has the Start
-    /// menu's icons made (see `IconPlan`).
-    ListStartApps { icon_px: u32, icons: IconPlan },
+    /// Start menu (Win double tap) and the launcher: lists `shell:AppsFolder` (`list_apps_arena`: in an
+    /// `--start-apps` child when `child`, in-process otherwise) -> `ShellEvent::StartApps`; then, as
+    /// `icons` says, has the Start menu's icons made (see `IconPlan`). `child` is set by the launcher
+    /// and, only while a launcher chord is set, by Start: with no chord Start lists in-process (M1).
+    ListStartApps { icon_px: u32, icons: IconPlan, child: bool },
     /// One batch of Start menu icons made on this thread -> `ShellEvent::StartIcons`. Queued by
     /// `ListStartApps` only when its icons child cannot start; low priority like `ResolveApp`.
     StartIcons { icon_px: u32, ids: Vec<String> },
@@ -727,7 +728,7 @@ impl Shell {
                     a.shutdown();
                 }
             }
-            ShellRequest::ListStartApps { icon_px, icons } => self.list_start_apps(icon_px, &icons),
+            ShellRequest::ListStartApps { icon_px, icons, child } => self.list_start_apps(icon_px, &icons, child),
             ShellRequest::StartSettingsReady => push_event(self.ui, ShellEvent::StartSettings),
             ShellRequest::StartRelease => {
                 let _ = self.end_job(IconClient::Start);
@@ -759,8 +760,8 @@ impl Shell {
 
     /// `ListStartApps`: lists the catalogue (`list_apps_arena`), publishes it, then has the icons the Start menu does
     /// not have yet made (`start_menu_icons`). One listing serves Start and the launcher.
-    fn list_start_apps(&mut self, icon_px: u32, icons: &IconPlan) {
-        let apps = Arc::new(list_apps_arena());
+    fn list_start_apps(&mut self, icon_px: u32, icons: &IconPlan, child: bool) {
+        let apps = Arc::new(list_apps_arena(child));
         let v = apps.view();
         let ids = (0..v.len()).map(|i| v.id(i));
         let missing =
@@ -1377,12 +1378,13 @@ const APPS_EXIT_EMPTY: i32 = 3;
 /// fails, or prints anything the check refuses is logged (once per process) and the catalogue is listed here as before,
 /// through the same encoder; after a child that ran out of time every later listing of this process is made here, so a
 /// hung child never holds this thread 5 s twice. The AppsFolder enumeration and Windows' app index (the shell modules and
-/// the parse of two index files) then load only in the child, which takes them with it when it exits.
+/// the parse of two index files) then load only in the child, which takes them with it when it exits. With `child`
+/// false (Start with no launcher chord) the catalogue is listed here as in M1, with no child, thread or job.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn list_apps_arena() -> Arena {
+fn list_apps_arena(child: bool) -> Arena {
     static CHILD_OFF: AtomicBool = AtomicBool::new(false);
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if !CHILD_OFF.load(Relaxed) {
+    if child && !CHILD_OFF.load(Relaxed) {
         let t = Instant::now();
         let out = std::env::current_exe()
             .map_err(|e| format!("no exe path: {e}"))
