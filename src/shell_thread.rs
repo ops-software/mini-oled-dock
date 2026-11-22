@@ -1613,6 +1613,31 @@ pub(crate) fn elevation() -> Option<bool> {
 /// elevated ShellExecute resolves protocol handlers through the merged HKCR view, which includes
 /// the medium-writable `HKCU\Software\Classes` (the classic fodhelper-style UAC bypass).
 fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
+    launch_with(target, args, LaunchBy::Shared)
+}
+
+/// Who asks `launch_with` for a launch: the shared requests (Start, the bar, notifications, the power popup), whose
+/// rule is 1.4's, or the launcher, whose requests fail closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LaunchBy {
+    Shared,
+    Launcher,
+}
+
+/// Whether a launch may run `ShellExecuteExW` in the dock's own process: a shared request whenever the dock is not
+/// known to be elevated (1.4's rule); a launcher request only when it is known not to be (`plain_open`: a token that
+/// cannot be read counts as elevated).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn in_process(by: LaunchBy, elevation: Option<bool>) -> bool {
+    match by {
+        LaunchBy::Shared => elevation != Some(true),
+        LaunchBy::Launcher => plain_open(Verb::Open, elevation),
+    }
+}
+
+/// `launch` with the caller's rule for the in-process path (`in_process`); otherwise the desktop shell, or refused.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launch_with(target: &str, args: Option<&str>, by: LaunchBy) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("empty target".into());
@@ -1625,7 +1650,7 @@ fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
         .map(|p| p.to_string_lossy().into_owned());
-    if !is_elevated() {
+    if in_process(by, elevation()) {
         log!("shell: Launch '{target}' args={args:?}");
         return shell_execute(target, args, dir.as_deref());
     }
@@ -1695,6 +1720,12 @@ fn app_target_path(id: &str) -> Option<String> {
 /// `ShellRequest::RevealApp`: File Explorer (from the Windows folder) with the app's file selected.
 /// An app with no file to show (a Store app) is not a failure.
 fn reveal_app(id: &str) -> Result<(), String> {
+    reveal_app_with(id, LaunchBy::Shared)
+}
+
+/// `reveal_app` with the caller's rule for `launch_with`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn reveal_app_with(id: &str, by: LaunchBy) -> Result<(), String> {
     let Some(path) = app_target_path(id) else {
         log!("shell: RevealApp '{id}': no file to show");
         return Ok(());
@@ -1702,7 +1733,7 @@ fn reveal_app(id: &str) -> Result<(), String> {
     let Some(explorer) = system_dir().and_then(|s| s.parent().map(|w| w.join("explorer.exe"))) else {
         return Err("no Windows folder".into());
     };
-    let r = launch(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")));
+    let r = launch_with(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")), by);
     if let Err(e) = &r {
         log!("shell: RevealApp '{path}' not executed: {e}");
     }
@@ -1823,10 +1854,13 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             }
             r
         }
-        // Catalogue ids and settings targets: these functions log as they do for Start.
-        ShellRequest::LauncherLaunch { target, args } => launch(&target, args.as_deref()).map_err(Fail::Shell),
+        // Catalogue ids and settings targets: these functions log as they do for Start, and use the dock's own
+        // ShellExecute only when it is known not to be elevated (`in_process`).
+        ShellRequest::LauncherLaunch { target, args } => {
+            launch_with(&target, args.as_deref(), LaunchBy::Launcher).map_err(Fail::Shell)
+        }
         ShellRequest::LauncherAppAdmin { id } => launch_app_admin(&id).map_err(Fail::Shell),
-        ShellRequest::LauncherRevealApp { id } => reveal_app(&id).map_err(Fail::Shell),
+        ShellRequest::LauncherRevealApp { id } => reveal_app_with(&id, LaunchBy::Launcher).map_err(Fail::Shell),
         _ => return,
     };
     if let Err(err) = &r {
@@ -2675,6 +2709,18 @@ mod tests {
         let (line, file) = run_line("notepad");
         assert!(run_as_typed_with(&line, file, &Gesture::for_test(1), &mut recorder(&mut calls, true)).is_ok());
         assert!(!plain_open(calls[0].3, Some(false)), "runas always goes through the desktop shell");
+    }
+
+    #[test]
+    fn launcher_launches_run_in_process_only_when_known_unelevated() {
+        // The launcher's catalogue apps, settings targets and reveals fail closed, as its other requests (`plain_open`).
+        assert!(in_process(LaunchBy::Launcher, Some(false)));
+        assert!(!in_process(LaunchBy::Launcher, Some(true)));
+        assert!(!in_process(LaunchBy::Launcher, None), "a token that cannot be read goes through the desktop shell");
+        // The shared requests (Start, the bar, notifications) keep 1.4's rule.
+        assert!(in_process(LaunchBy::Shared, Some(false)));
+        assert!(!in_process(LaunchBy::Shared, Some(true)));
+        assert!(in_process(LaunchBy::Shared, None));
     }
 
     #[test]
