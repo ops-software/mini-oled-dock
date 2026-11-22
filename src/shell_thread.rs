@@ -1714,12 +1714,20 @@ fn reveal_app(id: &str) -> Result<(), String> {
 /// reach the shell and start nothing.
 type Exec<'a> = &'a mut dyn FnMut(&str, Option<&str>, Option<&str>, Verb) -> Result<(), String>;
 
-/// The real `Exec`: the desktop shell (Explorer, medium integrity) when the dock is elevated or the
-/// verb is `runas` (Explorer asks UAC), as `launch` and `launch_admin` do; the dock's token is never
-/// used. Plain `ShellExecuteExW` only for an unelevated dock opening something.
+/// Whether a launcher request may use plain `ShellExecuteExW` in the dock's own process: only to open
+/// something, and only when the dock is known not to be elevated. A token that cannot be read
+/// (`elevation() == None`) counts as elevated: what the user typed never reaches an admin token.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn plain_open(verb: Verb, elevation: Option<bool>) -> bool {
+    verb == Verb::Open && elevation == Some(false)
+}
+
+/// The real `Exec`: the desktop shell (Explorer, medium integrity) unless `plain_open` (an open by a
+/// dock known not to be elevated); `runas` always goes there (Explorer asks UAC), as in `launch_admin`.
+/// If the desktop shell is unavailable the request is refused; the dock's token is never used.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn shell_exec(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> Result<(), String> {
-    if verb == Verb::Open && !is_elevated() {
+    if plain_open(verb, elevation()) {
         return shell_execute(file, args, dir);
     }
     desktop_shell_execute(file, args, dir, verb, SW_SHOWNORMAL.0).map_err(|e| format!("desktop shell: {e}"))
@@ -2628,6 +2636,17 @@ mod tests {
             (f.as_str(), a.as_deref(), d.as_deref(), v.as_str()),
             ("notepad", Some("C:\\temp\\a.txt"), None, "runas")
         );
+    }
+
+    #[test]
+    fn plain_shell_execute_only_when_known_unelevated() {
+        assert!(plain_open(Verb::Open, Some(false)));
+        assert!(!plain_open(Verb::Open, Some(true)));
+        assert!(!plain_open(Verb::Open, None), "a token that cannot be read goes through the desktop shell");
+        let mut calls = Vec::new();
+        let (line, file) = run_line("notepad");
+        assert!(run_as_typed_with(&line, file, &Gesture::for_test(1), &mut recorder(&mut calls, true)).is_ok());
+        assert!(!plain_open(calls[0].3, Some(false)), "runas always goes through the desktop shell");
     }
 
     #[test]
