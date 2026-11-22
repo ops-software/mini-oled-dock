@@ -317,7 +317,7 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         return false;
     }
     let vk = kb.vkCode;
-    if LAUNCHER_CHORD.load(Relaxed) & CHORD_SET != 0 {
+    if LAUNCHER_CHORD.load(Acquire) & CHORD_SET != 0 {
         let mods = mods_step(vk, down, kb.time);
         note_gesture(&GESTURE_TIME, kb.flags.0, kb.dwExtraInfo, vk, down, mods, kb.time);
         if let Some(swallow) = launcher_step(kb, down, mods) {
@@ -1188,7 +1188,7 @@ fn note_gesture(slot: &AtomicU64, flags: u32, extra: usize, vk: u32, down: bool,
     }
 }
 
-// UI-written (Relaxed: one writer each).
+// UI-written (Relaxed: one writer each; `LAUNCHER_CHORD` is stored with Release after `RESET_MODS`, `swap_chord`).
 static LAUNCHER_CHORD: AtomicU32 = AtomicU32::new(0);
 static PASS_FLAGS: AtomicU8 = AtomicU8::new(0);
 static LAUNCHER_ACKED: AtomicU32 = AtomicU32::new(0);
@@ -1224,9 +1224,23 @@ fn unpack_chord(v: u32) -> Option<ChordSpec> {
     (v & CHORD_SET != 0).then_some(ChordSpec { vk: (v & 0xFF) as u16, mods: Mods(((v >> 8) & 0xF) as u8) })
 }
 
-/// UI: the launcher's chord (None: off, and the hook leaves every key to the Win branch).
+/// UI: the launcher's chord (None: off, and the hook leaves every key to the Win branch). A change of chord also
+/// forgets the tracked modifiers: they are not tracked while the chord is off, so a release missed then must not make
+/// a bare Space match when it comes back (spec rule 1). Setting the same chord again forgets nothing.
 pub fn set_launcher_chord(chord: Option<ChordSpec>) {
-    LAUNCHER_CHORD.store(pack_chord(chord), Relaxed);
+    swap_chord(&LAUNCHER_CHORD, &RESET_MODS, chord);
+}
+
+/// `set_launcher_chord` on its two statics. The UI thread is their only writer, so the load and the store cannot race;
+/// the reset is published before the chord (Release, paired with `handle_key`'s Acquire load), so an event that sees
+/// the new chord also sees the reset.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn swap_chord(slot: &AtomicU32, reset: &AtomicU32, chord: Option<ChordSpec>) {
+    let new = pack_chord(chord);
+    if slot.load(Relaxed) != new {
+        reset.fetch_add(1, Relaxed);
+        slot.store(new, Release);
+    }
 }
 
 /// UI: why the chord passes (fullscreen, remote, yield), on every foreground change.
@@ -1933,6 +1947,31 @@ mod tests {
         track_step(&mut k.track, 1, LALT, true, 200, |_| true);
         k.s.mods = k.track.mods(false);
         assert_eq!(resolve_launcher(&k.s, ev(SPACE, true, 210)), None);
+    }
+
+    #[test]
+    fn chord_change_forgets_tracked_modifiers() {
+        let (slot, reset) = (AtomicU32::new(0), AtomicU32::new(0));
+        let mut t = ModTrack::default();
+        swap_chord(&slot, &reset, Some(ALT_SPACE));
+        track_step(&mut t, reset.load(Relaxed), LALT, true, 100, |_| true);
+        assert_eq!(t.mods(false), Mods::ALT);
+        // The chord goes off: Alt's release at 200 is not tracked. It comes back within MOD_STALE_MS.
+        swap_chord(&slot, &reset, None);
+        swap_chord(&slot, &reset, Some(ALT_SPACE));
+        track_step(&mut t, reset.load(Relaxed), SPACE, true, 300, |_| true);
+        let s = ChordState { mods: t.mods(false), ..st() };
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 300)), None, "a bare Space never matches");
+        track_step(&mut t, reset.load(Relaxed), SPACE, false, 310, |_| true);
+        // The same chord again forgets nothing: Alt really held still matches.
+        track_step(&mut t, reset.load(Relaxed), LALT, true, 400, |_| true);
+        let before = reset.load(Relaxed);
+        swap_chord(&slot, &reset, Some(ALT_SPACE));
+        assert_eq!(reset.load(Relaxed), before);
+        assert_eq!(unpack_chord(slot.load(Relaxed)), Some(ALT_SPACE));
+        track_step(&mut t, reset.load(Relaxed), SPACE, true, 410, |_| true);
+        let s = ChordState { mods: t.mods(false), ..st() };
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 410)), Some(Verdict::SwallowPost(1)));
     }
 
     #[test]
