@@ -55,6 +55,8 @@ thread_local! {
     /// thread than the one that made it makes `LIVE` negative, which is why it is signed).
     static LIVE: Cell<i64> = const { Cell::new(0) };
     static PEAK: Cell<i64> = const { Cell::new(0) };
+    /// The largest block asked for since the last `largest_block_during` began.
+    static LARGEST: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Counts the allocations of the calling thread (other test threads do not disturb a measurement).
@@ -64,7 +66,12 @@ fn bump() {
     let _ = COUNT.try_with(|c| c.set(c.get() + 1));
 }
 
+fn note_block(bytes: usize) {
+    let _ = LARGEST.try_with(|l| l.set(l.get().max(bytes)));
+}
+
 fn grow(bytes: usize) {
+    note_block(bytes);
     let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
     let _ = LIVE.try_with(|l| {
         let now = l.get().saturating_add(bytes);
@@ -111,6 +118,15 @@ pub fn allocations_during<R>(f: impl FnOnce() -> R) -> (R, u64) {
     let r = f();
     let after = COUNT.with(|c| c.get());
     (r, after - before)
+}
+
+/// Runs `f` and returns its result with the largest single block the calling thread allocated (or grew to) meanwhile.
+pub fn largest_block_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let outer = LARGEST.with(|l| l.replace(0));
+    let r = f();
+    let largest = LARGEST.with(|l| l.get());
+    LARGEST.with(|l| l.set(largest.max(outer)));
+    (r, largest)
 }
 
 /// Runs `f` and returns its result with the most bytes the calling thread held live above where it started (the
@@ -166,6 +182,10 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(*b, 1);
         let (_, none) = allocations_during(|| 1 + 1);
+        assert_eq!(none, 0);
+        let (v, largest) = largest_block_during(|| (vec![0u8; 3000], vec![0u8; 10]));
+        assert_eq!((largest, v.0.len()), (3000, 3000));
+        let ((), none) = largest_block_during(|| ());
         assert_eq!(none, 0);
     }
 

@@ -3,6 +3,7 @@
 //! loaded: nothing is folded per candidate per keystroke.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::arena::{self, Arena, ArenaError, Caps, Kind, SettingIn};
 #[cfg(test)]
@@ -239,26 +240,45 @@ pub fn build_settings_arena(key: &str, list: &[Setting]) -> Result<Arena, ArenaE
     Arena::new(encode_setting_list(key, list)?, Kind::Settings, Some(key), Caps::SETTINGS)
 }
 
-/// Icons kept between opens (at most `ICON_CACHE_CAP`), the least recently used dropped first.
-pub const ICON_CACHE_CAP: usize = 40;
+/// The bytes the icons kept between opens may take (MEM-2): each entry counts its pixels (w x h x 4) and its key.
+pub const ICON_CACHE_BYTES: usize = 160 * 1024;
 
+/// What an entry of the icon cache counts against `ICON_CACHE_BYTES`.
+fn icon_entry_bytes(key: &str, bmp: &IconBitmap) -> usize {
+    bmp.pixels.len().saturating_mul(4).saturating_add(key.len())
+}
+
+/// The icons kept between opens, at most `ICON_CACHE_BYTES`, the least recently used (painted at a close, or arrived)
+/// dropped first. Each bitmap is shared: an open's rows hold the same `Rc`s, never copies.
 #[derive(Default)]
 pub struct IconCache {
-    map: HashMap<String, (IconBitmap, u64)>,
+    map: HashMap<String, (Rc<IconBitmap>, u64)>,
     tick: u64,
+    /// What the entries count, kept as they come and go.
+    bytes: usize,
 }
 
 impl IconCache {
-    /// Keeps `bmp` under the lower-case `key`; the oldest entry goes when the cache is full.
-    pub fn insert(&mut self, key: &str, bmp: IconBitmap) {
+    /// Keeps `bmp` under the lower-case `key`; the least recently used entries go while the cache is over its cap. An
+    /// icon larger than the whole cap is not kept (it would push every other one out).
+    pub fn insert(&mut self, key: &str, bmp: Rc<IconBitmap>) {
+        let key = key.to_lowercase();
+        let cost = icon_entry_bytes(&key, &bmp);
+        if cost > ICON_CACHE_BYTES {
+            return;
+        }
         self.tick += 1;
-        self.map.insert(key.to_lowercase(), (bmp, self.tick));
-        while self.map.len() > ICON_CACHE_CAP {
-            let oldest = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone());
-            match oldest {
-                Some(k) => self.map.remove(&k),
-                None => break,
-            };
+        let key_len = key.len();
+        if let Some((old, _)) = self.map.insert(key, (bmp, self.tick)) {
+            self.bytes = self.bytes.saturating_sub(old.pixels.len().saturating_mul(4).saturating_add(key_len));
+        }
+        self.bytes = self.bytes.saturating_add(cost);
+        // The new entry is the most recent: it is never the one that goes.
+        while self.bytes > ICON_CACHE_BYTES {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) else { break };
+            if let Some((b, _)) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(icon_entry_bytes(&oldest, &b));
+            }
         }
     }
 
@@ -271,15 +291,21 @@ impl IconCache {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<&IconBitmap> {
+    #[cfg(test)]
+    pub fn get(&self, key: &str) -> Option<&Rc<IconBitmap>> {
         self.map.get(key).map(|(b, _)| b)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &IconBitmap)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Rc<IconBitmap>)> {
         self.map.iter().map(|(k, (b, _))| (k.as_str(), b))
     }
 
-    #[cfg(test)]
+    /// What the cache holds, as its cap counts it.
+    #[cfg(any(test, feature = "owner-probe"))]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -453,17 +479,42 @@ mod tests {
     }
 
     #[test]
-    fn icon_cache_keeps_the_newest_forty() {
+    fn icon_cache_drops_the_least_recently_used() {
+        let icon = || Rc::new(IconBitmap::new(48, 48));
         let mut c = IconCache::default();
-        for i in 0..ICON_CACHE_CAP {
-            c.insert(&format!("APP{i}"), IconBitmap::new(2, 2));
+        for i in 0..17 {
+            c.insert(&format!("APP{i:02}"), icon());
         }
-        assert_eq!(c.len(), ICON_CACHE_CAP);
-        c.touch("app0");
-        c.insert("new", IconBitmap::new(2, 2));
-        assert_eq!(c.len(), ICON_CACHE_CAP);
-        assert!(c.get("app0").is_some(), "used last, kept");
-        assert!(c.get("app1").is_none(), "the least recently used went");
+        assert_eq!(c.len(), 17, "17 icons of 48 px fit");
+        c.touch("app00");
+        c.insert("new", icon());
+        assert_eq!(c.len(), 17);
+        assert!(c.get("app00").is_some(), "used last, kept");
+        assert!(c.get("app01").is_none(), "the least recently used went");
         assert!(c.get("new").is_some());
+        // The same key again counts once.
+        c.insert("NEW", icon());
+        assert_eq!((c.len(), c.bytes()), (17, 16 * (48 * 48 * 4 + 5) + 48 * 48 * 4 + 3));
+        // An icon larger than the whole cap is not kept, and pushes nothing out.
+        c.insert("huge", Rc::new(IconBitmap::new(256, 256)));
+        assert_eq!((c.len(), c.get("huge").is_none()), (17, true));
+    }
+
+    /// L3 T20 (MEM-2): the cache is capped by bytes, each entry counting its pixels and its key: with 110-byte ids,
+    /// floor(163,840 / (px x px x 4 + 110)) icons stay, the newest, and the cache never holds more than 160 KiB.
+    #[test]
+    fn icon_cache_capped_by_bytes() {
+        let id = |i: usize| format!("{i:04}{}", "x".repeat(106));
+        assert_eq!(id(7).len(), 110);
+        for (px, kept) in [(30u32, 44usize), (36, 30), (48, 17)] {
+            let mut c = IconCache::default();
+            for i in 0..100 {
+                c.insert(&id(i), Rc::new(IconBitmap::new(px, px)));
+                assert!(c.bytes() <= ICON_CACHE_BYTES, "{px} px, {i} icons: {} B", c.bytes());
+            }
+            assert_eq!(c.len(), kept, "{px} px");
+            assert_eq!(c.bytes(), kept * (px as usize * px as usize * 4 + 110));
+            assert!(c.get(&id(99)).is_some() && c.get(&id(100 - kept)).is_some() && c.get(&id(99 - kept)).is_none());
+        }
     }
 }

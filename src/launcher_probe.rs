@@ -301,8 +301,8 @@ pub fn closed() {
     }
 }
 
-/// MEM-2's budget for the icons the launcher keeps between opens (T20 makes it the cache's byte cap).
-const ICON_CACHE_BUDGET: usize = 163_840;
+/// MEM-2's budget for the icons the launcher keeps between opens: the cache's byte cap (L3 T20).
+const ICON_CACHE_BUDGET: usize = crate::launcher::catalog::ICON_CACHE_BYTES;
 
 /// At each close: the pixel bytes of the icons kept between opens (live check L-4's fill cycle).
 pub fn icon_cache(bytes: usize) {

@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{HWND, RECT};
@@ -448,8 +449,8 @@ pub(crate) struct Launcher {
     max_h: i32,
     /// The launcher is the foreground window: caret, selected plate and hint show only then.
     foreground: bool,
-    /// App icons by lower-case id, the bar's by "bar:" and the lower-case group key.
-    icons: HashMap<String, IconBitmap>,
+    /// App icons by lower-case id, the bar's by "bar:" and the lower-case group key: the cache's own bitmaps, shared.
+    icons: HashMap<String, Rc<IconBitmap>>,
     /// The lower-case app ids whose icons this open asked the shell thread for (`ask_icons`), each once.
     asked: RefCell<HashSet<String>>,
     /// First visible row, and the selection the last layout saw (the view follows a new selection, not a wheel).
@@ -794,6 +795,11 @@ impl Launcher {
     /// every open, nothing of the open kept), and the next hidden trim is re-armed for the small blocks; a changed run
     /// history or frecency is written 2 s later, and a catalogue older than 10 minutes is listed again.
     fn housekeeping(&mut self, sys: &mut dyn SysPort) {
+        // The icons child of this open's rows ends with it (L3 T20): what it has not made yet is asked for again by the
+        // next open that shows those rows.
+        if !self.asked.get_mut().is_empty() {
+            sys.shell(ShellRequest::LauncherClosed);
+        }
         let used: Vec<String> = self
             .session
             .rows()
@@ -859,8 +865,8 @@ impl Launcher {
     }
 
     /// An icon arrived: an app id, or "bar:" + group key, lower-case (L1a-16).
-    pub(crate) fn set_icon(&mut self, key: &str, bmp: IconBitmap) {
-        self.icons.insert(key.to_lowercase(), bmp);
+    pub(crate) fn set_icon(&mut self, key: &str, bmp: impl Into<Rc<IconBitmap>>) {
+        self.icons.insert(key.to_lowercase(), bmp.into());
     }
 
     /// A shrink waits (while the user types) or is let go (120 ms without a keystroke): growing is never held.
@@ -1706,9 +1712,10 @@ fn new_launcher() -> Launcher {
         l.open_seq = c.open_seq;
         l.fg_at_open = c.fg_at_open;
         l.set_shape(c.width, c.opts.rows);
-        // The icons kept between opens: rows that have one never ask again.
+        // The icons kept between opens, shared with the cache (no pixel is copied): rows that have one never ask again.
+        l.icons.reserve(c.icons.len());
         for (k, b) in c.icons.iter() {
-            l.icons.insert(k.to_string(), b.clone());
+            l.icons.insert(k.to_string(), Rc::clone(b));
         }
         l
     });
@@ -1924,7 +1931,7 @@ pub(crate) fn is_on() -> bool {
 /// The pixel bytes of the icons kept between opens (the probe's line at each close).
 #[cfg(feature = "owner-probe")]
 fn icon_cache_bytes() -> usize {
-    with_ctrl(|c| c.icons.iter().map(|(_, b)| b.pixels.len() * std::mem::size_of::<u32>()).sum()).unwrap_or(0)
+    with_ctrl(|c| c.icons.bytes()).unwrap_or(0)
 }
 
 /// The launcher was opened in this process: its window, surface and paint code are paged in (`warm_window`).
@@ -2104,27 +2111,25 @@ pub(crate) fn on_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>) {
     }
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Icons);
-    let mut ids = Vec::new();
+    let mut got = Vec::new();
     let px = with_ctrl(|c| c.icon_px).unwrap_or(icon_px);
     for (id, bmp) in icons {
         let Some(b) = bmp else { continue };
         let b = if icon_px != px && px != 0 { crate::icons::resize_area(&b, px) } else { b };
         if !b.is_empty() {
-            with_ctrl(|c| c.icons.insert(&id, b));
-            ids.push(id);
+            // One bitmap, shared by the cache and the open rows.
+            let b = Rc::new(b);
+            with_ctrl(|c| c.icons.insert(&id, Rc::clone(&b)));
+            got.push((id, b));
         }
     }
-    if ids.is_empty() {
+    if got.is_empty() {
         return;
     }
     super::with_launcher(|l| {
-        with_ctrl(|c| {
-            for id in &ids {
-                if let Some(b) = c.icons.get(&id.to_lowercase()) {
-                    l.set_icon(id, b.clone());
-                }
-            }
-        });
+        for (id, b) in got {
+            l.set_icon(&id, b);
+        }
         Reply::Redraw
     });
 }
@@ -3361,7 +3366,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     }
     let mut l = Launcher::with_session(session);
     for (k, b) in icons {
-        l.icons.insert(k, b);
+        l.icons.insert(k, Rc::new(b));
     }
     l.foreground = scene != PreviewScene::Inactive;
     if scene == PreviewScene::NoticeTookOver {
@@ -3935,12 +3940,38 @@ mod tests {
         show(&mut l, &mut sys);
         show(&mut l, &mut sys);
         assert_eq!(asks(&sys).len(), 1, "{:?}", sys.ops);
-        // A row whose icon is in hand never asks.
+        // The close ends the icons child of an open that asked for icons (L3 T20).
+        l.housekeeping(&mut sys);
+        assert!(sys.ops.iter().any(|o| o == "Shell(LauncherClosed)"), "{:?}", sys.ops);
+        // A row whose icon is in hand never asks, and its close has no child to end.
         let mut sys = EffectSys::default();
         let mut l = typed(&fx, "calc");
         l.set_icon(calc, IconBitmap::new(24, 24));
         show(&mut l, &mut sys);
         assert!(asks(&sys).is_empty(), "{:?}", sys.ops);
+        l.housekeeping(&mut sys);
+        assert!(!sys.ops.iter().any(|o| o.contains("LauncherClosed")), "{:?}", sys.ops);
+    }
+
+    /// L3 T20: an open takes the cached icons as shared bitmaps: with 40 icons in the cache (30 px, 141 KiB),
+    /// `new_launcher` makes no block as large as one bitmap, and its rows point at the cache's own pixels.
+    #[test]
+    fn open_shares_icons_without_copy() {
+        let px = 30u32;
+        let bitmap_bytes = (px * px * 4) as usize;
+        with_ctrl(|c| {
+            *c = Ctrl::new();
+            for i in 0..40 {
+                c.icons.insert(&format!("vendor.app{i:02}"), Rc::new(IconBitmap::new(px, px)));
+            }
+        });
+        let (l, largest) = crate::launcher::testkit::largest_block_during(new_launcher);
+        assert_eq!(l.icons.len(), 40);
+        assert!(largest < bitmap_bytes, "a block of {largest} B, a bitmap is {bitmap_bytes} B");
+        let shared = with_ctrl(|c| c.icons.iter().all(|(k, b)| l.icons.get(k).is_some_and(|o| Rc::ptr_eq(o, b))));
+        assert_eq!(shared, Some(true));
+        drop(l);
+        with_ctrl(|c| *c = Ctrl::new());
     }
 
     #[test]
@@ -4511,7 +4542,7 @@ mod tests {
             )]));
             c.settings = SettingsArena::of(&crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]));
             c.windows = vec![window_row(0x1001, "Blocco note")];
-            c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
+            c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", Rc::new(IconBitmap::new(24, 24)));
             c.history = vec!["ping 1.1.1.1".into()];
             c.last_query = Some("calc".into());
             c.listed_at_ms = 5;

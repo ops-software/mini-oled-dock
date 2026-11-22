@@ -2,6 +2,9 @@
 //!
 //! Does: program name resolution, icon extraction/caching, audio (`AudioController`),
 //! app launch (de-elevated through the desktop shell, see `launch`). The UI thread NEVER does these things.
+//! The Start menu's and the launcher's icons are made by short-lived `--start-icons` children (one job per
+//! client, read by an "icons" thread that pushes the events), the AppsFolder catalogue by an `--start-apps`
+//! child: the shell components they load leave with them.
 //!
 //! PROTOCOL (neither side blocks the other):
 //!  * UI -> shell: `request(ShellRequest)`. Puts the request in an mpsc channel and posts the
@@ -21,7 +24,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -196,13 +199,14 @@ pub enum ShellRequest {
     /// Volume module disabled: shuts the `AudioController` down and drops it.
     AudioRelease,
     /// Start menu (Win double tap) and the launcher: lists `shell:AppsFolder` (in an `--start-apps`
-    /// child, `list_apps_arena`) -> `ShellEvent::StartApps`; then, as `icons` says, queues the Start
-    /// menu's icons (see `IconPlan`).
+    /// child, `list_apps_arena`) -> `ShellEvent::StartApps`; then, as `icons` says, has the Start
+    /// menu's icons made (see `IconPlan`).
     ListStartApps { icon_px: u32, icons: IconPlan },
-    /// One batch of Start menu icons -> `ShellEvent::StartIcons`. Queued by `ListStartApps` only;
-    /// low priority like `ResolveApp`.
+    /// One batch of Start menu icons made on this thread -> `ShellEvent::StartIcons`. Queued by
+    /// `ListStartApps` only when its icons child cannot start; low priority like `ResolveApp`.
     StartIcons { icon_px: u32, ids: Vec<String> },
-    /// The Start menu closed: forget the icons sent and drop the queued `StartIcons` batches.
+    /// The Start menu closed: its icons child is killed and reaped, the icons sent are forgotten and
+    /// the queued `StartIcons` batches dropped.
     StartRelease,
     /// Sent by the thread of `start_search::load_settings` when the settings catalog is ready
     /// -> `ShellEvent::StartSettings` (this thread is the one that can wake the UI).
@@ -241,10 +245,14 @@ pub enum ShellRequest {
     /// `RevealApp` for the launcher: a failure pushes `LaunchFailed` (an app with no file to show is
     /// no failure).
     LauncherRevealApp { id: String },
-    /// Icons of the launcher's visible rows that lack one -> `ShellEvent::LauncherIcons`. Not a
-    /// low-priority request: it runs ahead of the Start menu's batches, and a newer one replaces the
-    /// pending one. It never reads or changes what the Start menu was sent.
+    /// Icons of the launcher's visible rows that lack one -> `ShellEvent::LauncherIcons`, made by an
+    /// `--start-icons` child (the launcher's job, which a newer request replaces). Not a low-priority
+    /// request: it runs ahead of the Start menu's batches, and a newer one replaces the pending one. It
+    /// never reads or changes what the Start menu was sent.
     StartIconsFor { icon_px: u32, ids: Vec<String> },
+    /// The launcher closed after asking for icons: its icons child is killed and reaped, and a pending
+    /// `StartIconsFor` is dropped (the next open asks again for the rows it shows).
+    LauncherClosed,
     /// A query that found nothing: Windows' typo rewrite of it (`start_search::converted`, a 1.4 MB
     /// read kept off the UI thread) -> `ShellEvent::LauncherConverted`. A newer one replaces the
     /// pending one.
@@ -261,7 +269,8 @@ pub enum ShellRequest {
 #[derive(Clone, Debug)]
 pub enum IconPlan {
     /// The Start menu: the icons not sent yet at `icon_px` (the ids in `first`, the menu pins, go
-    /// first) as `StartIcons` batches, which run behind every other request.
+    /// first), made by an `--start-icons` child (L3 T20); when it cannot start, as `StartIcons`
+    /// batches made here, which run behind every other request.
     All { first: Vec<String> },
     /// The launcher's catalogue: none, and what the Start menu was sent is left as it is (the
     /// launcher asks for its rows' icons with `StartIconsFor`).
@@ -455,6 +464,9 @@ struct Shell {
     /// (a new size starts over).
     start_px: u32,
     start_sent: HashSet<String>,
+    /// The `--start-icons` child at work for the Start menu and the launcher's, each while it runs (L3 T20).
+    start_job: Option<IconJob>,
+    launcher_job: Option<IconJob>,
 }
 
 fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
@@ -480,6 +492,8 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         net: None,
         start_px: 0,
         start_sent: HashSet::new(),
+        start_job: None,
+        launcher_job: None,
     };
 
     // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
@@ -515,6 +529,9 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         // SAFETY: `timer` is the id returned by SetTimer on the same thread.
         let _ = unsafe { KillTimer(None, timer) };
     }
+    // No icons child outlives the thread that started it.
+    let _ = shell.end_job(IconClient::Start);
+    let _ = shell.end_job(IconClient::Launcher);
     // COM objects (audio callbacks, network list manager) must be released before CoUninitialize.
     shell.net = None;
     if let Some(a) = shell.audio.take() {
@@ -588,9 +605,11 @@ impl Shell {
         push_event(self.ui, ShellEvent::AudioSessions(rows));
     }
 
-    /// Drains the mpsc queue and works through the requests: volume/launch first, then the (slow)
-    /// resolutions and Start menu icon batches, re-checking the queue after each request.
+    /// Reaps the icons jobs that ended or hung (`reap_icon_jobs`), then drains the mpsc queue and works
+    /// through the requests: volume/launch first, then the (slow) resolutions and Start menu icon batches,
+    /// re-checking the queue after each request.
     fn pump(&mut self, rx: &Receiver<ShellRequest>) {
+        self.reap_icon_jobs();
         loop {
             while let Ok(r) = rx.try_recv() {
                 enqueue(&mut self.pending, r);
@@ -624,7 +643,15 @@ impl Shell {
             | ShellRequest::LauncherLaunch { .. }
             | ShellRequest::LauncherAppAdmin { .. }
             | ShellRequest::LauncherRevealApp { .. }) => launcher_launch(self.ui, req),
-            ShellRequest::StartIconsFor { icon_px, ids } => launcher_icons(self.ui, icon_px, ids),
+            ShellRequest::StartIconsFor { icon_px, ids } => {
+                let px = icon_px.clamp(*ICON_PX_RANGE.start(), *ICON_PX_RANGE.end());
+                if let Err(back) = self.start_icon_job(IconClient::Launcher, px, ids) {
+                    launcher_icons(self.ui, px, back);
+                }
+            }
+            ShellRequest::LauncherClosed => {
+                let _ = self.end_job(IconClient::Launcher);
+            }
             ShellRequest::LauncherConvert { gen, query } => launcher_convert(self.ui, gen, &query),
             ShellRequest::LauncherStateLoad => launcher_state_load(self.ui),
             ShellRequest::LauncherStateSave { frecency, run, delete } => launcher_state_save(frecency, run, delete),
@@ -703,6 +730,7 @@ impl Shell {
             ShellRequest::ListStartApps { icon_px, icons } => self.list_start_apps(icon_px, &icons),
             ShellRequest::StartSettingsReady => push_event(self.ui, ShellEvent::StartSettings),
             ShellRequest::StartRelease => {
+                let _ = self.end_job(IconClient::Start);
                 start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending);
                 crate::start_search::release_app_index();
                 // The icon pipeline and the AppsFolder catalog are done: this STA's COM servers with no object left are
@@ -729,14 +757,18 @@ impl Shell {
 
     // -------------------------------------------------------------- Start menu
 
-    /// `ListStartApps`: lists the catalogue (`list_apps_arena`), queues the icons the UI does not have yet, then publishes
-    /// it. One listing serves Start and the launcher.
+    /// `ListStartApps`: lists the catalogue (`list_apps_arena`), publishes it, then has the icons the Start menu does
+    /// not have yet made (`start_menu_icons`). One listing serves Start and the launcher.
     fn list_start_apps(&mut self, icon_px: u32, icons: &IconPlan) {
         let apps = Arc::new(list_apps_arena());
         let v = apps.view();
         let ids = (0..v.len()).map(|i| v.id(i));
-        queue_start_icons(&mut self.start_px, &mut self.start_sent, &mut self.pending, ids, icon_px, icons);
+        let missing =
+            missing_start_icons(&mut self.start_px, &mut self.start_sent, &mut self.pending, ids, icon_px, icons);
         push_event(self.ui, ShellEvent::StartApps(apps));
+        if let Some(missing) = missing {
+            self.start_menu_icons(missing);
+        }
     }
 
     // -------------------------------------------------------------- name and icon
@@ -1428,6 +1460,516 @@ pub fn run_apps_child() -> i32 {
     code
 }
 
+// ------------------------------------------------------------------ icons from a child (L3 T20, M1 F5)
+
+/// The flag of the child mode that makes icons (`run_icons_child`), followed by the pixel size; not combinable.
+pub(crate) const ICONS_FLAG: &str = "--start-icons";
+/// The pixel sizes `--start-icons` takes: the clamp every icon request of the dock gets.
+pub(crate) const ICON_PX_RANGE: std::ops::RangeInclusive<u32> = 8..=256;
+/// The first line of an icons child's output.
+const ICONS_HEADER: &[u8] = b"mini-oled-dock start-icons 1\n";
+/// What one icons child is given at most: ids, bytes per id (its line, the newline aside), bytes of input.
+const ICON_IDS_MAX: usize = 2_000;
+const ICON_ID_MAX_BYTES: usize = 1_024;
+const ICON_INPUT_MAX: usize = 2 * 1024 * 1024;
+// A full batch, newlines included, always fits in the child's input: the dock's writer never fills a pipe the child
+// has stopped reading.
+const _: () = assert!(ICON_IDS_MAX * (ICON_ID_MAX_BYTES + 1) <= ICON_INPUT_MAX);
+/// The bytes of a frame's head: index, width and height, each a u32 LE.
+const ICON_FRAME_HEAD: usize = 12;
+/// A job older than this plus `ICON_JOB_PER_ID` per id is a hung child (about 7 ms per icon measured).
+const ICON_JOB_BASE: Duration = Duration::from_secs(2);
+const ICON_JOB_PER_ID: Duration = Duration::from_millis(50);
+/// The read buffer of a job's reader thread (several frames at the dock's sizes), and the child's write buffer.
+const ICON_IO_BUF: usize = 64 * 1024;
+/// The stack of a job's reader thread.
+const ICON_READER_STACK: usize = 128 * 1024;
+/// How long the shell thread waits for a killed child to be gone: one held in the kernel past it is left to the dock's
+/// job, so a launch never waits behind it.
+const ICON_REAP_WAIT_MS: u32 = 1_000;
+
+/// Whose icons a job makes; each client has at most one job at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IconClient {
+    Start,
+    Launcher,
+}
+
+/// What a job's reader thread tells the shell thread: how many of the job's ids were answered (every id before that
+/// index went to the UI), that it ended (both pipes closed: nothing more comes), and that the shell thread stopped the
+/// child on purpose (nothing more of the job goes to the UI, and its cut output is no failure to log).
+#[derive(Default)]
+struct IconProgress {
+    delivered: AtomicUsize,
+    ended: AtomicBool,
+    stopped: AtomicBool,
+}
+
+/// One `--start-icons` child at work for a client: the process (only the shell thread waits on it or kills it; the
+/// reader thread holds its pipes), the size and ids it was given, its progress and when it started.
+struct IconJob {
+    child: std::process::Child,
+    px: u32,
+    ids: Arc<[String]>,
+    progress: Arc<IconProgress>,
+    started: Instant,
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl IconJob {
+    /// How long the job may run before it counts as hung.
+    fn deadline(&self) -> Duration {
+        let n = u32::try_from(self.ids.len()).unwrap_or(u32::MAX);
+        ICON_JOB_BASE.saturating_add(ICON_JOB_PER_ID.saturating_mul(n))
+    }
+
+    /// Kills and reaps the child (harmless once it has exited; the wait is bounded by `ICON_REAP_WAIT_MS`): its ids and
+    /// how many of them were answered. Its reader sees the output close and ends; nothing it still decodes goes to the
+    /// UI.
+    fn stop(mut self) -> (Arc<[String]>, usize) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        self.progress.stopped.store(true, SeqCst);
+        let _ = self.child.kill();
+        // SAFETY: the process handle is valid while `self.child` lives; waiting on it has no other effect.
+        let _ = unsafe { WaitForSingleObject(HANDLE(self.child.as_raw_handle()), ICON_REAP_WAIT_MS) };
+        let _ = self.child.try_wait();
+        (self.ids, self.progress.delivered.load(SeqCst))
+    }
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl Shell {
+    fn job(&mut self, c: IconClient) -> &mut Option<IconJob> {
+        match c {
+            IconClient::Start => &mut self.start_job,
+            IconClient::Launcher => &mut self.launcher_job,
+        }
+    }
+
+    /// Ends the client's job, if any (killed and reaped): its size, ids and answered count.
+    fn end_job(&mut self, c: IconClient) -> Option<(u32, Arc<[String]>, usize)> {
+        let job = self.job(c).take()?;
+        let px = job.px;
+        let (ids, delivered) = job.stop();
+        Some((px, ids, delivered))
+    }
+
+    /// At each pass of the queue: a job whose child exited and whose reader ended is reaped, a job past its deadline is
+    /// killed and reaped (a hung child; logged once per process). What either left unanswered for the Start menu leaves
+    /// `start_sent`, so its next listing asks for it again.
+    fn reap_icon_jobs(&mut self) {
+        for c in [IconClient::Start, IconClient::Launcher] {
+            let Some(job) = self.job(c).as_mut() else { continue };
+            let exited = !matches!(job.child.try_wait(), Ok(None));
+            let late = job.started.elapsed() > job.deadline();
+            if !(late || exited && job.progress.ended.load(SeqCst)) {
+                continue;
+            }
+            if late && !exited {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Relaxed) {
+                    log!(
+                        "start icons: the icons process was still at work after {} ms and was stopped",
+                        job.deadline().as_millis()
+                    );
+                }
+            }
+            if let Some((_, ids, delivered)) = self.end_job(c) {
+                if c == IconClient::Start {
+                    unsend_icons(&mut self.start_sent, &ids, delivered);
+                }
+            }
+        }
+    }
+
+    /// Starts the client's icons child for `ids` at `px` in place of its running job, whose ids not answered yet (at
+    /// the same size) go first (`next_icon_batch`): killing a batch would otherwise lose its rest for the whole open,
+    /// since neither the launcher nor Start asks for an id twice. An id a child cannot take gets no icon; past
+    /// `ICON_IDS_MAX` the others are dropped (for Start they leave `start_sent`). Err: the child could not start
+    /// (logged once per process), with the ids to make here, as before.
+    fn start_icon_job(&mut self, c: IconClient, px: u32, ids: Vec<String>) -> Result<(), Vec<String>> {
+        let ids = match self.end_job(c) {
+            Some((old_px, old, delivered)) if old_px == px => next_icon_batch(&old, delivered, ids),
+            _ => ids,
+        };
+        let (batch, over) = icon_batch(ids);
+        if c == IconClient::Start {
+            for id in &over {
+                self.start_sent.remove(id);
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        match spawn_icon_job(self.ui, c, px, batch) {
+            Ok(job) => {
+                *self.job(c) = Some(job);
+                Ok(())
+            }
+            Err((why, batch)) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Relaxed) {
+                    log!("start icons: the icons process could not start ({why}), icons made in-process");
+                }
+                Err(batch)
+            }
+        }
+    }
+
+    /// The Start menu's icons not sent yet (`missing`, at `start_px`): made by its icons child, or queued as
+    /// `StartIcons` batches made here, as before, when the child cannot start. A job at another size is ended first
+    /// (its ids were forgotten with that size).
+    fn start_menu_icons(&mut self, missing: Vec<String>) {
+        let px = self.start_px;
+        if self.start_job.as_ref().is_some_and(|j| j.px != px) {
+            let _ = self.end_job(IconClient::Start);
+        }
+        if missing.is_empty() {
+            return;
+        }
+        if let Err(back) = self.start_icon_job(IconClient::Start, px, missing) {
+            for chunk in back.chunks(START_ICON_BATCH) {
+                self.pending.push_back(ShellRequest::StartIcons { icon_px: px, ids: chunk.to_vec() });
+            }
+        }
+    }
+}
+
+/// Starts an `--start-icons <px>` child for `ids` (`update::spawn_in_job`: the dock's own exe and token, no window,
+/// the dock's job; stdin and stdout piped, stderr null) and its reader thread ("icons", 128 KB of stack), which gets
+/// both pipes. Err: why, with the ids back.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> Result<IconJob, (String, Vec<String>)> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return Err((format!("no exe path: {e}"), ids)),
+    };
+    let mut cmd = Command::new(exe);
+    cmd.arg(ICONS_FLAG)
+        .arg(px.to_string())
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = match crate::update::spawn_in_job(&mut cmd) {
+        Ok(child) => child,
+        Err(e) => return Err((e.to_string(), ids)),
+    };
+    let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(("no pipes".into(), ids));
+    };
+    let ids: Arc<[String]> = ids.into();
+    let progress = Arc::new(IconProgress::default());
+    let started = Instant::now();
+    let reader = IconReader { ui, client, px, ids: Arc::clone(&ids), progress: Arc::clone(&progress), started };
+    let spawned = std::thread::Builder::new()
+        .name("icons".into())
+        .stack_size(ICON_READER_STACK)
+        .spawn(move || reader.run(input, output));
+    if let Err(e) = spawned {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err((format!("no reader thread: {e}"), ids.to_vec()));
+    }
+    Ok(IconJob { child, px, ids, progress, started })
+}
+
+/// What a job's reader thread needs besides the pipes.
+struct IconReader {
+    ui: isize,
+    client: IconClient,
+    px: u32,
+    ids: Arc<[String]>,
+    progress: Arc<IconProgress>,
+    started: Instant,
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl IconReader {
+    /// The reader thread of one job: it writes the ids (the shell thread never writes to a pipe, so a child slow to
+    /// read its input never holds a launch), closes the child's input, then decodes the frames and pushes them to the
+    /// UI as they arrive: the Start menu's in batches of `START_ICON_BATCH`, the launcher's as soon as nothing more
+    /// waits in the pipe. It ends at the end of the output, at a write error or the first frame refused (each logged
+    /// once per process; dropping the pipes makes a child still at work exit at its next write), or when the shell
+    /// thread kills the child; then it logs what it delivered.
+    fn run(self, input: std::process::ChildStdin, output: std::process::ChildStdout) {
+        static WRITE_WARNED: AtomicBool = AtomicBool::new(false);
+        static FRAME_WARNED: AtomicBool = AtomicBool::new(false);
+        let (first, failed) = match self.feed(input) {
+            Ok(()) => {
+                let (first, outcome) = self.read(output);
+                (first, outcome.err().map(|why| (&FRAME_WARNED, why)))
+            }
+            Err(e) => {
+                drop(output);
+                (None, Some((&WRITE_WARNED, format!("the ids could not be written: {e}"))))
+            }
+        };
+        self.progress.ended.store(true, SeqCst);
+        if let Some((warned, why)) = failed {
+            if !self.progress.stopped.load(SeqCst) && !warned.swap(true, Relaxed) {
+                log!("start icons: the icons process failed ({why}); its other icons are not made");
+            }
+        }
+        let n = self.ids.len();
+        let delivered = self.progress.delivered.load(SeqCst);
+        let first =
+            first.map_or_else(|| "none delivered".to_string(), |t| format!("first batch after {} ms", t.as_millis()));
+        let whose = if self.client == IconClient::Launcher { " for the launcher" } else { "" };
+        log!("start icons: {delivered} of {n} in {} ms, {first} (child){whose}", self.started.elapsed().as_millis());
+    }
+
+    /// Writes the ids, one per line, and closes the child's input.
+    fn feed(&self, mut input: std::process::ChildStdin) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut text = Vec::with_capacity(self.ids.iter().map(|id| id.len() + 1).sum());
+        for id in self.ids.iter() {
+            text.extend_from_slice(id.as_bytes());
+            text.push(b'\n');
+        }
+        input.write_all(&text)
+    }
+
+    /// Decodes the output and delivers the frames: when the first batch went out, and how the output ended.
+    fn read(&self, output: std::process::ChildStdout) -> (Option<Duration>, Result<(), String>) {
+        let n = self.ids.len();
+        let mut r = std::io::BufReader::with_capacity(ICON_IO_BUF, output);
+        if let Err(why) = read_icon_header(&mut r) {
+            return (None, Err(why));
+        }
+        let (mut batch, mut prev, mut first) = (Vec::new(), None, None);
+        let outcome = loop {
+            match read_icon_frame(&mut r, n, self.px, prev) {
+                Ok(Some((i, icon))) => {
+                    prev = Some(i);
+                    let Some(id) = self.ids.get(i) else { break Err(format!("frame {i} of {n}")) };
+                    batch.push((id.clone(), icon));
+                    let due = match self.client {
+                        IconClient::Start => batch.len() >= START_ICON_BATCH,
+                        IconClient::Launcher => r.buffer().is_empty(),
+                    };
+                    if due {
+                        self.deliver(&mut batch, i, &mut first);
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(why) => break Err(why),
+            }
+        };
+        if let (Some(i), false) = (prev, batch.is_empty()) {
+            self.deliver(&mut batch, i, &mut first);
+        }
+        (first, outcome)
+    }
+
+    /// Pushes `batch` (its last frame of index `last`) to the UI, unless the shell thread stopped the job.
+    fn deliver(&self, batch: &mut Vec<(String, Option<IconBitmap>)>, last: usize, first: &mut Option<Duration>) {
+        let icons = std::mem::take(batch);
+        if self.progress.stopped.load(SeqCst) {
+            return;
+        }
+        let icon_px = self.px;
+        push_event(
+            self.ui,
+            match self.client {
+                IconClient::Start => ShellEvent::StartIcons { icon_px, icons },
+                IconClient::Launcher => ShellEvent::LauncherIcons { icon_px, icons },
+            },
+        );
+        self.progress.delivered.store(last + 1, SeqCst);
+        first.get_or_insert_with(|| self.started.elapsed());
+    }
+}
+
+/// `--start-icons <px>`, in the child a job starts: all of stdin is read first (`read_icon_ids`; the dock's writer and
+/// this reader never wait on each other), then the header and one frame per id in input order, each written and flushed
+/// at once, the pixels from `start_icon`, so identical to the ones the dock made in-process. It touches no data folder,
+/// logger, mutex or console and writes nothing but stdout. Exit 0 = every frame written; 1 = COM failed, or a write
+/// failed (the dock went away or stopped the job): it exits at once.
+pub fn run_icons_child(px: u32) -> i32 {
+    use std::io::Write;
+    let ids = read_icon_ids(&mut std::io::stdin().lock());
+    // SAFETY: the first COM call of this thread (the child's main thread); paired with CoUninitialize below.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return 1;
+    }
+    let mut out = std::io::BufWriter::with_capacity(ICON_IO_BUF, std::io::stdout().lock());
+    if out.write_all(ICONS_HEADER).and_then(|()| out.flush()).is_err() {
+        return 1;
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let icon = id.as_deref().and_then(|id| start_icon(id, px)).filter(|b| b.width == px && b.height == px);
+        let frame = encode_icon_frame(u32::try_from(i).unwrap_or(u32::MAX), icon.as_ref());
+        if out.write_all(&frame).and_then(|()| out.flush()).is_err() {
+            return 1;
+        }
+    }
+    // SAFETY: paired with the successful CoInitializeEx above; every icon released its COM objects.
+    unsafe { CoUninitialize() };
+    0
+}
+
+/// One frame of an icons child: u32 LE index, width and height, then width x height u32 LE premultiplied pixels,
+/// top-down (`IconBitmap`'s layout). `None`, or a bitmap whose pixels do not match its size, is the 0 x 0 frame:
+/// no icon.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn encode_icon_frame(index: u32, icon: Option<&IconBitmap>) -> Vec<u8> {
+    let icon =
+        icon.filter(|b| !b.pixels.is_empty() && b.pixels.len() as u64 == u64::from(b.width) * u64::from(b.height));
+    let (w, h, pixels) = icon.map_or((0, 0, &[][..]), |b| (b.width, b.height, b.pixels.as_slice()));
+    let mut out = Vec::with_capacity(ICON_FRAME_HEAD + pixels.len() * 4);
+    for x in [index, w, h] {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    for p in pixels {
+        out.extend_from_slice(&p.to_le_bytes());
+    }
+    out
+}
+
+/// Fills `buf` from `r` until it is full or the input ends: the bytes read.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn read_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0usize;
+    while let Some(rest) = buf.get_mut(got..).filter(|b| !b.is_empty()) {
+        match r.read(rest) {
+            Ok(0) => break,
+            Ok(k) => got = got.saturating_add(k),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got.min(buf.len()))
+}
+
+/// Reads the header of an icons child's output: `mini-oled-dock start-icons 1` and a newline, nothing else.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn read_icon_header(r: &mut impl std::io::Read) -> Result<(), String> {
+    let mut head = [0u8; ICONS_HEADER.len()];
+    match read_full(r, &mut head) {
+        Ok(0) => Err("no output".into()),
+        Ok(k) if k == head.len() && head == *ICONS_HEADER => Ok(()),
+        Ok(_) => Err("not an icons output".into()),
+        Err(e) => Err(format!("reading the header: {e}")),
+    }
+}
+
+/// The next frame of an icons child that was given `n` ids at `px` (one of `ICON_PX_RANGE`), after the frame of
+/// index `prev`; `Ok(None)` at a clean end (the output ends between two frames). Refused, before anything is allocated
+/// from it: an index of `n` or more, or not above `prev` (so never more than `n` frames); a width other than the
+/// height, or neither 0 nor exactly `px` (`start_icon` always makes `px` x `px`), so no frame is larger than
+/// `px` x `px` x 4 bytes; a frame cut short.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn read_icon_frame(
+    r: &mut impl std::io::Read,
+    n: usize,
+    px: u32,
+    prev: Option<usize>,
+) -> Result<Option<(usize, Option<IconBitmap>)>, String> {
+    if !ICON_PX_RANGE.contains(&px) {
+        return Err(format!("{px} px is no icon size"));
+    }
+    let mut head = [0u8; ICON_FRAME_HEAD];
+    match read_full(r, &mut head).map_err(|e| format!("reading a frame: {e}"))? {
+        0 => return Ok(None),
+        ICON_FRAME_HEAD => {}
+        k => return Err(format!("a frame cut after {k} bytes")),
+    }
+    let [i0, i1, i2, i3, w0, w1, w2, w3, h0, h1, h2, h3] = head;
+    let index = usize::try_from(u32::from_le_bytes([i0, i1, i2, i3])).unwrap_or(usize::MAX);
+    let (w, h) = (u32::from_le_bytes([w0, w1, w2, w3]), u32::from_le_bytes([h0, h1, h2, h3]));
+    if index >= n {
+        return Err(format!("frame {index} of {n}"));
+    }
+    if let Some(p) = prev.filter(|&p| index <= p) {
+        return Err(format!("frame {index} after frame {p}"));
+    }
+    if w != h {
+        return Err(format!("a {w} x {h} frame"));
+    }
+    if w == 0 {
+        return Ok(Some((index, None)));
+    }
+    if w != px {
+        return Err(format!("a {w} px frame at {px} px"));
+    }
+    let side = px as usize;
+    let mut bytes = vec![0u8; side * side * 4];
+    let got = read_full(r, &mut bytes).map_err(|e| format!("reading a frame: {e}"))?;
+    if got != bytes.len() {
+        return Err(format!("a frame cut after {} bytes", ICON_FRAME_HEAD + got));
+    }
+    let pixels = bytes.chunks_exact(4).map(|c| <[u8; 4]>::try_from(c).map_or(0, u32::from_le_bytes)).collect();
+    Ok(Some((index, Some(IconBitmap { width: px, height: px, pixels }))))
+}
+
+/// The ids an icons child reads from its input, one per line as the dock wrote them: reading stops at 2 MiB (the line
+/// the cap cuts is dropped) and at most `ICON_IDS_MAX` lines are taken; a line over `ICON_ID_MAX_BYTES` or not UTF-8
+/// is an id with no icon (`None`), so every answer keeps the index of its line. A read error ends the input there.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn read_icon_ids(r: &mut impl std::io::Read) -> Vec<Option<String>> {
+    use std::io::Read;
+    let mut input = Vec::new();
+    let _ = r.take(ICON_INPUT_MAX as u64 + 1).read_to_end(&mut input);
+    if input.len() > ICON_INPUT_MAX {
+        let keep = input.get(..ICON_INPUT_MAX).and_then(|b| b.iter().rposition(|&c| c == b'\n')).map_or(0, |i| i + 1);
+        input.truncate(keep);
+    }
+    let mut lines: Vec<&[u8]> = input.split(|&b| b == b'\n').collect();
+    // After the last newline: nothing, or a last line without its newline.
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines
+        .into_iter()
+        .take(ICON_IDS_MAX)
+        .map(|l| if l.len() <= ICON_ID_MAX_BYTES { std::str::from_utf8(l).ok().map(str::to_string) } else { None })
+        .collect()
+}
+
+/// The ids one child is given, in order: an id with a control character or over the child's line cap (1,024 bytes) is
+/// left out, so it gets no icon, as when an extraction fails, and never breaks a batch; past `ICON_IDS_MAX` the others
+/// come back.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn icon_batch(ids: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut batch: Vec<String> =
+        ids.into_iter().filter(|id| id.len() <= ICON_ID_MAX_BYTES && !id.chars().any(char::is_control)).collect();
+    let over = if batch.len() > ICON_IDS_MAX { batch.split_off(ICON_IDS_MAX) } else { Vec::new() };
+    (batch, over)
+}
+
+/// The batch that replaces a running job of the same client: the ids the old job had not answered (`old[delivered..]`)
+/// that `ids` does not ask for again, first (they were asked earlier), then `ids`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn next_icon_batch(old: &[String], delivered: usize, ids: Vec<String>) -> Vec<String> {
+    let rest = old.get(delivered..).unwrap_or(&[]);
+    if rest.is_empty() {
+        return ids;
+    }
+    let mut batch: Vec<String> = {
+        let asked: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        rest.iter().filter(|id| !asked.contains(id.as_str())).cloned().collect()
+    };
+    batch.extend(ids);
+    batch
+}
+
+/// The Start menu's ids a job ended without answering (`old[delivered..]`), with no batch to carry them: they leave
+/// `start_sent`, so the next listing of the same open asks for them again.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn unsend_icons(sent: &mut HashSet<String>, old: &[String], delivered: usize) {
+    for id in old.get(delivered..).unwrap_or(&[]) {
+        sent.remove(id);
+    }
+}
+
 /// Index in `apps` of the app that sent a notification: same id as the AUMID, then same display
 /// name, then (Win32 toast ids such as "FirefoxToast-308046B0AF4A39CB") the id equal to the part
 /// after the last '-'. Pure, for the tests.
@@ -1978,8 +2520,8 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
     }
 }
 
-/// `StartIconsFor`: the icons of the launcher's rows, made at `icon_px` (clamped as the Start menu's).
-/// Start's `start_px` and `start_sent` are not touched.
+/// `StartIconsFor` made here, when its icons child cannot start: the icons of the launcher's rows, made at
+/// `icon_px` (clamped as the Start menu's). Start's `start_px` and `start_sent` are not touched.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launcher_icons(ui: isize, icon_px: u32, ids: Vec<String>) {
     let icon_px = icon_px.clamp(8, 256);
@@ -2496,10 +3038,12 @@ fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) -> Result<
 }
 
 /// Puts a request in the queue. A newer launcher icon request or typo rewrite replaces the pending one:
-/// only the latest keystroke's rows matter.
+/// only the latest keystroke's rows matter; the launcher's close drops its pending icon request.
 fn enqueue(pending: &mut VecDeque<ShellRequest>, r: ShellRequest) {
     match r {
-        ShellRequest::StartIconsFor { .. } => pending.retain(|p| !matches!(p, ShellRequest::StartIconsFor { .. })),
+        ShellRequest::StartIconsFor { .. } | ShellRequest::LauncherClosed => {
+            pending.retain(|p| !matches!(p, ShellRequest::StartIconsFor { .. }))
+        }
         ShellRequest::LauncherConvert { .. } => pending.retain(|p| !matches!(p, ShellRequest::LauncherConvert { .. })),
         _ => {}
     }
@@ -2517,17 +3061,18 @@ fn next_request(pending: &mut VecDeque<ShellRequest>) -> Option<ShellRequest> {
 }
 
 /// The Start menu's part of `ListStartApps`, over the catalogue's `ids` (the arena's order, by name).
-/// `IconPlan::All`: the icons not sent yet at `icon_px` are queued as `StartIcons` batches, the pins
-/// (`first`) first; a new size starts over. `IconPlan::None` (the launcher's catalogue) touches nothing.
-fn queue_start_icons<'a>(
+/// `IconPlan::All`: the icons not sent yet at `icon_px`, the pins (`first`) first, marked as sent and
+/// returned (`Shell::start_menu_icons` has them made); a new size starts over and drops the batches
+/// queued at the old one. `IconPlan::None` (the launcher's catalogue) touches nothing: `None`.
+fn missing_start_icons<'a>(
     start_px: &mut u32,
     sent: &mut HashSet<String>,
     pending: &mut VecDeque<ShellRequest>,
     ids: impl IntoIterator<Item = &'a str>,
     icon_px: u32,
     plan: &IconPlan,
-) {
-    let IconPlan::All { first } = plan else { return };
+) -> Option<Vec<String>> {
+    let IconPlan::All { first } = plan else { return None };
     let icon_px = icon_px.clamp(8, 256);
     if icon_px != *start_px {
         *start_px = icon_px;
@@ -2538,9 +3083,7 @@ fn queue_start_icons<'a>(
     // Pins first (stable sort: the catalog order is kept inside each group).
     missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
     sent.extend(missing.iter().cloned());
-    for chunk in missing.chunks(START_ICON_BATCH) {
-        pending.push_back(ShellRequest::StartIcons { icon_px, ids: chunk.to_vec() });
-    }
+    Some(missing)
 }
 
 /// `StartRelease`: a reopened Start menu starts from nothing, so the next `ListStartApps` resends every icon.
@@ -3117,14 +3660,22 @@ mod tests {
         let mut sent = HashSet::from(["a".to_string()]);
         let mut pending: VecDeque<ShellRequest> = VecDeque::new();
         pending.push_back(ShellRequest::StartIcons { icon_px: 48, ids: vec!["z".into()] });
-        queue_start_icons(&mut px, &mut sent, &mut pending, apps, 32, &IconPlan::None);
-        assert_eq!((px, sent.len(), pending.len()), (48, 1, 1), "the launcher's catalogue changes nothing of Start's");
-        queue_start_icons(&mut px, &mut sent, &mut pending, apps, 48, &IconPlan::All { first: vec!["C".into()] });
-        assert_eq!((px, sent.len(), pending.len()), (48, 3, 2));
-        assert!(matches!(&pending[1], ShellRequest::StartIcons { icon_px: 48, ids } if *ids == ["c", "b"]));
-        // A new size starts Start's icons over.
-        queue_start_icons(&mut px, &mut sent, &mut pending, apps, 64, &IconPlan::All { first: Vec::new() });
-        assert_eq!((px, sent.len(), pending.len()), (64, 3, 1));
+        let none = missing_start_icons(&mut px, &mut sent, &mut pending, apps, 32, &IconPlan::None);
+        assert_eq!(
+            (none, px, sent.len(), pending.len()),
+            (None, 48, 1, 1),
+            "the launcher's catalogue changes nothing of Start's"
+        );
+        let pins = IconPlan::All { first: vec!["C".into()] };
+        let missing = missing_start_icons(&mut px, &mut sent, &mut pending, apps, 48, &pins);
+        assert_eq!((missing, px, sent.len(), pending.len()), (Some(strings(&["c", "b"])), 48, 3, 1));
+        // Nothing new: nothing to make.
+        let missing = missing_start_icons(&mut px, &mut sent, &mut pending, apps, 48, &pins);
+        assert_eq!(missing, Some(Vec::new()));
+        // A new size starts Start's icons over, and drops the batches made here at the old one.
+        let missing =
+            missing_start_icons(&mut px, &mut sent, &mut pending, apps, 64, &IconPlan::All { first: Vec::new() });
+        assert_eq!((missing, px, sent.len(), pending.len()), (Some(strings(&["a", "b", "c"])), 64, 3, 0));
     }
 
     /// L3 T17: what the dock takes from an `--start-apps` child is checked whole before it is used, and any failure is a
@@ -3198,5 +3749,381 @@ mod tests {
         assert_eq!(load_state_from(&dir), (None, None));
         assert!(save_state_to(&dir, None, None, true).is_ok(), "nothing to delete is no failure");
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ---- L3 T20: icons from a child
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A frame's bytes as an icons child writes them, with `pixels` zero pixels.
+    fn raw_frame(index: u32, w: u32, h: u32, pixels: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        for x in [index, w, h] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.resize(v.len() + pixels * 4, 0);
+        v
+    }
+
+    #[test]
+    fn icon_frames_round_trip() {
+        let a = IconBitmap { width: 8, height: 8, pixels: (0..64u32).map(|i| i.wrapping_mul(0x0103_0507)).collect() };
+        let c = IconBitmap { width: 8, height: 8, pixels: vec![0xFF12_3456; 64] };
+        let out = [
+            ICONS_HEADER.to_vec(),
+            encode_icon_frame(0, Some(&a)),
+            encode_icon_frame(1, None),
+            encode_icon_frame(2, Some(&c)),
+        ]
+        .concat();
+        assert_eq!(out.len(), ICONS_HEADER.len() + 3 * ICON_FRAME_HEAD + 2 * 8 * 8 * 4);
+        let mut r = &out[..];
+        read_icon_header(&mut r).unwrap();
+        assert_eq!(read_icon_frame(&mut r, 3, 8, None).unwrap(), Some((0, Some(a))));
+        assert_eq!(read_icon_frame(&mut r, 3, 8, Some(0)).unwrap(), Some((1, None)));
+        assert_eq!(read_icon_frame(&mut r, 3, 8, Some(1)).unwrap(), Some((2, Some(c))));
+        assert_eq!(read_icon_frame(&mut r, 3, 8, Some(2)).unwrap(), None, "a clean end");
+        // The head is the index, the width and the height, little-endian; no icon is a 0 x 0 frame.
+        assert_eq!(encode_icon_frame(0x0102_0304, None), [4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // A bitmap whose pixels do not match its size goes as no icon.
+        let odd = IconBitmap { width: 8, height: 8, pixels: vec![1; 3] };
+        assert_eq!(encode_icon_frame(5, Some(&odd)), encode_icon_frame(5, None));
+        assert_eq!(encode_icon_frame(5, Some(&IconBitmap::default())), encode_icon_frame(5, None));
+    }
+
+    #[test]
+    fn icon_frames_rejected() {
+        let bad_headers: [&[u8]; 6] = [
+            b"",
+            b"mini-oled-dock start-icons 1",
+            b"mini-oled-dock start-icons 2\n",
+            b"MINI-OLED-DOCK START-ICONS 1\n",
+            b"mini-oled-dock apps-catalog 1\n",
+            b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        ];
+        for h in bad_headers {
+            assert!(read_icon_header(&mut &h[..]).is_err(), "{h:?}");
+        }
+        let read = |b: &[u8], n: usize, px: u32, prev: Option<usize>| read_icon_frame(&mut &b[..], n, px, prev);
+        // An index of n or more.
+        assert!(read(&raw_frame(3, 0, 0, 0), 3, 30, None).is_err());
+        assert!(read(&raw_frame(u32::MAX, 0, 0, 0), 3, 30, None).is_err());
+        assert!(read(&raw_frame(0, 0, 0, 0), 0, 30, None).is_err(), "no id at all");
+        // An index not above the previous one.
+        assert!(read(&raw_frame(1, 0, 0, 0), 3, 30, Some(1)).is_err());
+        assert!(read(&raw_frame(0, 0, 0, 0), 3, 30, Some(1)).is_err());
+        assert_eq!(read(&raw_frame(2, 0, 0, 0), 3, 30, Some(0)).unwrap(), Some((2, None)), "an id skipped is no error");
+        // A width other than the height.
+        assert!(read(&raw_frame(0, 30, 29, 30 * 29), 3, 30, None).is_err());
+        assert!(read(&raw_frame(0, 0, 30, 0), 3, 30, None).is_err());
+        assert!(read(&raw_frame(0, 30, 0, 0), 3, 30, None).is_err());
+        // A width neither 0 nor exactly px: a 256 px frame when px is 30, a smaller one, a huge one with no pixels.
+        assert!(read(&raw_frame(0, 256, 256, 256 * 256), 3, 30, None).is_err());
+        assert!(read(&raw_frame(0, 29, 29, 29 * 29), 3, 30, None).is_err());
+        assert!(read(&raw_frame(0, 0x8000_0000, 0x8000_0000, 0), 3, 30, None).is_err());
+        // A size the dock never asks for is refused whatever the frame says.
+        assert!(read(&raw_frame(0, 300, 300, 300 * 300), 3, 300, None).is_err());
+        assert!(read(&raw_frame(0, 0, 0, 0), 3, 0, None).is_err());
+        // A frame cut short, in its head or in its pixels.
+        let whole = raw_frame(0, 30, 30, 900);
+        assert!(read(&whole, 3, 30, None).unwrap().is_some());
+        for cut in [1, 4, 11, 12, 13, whole.len() - 1] {
+            assert!(read(&whole[..cut], 3, 30, None).is_err(), "cut at {cut}");
+        }
+        // More than n frames: the one after the n-th is refused.
+        let three = [raw_frame(0, 0, 0, 0), raw_frame(1, 0, 0, 0), raw_frame(2, 0, 0, 0)].concat();
+        let mut r = &three[..];
+        let mut prev = None;
+        for want in [0, 1] {
+            let got = read_icon_frame(&mut r, 2, 30, prev).unwrap().map(|(i, _)| i);
+            assert_eq!(got, Some(want));
+            prev = got;
+        }
+        assert!(read_icon_frame(&mut r, 2, 30, prev).is_err());
+    }
+
+    #[test]
+    fn icon_frame_reader_never_panics() {
+        let mut rng = crate::launcher::testkit::XorShift::new(0x1C0F_2A3D);
+        let valid = [
+            ICONS_HEADER.to_vec(),
+            encode_icon_frame(0, Some(&IconBitmap::new(8, 8))),
+            encode_icon_frame(2, None),
+            encode_icon_frame(3, Some(&IconBitmap { width: 8, height: 8, pixels: vec![0xFF00_00FF; 64] })),
+        ]
+        .concat();
+        let mut frames = 0usize;
+        for round in 0..10_000u32 {
+            let mut buf: Vec<u8> = if round % 2 == 0 {
+                // A valid output, damaged: some bytes changed, then cut anywhere.
+                let mut b = valid.clone();
+                for _ in 0..1 + rng.next_u64() % 4 {
+                    let at = (rng.next_u64() as usize) % b.len();
+                    b[at] = rng.next_u64() as u8;
+                }
+                b.truncate((rng.next_u64() as usize) % (b.len() + 1));
+                b
+            } else {
+                let len = (rng.next_u64() % 700) as usize;
+                (0..len).map(|_| rng.next_u64() as u8).collect()
+            };
+            if round % 4 == 1 {
+                // Random bytes behind a good header, so the frames are read.
+                buf.splice(0..0, ICONS_HEADER.iter().copied());
+            }
+            let n = (rng.next_u64() % 6) as usize;
+            let px = *rng.pick(&[8u32, 9, 30, 256]);
+            let mut r = &buf[..];
+            if read_icon_header(&mut r).is_err() {
+                continue;
+            }
+            let mut prev: Option<usize> = None;
+            let mut count = 0;
+            while let Ok(Some((i, icon))) = read_icon_frame(&mut r, n, px, prev) {
+                assert!(i < n && prev.is_none_or(|p| i > p), "{i} after {prev:?} of {n}");
+                if let Some(b) = icon {
+                    assert_eq!((b.width, b.height, b.pixels.len()), (px, px, (px * px) as usize));
+                }
+                prev = Some(i);
+                count += 1;
+                assert!(count <= n);
+            }
+            frames += count;
+        }
+        assert!(frames > 500, "the damaged outputs reach the frames: {frames}");
+    }
+
+    #[test]
+    fn icon_ids_skip_bad_ids() {
+        let ok_long = "b".repeat(1_024);
+        let ids = vec![
+            "Vendor.App".to_string(),
+            "bad\u{7}id".into(),
+            "a".repeat(1_025),
+            ok_long.clone(),
+            "line\nbreak".into(),
+            "cr\r".into(),
+            "tab\tid".into(),
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(),
+        ];
+        let (batch, rest) = icon_batch(ids);
+        assert_eq!(batch, ["Vendor.App", ok_long.as_str(), "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"]);
+        assert!(rest.is_empty());
+        // At most 2,000 ids go to one child; the others come back, in order.
+        let (batch, rest) = icon_batch((0..2_005).map(|i| format!("app{i}")).collect());
+        assert_eq!((batch.len(), rest.len(), rest[0].as_str()), (2_000, 5, "app2000"));
+        // The child reads them as they were written, one per line; a line it cannot take is an id without an icon,
+        // so every answer keeps the index of its line.
+        let mut input = b"a\n\xFF\xFE\nb\n".to_vec();
+        input.extend_from_slice(&[b'x'; 1_025]);
+        input.extend_from_slice(b"\nc");
+        let read = |b: &[u8]| read_icon_ids(&mut &b[..]);
+        let want = [Some("a".to_string()), None, Some("b".into()), None, Some("c".into())];
+        assert_eq!(read(&input), want);
+        assert!(read(b"").is_empty());
+        assert_eq!(read(b"x\n"), [Some("x".to_string())]);
+        assert_eq!(read(&b"y\n".repeat(2_001)).len(), 2_000, "2,000 lines at most");
+        // Reading stops at 2 MiB (an endless input ends there), and the line the cap cuts is no id.
+        assert!(read_icon_ids(&mut std::io::repeat(b'y')).is_empty());
+        let mut big = b"first\n".to_vec();
+        big.resize(3 * 1024 * 1024, b'q');
+        assert_eq!(read(&big), [Some("first".to_string())]);
+    }
+
+    /// A job's reader feeds the ids to a real child, decodes its output from the pipe and delivers Start's icons in
+    /// batches of 8; then the job counts every id answered, and ended.
+    #[test]
+    fn icon_reader_delivers_a_childs_frames() {
+        use std::process::{Command, Stdio};
+        let px = 9u32;
+        let ids: Vec<String> = (0..10).map(|i| format!("vendor.app{i}")).collect();
+        let mut out = ICONS_HEADER.to_vec();
+        for i in 0..10u32 {
+            let icon = (i % 3 != 1).then(|| IconBitmap { width: px, height: px, pixels: vec![0xFF00_0000 | i; 81] });
+            out.extend(encode_icon_frame(i, icon.as_ref()));
+        }
+        let path = std::env::temp_dir().join(format!("dock_icon_frames_{}.bin", std::process::id()));
+        std::fs::write(&path, &out).unwrap();
+        // A child that prints the frames and never reads its input, as a child stuck before its first read would.
+        let mut child = Command::new("cmd.exe")
+            .arg("/c")
+            .arg("type")
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let progress = Arc::new(IconProgress::default());
+        let (input, output) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let reader = IconReader {
+            ui: 0,
+            client: IconClient::Start,
+            px,
+            ids: ids.into(),
+            progress: Arc::clone(&progress),
+            started: Instant::now(),
+        };
+        reader.run(input, output);
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+        assert!(progress.ended.load(SeqCst));
+        assert_eq!(progress.delivered.load(SeqCst), 10);
+        let batches: Vec<Vec<(String, bool)>> = drain_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                ShellEvent::StartIcons { icon_px: 9, icons } => {
+                    Some(icons.into_iter().map(|(id, b)| (id, b.is_some_and(|b| b.pixels.len() == 81))).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [8, 2]);
+        assert_eq!(batches[0][0], ("vendor.app0".to_string(), true));
+        assert_eq!(batches[0][1], ("vendor.app1".to_string(), false), "a 0 x 0 frame is no icon");
+        assert_eq!(batches[1][1], ("vendor.app9".to_string(), true));
+    }
+
+    #[test]
+    fn replaced_job_carries_its_undelivered_ids() {
+        let old = strings(&["a", "b", "c", "d"]);
+        // Two answered: c and d were asked first, so they go first; d once, since the new batch asks for it too.
+        assert_eq!(next_icon_batch(&old, 2, strings(&["e", "d"])), strings(&["c", "e", "d"]));
+        assert_eq!(next_icon_batch(&old, 0, strings(&["e"])), strings(&["a", "b", "c", "d", "e"]));
+        assert_eq!(next_icon_batch(&old, 4, strings(&["e"])), strings(&["e"]));
+        assert_eq!(next_icon_batch(&old, 9, strings(&["e"])), strings(&["e"]), "a count past the end carries nothing");
+        assert_eq!(next_icon_batch(&old, 1, Vec::new()), strings(&["b", "c", "d"]));
+        // Start: ids a job ended without answering, with no batch to carry them, leave start_sent, so the next listing
+        // of the same open asks for them again; the answered ones and the others stay.
+        let mut sent: HashSet<String> = strings(&["a", "b", "c", "d", "z"]).into_iter().collect();
+        unsend_icons(&mut sent, &old, 2);
+        let mut left: Vec<&str> = sent.iter().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["a", "b", "z"]);
+        unsend_icons(&mut sent, &old, 9);
+        assert_eq!(sent.len(), 3);
+    }
+
+    /// A Shell with no audio, network or job, as `thread_main` makes it.
+    fn test_shell() -> Shell {
+        Shell {
+            ui: 0,
+            audio: None,
+            names: HashMap::new(),
+            pending: VecDeque::new(),
+            net: None,
+            start_px: 0,
+            start_sent: HashSet::new(),
+            start_job: None,
+            launcher_job: None,
+        }
+    }
+
+    /// A job whose "child" waits on its input until it is killed (`cmd /c pause` on a pipe), or exits at once.
+    fn fake_job(ids: &[&str], waits: bool) -> (IconJob, HANDLE) {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+        let args: &[&str] = if waits { &["/c", "pause"] } else { &["/c", "exit 0"] };
+        let child = Command::new("cmd.exe")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // A handle of the test's own, to see the process end after the job's handle is gone.
+        let mut seen = HANDLE::default();
+        // SAFETY: the child's handle is valid while `child` lives; `seen` is written once and closed by `ended`.
+        unsafe {
+            let me = GetCurrentProcess();
+            windows::Win32::Foundation::DuplicateHandle(
+                me,
+                HANDLE(child.as_raw_handle()),
+                me,
+                &mut seen,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .unwrap();
+        }
+        let job =
+            IconJob { child, px: 24, ids: strings(ids).into(), progress: Arc::default(), started: Instant::now() };
+        (job, seen)
+    }
+
+    /// The process of `h` has ended (waiting at most `ms`); closes `h`.
+    fn ended(h: HANDLE, ms: u32) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: `h` is a process handle of ours, closed once here.
+        unsafe {
+            let done = WaitForSingleObject(h, ms) == WAIT_OBJECT_0;
+            let _ = CloseHandle(h);
+            done
+        }
+    }
+
+    #[test]
+    fn launcher_close_ends_its_icon_job() {
+        let mut sh = test_shell();
+        let (start, start_seen) = fake_job(&["a"], true);
+        let (launcher, launcher_seen) = fake_job(&["b", "c"], true);
+        sh.start_job = Some(start);
+        sh.launcher_job = Some(launcher);
+        enqueue(&mut sh.pending, ShellRequest::StartIconsFor { icon_px: 24, ids: strings(&["d"]) });
+        enqueue(&mut sh.pending, ShellRequest::VolumeRefresh);
+        enqueue(&mut sh.pending, ShellRequest::LauncherClosed);
+        assert_eq!(sh.pending.len(), 2, "the close drops the launcher's pending icons");
+        sh.handle_request(ShellRequest::LauncherClosed);
+        assert!(sh.launcher_job.is_none());
+        assert!(ended(launcher_seen, 0), "killed and reaped before the request returned");
+        // Start's job is untouched.
+        let still = sh.start_job.as_mut().map(|j| matches!(j.child.try_wait(), Ok(None)));
+        assert_eq!(still, Some(true));
+        // Start's own release ends it.
+        sh.handle_request(ShellRequest::StartRelease);
+        assert!(sh.start_job.is_none() && ended(start_seen, 0));
+    }
+
+    #[test]
+    fn finished_and_hung_icon_jobs_are_reaped() {
+        let mut sh = test_shell();
+        // A child that exited with one id of three answered: reaped once its reader ended, and the two others leave
+        // start_sent.
+        let (job, seen) = fake_job(&["a", "b", "c"], false);
+        let progress = Arc::clone(&job.progress);
+        progress.delivered.store(1, Relaxed);
+        sh.start_sent = strings(&["a", "b", "c", "z"]).into_iter().collect();
+        sh.start_job = Some(job);
+        assert!(ended(seen, 10_000));
+        if let Some(j) = sh.start_job.as_mut() {
+            j.started = Instant::now();
+        }
+        sh.reap_icon_jobs();
+        assert!(sh.start_job.is_some(), "its reader may still be pushing the last icons");
+        progress.ended.store(true, Relaxed);
+        sh.reap_icon_jobs();
+        assert!(sh.start_job.is_none());
+        let mut left: Vec<&str> = sh.start_sent.iter().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["a", "z"]);
+        // A child still running within its deadline stays; past it (2 s and 50 ms per id) it is killed and reaped.
+        let (job, seen) = fake_job(&["x"], true);
+        sh.launcher_job = Some(job);
+        sh.reap_icon_jobs();
+        assert!(sh.launcher_job.is_some());
+        if let Some(j) = sh.launcher_job.as_mut() {
+            j.started = Instant::now().checked_sub(Duration::from_millis(2_100)).unwrap();
+        }
+        sh.reap_icon_jobs();
+        assert!(sh.launcher_job.is_none() && ended(seen, 0));
+        assert!(sh.start_sent.len() == 2, "the launcher's job touches nothing of Start's");
     }
 }

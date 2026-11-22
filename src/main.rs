@@ -201,6 +201,9 @@ pub struct Args {
     /// `--start-settings`: the settings catalogue built in a child of the dock, its arena on stdout
     /// (`start_search::run_settings_child`); combines with nothing.
     pub start_settings: bool,
+    /// `--start-icons <px>` (8-256): the icons of the AppsFolder ids on stdin made in a child of the dock at `px`, as
+    /// frames on stdout (`shell_thread::run_icons_child`); combines with nothing.
+    pub start_icons: Option<u32>,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -253,6 +256,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--update-fetch" => a.update_fetch = true,
             "--start-apps" => a.start_apps = true,
             "--start-settings" => a.start_settings = true,
+            "--start-icons" => {
+                let px =
+                    it.next().and_then(|v| v.parse::<u32>().ok()).filter(|px| shell_thread::ICON_PX_RANGE.contains(px));
+                a.start_icons = Some(px.ok_or("--start-icons requires a pixel size from 8 to 256")?);
+            }
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
@@ -267,6 +275,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     if a.start_settings && flags > 1 {
         return Err("--start-settings cannot be combined with other arguments".into());
+    }
+    if a.start_icons.is_some() && flags > 1 {
+        return Err("--start-icons cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
@@ -1094,6 +1105,11 @@ fn main() -> std::process::ExitCode {
     if args.start_settings {
         return std::process::ExitCode::from(start_search::run_settings_child().clamp(0, 255) as u8);
     }
+    // --start-icons <px>: the Start menu's and the launcher's icons made in a child of the dock
+    // (`shell_thread::spawn_icon_job`); stdin and stdout only, no data folder, logger, mutex or console.
+    if let Some(px) = args.start_icons {
+        return std::process::ExitCode::from(shell_thread::run_icons_child(px).clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1310,11 +1326,20 @@ mod tests {
         let s = p(&[start_search::SETTINGS_FLAG]).unwrap(); // the flag of the settings child (L3 T18)
         assert!(s.start_settings && !s.start_apps && !s.settings && !s.autostart);
         assert!(!p(&["--settings"]).unwrap().start_settings);
+        let i = p(&[shell_thread::ICONS_FLAG, "40"]).unwrap(); // the flag of the icons child (L3 T20)
+        assert!(i.start_icons == Some(40) && !i.start_apps && !i.start_settings && !i.settings);
+        assert_eq!(p(&["--start-icons", "8"]).unwrap().start_icons, Some(8));
+        assert_eq!(p(&["--start-icons", "256"]).unwrap().start_icons, Some(256));
+        assert_eq!(p(&["--autostart"]).unwrap().start_icons, None);
+        for bad in ["0", "300", "x", "7", "257", "-1", "", " 40", "40px"] {
+            assert!(p(&["--start-icons", bad]).is_err(), "{bad:?}");
+        }
+        assert!(p(&["--start-icons"]).is_err(), "a size is required");
     }
 
     #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 20] = [
+        let bad: [&[&str]; 24] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1335,6 +1360,10 @@ mod tests {
             &["--settings", "--start-settings"],
             &["--start-settings", "--start-apps"],
             &["--start-settings", "--start-settings"],
+            &["--start-icons", "40", "--autostart"],
+            &["--settings", "--start-icons", "40"],
+            &["--start-icons", "40", "--start-apps"],
+            &["--start-icons", "40", "--start-icons", "40"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");
