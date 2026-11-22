@@ -78,6 +78,11 @@ windows = { version = "0.62.2", features = [
 embed-manifest = "1.5.1"
 winresource = "0.1.19"
 
+[features]
+default = []
+# Owner-probe builds (launcher L0 sessions): compiles in the probe switches and probe log lines, nothing else.
+owner-probe = []
+
 [profile.release]
 opt-level = "z"
 lto = true

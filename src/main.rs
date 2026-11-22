@@ -44,6 +44,7 @@ mod hook;
 mod i18n;
 mod icons;
 mod jumplist;
+mod launcher;
 mod logger;
 mod mem;
 mod metrics;
