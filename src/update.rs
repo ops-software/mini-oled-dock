@@ -266,7 +266,8 @@ const FETCH_EXIT_RESPONSE: i32 = 0;
 const FETCH_EXIT_ERROR: i32 = 2;
 
 /// The check's GET in an `--update-fetch` child (`run_capture`: no window, the dock's job, output
-/// capped). None = no usable answer, the reason logged: the caller asks in-process.
+/// capped). None = no usable answer, the reason logged once per process (house rule 7 of plan L3):
+/// the caller asks in-process, every time.
 fn fetch_in_child() -> Option<Result<winhttp::Response, String>> {
     let answer = std::env::current_exe()
         .map_err(|e| format!("no exe path: {e}"))
@@ -275,7 +276,10 @@ fn fetch_in_child() -> Option<Result<winhttp::Response, String>> {
     match answer {
         Ok(r) => Some(r),
         Err(why) => {
-            crate::log!("update: check process failed ({why}), checking in-process");
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::log!("update: check process failed ({why}), checking in-process");
+            }
             None
         }
     }
