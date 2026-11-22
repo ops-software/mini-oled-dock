@@ -437,6 +437,7 @@ fn key_down_input(vk: u32, scan: u32, extended: bool) -> INPUT {
 }
 
 /// A key up tagged INJECT_TAG (the launcher's menu-mask key).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn key_up_input(vk: u32) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
@@ -557,6 +558,7 @@ const CHORD_SET: u32 = 1 << 12;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PassFlags(pub u8);
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl PassFlags {
     pub const FULLSCREEN: PassFlags = PassFlags(1);
     pub const REMOTE: PassFlags = PassFlags(2);
@@ -580,6 +582,7 @@ struct AckWatch {
     ack_seen: u32,
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl AckWatch {
     /// On every key event: true = a post has been unacknowledged for ACK_TIMEOUT_MS.
     fn check(&mut self, acked: u32, now: u32) -> bool {
@@ -689,6 +692,7 @@ enum SpaceState {
     Passed,
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl SpaceState {
     fn from_u8(v: u8) -> SpaceState {
         match v {
@@ -725,6 +729,7 @@ pub(crate) struct KeyEv {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct RingCtl(pub u64);
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl RingCtl {
     const OPEN: u64 = 1 << 9;
     const ENDED: u64 = 1 << 8;
@@ -771,6 +776,7 @@ pub struct KeyRec {
     pub time: u32,
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl KeyRec {
     /// time:32 | scan:12 | vk:8 | mods:4 | ext:1.
     fn pack(self) -> u64 {
@@ -922,10 +928,12 @@ pub(crate) fn physical(flags: u32, extra: usize) -> bool {
     extra != INJECT_TAG && flags & LLKHF_INJECTED.0 == 0
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 const fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0xA0..=0xA5)
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 const fn is_win(vk: u32) -> bool {
     matches!(vk, 0x5B | 0x5C)
 }
@@ -1148,6 +1156,7 @@ pub struct InjectPlan {
     pub len: u8,
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl InjectPlan {
     pub fn keys(&self) -> &[(u16, bool)] {
         self.keys.get(..usize::from(self.len)).unwrap_or(&[])
@@ -1168,10 +1177,12 @@ pub fn reinject_plan(alt_tracked_down: bool) -> InjectPlan {
 
 /// The hook's gesture evidence: the whole kb.time and a separate valid bit (a "| 1" on the time would change every
 /// even time and fail the launcher's time equality on half of all presses).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub(crate) fn pack_gesture_time(t: u32) -> u64 {
     (1 << 32) | u64::from(t)
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub(crate) fn unpack_gesture_time(v: u64) -> Option<u32> {
     if v >> 32 == 1 {
         Some(v as u32)
@@ -1216,10 +1227,12 @@ static RING: Ring = Ring::new();
 /// `pack_gesture_time(kb.time)`, stored by the hook, consumed by the UI with one swap.
 static GESTURE_TIME: AtomicU64 = AtomicU64::new(0);
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn pack_chord(chord: Option<ChordSpec>) -> u32 {
     chord.map_or(0, |c| u32::from(c.vk & 0xFF) | (u32::from(c.mods.0 & 0xF) << 8) | CHORD_SET)
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn unpack_chord(v: u32) -> Option<ChordSpec> {
     (v & CHORD_SET != 0).then_some(ChordSpec { vk: (v & 0xFF) as u16, mods: Mods(((v >> 8) & 0xF) as u8) })
 }
@@ -1227,6 +1240,7 @@ fn unpack_chord(v: u32) -> Option<ChordSpec> {
 /// UI: the launcher's chord (None: off, and the hook leaves every key to the Win branch). A change of chord also
 /// forgets the tracked modifiers: they are not tracked while the chord is off, so a release missed then must not make
 /// a bare Space match when it comes back (spec rule 1). Setting the same chord again forgets nothing.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn set_launcher_chord(chord: Option<ChordSpec>) {
     swap_chord(&LAUNCHER_CHORD, &RESET_MODS, chord);
 }
@@ -1244,11 +1258,13 @@ fn swap_chord(slot: &AtomicU32, reset: &AtomicU32, chord: Option<ChordSpec>) {
 }
 
 /// UI: why the chord passes (fullscreen, remote, yield), on every foreground change.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn set_pass_flags(flags: PassFlags) {
     PASS_FLAGS.store(flags.0, Relaxed);
 }
 
 /// UI, first thing on WM_DOCK_LAUNCHER: the post of `seq` arrived.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn ack_launcher(seq: u32) {
     #[cfg(feature = "owner-probe")]
     crate::launcher_probe::freeze_ui_once();
@@ -1257,36 +1273,43 @@ pub fn ack_launcher(seq: u32) {
 
 /// UI: true right before the launcher's ShowWindow, false at its close (a chord while shown closes the launcher and
 /// opens no type-ahead window).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn set_launcher_shown(on: bool) {
     LAUNCHER_SHOWN.store(on, Relaxed);
 }
 
 /// UI: the post of `seq` opens nothing (dropped, failed open, fullscreen, a closing chord): its keys are discarded. A
 /// no-op for another sequence.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn end_typeahead(seq: u32) {
     let _ = RING.end(seq);
 }
 
 /// UI, once, at the launcher's activation: the keys typed after the chord of `seq`, in order.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn take_typeahead(seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
     RING.take(seq, out)
 }
 
 /// UI: forget the tracked modifiers (after lock, suspend and every admin launch).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn reset_modifiers() {
     RESET_MODS.fetch_add(1, Relaxed);
 }
 
 /// UI: the kb.time of the last physical Ctrl+Shift+Enter, consumed (one swap: the whole value or nothing).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn take_gesture_time() -> Option<u32> {
     unpack_gesture_time(GESTURE_TIME.swap(0, Relaxed))
 }
 
 /// UI: Alt is down as the hook tracks it (for `reinject_plan`).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn alt_tracked_down() -> bool {
     load_mods().alt_down()
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn load_mods() -> ModTrack {
     let v = MODS.load(Relaxed);
     ModTrack { down: (v & 0xFF) as u8, last: MODS_LAST.load(Relaxed), reset_seen: (v >> 32) as u32 }
@@ -1382,6 +1405,7 @@ fn launcher_step(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods) -> Option<bool> {
     swallow
 }
 
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn post_launcher(msg: u32, wparam: usize, time: u32) {
     let h = hwnd();
     if h.0.is_null() {
@@ -1392,6 +1416,7 @@ fn post_launcher(msg: u32, wparam: usize, time: u32) {
 }
 
 /// [MASK_KEY down, MASK_KEY up], tagged, while Alt is still down: the Alt release is then no lone Alt tap.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn send_mask() {
     let vk = MASK_KEY.load(Relaxed);
     if vk == 0 {
