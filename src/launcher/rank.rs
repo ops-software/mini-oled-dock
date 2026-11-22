@@ -1001,7 +1001,7 @@ it|zzzz|-|0
     #[test]
     fn destructive_default_for_names_and_long_prefixes() {
         let allowed = |title: &str, id: CommandId, q: &str| default_allowed(&command(title, id, true), &query(q));
-        for q in ["shut", "shut d", "shut down", "shutdown", "spegni", "arre", "arresta", "power off", "down"] {
+        for q in ["shut", "shut d", "shut down", "shutdown", "spegni", "arre", "arresta", "down"] {
             assert!(allowed("Shut down", CommandId::ShutDown, q), "shut down {q:?}");
         }
         for q in ["sleep", "slee", "sosp", "sospendi", "sospensione"] {
@@ -1013,6 +1013,10 @@ it|zzzz|-|0
         for q in ["sign", "sign out", "disc", "disconnetti", "logoff", "log"] {
             // "log" is three characters and not a name: only the first five count.
             assert_eq!(allowed("Sign out", CommandId::SignOut, q), q != "log", "sign out {q:?}");
+        }
+        // "power" and "off" belong to no destructive name (the Power options page must not default to Shut down).
+        for q in ["power", "power off", "off", "powe"] {
+            assert!(!allowed("Shut down", CommandId::ShutDown, q), "shut down {q:?}");
         }
         // Not another command's words.
         assert!(!allowed("Sleep", CommandId::Sleep, "shut"));

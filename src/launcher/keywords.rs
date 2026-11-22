@@ -81,9 +81,7 @@ pub fn destructive_names(id: CommandId) -> &'static [&'static str] {
     match id {
         CommandId::Sleep => &["sleep", "sospendi", "sospensione", "standby"],
         CommandId::Restart => &["restart", "riavvia", "riavvio", "reboot"],
-        CommandId::ShutDown => {
-            &["shut down", "shutdown", "arresta", "arresta il sistema", "spegni", "spegnimento", "power off"]
-        }
+        CommandId::ShutDown => &["shut down", "shutdown", "arresta", "arresta il sistema", "spegni", "spegnimento"],
         CommandId::SignOut => &["sign out", "signout", "log off", "logoff", "disconnetti", "esci dall'account"],
         _ => &[],
     }
