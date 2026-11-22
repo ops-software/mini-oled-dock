@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::UI::WindowsAndMessaging::{GetMessageTime, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetMessageTime, GetWindowThreadProcessId};
 
 use crate::log;
 
@@ -172,6 +172,29 @@ pub fn focused() {
     let first = with_open(|p| (!std::mem::replace(&mut p.focused, true)).then(|| t.wrapping_sub(p.chord_time)));
     if let Some(Some(ms)) = first {
         log!("launcher probe: chord to foreground {ms} ms");
+    }
+}
+
+/// `popup::mark_active` (WM_ACTIVATE): `in_front` false is an activation in the dock's thread while another window kept the
+/// foreground (variant 1 of `ui::force_foreground` on the synthetic-F15 path, B1). Logged while a launcher open is
+/// measured.
+pub fn activated(in_front: bool) {
+    if !in_front && with_open(|_| ()).is_some() {
+        log!("launcher probe: activated in its thread, foreground elsewhere");
+    }
+}
+
+/// `popup::open`: the foreground attempt won (`Retry::Focused`), and whether `hwnd` is in front right after it, before
+/// the content hears `focus(true)` (B1, live check L-2). Logged while a launcher open is measured.
+pub fn won_foreground(hwnd: HWND) {
+    if with_open(|_| ()).is_none() {
+        return;
+    }
+    // SAFETY: no preconditions.
+    if unsafe { GetForegroundWindow() } == hwnd {
+        log!("launcher probe: foreground attempt won, launcher in front");
+    } else {
+        log!("launcher probe: foreground attempt won, launcher not in front");
     }
 }
 

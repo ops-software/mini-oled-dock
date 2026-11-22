@@ -1152,9 +1152,16 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     if kind != PopupKind::Launcher {
         install_mouse_hook();
     }
-    let focused = crate::ui::force_foreground(hwnd);
-    // A close during the activation (the content's `focus` runs from WM_ACTIVATE inside SetForegroundWindow) leaves no
-    // popup to arm timers for: the tick would re-arm itself on a closed popup.
+    let outcome = retry_outcome(FOCUS_RETRIES, crate::ui::force_foreground(hwnd), false);
+    if outcome == Retry::Focused {
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::won_foreground(hwnd);
+        // A no-op when WM_ACTIVATE already saw the popup in front (`was_active`).
+        became_foreground();
+    }
+    // A close during the activation (the content's `focus` runs from WM_ACTIVATE inside SetForegroundWindow, or from the
+    // won attempt's `became_foreground` just above) leaves no popup to arm timers for: the tick would re-arm itself on a
+    // closed popup.
     if with(|st| st.open.as_ref().map(|o| o.hwnd)).flatten() != Some(hwnd) {
         return true;
     }
@@ -1162,7 +1169,7 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     unsafe {
         // The foreground can be refused (lock, elevated app in front, a transient null foreground):
         // visible but without the keyboard, the Start menu search box would not receive typing.
-        if !focused && SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) == 0 {
+        if outcome == Retry::Again && SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) == 0 {
             log!("popup: SetTimer(focus) failed");
         }
         if initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
@@ -1566,6 +1573,9 @@ fn mark_active(hwnd: HWND) {
     let _ = unsafe { SetFocus(Some(hwnd)) };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
+    // Variant 1 of `ui::force_foreground` on the synthetic-F15 path: active in the dock's thread, another window in front.
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::activated(fg == hwnd);
     if fg == hwnd {
         became_foreground();
     }
@@ -1887,12 +1897,18 @@ enum Retry {
     Stop,
     /// No more tries and the content closes without the keyboard (`focus_lost_closes`).
     Close,
+    /// The attempt left the popup in front: the content hears `focus(true)` now. `force_foreground` can win with no
+    /// WM_ACTIVATE that sees the popup in front (variant 1 activates it in the dock's thread while another window keeps
+    /// the foreground, variant 2 then wins without a new activation), and nothing else would tell the content before
+    /// the 1 s tick.
+    Focused,
 }
 
-/// The outcome of a foreground attempt: `tries_left` after it, `focused` its result.
+/// The outcome of a foreground attempt: `tries_left` after it, `focused` its result. A won attempt is `Focused`
+/// whatever is left: the caller tells the content at once (B1: the type-ahead window is 500 ms, the tick 1 s).
 fn retry_outcome(tries_left: u8, focused: bool, focus_lost_closes: bool) -> Retry {
     if focused {
-        Retry::Stop
+        Retry::Focused
     } else if tries_left > 0 {
         Retry::Again
     } else if focus_lost_closes {
@@ -1938,6 +1954,7 @@ fn on_focus_retry(hwnd: HWND) {
                 log!("popup: SetTimer(focus) failed");
             }
         }
+        Retry::Focused => became_foreground(),
         Retry::Stop => {}
         Retry::Close => close_inner("no foreground"),
     }
@@ -2213,13 +2230,23 @@ mod tests {
     fn focus_retry_outcomes() {
         assert_eq!(retry_outcome(3, false, false), Retry::Again);
         assert_eq!(retry_outcome(3, false, true), Retry::Again);
-        assert_eq!(retry_outcome(2, true, true), Retry::Stop, "got the foreground");
-        assert_eq!(retry_outcome(0, true, true), Retry::Stop);
-        assert_eq!(retry_outcome(0, true, false), Retry::Stop);
+        assert_eq!(retry_outcome(2, true, true), Retry::Focused, "got the foreground");
+        assert_eq!(retry_outcome(0, true, true), Retry::Focused);
+        assert_eq!(retry_outcome(0, true, false), Retry::Focused);
         assert_eq!(retry_outcome(0, false, true), Retry::Close, "the launcher never sits there without the keyboard");
         assert_eq!(retry_outcome(0, false, false), Retry::Stop, "another kind stays (the tick safety net remains)");
         assert!(popup_launcher::new().focus_lost_closes());
         assert!(!popup_start::new().focus_lost_closes());
+    }
+
+    #[test]
+    fn a_won_foreground_is_heard_at_once() {
+        // B1: a foreground attempt that wins is heard now, never at the 1 s tick.
+        for left in 0..=FOCUS_RETRIES {
+            for closes in [false, true] {
+                assert_eq!(retry_outcome(left, true, closes), Retry::Focused, "{left} {closes}");
+            }
+        }
     }
 
     #[test]
