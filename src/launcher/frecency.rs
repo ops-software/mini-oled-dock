@@ -7,24 +7,36 @@
 //! strict: one bad line, a duplicate key or another version gives an empty state.
 #![deny(clippy::arithmetic_side_effects)]
 
-use std::collections::HashMap;
-
 use super::model::ItemKey;
 
 pub const HEADER: &str = "mini-oled-dock launcher-frecency 1";
 pub const MAX_ENTRIES: usize = 1000;
 pub const MAX_BYTES: usize = 64 * 1024;
 
+/// 2020-01-01T00:00:00Z: the entries keep the time of the last pick as seconds since this, in a u32 (good until 2156).
+const FRECENCY_EPOCH: i64 = 1_577_836_800;
 const HOUR: i64 = 3600;
 const DAY: i64 = 24 * HOUR;
 const WEEK: i64 = 7 * DAY;
 /// The boost never reaches the pinned rows' u16::MAX.
 const MAX_BOOST: u16 = u16::MAX - 1;
 
-/// The picks learned so far: per key the number of picks and the Unix second of the last one.
+/// One learned key: the key, the number of picks and the second of the last one since `FRECENCY_EPOCH` (saturating).
+type Entry = (u64, u16, u32);
+
+fn since_epoch(unix: i64) -> u32 {
+    u32::try_from(unix.saturating_sub(FRECENCY_EPOCH).max(0)).unwrap_or(u32::MAX)
+}
+
+fn unix_of(since: u32) -> i64 {
+    FRECENCY_EPOCH.saturating_add(i64::from(since))
+}
+
+/// The picks learned so far: per key the number of picks and the second of the last one. A vector sorted by key and
+/// searched by bisection: 16 bytes an entry, 16 KiB at the cap, no hash table and no spare capacity.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Frecency {
-    entries: HashMap<u64, (u16, i64)>,
+    entries: Vec<Entry>,
 }
 
 /// The weight of a count by the age of the last pick, in quarters: x4 under an hour, x2 under a day, /2 under a week,
@@ -43,10 +55,35 @@ impl Frecency {
         Frecency::default()
     }
 
+    fn find(&self, key: u64) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&key, |e| e.0)
+    }
+
+    /// Sets the entry of `key`, keeping the vector sorted.
+    fn put(&mut self, key: u64, count: u16, last: i64) {
+        let e = (key, count, since_epoch(last));
+        match self.find(key) {
+            Ok(i) => {
+                if let Some(slot) = self.entries.get_mut(i) {
+                    *slot = e;
+                }
+            }
+            Err(i) => self.entries.insert(i, e),
+        }
+    }
+
+    /// The entry with the oldest last pick (the lowest key among equals) leaves.
+    fn evict_oldest(&mut self) {
+        let oldest = self.entries.iter().enumerate().min_by_key(|(_, e)| (e.2, e.0)).map(|(i, _)| i);
+        if let Some(i) = oldest {
+            self.entries.remove(i);
+        }
+    }
+
     /// A state that the picking rules would never make (a destructive row, a hand-edited file).
     #[cfg(test)]
     pub fn entries_for_test(&mut self, key: ItemKey) {
-        self.entries.insert(key.0, (500, 1_790_000_000));
+        self.put(key.0, 500, 1_790_000_000);
     }
 
     #[cfg(test)]
@@ -61,8 +98,8 @@ impl Frecency {
     /// The rank boost of a row (0 when it was never picked): count x weight, saturating. It only orders rows inside one
     /// tier (it is the second field of Score, after the tier). No allocation, no disk.
     pub fn boost(&self, key: ItemKey, now: i64) -> u16 {
-        let Some(&(count, last)) = self.entries.get(&key.0) else { return 0 };
-        let w = weight_quarters(now.saturating_sub(last));
+        let Some(&(_, count, last)) = self.find(key.0).ok().and_then(|i| self.entries.get(i)) else { return 0 };
+        let w = weight_quarters(now.saturating_sub(unix_of(last)));
         u16::try_from(u32::from(count).saturating_mul(w).min(u32::from(MAX_BOOST))).unwrap_or(MAX_BOOST)
     }
 
@@ -72,44 +109,51 @@ impl Frecency {
         if destructive || now < 0 {
             return false;
         }
-        if let Some(e) = self.entries.get_mut(&key.0) {
-            e.0 = e.0.saturating_add(1);
-            e.1 = now;
+        if let Ok(i) = self.find(key.0) {
+            if let Some(e) = self.entries.get_mut(i) {
+                e.1 = e.1.saturating_add(1);
+                e.2 = since_epoch(now);
+            }
             return true;
         }
         if self.entries.len() >= MAX_ENTRIES {
-            let oldest = self.entries.iter().min_by_key(|(k, (_, last))| (*last, **k)).map(|(k, _)| *k);
-            if let Some(k) = oldest {
-                self.entries.remove(&k);
-            }
+            self.evict_oldest();
         }
-        self.entries.insert(key.0, (1, now));
+        self.put(key.0, 1, now);
         true
     }
 
     /// Shift+Delete on a row.
     pub fn forget(&mut self, key: ItemKey) -> bool {
-        self.entries.remove(&key.0).is_some()
+        match self.find(key.0) {
+            Ok(i) => {
+                self.entries.remove(i);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Adds picks made in memory while the file was still being read: the counts add, the later pick wins.
     pub fn absorb(&mut self, newer: &Frecency) {
-        for (key, &(count, last)) in &newer.entries {
-            let e = self.entries.entry(*key).or_insert((0, last));
-            e.0 = e.0.saturating_add(count);
-            e.1 = e.1.max(last);
+        for &(key, count, last) in &newer.entries {
+            match self.find(key) {
+                Ok(i) => {
+                    if let Some(e) = self.entries.get_mut(i) {
+                        e.1 = e.1.saturating_add(count);
+                        e.2 = e.2.max(last);
+                    }
+                }
+                Err(i) => self.entries.insert(i, (key, count, last)),
+            }
         }
         while self.entries.len() > MAX_ENTRIES {
-            let oldest = self.entries.iter().min_by_key(|(k, (_, last))| (*last, **k)).map(|(k, _)| *k);
-            match oldest {
-                Some(k) => self.entries.remove(&k),
-                None => break,
-            };
+            self.evict_oldest();
         }
     }
 
     pub fn clear(&mut self) {
-        self.entries = HashMap::new();
+        self.entries = Vec::new();
     }
 
     /// The entries of a file, or an empty state for anything that is not exactly the format.
@@ -123,12 +167,12 @@ impl Frecency {
         }
         let text = std::str::from_utf8(bytes).ok()?;
         let body = text.strip_prefix(HEADER)?.strip_prefix('\n')?;
-        let mut entries = HashMap::new();
+        let mut f = Frecency::new();
         if body.is_empty() {
-            return Some(Frecency { entries });
+            return Some(f);
         }
         for line in body.strip_suffix('\n')?.split('\n') {
-            if entries.len() >= MAX_ENTRIES {
+            if f.entries.len() >= MAX_ENTRIES {
                 return None;
             }
             let mut parts = line.split(' ');
@@ -139,22 +183,21 @@ impl Frecency {
             let key = parse_key(key)?;
             let count = u16::try_from(parse_number(count)?).ok().filter(|c| *c >= 1)?;
             let last = i64::try_from(parse_number(last)?).ok()?;
-            if entries.insert(key, (count, last)).is_some() {
-                return None;
-            }
+            let at = f.find(key).err()?; // a duplicate key
+            f.entries.insert(at, (key, count, since_epoch(last)));
         }
-        Some(Frecency { entries })
+        Some(f)
     }
 
     /// The bytes of the file, the most recent pick first (a stable order, so an unchanged state writes the same bytes).
     pub fn render(&self) -> Vec<u8> {
-        let mut rows: Vec<(&u64, &(u16, i64))> = self.entries.iter().collect();
-        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        let mut rows: Vec<&Entry> = self.entries.iter().collect();
+        rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
         let mut s = String::with_capacity(HEADER.len().saturating_add(1).saturating_add(rows.len().saturating_mul(34)));
         s.push_str(HEADER);
         s.push('\n');
-        for (key, (count, last)) in rows.into_iter().take(MAX_ENTRIES) {
-            s.push_str(&format!("{key:016x} {count} {last}\n"));
+        for &(key, count, last) in rows.into_iter().take(MAX_ENTRIES) {
+            s.push_str(&format!("{key:016x} {count} {}\n", unix_of(last)));
         }
         s.into_bytes()
     }
@@ -212,8 +255,19 @@ mod tests {
         g.pick(k, NOW, false);
         assert_eq!(g.boost(k, NOW + 30 * DAY), 1);
         // Saturates below the pinned rows' value.
-        f.entries.insert(9, (u16::MAX, NOW));
+        f.put(9, u16::MAX, NOW);
         assert_eq!(f.boost(key(9), NOW), u16::MAX - 1);
+    }
+
+    #[test]
+    fn entries_fit_16_kib() {
+        assert!(std::mem::size_of::<Entry>() * MAX_ENTRIES <= 16_384);
+        // Full, the vector holds no more than the cap's worth (no spare capacity after a parse).
+        let lines: String = (0..1000u64).map(|i| format!("{i:016x} 1 1700000000\n")).collect();
+        let text = format!("{HEADER}\n{lines}");
+        let f = Frecency::parse(text.as_bytes());
+        assert_eq!(f.len(), 1000);
+        assert!(f.entries.capacity() * std::mem::size_of::<Entry>() <= 2 * 16_384, "{}", f.entries.capacity());
     }
 
     #[test]
