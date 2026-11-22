@@ -129,7 +129,7 @@ const TEXT_ALPHA: u32 = 230;
 const TEXT2_ALPHA: u32 = 170;
 const SEP_ALPHA: u32 = 30;
 /// Alpha of the "open" indicator.
-const OPEN_ALPHA: u32 = 120;
+pub(crate) const OPEN_ALPHA: u32 = 120;
 /// Text alpha of a pinned app without windows (230 * 0.7), idle / hover.
 const DIM_TEXT_ALPHA: u32 = 161;
 const DIM_TEXT_ALPHA_HOT: u32 = 215;

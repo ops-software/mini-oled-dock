@@ -80,7 +80,7 @@ const W: i32 = 420;
 const H: i32 = 540;
 /// Outer inset of the content.
 const INSET: i32 = 14;
-const SEARCH_H: i32 = 38;
+pub(crate) const SEARCH_H: i32 = 38;
 /// Space between the sections.
 const GAP: i32 = 10;
 /// Pin strip: side of a cell, icon side inside it, height of the line under it (the name of the
