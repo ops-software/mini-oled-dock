@@ -3,8 +3,8 @@
 //!
 //! THREADING:
 //!  * `init`, `install_hook`, `remove_hook`, `on_winevent`, `on_safety_timer`, `on_taskbar_created`,
-//!    `shutdown`: UI thread ONLY (the WinEvent callback runs on the UI thread and posts
-//!    `WM_DOCK_TASKBAR_EVENT`).
+//!    `shutdown`: UI thread ONLY (the taskbar has no WinEvent hook of its own: `apps::winevent_proc` runs on the
+//!    UI thread and hands the raw events to `on_raw_event`, which posts `WM_DOCK_TASKBAR_EVENT`).
 //!  * `restore()` and `restore_force()`: callable from ANY thread/process (panic hook,
 //!    WM_ENDSESSION, watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
 //!    thread-safe Win32 APIs and do not touch thread-local state.
@@ -24,18 +24,14 @@ use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowRect,
-    GetWindowThreadProcessId,
-    IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
-    SendNotifyMessageW,
-    SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
-    HWND_BOTTOM,
-    HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW, OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_COPYDATA,
+    GetWindowThreadProcessId, IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW,
+    SendMessageTimeoutW, SendNotifyMessageW, SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW, HWND_BOTTOM, HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW,
+    OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_SHOWNA, WM_COPYDATA,
 };
 
 use crate::config;
@@ -52,8 +48,9 @@ static HIDDEN: AtomicBool = AtomicBool::new(false);
 static RESTORING: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "TaskbarCreated" message (0 = not registered yet).
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
-/// Raw handle (isize) of the taskbar WinEvent hook (0 = no hook).
-static WINEVENT_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// true while the taskbar wants the raw WinEvents that `apps::winevent_proc` hands to `on_raw_event` (set by
+/// `install_hook`, cleared by `remove_hook`): the taskbar has no WinEvent hook of its own.
+static WANT_EVENTS: AtomicBool = AtomicBool::new(false);
 /// Instant (ms since process start, +1) of the last `TaskbarCreated` broadcast sent by us.
 static LAST_BROADCAST_MS: AtomicU64 = AtomicU64::new(0);
 /// Explorer's primary `Shell_TrayWnd` as last seen by `hide_all` (0 = unknown): its destruction means
@@ -677,35 +674,26 @@ pub fn init() -> Result<bool, String> {
     Ok(true)
 }
 
-/// installs `SetWinEventHook(EVENT_OBJECT_SHOW..EVENT_OBJECT_CREATE)` (OUTOFCONTEXT |
-/// SKIPOWNPROCESS) whose callback filters the taskbar classes (also on the parent) and posts
-/// `WM_DOCK_TASKBAR_EVENT` to the dock window. Called from the UI thread AFTER the creation of the
-/// window (the callback uses `crate::hwnd()`). No-op if `HIDDEN` is false.
+/// Arms the taskbar's share of the apps WinEvent hook (`apps::install_winevent_hook`, whose CREATE..HIDE range
+/// covers CREATE, DESTROY and SHOW): `apps::winevent_proc` then hands every raw event to `on_raw_event`, which
+/// filters the taskbar classes (also on the parent) and posts `WM_DOCK_TASKBAR_EVENT` to the dock window. Called
+/// from the UI thread AFTER the creation of the window and after `ui::attach`. No-op if `HIDDEN` is false.
 pub fn install_hook() -> Result<(), String> {
-    if !HIDDEN.load(Relaxed) || WINEVENT_HOOK.load(Relaxed) != 0 {
+    if !HIDDEN.load(Relaxed) || WANT_EVENTS.load(Relaxed) {
         return Ok(());
     }
-    // Range CREATE(0x8000)..SHOW(0x8002): also includes DESTROY, discarded by the callback.
-    // SAFETY: `winevent_proc` is a 'static `extern "system"` with the WINEVENTPROC signature; without
-    // WINEVENT_INCONTEXT no module is needed. The UI thread has a message loop (out-of-context delivery).
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_OBJECT_CREATE,
-            EVENT_OBJECT_SHOW,
-            None,
-            Some(winevent_proc),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    };
-    if hook.is_invalid() {
-        return Err(format!("SetWinEventHook failed: {:?}", windows::core::Error::from_thread()));
+    if !crate::apps::hooks_installed() {
+        return Err("apps WinEvent hooks not installed".into());
     }
-    WINEVENT_HOOK.store(hook.0 as isize, Relaxed);
-    log!("taskbar: WinEventHook installed");
+    WANT_EVENTS.store(true, Relaxed);
+    log!("taskbar: events armed (apps WinEvent hook)");
     allow_taskbar_created();
     Ok(())
+}
+
+/// true while `on_raw_event` wants the events of `apps::winevent_proc`.
+pub(crate) fn wants_events() -> bool {
+    WANT_EVENTS.load(Relaxed)
 }
 
 /// The dock runs elevated: without this exception UIPI would drop the `TaskbarCreated` broadcast
@@ -740,16 +728,9 @@ fn restored_externally() -> bool {
     true
 }
 
-/// Removes the hook (`UnhookWinEvent`). Idempotent. UI thread.
+/// Stops asking for the raw events (the apps hook stays). Idempotent. UI thread.
 pub fn remove_hook() {
-    let raw = WINEVENT_HOOK.swap(0, Relaxed);
-    if raw == 0 {
-        return;
-    }
-    // SAFETY: handle obtained from SetWinEventHook on this thread; the swap guarantees a single release.
-    if !unsafe { UnhookWinEvent(HWINEVENTHOOK(raw as *mut c_void)) }.as_bool() {
-        log!("taskbar: UnhookWinEvent failed");
-    }
+    WANT_EVENTS.store(false, Relaxed);
 }
 
 /// What a DESTROY event of `hwnd` means for the taskbar.
@@ -779,34 +760,47 @@ fn hold_back_is_news(prev: isize, owner: isize) -> bool {
     prev != owner
 }
 
-/// WinEvent callback (UI thread): filters the taskbar classes (also on the parent) and posts
-/// `WM_DOCK_TASKBAR_EVENT` (wParam = event, lParam = HWND) to the dock window.
-unsafe extern "system" fn winevent_proc(
-    _hook: HWINEVENTHOOK,
-    event: u32,
-    hwnd: HWND,
-    id_object: i32,
-    _id_child: i32,
-    _thread: u32,
-    _time: u32,
-) {
-    if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 {
+/// What a raw WinEvent means for the taskbar.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RawKind {
+    Ignore,
+    /// Post it as it is (a DESTROY of a window we track).
+    Post,
+    /// Post it if the window, or its parent, is of a taskbar class.
+    CheckClass,
+}
+
+/// `tracked` = the window is `EXPLORER_TRAY` or `EDGE_HOLDER`.
+fn raw_event_kind(event: u32, id_object: i32, tracked: bool) -> RawKind {
+    if id_object != OBJID_WINDOW.0 {
+        return RawKind::Ignore;
+    }
+    match event {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE => RawKind::CheckClass,
+        EVENT_OBJECT_DESTROY if tracked => RawKind::Post,
+        _ => RawKind::Ignore,
+    }
+}
+
+/// Raw WinEvent (UI thread, called by `apps::winevent_proc` while `wants_events`): filters the taskbar classes
+/// (also on the parent) and posts `WM_DOCK_TASKBAR_EVENT` (wParam = event, lParam = HWND) to the dock window.
+pub(crate) fn on_raw_event(event: u32, hwnd: HWND, id_object: i32) {
+    if hwnd.0.is_null() {
         return;
     }
-    if event == EVENT_OBJECT_DESTROY {
-        if destroy_act(hwnd.0 as isize, EXPLORER_TRAY.load(Relaxed), EDGE_HOLDER.load(Relaxed)) == DestroyAct::Ignore {
-            return;
+    let h = hwnd.0 as isize;
+    let tracked = h == EXPLORER_TRAY.load(Relaxed) || h == EDGE_HOLDER.load(Relaxed);
+    match raw_event_kind(event, id_object, tracked) {
+        RawKind::Ignore => return,
+        RawKind::Post => {}
+        RawKind::CheckClass => {
+            // SAFETY: GetParent has no preconditions; for invalid windows it fails.
+            let parent = unsafe { GetParent(hwnd) }.ok();
+            let hit = is_taskbar_class(&class_of(hwnd)) || parent.is_some_and(|p| is_taskbar_class(&class_of(p)));
+            if !hit {
+                return;
+            }
         }
-    } else if event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE {
-        return;
-    }
-    // SAFETY: GetParent has no preconditions; for invalid windows it fails.
-    let parent = unsafe { GetParent(hwnd) }.ok();
-    let hit = event == EVENT_OBJECT_DESTROY
-        || is_taskbar_class(&class_of(hwnd))
-        || parent.is_some_and(|p| is_taskbar_class(&class_of(p)));
-    if !hit {
-        return;
     }
     let ui = crate::hwnd();
     if ui.0.is_null() {
@@ -1311,6 +1305,26 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_taskbar_events_filtered_as_before() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EVENT_OBJECT_CLOAKED, EVENT_OBJECT_HIDE, EVENT_SYSTEM_FOREGROUND, OBJID_CURSOR,
+        };
+        use RawKind::*;
+        let w = OBJID_WINDOW.0;
+        for tracked in [false, true] {
+            assert_eq!(raw_event_kind(EVENT_OBJECT_SHOW, w, tracked), CheckClass);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_CREATE, w, tracked), CheckClass);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_HIDE, w, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_SHOW, OBJID_CURSOR.0, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_DESTROY, OBJID_CURSOR.0, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_SYSTEM_FOREGROUND, w, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_CLOAKED, w, tracked), Ignore);
+        }
+        assert_eq!(raw_event_kind(EVENT_OBJECT_DESTROY, w, true), Post);
+        assert_eq!(raw_event_kind(EVENT_OBJECT_DESTROY, w, false), Ignore);
+    }
 
     #[test]
     fn edge_holder_bookkeeping() {
