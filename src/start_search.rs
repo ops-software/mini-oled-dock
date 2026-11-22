@@ -45,9 +45,12 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 use windows::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
 };
-use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
+};
 use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, SHLoadIndirectString, KF_FLAG_DEFAULT};
 
+use crate::launcher::catalog::FoldedSettings;
 use crate::log;
 
 /// Largest index file read.
@@ -462,12 +465,148 @@ pub(crate) struct Setting {
     pub args: Option<String>,
 }
 
-static SETTINGS: Mutex<Option<Arc<Vec<Setting>>>> = Mutex::new(None);
+/// The settings catalog and, while the launcher holds it, the launcher's rows and keyword dictionary of it.
+#[derive(Default)]
+struct Held {
+    list: Option<Arc<Vec<Setting>>>,
+    /// Made from `list` off the UI thread (L3 KEY-11): by the thread that built the list when the launcher held it, else
+    /// by one `fold_for_launcher` thread. Dropped with the list and when the launcher lets the catalog go.
+    folded: Option<Arc<FoldedSettings>>,
+    /// A `fold_for_launcher` thread is running.
+    folding: bool,
+}
+
+static SETTINGS: Mutex<Held> = Mutex::new(Held { list: None, folded: None, folding: false });
 static SETTINGS_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn held() -> std::sync::MutexGuard<'static, Held> {
+    SETTINGS.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// The settings catalog; empty until `load_settings` has finished (and after `release_settings`).
 pub(crate) fn settings() -> Arc<Vec<Setting>> {
-    SETTINGS.lock().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_default()
+    held().list.clone().unwrap_or_default()
+}
+
+/// A built list goes in (taken), with the launcher's rows of it when they were made and the launcher still holds the
+/// catalog (`launcher`); nothing when the catalog was released meanwhile (`started` false). What is not taken is
+/// dropped by the caller, after the lock. True when the list was kept.
+fn store_built(
+    h: &mut Held,
+    list: &mut Option<Arc<Vec<Setting>>>,
+    folded: &mut Option<Arc<FoldedSettings>>,
+    started: bool,
+    launcher: bool,
+) -> bool {
+    if !started {
+        return false;
+    }
+    h.list = list.take();
+    h.folded = if launcher { folded.take() } else { None };
+    true
+}
+
+/// What the launcher's ask finds: the list with its rows, a list to fold (this ask starts the one fold), or nothing yet.
+enum LauncherAsk {
+    Ready(Arc<Vec<Setting>>, Arc<FoldedSettings>),
+    Fold(Arc<Vec<Setting>>),
+    Wait,
+}
+
+fn launcher_ask(h: &mut Held) -> LauncherAsk {
+    match (&h.list, &h.folded) {
+        (Some(l), Some(f)) => LauncherAsk::Ready(l.clone(), f.clone()),
+        (Some(l), None) if !h.folding => {
+            h.folding = true;
+            LauncherAsk::Fold(l.clone())
+        }
+        _ => LauncherAsk::Wait,
+    }
+}
+
+/// What a launcher fold does when it ends: its rows were kept (the launcher is told), it folds the list that replaced its
+/// own next, or it ends with nothing kept.
+enum FoldNext {
+    Posted,
+    Again(Arc<Vec<Setting>>),
+    Done,
+}
+
+/// A launcher fold of `list` ended: its rows are kept (taken) when `list` is still the held one, the launcher still
+/// holds it (`launcher`) and no rows came meanwhile; when another list without rows replaced it, that one is folded
+/// next. Rows not taken are dropped by the caller, after the lock.
+fn fold_done(
+    h: &mut Held,
+    list: &Arc<Vec<Setting>>,
+    folded: &mut Option<Arc<FoldedSettings>>,
+    launcher: bool,
+) -> FoldNext {
+    if launcher && h.folded.is_none() {
+        match &h.list {
+            Some(l) if Arc::ptr_eq(l, list) => {
+                h.folded = folded.take();
+                h.folding = false;
+                return FoldNext::Posted;
+            }
+            Some(l) => return FoldNext::Again(l.clone()),
+            None => {}
+        }
+    }
+    h.folding = false;
+    FoldNext::Done
+}
+
+/// `who` let the catalog go and `left` holders remain: with none left the list goes; the launcher's rows go with the
+/// launcher's hold.
+fn release_step(h: &mut Held, who: Holder, left: u8) {
+    if left == 0 {
+        h.list = None;
+    }
+    if left == 0 || who == Holder::Launcher {
+        h.folded = None;
+    }
+}
+
+/// The launcher's settings: the held list with the rows and keyword dictionary made of it. When the list is there
+/// without them, one short-lived thread makes them and posts `StartSettingsReady`: the UI thread never folds.
+pub(crate) fn launcher_settings() -> Option<(Arc<Vec<Setting>>, Arc<FoldedSettings>)> {
+    let ask = launcher_ask(&mut held());
+    match ask {
+        LauncherAsk::Ready(list, folded) => Some((list, folded)),
+        LauncherAsk::Fold(list) => {
+            fold_for_launcher(list);
+            None
+        }
+        LauncherAsk::Wait => None,
+    }
+}
+
+/// Folds `list` for the launcher on a short-lived thread (normal priority: the launcher waits for these rows, and pages a
+/// background thread touches get a low memory priority).
+fn fold_for_launcher(list: Arc<Vec<Setting>>) {
+    let spawned = std::thread::Builder::new().name("start-settings".into()).spawn(move || {
+        let mut list = list;
+        loop {
+            let mut folded = Some(Arc::new(FoldedSettings::new(&list)));
+            let next = {
+                let mut h = held();
+                fold_done(&mut h, &list, &mut folded, holds_settings(Holder::Launcher))
+            };
+            drop(folded);
+            match next {
+                FoldNext::Posted => {
+                    crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);
+                    return;
+                }
+                FoldNext::Again(l) => list = l,
+                FoldNext::Done => return,
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        held().folding = false;
+        log!("start search: cannot start the launcher's settings fold: {e}");
+    }
 }
 
 /// Builds the settings catalog on a background thread, unless it is there or being built. It takes
@@ -493,10 +632,25 @@ pub(crate) fn load_settings() {
             t.elapsed().as_millis(),
             if cached { " (disk cache)" } else { "" }
         );
-        // Released while it was being built: not kept.
-        if SETTINGS_STARTED.load(Relaxed) {
-            *SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(list));
-            // An open menu searches again: what is typed may match a setting.
+        let list = Arc::new(list);
+        // The launcher holds the catalog: its rows and keyword dictionary are made here too, never on the UI thread, at
+        // normal priority (they are read by every keystroke, and a background thread's pages get a low memory priority).
+        let mut folded = holds_settings(Holder::Launcher).then(|| {
+            // SAFETY: pseudo-handle of the current thread; ends the background mode begun above, harmless if it fails.
+            let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
+            Arc::new(FoldedSettings::new(&list))
+        });
+        // Released while it was being built: not kept (decided under the lock a release clears it with; what is not
+        // kept is dropped after it).
+        let mut list = Some(list);
+        let kept = {
+            let mut h = held();
+            let started = SETTINGS_STARTED.load(Relaxed);
+            store_built(&mut h, &mut list, &mut folded, started, holds_settings(Holder::Launcher))
+        };
+        drop((list, folded));
+        if kept {
+            // An open menu searches again: what is typed may match a setting; the launcher takes its rows.
             crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);
         }
         if hr.is_ok() {
@@ -536,11 +690,13 @@ pub(crate) fn hold_settings(h: Holder) {
     load_settings();
 }
 
-/// `h` lets the settings catalog go; it is freed only when no holder is left.
+/// `h` lets the settings catalog go; it is freed only when no holder is left. The launcher's rows go with its hold.
 pub(crate) fn release_settings_for(h: Holder) {
-    if holders_step(&HOLDERS, h, false) == 0 {
-        free_settings();
+    let left = holders_step(&HOLDERS, h, false);
+    if left == 0 {
+        SETTINGS_STARTED.store(false, Relaxed);
     }
+    release_step(&mut held(), h, left);
 }
 
 /// `h` still holds the catalog.
@@ -551,11 +707,6 @@ pub(crate) fn holds_settings(h: Holder) -> bool {
 /// Frees the settings catalog (the Start menu data was released): the next Start menu builds it again.
 pub(crate) fn release_settings() {
     release_settings_for(Holder::Start);
-}
-
-fn free_settings() {
-    SETTINGS_STARTED.store(false, Relaxed);
-    *SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 /// `@dll,-id` / `@{package?ms-resource://...}` resolved in the display language; plain text as it is.
@@ -1180,6 +1331,101 @@ mod tests {
         assert_eq!(holders_step(&bits, Holder::Launcher, true), 2);
         assert_eq!(holders_step(&bits, Holder::Start, true), 3);
         assert_eq!(holders_step(&bits, Holder::Launcher, false), 1);
+    }
+
+    fn held_list(n: usize) -> (Arc<Vec<Setting>>, Arc<FoldedSettings>) {
+        let list = Arc::new(sample(n));
+        let folded = Arc::new(FoldedSettings::new(&list));
+        (list, folded)
+    }
+
+    fn ready_with(ask: LauncherAsk, list: &Arc<Vec<Setting>>) -> bool {
+        matches!(ask, LauncherAsk::Ready(l, f) if Arc::ptr_eq(&l, list) && f.rows.len() == list.len() && f.index.bytes() > 0)
+    }
+
+    #[test]
+    fn launcher_rows_come_with_the_list_or_from_one_fold() {
+        let mut h = Held::default();
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Wait), "no list yet: the build brings it");
+        // Built while the launcher held the catalog: the rows came with it, nothing is folded later.
+        let (list, folded) = held_list(40);
+        assert!(store_built(&mut h, &mut Some(list.clone()), &mut Some(folded), true, true));
+        assert!(ready_with(launcher_ask(&mut h), &list));
+        assert!(!h.folding);
+        // Built for Start alone: the launcher's first ask starts one fold, later asks wait for it.
+        let mut h = Held::default();
+        let (list, folded) = held_list(40);
+        assert!(store_built(&mut h, &mut Some(list.clone()), &mut None, true, false));
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(l) if Arc::ptr_eq(&l, &list)));
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Wait), "one fold at a time");
+        assert!(matches!(fold_done(&mut h, &list, &mut Some(folded), true), FoldNext::Posted));
+        assert!(!h.folding);
+        assert!(ready_with(launcher_ask(&mut h), &list));
+    }
+
+    #[test]
+    fn launcher_rows_never_outlive_the_list_or_the_hold() {
+        // Made while the launcher held the catalog, released before the store: the list stays, the rows do not.
+        let mut h = Held::default();
+        let (list, folded) = held_list(10);
+        assert!(store_built(&mut h, &mut Some(list.clone()), &mut Some(folded), true, false));
+        assert!(h.list.is_some() && h.folded.is_none());
+        // Released while it was being built: nothing is kept.
+        let mut h = Held::default();
+        let (list, folded) = held_list(10);
+        assert!(!store_built(&mut h, &mut Some(list), &mut Some(folded), false, true));
+        assert!(h.list.is_none() && h.folded.is_none());
+        // The launcher lets go and Start still holds: the list stays, the rows go; the last holder frees both.
+        let (list, folded) = held_list(10);
+        store_built(&mut h, &mut Some(list), &mut Some(folded), true, true);
+        release_step(&mut h, Holder::Launcher, Holder::Start as u8);
+        assert!(h.list.is_some() && h.folded.is_none());
+        let (list, folded) = held_list(10);
+        store_built(&mut h, &mut Some(list), &mut Some(folded), true, true);
+        release_step(&mut h, Holder::Start, Holder::Launcher as u8);
+        assert!(h.list.is_some() && h.folded.is_some(), "Start let go, the launcher still holds both");
+        release_step(&mut h, Holder::Launcher, 0);
+        assert!(h.list.is_none() && h.folded.is_none());
+    }
+
+    #[test]
+    fn a_fold_of_a_list_that_went_is_not_kept() {
+        // The list was freed during the fold.
+        let mut h = Held::default();
+        let (list, folded) = held_list(10);
+        store_built(&mut h, &mut Some(list.clone()), &mut None, true, true);
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
+        release_step(&mut h, Holder::Launcher, 0);
+        assert!(matches!(fold_done(&mut h, &list, &mut Some(folded), true), FoldNext::Done));
+        assert!(h.folded.is_none() && !h.folding);
+        // The launcher let go during the fold.
+        let (list, folded) = held_list(10);
+        store_built(&mut h, &mut Some(list.clone()), &mut None, true, true);
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
+        assert!(matches!(fold_done(&mut h, &list, &mut Some(folded), false), FoldNext::Done));
+        assert!(h.folded.is_none() && !h.folding);
+        // Another list replaced it, without rows: that one is folded next, and kept.
+        let (old, old_folded) = held_list(10);
+        let mut h = Held::default();
+        store_built(&mut h, &mut Some(old.clone()), &mut None, true, true);
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
+        let (new, new_folded) = held_list(12);
+        store_built(&mut h, &mut Some(new.clone()), &mut None, true, true);
+        assert!(
+            matches!(fold_done(&mut h, &old, &mut Some(old_folded), true), FoldNext::Again(l) if Arc::ptr_eq(&l, &new))
+        );
+        assert!(h.folding && h.folded.is_none());
+        assert!(matches!(fold_done(&mut h, &new, &mut Some(new_folded), true), FoldNext::Posted));
+        assert!(ready_with(launcher_ask(&mut h), &new));
+        // Another list replaced it with its own rows: the fold is dropped.
+        let mut h = Held::default();
+        let (old, old_folded) = held_list(10);
+        store_built(&mut h, &mut Some(old.clone()), &mut None, true, true);
+        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
+        let (new, new_folded) = held_list(12);
+        store_built(&mut h, &mut Some(new.clone()), &mut Some(new_folded), true, true);
+        assert!(matches!(fold_done(&mut h, &old, &mut Some(old_folded), true), FoldNext::Done));
+        assert!(ready_with(launcher_ask(&mut h), &new) && !h.folding);
     }
 
     /// Builds the REAL settings catalog and app index of this machine (run by hand:

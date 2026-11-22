@@ -21,7 +21,7 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
-use crate::launcher::catalog::{self, CatApp, IconCache};
+use crate::launcher::catalog::{self, CatApp, FoldedSettings, IconCache};
 use crate::launcher::field::KeyEvent;
 use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
@@ -29,7 +29,7 @@ use crate::launcher::history;
 use crate::launcher::index::IndexBuf;
 use crate::launcher::model::{
     Batch, Choice, CommandId, GlyphId, IconRef, Item, ItemKey, KeyChord, Kind, Mode, Mods, NumberStyle, Payload,
-    ProviderId, ProviderMask, SettingRow, Verb, WindowRow,
+    ProviderId, ProviderMask, Verb, WindowRow,
 };
 use crate::launcher::powertoys::{self, Pt, PtEvent, PtNotice, PtState};
 use crate::launcher::providers::{self, Budget, Context, LauncherOpts};
@@ -2037,7 +2037,8 @@ pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
     }
 }
 
-/// `ShellEvent::StartSettings`: the settings list is built; when the launcher holds it, its rows are folded now.
+/// `ShellEvent::StartSettings`: the settings list is built (or the launcher's rows of it); when the launcher holds it,
+/// they are taken now.
 pub(crate) fn on_settings_ready() {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::SettingsReady);
@@ -2046,17 +2047,13 @@ pub(crate) fn on_settings_ready() {
     }
 }
 
-/// Folds the held settings list into rows (once per load: names and keywords are folded here, not per keystroke).
+/// Takes the held settings list with the rows and keyword dictionary made of it on a settings thread (once per load:
+/// names and keywords are folded there, never here on the UI thread, L3 KEY-11). Not made yet: they come with a later
+/// `StartSettings` event.
 fn fold_held_settings() {
-    let list = start_search::settings();
-    if list.is_empty() {
-        return;
-    }
-    let rows = catalog::fold_settings(&list);
-    let rows_ix = catalog::index_settings(&rows);
+    let Some((list, folded)) = start_search::launcher_settings() else { return };
     with_ctrl(|c| {
-        c.settings = rows;
-        c.settings_ix = rows_ix;
+        c.settings = folded;
         c.setting_list = list;
     });
 }
@@ -2176,8 +2173,7 @@ fn release_resident() {
         return;
     }
     let _ = with_ctrl(|c| {
-        c.settings = Vec::new();
-        c.settings_ix = IndexBuf::default();
+        c.settings = Arc::default();
         c.setting_list = Arc::default();
         c.windows = Vec::new();
         c.failed_query = None;
@@ -2198,7 +2194,7 @@ pub(crate) fn prepare_open() {
         let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
     }
     start_search::hold_settings(Holder::Launcher);
-    if with_ctrl(|c| c.settings.is_empty()) == Some(true) {
+    if with_ctrl(|c| c.settings.rows.is_empty()) == Some(true) {
         fold_held_settings();
     }
     let windows = crate::launcher_sys::window_rows();
@@ -2478,10 +2474,10 @@ struct Ctrl {
     num: NumberStyle,
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
     apps: Vec<CatApp>,
-    settings: Vec<SettingRow>,
-    /// The keyword dictionaries of `apps` and `settings` (L3 T9), built where they are.
+    /// The keyword dictionary of `apps` (L3 T9), built where they are.
     apps_ix: IndexBuf,
-    settings_ix: IndexBuf,
+    /// The settings rows and their keyword dictionary, shared with `start_search`'s settings thread that made them.
+    settings: Arc<FoldedSettings>,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
     /// What was picked (L1b-3): read by every keystroke, written 2 s after a close that changed it.
@@ -2577,9 +2573,8 @@ impl Ctrl {
             opts: LauncherOpts::default(),
             num: NumberStyle { decimal: '.', group: ',' },
             apps: Vec::new(),
-            settings: Vec::new(),
             apps_ix: IndexBuf::default(),
-            settings_ix: IndexBuf::default(),
+            settings: Arc::default(),
             windows: Vec::new(),
             history: Vec::new(),
             frecency: Frecency::new(),
@@ -2660,9 +2655,9 @@ impl Ctrl {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
         Context {
             apps: &self.apps,
-            settings: &self.settings,
+            settings: &self.settings.rows,
             apps_ix: Some(self.apps_ix.view()),
-            settings_ix: Some(self.settings_ix.view()),
+            settings_ix: Some(self.settings.index.view()),
             windows: &self.windows,
             history: &self.history,
             opts: &self.opts,
@@ -4458,12 +4453,16 @@ mod tests {
 
     #[test]
     fn chord_off_keeps_no_resident_data() {
+        use crate::launcher::model::SettingRow;
         use crate::start_search::Keys;
         let filled = |dirty: bool, learn: bool| {
             let mut c = Ctrl::new();
             c.apps =
                 vec![CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 1)];
-            c.settings = vec![SettingRow::new(0, "Schermo", Keys::default(), 1)];
+            c.settings = Arc::new(FoldedSettings {
+                rows: vec![SettingRow::new(0, "Schermo", Keys::default(), 1)],
+                index: IndexBuf::default(),
+            });
             c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
             c.history = vec!["ping 1.1.1.1".into()];
             c.last_query = Some("calc".into());
@@ -4474,7 +4473,7 @@ mod tests {
         };
         let empty = |c: &Ctrl| {
             c.apps.is_empty()
-                && c.settings.is_empty()
+                && c.settings.rows.is_empty()
                 && c.windows.is_empty()
                 && c.icons.len() == 0
                 && c.history.is_empty()

@@ -165,6 +165,23 @@ pub fn index_settings(rows: &[SettingRow]) -> IndexBuf {
     IndexBuf::build(rows.iter().enumerate().map(|(i, r)| (u32::try_from(i).unwrap_or(u32::MAX), r.cand())))
 }
 
+/// The launcher's settings rows and their keyword dictionary: made from the held list off the UI thread (`start_search`
+/// builds them on a settings thread, L3 KEY-11) and shared with the list they index.
+#[derive(Default, Debug)]
+pub struct FoldedSettings {
+    pub rows: Vec<SettingRow>,
+    pub index: IndexBuf,
+}
+
+impl FoldedSettings {
+    /// `fold_settings` of `list`, then `index_settings` of the rows.
+    pub fn new(list: &[Setting]) -> FoldedSettings {
+        let rows = fold_settings(list);
+        let index = index_settings(&rows);
+        FoldedSettings { rows, index }
+    }
+}
+
 /// Icons kept between opens (at most `ICON_CACHE_CAP`), the least recently used dropped first.
 pub const ICON_CACHE_CAP: usize = 40;
 
