@@ -1560,6 +1560,8 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::on_audio_sessions(list);
             return false;
         }
+        // The launcher's replies: it handles them from L1a-15; nothing asks for them yet.
+        ShellEvent::LaunchFailed { .. } => return false,
         other => other,
     };
     UI.with(|u| {
@@ -1598,7 +1600,8 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             | ShellEvent::StartIcons { .. }
             | ShellEvent::StartSettings
             | ShellEvent::Spatial(_)
-            | ShellEvent::AudioSessions(_) => false,
+            | ShellEvent::AudioSessions(_)
+            | ShellEvent::LaunchFailed { .. } => false,
         }
     })
 }

@@ -205,6 +205,12 @@ pub enum ShellRequest {
     /// Click on a notification whose app has no open window: launches the app that sent it, found in
     /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
     OpenNotifApp { aumid: String, name: String },
+    // ---- the launcher's requests (built by launcher_sys.rs only). Each launch that fails pushes
+    // `ShellEvent::LaunchFailed`; the shared requests above never do. Logged as kind and length only.
+    /// Open a file or folder of a result row: the path as it is, in one desktop-shell call (no
+    /// `updated_exe_path`, no `is_dir`, no working directory).
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    OpenPath { path: String },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -232,6 +238,16 @@ pub enum ShellEvent {
     StartIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
     /// The settings catalog of the Start menu search is ready (`start_search::settings`).
     StartSettings,
+    /// A launcher request did not reach the desktop shell, or the shell refused it. Never pushed for
+    /// the shared requests (`Launch`, `LaunchAppAdmin`, `RevealApp`).
+    #[allow(dead_code)] // read by the launcher (L1a-17)
+    LaunchFailed { kind: LaunchKind },
+}
+
+/// What a failed launcher launch was (`ShellEvent::LaunchFailed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchKind {
+    Path,
 }
 
 /// Shell thread handle; passed to `stop`.
@@ -530,6 +546,9 @@ impl Shell {
             ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
             ShellRequest::LaunchAppAdmin { id } => launch_app_admin(&id),
             ShellRequest::RevealApp { id } => reveal_app(&id),
+            // launcher arms: begin
+            req @ ShellRequest::OpenPath { .. } => launcher_launch(self.ui, req),
+            // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
                 let st = self.audio.as_mut().map(|a| a.adjust(delta_percent));
@@ -1616,6 +1635,79 @@ fn reveal_app(id: &str) {
     }
 }
 
+// launcher requests: begin
+// What the launcher asks for. Every launch leaves through the desktop shell (`shell_exec`), `runas`
+// only from `RunAsTyped`. Logs carry the request's kind and the length of its text, never the text.
+
+/// One desktop-shell call as the launcher's requests make it: (file, arguments, working directory,
+/// verb). The real one is `shell_exec`; the tests pass a recorder, so they see exactly what would
+/// reach the shell and start nothing.
+type Exec<'a> = &'a mut dyn FnMut(&str, Option<&str>, Option<&str>, Verb) -> Result<(), String>;
+
+/// The real `Exec`: the desktop shell (Explorer, medium integrity) when the dock is elevated or the
+/// verb is `runas` (Explorer asks UAC), as `launch` and `launch_admin` do; the dock's token is never
+/// used. Plain `ShellExecuteExW` only for an unelevated dock opening something.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn shell_exec(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> Result<(), String> {
+    if verb == Verb::Open && !is_elevated() {
+        return shell_execute(file, args, dir);
+    }
+    desktop_shell_execute(file, args, dir, verb, SW_SHOWNORMAL.0).map_err(|e| format!("desktop shell: {e}"))
+}
+
+/// The launcher launch a request is; `None` for the shared requests (Start, the bar, notifications,
+/// the power popup, the updater), whose failures never become a launcher notice.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
+    match req {
+        ShellRequest::OpenPath { .. } => Some(LaunchKind::Path),
+        _ => None,
+    }
+}
+
+/// What a launcher launch pushes when it failed.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn failure_event(kind: LaunchKind, r: &Result<(), String>) -> Option<ShellEvent> {
+    r.is_err().then_some(ShellEvent::LaunchFailed { kind })
+}
+
+/// Runs one launcher launch; a failure is logged (kind and error only) and pushed as `LaunchFailed`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launcher_launch(ui: isize, req: ShellRequest) {
+    let Some(kind) = launch_kind(&req) else { return };
+    let mut exec = shell_exec;
+    let r = match req {
+        ShellRequest::OpenPath { path } => {
+            let r = open_path_with(&path, &mut exec);
+            if r.is_ok() {
+                log!("shell: OpenPath ({} chars) via the desktop shell", path.chars().count());
+            }
+            r
+        }
+        _ => return,
+    };
+    if let Err(err) = &r {
+        let e = format!("{kind:?}: {err}");
+        log!("shell: launcher launch not executed ({e})");
+    }
+    if let Some(ev) = failure_event(kind, &r) {
+        push_event(ui, ev);
+    }
+}
+
+/// `OpenPath`: refuses an empty path or one with a control character, then exactly one shell call
+/// with the path as it is: no `updated_exe_path`, no `is_dir`, no working directory, so nothing
+/// the launcher found or the user typed touches the file system from the elevated process.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn open_path_with(path: &str, exec: Exec) -> Result<(), String> {
+    if path.trim().is_empty() || path.chars().any(char::is_control) {
+        return Err("refused: an empty path or a control character".into());
+    }
+    exec(path, None, None, Verb::Open)
+}
+
+// launcher requests: end
+
 /// Owned `VARIANT` that is released with `VariantClear` on drop.
 struct OwnedVariant(VARIANT);
 
@@ -1977,5 +2069,53 @@ mod tests {
     fn system_dir_comes_from_the_api() {
         let d = system_dir().expect("GetSystemDirectoryW");
         assert!(d.is_absolute() && d.join("kernel32.dll").is_file());
+    }
+
+    // ---- launcher requests
+
+    type Call = (String, Option<String>, Option<String>, Verb);
+
+    /// A fake desktop shell: records every call, succeeds or fails as told, starts nothing.
+    fn recorder(
+        calls: &mut Vec<Call>,
+        ok: bool,
+    ) -> impl FnMut(&str, Option<&str>, Option<&str>, Verb) -> Result<(), String> + '_ {
+        move |f, a, d, v| {
+            calls.push((f.to_string(), a.map(str::to_string), d.map(str::to_string), v));
+            if ok {
+                Ok(())
+            } else {
+                Err("0x80004005".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn open_path_is_one_shell_call() {
+        let mut calls = Vec::new();
+        assert!(open_path_with("C:\\x y\\a.txt", &mut recorder(&mut calls, true)).is_ok());
+        assert_eq!(calls, [("C:\\x y\\a.txt".to_string(), None, None, Verb::Open)]);
+    }
+
+    #[test]
+    fn open_path_refuses_controls() {
+        let mut calls = Vec::new();
+        for bad in ["", "   ", "C:\\a\nb.txt", "C:\\a\u{0}.txt", "C:\\a\u{85}.txt", "\u{7F}"] {
+            assert!(open_path_with(bad, &mut recorder(&mut calls, true)).is_err(), "{bad:?}");
+        }
+        assert!(calls.is_empty(), "a refused path reaches no shell call: {calls:?}");
+    }
+
+    #[test]
+    fn launch_failed_pushed_on_error() {
+        let mut calls = Vec::new();
+        let r = open_path_with("C:\\a.txt", &mut recorder(&mut calls, false));
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            failure_event(LaunchKind::Path, &r),
+            Some(ShellEvent::LaunchFailed { kind: LaunchKind::Path })
+        ));
+        assert!(failure_event(LaunchKind::Path, &Ok(())).is_none());
+        assert_eq!(launch_kind(&ShellRequest::OpenPath { path: "C:\\a.txt".into() }), Some(LaunchKind::Path));
     }
 }
