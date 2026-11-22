@@ -189,7 +189,7 @@ fn ledger_target_is_not_behind_cargo() {
 
 #[test]
 fn g7_values_are_pinned() {
-    // Changing one needs this test edited too, which CODEOWNERS makes the owner's review.
+    // Changing one needs this test edited too, which is a change the owner reviews.
     assert_eq!(value("private.dock_hidden"), 12.0 * MIB);
     assert_eq!(value("private.kit_empty"), 4.0 * MIB);
     assert_eq!(value("private.tasks_640x560"), 15.0 * MIB);
