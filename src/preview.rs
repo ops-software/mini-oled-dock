@@ -812,6 +812,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         "popup_start" => crate::popup::popup_start::new(),
         "popup_startmenu"
         | "popup_startmenu_search"
+        | "popup_startmenu_offer"
         | "popup_startmenu_win11"
         | "popup_startmenu_win11_grid"
         | "popup_startmenu_menu"
@@ -853,6 +854,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             let (over, folders) = match name {
                 "popup_startmenu_menu" => (Some(PreviewOver::Menu), Vec::new()),
                 "popup_startmenu_letters" => (Some(PreviewOver::Letters), Vec::new()),
+                "popup_startmenu_offer" => (Some(PreviewOver::Offer), Vec::new()),
                 "popup_startmenu_win11_folder" => {
                     let apps = ["spotify", "steam", "discord"].map(str::to_string).to_vec();
                     (Some(PreviewOver::Folder), vec![crate::config::StartFolder { name: "Games".to_string(), apps }])
@@ -867,18 +869,13 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             });
             let apps =
                 APPS.iter().map(|&(n, l, c)| (n.to_lowercase(), n.to_string(), mock_icon(l, c, m.px(32)))).collect();
-            let query = if name == "popup_startmenu_search" { "te" } else { "" };
+            let query = if matches!(name, "popup_startmenu_search" | "popup_startmenu_offer") { "te" } else { "" };
             let style = if name.starts_with("popup_startmenu_win11") {
                 crate::config::StartStyle::Windows11
             } else {
                 crate::config::StartStyle::Compact
             };
-            crate::popup::popup_startmenu::preview_new(
-                apps,
-                query,
-                style,
-                over,
-            )
+            crate::popup::popup_startmenu::preview_new(apps, query, style, over)
         }
         n if crate::popup::popup_launcher::PreviewScene::from_name(n).is_some() => {
             let scene = crate::popup::popup_launcher::PreviewScene::from_name(n)?;
@@ -1076,6 +1073,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_start", 4),
             ("popup_startmenu", 12),
             ("popup_startmenu_search", 1),
+            ("popup_startmenu_offer", 1),
             ("popup_startmenu_win11", 5),
             ("popup_startmenu_win11_grid", 6),
             // Overlays open: control 0 is the backdrop, then their rows / cells.

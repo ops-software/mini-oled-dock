@@ -39,7 +39,7 @@ use crate::launcher::web::{self, Engine, Template};
 use crate::launcher_sys::{RealHook, RealSys};
 use crate::log;
 use crate::render::Metrics;
-use crate::shell_thread::{IconPlan, ShellRequest, StartApp};
+use crate::shell_thread::{IconPlan, LaunchKind, ShellRequest, StartApp};
 use crate::start_search::{self, AppIndex, Holder, Setting};
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
@@ -301,6 +301,8 @@ pub(crate) struct Launcher {
     icon_px: u32,
     /// The titles of the windows were read for this open (the "<" mode, once).
     titles_read: bool,
+    /// The close sent a launch to the shell thread (a refused one may reopen the launcher, `after_failure`).
+    launched: bool,
 }
 
 impl Launcher {
@@ -329,6 +331,7 @@ impl Launcher {
             forgotten: Vec::new(),
             icon_px: style::ICON_M as u32,
             titles_read: false,
+            launched: false,
         }
     }
 
@@ -520,6 +523,7 @@ impl Launcher {
                         with_ctrl(|c| c.dirty |= c.learn && history::push_front(&mut c.history, line));
                     }
                     if let Some(req) = crate::launcher_sys::to_request(r, &setting) {
+                        self.launched = true;
                         sys.shell(req);
                     }
                     if elevates {
@@ -556,10 +560,13 @@ impl Launcher {
             })
             .collect();
         let now = sys.now_ms();
+        let failed_query = std::mem::take(&mut self.launched).then(|| self.session.last_query());
         let plan = with_ctrl(|c| {
             for id in &used {
                 c.icons.touch(id);
             }
+            c.hidden_at_ms = now;
+            c.failed_query = failed_query;
             (c.dirty, c.catalogue_stale(now))
         });
         let (save, stale) = plan.unwrap_or_default();
@@ -1193,6 +1200,10 @@ fn new_launcher() -> Launcher {
         l
     });
     let mut l = made.unwrap_or_else(|| Launcher::with_session(Session::open(&LauncherOpts::default(), None)));
+    // The error of a launch refused while the launcher was away shows once, at this open.
+    if with_ctrl(|c| c.notice.take()).flatten().is_some() {
+        l.session.set_notices(vec![failure_row()]);
+    }
     if !l.session.query_text().is_empty() {
         // The kept query's rows.
         let _ = ctx(|cx| l.session.refresh(cx));
@@ -1232,6 +1243,94 @@ pub(crate) fn on_timer(hwnd: HWND, id: usize) {
         crate::msg::TIMER_LAUNCHER_RELEASE => release_resident(),
         _ => {}
     }
+}
+
+/// A launch is refused (`ShellEvent::LaunchFailed`) up to this long after the hide: the launcher reopens with the error.
+const REOPEN_WITHIN_MS: u64 = 1_000;
+
+/// What a refused launch does (5.5.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FailurePlan {
+    /// The launcher reopens with the same query and the error row.
+    Reopen,
+    /// A notice row shows at the next open; the launcher never reopens by itself.
+    NoticeLater,
+}
+
+/// The plan for a refusal that came `ms_since_hide` after the close: within 1 s, with the foreground still the window of
+/// the open (or none), the user is still waiting for the launch; later, or somewhere else, a reopen would steal their typing.
+pub(crate) fn after_failure(ms_since_hide: u64, fg_is_ours_or_null: bool) -> FailurePlan {
+    if ms_since_hide <= REOPEN_WITHIN_MS && fg_is_ours_or_null {
+        FailurePlan::Reopen
+    } else {
+        FailurePlan::NoticeLater
+    }
+}
+
+/// The error row of a refused launch (no action: Enter on it only closes).
+fn failure_row() -> Item {
+    notice_row("launch-failed", strings::launch_failed(), None)
+}
+
+/// A notice row (5.5.2): an info mark, the text, no verb.
+fn notice_row(id: &str, title: &str, detail: Option<&str>) -> Item {
+    use crate::launcher::model::{ItemKey, Score, VerbSet};
+    Item {
+        key: ItemKey::of(ProviderId::Apps, id),
+        from: ProviderId::Apps,
+        kind: Kind::Notice,
+        title: title.into(),
+        detail: detail.map(Into::into),
+        icon: IconRef::Glyph(GlyphId::Info),
+        score: Score { tier: 0, learned: std::cmp::Reverse(0), idle: true, kind: 0, rank: 0, len: 0 },
+        verbs: VerbSet::empty(),
+        payload: Payload::None,
+        destructive: false,
+    }
+}
+
+/// `ShellEvent::LaunchFailed` (only the launcher's own requests push it): within a second of the hide, with the foreground
+/// still where the open came from, the launcher reopens with the same query and the error; otherwise the error waits as a
+/// notice for the next open.
+pub(crate) fn on_launch_failed(kind: LaunchKind) {
+    if !is_on() {
+        return;
+    }
+    log!("launcher: a launch was refused ({kind:?})");
+    let now = RealSys.now_ms();
+    let fg = RealSys.foreground();
+    let held = with_ctrl(|c| (now.saturating_sub(c.hidden_at_ms), c.fg_at_open, c.failed_query.take()));
+    let Some((since, fg_open, query)) = held else { return };
+    let ours_or_null = fg == 0 || fg == fg_open;
+    match (after_failure(since, ours_or_null), query) {
+        (FailurePlan::Reopen, Some(q)) => reopen_with_error(&q),
+        _ => {
+            with_ctrl(|c| c.notice = Some(kind));
+        }
+    }
+}
+
+/// Opens the launcher again as the chord would (no type-ahead: no key of the user is kept for it) and shows the error over
+/// the same query.
+fn reopen_with_error(query: &str) {
+    let mut hook = RealHook;
+    let mut sys = RealSys;
+    let Some((pick, top_percent)) = with_ctrl(|c| (c.pick, c.top_percent)) else { return };
+    sys.prepare_open();
+    hook.shown(true);
+    if !sys.open(pick, top_percent) {
+        hook.shown(false);
+        return;
+    }
+    with_ctrl(|c| c.notice = None);
+    super::with_launcher(|l| {
+        ctx(|cx| {
+            l.session.set_notices(vec![failure_row()]);
+            let fx = if query.is_empty() { l.session.refresh(cx) } else { l.session.chars(query, cx) };
+            l.run(fx, cx, &mut RealSys)
+        })
+        .unwrap_or(Reply::None)
+    });
 }
 
 /// A chord is set: the launcher's state exists.
@@ -1370,6 +1469,7 @@ fn release_resident() {
         c.settings = Vec::new();
         c.setting_list = Arc::default();
         c.windows = Vec::new();
+        c.failed_query = None;
     });
     start_search::release_settings_for(Holder::Launcher);
     crate::mem::released_data();
@@ -1390,6 +1490,7 @@ pub(crate) fn prepare_open() {
     let windows = crate::launcher_sys::window_rows();
     let (state, listed) = with_ctrl(|c| {
         c.windows = windows;
+        c.failed_query = None;
         let state = (!std::mem::replace(&mut c.state_loaded, true)).then_some(c.learn);
         (state, c.apps.is_empty() && c.listing_since.is_none())
     })
@@ -1659,6 +1760,12 @@ struct Ctrl {
     learn: bool,
     state_loaded: bool,
     dirty: bool,
+    /// The last close that launched something: when it hid, and the query as typed (kept for the reopen of a refused launch
+    /// only, at most until the next open or the release).
+    hidden_at_ms: u64,
+    failed_query: Option<String>,
+    /// A refused launch that could not reopen the launcher: its notice row shows at the next open.
+    notice: Option<LaunchKind>,
 }
 
 /// A catalogue older than this is listed again after a close.
@@ -1717,6 +1824,9 @@ impl Ctrl {
             learn: true,
             state_loaded: false,
             dirty: false,
+            hidden_at_ms: 0,
+            failed_query: None,
+            notice: None,
         }
     }
 
@@ -2611,6 +2721,29 @@ mod tests {
         let mut again = typed(&fx, "<");
         again.read_titles(Reply::None, &mut sys);
         assert_eq!(fills(&sys), 2);
+    }
+
+    #[test]
+    fn launch_failed_reopens_only_within_1_s() {
+        assert_eq!(after_failure(0, true), FailurePlan::Reopen);
+        assert_eq!(after_failure(1_000, true), FailurePlan::Reopen);
+        assert_eq!(after_failure(1_001, true), FailurePlan::NoticeLater);
+        assert_eq!(after_failure(200, false), FailurePlan::NoticeLater, "the user moved on to another window");
+        assert_eq!(after_failure(u64::MAX, true), FailurePlan::NoticeLater);
+    }
+
+    #[test]
+    fn a_refusal_that_cannot_reopen_waits_for_the_next_open() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        with_ctrl(|c| c.notice = Some(LaunchKind::App));
+        let mut l = new_launcher();
+        assert_eq!(with_ctrl(|c| c.notice), Some(None), "shown once");
+        l.session.chars("zz", &fx.cx());
+        assert_eq!(l.session.rows().first().map(|r| r.kind), Some(Kind::Notice));
+        assert_eq!(l.session.rows().first().map(|r| &*r.title), Some(strings::launch_failed()));
+        let again = new_launcher();
+        assert!(again.session.rows().iter().all(|r| r.kind != Kind::Notice));
     }
 
     #[test]

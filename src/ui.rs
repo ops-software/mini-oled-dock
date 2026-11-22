@@ -1593,8 +1593,10 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::popup_launcher::on_state(run);
             return false;
         }
-        // Read by the launcher (L1a-17).
-        ShellEvent::LaunchFailed { .. } => return false,
+        ShellEvent::LaunchFailed { kind } => {
+            popup::popup_launcher::on_launch_failed(kind);
+            return false;
+        }
         other => other,
     };
     UI.with(|u| {
@@ -2535,7 +2537,11 @@ fn launch_target(e: &Entry) -> Option<String> {
 pub(crate) fn paint_bar_icon(s: &mut crate::surface::Surface, key: &str, x: i32, y: i32, size: i32) -> bool {
     UI.with(|u| {
         let Ok(st) = u.try_borrow() else { return false };
-        let icon = st.entries.iter().find(|e| same_key(&e.key, key) || same_key(&e.group_key, key)).and_then(|e| e.icon.as_ref());
+        let icon = st
+            .entries
+            .iter()
+            .find(|e| same_key(&e.key, key) || same_key(&e.group_key, key))
+            .and_then(|e| e.icon.as_ref());
         match icon {
             Some(b) => {
                 s.blit(b, x, y, size, 255);

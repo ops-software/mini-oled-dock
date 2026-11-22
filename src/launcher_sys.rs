@@ -26,9 +26,9 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
-    VK_SHIFT,
+    GetKeyState, GetKeyboardLayout, RegisterHotKey, SendInput, ToUnicodeEx, UnregisterHotKey, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_ALT, MOD_SHIFT, VIRTUAL_KEY, VK_CAPITAL,
+    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -443,6 +443,25 @@ impl SysPort for RealSys {
 
     fn close_quiet(&mut self) {
         popup::close("session end");
+    }
+}
+
+/// The id of the probe's hotkey (the launcher's, "LA").
+const PROBE_HOTKEY_ID: i32 = 0x4C41;
+
+/// Whether no other app holds the launcher's chord: Alt+Space, or Alt+Shift+Space with `shift`. The chord is registered on
+/// the popup window and given back at once; a refusal means another program owns it. Only the offer in Start asks.
+pub(crate) fn chord_is_free(shift: bool) -> bool {
+    let Some(hwnd) = popup::popup_hwnd() else { return true };
+    let mods = if shift { MOD_ALT | MOD_SHIFT } else { MOD_ALT };
+    // SAFETY: our own window on this thread; the registration is undone right after.
+    match unsafe { RegisterHotKey(Some(hwnd), PROBE_HOTKEY_ID, mods, u32::from(VK_SPACE.0)) } {
+        Ok(()) => {
+            // SAFETY: the hotkey just registered with this id on this window.
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), PROBE_HOTKEY_ID) };
+            true
+        }
+        Err(_) => false,
     }
 }
 

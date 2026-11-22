@@ -289,7 +289,6 @@ pub enum ShellEvent {
     StartSettings,
     /// A launcher request did not reach the desktop shell, or the shell refused it. Never pushed for
     /// the shared requests (`Launch`, `LaunchAppAdmin`, `RevealApp`).
-    #[allow(dead_code)] // read by the launcher (L1a-17)
     LaunchFailed { kind: LaunchKind },
     /// Icons of launcher rows at `icon_px` (reply to `StartIconsFor`; `None` = the app has none).
     LauncherIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },

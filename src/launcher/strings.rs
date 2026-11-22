@@ -119,6 +119,20 @@ pub fn offer_use_alt_shift_space() -> &'static str {
 pub fn offer_dismiss() -> &'static str {
     tr("Don't show again", "Non mostrare più")
 }
+/// The offer row after the probe found Alt+Space taken: Alt+Shift+Space is proposed.
+pub fn offer_alt_space_held() -> &'static str {
+    tr("Another app holds Alt+Space. Use Alt+Shift+Space", "Un'altra app usa Alt+Spazio. Usa Alt+Maiusc+Spazio")
+}
+/// The offer row after the probe found both chords taken.
+pub fn offer_both_held() -> &'static str {
+    tr("Another app holds Alt+Space and Alt+Shift+Space", "Un'altra app usa Alt+Spazio e Alt+Maiusc+Spazio")
+}
+
+// ---- refused launches (5.5.3)
+/// The error row of a launch that did not reach the desktop shell.
+pub fn launch_failed() -> &'static str {
+    tr("Couldn't start it: Explorer isn't answering", "Impossibile avviarlo: Esplora risorse non risponde")
+}
 
 /// The window name (the launcher keeps this static name for screen readers).
 pub fn window_name() -> &'static str {
