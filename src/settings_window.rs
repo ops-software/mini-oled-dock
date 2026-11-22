@@ -689,10 +689,14 @@ impl Win {
         self.refresh();
     }
 
-    /// Shows `page`: top of the page, chooser closed, picker open when the colour is not a preset.
+    /// Shows `page`: top of the page, chooser closed, picker open when the colour is not a preset. The Launcher page
+    /// looks for PowerToys first (its row).
     fn goto(&mut self, page: Page) {
         self.finish();
         let bg = config::get().background;
+        if page == Page::Launcher {
+            crate::popup::popup_launcher::pt_refresh();
+        }
         self.page = page;
         self.scroll = 0;
         self.chooser_open = false;
@@ -732,12 +736,16 @@ pub fn open() {
     }
 }
 
-/// Opens the window (or the open one) on `page`.
+/// Opens the window (or the open one) on `page`. The Launcher page, already shown, is built again after its look for
+/// PowerToys.
 pub fn open_at(page: Page) {
     open();
     with_win(|w| {
         if w.page != page {
             w.goto(page);
+        } else if page == Page::Launcher {
+            crate::popup::popup_launcher::pt_refresh();
+            w.refresh();
         }
     });
 }

@@ -2548,6 +2548,27 @@ fn pt_closed(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
     }
 }
 
+/// Settings > Launcher is shown (5.7: a check "when its Settings page opens"): PowerToys is looked for before the page's
+/// rows are built, so the PowerToys row is there when Command Palette started after the 60 s check (its hook sees the
+/// chord first, so no open or close of the launcher ever looks). With the chord off nothing is touched.
+pub(crate) fn pt_refresh() {
+    if ON.with(Cell::get) {
+        pt_page_shown(&mut RealHook, &mut RealSys);
+    }
+}
+
+/// The look of `pt_refresh`: only with the chord Alt+Space and no chord owner found (a running one is waited on), at
+/// most every `PT_RESCAN_MS`, so going back and forth between the pages costs no scan each.
+fn pt_page_shown(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+    let now = sys.now_ms();
+    let due = with_ctrl(|c| {
+        c.pt_on && c.pt.state() == PtState::Absent && now.saturating_sub(c.pt_scanned_ms) >= PT_RESCAN_MS
+    });
+    if due == Some(true) {
+        pt_check(hook, sys);
+    }
+}
+
 /// A chord passed under YIELD: its answer window opens for `ANSWER_MS` (`TIMER_LAUNCHER_PT`). Command Palette already
 /// in front counts as the answer (the chord closes it). The process list is looked at again first, unless it was looked
 /// at less than `PT_RESCAN_MS` ago (the owner's exit is waited on anyway): presses in a row cost no scan each.
@@ -4837,6 +4858,37 @@ mod tests {
         pt_check(&mut hook, &mut sys);
         pt_closed(&mut hook, &mut sys);
         assert_eq!(sys.scans, 2);
+    }
+
+    #[test]
+    fn the_settings_page_looks_for_command_palette() {
+        // Command Palette started after the 60 s check: its hook sees Alt+Space first, so no open or close looks again.
+        with_ctrl(|c| *c = Ctrl::new());
+        pt_ctrl(PtState::Absent);
+        with_ctrl(|c| c.pt_scanned_ms = 60_000);
+        let mut hook = FakeHook::default();
+        let mut sys = FakeSys { now: 100_000, owners: true, ..fresh() };
+        pt_page_shown(&mut hook, &mut sys);
+        assert_eq!((sys.scans, pt_state()), (1, PtState::Detected), "Settings > Launcher shows its row");
+        // A running one is waited on: showing the page again costs no scan.
+        pt_page_shown(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 1);
+        // None running: a look at most every PT_RESCAN_MS.
+        sys.owners = false;
+        pt_check(&mut hook, &mut sys);
+        assert_eq!((sys.scans, pt_state()), (2, PtState::Absent));
+        sys.now += 1_000;
+        pt_page_shown(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 2, "too soon");
+        sys.now += PT_RESCAN_MS as u32;
+        pt_page_shown(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 3);
+        // Another chord: nothing of PowerToys is looked for.
+        with_ctrl(|c| c.pt_on = false);
+        sys.now += PT_RESCAN_MS as u32;
+        pt_page_shown(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 3);
+        with_ctrl(|c| *c = Ctrl::new());
     }
 
     #[test]
