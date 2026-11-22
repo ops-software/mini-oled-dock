@@ -1006,11 +1006,8 @@ impl ChordState {
             Some(Verdict::Pass | Verdict::PassNotify | Verdict::PassFullscreen) if ev.down => {
                 self.space = SpaceState::Passed
             }
-            Some(Verdict::Buffer) => {
-                if matches!(pushed, Some(Push::Stored | Push::Full)) {
-                    self.set_buffered(ev.vk, true);
-                }
-            }
+            // A key the ring refused (Closed) passed to Windows: no bit, or its up would be swallowed.
+            Some(Verdict::Buffer) => self.set_buffered(ev.vk, matches!(pushed, Some(Push::Stored | Push::Full))),
             Some(Verdict::SwallowSilent) if !ev.down => self.set_buffered(ev.vk, false),
             None if ev.down => self.set_buffered(ev.vk, false),
             _ => {}
@@ -1842,6 +1839,30 @@ mod tests {
         assert!(!k.s.buffered(KEY_A), "and clears the stale bit");
         assert_eq!(k.key(KEY_A, false, 20_050), None, "so its up passes too");
         assert!(balanced(&k.seen));
+    }
+
+    #[test]
+    fn closed_push_of_a_buffered_key_clears_its_bit() {
+        // 'a' is kept for the launcher; its repeat races the UI's end of the window: the hook saw the window live, its
+        // push is refused (Closed) and the repeat passes, so Windows now holds 'a' down and must get its up.
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.key(KEY_A, true, 10_100), Some(true), "stored");
+        assert!(k.s.buffered(KEY_A));
+        // The repeat, step by step: the hook's snapshot of the open window, the UI's end, the refused push.
+        let repeat = ev(KEY_A, true, 10_133);
+        k.s.ring = k.ring.ctl();
+        let v = resolve_launcher(&k.s, repeat);
+        assert_eq!(v, Some(Verdict::Buffer));
+        assert_eq!(k.ring.end(1), Some(1), "the UI ends the window in between");
+        let pushed = k.ring.try_push(k.s.ring.seq(), 0);
+        assert_eq!(pushed, Push::Closed);
+        assert_eq!(swallow_of(v, Some(pushed)), Some(false), "the repeat passes");
+        k.s.after(v.as_ref(), repeat, Some(pushed));
+        k.seen.push((KEY_A, true));
+        assert!(!k.s.buffered(KEY_A), "Windows holds this down: no bit is left");
+        assert_eq!(k.key(KEY_A, false, 10_150), None, "so its up passes");
+        assert!(balanced(&k.seen), "{:?}", k.seen);
     }
 
     #[test]
