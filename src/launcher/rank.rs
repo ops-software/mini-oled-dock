@@ -131,43 +131,75 @@ impl Cand<'_> {
     }
 }
 
+/// The score of a match of `tier`. In the hidden tiers (4, 6, 7) the synonym's penalty orders the rows before the kind:
+/// `kind` is 0 and `rank` the penalty. Elsewhere it is `Cand::score` (5.4.1's order).
+pub fn score_for(c: &Cand, q: &str, tier: u8, running: bool, kind: u8) -> Score {
+    let mut s = c.score(tier, running, kind);
+    if matches!(tier, T_SYN_EQ | T_SYN_PREFIX | T_BAG_EQ) {
+        let q = q.trim();
+        if let Some((t, penalty)) = hidden_best(c, q, q.chars().count()) {
+            if t == tier {
+                s.kind = 0;
+                s.rank = penalty;
+            }
+        }
+    }
+    s
+}
+
 // ---------------------------------------------------------------- tiers
 
 fn contains_every_word(c: &Cand, q: &str) -> bool {
     q.split_whitespace().all(|w| c.folded.contains(w))
 }
 
-/// Tiers 0-5 of 5.2.5 for the folded query `q`: the best tier that matches, or None. An empty query matches nothing
-/// (the empty state shows no rows). Tier 6 is `match_fuzzy`, which the caller asks only when no candidate matched.
+/// Tiers 0-7 of 5.2.5 for the folded query `q`: the best tier that matches, or None. An empty query matches nothing
+/// (the empty state shows no rows). Tier 8 is `match_fuzzy`, which the caller asks only when no candidate matched.
 pub fn match_tiers(c: &Cand, q: &str) -> Option<u8> {
     let q = q.trim();
     if q.is_empty() {
         return None;
     }
-    let tier = tiers(c, q);
-    // The tiers tried: up to the one that matched, all six when none did (the bench's linear bound, LC-3).
-    #[cfg(test)]
-    TIER_CHECKS.with(|n| n.set(n.get() + tier.map_or(6, |t| u64::from(t) + 1)));
-    tier
+    tiers(c, q)
 }
+
+/// Counts one stage of `tiers` (name, initials, hidden word, substring): at most 4 per candidate (the bench's linear
+/// bound, LC-3).
+#[cfg(test)]
+fn stage() {
+    TIER_CHECKS.with(|n| n.set(n.get() + 1));
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn stage() {}
 
 #[cfg(test)]
 thread_local! {
-    /// The tier checks `match_tiers` made on this thread. Per thread, like the allocation counter of the test kit, so
+    /// The tier stages `match_tiers` ran on this thread. Per thread, like the allocation counter of the test kit, so
     /// the tests running beside a measurement never add to it.
     pub(crate) static TIER_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-// The tiers of the hidden words, in L3 T6's numbering: `tiers` takes them from T6 on.
+// The tiers, best first (5.2.5, L3 T6). 8 is `match_fuzzy`; Windows' typo rewrite shows the rows of the query it read, at
+// their own tiers.
+/// A name equals the query.
+pub(crate) const T_EXACT: u8 = 0;
+/// A name starts with the query.
+pub(crate) const T_PREFIX: u8 = 1;
+/// A word of a name starts with the first query word and every query word is contained.
+pub(crate) const T_WORD: u8 = 2;
+/// The initials of the shown name (2+ characters, no space).
+pub(crate) const T_INITIALS: u8 = 3;
 /// A curated synonym (Windows' or ours) equals the query.
-#[allow(dead_code)] // L3 T6 puts the classifier in the order
 pub(crate) const T_SYN_EQ: u8 = 4;
+/// Every query word is a substring of the shown name.
+pub(crate) const T_SUBSTR: u8 = 5;
 /// A curated synonym starts with the query (2+ characters).
-#[allow(dead_code)] // L3 T6
 pub(crate) const T_SYN_PREFIX: u8 = 6;
 /// A settings XML keyword equals the query (never by prefix).
-#[allow(dead_code)] // L3 T6
 pub(crate) const T_BAG_EQ: u8 = 7;
+/// Fuzzy: a subsequence or a near word prefix of a name.
+pub(crate) const T_FUZZY: u8 = 8;
 
 #[cfg(test)]
 thread_local! {
@@ -179,7 +211,6 @@ thread_local! {
 /// A key equal to `q` is a curated synonym (T_SYN_EQ) or an XML word (T_BAG_EQ, penalty = the sentinel); a curated key
 /// that starts with `q` (2+ characters) is T_SYN_PREFIX; an XML key that only starts with `q` gives nothing. A penalty
 /// is parsed only for a key that matched. Stops early on a T_SYN_EQ with penalty 1 or less. Allocates nothing.
-#[allow(dead_code)] // L3 T6 puts it in `tiers`
 pub(crate) fn hidden_best(c: &Cand, q: &str, chars: usize) -> Option<(u8, u32)> {
     let mut best: Option<(u8, u32)> = None;
     for (k, text) in c.keys.raw() {
@@ -212,15 +243,15 @@ pub(crate) fn hidden_best(c: &Cand, q: &str, chars: usize) -> Option<(u8, u32)> 
 /// the words of `text` start.
 fn name_like(text: &str, q: &str, mut starts: impl Iterator<Item = usize>) -> Option<u8> {
     if text == q {
-        return Some(0);
+        return Some(T_EXACT);
     }
     if text.starts_with(q) {
-        return Some(1);
+        return Some(T_PREFIX);
     }
     if q.split_whitespace().all(|w| text.contains(w)) {
         let first = q.split_whitespace().next().unwrap_or(q);
         if starts.any(|w| text.get(w..).is_some_and(|t| t.starts_with(first))) {
-            return Some(2);
+            return Some(T_WORD);
         }
     }
     None
@@ -252,30 +283,31 @@ pub fn name_tier(c: &Cand, q: &str) -> Option<u8> {
     best
 }
 
-/// `match_tiers` for a trimmed query that is not empty.
+/// `match_tiers` for a trimmed query that is not empty: a name (0-2), the initials (3), a curated synonym equal to the
+/// query (4), every word inside the shown name (5), then the other hidden word (6 or 7). Hidden words never beat a name.
 fn tiers(c: &Cand, q: &str) -> Option<u8> {
+    stage();
     if let Some(t) = name_tier(c, q) {
         return Some(t);
     }
     let chars = q.chars().count();
-    // A hidden word equal to the query (L3 T6 moves it below every name).
-    if c.keys.iter().any(|(k, _)| k == q) {
-        return Some(1);
-    }
-    let every = contains_every_word(c, q);
+    stage();
     if chars >= 2 && !q.contains(char::is_whitespace) && c.initials.contains(q) {
-        return Some(3);
+        return Some(T_INITIALS);
     }
-    if every {
-        return Some(4);
+    stage();
+    let hidden = hidden_best(c, q, chars).map(|(t, _)| t);
+    if hidden == Some(T_SYN_EQ) {
+        return hidden;
     }
-    if chars >= 2 && c.any_keyword(|k| k.starts_with(q)) {
-        return Some(5);
+    stage();
+    if contains_every_word(c, q) {
+        return Some(T_SUBSTR);
     }
-    None
+    hidden
 }
 
-/// The caller's policy in one place: every candidate through tiers 0-5; only when none matched, through tier 6.
+/// The caller's policy in one place: every candidate through tiers 0-7; only when none matched, through tier 8.
 /// Pushes (index, tier) into `out` (cleared first).
 #[cfg(test)]
 pub fn match_all(cands: &[Cand], q: &str, out: &mut Vec<(usize, u8)>) {
@@ -308,7 +340,7 @@ pub fn match_fuzzy(c: &Cand, q: &str) -> Option<u8> {
     };
     let compact = |t: &str| subsequence_gaps(t, qc, 2);
     if m >= 3 && qc.iter().all(|ch| !ch.is_whitespace()) && compact(c.folded) {
-        return Some(6);
+        return Some(T_FUZZY);
     }
     if dist == 0 {
         return None;
@@ -319,7 +351,7 @@ pub fn match_fuzzy(c: &Cand, q: &str) -> Option<u8> {
             || k.match_indices(' ').any(|(i, _)| k.get(i + 1..).is_some_and(|t| near_prefix(t, qc, dist)))
     };
     if name || c.any_keyword(key) {
-        return Some(6);
+        return Some(T_FUZZY);
     }
     None
 }
@@ -443,6 +475,67 @@ mod tests {
         let mut out = String::new();
         fold(s, &mut out);
         out
+    }
+
+    #[test]
+    fn tier_order() {
+        use crate::launcher::catalog::CatApp;
+        use crate::launcher::model::SettingRow;
+        use crate::start_search::XML_KEYWORD_PENALTY as XML;
+        let app = |id: &str, name: &str| CatApp::new(id, name, Keys::default(), 1);
+        let calc = app("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calculator");
+        let notepad = app("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", "Notepad");
+        let rdc = app("Microsoft.Windows.RemoteDesktop", "Remote Desktop Connection");
+        let control = app("Microsoft.Windows.ControlPanel", "Control Panel");
+        let italian_calc = app("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice");
+        let remote = Indexed::new("Network");
+        let remote_keys = Keys::from(&[("remote desktop", 900)][..]).tidy();
+        let devices = SettingRow::new(0, "Gestione dispositivi", Keys::from(&[("device manager", XML)][..]).tidy(), 1);
+        // One candidate per tier, the examples of the plan's Appendix B.1.
+        let cases: [(Cand, &str, u8); 9] = [
+            (calc.cand(), "calc", T_EXACT),
+            (notepad.cand(), "notep", T_PREFIX),
+            (rdc.cand(), "desktop conn", T_WORD),
+            (rdc.cand(), "rdc", T_INITIALS),
+            (rdc.cand(), "rdp", T_SYN_EQ),
+            (control.cand(), "ntrol", T_SUBSTR),
+            (remote.cand(&remote_keys, &[], 1), "remot", T_SYN_PREFIX),
+            (devices.cand(), "device manager", T_BAG_EQ),
+            (italian_calc.cand(), "calcolatirce", T_FUZZY),
+        ];
+        let mut last = None;
+        for (c, q, want) in &cases {
+            let got = match_tiers(c, q).or_else(|| match_fuzzy(c, q));
+            assert_eq!(got, Some(*want), "{q}");
+            assert!(last.is_none_or(|l| l < *want), "the tiers are in order");
+            last = Some(*want);
+        }
+        assert_eq!(T_FUZZY, 8);
+    }
+
+    #[test]
+    fn penalty_orders_hidden_tiers() {
+        let x = Indexed::new("Wireless");
+        let k = |p: u32| Keys::from(&[("wifi", p)][..]).tidy();
+        let (k400, k650, k900) = (k(400), k(650), k(900));
+        let (a, b, c) = (x.cand(&k400, &[], 5), x.cand(&k900, &[], 1), x.cand(&k650, &[], 9));
+        let score = |c: &Cand, kind: u8| {
+            let t = match_tiers(c, "wifi").unwrap();
+            assert_eq!(t, T_SYN_EQ);
+            score_for(c, "wifi", t, false, kind)
+        };
+        // Two settings (kind 3) with penalties 400 and 900 and a command (kind 2) with 650: the penalty decides before the
+        // kind and before the popularity rank.
+        let mut rows = [(score(&b, 3), "b"), (score(&c, 2), "c"), (score(&a, 3), "a")];
+        rows.sort();
+        assert_eq!(rows.map(|r| r.1), ["a", "c", "b"]);
+        // Outside the hidden tiers the kind still comes first.
+        let n = Indexed::new("Wifi tool");
+        let by_name = |kind: u8, rank: u32| {
+            let c = n.cand(Keys::none(), &[], rank);
+            score_for(&c, "wifi", match_tiers(&c, "wifi").unwrap(), false, kind)
+        };
+        assert!(by_name(2, 9) < by_name(3, 1));
     }
 
     #[test]
@@ -614,6 +707,17 @@ mod fixtures {
         ("OneDrive", "OneDrive", "onedrive.exe", NONE),
     ];
 
+    /// English name and the XML words it carries in the fixture (tier 7).
+    const XML_WORDS: &[(&str, &[&str])] = &[
+        ("Photos", &["pictures"]),
+        ("Camera", &["video"]),
+        ("Maps", &["directions"]),
+        ("Weather", &["temperature"]),
+        ("Mail", &["inbox"]),
+        ("Clock", &["stopwatch"]),
+        ("Calendar", &["agenda"]),
+    ];
+
     /// Commands: English name, Italian name, hidden keywords (commands.rs will own the real ones).
     const COMMANDS: &[(&str, &str, &[&str])] = &[
         ("Lock", "Blocca", &["lock", "blocca"]),
@@ -643,6 +747,14 @@ mod fixtures {
             for s in inbox.map_or(&[][..], |e| e.synonyms) {
                 k.push(s, 1);
             }
+            // Settings-style XML words (the sentinel penalty) on a few entries: the T_BAG_EQ tier.
+            for (app, words) in XML_WORDS {
+                if app == en {
+                    for w in *words {
+                        k.push(w, crate::start_search::XML_KEYWORD_PENALTY);
+                    }
+                }
+            }
             v.push(Entry {
                 en,
                 name,
@@ -671,7 +783,7 @@ mod fixtures {
         o
     }
 
-    /// The caller's policy: tiers 0-5 over everything, tier 6 only when they found nothing. First by Score, then by
+    /// The caller's policy: tiers 0-7 over everything, tier 8 only when they found nothing. First by Score, then by
     /// folded name.
     fn best(it: bool, query: &str) -> Option<(&'static str, u8)> {
         let pool = pool(it);
@@ -817,13 +929,13 @@ en|window m|Window menu|1
 en|task man|Task Manager|1
 en|note|Notepad|1
 en|adobe|Adobe Photoshop 2025|1
-en|rdp|Remote Desktop Connection|1
+en|rdp|Remote Desktop Connection|4
 en|mstsc|Remote Desktop Connection|0
 en|regedit|Registry Editor|0
 en|cmd|Command Prompt|0
 en|taskmgr|Task Manager|0
-en|defender|Windows Security|1
-en|browser|Microsoft Edge|1
+en|defender|Windows Security|4
+en|browser|Microsoft Edge|4
 en|edge|Microsoft Edge|2
 en|explorer|File Explorer|2
 en|spegni|Shut down|0
@@ -932,15 +1044,15 @@ en|dm|Device Manager|3
 it|gd|Device Manager|3
 it|ga|Task Manager|3
 it|rds|Registry Editor|3
-en|eam|Teams|4
-en|oogle|Google Chrome|4
-en|culator|Calculator|4
-en|xplor|File Explorer|4
-en|hrome|Google Chrome|4
-en|ntrol|Control Panel|4
-en|oto|Photos|4
-en|ager|Task Manager|4
-en|ntrol pa|Control Panel|4
+en|eam|Teams|5
+en|oogle|Google Chrome|5
+en|culator|Calculator|5
+en|xplor|File Explorer|5
+en|hrome|Google Chrome|5
+en|ntrol|Control Panel|5
+en|oto|Photos|5
+en|ager|Task Manager|5
+en|ntrol pa|Control Panel|5
 en|calcol|Calculator|1
 en|esplora|File Explorer|1
 en|blocco|Notepad|1
@@ -968,26 +1080,37 @@ en|discon|Sign out|1
 en|bloc|Notepad|1
 it|snipping|Snipping Tool|1
 it|sticky|Sticky Notes|1
-en|brows|Microsoft Edge|5
-en|defen|Windows Security|5
-en|webc|Camera|5
-en|galle|Photos|5
-en|forec|Weather|5
-en|navig|Maps|5
-en|clacolatrice|Calculator|6
-en|notpead|Notepad|6
-en|calclator|Calculator|6
-en|firefx|Firefox|6
-en|chorme|Google Chrome|6
-en|spotfy|Spotify|6
-en|discrod|Discord|6
-en|exlorer|File Explorer|6
-en|taks manager|Task Manager|6
-en|steem|Steam|6
-en|gogle|Google Chrome|6
-it|notpad|Notepad|6
-it|pannelo di controllo|Control Panel|6
-it|calcolatrcie|Calculator|6
+en|brows|Microsoft Edge|6
+en|webcam|Camera|4
+en|gallery|Photos|4
+en|navigation|Maps|4
+en|forecast|Weather|4
+en|pictures|Photos|7
+en|video|Camera|7
+en|directions|Maps|7
+en|temperature|Weather|7
+en|inbox|Mail|7
+en|stopwatch|Clock|7
+en|agenda|Calendar|7
+en|defen|Windows Security|6
+en|webc|Camera|6
+en|galle|Photos|6
+en|forec|Weather|6
+en|navig|Maps|6
+en|clacolatrice|Calculator|8
+en|notpead|Notepad|8
+en|calclator|Calculator|8
+en|firefx|Firefox|8
+en|chorme|Google Chrome|8
+en|spotfy|Spotify|8
+en|discrod|Discord|8
+en|exlorer|File Explorer|8
+en|taks manager|Task Manager|8
+en|steem|Steam|8
+en|gogle|Google Chrome|8
+it|notpad|Notepad|8
+it|pannelo di controllo|Control Panel|8
+it|calcolatrcie|Calculator|8
 en|qqqqqq|-|0
 en|xyz|-|0
 en|hello world|-|0
@@ -1015,26 +1138,26 @@ it|zzzz|-|0
 
     #[test]
     fn fixtures_cover_every_tier() {
-        for t in 0..=6 {
+        for t in 0..=8 {
             assert!(ROWS.lines().filter(|l| l.ends_with(&format!("|{t}"))).count() >= 6, "tier {t}");
         }
     }
 
     #[test]
-    fn tier6_only_when_nothing_else() {
+    fn fuzzy_only_when_nothing_else() {
         let pool = pool(false);
         let cands: Vec<Cand> = pool.iter().map(|e| e.name.cand(&e.keys, e.extra, e.rank)).collect();
         let mut out = Vec::new();
-        // "notpead" matches nothing in tiers 0-5, so the fuzzy pass runs and every hit is tier 6.
+        // "notpead" matches nothing in tiers 0-7, so the fuzzy pass runs and every hit is tier 8.
         assert!(cands.iter().all(|c| match_tiers(c, "notpead").is_none()));
         match_all(&cands, "notpead", &mut out);
-        assert!(!out.is_empty() && out.iter().all(|&(_, t)| t == 6));
-        // "notepad" has tier 0-5 matches: no tier 6 row may appear next to them, though "notpad" is also close.
+        assert!(!out.is_empty() && out.iter().all(|&(_, t)| t == T_FUZZY));
+        // "notepad" has tier 0-7 matches: no fuzzy row may appear next to them, though "notpad" is also close.
         match_all(&cands, "notepad", &mut out);
-        assert!(!out.is_empty() && out.iter().all(|&(_, t)| t <= 5));
-        // match_tiers itself never answers 6.
+        assert!(!out.is_empty() && out.iter().all(|&(_, t)| t <= T_BAG_EQ));
+        // match_tiers itself never answers the fuzzy tier.
         for q in ["notpead", "clacolatrice", "xyz", "calc", "vsc", "bloc"] {
-            assert!(cands.iter().all(|c| match_tiers(c, q).is_none_or(|t| t <= 5)));
+            assert!(cands.iter().all(|c| match_tiers(c, q).is_none_or(|t| t <= T_BAG_EQ)));
         }
         // An empty query matches nothing, in either pass.
         assert!(cands.iter().all(|c| match_tiers(c, " ").is_none() && match_fuzzy(c, "").is_none()));

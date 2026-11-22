@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(names, ["Àlfa", "Connessione Desktop Remoto", "Zeta"]);
         let rdc = &apps[1];
         assert_eq!(rdc.rank, 3);
-        assert_eq!(rank::match_tiers(&rdc.cand(), "rdp"), Some(1), "the synonym finds it");
+        assert_eq!(rank::match_tiers(&rdc.cand(), "rdp"), Some(4), "the synonym finds it");
         assert_eq!((apps[0].rank, apps[2].rank), (99, 99), "an app without a rank gets the default");
         // No index: no keywords, rank 0.
         let bare = ingest(&list, None);

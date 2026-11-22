@@ -166,7 +166,7 @@ pub const ORDER: [ProviderId; 8] = [
     ProviderId::Registry,
 ];
 
-/// The providers that rank candidates by tiers: only they take part in the tier 6 pass.
+/// The providers that rank candidates by tiers: only they take part in the fuzzy (tier 8) pass.
 const RANKED: [ProviderId; 5] =
     [ProviderId::Apps, ProviderId::Windows, ProviderId::Commands, ProviderId::Settings, ProviderId::Registry];
 
@@ -189,8 +189,12 @@ const KIND_FILE: u8 = 6;
 /// score, so a full `TopK` never drops them.
 const PINNED: Score = Score { tier: 0, learned: Reverse(u16::MAX), idle: false, kind: 0, rank: 0, len: 0 };
 
-/// The implicit run line of Mixed mode sorts below every row matched at tiers 0-5 (5.2.4: "below the app rows").
+/// The implicit run line of Mixed mode sorts below every row matched at tiers 0-5 (5.2.4: "below the app rows"); T7
+/// places it after the top hit instead.
 const IMPLICIT_RUN_TIER: u8 = 6;
+
+/// In Mixed mode at most this many settings rows that only a hidden word matched (tiers 4, 6 and 7).
+const HIDDEN_SETTINGS_CAP: usize = 3;
 
 /// A provider's time budget per keystroke (5.4.1), counted in every build and never asserted (house rule 8).
 pub const BUDGET_US: u64 = 2_000;
@@ -236,8 +240,8 @@ fn runs(id: ProviderId, q: &Query, mask: ProviderMask) -> bool {
     }
 }
 
-/// Every provider that runs for this query, in the order of 5.4.1, into one `TopK`. Tier 6 runs only when no
-/// ranked candidate matched at tiers 0-5. Each provider is timed against its budget.
+/// Every provider that runs for this query, in the order of 5.4.1, into one `TopK`. Tier 8 runs only when no
+/// ranked candidate matched at tiers 0-7. Each provider is timed against its budget.
 pub fn query_all(q: &Query, cx: &Context, budget: &mut Budget) -> TopK {
     query_all_traced(q, cx, budget, &mut |_| {})
 }
@@ -423,7 +427,7 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
             let mut f = String::with_capacity(q.raw.len());
             rank::fold(q.raw.trim(), &mut f);
             raw_folded = f;
-            (&raw_folded, 1)
+            (&raw_folded, rank::T_PREFIX)
         }
         _ => (&q.folded, u8::MAX),
     };
@@ -435,11 +439,11 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         hits += 1;
         // Look for the running window only when the row could stay: running is the better of the two scores.
         let learned = learned_boost(cx, ProviderId::Apps, &app.id);
-        if !top.accepts(&Score { learned, ..c.score(tier, true, KIND_APP) }) {
+        if !top.accepts(&Score { learned, ..rank::score_for(&c, text, tier, true, KIND_APP) }) {
             continue;
         }
         let win = cx.windows.iter().position(|w| same_program(app, w));
-        let score = Score { learned, ..c.score(tier, win.is_some(), KIND_APP) };
+        let score = Score { learned, ..rank::score_for(&c, text, tier, win.is_some(), KIND_APP) };
         if top.accepts(&score) {
             keep_best(&mut best, top.cap, score, &app.name, (i, win));
         }
@@ -573,7 +577,7 @@ fn command_score(cmd: &Command, i: usize, q: &Query, fuzzy: bool, s: &mut Scratc
     s.name.reset(cmd.name());
     let c = s.name.cand(&no_keys, cmd.keywords, index_u32(i));
     let tier = tier_of(&c, &q.folded, fuzzy)?;
-    Some(c.score(tier, false, KIND_COMMAND))
+    Some(rank::score_for(&c, &q.folded, tier, false, KIND_COMMAND))
 }
 
 /// One command row (`command_score`).
@@ -632,16 +636,22 @@ fn registry(q: &Query, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
 fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK) -> usize {
     let mut hits = 0;
     let mut best = Vec::with_capacity(top.cap);
+    // Mixed mode: the rows only a hidden word matched are the best HIDDEN_SETTINGS_CAP of their own (L3 T6); "$" has no cap.
+    let capped = q.mode == Mode::Mixed;
+    let mut hidden = Vec::with_capacity(if capped { HIDDEN_SETTINGS_CAP } else { 0 });
     for row in cx.settings {
         let c = row.cand();
         let Some(tier) = tier_of(&c, &q.folded, fuzzy) else { continue };
         hits += 1;
         let learned = learned_boost(cx, ProviderId::Settings, &row.name);
-        let score = Score { learned, ..c.score(tier, false, KIND_SETTING) };
-        if top.accepts(&score) {
+        let score = Score { learned, ..rank::score_for(&c, &q.folded, tier, false, KIND_SETTING) };
+        if capped && matches!(tier, rank::T_SYN_EQ | rank::T_SYN_PREFIX | rank::T_BAG_EQ) {
+            keep_best(&mut hidden, HIDDEN_SETTINGS_CAP, score, &row.name, row);
+        } else if top.accepts(&score) {
             keep_best(&mut best, top.cap, score, &row.name, row);
         }
     }
+    best.extend(hidden);
     for (score, _, row) in best {
         top.push(Item {
             key: ItemKey::of(ProviderId::Settings, &row.name),
@@ -1424,9 +1434,21 @@ pub(crate) mod tests {
     fn tier6_runs_only_when_nothing_matched() {
         let fx = Fx::new();
         let rows = fx.rows("clacolatrice");
-        assert_eq!((&*rows[0].title, rows[0].score.tier), ("Calcolatrice", 6));
+        assert_eq!((&*rows[0].title, rows[0].score.tier), ("Calcolatrice", 8));
         // "stea" matches Steam by prefix: no fuzzy rows next to it.
-        assert!(fx.rows("stea").iter().all(|r| r.score.tier < 6));
+        assert!(fx.rows("stea").iter().all(|r| r.score.tier < rank::T_FUZZY));
+    }
+
+    #[test]
+    fn at_most_three_hidden_settings_in_mixed() {
+        use crate::start_search::XML_KEYWORD_PENALTY as XML;
+        let mut fx = Fx::new();
+        fx.settings = (0..6)
+            .map(|i| SettingRow::new(i, &format!("Panel {i}"), Keys::from(&[("frobnicate", XML)][..]), 10 + i))
+            .collect();
+        let settings = |raw: &str| fx.rows(raw).into_iter().filter(|r| r.kind == Kind::Setting).count();
+        assert_eq!(settings("frobnicate"), 3, "Mixed mode: the best three of the hidden-only rows");
+        assert_eq!(settings("$frobnicate"), 6, "the Settings mode has no cap");
     }
 
     #[test]

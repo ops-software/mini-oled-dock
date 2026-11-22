@@ -18,10 +18,9 @@ use super::runline;
 use crate::shell_thread::StartApp;
 use crate::start_search::{AppIndex, Keys, Setting};
 
-/// The fuzzy tier (L3 T6 numbers it 8).
-const TIER_FUZZY: u8 = 8;
-/// Tiers 4, 6 and 7: a hidden word (synonym or XML keyword) was the only match (L3 T6).
-const HIDDEN_TIERS: [u8; 3] = [4, 6, 7];
+const TIER_FUZZY: u8 = rank::T_FUZZY;
+/// A hidden word (a curated synonym or an XML keyword) was the only match.
+const HIDDEN_TIERS: [u8; 3] = [rank::T_SYN_EQ, rank::T_SYN_PREFIX, rank::T_BAG_EQ];
 
 const EN_NUM: NumberStyle = NumberStyle { decimal: '.', group: ',' };
 const IT_NUM: NumberStyle = NumberStyle { decimal: ',', group: '.' };
