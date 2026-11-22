@@ -62,10 +62,10 @@ static EXPLORER_TRAY: AtomicIsize = AtomicIsize::new(0);
 /// `now_ms()` when `explorer_gone` stopped our tray host (0 = not paused): it is started again once the
 /// new Explorer has registered its desktop (`on_reannounce_timer`).
 static HOST_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
-/// true once `hide_all` has logged that it held back `ABM_SETSTATE` because of an edge conflict; cleared when
-/// the state is sent again, when auto-hide reads on and on an Explorer restart, so a lasting conflict is
-/// logged once, not every second.
-static EDGE_CONFLICT_LOGGED: AtomicBool = AtomicBool::new(false);
+/// The window that held the taskbar's edge at the last hold-back (0 = no hold-back in effect): its DESTROY
+/// runs `hide_all` again. Cleared when the state is sent again, when auto-hide reads on and on an Explorer
+/// restart, so a lasting conflict is logged once, not every second.
+static EDGE_HOLDER: AtomicIsize = AtomicIsize::new(0);
 /// Taskbar state (`ABS_*`) of the last `ABM_GETSTATE` read by `hide_all`, or `STATE_UNREAD` / `STATE_UNKNOWN`:
 /// a change is logged once, so the log tells whether Explorer turned auto-hide off by itself or kept it off.
 static LAST_STATE: AtomicU32 = AtomicU32::new(STATE_UNREAD);
@@ -752,6 +752,33 @@ pub fn remove_hook() {
     }
 }
 
+/// What a DESTROY event of `hwnd` means for the taskbar.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DestroyAct {
+    /// Explorer's primary taskbar is gone (Explorer exits or crashes).
+    ExplorerGone,
+    /// The window that held the taskbar's edge is gone: auto-hide can be asked for again.
+    HolderGone,
+    Ignore,
+}
+
+fn destroy_act(hwnd: isize, explorer_tray: isize, holder: isize) -> DestroyAct {
+    if hwnd == 0 {
+        DestroyAct::Ignore
+    } else if hwnd == explorer_tray {
+        DestroyAct::ExplorerGone
+    } else if hwnd == holder {
+        DestroyAct::HolderGone
+    } else {
+        DestroyAct::Ignore
+    }
+}
+
+/// true if a hold-back by `owner` is a new conflict (the previous holder was another window or none).
+fn hold_back_is_news(prev: isize, owner: isize) -> bool {
+    prev != owner
+}
+
 /// WinEvent callback (UI thread): filters the taskbar classes (also on the parent) and posts
 /// `WM_DOCK_TASKBAR_EVENT` (wParam = event, lParam = HWND) to the dock window.
 unsafe extern "system" fn winevent_proc(
@@ -767,7 +794,7 @@ unsafe extern "system" fn winevent_proc(
         return;
     }
     if event == EVENT_OBJECT_DESTROY {
-        if hwnd.0 as isize != EXPLORER_TRAY.load(Relaxed) {
+        if destroy_act(hwnd.0 as isize, EXPLORER_TRAY.load(Relaxed), EDGE_HOLDER.load(Relaxed)) == DestroyAct::Ignore {
             return;
         }
     } else if event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE {
@@ -831,7 +858,7 @@ pub fn hide_all() {
     // A failed read counts as auto-hide off: the request is sent as 1.4.2 did (fail open).
     let state = read.unwrap_or(0);
     if state & ABS_AUTOHIDE != 0 {
-        EDGE_CONFLICT_LOGGED.store(false, Relaxed); // a conflict after this one is logged again
+        EDGE_HOLDER.store(0, Relaxed); // a conflict after this one is logged again
     }
     // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
     // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
@@ -850,7 +877,7 @@ pub fn hide_all() {
     match autohide_action(state, owner) {
         AutoHideAction::Nothing => {}
         AutoHideAction::HoldBack(owner) => {
-            if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
+            if hold_back_is_news(EDGE_HOLDER.swap(owner, Relaxed), owner) {
                 // `Held` comes only from an answered question, which named the edge and monitor.
                 let (edge, mon) = asked.as_ref().map_or((u32::MAX, RECT::default()), |&q| q);
                 let holder = HWND(owner as *mut c_void);
@@ -879,7 +906,7 @@ pub fn hide_all() {
             if RESTORING.load(Relaxed) || restored_externally() {
                 return;
             }
-            EDGE_CONFLICT_LOGGED.store(false, Relaxed);
+            EDGE_HOLDER.store(0, Relaxed);
             log!("taskbar: {}{}, sending ABM_SETSTATE", autohide_off_text(read), edge_check_text(owner, &asked));
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
             // The direct send waits up to APPBAR_TIMEOUT_MS, so the same race is checked again before the
@@ -926,8 +953,18 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
         return;
     }
     if event == EVENT_OBJECT_DESTROY {
-        if hwnd.0 as isize == EXPLORER_TRAY.swap(0, Relaxed) {
-            explorer_gone();
+        let h = hwnd.0 as isize;
+        match destroy_act(h, EXPLORER_TRAY.load(Relaxed), EDGE_HOLDER.load(Relaxed)) {
+            DestroyAct::ExplorerGone => {
+                EXPLORER_TRAY.store(0, Relaxed);
+                explorer_gone();
+            }
+            DestroyAct::HolderGone => {
+                EDGE_HOLDER.store(0, Relaxed);
+                log!("taskbar: window 0x{h:X} that held the taskbar's edge is gone, asking for auto-hide again");
+                hide_all();
+            }
+            DestroyAct::Ignore => {}
         }
         return;
     }
@@ -1011,7 +1048,7 @@ fn arm_reannounce(ms: u32) {
 /// does not broadcast `TaskbarCreated` on restart, so the window event is what actually fires.
 fn explorer_restarted(why: &str) {
     log!("taskbar: Explorer restarted ({why}), redoing self-heal and hide");
-    EDGE_CONFLICT_LOGGED.store(false, Relaxed); // the new Explorer's conflicts are news
+    EDGE_HOLDER.store(0, Relaxed); // the new Explorer's conflicts are news
     self_heal();
     if !ensure_state_saved(None) {
         log!("taskbar: state not saveable after the Explorer restart, not hiding");
@@ -1274,6 +1311,21 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_holder_bookkeeping() {
+        use DestroyAct::*;
+        assert_eq!(destroy_act(0, 0, 0), Ignore, "a null window is never news");
+        assert_eq!(destroy_act(0, 5, 7), Ignore);
+        assert_eq!(destroy_act(5, 5, 7), ExplorerGone);
+        assert_eq!(destroy_act(7, 5, 7), HolderGone);
+        assert_eq!(destroy_act(9, 5, 7), Ignore);
+        assert_eq!(destroy_act(5, 5, 5), ExplorerGone, "Explorer's tray wins over the holder");
+        assert_eq!(destroy_act(7, 0, 0), Ignore, "nothing tracked");
+        assert!(hold_back_is_news(0, 7));
+        assert!(hold_back_is_news(5, 7), "a different holder is news");
+        assert!(!hold_back_is_news(7, 7), "the same holder is logged once");
+    }
 
     #[test]
     fn fallback_confirms_only_the_auto_hide_bit() {
