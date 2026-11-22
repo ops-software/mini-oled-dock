@@ -783,9 +783,9 @@ pub fn suspend_mouse_hook() -> bool {
     was
 }
 
-/// Reinstalls the hook removed by `suspend_mouse_hook`, if a popup is still open.
+/// Reinstalls the hook removed by `suspend_mouse_hook`, if a popup is still open (never for the launcher).
 pub fn resume_mouse_hook(was: bool) {
-    if was && is_open() {
+    if was && is_open() && current() != Some(PopupKind::Launcher) {
         install_mouse_hook();
     }
 }
@@ -1031,7 +1031,11 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     // SAFETY: `hwnd` is our popup window.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
     store_rect(&ITEM_RECT, &anchor.item);
-    install_mouse_hook();
+    // The launcher installs no mouse hook (SPEC 5.2.10): a busy UI thread would stall the system mouse. It closes on
+    // focus loss alone.
+    if kind != PopupKind::Launcher {
+        install_mouse_hook();
+    }
     let focused = crate::ui::force_foreground(hwnd);
     // SAFETY: `hwnd` is our window; the callbacks are in its wnd_proc.
     unsafe {

@@ -508,6 +508,60 @@ fn launcher_timers_are_one_shot() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- lint 8: the launcher installs no mouse hook -------------------------------------------------------------------
+
+const NO_HOOK_GUARD: &str = "kind != PopupKind::Launcher";
+
+/// Inside `fn open(` of src/popup.rs, every `install_mouse_hook();` holds the guard on its own line or sits right under a
+/// line (the nearest non-blank one) that holds the guard and ends with `{`.
+fn mouse_hook_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != "src/popup.rs" {
+        return v;
+    }
+    let Some((s, e)) = fn_body(text, "fn open(", 0) else {
+        v.push(format!("{path}: fn open( not found"));
+        return v;
+    };
+    let first = line_of(text, s);
+    let lines: Vec<&str> = text.get(s..e).unwrap_or("").lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        if !l.contains("install_mouse_hook();") || l.contains(NO_HOOK_GUARD) {
+            continue;
+        }
+        let prev = lines.get(..i).and_then(|p| p.iter().rev().find(|p| !p.trim().is_empty()));
+        if !prev.is_some_and(|p| p.contains(NO_HOOK_GUARD) && p.trim_end().ends_with('{')) {
+            v.push(format!("{path}:{}: install_mouse_hook() in fn open without {NO_HOOK_GUARD}", first + i));
+        }
+    }
+    v
+}
+
+#[test]
+fn no_mouse_hook_for_the_launcher() {
+    let p = "src/popup.rs";
+    let good = "fn open(kind: K) {\n    store();\n    if kind != PopupKind::Launcher {\n        install_mouse_hook();\n    }\n}\n";
+    assert!(mouse_hook_violations(p, good).is_empty());
+    let one_line = "fn open(kind: K) {\n    if kind != PopupKind::Launcher { install_mouse_hook(); }\n}\n";
+    assert!(mouse_hook_violations(p, one_line).is_empty());
+    let blank = "fn open(kind: K) {\n    if kind != PopupKind::Launcher {\n\n        install_mouse_hook();\n    }\n}\n";
+    assert!(mouse_hook_violations(p, blank).is_empty());
+    // 1.4.3's open: the call right under store_rect.
+    let bare = "fn open(kind: K) {\n    store_rect(&ITEM_RECT, &anchor.item);\n    install_mouse_hook();\n}\n";
+    assert_eq!(
+        mouse_hook_violations(p, bare),
+        ["src/popup.rs:3: install_mouse_hook() in fn open without kind != PopupKind::Launcher"]
+    );
+    let no_brace = "fn open(kind: K) {\n    let x = kind != PopupKind::Launcher;\n    install_mouse_hook();\n}\n";
+    assert_eq!(mouse_hook_violations(p, no_brace).len(), 1);
+    // Only fn open is checked; a file without it fails rather than passing empty.
+    assert!(mouse_hook_violations(p, &format!("fn resume() {{\n    install_mouse_hook();\n}}\n{good}")).is_empty());
+    assert_eq!(mouse_hook_violations(p, "fn close() {}").len(), 1);
+    assert!(mouse_hook_violations("src/ui.rs", bare).is_empty());
+    let all = scan_tree(mouse_hook_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
