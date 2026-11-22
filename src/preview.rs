@@ -1092,7 +1092,7 @@ pub fn run(dir: &str) -> i32 {
                 None => false,
             };
             if italian {
-                crate::i18n::set_preview(true);
+                crate::i18n::set_preview(english_preview(&plan()));
             }
             failures += i32::from(!ok);
         }
@@ -1128,9 +1128,23 @@ pub fn run(dir: &str) -> i32 {
     0
 }
 
+/// The i18n preview bit a cell runs with: set (English) unless the cell renders Italian.
+fn english_preview(p: &Plan) -> bool {
+    !p.italian
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn italian_cell_keeps_italian_after_an_it_popup() {
+        let it = Plan::try_from_vars(Some("96"), Some("it"), None).unwrap();
+        let en = Plan::try_from_vars(Some("96"), Some("en"), None).unwrap();
+        assert!(!english_preview(&it));
+        assert!(english_preview(&en));
+        assert!(english_preview(&Plan::LEGACY));
+    }
 
     #[test]
     fn plan_defaults_are_the_legacy_run() {
