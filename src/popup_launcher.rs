@@ -41,6 +41,10 @@ impl Content for Launcher {
     fn wants_sys_keys(&self) -> bool {
         true
     }
+
+    fn focus_lost_closes(&self) -> bool {
+        true
+    }
 }
 
 /// The content of a new launcher popup (`popup::make_content`).

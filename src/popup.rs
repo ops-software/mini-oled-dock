@@ -332,6 +332,19 @@ pub(crate) trait Content {
     fn close_request(&mut self) -> Reply {
         Reply::Close
     }
+    /// `true`: the popup became the foreground window (once per open). `false`: it lost it and is about to close.
+    fn focus(&mut self, _active: bool) -> Reply {
+        Reply::None
+    }
+    /// The pointer moved to `(x, y)` (client px); called before the hit test.
+    fn pointer(&mut self, _x: i32, _y: i32) -> Reply {
+        Reply::None
+    }
+    /// true: the popup closes when the foreground retries end without the keyboard (the launcher: what the user types
+    /// would reach the window behind it).
+    fn focus_lost_closes(&self) -> bool {
+        false
+    }
     /// 1 s tick (`TIMER_POPUP_TICK`); also fired early by `popup::tick_soon`.
     fn tick(&mut self) -> Reply {
         Reply::None
@@ -1433,11 +1446,23 @@ fn mark_active(hwnd: HWND) {
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     if fg == hwnd {
-        with(|st| {
-            if let Some(o) = st.open.as_mut() {
-                o.was_active = true;
-            }
-        });
+        became_foreground();
+    }
+}
+
+/// The open popup is seen as the foreground window: the first time per open the content hears `focus(true)`.
+fn became_foreground() {
+    let reply = with(|st| {
+        let o = st.open.as_mut()?;
+        if o.was_active {
+            return None;
+        }
+        o.was_active = true;
+        Some(o.content.focus(true))
+    })
+    .flatten();
+    if let Some(r) = reply {
+        apply(r);
     }
 }
 
@@ -1449,7 +1474,13 @@ fn on_inactive(other: HWND) {
             log!("popup: focus lost to the fullscreen app's bounce: staying open");
             return;
         }
-        with(|st| st.last_inactive = Some((k, now_ms())));
+        with(|st| {
+            st.last_inactive = Some((k, now_ms()));
+            if let Some(o) = st.open.as_mut() {
+                // The popup closes right below: the reply has nothing left to change.
+                let _ = o.content.focus(false);
+            }
+        });
         close_inner("focus lost");
     }
 }
@@ -1457,10 +1488,10 @@ fn on_inactive(other: HWND) {
 fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
     let r = with(|st| {
         let o = st.open.as_mut()?;
+        let mut reply = o.content.pointer(x, y);
         let hit = o.content.hit(x, y);
-        let mut reply = Reply::None;
         if let Some(id) = o.pressed {
-            reply = o.content.drag(id, x, y);
+            reply = reply.merge(o.content.drag(id, x, y));
             let nh = if hit == Some(id) { hit } else { None };
             if nh != o.hot {
                 o.hot = nh;
@@ -1468,7 +1499,7 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
             }
         } else if hit != o.hot {
             o.hot = hit;
-            reply = Reply::Redraw;
+            reply = reply.merge(Reply::Redraw);
         }
         let need = !o.tracking;
         o.tracking = true;
@@ -1679,21 +1710,45 @@ fn on_start_release(hwnd: HWND) {
     }
 }
 
+/// What follows a foreground attempt of `on_focus_retry`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    /// Try again after `FOCUS_RETRY_MS`.
+    Again,
+    /// No more tries; the popup stays (the tick safety net remains).
+    Stop,
+    /// No more tries and the content closes without the keyboard (`focus_lost_closes`).
+    Close,
+}
+
+/// The outcome of a foreground attempt: `tries_left` after it, `focused` its result.
+fn retry_outcome(tries_left: u8, focused: bool, focus_lost_closes: bool) -> Retry {
+    if focused {
+        Retry::Stop
+    } else if tries_left > 0 {
+        Retry::Again
+    } else if focus_lost_closes {
+        Retry::Close
+    } else {
+        Retry::Stop
+    }
+}
+
 /// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
 /// the foreground is still the window that was in front at open time (or null, or ours): if the
 /// user has meanwhile moved to another window, the popup is not pushed in front of it (the tick
-/// safety net closes it).
+/// safety net closes it). A content that `focus_lost_closes` closes when the last try fails.
 fn on_focus_retry(hwnd: HWND) {
     // SAFETY: timer of our window.
     let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_FOCUS) };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
+    if fg == hwnd {
+        became_foreground();
+        return;
+    }
     let go = with(|st| {
         let o = st.open.as_mut()?;
-        if fg == hwnd {
-            o.was_active = true;
-            return None;
-        }
         if o.focus_tries == 0 {
             return None;
         }
@@ -1702,17 +1757,21 @@ fn on_focus_retry(hwnd: HWND) {
             return None;
         }
         o.focus_tries -= 1;
-        Some((o.focus_tries, ()))
+        Some((o.focus_tries, o.content.focus_lost_closes()))
     })
     .flatten();
-    let Some((left, _)) = go else { return };
+    let Some((left, closes)) = go else { return };
     let ok = crate::ui::force_foreground(hwnd);
     log!("popup: foreground retry ({left} left) -> {ok}");
-    if !ok && left > 0 {
-        // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
-        if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
-            log!("popup: SetTimer(focus) failed");
+    match retry_outcome(left, ok, closes) {
+        Retry::Again => {
+            // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
+            if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
+                log!("popup: SetTimer(focus) failed");
+            }
         }
+        Retry::Stop => {}
+        Retry::Close => close_inner("no foreground"),
     }
 }
 
@@ -1741,11 +1800,7 @@ fn on_tick(hwnd: HWND) {
         // SAFETY: no preconditions.
         let fg = unsafe { GetForegroundWindow() };
         if fg == hwnd {
-            with(|st| {
-                if let Some(o) = st.open.as_mut() {
-                    o.was_active = true;
-                }
-            });
+            became_foreground();
         } else if fg != fg_at_open && !crate::ui::fs_bounce_grace(fg) {
             close_inner("foreground changed");
             return;
@@ -1968,6 +2023,19 @@ mod tests {
         assert_eq!(utf16_char(&mut held, 0xD83C), None, "a second high replaces the first");
         assert_eq!(utf16_char(&mut held, 0xDF89), Some('\u{1F389}'));
         assert_eq!(utf16_char(&mut held, 0xE9), Some('\u{E9}'));
+    }
+
+    #[test]
+    fn focus_retry_outcomes() {
+        assert_eq!(retry_outcome(3, false, false), Retry::Again);
+        assert_eq!(retry_outcome(3, false, true), Retry::Again);
+        assert_eq!(retry_outcome(2, true, true), Retry::Stop, "got the foreground");
+        assert_eq!(retry_outcome(0, true, true), Retry::Stop);
+        assert_eq!(retry_outcome(0, true, false), Retry::Stop);
+        assert_eq!(retry_outcome(0, false, true), Retry::Close, "the launcher never sits there without the keyboard");
+        assert_eq!(retry_outcome(0, false, false), Retry::Stop, "another kind stays (the tick safety net remains)");
+        assert!(popup_launcher::new().focus_lost_closes());
+        assert!(!popup_start::new().focus_lost_closes());
     }
 
     #[test]
