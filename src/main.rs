@@ -98,6 +98,9 @@ use windows::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, CONSOLE_MODE as ConMode, CTRL_BREAK_EVENT, CTRL_C_EVENT, ENABLE_EXTENDED_FLAGS,
     ENABLE_QUICK_EDIT_MODE, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows::Win32::System::Diagnostics::Debug::{
+    SetErrorMode, THREAD_ERROR_MODE, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -692,6 +695,19 @@ fn set_timer(h: HWND, id: usize, ms: u32) {
 /// terminal despite the `windows` subsystem. Failures are ignored (started from Explorer/task:
 /// no parent with a console; elevated dock launched from a non-elevated terminal: access denied).
 /// If the standard handles are not valid it points them at `CONOUT$`. Returns true if attached.
+/// The error mode of a child mode (`--update-fetch`, `--start-apps`, `--start-settings`, `--start-icons`): a crash in a
+/// third-party shell or icon handler, or a failed file open, ends the child silently instead of showing the user a
+/// dialog; the dock sees the failed exit and takes its fallback.
+fn child_error_mode() -> THREAD_ERROR_MODE {
+    SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+}
+
+/// Sets `child_error_mode` for the whole process, first thing of a child mode.
+fn set_child_error_mode() {
+    // SAFETY: no preconditions; the mode of this short-lived child process only.
+    unsafe { SetErrorMode(child_error_mode()) };
+}
+
 fn attach_console() -> bool {
     // SAFETY: no preconditions; fails harmlessly if the parent has no console.
     if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
@@ -1091,6 +1107,9 @@ fn main() -> std::process::ExitCode {
         println!("{}", version_line());
         return std::process::ExitCode::SUCCESS;
     }
+    if args.update_fetch || args.start_apps || args.start_settings || args.start_icons.is_some() {
+        set_child_error_mode();
+    }
     // --update-fetch: the update check's GET in a child of the dock (`update::fetch_latest`); stdout only,
     // no data folder, logger, mutex or console.
     if args.update_fetch {
@@ -1307,6 +1326,17 @@ mod tests {
         assert!(a.settings && !a.install);
         assert!(!p(&[]).unwrap().settings);
         assert!(p(&["--setings"]).is_err());
+    }
+
+    #[test]
+    fn the_child_modes_set_the_error_mode_before_any_work() {
+        assert_eq!(child_error_mode().0, 0x0001 | 0x0002 | 0x8000);
+        let src = include_str!("main.rs");
+        let call = src.find("        set_child_error_mode();").expect("the call");
+        for first in ["run_fetch_child()", "run_apps_child()", "run_settings_child()", "run_icons_child(px)"] {
+            let at = src.find(&format!("::{first}.clamp")).expect(first);
+            assert!(call < at, "{first} runs after the error mode is set");
+        }
     }
 
     #[test]
