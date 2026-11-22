@@ -9,17 +9,17 @@
       "unit": "bytes",
       "gate": "ledger",
       "base_bytes": 1400320,
-      "target": "1.4.3",
-      "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test.",
+      "target": "1.5.0",
+      "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test. 1.5.0 step re-keyed (owner decision, L3 T23): the launcher was never in the ledger; the release exe of feat/launcher after plan L3 is 1765888 bytes (cargo build --release --locked, manifest kept), rounded up to the next 16 KiB 1769472, plus 96 KiB reserved for launcher part L2 (files, date and time, units, clipboard) is 1867776 bytes, which is 456.5 KiB over base_bytes and is written as 457 whole KiB. The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of it; the target is 1.5.0, the version this branch ships as.",
       "ledger_kib_cumulative": {
         "1.4.2": 0,
         "1.4.3": 80,
         "1.4.4": 120,
-        "1.5.0": 180,
-        "1.6.0": 330,
-        "1.7.0": 780,
-        "1.8.0": 1030,
-        "1.9.0": 1280
+        "1.5.0": 457,
+        "1.6.0": 607,
+        "1.7.0": 1057,
+        "1.8.0": 1307,
+        "1.9.0": 1557
       }
     },
     {
@@ -149,6 +149,51 @@
       "gate": "max",
       "value": 1048576,
       "note": "open and close each surface 20 times, growth strictly below 1 MiB (AG2 section 3.4)"
+    },
+    {
+      "id": "launcher.key_p95_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 4000,
+      "note": "keystroke to presented results, p95 (SPEC-launcher 5.5.7, L3 T23); activation is the owner's"
+    },
+    {
+      "id": "launcher.key_max_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 8000,
+      "note": "keystroke to presented results, max (SPEC-launcher 5.5.7)"
+    },
+    {
+      "id": "private.launcher_rest_delta",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 629146,
+      "note": "private bytes at rest with the launcher chord set, over the same config without it: +0.6 MiB (SPEC-launcher G-b, G-c)"
+    },
+    {
+      "id": "private.launcher_open_delta_125",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 3145728,
+      "note": "private bytes while the launcher is open at 125 %, over at rest: +3 MiB (SPEC-launcher G-b, G-c)"
+    },
+    {
+      "id": "private.launcher_close_residue",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 104858,
+      "note": "private bytes left after a close and the next hidden trim, over before the open: 0.1 MiB (L3 T22, T19)"
     },
     {
       "id": "exe_size.tasks",

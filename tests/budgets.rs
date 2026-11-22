@@ -116,7 +116,7 @@ fn schema_is_valid() {
         };
         let wh = one_of("where", &["CI", "VM", "OWNER"]);
         let st = one_of("status", &["active", "pending"]);
-        one_of("unit", &["bytes", "count", "ms", "ctxsw_per_s", "percent_core"]);
+        one_of("unit", &["bytes", "count", "ms", "us", "ctxsw_per_s", "percent_core"]);
         let gate = one_of("gate", &["max", "ledger", "file", "baseline_plus_15pct"]);
         if gate == "max" {
             assert!(r["value"].is_number(), "{id}: a max row needs a numeric value");
@@ -199,6 +199,11 @@ fn g7_values_are_pinned() {
     assert_eq!(value("private.tasks_admin"), 4.0 * MIB);
     assert_eq!(value("private.uia_client_delta"), 2.0 * MIB);
     assert_eq!(value("leak.open_close_20"), MIB);
+    assert_eq!(value("launcher.key_p95_us"), 4000.0);
+    assert_eq!(value("launcher.key_max_us"), 8000.0);
+    assert_eq!(value("private.launcher_rest_delta"), (0.6 * MIB).round());
+    assert_eq!(value("private.launcher_open_delta_125"), 3.0 * MIB);
+    assert_eq!(value("private.launcher_close_residue"), (0.1 * MIB).round());
     assert_eq!(value("wakeups.dock_hidden"), 0.25);
     assert_eq!(value("wakeups.kit_static"), 0.0);
     assert_eq!(value("timers.dock_hidden"), 0.0);
@@ -237,6 +242,11 @@ fn every_g7_budget_has_a_row() {
         "private.tasks_admin",
         "private.uia_client_delta",
         "leak.open_close_20",
+        "launcher.key_p95_us",
+        "launcher.key_max_us",
+        "private.launcher_rest_delta",
+        "private.launcher_open_delta_125",
+        "private.launcher_close_residue",
         "exe_size.tasks",
         "exe_size.files",
         "exe_size.tasks_admin",
