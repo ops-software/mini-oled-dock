@@ -72,14 +72,20 @@ impl ProviderMask {
         ProviderMask((1u16 << (ProviderId::Registry as u16 + 1)) - 1)
     }
 
+    /// Units answers under `calc`, so it shares Calc's bit.
+    fn bit(id: ProviderId) -> u16 {
+        let id = if id == ProviderId::Units { ProviderId::Calc } else { id };
+        1u16 << (id as u16)
+    }
+
     pub fn with(self, id: ProviderId, on: bool) -> ProviderMask {
-        let bit = 1u16 << (id as u16);
+        let bit = Self::bit(id);
         let bits = if on { self.0 | bit } else { self.0 & !bit };
         ProviderMask(bits | Self::APPS)
     }
 
     pub fn has(self, id: ProviderId) -> bool {
-        self.0 & (1u16 << (id as u16)) != 0
+        self.0 & Self::bit(id) != 0
     }
 }
 
@@ -503,6 +509,15 @@ mod tests {
         assert_eq!(ProviderId::from_name("units"), None);
         assert_eq!(ProviderId::from_name("Apps"), None);
         assert_eq!(ProviderId::Units.name(), "calc");
+    }
+
+    #[test]
+    fn units_follows_calc_in_the_mask() {
+        let off = ProviderMask::all().with(ProviderId::Calc, false);
+        assert!(!off.has(ProviderId::Calc) && !off.has(ProviderId::Units));
+        assert!(off.with(ProviderId::Units, true).has(ProviderId::Calc));
+        assert!(ProviderMask::all().has(ProviderId::Units));
+        assert!(off.has(ProviderId::Apps));
     }
 
     #[test]

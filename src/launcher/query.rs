@@ -41,8 +41,14 @@ impl PrefixTable {
             .filter_map(|(prefix, name)| {
                 let id = ProviderId::from_name(name)?;
                 let chars = prefix.chars().count();
-                let closed = !is_word_prefix(prefix) || prefix.ends_with(' ');
-                (chars != 0 && chars <= MAX_PREFIX_CHARS && closed).then(|| (Box::from(prefix.as_str()), id))
+                let word = is_word_prefix(prefix);
+                let closed = !word || prefix.ends_with(' ');
+                // No control characters; white space only as the single trailing space of a word prefix; not only digits.
+                let body = if word { prefix.strip_suffix(' ').unwrap_or(prefix) } else { prefix };
+                let plain = !prefix.chars().any(char::is_control)
+                    && !body.chars().any(char::is_whitespace)
+                    && !prefix.chars().all(|c| c.is_ascii_digit());
+                (chars != 0 && chars <= MAX_PREFIX_CHARS && closed && plain).then(|| (Box::from(prefix.as_str()), id))
             })
             .collect();
         PrefixTable::from_list(list)
@@ -253,6 +259,12 @@ mod tests {
             ("ok ", "run"),
             ("@", "units"),
             ("%", "files"),
+            (" ", "web"),
+            ("\t", "web"),
+            ("1", "web"),
+            ("12", "web"),
+            ("a b ", "web"),
+            ("\u{7}", "web"),
         ] {
             m.insert(k.to_string(), v.to_string());
         }
@@ -262,6 +274,9 @@ mod tests {
         assert_eq!(parse("@x", &t).mode, Mode::Mixed);
         assert_eq!(parse("ok x", &t).mode, Mode::Only(ProviderId::Run));
         assert_eq!(parse("%x", &t).mode, Mode::Only(ProviderId::Files));
+        for raw in [" x", "\tx", "1x", "12x", "a b x", "\u{7}x"] {
+            assert_eq!(parse(raw, &t).mode, Mode::Mixed, "{raw:?}");
+        }
     }
 
     #[test]
