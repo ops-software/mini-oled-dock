@@ -1811,22 +1811,27 @@ pub(crate) fn on_state(frecency: Option<Vec<u8>>, run: Option<Vec<u8>>) {
     });
 }
 
-/// A PowerToys chord owner is running (Settings > Launcher shows its row only then).
+/// A PowerToys chord owner is running (Settings > Launcher shows its row only then). With the chord off the launcher's
+/// state is not looked at (nor built): Settings refreshes call this.
 pub(crate) fn pt_detected() -> bool {
-    with_ctrl(|c| c.pt.state() != PtState::Absent).unwrap_or(false)
+    ON.with(Cell::get) && with_ctrl(|c| c.pt.state() != PtState::Absent).unwrap_or(false)
 }
 
 /// "Forget history" (Settings > Launcher, L1b-7): the run history and every learned rank leave the memory and the files.
+/// With the chord off nothing is in memory (and the state is not built for this): only the files are deleted.
 pub(crate) fn forget_history() {
-    let cleared = with_ctrl(|c| {
-        c.history.clear();
-        c.frecency.clear();
-        c.dirty = false;
-        c.frec_dirty = false;
-    });
-    if cleared.is_some() {
-        crate::shell_thread::request(ShellRequest::LauncherStateSave { frecency: None, run: None, delete: true });
+    if ON.with(Cell::get) {
+        let cleared = with_ctrl(|c| {
+            c.history.clear();
+            c.frecency.clear();
+            c.dirty = false;
+            c.frec_dirty = false;
+        });
+        if cleared.is_none() {
+            return;
+        }
     }
+    crate::shell_thread::request(ShellRequest::LauncherStateSave { frecency: None, run: None, delete: true });
 }
 
 /// `TIMER_LAUNCHER_SAVE`: a changed history is written (the shell thread writes it for the shell user).
@@ -3679,6 +3684,21 @@ mod tests {
         sys.now = 700_000;
         l.housekeeping(&mut sys);
         assert!(sys.ops.iter().any(|o| o.contains("ListStartApps") && o.contains("None")), "{:?}", sys.ops);
+    }
+
+    #[test]
+    fn settings_with_the_chord_off_never_build_the_launcher_state() {
+        // A thread of its own: its controller state was never touched, and no chord is set on it.
+        std::thread::spawn(|| {
+            assert!(!ON.with(Cell::get));
+            assert!(!pt_detected());
+            forget_history();
+            // The first look at the state builds it (the prefix table, the web template): so nothing above did.
+            let (_, built) = crate::launcher::testkit::allocations_during(|| with_ctrl(|_| ()));
+            assert!(built > 0, "the Settings page's calls built the launcher state with the chord off");
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

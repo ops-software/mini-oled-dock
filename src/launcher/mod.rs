@@ -24,4 +24,4 @@ pub mod web;
 #[cfg(test)]
 mod lints;
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
