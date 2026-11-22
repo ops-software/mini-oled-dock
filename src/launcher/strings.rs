@@ -188,12 +188,13 @@ pub fn choice_label(c: Choice) -> &'static str {
 pub fn pt_alt_shift_space_held() -> &'static str {
     tr("Another app holds Alt+Shift+Space", "Un'altra app usa Alt+Maiusc+Spazio")
 }
-/// The notice after two passed chords that Command Palette did not answer.
+/// The notice after two passed chords that Command Palette did not answer: a short title, whole at 560 px.
 pub fn pt_took_over() -> &'static str {
-    tr(
-        "Command Palette is running but did not answer Alt+Space, so the launcher has it now",
-        "Command Palette è attivo ma non ha risposto ad Alt+Spazio, quindi ora lo usa il launcher",
-    )
+    tr("Command Palette did not answer Alt+Space", "Command Palette non ha risposto ad Alt+Spazio")
+}
+/// Its detail: the chord is the launcher's now.
+pub fn pt_took_over_detail() -> &'static str {
+    tr("It is running, but the launcher has Alt+Space now", "È attivo, ma ora Alt+Spazio è del launcher")
 }
 
 // ---- refused launches (5.5.3)
@@ -253,7 +254,8 @@ mod tests {
         assert_eq!(choice_label(Choice::LeaveChord), "Leave it to Command Palette until I turn its shortcut off");
         assert_eq!(choice_label(Choice::UseAltShiftSpace), "Use Alt+Shift+Space instead");
         assert!(pt_turn_off().starts_with("Turn its shortcut off in PowerToys > Command Palette"));
-        assert!(pt_took_over().ends_with("so the launcher has it now"));
+        assert_eq!(pt_took_over(), "Command Palette did not answer Alt+Space");
+        assert_eq!(pt_took_over_detail(), "It is running, but the launcher has Alt+Space now");
         assert_eq!(hint_pt_take(), "Take Alt+Space · Enter");
         assert_eq!(pt_alt_shift_space_held(), "Another app holds Alt+Shift+Space");
     }

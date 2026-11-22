@@ -1097,6 +1097,7 @@ pub fn run(dir: &str) -> i32 {
             ("launcher_field_pair", 0),
             ("launcher_actions", 0),
             ("launcher_notice_actions", 0),
+            ("launcher_notice_took_over", 0),
         ] {
             // Popups read the background tone from the config: every one starts from the defaults.
             crate::config::set(plan().base_config());

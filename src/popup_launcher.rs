@@ -1533,7 +1533,7 @@ fn pt_notice_key() -> ItemKey {
 fn pt_notice_row(n: PtNotice) -> Item {
     let mut row = match n {
         PtNotice::Shared => notice_row("powertoys", strings::pt_shared(), Some(strings::pt_turn_off())),
-        PtNotice::TookOver => notice_row("powertoys", strings::pt_took_over(), None),
+        PtNotice::TookOver => notice_row("powertoys", strings::pt_took_over(), Some(strings::pt_took_over_detail())),
     };
     if n == PtNotice::Shared {
         row.verbs = crate::launcher::model::VerbSet::empty().with(Verb::Open);
@@ -2816,6 +2816,8 @@ pub(crate) enum PreviewScene {
     Actions,
     /// The PowerToys notice's action list: its three choices and Don't show again (5.7).
     NoticeActions,
+    /// The notice after two passed chords Command Palette did not answer (5.7), at the narrowest launcher width.
+    NoticeTookOver,
 }
 
 impl PreviewScene {
@@ -2835,6 +2837,7 @@ impl PreviewScene {
             "field_pair" => PreviewScene::FieldPair,
             "actions" => PreviewScene::Actions,
             "notice_actions" => PreviewScene::NoticeActions,
+            "notice_took_over" => PreviewScene::NoticeTookOver,
             _ => return None,
         })
     }
@@ -2934,7 +2937,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::RunReview => long_line,
         PreviewScene::Windows => "<",
         // The PowerToys notice comes with the first chord: the field is still empty.
-        PreviewScene::Notice | PreviewScene::NoticeActions => "",
+        PreviewScene::Notice | PreviewScene::NoticeActions | PreviewScene::NoticeTookOver => "",
         PreviewScene::Error => "calc",
         PreviewScene::FieldPair => "",
     };
@@ -2948,6 +2951,11 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     if matches!(scene, PreviewScene::Notice | PreviewScene::NoticeActions) {
         // The first chord the dock sees while Command Palette runs (5.7).
         session.set_notices(vec![pt_notice_row(PtNotice::Shared)]);
+        let _ = session.refresh(&cx);
+    }
+    if scene == PreviewScene::NoticeTookOver {
+        // The launcher took the chord: the next open says so.
+        session.set_notices(vec![pt_notice_row(PtNotice::TookOver)]);
         let _ = session.refresh(&cx);
     }
     if scene == PreviewScene::NoticeActions {
@@ -2964,6 +2972,9 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         l.icons.insert(k, b);
     }
     l.foreground = scene != PreviewScene::Inactive;
+    if scene == PreviewScene::NoticeTookOver {
+        l.set_shape(*style::WIDTH_RANGE.start(), style::ROWS_DEFAULT);
+    }
     l
 }
 
@@ -4602,6 +4613,7 @@ mod tests {
             "launcher_windows",
             "launcher_notice",
             "launcher_notice_actions",
+            "launcher_notice_took_over",
             "launcher_error",
             "launcher_field_pair",
         ];
@@ -4743,6 +4755,7 @@ mod tests {
         assert!(!yields(&hook));
         let l = new_launcher();
         assert_eq!(l.session.rows().first().map(|r| &*r.title), Some(strings::pt_took_over()));
+        assert_eq!(l.session.rows().first().and_then(|r| r.detail.as_deref()), Some(strings::pt_took_over_detail()));
         assert_eq!(l.session.selected(), None, "a notice without a choice is never the default");
         // It exits: the chord is the launcher's.
         pt_check(&mut hook, &mut FakeSys { owners: false, ..fresh() });

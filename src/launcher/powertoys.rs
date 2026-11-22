@@ -83,7 +83,7 @@ pub enum PtEvent {
 pub enum PtNotice {
     /// "PowerToys Command Palette is running and also uses Alt+Space.", with its choices.
     Shared,
-    /// "Command Palette is running but did not answer Alt+Space, so the launcher has it now".
+    /// "Command Palette did not answer Alt+Space", with the detail "It is running, but the launcher has Alt+Space now".
     TookOver,
 }
 
