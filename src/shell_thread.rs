@@ -3154,9 +3154,11 @@ fn missing_start_icons<'a>(
         sent.clear();
         pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
     }
-    let mut missing: Vec<String> = ids.into_iter().filter(|id| !sent.contains(*id)).map(str::to_string).collect();
-    // Pins first (stable sort: the catalog order is kept inside each group).
-    crate::tinysort::sort_by_key(&mut missing, |id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
+    // Pins first; the catalogue order is kept inside each group (a stable partition: the key is a bool, so no sort).
+    let is_pin = |id: &str| first.iter().any(|f| f.eq_ignore_ascii_case(id));
+    let (mut missing, rest): (Vec<String>, Vec<String>) =
+        ids.into_iter().filter(|id| !sent.contains(*id)).map(str::to_string).partition(|id| is_pin(id));
+    missing.extend(rest);
     sent.extend(missing.iter().cloned());
     Some(missing)
 }
