@@ -861,6 +861,77 @@ fn injected_keys_carry_the_tag() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- lint 14: no probe switch name in a release string ---------------------------------------------------------------
+
+/// The names a release exe must not carry: the plan's check is a plain byte search of the built exe for these.
+const PROBE_PREFIXES: [&str; 2] = ["DOCK_LAUNCHER_", "DOCK_TEST_"];
+
+/// The string literals of one line of code, quotes excluded (escapes kept as written).
+fn literals(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let b = line.as_bytes();
+    let (mut i, mut start) = (0, None);
+    while i < b.len() {
+        match (b.get(i), start) {
+            (Some(b'\\'), Some(_)) => i += 1,
+            (Some(b'"'), None) => start = Some(i + 1),
+            (Some(b'"'), Some(s)) => {
+                out.push(line.get(s..i).unwrap_or(""));
+                start = None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// No string literal of the dock's code (comments, tests and the owner-probe module aside) names a probe switch or a
+/// message constant of the launcher: `PostMessageW(WM_DOCK_LAUNCHER_CLOSE) failed` in a log line put the name in the
+/// release exe. Words of the log say what failed instead.
+fn probe_name_violations(path: &str, text: &str) -> Vec<String> {
+    if path == "src/launcher_probe.rs" {
+        return Vec::new(); // compiled in only with the owner-probe feature (lint 4)
+    }
+    let mut v = Vec::new();
+    let end = test_start(text);
+    let mut at = 0;
+    for (n, line) in text.split_inclusive('\n').enumerate() {
+        at += line.len();
+        if at > end {
+            break;
+        }
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        for lit in literals(line) {
+            if let Some(p) = PROBE_PREFIXES.iter().find(|p| lit.contains(**p)) {
+                v.push(format!("{path}:{}: a string holds \"{p}\": {lit}", n + 1));
+            }
+        }
+    }
+    v
+}
+
+#[test]
+fn release_strings_hold_no_probe_name() {
+    let good = "log!(\"launcher: posting the close failed: {e}\");\nlet (msg, wp) = (WM_DOCK_LAUNCHER_CLOSE, 0);\n// \"DOCK_TEST_X\"\n";
+    assert!(probe_name_violations("src/launcher_sys.rs", good).is_empty());
+    let bad = "log!(\"launcher: PostMessageW(WM_DOCK_LAUNCHER_CLOSE) failed: {e}\");";
+    assert_eq!(probe_name_violations("src/launcher_sys.rs", bad).len(), 1);
+    assert_eq!(probe_name_violations("src/x.rs", "let k = \"DOCK_TEST_FREEZE_UI_MS\";").len(), 1);
+    assert_eq!(
+        probe_name_violations("src/x.rs", "f(\"a \\\" b\", \"DOCK_LAUNCHER_DROP\")").len(),
+        1,
+        "after an escaped quote"
+    );
+    assert!(probe_name_violations("src/launcher_probe.rs", "switch(&ON, \"DOCK_LAUNCHER_DROP\")").is_empty());
+    assert!(probe_name_violations("src/x.rs", "#[cfg(test)]\nmod t { fn f() { g(\"DOCK_TEST_X\"); } }").is_empty());
+    let all = scan_tree(probe_name_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {

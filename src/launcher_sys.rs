@@ -477,7 +477,7 @@ impl SysPort for RealSys {
         // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
         let r = unsafe { PostMessageW(Some(crate::hwnd()), msg, wp, LPARAM(0)) };
         if let Err(e) = &r {
-            log!("launcher: PostMessageW(WM_DOCK_LAUNCHER_CLOSE) failed: {e}");
+            log!("launcher: posting the close of the open failed: {e}");
         }
         r.is_ok()
     }
