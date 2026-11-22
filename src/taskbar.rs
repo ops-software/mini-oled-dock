@@ -3,8 +3,8 @@
 //!
 //! THREADING:
 //!  * `init`, `install_hook`, `remove_hook`, `on_winevent`, `on_safety_timer`, `on_taskbar_created`,
-//!    `shutdown`: UI thread ONLY (the WinEvent callback runs on the UI thread and posts
-//!    `WM_DOCK_TASKBAR_EVENT`).
+//!    `shutdown`: UI thread ONLY (the taskbar has no WinEvent hook of its own: `apps::winevent_proc` runs on the
+//!    UI thread and hands the raw events to `on_raw_event`, which posts `WM_DOCK_TASKBAR_EVENT`).
 //!  * `restore()` and `restore_force()`: callable from ANY thread/process (panic hook,
 //!    WM_ENDSESSION, watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
 //!    thread-safe Win32 APIs and do not touch thread-local state.
@@ -24,18 +24,14 @@ use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, FindWindowExW, GetClassNameW, GetParent, GetPropW, GetWindowRect,
-    GetWindowThreadProcessId,
-    IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW, SendMessageTimeoutW,
-    SendNotifyMessageW,
-    SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
-    HWND_BOTTOM,
-    HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW, OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_COPYDATA,
+    GetWindowThreadProcessId, IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW,
+    SendMessageTimeoutW, SendNotifyMessageW, SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW, HWND_BOTTOM, HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW,
+    OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_SHOWNA, WM_COPYDATA,
 };
 
 use crate::config;
@@ -52,8 +48,9 @@ static HIDDEN: AtomicBool = AtomicBool::new(false);
 static RESTORING: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "TaskbarCreated" message (0 = not registered yet).
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
-/// Raw handle (isize) of the taskbar WinEvent hook (0 = no hook).
-static WINEVENT_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// true while the taskbar wants the raw WinEvents that `apps::winevent_proc` hands to `on_raw_event` (set by
+/// `install_hook`, cleared by `remove_hook`): the taskbar has no WinEvent hook of its own.
+static WANT_EVENTS: AtomicBool = AtomicBool::new(false);
 /// Instant (ms since process start, +1) of the last `TaskbarCreated` broadcast sent by us.
 static LAST_BROADCAST_MS: AtomicU64 = AtomicU64::new(0);
 /// Explorer's primary `Shell_TrayWnd` as last seen by `hide_all` (0 = unknown): its destruction means
@@ -62,10 +59,11 @@ static EXPLORER_TRAY: AtomicIsize = AtomicIsize::new(0);
 /// `now_ms()` when `explorer_gone` stopped our tray host (0 = not paused): it is started again once the
 /// new Explorer has registered its desktop (`on_reannounce_timer`).
 static HOST_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
-/// true once `hide_all` has logged that it held back `ABM_SETSTATE` because of an edge conflict; cleared when
-/// the state is sent again, when auto-hide reads on and on an Explorer restart, so a lasting conflict is
-/// logged once, not every second.
-static EDGE_CONFLICT_LOGGED: AtomicBool = AtomicBool::new(false);
+/// The window that held the taskbar's edge at the last hold-back (0 = no hold-back in effect): its DESTROY, or the
+/// safety timer once it is no longer a window (`holder_left`), runs `hide_all` again. Cleared when the state is
+/// sent again, when auto-hide reads on and on an Explorer restart, so a lasting conflict is logged once, not every
+/// second.
+static EDGE_HOLDER: AtomicIsize = AtomicIsize::new(0);
 /// Taskbar state (`ABS_*`) of the last `ABM_GETSTATE` read by `hide_all`, or `STATE_UNREAD` / `STATE_UNKNOWN`:
 /// a change is logged once, so the log tells whether Explorer turned auto-hide off by itself or kept it off.
 static LAST_STATE: AtomicU32 = AtomicU32::new(STATE_UNREAD);
@@ -393,7 +391,8 @@ fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, Result<(u32, RECT), String>) {
     if unsafe { GetWindowRect(tray, &mut bar) }.is_err() {
         return (EdgeOwner::NoAnswer, Err("GetWindowRect failed".to_string()));
     }
-    // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
+    // SAFETY: MonitorFromWindow takes no pointers; for a taskbar destroyed since GetWindowRect it can
+    // return NULL, and GetMonitorInfoW below then fails and is handled.
     let hm = unsafe { MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has the right `cbSize` and is writable.
@@ -489,7 +488,13 @@ fn set_state(tray: HWND, state: u32) -> bool {
     }
     log!("taskbar: direct ABM_SETSTATE send failed, falling back to SHAppBarMessage");
     appbar_shell(ABM_SETSTATE, tray, state);
-    matches!(appbar_direct(ABM_GETSTATE, tray, 0), Some(v) if (v as u32) & ABS_MASK == state)
+    matches!(appbar_direct(ABM_GETSTATE, tray, 0), Some(v) if state_reads_as(v as u32, state))
+}
+
+/// True when a read-back state matches the wanted one on the auto-hide bit only: ABM_GETSTATE never
+/// reports ABS_ALWAYSONTOP (live fact X2: after ABM_SETSTATE(2) it reads 0). Pure.
+fn state_reads_as(read: u32, want: u32) -> bool {
+    (read ^ want) & ABS_AUTOHIDE == 0
 }
 
 // ------------------------------------------------------------ state file
@@ -670,35 +675,26 @@ pub fn init() -> Result<bool, String> {
     Ok(true)
 }
 
-/// installs `SetWinEventHook(EVENT_OBJECT_SHOW..EVENT_OBJECT_CREATE)` (OUTOFCONTEXT |
-/// SKIPOWNPROCESS) whose callback filters the taskbar classes (also on the parent) and posts
-/// `WM_DOCK_TASKBAR_EVENT` to the dock window. Called from the UI thread AFTER the creation of the
-/// window (the callback uses `crate::hwnd()`). No-op if `HIDDEN` is false.
+/// Arms the taskbar's share of the apps WinEvent hook (`apps::install_winevent_hook`, whose CREATE..HIDE range
+/// covers CREATE, DESTROY and SHOW): `apps::winevent_proc` then hands every raw event to `on_raw_event`, which
+/// filters the taskbar classes (also on the parent) and posts `WM_DOCK_TASKBAR_EVENT` to the dock window. Called
+/// from the UI thread AFTER the creation of the window and after `ui::attach`. No-op if `HIDDEN` is false.
 pub fn install_hook() -> Result<(), String> {
-    if !HIDDEN.load(Relaxed) || WINEVENT_HOOK.load(Relaxed) != 0 {
+    if !HIDDEN.load(Relaxed) || WANT_EVENTS.load(Relaxed) {
         return Ok(());
     }
-    // Range CREATE(0x8000)..SHOW(0x8002): also includes DESTROY, discarded by the callback.
-    // SAFETY: `winevent_proc` is a 'static `extern "system"` with the WINEVENTPROC signature; without
-    // WINEVENT_INCONTEXT no module is needed. The UI thread has a message loop (out-of-context delivery).
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_OBJECT_CREATE,
-            EVENT_OBJECT_SHOW,
-            None,
-            Some(winevent_proc),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    };
-    if hook.is_invalid() {
-        return Err(format!("SetWinEventHook failed: {:?}", windows::core::Error::from_thread()));
+    if !crate::apps::hooks_installed() {
+        return Err("apps WinEvent hooks not installed".into());
     }
-    WINEVENT_HOOK.store(hook.0 as isize, Relaxed);
-    log!("taskbar: WinEventHook installed");
+    WANT_EVENTS.store(true, Relaxed);
+    log!("taskbar: events armed (apps WinEvent hook)");
     allow_taskbar_created();
     Ok(())
+}
+
+/// true while `on_raw_event` wants the events of `apps::winevent_proc`.
+pub(crate) fn wants_events() -> bool {
+    WANT_EVENTS.load(Relaxed)
 }
 
 /// The dock runs elevated: without this exception UIPI would drop the `TaskbarCreated` broadcast
@@ -733,46 +729,87 @@ fn restored_externally() -> bool {
     true
 }
 
-/// Removes the hook (`UnhookWinEvent`). Idempotent. UI thread.
+/// Stops asking for the raw events (the apps hook stays). Idempotent. UI thread.
 pub fn remove_hook() {
-    let raw = WINEVENT_HOOK.swap(0, Relaxed);
-    if raw == 0 {
-        return;
-    }
-    // SAFETY: handle obtained from SetWinEventHook on this thread; the swap guarantees a single release.
-    if !unsafe { UnhookWinEvent(HWINEVENTHOOK(raw as *mut c_void)) }.as_bool() {
-        log!("taskbar: UnhookWinEvent failed");
+    WANT_EVENTS.store(false, Relaxed);
+}
+
+/// What a DESTROY event of `hwnd` means for the taskbar.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum DestroyAct {
+    /// Explorer's primary taskbar is gone (Explorer exits or crashes).
+    ExplorerGone,
+    /// The window that held the taskbar's edge is gone: auto-hide can be asked for again.
+    HolderGone,
+    Ignore,
+}
+
+fn destroy_act(hwnd: isize, explorer_tray: isize, holder: isize) -> DestroyAct {
+    if hwnd == 0 {
+        DestroyAct::Ignore
+    } else if hwnd == explorer_tray {
+        DestroyAct::ExplorerGone
+    } else if hwnd == holder {
+        DestroyAct::HolderGone
+    } else {
+        DestroyAct::Ignore
     }
 }
 
-/// WinEvent callback (UI thread): filters the taskbar classes (also on the parent) and posts
-/// `WM_DOCK_TASKBAR_EVENT` (wParam = event, lParam = HWND) to the dock window.
-unsafe extern "system" fn winevent_proc(
-    _hook: HWINEVENTHOOK,
-    event: u32,
-    hwnd: HWND,
-    id_object: i32,
-    _id_child: i32,
-    _thread: u32,
-    _time: u32,
-) {
-    if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 {
+/// true if a hold-back by `owner` is a new conflict (the previous holder was another window or none).
+fn hold_back_is_news(prev: isize, owner: isize) -> bool {
+    prev != owner
+}
+
+/// true if the window of the hold-back in effect (`holder`, 0 = none) is no longer a window, so the safety timer
+/// asks for auto-hide again: its DESTROY event can arrive while its WM_DESTROY still runs, and a holder that lets go
+/// of the edge in there after other cleanup still held it when `on_winevent` asked. `is_window` runs only while a
+/// hold-back is in effect. Pure.
+fn holder_left(holder: isize, is_window: impl Fn(isize) -> bool) -> bool {
+    holder != 0 && !is_window(holder)
+}
+
+/// What a raw WinEvent means for the taskbar.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RawKind {
+    Ignore,
+    /// Post it as it is (a DESTROY of a window we track).
+    Post,
+    /// Post it if the window, or its parent, is of a taskbar class.
+    CheckClass,
+}
+
+/// `tracked` = the window is `EXPLORER_TRAY` or `EDGE_HOLDER`.
+fn raw_event_kind(event: u32, id_object: i32, tracked: bool) -> RawKind {
+    if id_object != OBJID_WINDOW.0 {
+        return RawKind::Ignore;
+    }
+    match event {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE => RawKind::CheckClass,
+        EVENT_OBJECT_DESTROY if tracked => RawKind::Post,
+        _ => RawKind::Ignore,
+    }
+}
+
+/// Raw WinEvent (UI thread, called by `apps::winevent_proc` while `wants_events`): filters the taskbar classes
+/// (also on the parent) and posts `WM_DOCK_TASKBAR_EVENT` (wParam = event, lParam = HWND) to the dock window.
+pub(crate) fn on_raw_event(event: u32, hwnd: HWND, id_object: i32) {
+    if hwnd.0.is_null() {
         return;
     }
-    if event == EVENT_OBJECT_DESTROY {
-        if hwnd.0 as isize != EXPLORER_TRAY.load(Relaxed) {
-            return;
+    let h = hwnd.0 as isize;
+    let tracked = h == EXPLORER_TRAY.load(Relaxed) || h == EDGE_HOLDER.load(Relaxed);
+    match raw_event_kind(event, id_object, tracked) {
+        RawKind::Ignore => return,
+        RawKind::Post => {}
+        RawKind::CheckClass => {
+            // SAFETY: GetParent has no preconditions; for invalid windows it fails.
+            let parent = unsafe { GetParent(hwnd) }.ok();
+            let hit = is_taskbar_class(&class_of(hwnd)) || parent.is_some_and(|p| is_taskbar_class(&class_of(p)));
+            if !hit {
+                return;
+            }
         }
-    } else if event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_CREATE {
-        return;
-    }
-    // SAFETY: GetParent has no preconditions; for invalid windows it fails.
-    let parent = unsafe { GetParent(hwnd) }.ok();
-    let hit = event == EVENT_OBJECT_DESTROY
-        || is_taskbar_class(&class_of(hwnd))
-        || parent.is_some_and(|p| is_taskbar_class(&class_of(p)));
-    if !hit {
-        return;
     }
     let ui = crate::hwnd();
     if ui.0.is_null() {
@@ -824,13 +861,13 @@ pub fn hide_all() {
     // A failed read counts as auto-hide off: the request is sent as 1.4.2 did (fail open).
     let state = read.unwrap_or(0);
     if state & ABS_AUTOHIDE != 0 {
-        EDGE_CONFLICT_LOGGED.store(false, Relaxed); // a conflict after this one is logged again
+        EDGE_HOLDER.store(0, Relaxed); // a conflict after this one is logged again
     }
     // Explorer refuses auto-hide on an edge another window already holds, and tells the user with a
     // modal box ("already an auto-hide toolbar on this side"). Seen right after a fullscreen app took
     // the foreground: the request is held back then. The taskbar is still hidden below with SW_HIDE, but a
-    // taskbar without auto-hide keeps its work area reserved, so its strip stays empty until the next re-show
-    // re-checks.
+    // taskbar without auto-hide keeps its work area reserved, so its strip stays empty until the holder is gone
+    // (`on_winevent`, `on_safety_timer`) or the next re-show re-checks.
     // Only the primary taskbar's edge is asked about, and only when auto-hide is off: Explorer's primary
     // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
     // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
@@ -843,7 +880,7 @@ pub fn hide_all() {
     match autohide_action(state, owner) {
         AutoHideAction::Nothing => {}
         AutoHideAction::HoldBack(owner) => {
-            if !EDGE_CONFLICT_LOGGED.swap(true, Relaxed) {
+            if hold_back_is_news(EDGE_HOLDER.swap(owner, Relaxed), owner) {
                 // `Held` comes only from an answered question, which named the edge and monitor.
                 let (edge, mon) = asked.as_ref().map_or((u32::MAX, RECT::default()), |&q| q);
                 let holder = HWND(owner as *mut c_void);
@@ -872,7 +909,7 @@ pub fn hide_all() {
             if RESTORING.load(Relaxed) || restored_externally() {
                 return;
             }
-            EDGE_CONFLICT_LOGGED.store(false, Relaxed);
+            EDGE_HOLDER.store(0, Relaxed);
             log!("taskbar: {}{}, sending ABM_SETSTATE", autohide_off_text(read), edge_check_text(owner, &asked));
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
             // The direct send waits up to APPBAR_TIMEOUT_MS, so the same race is checked again before the
@@ -919,8 +956,18 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
         return;
     }
     if event == EVENT_OBJECT_DESTROY {
-        if hwnd.0 as isize == EXPLORER_TRAY.swap(0, Relaxed) {
-            explorer_gone();
+        let h = hwnd.0 as isize;
+        match destroy_act(h, EXPLORER_TRAY.load(Relaxed), EDGE_HOLDER.load(Relaxed)) {
+            DestroyAct::ExplorerGone => {
+                EXPLORER_TRAY.store(0, Relaxed);
+                explorer_gone();
+            }
+            DestroyAct::HolderGone => {
+                EDGE_HOLDER.store(0, Relaxed);
+                log!("taskbar: window 0x{h:X} that held the taskbar's edge is gone, asking for auto-hide again");
+                hide_all();
+            }
+            DestroyAct::Ignore => {}
         }
         return;
     }
@@ -945,10 +992,20 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
     hide_all();
 }
 
-/// 1 s safety timer (`TIMER_SECOND`): if a native taskbar is visible, redoes `hide_all()`.
+/// 1 s safety timer (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
+/// no longer a window (`holder_left`), redoes `hide_all()`.
 /// No-op if `HIDDEN` is false or if the taskbar was restored from outside (see `restored_externally`).
 pub fn on_safety_timer() {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
     if !HIDDEN.load(Relaxed) || restored_externally() {
+        return;
+    }
+    let holder = EDGE_HOLDER.load(Relaxed);
+    // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
+    if holder_left(holder, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool()) {
+        EDGE_HOLDER.store(0, Relaxed);
+        log!("taskbar: edge holder 0x{holder:X} is no longer a window, asking for auto-hide again");
+        hide_all();
         return;
     }
     if native_taskbars().into_iter().any(is_visible) {
@@ -1004,7 +1061,7 @@ fn arm_reannounce(ms: u32) {
 /// does not broadcast `TaskbarCreated` on restart, so the window event is what actually fires.
 fn explorer_restarted(why: &str) {
     log!("taskbar: Explorer restarted ({why}), redoing self-heal and hide");
-    EDGE_CONFLICT_LOGGED.store(false, Relaxed); // the new Explorer's conflicts are news
+    EDGE_HOLDER.store(0, Relaxed); // the new Explorer's conflicts are news
     self_heal();
     if !ensure_state_saved(None) {
         log!("taskbar: state not saveable after the Explorer restart, not hiding");
@@ -1267,6 +1324,68 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_taskbar_events_filtered_as_before() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EVENT_OBJECT_CLOAKED, EVENT_OBJECT_HIDE, EVENT_SYSTEM_FOREGROUND, OBJID_CURSOR,
+        };
+        use RawKind::*;
+        let w = OBJID_WINDOW.0;
+        for tracked in [false, true] {
+            assert_eq!(raw_event_kind(EVENT_OBJECT_SHOW, w, tracked), CheckClass);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_CREATE, w, tracked), CheckClass);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_HIDE, w, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_SHOW, OBJID_CURSOR.0, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_DESTROY, OBJID_CURSOR.0, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_SYSTEM_FOREGROUND, w, tracked), Ignore);
+            assert_eq!(raw_event_kind(EVENT_OBJECT_CLOAKED, w, tracked), Ignore);
+        }
+        assert_eq!(raw_event_kind(EVENT_OBJECT_DESTROY, w, true), Post);
+        assert_eq!(raw_event_kind(EVENT_OBJECT_DESTROY, w, false), Ignore);
+    }
+
+    #[test]
+    fn edge_holder_bookkeeping() {
+        use DestroyAct::*;
+        assert_eq!(destroy_act(0, 0, 0), Ignore, "a null window is never news");
+        assert_eq!(destroy_act(0, 5, 7), Ignore);
+        assert_eq!(destroy_act(5, 5, 7), ExplorerGone);
+        assert_eq!(destroy_act(7, 5, 7), HolderGone);
+        assert_eq!(destroy_act(9, 5, 7), Ignore);
+        assert_eq!(destroy_act(5, 5, 5), ExplorerGone, "Explorer's tray wins over the holder");
+        assert_eq!(destroy_act(7, 0, 0), Ignore, "nothing tracked");
+        assert!(hold_back_is_news(0, 7));
+        assert!(hold_back_is_news(5, 7), "a different holder is news");
+        assert!(!hold_back_is_news(7, 7), "the same holder is logged once");
+    }
+
+    #[test]
+    fn a_holder_that_lets_go_after_its_destroy_event_is_rechecked() {
+        let calls = std::cell::Cell::new(0);
+        let alive = |up: bool| {
+            let calls = &calls;
+            move |_: isize| {
+                calls.set(calls.get() + 1);
+                up
+            }
+        };
+        assert!(!holder_left(0, alive(false)), "no hold-back in effect: nothing to ask");
+        assert_eq!(calls.get(), 0, "without a hold-back the check costs no call");
+        assert!(!holder_left(7, alive(true)), "a holder that is still a window keeps the request held back");
+        assert!(holder_left(7, alive(false)), "a holder that is no longer a window: ask again");
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn fallback_confirms_only_the_auto_hide_bit() {
+        for (r, w) in [(0, 2), (2, 2), (0, 0), (1, 1), (3, 1)] {
+            assert!(state_reads_as(r, w), "{r} {w}");
+        }
+        for (r, w) in [(1, 0), (0, 1), (1, 2)] {
+            assert!(!state_reads_as(r, w), "{r} {w}");
+        }
+    }
 
     #[test]
     fn state_parsing_masks_and_rejects() {

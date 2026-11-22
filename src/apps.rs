@@ -163,7 +163,8 @@ fn hw(h: isize) -> HWND {
 
 /// Installs the `SetWinEventHook` hooks (OUTOFCONTEXT | SKIPOWNPROCESS) for
 /// `EVENT_OBJECT_SHOW/HIDE/DESTROY/CREATE`, `EVENT_SYSTEM_FOREGROUND`, `EVENT_OBJECT_CLOAKED/UNCLOAKED`.
-/// The callback posts `WM_DOCK_APPS_DIRTY` (wParam = event, lParam = HWND) to the dock window.
+/// The callback posts `WM_DOCK_APPS_DIRTY` (wParam = event, lParam = HWND) to the dock window, and hands every raw
+/// event to `taskbar::on_raw_event` while the taskbar wants them (one hook for both).
 /// Called from the UI thread (needs its message loop). Idempotent.
 pub fn install_winevent_hook() -> Result<(), String> {
     if HOOKS.with(|h| !h.borrow().is_empty()) {
@@ -198,6 +199,12 @@ pub fn install_winevent_hook() -> Result<(), String> {
     Ok(())
 }
 
+/// true while the hooks are installed (a thread-local of the UI thread, the thread the taskbar's `install_hook`
+/// runs on).
+pub(crate) fn hooks_installed() -> bool {
+    HOOKS.with(|h| !h.borrow().is_empty())
+}
+
 /// Removes the hooks (`UnhookWinEvent`). Idempotent. UI thread.
 pub fn remove_winevent_hook() {
     let hooks = HOOKS.with(|h| std::mem::take(&mut *h.borrow_mut()));
@@ -225,6 +232,11 @@ unsafe extern "system" fn winevent_proc(
 ) {
     if hwnd.0.is_null() {
         return;
+    }
+    // The taskbar has no hook of its own: it sees the same events here, before the filters below (a SHOW on a
+    // taskbar's child must still reach it).
+    if crate::taskbar::wants_events() {
+        crate::taskbar::on_raw_event(event, hwnd, id_object);
     }
     if event != EVENT_SYSTEM_FOREGROUND {
         // Only events on the window itself (not on caret, cursor, accessible elements...).
