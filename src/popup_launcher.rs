@@ -197,8 +197,9 @@ fn ellipsize_middle(s: &Surface, text: &str, font: Font, max_w: i32) -> String {
 }
 
 /// `text` wrapped over lines of `max_w` px: at the last space that fits, else inside a word. Stops one line past
-/// `max_lines`, so the caller can tell a text that does not fit from one that does.
-fn wrap(s: &Surface, text: &str, font: Font, max_w: i32, max_lines: usize) -> Vec<Vec<Run>> {
+/// `max_lines`, so the caller can tell a text that does not fit from one that does. The first line is `first_w` wide
+/// (narrower than the rest when the row's hint sits beside it), the others `max_w`.
+fn wrap(s: &Surface, text: &str, font: Font, first_w: i32, max_w: i32, max_lines: usize) -> Vec<Vec<Run>> {
     let mut lines: Vec<Vec<Run>> = Vec::new();
     let mut cur: Vec<Run> = Vec::new();
     let mut cur_w = 0;
@@ -213,7 +214,8 @@ fn wrap(s: &Surface, text: &str, font: Font, max_w: i32, max_lines: usize) -> Ve
     for c in text.chars() {
         let u = unit(c);
         let w = s.text_width(&u.text, font);
-        if cur_w + w > max_w && !cur.is_empty() {
+        let limit = if lines.is_empty() { first_w } else { max_w };
+        if cur_w + w > limit && !cur.is_empty() {
             let split = last_break.unwrap_or(cur.len());
             let rest = cur.split_off(split);
             lines.push(flush(cur));
@@ -652,11 +654,10 @@ impl Launcher {
 
     /// The lines under the name of a row: a notice's text or the selected row's review, wrapped; empty for the others.
     fn detail_lines(&self, s: &Surface, item: &Item, selected: bool) -> Vec<Vec<Run>> {
-        let m = s.metrics();
-        let max_w = hint_right(m, self.width) - m.px(style::NAME_X);
+        let (first_w, max_w) = self.detail_widths(s, item, selected);
         if item.kind == Kind::Notice {
             let Some(text) = item.detail.as_deref() else { return Vec::new() };
-            let mut lines = wrap(s, text, Font::Caption, max_w, MAX_LINES);
+            let mut lines = wrap(s, text, Font::Caption, first_w, max_w, MAX_LINES);
             if lines.len() > MAX_LINES {
                 lines.truncate(MAX_LINES);
                 if let Some(last) = lines.last_mut() {
@@ -670,7 +671,7 @@ impl Launcher {
         }
         match review_text(item) {
             Some(text) => {
-                let lines = wrap(s, text, Font::Caption, max_w, MAX_LINES);
+                let lines = wrap(s, text, Font::Caption, first_w, max_w, MAX_LINES);
                 if lines.len() > MAX_LINES {
                     // Too long to show whole: Run as administrator is refused, and the detail says why (5.3).
                     let why = self.session.admin_refusal().and_then(gesture::Refusal::detail);
@@ -683,13 +684,24 @@ impl Launcher {
         }
     }
 
+    /// The widths of the detail lines of a row (physical px): the first, and the others. The hint of the selected row
+    /// sits at the right of the name's line and reaches into the first detail line, so that line stops before the
+    /// hint's column (the name's own limit); the lines below it have the whole width.
+    fn detail_widths(&self, s: &Surface, item: &Item, selected: bool) -> (i32, i32) {
+        let m = s.metrics();
+        let rest = hint_right(m, self.width) - m.px(style::NAME_X);
+        match hint_for(item).filter(|_| selected && self.foreground) {
+            Some(hint) => (rest - s.text_width(hint, Font::Caption) - m.px(HINT_GAP), rest),
+            None => (rest, rest),
+        }
+    }
+
     /// How many CAPTION lines the review of the selected row needs, capped one past the limit (the session's measure).
     fn review_lines(&self, s: &Surface) -> Option<u8> {
         let item = self.session.selected()?;
         let text = review_text(item)?;
-        let m = s.metrics();
-        let max_w = hint_right(m, self.width) - m.px(style::NAME_X);
-        let n = wrap(s, text, Font::Caption, max_w, MAX_LINES).len().min(MAX_LINES + 1);
+        let (first_w, max_w) = self.detail_widths(s, item, true);
+        let n = wrap(s, text, Font::Caption, first_w, max_w, MAX_LINES).len().min(MAX_LINES + 1);
         u8::try_from(n.max(1)).ok()
     }
 
@@ -946,7 +958,7 @@ impl Launcher {
             }
         } else if let Some(detail) = item.detail.as_deref() {
             let alpha = if detail.contains(strings::thousands()) { style::FG_SECONDARY } else { style::FG_TERTIARY };
-            let max_w = hint_right(m, self.width) - nx;
+            let (max_w, _) = self.detail_widths(s, item, selected);
             if detail.chars().any(gesture::is_marker) {
                 draw_line(s, detail, nx, dy, max_w, Font::Caption, alpha);
             } else {
@@ -3666,7 +3678,7 @@ mod tests {
         let s = surface(96);
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
         let w = s.text_width("alpha beta gamma delta epsilon", Font::Caption);
-        let lines = wrap(&s, text, Font::Caption, w, 10);
+        let lines = wrap(&s, text, Font::Caption, w, w, 10);
         assert!(lines.len() >= 3);
         for l in &lines {
             let line_w: i32 = l.iter().map(|r| s.text_width(&r.text, Font::Caption)).sum();
@@ -3674,11 +3686,60 @@ mod tests {
         }
         let joined: String = lines.iter().flatten().map(|r| r.text.as_str()).collect();
         assert_eq!(joined, text, "nothing is lost or ellipsized");
-        let cut = wrap(&s, text, Font::Caption, w, 2);
+        let cut = wrap(&s, text, Font::Caption, w, w, 2);
         assert_eq!(cut.len(), 3, "one line past the limit tells the caller it does not fit");
         // A word longer than the line breaks inside it.
-        let long = wrap(&s, &"x".repeat(200), Font::Caption, w, 10);
+        let long = wrap(&s, &"x".repeat(200), Font::Caption, w, w, 10);
         assert!(long.len() >= 2);
+    }
+
+    #[test]
+    fn the_first_line_may_be_narrower_than_the_rest() {
+        let s = surface(96);
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+        let rest = s.text_width("alpha beta gamma delta epsilon", Font::Caption);
+        let first = s.text_width("alpha beta gamma", Font::Caption);
+        let lines = wrap(&s, text, Font::Caption, first, rest, 10);
+        let width = |l: &[Run]| l.iter().map(|r| s.text_width(&r.text, Font::Caption)).sum::<i32>();
+        assert!(width(&lines[0]) <= first, "the first line stops at its own width");
+        assert!(lines.iter().skip(1).any(|l| width(l) > first), "the others use the whole width");
+        let joined: String = lines.iter().flatten().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn the_detail_stops_before_the_hint_column() {
+        for dpi in [96, 120, 144, 192] {
+            let s = surface(dpi);
+            let mut l = scene_launcher(PreviewScene::RunReview);
+            l.size(&s);
+            let m = s.metrics();
+            let item = l.session.selected().unwrap().clone();
+            let hint = hint_for(&item).unwrap();
+            let hint_left = hint_right(m, l.width) - s.text_width(hint, Font::Caption);
+            let (first, rest) = l.detail_widths(&s, &item, true);
+            assert!(
+                m.px(style::NAME_X) + first <= hint_left - m.px(HINT_GAP),
+                "{dpi}: the column ends before the hint"
+            );
+            assert!(first < rest, "{dpi}: only the first line gives way");
+            assert_eq!(l.detail_widths(&s, &item, false), (rest, rest), "{dpi}: no hint, no give");
+            let g = l.geo.borrow().clone();
+            let row = g.rows.iter().find(|r| Some(r.idx) == l.session.selected_index()).unwrap();
+            let width = |line: &[Run]| line.iter().map(|r| s.text_width(&r.text, Font::Caption)).sum::<i32>();
+            assert!(width(&row.lines[0]) <= first, "{dpi}: the review's first line is within it");
+            assert!(
+                row.lines.iter().skip(1).all(|line| width(line) <= rest),
+                "{dpi}: the others are within the names' width"
+            );
+        }
+        // An unselected row, or a launcher without the focus, shows no hint: the detail has the whole width.
+        let s = surface(96);
+        let mut l = scene_launcher(PreviewScene::Inactive);
+        l.size(&s);
+        let item = l.session.selected().unwrap().clone();
+        let (first, rest) = l.detail_widths(&s, &item, true);
+        assert_eq!(first, rest);
     }
 
     #[test]
