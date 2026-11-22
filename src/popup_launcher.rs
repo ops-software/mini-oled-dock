@@ -486,9 +486,11 @@ impl Launcher {
     }
 
     /// After a keystroke: a new layout waits to shrink until no key came for `SHRINK_MS`.
-    /// A notice row learned while this launcher is open: it shows after the others, over the same query.
-    fn show_notice(&mut self, row: Item, cx: &Context, sys: &mut dyn SysPort) -> Reply {
-        self.session.push_notice(row);
+    /// Notice rows learned while this launcher is open: they show after the others, in order, over the same query.
+    fn show_notices(&mut self, rows: Vec<Item>, cx: &Context, sys: &mut dyn SysPort) -> Reply {
+        for row in rows {
+            self.session.push_notice(row);
+        }
         let fx = self.session.refresh(cx);
         self.run(fx, cx, sys)
     }
@@ -2488,11 +2490,26 @@ fn answer_allowed(answer: Option<Choice>, held: &dyn Fn() -> bool) -> bool {
 
 /// Another app holds Alt+Shift+Space: an open launcher says so at once, otherwise its next open does (once).
 fn show_chord_held() {
-    let shown =
-        super::with_launcher(|l| ctx(|cx| l.show_notice(chord_held_row(), cx, &mut RealSys)).unwrap_or(Reply::None));
-    if !shown {
-        with_ctrl(|c| c.chord_held = true);
-    }
+    held_flow(&mut |rows| {
+        super::with_launcher(|l| ctx(|cx| l.show_notices(rows, cx, &mut RealSys)).unwrap_or(Reply::None))
+    });
+}
+
+/// `show_chord_held` with the open launcher as `show` (false: none is open). Nothing was written, so the PowerToys
+/// notice's question is still open: its row (which the choice took out of the list) shows again under the held chord's,
+/// unless the owner exited or the launcher took the chord meanwhile.
+fn held_flow(show: &mut dyn FnMut(Vec<Item>) -> bool) {
+    let again = with_ctrl(|c| c.pt.renotice()).unwrap_or(false);
+    let rows = std::iter::once(chord_held_row()).chain(again.then(|| pt_notice_row(PtNotice::Shared))).collect();
+    let shown = show(rows);
+    with_ctrl(|c| {
+        if !shown {
+            c.chord_held = true;
+        } else if again {
+            // Shown now, not once more at the next open.
+            let _ = c.pt.take_notice();
+        }
+    });
 }
 
 /// What the PowerToys notice's answer writes: Take and Leave set `with_powertoys`, Use Alt+Shift+Space sets the chord,
@@ -4920,7 +4937,7 @@ mod tests {
         let mut l = typed(&fx, "note");
         l.session.set_notices(vec![failure_row()]);
         let _ = l.session.refresh(&fx.cx());
-        assert_eq!(l.show_notice(chord_held_row(), &fx.cx(), &mut EffectSys::default()), Reply::Relayout);
+        assert_eq!(l.show_notices(vec![chord_held_row()], &fx.cx(), &mut EffectSys::default()), Reply::Relayout);
         let titles: Vec<&str> = l.session.rows().iter().take(2).map(|r| &*r.title).collect();
         assert_eq!(titles, [strings::launch_failed(), strings::pt_alt_shift_space_held()]);
         assert!(l.session.rows().iter().any(|r| r.kind != Kind::Notice), "the query's rows stay");
@@ -4934,6 +4951,34 @@ mod tests {
         let l = new_launcher();
         assert_eq!(l.session.rows().first().map(|r| &*r.title), Some(strings::pt_alt_shift_space_held()));
         assert!(new_launcher().session.rows().iter().all(|r| r.kind != Kind::Notice), "once");
+        // The question is still open: the notice (which the choice took out of the list) shows again under that row,
+        // with its choices, in the open launcher...
+        let notice_titles = |l: &Launcher| -> Vec<String> {
+            l.session.rows().iter().filter(|r| r.kind == Kind::Notice).map(|r| r.title.to_string()).collect()
+        };
+        let both = [strings::pt_alt_shift_space_held(), strings::pt_shared()];
+        pt_ctrl(PtState::Detected);
+        with_ctrl(|c| c.pt.on(PtEvent::FirstChord));
+        let mut l = new_launcher();
+        l.session.set_notices(Vec::new());
+        let mut sys = EffectSys::default();
+        held_flow(&mut |rows| {
+            let _ = l.show_notices(rows, &fx.cx(), &mut sys);
+            true
+        });
+        assert_eq!(notice_titles(&l), both);
+        let shared = l.session.rows().iter().find(|r| &*r.title == strings::pt_shared()).unwrap();
+        assert!(matches!(shared.payload, Payload::Choices(c) if c.len() == 3), "Take and Leave are there again");
+        assert!(new_launcher().session.rows().iter().all(|r| r.kind != Kind::Notice), "shown, not once more");
+        // ... or at the next open, once.
+        held_flow(&mut |_| false);
+        assert_eq!(notice_titles(&new_launcher()), both);
+        assert!(new_launcher().session.rows().iter().all(|r| r.kind != Kind::Notice), "once");
+        // With no question left (the owner exited) only the held chord's row shows.
+        pt_check(&mut FakeHook::default(), &mut FakeSys { owners: false, ..fresh() });
+        held_flow(&mut |_| false);
+        assert_eq!(notice_titles(&new_launcher()), [strings::pt_alt_shift_space_held()]);
+        with_ctrl(|c| *c = Ctrl::new());
     }
 
     #[test]

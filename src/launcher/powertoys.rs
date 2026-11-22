@@ -130,6 +130,16 @@ impl Pt {
         self.pending.take()
     }
 
+    /// The notice's answer could not be written (Use Alt+Shift+Space while another app holds it): the question is still
+    /// open, so the notice is pending again. Only while the chord passes and the notice is unanswered; true when it is.
+    pub fn renotice(&mut self) -> bool {
+        let open = self.yields() && !self.done;
+        if open {
+            self.pending = Some(PtNotice::Shared);
+        }
+        open
+    }
+
     /// The config's keys, at start and at each change: a changed `with_powertoys` is the choice of the notice (or of the
     /// config file); `powertoys_done` set before the first chord means no notice.
     pub fn configure(&mut self, take: bool, done: bool) {
@@ -372,6 +382,32 @@ mod tests {
         pt.on(FirstChord);
         check(&mut pt, &[]);
         assert_eq!(pt.take_notice(), None);
+    }
+
+    #[test]
+    fn a_refused_answer_asks_again() {
+        // The notice shown and answered with a chord another app holds: nothing was written, so it is asked again.
+        let mut pt = Pt::new();
+        check(&mut pt, &[CMDPAL]);
+        pt.on(FirstChord);
+        assert_eq!(pt.take_notice(), Some(PtNotice::Shared));
+        assert!(pt.renotice());
+        assert_eq!(pt.take_notice(), Some(PtNotice::Shared));
+        assert_eq!(pt.state(), Yield { unanswered: 0 }, "the chord still passes");
+        // Answered meanwhile, the owner gone, or the chord taken: no question is left.
+        pt.configure(false, true);
+        assert!(!pt.renotice());
+        let mut pt = Pt::new();
+        assert!(!pt.renotice(), "nothing runs");
+        check(&mut pt, &[CMDPAL]);
+        pt.on(FirstChord);
+        let _ = pt.take_notice();
+        for _ in 0..MAX_UNANSWERED {
+            pt.on(PassedChord);
+            pt.on(NoAnswerIn400ms);
+        }
+        assert!(!pt.renotice(), "taken over");
+        assert_eq!(pt.take_notice(), Some(PtNotice::TookOver), "its own notice is kept");
     }
 
     #[test]
