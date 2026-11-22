@@ -14,12 +14,17 @@ use windows::Win32::UI::WindowsAndMessaging::KillTimer;
 
 use super::{center_y, Content, HitMap, PopupKind, Reply};
 use crate::glyphs;
-use crate::hook::{self, PassFlags, PostAction};
+use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
+use crate::launcher::catalog::CatApp;
+use crate::launcher::field::KeyEvent;
 use crate::launcher::gesture;
-use crate::launcher::model::{GlyphId, IconRef, Item, Kind, Payload, ProviderId, Verb};
-use crate::launcher::providers::LauncherOpts;
-use crate::launcher::session::Session;
+use crate::launcher::model::{
+    GlyphId, IconRef, Item, Kind, Mods, NumberStyle, Payload, ProviderId, SettingRow, Verb, WindowRow,
+};
+use crate::launcher::providers::{Context, LauncherOpts};
+use crate::launcher::runline;
+use crate::launcher::session::{Effect, ReplayKey, Session};
 use crate::launcher::strings;
 use crate::launcher::style;
 use crate::launcher::verbs;
@@ -265,6 +270,10 @@ pub(crate) struct Launcher {
     bar_ticks: Cell<u8>,
     /// The sequence of the chord post that opened it (`hook::LAUNCHER_SEQ`): its type-ahead window is ended at the close.
     open_seq: u32,
+    /// The first activation took the type-ahead ring (once per open).
+    taken: bool,
+    /// The session's effects that run after the close, in order.
+    queued: Vec<Effect>,
 }
 
 impl Launcher {
@@ -285,7 +294,55 @@ impl Launcher {
             hold_shrink: false,
             bar_ticks: Cell::new(0),
             open_seq: 0,
+            taken: false,
+            queued: Vec::new(),
         }
+    }
+
+    /// The launcher became the foreground window (or lost it): caret, selected plate and hint come with it.
+    fn set_foreground(&mut self, active: bool) -> Reply {
+        if self.foreground == active {
+            return Reply::None;
+        }
+        self.foreground = active;
+        // The review and the hint come with the focus, and the review changes the height.
+        Reply::Relayout
+    }
+
+    /// `focus` on the ports. At the first activation the keys the hook kept for this open's post are taken and replayed
+    /// into the session in order; losing the foreground ends the window (a no-op after the take).
+    fn on_focus(&mut self, active: bool, cx: &Context, hook: &mut dyn HookPort, sys: &mut dyn SysPort) -> Reply {
+        let view = self.set_foreground(active);
+        if !active {
+            hook.end(self.open_seq);
+            return view;
+        }
+        if self.taken {
+            return view;
+        }
+        self.taken = true;
+        let mut buf = [KeyRec::default(); RING_CAP];
+        let n = hook.take(self.open_seq, &mut buf);
+        let keys = replay_keys(buf.get(..n).unwrap_or(&[]), sys);
+        if keys.is_empty() {
+            return view;
+        }
+        let fx = self.session.replay(&keys, cx);
+        view.merge(self.run(fx, cx, sys))
+    }
+
+    /// Runs the session's effects in order: the view's at once, the others after the close.
+    fn run(&mut self, fx: Vec<Effect>, _cx: &Context, _sys: &mut dyn SysPort) -> Reply {
+        let mut reply = Reply::None;
+        for e in fx {
+            match e {
+                Effect::Relayout => reply = reply.merge(Reply::Relayout),
+                Effect::Redraw => reply = reply.merge(Reply::Redraw),
+                Effect::Hide { .. } => reply = Reply::Close,
+                other => self.queued.push(other),
+            }
+        }
+        reply
     }
 
     /// The chord again while open (the controller's `OpenPlan::Close`): the final Esc.
@@ -298,6 +355,8 @@ impl Launcher {
     fn finish(&mut self, hook: &mut dyn HookPort) {
         hook.shown(false);
         hook.end(self.open_seq);
+        // The effects of the close run on the system port (L1a-15c).
+        self.queued.clear();
     }
 
     /// The session the keys and the late batches go to (L1a-15).
@@ -797,12 +856,10 @@ impl Content for Launcher {
     }
 
     fn focus(&mut self, active: bool) -> Reply {
-        if self.foreground == active {
-            return Reply::None;
+        match ctx(|cx| self.on_focus(active, cx, &mut RealHook, &mut RealSys)) {
+            Some(r) => r,
+            None => self.set_foreground(active),
         }
-        self.foreground = active;
-        // The review and the hint come with the focus, and the review changes the height.
-        Reply::Relayout
     }
 
     fn tick(&mut self) -> Reply {
@@ -871,6 +928,8 @@ pub(crate) trait HookPort {
     fn seqs(&self) -> (u32, u32);
     /// `hook::alt_tracked_down`.
     fn alt_down(&self) -> bool;
+    /// `hook::take_typeahead`: the keys typed after the chord of `seq`, once (0 for another sequence or an ended one).
+    fn take(&mut self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize;
 }
 
 /// What the controller asks of Windows: Win32 and the popup host in the dock (`launcher_sys::RealSys`), a recorder in the
@@ -890,6 +949,49 @@ pub(crate) trait SysPort {
     fn close_launcher(&mut self);
     /// `SendInput` of these (vk, up) events, tagged `hook::INJECT_TAG`.
     fn inject(&mut self, keys: &[(u16, bool)]);
+    /// What a kept key types with the UI thread's keyboard layout and its recorded modifiers (`ToUnicodeEx`, keyboard
+    /// state left unchanged).
+    fn translate(&mut self, rec: &KeyRec) -> Typed;
+}
+
+/// What one kept key types.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Typed {
+    /// These characters, none of them a control character.
+    Text(String),
+    /// A dead key: dropped (the character it would start never comes).
+    Dead,
+    /// No character, or a control one (Enter, Esc, Tab, Backspace, Ctrl+letter): the key itself.
+    Key,
+}
+
+/// `ToUnicodeEx`'s answer (`n` units written to `buf`, negative for a dead key) as what the key types.
+pub(crate) fn typed_of(n: i32, buf: &[u16]) -> Typed {
+    if n < 0 {
+        return Typed::Dead;
+    }
+    let units = buf.get(..usize::try_from(n).unwrap_or(0)).unwrap_or(&[]);
+    let text = String::from_utf16_lossy(units);
+    if text.is_empty() || text.chars().any(char::is_control) {
+        Typed::Key
+    } else {
+        Typed::Text(text)
+    }
+}
+
+/// The kept keys as the session replays them, in order: characters as text, the other keys as key events.
+fn replay_keys(recs: &[KeyRec], sys: &mut dyn SysPort) -> Vec<ReplayKey> {
+    let mut out = Vec::with_capacity(recs.len());
+    for r in recs {
+        match sys.translate(r) {
+            Typed::Text(s) => out.extend(s.chars().map(ReplayKey::Text)),
+            Typed::Dead => {}
+            Typed::Key => {
+                out.push(ReplayKey::Key(KeyEvent { vk: r.vk, mods: r.mods, repeat: false, sys: r.mods.has(Mods::ALT) }))
+            }
+        }
+    }
+    out
 }
 
 /// Which monitor the launcher opens on (`launcher.monitor`).
@@ -935,6 +1037,14 @@ struct Ctrl {
     over_fullscreen_pass: bool,
     /// The pass flags the hook was last given.
     flags: PassFlags,
+    /// The session's view of the config and the locale's number marks.
+    opts: LauncherOpts,
+    num: NumberStyle,
+    /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
+    apps: Vec<CatApp>,
+    settings: Vec<SettingRow>,
+    windows: Vec<WindowRow>,
+    history: Vec<Box<str>>,
 }
 
 impl Ctrl {
@@ -945,6 +1055,27 @@ impl Ctrl {
             top_percent: crate::config::LAUNCHER_TOP_PERCENT.2,
             over_fullscreen_pass: true,
             flags: PassFlags::default(),
+            opts: LauncherOpts::default(),
+            num: NumberStyle { decimal: '.', group: ',' },
+            apps: Vec::new(),
+            settings: Vec::new(),
+            windows: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    /// The providers' context of one keystroke: borrowed, nothing copied.
+    fn context(&self) -> Context<'_> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        Context {
+            apps: &self.apps,
+            settings: &self.settings,
+            windows: &self.windows,
+            history: &self.history,
+            known: &runline::KNOWN,
+            opts: &self.opts,
+            num: self.num,
+            now_unix: now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
         }
     }
 }
@@ -960,6 +1091,17 @@ fn with_ctrl<R>(f: impl FnOnce(&mut Ctrl) -> R) -> Option<R> {
         Ok(mut g) => Some(f(&mut g)),
         Err(_) => {
             log!("launcher: controller state already in use (re-entry), operation skipped");
+            None
+        }
+    })
+}
+
+/// Runs `f` with the providers' context; None (logged) on a re-entry.
+fn ctx<R>(f: impl FnOnce(&Context) -> R) -> Option<R> {
+    CTRL.with(|c| match c.try_borrow() {
+        Ok(g) => Some(f(&g.context())),
+        Err(_) => {
+            log!("launcher: controller state already in use (re-entry), key skipped");
             None
         }
     })
@@ -1302,6 +1444,9 @@ mod tests {
         newest: u32,
         failopen: u32,
         alt: bool,
+        /// The type-ahead ring: its post's sequence and its keys.
+        ring: (u32, Vec<KeyRec>),
+        takes: Vec<u32>,
     }
 
     impl HookPort for FakeHook {
@@ -1322,6 +1467,17 @@ mod tests {
         }
         fn alt_down(&self) -> bool {
             self.alt
+        }
+        fn take(&mut self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
+            self.takes.push(seq);
+            if seq != self.ring.0 {
+                return 0;
+            }
+            let keys = std::mem::take(&mut self.ring.1);
+            for (slot, k) in out.iter_mut().zip(&keys) {
+                *slot = *k;
+            }
+            keys.len().min(RING_CAP)
         }
     }
 
@@ -1365,6 +1521,112 @@ mod tests {
         fn inject(&mut self, keys: &[(u16, bool)]) {
             self.ops.push(Op::Inject(keys.to_vec()));
         }
+        /// The fake layout: `scan` holds the character a key types (0: none, 0xFFFF: a dead key).
+        fn translate(&mut self, rec: &KeyRec) -> Typed {
+            match rec.scan {
+                0 => Typed::Key,
+                0xFFFF => Typed::Dead,
+                c => Typed::Text(char::from_u32(u32::from(c)).unwrap().to_string()),
+            }
+        }
+    }
+
+    const VK_RETURN: u16 = 0x0D;
+
+    /// A kept key that types `c`.
+    fn ch(c: char) -> KeyRec {
+        KeyRec { vk: c.to_ascii_uppercase() as u16, scan: c as u16, ..KeyRec::default() }
+    }
+
+    fn enter(mods: Mods) -> KeyRec {
+        KeyRec { vk: VK_RETURN, mods, ..KeyRec::default() }
+    }
+
+    /// A launcher content opened for the post `seq`.
+    fn opened(seq: u32) -> Launcher {
+        let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
+        l.open_seq = seq;
+        l
+    }
+
+    #[test]
+    fn replay_builds_events_in_order() {
+        use crate::launcher::providers::tests::Fx;
+        use crate::launcher::session::{Effect, LaunchReq, ReplayKey};
+        let fx = Fx::new();
+        let dead = KeyRec { vk: 0xDE, scan: 0xFFFF, ..KeyRec::default() };
+        let ring = vec![ch('c'), dead, ch('a'), ch('l'), ch('c'), enter(Mods::NONE)];
+        let keys = replay_keys(&ring, &mut FakeSys::default());
+        let want = [
+            ReplayKey::Text('c'),
+            ReplayKey::Text('a'),
+            ReplayKey::Text('l'),
+            ReplayKey::Text('c'),
+            ReplayKey::Key(KeyEvent { vk: VK_RETURN, mods: Mods::NONE, repeat: false, sys: false }),
+        ];
+        assert_eq!(keys, want, "four characters then Enter; the dead key is dropped");
+        // What ToUnicodeEx's answer types.
+        assert_eq!(typed_of(1, &[u16::from(b'c'), 0]), Typed::Text("c".into()));
+        assert_eq!(typed_of(-1, &[0x5E]), Typed::Dead);
+        assert_eq!(typed_of(0, &[0]), Typed::Key, "an arrow");
+        assert_eq!(typed_of(1, &[0x0D]), Typed::Key, "Enter");
+        assert_eq!(typed_of(1, &[0x01]), Typed::Key, "Ctrl+A");
+        assert_eq!(typed_of(2, &[0xD83D, 0xDE00]), Typed::Text("\u{1F600}".into()), "a pair of surrogates");
+        // At the first activation: the ring of the open's sequence is taken and acted on.
+        let mut l = opened(7);
+        let mut hook = FakeHook { ring: (7, ring), ..FakeHook::default() };
+        let reply = l.on_focus(true, &fx.cx(), &mut hook, &mut FakeSys::default());
+        assert_eq!(hook.takes, [7]);
+        assert_eq!(l.session.query_text(), "calc");
+        assert_eq!(reply, Reply::Close, "Enter on the rows of \"calc\" launches");
+        let calc = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+        assert_eq!(l.queued, [Effect::Launch(LaunchReq::App(calc.into()))], "the Launch of Calcolatrice");
+        // Once per open: a second activation takes nothing.
+        l.on_focus(true, &fx.cx(), &mut hook, &mut FakeSys::default());
+        assert_eq!(hook.takes, [7]);
+        // Losing the foreground ends the window (a no-op after the take).
+        l.on_focus(false, &fx.cx(), &mut hook, &mut FakeSys::default());
+        assert_eq!(hook.ends, [7]);
+    }
+
+    #[test]
+    fn replay_takes_only_its_own_sequence() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = opened(7);
+        let mut hook = FakeHook { ring: (6, vec![ch('s'), ch('h'), enter(Mods::NONE)]), ..FakeHook::default() };
+        let reply = l.on_focus(true, &fx.cx(), &mut hook, &mut FakeSys::default());
+        assert_eq!(hook.takes, [7]);
+        assert_eq!(l.session.query_text(), "", "the keys of post 6 are never replayed into the open of post 7");
+        assert_eq!(reply, Reply::Relayout, "only the focus change");
+        assert!(l.queued.is_empty());
+    }
+
+    #[test]
+    fn replayed_ctrl_shift_enter_never_gesture() {
+        use crate::launcher::gesture::Gesture;
+        use crate::launcher::providers::tests::Fx;
+        use crate::launcher::session::Effect;
+        let fx = Fx::new();
+        let ctrl_shift = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
+        let typed = |l: &mut Launcher| {
+            l.session.chars("> cmd /c dir", &fx.cx());
+            let key = l.session.selected().unwrap().key;
+            l.session.set_review_lines(key, 1);
+        };
+        // A person's Ctrl+Shift+Enter with the hook's proof runs the line as administrator.
+        let mut live = opened(7);
+        typed(&mut live);
+        let ev = KeyEvent { vk: VK_RETURN, mods: ctrl_shift, repeat: false, sys: false };
+        let fx_live = live.session.key(ev, Some(Gesture::for_test(9)), &fx.cx());
+        assert!(fx_live.iter().any(|e| matches!(e, Effect::Launch(_))), "{fx_live:?}");
+        // The same keys kept by the hook and replayed never carry a gesture: nothing runs.
+        let mut l = opened(7);
+        typed(&mut l);
+        let mut hook = FakeHook { ring: (7, vec![enter(ctrl_shift)]), ..FakeHook::default() };
+        let reply = l.on_focus(true, &fx.cx(), &mut hook, &mut FakeSys::default());
+        assert_ne!(reply, Reply::Close);
+        assert!(!l.queued.iter().any(|e| matches!(e, Effect::Launch(_))), "{:?}", l.queued);
     }
 
     /// A post of `seq` sent at 1000 and handled at `now`, the hook's newest sequence `newest`.

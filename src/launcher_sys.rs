@@ -15,15 +15,18 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    GetKeyState, GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
+    VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
 
-use crate::hook::{self, PassFlags};
+use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
+use crate::launcher::model::Mods;
 use crate::launcher::session::LaunchReq;
 use crate::log;
-use crate::popup::popup_launcher::{HookPort, Launcher, MonitorPick, SysPort};
+use crate::popup::popup_launcher::{typed_of, HookPort, Launcher, MonitorPick, SysPort, Typed};
 use crate::popup::{self, Centred, PopupKind};
 use crate::shell_thread::ShellRequest;
 
@@ -53,6 +56,10 @@ impl HookPort for RealHook {
 
     fn alt_down(&self) -> bool {
         hook::alt_tracked_down()
+    }
+
+    fn take(&mut self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
+        hook::take_typeahead(seq, out)
     }
 }
 
@@ -144,6 +151,39 @@ impl SysPort for RealSys {
             let count = inputs.len();
             log!("launcher: SendInput accepted {n} of {count} events");
         }
+    }
+
+    fn translate(&mut self, rec: &KeyRec) -> Typed {
+        let mut state = [0u8; 256];
+        let mut down = |vks: &[VIRTUAL_KEY]| {
+            for vk in vks {
+                if let Some(s) = state.get_mut(usize::from(vk.0)) {
+                    *s = 0x80;
+                }
+            }
+        };
+        if rec.mods.has(Mods::SHIFT) {
+            down(&[VK_SHIFT, VK_LSHIFT]);
+        }
+        if rec.mods.has(Mods::CTRL) {
+            down(&[VK_CONTROL, VK_LCONTROL]);
+        }
+        if rec.mods.has(Mods::ALT) {
+            down(&[VK_MENU, VK_LMENU]);
+        }
+        // SAFETY: GetKeyState has no preconditions; the low bit is the toggle state.
+        if unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0 {
+            if let Some(s) = state.get_mut(usize::from(VK_CAPITAL.0)) {
+                *s = 0x01;
+            }
+        }
+        let mut buf = [0u16; 8];
+        // SAFETY: `state` and `buf` are valid for the call; flag 0x4 leaves the keyboard state (dead keys included)
+        // unchanged; GetKeyboardLayout(0) is the calling thread's layout.
+        let n = unsafe {
+            ToUnicodeEx(u32::from(rec.vk), u32::from(rec.scan), &state, &mut buf, 0x4, Some(GetKeyboardLayout(0)))
+        };
+        typed_of(n, &buf)
     }
 }
 
