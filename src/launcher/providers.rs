@@ -192,6 +192,12 @@ const PINNED: Score = Score { tier: 0, learned: Reverse(u16::MAX), idle: false, 
 /// In Mixed mode at most this many settings rows that only a hidden word matched (tiers 4, 6 and 7).
 const HIDDEN_SETTINGS_CAP: usize = 3;
 
+#[cfg(test)]
+thread_local! {
+    /// The fuzzy passes `query_all` ran on this thread (L3 T8: none for a query that already has an answer).
+    pub(crate) static FUZZY_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// A provider's time budget per keystroke (5.4.1), counted in every build and never asserted (house rule 8).
 pub const BUDGET_US: u64 = 2_000;
 
@@ -258,7 +264,12 @@ fn query_all_traced(q: &Query, cx: &Context, budget: &mut Budget, trace: &mut dy
         hits += run_one(id, q, cx, false, &mut top, &mut s);
         spend(&mut spent, &mut ran, id, t);
     }
-    if hits == 0 && !q.folded.is_empty() {
+    // Fuzzy is the last resort: nothing ranked matched and nothing else answered (a run, path, URL, answer or registry row
+    // is an answer; the web row is not).
+    let answered = top.items.iter().any(|i| i.key != web_search_key());
+    if hits == 0 && !q.folded.is_empty() && !answered {
+        #[cfg(test)]
+        FUZZY_PASSES.with(|n| n.set(n.get() + 1));
         for id in ORDER {
             if RANKED.contains(&id) && ran.get(id as usize).copied().unwrap_or(false) {
                 let t = Instant::now();
@@ -1597,12 +1608,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tier6_runs_only_when_nothing_matched() {
+    fn fuzzy_runs_only_when_nothing_answered() {
         let fx = Fx::new();
         let rows = fx.rows("clacolatrice");
         assert_eq!((&*rows[0].title, rows[0].score.tier), ("Calcolatrice", 8));
         // "stea" matches Steam by prefix: no fuzzy rows next to it.
         assert!(fx.rows("stea").iter().all(|r| r.score.tier < rank::T_FUZZY));
+    }
+
+    #[test]
+    fn fuzzy_never_after_an_answer() {
+        let fx = Fx::new();
+        let passes = || FUZZY_PASSES.with(std::cell::Cell::get);
+        let before = passes();
+        for raw in ["c:\\windows\\system32", "https://x.example", "ipconfig /all", "12*(3+4)", "> notepad"] {
+            let rows = fx.query(raw).0;
+            assert!(!rows.is_empty(), "{raw}: an answer row");
+            assert!(rows.iter().all(|r| r.score.tier != rank::T_FUZZY), "{raw}");
+        }
+        assert_eq!(passes(), before, "no fuzzy pass at all");
+        // The pass does run for a query nothing answered.
+        let _ = fx.query("clacolatrice");
+        assert_eq!(passes(), before + 1);
+    }
+
+    #[test]
+    fn fuzzy_ignores_keywords() {
+        let mut fx = Fx::new();
+        fx.settings = vec![
+            SettingRow::new(0, "Frob panel", Keys::from(&[("quantumflux", 1)][..]), 1),
+            SettingRow::new(1, "Zoomable options", Keys::default(), 2),
+        ];
+        let settings = |fx: &Fx, raw: &str| -> Vec<String> {
+            fx.rows(raw).into_iter().filter(|r| r.kind == Kind::Setting).map(|r| r.title.to_string()).collect()
+        };
+        assert!(settings(&fx, "quantumflix").is_empty(), "one edit from a keyword: not found");
+        assert_eq!(settings(&fx, "zoomabel"), ["Zoomable options"], "one edit from the name: found");
     }
 
     #[test]
@@ -1889,6 +1930,34 @@ mod bench {
             worst = worst.max(n);
         }
         worst
+    }
+
+    /// KEY-3: the most edit-distance cells one query computes over the bench's candidates, for each of the 1,000 queries
+    /// and every prefix of each (the keystrokes of typing it). The pass costs a bounded amount whatever the query.
+    const MAX_OSA_CELLS: u64 = 50_000;
+
+    #[test]
+    fn osa_cells_bounded() {
+        use crate::launcher::rank::OSA_CELLS;
+        let big = Big::new(1);
+        let cx = big.cx();
+        let mut worst = (0, String::new());
+        for raw in queries() {
+            let mut end = 0;
+            for ch in raw.chars() {
+                end += ch.len_utf8();
+                let part = &raw[..end];
+                let q = query::parse_query(part, &big.opts.prefixes, NUM, 1);
+                let before = OSA_CELLS.with(std::cell::Cell::get);
+                let _ = query_all(&q, &cx, &mut Budget::default());
+                let cells = OSA_CELLS.with(std::cell::Cell::get) - before;
+                if cells > worst.0 {
+                    worst = (cells, part.to_string());
+                }
+            }
+        }
+        println!("most OSA cells in one query: {} ({:?})", worst.0, worst.1);
+        assert!(worst.0 <= MAX_OSA_CELLS, "{} OSA cells for {:?}", worst.0, worst.1);
     }
 
     #[test]

@@ -523,7 +523,6 @@ fn world(ui: &str) -> World {
 }
 
 #[test]
-#[ignore = "green after L3 T8"]
 fn the_table() {
     let (en, it) = (World::new(false), World::new(true));
     let mut bad = Vec::new();
@@ -536,7 +535,6 @@ fn the_table() {
 }
 
 #[test]
-#[ignore = "green after L3 T8"]
 fn invariants() {
     let (en, it) = (World::new(false), World::new(true));
     let mut bad = Vec::new();

@@ -1,6 +1,6 @@
-//! Folding and ranking of the launcher (SPEC 5.2.5): `fold`, the name index built once at load, the match tiers 0-6
-//! and the destructive default rule of 5.2.7. Tier 7 (Windows' typo rewrite) is not here: it reads a file and so runs
-//! on the shell thread (L1a-12g).
+//! Folding and ranking of the launcher (SPEC 5.2.5): `fold`, the name index built once at load, the match tiers 0-8
+//! (names, initials, hidden words, fuzzy) and the destructive default rule of 5.2.7. Windows' typo rewrite is not here:
+//! it reads a file and so runs on the shell thread (L1a-12g); its rows carry the tiers of the query it read.
 
 use super::keywords;
 use super::model::{Item, Payload, Query, Score};
@@ -120,10 +120,6 @@ pub struct Cand<'a> {
 }
 
 impl Cand<'_> {
-    fn any_keyword(&self, pred: impl Fn(&str) -> bool) -> bool {
-        self.extra.iter().any(|k| pred(k)) || self.keys.iter().any(|(k, _)| pred(k))
-    }
-
     /// The order key of 5.4.1 for a match of `tier`. `kind` is the row kind's rank (app, window, command...).
     pub fn score(&self, tier: u8, running: bool, kind: u8) -> Score {
         let len = u16::try_from(self.folded.chars().count()).unwrap_or(u16::MAX);
@@ -321,8 +317,9 @@ pub fn match_all(cands: &[Cand], q: &str, out: &mut Vec<(usize, u8)>) {
 const FUZZY_MAX_Q: usize = 32;
 const FUZZY_BUF: usize = FUZZY_MAX_Q + 3;
 
-/// Tier 6: the query is a subsequence of the name with at most 2 gaps (3+ characters), or within Damerau distance 1
-/// (query of 4+ characters; 2 at 8+) of a word prefix of the name or of one of its keywords. Allocates nothing.
+/// Tier 8: the query is a subsequence of the shown name with at most 2 gaps (3+ characters), or within Damerau distance 1
+/// (query of 4+ characters; 2 at 8+) of a word prefix of the shown name or of one of its other names (`extra`). Names
+/// only: a hidden keyword is never compared. Allocates nothing.
 pub fn match_fuzzy(c: &Cand, q: &str) -> Option<u8> {
     let q = q.trim();
     let mut qc = ['\0'; FUZZY_MAX_Q];
@@ -345,12 +342,13 @@ pub fn match_fuzzy(c: &Cand, q: &str) -> Option<u8> {
     if dist == 0 {
         return None;
     }
-    let name = c.words.iter().filter_map(|&w| c.folded.get(usize::from(w)..)).any(|t| near_prefix(t, qc, dist));
-    let key = |k: &str| {
-        near_prefix(k, qc, dist)
-            || k.match_indices(' ').any(|(i, _)| k.get(i + 1..).is_some_and(|t| near_prefix(t, qc, dist)))
+    let name =
+        c.words.iter().filter_map(|&w| c.folded.get(usize::from(w)..)).any(|t| near_prefix_one_pass(t, qc, dist));
+    let alias = |k: &str| {
+        near_prefix_one_pass(k, qc, dist)
+            || k.match_indices(' ').any(|(i, _)| k.get(i + 1..).is_some_and(|t| near_prefix_one_pass(t, qc, dist)))
     };
-    if name || c.any_keyword(key) {
+    if name || c.extra.iter().any(|k| alias(k)) {
         return Some(T_FUZZY);
     }
     None
@@ -383,8 +381,91 @@ fn subsequence_gaps(t: &str, q: &[char], max_gaps: u8) -> bool {
 }
 
 /// Is some prefix of `t` (the length of `q` plus or minus `dist`) within Damerau (optimal string alignment) distance
-/// `dist` of `q`?
-fn near_prefix(t: &str, q: &[char], dist: usize) -> bool {
+/// `dist` of `q`? One OSA matrix: its last row holds the distance from `q` to every prefix of `t` at once, so the
+/// lengths `q - dist` to `q + dist` cost one pass instead of one each; a row whose smallest value exceeds `dist` ends it
+/// (no later row can come back under it). Allocates nothing.
+fn near_prefix_one_pass(t: &str, q: &[char], dist: usize) -> bool {
+    type Row = [u8; FUZZY_BUF + 1];
+    /// Above every distance that can matter: a cell outside the band or past the limit.
+    const FAR: u8 = 100;
+    let mut buf = ['\0'; FUZZY_BUF];
+    let mut n = 0;
+    for ch in t.chars().take(q.len() + dist) {
+        if let Some(slot) = buf.get_mut(n) {
+            *slot = ch;
+            n += 1;
+        }
+    }
+    let Some(b) = buf.get(..n) else { return false };
+    let lo = q.len().saturating_sub(dist).max(1);
+    // No prefix of `t` is long enough: nothing to compare.
+    if n < lo {
+        return false;
+    }
+    // `dist` edits spoil at most `dist` characters of `q` (an insertion spoils none, a swap keeps both): every other one
+    // is in `t` within `dist` places of its own. Most words fail this after a few characters.
+    let mut missing = 0;
+    for (k, c) in q.iter().enumerate() {
+        let near = b.get(k.saturating_sub(dist)..(k + dist + 1).min(n)).is_some_and(|w| w.contains(c));
+        if !near {
+            missing += 1;
+            if missing > dist {
+                return false;
+            }
+        }
+    }
+    let get = |r: &Row, i: usize| r.get(i).copied().unwrap_or(FAR);
+    let limit = u8::try_from(dist).unwrap_or(u8::MAX);
+    let mut older: Row = [FAR; FUZZY_BUF + 1];
+    let mut prev: Row = [FAR; FUZZY_BUF + 1];
+    for (j, s) in prev.iter_mut().enumerate().take(dist.min(n) + 1) {
+        *s = j as u8;
+    }
+    // Only the cells within `dist` of the diagonal can hold a distance of `dist` or less.
+    for (i, &ac) in q.iter().enumerate() {
+        let row = i + 1;
+        let mut cur: Row = [FAR; FUZZY_BUF + 1];
+        let mut row_min = FAR;
+        if row <= dist {
+            if let Some(s) = cur.first_mut() {
+                *s = row as u8;
+            }
+            row_min = row as u8;
+        }
+        for j in row.saturating_sub(dist).max(1)..=(row + dist).min(n) {
+            #[cfg(test)]
+            OSA_CELLS.with(|c| c.set(c.get() + 1));
+            let bc = b.get(j - 1).copied().unwrap_or('\0');
+            let sub = get(&prev, j - 1) + u8::from(ac != bc);
+            let mut best = sub.min(get(&prev, j) + 1).min(get(&cur, j - 1) + 1);
+            let swapped = i > 0 && j > 1 && q.get(i - 1) == Some(&bc) && b.get(j - 2) == Some(&ac);
+            if swapped {
+                best = best.min(get(&older, j - 2) + 1);
+            }
+            let best = best.min(FAR);
+            if let Some(s) = cur.get_mut(j) {
+                *s = best;
+            }
+            row_min = row_min.min(best);
+        }
+        if row_min > limit {
+            return false;
+        }
+        older = prev;
+        prev = cur;
+    }
+    (lo..=n).any(|len| get(&prev, len) <= limit)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The OSA cells `near_prefix_one_pass` computed on this thread (KEY-3's count, per query on the bench).
+    pub(crate) static OSA_CELLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The reference the one-pass version must equal: one OSA matrix per prefix length (the code before L3 T8).
+#[cfg(test)]
+fn near_prefix_reference(t: &str, q: &[char], dist: usize) -> bool {
     let mut buf = ['\0'; FUZZY_BUF];
     let mut n = 0;
     for ch in t.chars().take(q.len() + dist) {
@@ -398,6 +479,7 @@ fn near_prefix(t: &str, q: &[char], dist: usize) -> bool {
 }
 
 /// Optimal string alignment distance (insert, delete, replace, swap of neighbours), three rows on the stack.
+#[cfg(test)]
 fn osa(a: &[char], b: &[char]) -> usize {
     type Row = [u8; FUZZY_BUF + 1];
     fn get(r: &Row, i: usize) -> u8 {
@@ -475,6 +557,50 @@ mod tests {
         let mut out = String::new();
         fold(s, &mut out);
         out
+    }
+
+    #[test]
+    fn near_prefix_one_pass_equals_reference() {
+        use crate::launcher::testkit::XorShift;
+        // Every target and query over {a, b, c} up to 6 characters, at distances 0, 1 and 2.
+        let mut words: Vec<Vec<char>> = vec![Vec::new()];
+        let mut from = 0;
+        for _ in 0..6 {
+            let end = words.len();
+            for i in from..end {
+                for ch in ['a', 'b', 'c'] {
+                    let mut w = words[i].clone();
+                    w.push(ch);
+                    words.push(w);
+                }
+            }
+            from = end;
+        }
+        assert_eq!(words.len(), 1 + 3 + 9 + 27 + 81 + 243 + 729);
+        let strings: Vec<String> = words.iter().map(|w| w.iter().collect()).collect();
+        for t in &strings {
+            for q in &words {
+                for dist in 0..=2 {
+                    assert_eq!(
+                        near_prefix_one_pass(t, q, dist),
+                        near_prefix_reference(t, q, dist),
+                        "{t:?} {q:?} {dist}"
+                    );
+                }
+            }
+        }
+        // 100,000 seeded pairs over six letters, up to 12 characters.
+        let mut r = XorShift::new(0x0517);
+        let word = |r: &mut XorShift| -> Vec<char> {
+            let n = (r.next_u64() % 13) as usize;
+            (0..n).map(|_| char::from(b'a' + (r.next_u64() % 6) as u8)).collect()
+        };
+        for _ in 0..100_000 {
+            let (t, q) = (word(&mut r), word(&mut r));
+            let t: String = t.into_iter().collect();
+            let dist = (r.next_u64() % 3) as usize;
+            assert_eq!(near_prefix_one_pass(&t, &q, dist), near_prefix_reference(&t, &q, dist), "{t:?} {q:?} {dist}");
+        }
     }
 
     #[test]
