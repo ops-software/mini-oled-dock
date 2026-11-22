@@ -4,7 +4,8 @@
 //! WINDOW: class `DockPopup`, `WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`
 //! (WITHOUT `WS_EX_NOACTIVATE`: it needs focus for Esc and to know when the user clicks outside). Lives on the
 //! UI thread, drawn with `surface::Surface` (no WM_PAINT). Created on first open and
-//! reused (hidden on close).
+//! reused (hidden on close). With `LAUNCHER_UNOWNED` (the S-OWNER fallback) the launcher gets a second window of the
+//! same class with no owner, created on its first open and never destroyed before `shutdown`.
 //!
 //! CLOSING: `WM_ACTIVATE` with `WA_INACTIVE` (click on another window/desktop, Alt+Tab), Esc,
 //! `close()` from the bar (the bar is NOACTIVATE: clicking it does not deactivate the popup, so the UI
@@ -386,6 +387,8 @@ impl HitMap {
 /// Open popup.
 struct Open {
     kind: PopupKind,
+    /// The window it is shown in (`ensure_window_for`).
+    hwnd: HWND,
     content: Box<dyn Content>,
     /// `None` only while the surface is temporarily out for `present`.
     surf: Option<Surface>,
@@ -419,7 +422,10 @@ const FOCUS_RETRY_MS: u32 = 80;
 const FOCUS_RETRIES: u8 = 6;
 
 struct State {
+    /// The shared popup window.
     hwnd: HWND,
+    /// The launcher's own window (`LAUNCHER_UNOWNED`); null until its first open, and always without the fallback.
+    launcher_hwnd: HWND,
     available: bool,
     registered: bool,
     open: Option<Open>,
@@ -436,6 +442,7 @@ struct State {
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         hwnd: HWND::default(),
+        launcher_hwnd: HWND::default(),
         available: false,
         registered: false,
         open: None,
@@ -568,7 +575,7 @@ pub fn link_to_bar() -> bool {
     let hwnd = with(|st| {
         let o = st.open.as_mut()?;
         o.linked = true;
-        Some(st.hwnd)
+        Some(o.hwnd)
     })
     .flatten();
     let Some(hwnd) = hwnd else { return false };
@@ -587,8 +594,8 @@ pub fn is_linked() -> bool {
 /// show is over). No-op when nothing is linked.
 pub fn follow_bar(dy: i32, alpha: u8, settled: bool) {
     let prepared = with(|st| {
-        let hwnd = st.hwnd;
         let o = st.open.as_mut()?;
+        let hwnd = o.hwnd;
         if !o.linked {
             return None;
         }
@@ -735,7 +742,7 @@ pub fn on_start_settings() {
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {
     close_inner("shutdown");
-    if let Some(h) = with(|st| st.hwnd).filter(|h| !h.0.is_null()) {
+    for h in with(|st| [st.hwnd, st.launcher_hwnd]).unwrap_or_default().into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: our window.
         let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
         for id in LAUNCHER_TIMERS {
@@ -743,16 +750,17 @@ pub fn shutdown() {
             let _ = unsafe { KillTimer(Some(h), id) };
         }
     }
-    let Some((hwnd, registered)) = with(|st| {
-        let r = (st.hwnd, st.registered);
+    let Some((windows, registered)) = with(|st| {
+        let r = ([st.hwnd, st.launcher_hwnd], st.registered);
         st.hwnd = HWND::default();
+        st.launcher_hwnd = HWND::default();
         st.registered = false;
         st.available = false;
         r
     }) else {
         return;
     };
-    if !hwnd.0.is_null() {
+    for hwnd in windows.into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: window created by this module on the UI thread.
         if let Err(e) = unsafe { DestroyWindow(hwnd) } {
             log!("popup: DestroyWindow failed: {e}");
@@ -838,7 +846,8 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
             let pt = unsafe { (*(lp.0 as *const MSLLHOOKSTRUCT)).pt };
             if !in_rect(&POPUP_RECT, pt) && !in_rect(&ITEM_RECT, pt) {
                 // try_borrow: if the state is busy the hwnd read is skipped (the tick safety net remains).
-                let hwnd = STATE.with(|s| s.try_borrow().map(|g| g.hwnd).unwrap_or_default());
+                let hwnd = STATE
+                    .with(|s| s.try_borrow().map(|g| g.open.as_ref().map_or(g.hwnd, |o| o.hwnd)).unwrap_or_default());
                 if !hwnd.0.is_null() {
                     // SAFETY: posting to our own window; failure is harmless.
                     let _ = unsafe { PostMessageW(Some(hwnd), WM_POPUP_OUTSIDE, WPARAM(0), LPARAM(0)) };
@@ -883,9 +892,41 @@ fn window_name_for(kind: PopupKind) -> &'static str {
     }
 }
 
-/// Popup window, created on first request and reused.
-fn ensure_window() -> Option<HWND> {
-    let existing = with(|st| st.hwnd)?;
+/// S-OWNER (L0 owner session): false = the launcher shows in the shared popup window, owned by the dock window (the
+/// default until S-OWNER is recorded); true = the launcher gets its own unowned window, the fallback for an owned window
+/// that does not show or take the keyboard while its owner, the bar, is hidden.
+const LAUNCHER_UNOWNED: bool = false;
+
+/// The window a popup kind is shown in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    /// The shared popup window (`State::hwnd`), owned by the dock window.
+    Shared,
+    /// The launcher's own window (`State::launcher_hwnd`), with no owner.
+    Launcher,
+}
+
+/// `unowned_launcher` is `LAUNCHER_UNOWNED`.
+fn window_for_kind(kind: PopupKind, unowned_launcher: bool) -> Slot {
+    if kind == PopupKind::Launcher && unowned_launcher {
+        Slot::Launcher
+    } else {
+        Slot::Shared
+    }
+}
+
+/// true while `kind` is shown in the shared window under the launcher's name (renamed at open, named back at close).
+fn renames_shared_window(kind: PopupKind) -> bool {
+    kind == PopupKind::Launcher && window_for_kind(kind, LAUNCHER_UNOWNED) == Slot::Shared
+}
+
+/// The window of popup `kind`, created on first request and reused.
+fn ensure_window_for(kind: PopupKind) -> Option<HWND> {
+    let slot = window_for_kind(kind, LAUNCHER_UNOWNED);
+    let existing = with(|st| match slot {
+        Slot::Shared => st.hwnd,
+        Slot::Launcher => st.launcher_hwnd,
+    })?;
     // SAFETY: IsWindow accepts any handle, even null.
     if !existing.0.is_null() && unsafe { IsWindow(Some(existing)) }.as_bool() {
         return Some(existing);
@@ -899,14 +940,17 @@ fn ensure_window() -> Option<HWND> {
         }
     };
     let owner = crate::hwnd();
-    let owner = if owner.0.is_null() { None } else { Some(owner) };
-    // SAFETY: class registered by `init`; the PCWSTRs are static literals; the owner is the dock
-    // window (same thread) or none.
+    let owner = if owner.0.is_null() || slot == Slot::Launcher { None } else { Some(owner) };
+    // The launcher's own window keeps its name for good.
+    let launcher_name = (slot == Slot::Launcher).then(|| HSTRING::from(window_name_for(PopupKind::Launcher)));
+    let name = launcher_name.as_ref().map_or(w!("Dock popup"), |n| PCWSTR(n.as_ptr()));
+    // SAFETY: class registered by `init`; the names are a static literal or `launcher_name`, alive for the call; the
+    // owner is the dock window (same thread) or none.
     let r = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             CLASS_NAME,
-            w!("Dock popup"),
+            name,
             WS_POPUP,
             0,
             0,
@@ -918,15 +962,24 @@ fn ensure_window() -> Option<HWND> {
             None,
         )
     };
-    match r {
-        Ok(h) => {
+    match (r, slot) {
+        (Ok(h), Slot::Shared) => {
             with(|st| st.hwnd = h);
             POPUP_HWND.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
             Some(h)
         }
-        Err(e) => {
+        (Ok(h), Slot::Launcher) => {
+            with(|st| st.launcher_hwnd = h);
+            Some(h)
+        }
+        (Err(e), Slot::Shared) => {
             log!("popup: CreateWindowExW failed: {e}");
             with(|st| st.available = false);
+            None
+        }
+        // Only the launcher fails to open; the other popups keep their window.
+        (Err(e), Slot::Launcher) => {
+            log!("popup: CreateWindowExW (launcher) failed: {e}");
             None
         }
     }
@@ -998,7 +1051,7 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     // Any other popup closes without a fade; so does the window picker.
     close_inner("popup switch");
     crate::picker::close("popup opened");
-    let Some(hwnd) = ensure_window() else { return false };
+    let Some(hwnd) = ensure_window_for(kind) else { return false };
     if kind == PopupKind::StartMenu {
         // SAFETY: our window; fails harmlessly if the timer is not armed.
         let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
@@ -1022,6 +1075,7 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
         st.last_inactive = None;
         st.open = Some(Open {
             kind,
+            hwnd,
             content,
             surf: Some(surf),
             anchor,
@@ -1043,6 +1097,8 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     if installed.is_none() {
         return false;
     }
+    // `current_hwnd` and `tick_soon` reach the open popup's window.
+    POPUP_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
     if !render(true) {
         close_inner("initial render failed");
         return false;
@@ -1051,7 +1107,7 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
     // SHOWNA: activated only by `force_foreground`. Active before its AttachThreadInput, the popup would get
     // WA_INACTIVE from the merged input queues and close at once (first click lost when another app was in front).
-    if kind == PopupKind::Launcher {
+    if renames_shared_window(kind) {
         // SAFETY: `hwnd` is our popup window (same thread); no state borrow is held.
         if let Err(e) = unsafe { SetWindowTextW(hwnd, &HSTRING::from(window_name_for(kind))) } {
             log!("popup: SetWindowTextW failed: {e}");
@@ -1101,8 +1157,9 @@ pub fn closed_within(ms: u64) -> bool {
 }
 
 fn close_inner(reason: &str) {
-    let Some((taken, hwnd)) = with(|st| (st.open.take(), st.hwnd)) else { return };
+    let Some(taken) = with(|st| st.open.take()) else { return };
     let Some(mut o) = taken else { return };
+    let hwnd = o.hwnd;
     log!("popup: closing {:?} ({reason})", o.kind);
     HIGH.with(|h| h.set(0));
     // SAFETY: GetTickCount64 has no preconditions.
@@ -1123,7 +1180,7 @@ fn close_inner(reason: &str) {
     if !hwnd.0.is_null() {
         // SAFETY: `hwnd` is our window; the state is not borrowed.
         let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-        if o.kind == PopupKind::Launcher {
+        if renames_shared_window(o.kind) {
             // The shared window gets its own name back once hidden.
             // SAFETY: `hwnd` is our window; the state is not borrowed.
             let _ = unsafe { SetWindowTextW(hwnd, w!("Dock popup")) };
@@ -1144,8 +1201,8 @@ fn close_inner(reason: &str) {
 fn render(relayout: bool) -> bool {
     // The surface leaves the state for the whole of `present`: no borrow during UpdateLayeredWindow.
     let prepared = with(|st| {
-        let hwnd = st.hwnd;
         let o = st.open.as_mut()?;
+        let hwnd = o.hwnd;
         let mut surf = o.surf.take()?;
         // A previous failed resize leaves the surface without a DIB (0 x 0): retry the layout.
         if relayout || surf.size() == (0, 0) {
@@ -1717,7 +1774,7 @@ fn timer_owner(id: usize) -> TimerOwner {
 // The launcher's timers (L1a-15, L1a-16) arm through it; until then nothing does.
 #[allow(dead_code)]
 pub(crate) fn popup_hwnd() -> Option<HWND> {
-    ensure_window()
+    ensure_window_for(PopupKind::Launcher)
 }
 
 /// Fires the content's `tick` once after about `ms` (re-arms the 1 s tick timer, which `close_inner`
@@ -2123,6 +2180,16 @@ mod tests {
         assert_eq!((TIMER_POPUP_ANIM, TIMER_POPUP_START_RELEASE), (30, 33));
         assert_eq!(timer_owner(40), TimerOwner::Host);
         assert_eq!(timer_owner(29), TimerOwner::Host);
+    }
+
+    #[test]
+    fn window_for_kind_slots() {
+        assert_eq!(window_for_kind(PopupKind::Launcher, true), Slot::Launcher, "S-OWNER failed: its own window");
+        assert_eq!(window_for_kind(PopupKind::Launcher, false), Slot::Shared, "S-OWNER passed: the shared window");
+        for kind in [PopupKind::StartMenu, PopupKind::Audio, PopupKind::AppMenu] {
+            assert_eq!(window_for_kind(kind, true), Slot::Shared, "{kind:?}");
+            assert_eq!(window_for_kind(kind, false), Slot::Shared, "{kind:?}");
+        }
     }
 
     #[test]
