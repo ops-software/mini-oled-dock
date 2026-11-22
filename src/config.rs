@@ -486,8 +486,14 @@ impl Default for LauncherConfig {
             over_fullscreen: "pass".into(),
             learn: true,
             announce_selection: false,
-            providers: LAUNCHER_PROVIDERS.iter().map(|p| (p.to_string(), true)).collect(),
-            prefixes: LAUNCHER_PREFIXES.iter().map(|(p, n)| (p.to_string(), n.to_string())).collect(),
+            providers: LAUNCHER_PROVIDERS.iter().fold(BTreeMap::new(), |mut m, p| {
+                m.insert(p.to_string(), true);
+                m
+            }),
+            prefixes: LAUNCHER_PREFIXES.iter().fold(BTreeMap::new(), |mut m, (p, n)| {
+                m.insert(p.to_string(), n.to_string());
+                m
+            }),
             web_engine: "google".into(),
             web_url: String::new(),
             offer_done: false,
