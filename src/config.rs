@@ -1183,9 +1183,10 @@ fn render(c: &Config) -> String {
     // The key chord that opens it: "off", "alt+space" or "alt+shift+space".
     "chord": {l_chord},
     // While PowerToys Command Palette or PowerToys Run runs and "chord" is "alt+space": "yield" lets Alt+Space reach
-    // it as long as it answers (after two presses in a row with no answer the launcher keeps the chord until it exits
-    // or the dock restarts); "take" keeps Alt+Space for the launcher (turn its shortcut off in PowerToys, or it may
-    // still open on some presses). The first Alt+Space the dock sees after finding it asks once.
+    // it as long as it answers (after two presses in a row with no answer the launcher keeps the chord until it exits,
+    // the dock restarts or this value changes); "take" keeps Alt+Space for the launcher (turn its shortcut off in
+    // PowerToys, or it may still open on some presses). With "yield" and "powertoys_done" false, the first Alt+Space
+    // the dock sees after finding it opens the launcher with the PowerToys question instead of reaching it.
     "with_powertoys": {l_with_powertoys},
     // Display the box opens on: "pointer", "active" or "primary".
     "monitor": {l_monitor},
