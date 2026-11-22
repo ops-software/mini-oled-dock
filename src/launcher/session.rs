@@ -2011,8 +2011,7 @@ mod tests {
         let fx = Fx::new();
         let mut s = typed(&fx, "blocco");
         open_list(&mut s, &fx);
-        let danger: Vec<Act> =
-            s.action_list().unwrap().items().iter().filter(|e| e.danger).map(|e| e.act).collect();
+        let danger: Vec<Act> = s.action_list().unwrap().items().iter().filter(|e| e.danger).map(|e| e.act).collect();
         assert_eq!(danger, [Act::Verb(Verb::CloseWindow), Act::Verb(Verb::Forget)]);
         // Open on a destructive row (Shut down) is dangerous too.
         let mut s = typed(&fx, "shut down");
