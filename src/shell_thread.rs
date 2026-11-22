@@ -219,8 +219,9 @@ pub enum ShellRequest {
     /// (lint 1). The only launcher request with `runas`.
     RunAsTyped { line: String, file: Range<usize>, gesture: Gesture },
     /// Run a typed line (Enter) as it was typed: `line` split at `file`, unexpanded, no working
-    /// directory. With `console` (a console program, or Shift+Enter) it runs as `cmd.exe /k <line>`,
-    /// `cmd.exe` from `system_dir`.
+    /// directory. With `console` (a console program, or Shift+Enter) it runs as
+    /// `cmd.exe /s /k "<line>"` (with /s cmd strips exactly that outer pair of quotes), `cmd.exe` from
+    /// `system_dir`.
     LaunchCommand { line: String, file: Range<usize>, console: bool },
     /// Show a result's file or folder selected in File Explorer (`explorer.exe /select,"<path>"` from
     /// the Windows folder), in one shell call: the path is never looked at on disk.
@@ -2011,7 +2012,9 @@ fn open_path_with(path: &str, exec: Exec) -> Result<(), Fail> {
 /// (after its closing quote when it was quoted). Only the opening quote may stand before the file, and
 /// the file must end at a word break or at its closing quote; anything else (a range out of bounds or
 /// off a character boundary included) is refused, never a panic. With `console` the file is
-/// `<sys>\cmd.exe` and the arguments `/k ` and the whole trimmed line. Nothing is looked up or expanded.
+/// `<sys>\cmd.exe` and the arguments `/s /k "<the whole trimmed line>"`: with /s cmd removes exactly that
+/// outer pair of quotes and runs the line unchanged (without /s, a line that starts with a quote and holds
+/// more than two loses its first and last quote). Nothing is looked up or expanded.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn command_parts(
     line: &str,
@@ -2039,7 +2042,7 @@ fn command_parts(
         if !sys.is_absolute() {
             return Err("no system directory");
         }
-        return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(format!("/k {}", line.trim()))));
+        return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(format!("/s /k \"{}\"", line.trim()))));
     }
     let args = rest.trim();
     Ok((part.to_string(), (!args.is_empty()).then(|| args.to_string())))
@@ -2064,7 +2067,7 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
     exec(&file, args.as_deref(), None, Verb::RunAs).map_err(Fail::Shell)
 }
 
-/// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /k <line>`), one
+/// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /s /k "<line>"`), one
 /// shell call with no working directory. Nothing is expanded or looked up here: the line goes to the
 /// shell as typed.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -2716,11 +2719,21 @@ mod tests {
         assert!(launch_command_with(&line, file.clone(), true, sys, &mut recorder(&mut calls, true)).is_ok());
         let (line2, file2) = run_line("notepad a.txt");
         assert!(launch_command_with(&line2, file2, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        // A quoted program with quoted arguments: with /s cmd strips exactly the outer pair, never a quote of the line.
+        let (line3, file3) = run_line("\"C:\\Program Files\\Git\\bin\\bash.exe\" --login \"x y\"");
+        assert!(launch_command_with(&line3, file3, true, sys, &mut recorder(&mut calls, true)).is_ok());
+        let cmd = || "C:\\Windows\\System32\\cmd.exe".to_string();
         assert_eq!(
             calls,
             [
-                ("C:\\Windows\\System32\\cmd.exe".to_string(), Some("/k ping 1.1.1.1".to_string()), None, Verb::Open),
+                (cmd(), Some("/s /k \"ping 1.1.1.1\"".to_string()), None, Verb::Open),
                 ("notepad".to_string(), Some("a.txt".to_string()), None, Verb::Open),
+                (
+                    cmd(),
+                    Some("/s /k \"\"C:\\Program Files\\Git\\bin\\bash.exe\" --login \"x y\"\"".to_string()),
+                    None,
+                    Verb::Open
+                ),
             ]
         );
         // No system directory: no console, and no guess from the environment.
