@@ -3,3 +3,5 @@ tests/fixtures/** -text
 tests/golden/** binary
 budgets.json text eol=lf
 tests/ratchet.txt text eol=lf
+THIRD_PARTY_NOTICES.md text eol=lf
+tools/notices/* text eol=lf

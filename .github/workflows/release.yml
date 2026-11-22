@@ -54,7 +54,9 @@ jobs:
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/dock.exe dist/dock.exe
           $h = (Get-FileHash dist/dock.exe -Algorithm SHA256).Hash.ToLower()
-          "$h  dock.exe" | Out-File -Encoding ascii dist/dock.exe.sha256
+          $p = Join-Path $PWD 'dist/dock.exe.sha256'
+          [System.IO.File]::WriteAllText($p, "$h  dock.exe`n", [System.Text.UTF8Encoding]::new($false))
+          if ([System.IO.File]::ReadAllBytes($p) -contains 13) { throw 'CR in dock.exe.sha256' }
           $notes = ".github/release-notes/$env:TAG.md"
           if (Test-Path $notes) { Copy-Item $notes dist/notes.md } else { "mini-oled-dock $env:VERSION" | Out-File -Encoding utf8 dist/notes.md }
           "`n---`n`n**SHA256** of ``dock.exe``: ``$h``" | Add-Content -Encoding utf8 dist/notes.md
