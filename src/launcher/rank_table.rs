@@ -171,7 +171,7 @@ impl World {
             .map(|(name, syn, xml, rank)| {
                 let mut keys = Keys::from(*syn);
                 for w in *xml {
-                    keys.push(w, crate::start_search::KEYWORD_PENALTY);
+                    keys.push(w, crate::start_search::XML_KEYWORD_PENALTY);
                 }
                 Setting {
                     name: (*name).into(),

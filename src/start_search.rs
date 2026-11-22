@@ -51,8 +51,11 @@ use crate::log;
 
 /// Largest index file read.
 const MAX_FILE: u64 = 16 * 1024 * 1024;
-/// Penalty of a keyword of the settings catalog (the value Windows Search uses for them).
-pub(crate) const KEYWORD_PENALTY: u32 = 500;
+/// The penalty of a keyword that comes from Windows' XML bag of words (the settings catalogue's own keywords), not
+/// from its synonym list. Above every penalty Windows gives a synonym and distinct from `parse_synonyms`'s fallback
+/// (`u32::MAX / 2`), so `Keys::tidy` keeps a curated synonym over the same XML word and the launcher reads "XML"
+/// exactly when the penalty equals this value.
+pub(crate) const XML_KEYWORD_PENALTY: u32 = 999_999;
 /// The Settings app inside `shell:AppsFolder`.
 const SETTINGS_APP: &str =
     r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
@@ -84,6 +87,12 @@ impl Keys {
         self.0.push('\t');
         self.0.push_str(&penalty.to_string());
         self.0.push('\n');
+    }
+
+    /// The keywords and their penalty texts, nothing parsed: the launcher parses a penalty only for a keyword that
+    /// matched.
+    pub(crate) fn raw(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.lines().filter_map(|l| l.rsplit_once('\t'))
     }
 
     /// The keywords and their penalties, in the order they were added.
@@ -545,7 +554,7 @@ fn build_settings() -> Vec<Setting> {
             Setting { name, lower, keys, rank: u32::MAX, target: target.clone(), args: args.clone() }
         });
         for k in &keywords {
-            entry.keys.push(k, KEYWORD_PENALTY);
+            entry.keys.push(k, XML_KEYWORD_PENALTY);
         }
         if rank < entry.rank {
             (entry.rank, entry.target, entry.args) = (rank, target, args);
@@ -635,7 +644,8 @@ fn catalog_key_of(dock: &str, build: &str, lang: u16, files: &[(String, u64, u64
     if build.is_empty() || files.is_empty() {
         return None;
     }
-    let mut key = format!("{dock}|{build}|{lang:04x}");
+    // "l3s1": the settings keywords carry `XML_KEYWORD_PENALTY` since L3; a file written with the old penalty is rebuilt once.
+    let mut key = format!("{dock}|{build}|{lang:04x}|l3s1");
     for (name, len, mtime) in files {
         key.push('|');
         key.extend(name.chars().filter(|c| !c.is_control() && *c != '|'));
@@ -922,7 +932,7 @@ mod tests {
                 let name = format!("Setting Ünï {i}");
                 let mut keys = Keys::default();
                 for k in 0..(i % 4) {
-                    keys.push(&format!("kw{i}x{k}"), KEYWORD_PENALTY);
+                    keys.push(&format!("kw{i}x{k}"), XML_KEYWORD_PENALTY);
                 }
                 Setting {
                     lower: name.to_lowercase(),
@@ -977,6 +987,10 @@ mod tests {
             assert_ne!(other, k);
             assert!(decode_catalog(&bytes, &other).is_none(), "{other}");
         }
+        // A key written before the XML sentinel (no salt) does not match.
+        let old = k.replace("|l3s1", "");
+        assert_ne!(old, k);
+        assert!(decode_catalog(&bytes, &old).is_none(), "a pre-L3 cache is rebuilt once");
         assert!(catalog_key_of("1.5.0:9:9", "", 0x409, &files).is_none(), "unknown build: no cache");
         assert!(catalog_key_of("1.5.0:9:9", "26100.1", 0x409, &[]).is_none(), "no XML: no cache");
     }

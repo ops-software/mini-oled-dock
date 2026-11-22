@@ -157,6 +157,55 @@ thread_local! {
     pub(crate) static TIER_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+// The tiers of the hidden words, in L3 T6's numbering: `tiers` takes them from T6 on.
+/// A curated synonym (Windows' or ours) equals the query.
+#[allow(dead_code)] // L3 T6 puts the classifier in the order
+pub(crate) const T_SYN_EQ: u8 = 4;
+/// A curated synonym starts with the query (2+ characters).
+#[allow(dead_code)] // L3 T6
+pub(crate) const T_SYN_PREFIX: u8 = 6;
+/// A settings XML keyword equals the query (never by prefix).
+#[allow(dead_code)] // L3 T6
+pub(crate) const T_BAG_EQ: u8 = 7;
+
+#[cfg(test)]
+thread_local! {
+    /// The penalties `hidden_best` parsed on this thread (L3 T4: one per matching key, none for the others).
+    pub(crate) static PENALTY_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One pass over the hidden keywords of `c`: the best (tier, penalty) of T_SYN_EQ, T_SYN_PREFIX and T_BAG_EQ, or None.
+/// A key equal to `q` is a curated synonym (T_SYN_EQ) or an XML word (T_BAG_EQ, penalty = the sentinel); a curated key
+/// that starts with `q` (2+ characters) is T_SYN_PREFIX; an XML key that only starts with `q` gives nothing. A penalty
+/// is parsed only for a key that matched. Stops early on a T_SYN_EQ with penalty 1 or less. Allocates nothing.
+#[allow(dead_code)] // L3 T6 puts it in `tiers`
+pub(crate) fn hidden_best(c: &Cand, q: &str, chars: usize) -> Option<(u8, u32)> {
+    let mut best: Option<(u8, u32)> = None;
+    for (k, text) in c.keys.raw() {
+        let eq = k == q;
+        if !(eq || chars >= 2 && k.starts_with(q)) {
+            continue;
+        }
+        #[cfg(test)]
+        PENALTY_PARSES.with(|n| n.set(n.get() + 1));
+        let penalty: u32 = text.parse().unwrap_or(u32::MAX);
+        let bag = penalty == crate::start_search::XML_KEYWORD_PENALTY;
+        let tier = match (eq, bag) {
+            (true, false) => T_SYN_EQ,
+            (true, true) => T_BAG_EQ,
+            (false, false) => T_SYN_PREFIX,
+            (false, true) => continue,
+        };
+        if best.is_none_or(|b| (tier, penalty) < b) {
+            best = Some((tier, penalty));
+        }
+        if tier == T_SYN_EQ && penalty <= 1 {
+            break;
+        }
+    }
+    best
+}
+
 /// `match_tiers` for a trimmed query that is not empty.
 fn tiers(c: &Cand, q: &str) -> Option<u8> {
     let chars = q.chars().count();
@@ -354,6 +403,34 @@ mod tests {
         let mut out = String::new();
         fold(s, &mut out);
         out
+    }
+
+    #[test]
+    fn hidden_keys_are_classified() {
+        use crate::start_search::XML_KEYWORD_PENALTY as XML;
+        let keys =
+            Keys::from(&[("wifi", 400), ("wifi", XML), ("remote desktop", 900), ("shut", XML), ("remotely", XML)][..])
+                .tidy();
+        let x = Indexed::new("Network");
+        let c = x.cand(&keys, &[], 0);
+        let best = |q: &str| hidden_best(&c, q, q.chars().count());
+        assert_eq!(best("wifi"), Some((T_SYN_EQ, 400)), "the curated synonym wins over the XML word");
+        assert_eq!(best("remot"), Some((T_SYN_PREFIX, 900)));
+        assert_eq!(best("remote desktop"), Some((T_SYN_EQ, 900)));
+        assert_eq!(best("shut"), Some((T_BAG_EQ, XML)));
+        assert_eq!(best("shu"), None, "an XML word never matches by prefix");
+        assert_eq!(best("remotel"), None);
+        assert_eq!(best("x"), None);
+        // One penalty parsed per matching key, none for the others.
+        let parses = |q: &str| {
+            PENALTY_PARSES.with(|n| n.set(0));
+            let _ = best(q);
+            PENALTY_PARSES.with(std::cell::Cell::get)
+        };
+        assert_eq!(parses("wifi"), 1);
+        assert_eq!(parses("zzz"), 0);
+        assert_eq!(parses("shu"), 1, "shut matched as a prefix: parsed, then dropped as XML");
+        assert_eq!(parses("remot"), 2, "remote desktop and remotely both start with it");
     }
 
     #[test]
