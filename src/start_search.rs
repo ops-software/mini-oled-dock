@@ -894,7 +894,22 @@ fn expected_key_slot() -> std::sync::MutexGuard<'static, Option<Arc<str>>> {
 
 /// Each run of the settings thread stores the key it computed, so a settings file that changed during a session is seen
 /// at the thread's next run, never turned into a permanent mismatch.
+/// A launcher chord is set (`chord_changed`): only then does the key stay stored, because only the launcher reads it.
+static CHORD_SET: AtomicBool = AtomicBool::new(false);
+
+/// The launcher chord was set or switched off (`popup_launcher::on_config`). Off drops the stored key: nothing the
+/// launcher needs stays resident without a chord.
+pub(crate) fn chord_changed(on: bool) {
+    CHORD_SET.store(on, SeqCst);
+    if !on {
+        *expected_key_slot() = None;
+    }
+}
+
 fn store_key(key: Option<&str>) {
+    if !CHORD_SET.load(SeqCst) {
+        return;
+    }
     let mut slot = expected_key_slot();
     if slot.as_deref() != key {
         *slot = key.map(Arc::from);
@@ -909,7 +924,9 @@ pub(crate) fn expected_settings_key() -> Option<Arc<str>> {
         return Some(k);
     }
     let key: Arc<str> = current_key()?.into();
-    *expected_key_slot() = Some(key.clone());
+    if CHORD_SET.load(SeqCst) {
+        *expected_key_slot() = Some(key.clone());
+    }
     Some(key)
 }
 
@@ -1409,6 +1426,23 @@ mod tests {
     }
 
     /// L3 T18: the key ends with the arena's format, so a cache file of another layout is rebuilt once.
+    #[test]
+    fn the_cache_key_is_stored_only_while_a_chord_is_set() {
+        // One test owns the statics: the others never touch them.
+        chord_changed(false);
+        store_key(Some("k1"));
+        assert!(expected_key_slot().is_none(), "no chord: nothing stored");
+        chord_changed(true);
+        store_key(Some("k1"));
+        assert_eq!(expected_key_slot().as_deref(), Some("k1"));
+        store_key(Some("k2"));
+        assert_eq!(expected_key_slot().as_deref(), Some("k2"), "each run replaces it");
+        chord_changed(false);
+        assert!(expected_key_slot().is_none(), "the chord off drops it");
+        store_key(Some("k3"));
+        assert!(expected_key_slot().is_none(), "and a later run does not bring it back");
+    }
+
     #[test]
     fn settings_key_has_the_arena_format() {
         let k = key();

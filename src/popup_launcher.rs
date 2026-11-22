@@ -2738,6 +2738,7 @@ pub(crate) fn on_config() {
                 super::close("launcher chord off");
             }
             let save = with_ctrl(Ctrl::chord_off).flatten();
+            crate::start_search::chord_changed(false);
             crate::launcher_sys::release_owner_waits();
             if let Some(h) = crate::launcher_sys::timer_window() {
                 for id in crate::msg::TIMER_LAUNCHER_SHRINK..=crate::msg::TIMER_LAUNCHER_PT {
@@ -2752,6 +2753,7 @@ pub(crate) fn on_config() {
             log!("launcher: chord off");
         }
         (_, true) => {
+            crate::start_search::chord_changed(true);
             let pt = with_ctrl(|c| {
                 let was = c.pt_on;
                 c.configure(&cfg.launcher);
