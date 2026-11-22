@@ -142,6 +142,7 @@ const VK_C: u16 = 0x43;
 const VK_E: u16 = 0x45;
 const VK_V: u16 = 0x56;
 const VK_W: u16 = 0x57;
+const VK_X: u16 = 0x58;
 const VK_F4: u16 = 0x73;
 
 const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
@@ -406,6 +407,7 @@ impl Session {
             VK_RETURN => self.enter(m, gesture, cx),
             VK_E if m == CTRL_SHIFT => self.reveal(cx),
             VK_C if m == Mods::CTRL => self.copy(cx),
+            VK_X if m == Mods::CTRL => self.edit(Edit::Cut, cx),
             VK_V if m == Mods::CTRL => vec![Effect::Paste],
             VK_INSERT if m == Mods::SHIFT => vec![Effect::Paste],
             VK_A if m == Mods::CTRL => self.edit(Edit::SelectAll, cx),
@@ -504,6 +506,12 @@ impl Session {
                     self.take_chip(cx);
                 }
                 self.requery(cx)
+            }
+            // Ctrl+X: the text goes to the clipboard now, the launcher stays.
+            FieldOut::Cut(text) => {
+                let mut fx = vec![Effect::CopyNow(text.into())];
+                fx.extend(self.requery(cx));
+                fx
             }
         }
     }
@@ -1440,5 +1448,34 @@ mod tests {
         assert!(!out.iter().any(|e| matches!(e, Effect::Power(_) | Effect::Hide { .. })), "{out:?}");
         assert_eq!(s.selected_index(), Some(0));
         assert_eq!(s.click(0, 1_300, &fx.cx()), [Effect::Hide { restore: false }, Effect::Power(CommandId::Restart)]);
+    }
+
+    #[test]
+    fn shift_motions_select_and_ctrl_x_cuts_to_the_clipboard() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "open file");
+        // Ctrl+Left twice: before "file", before "open"; Shift+Ctrl+Right selects the word after the caret.
+        assert_eq!(press(&mut s, &fx, VK_LEFT, Mods::CTRL), [Effect::Redraw]);
+        assert_eq!(s.field().caret(), 5);
+        press(&mut s, &fx, VK_LEFT, Mods::CTRL);
+        assert_eq!(s.field().caret(), 0);
+        assert_eq!(press(&mut s, &fx, VK_RIGHT, CTRL_SHIFT), [Effect::Redraw]);
+        assert_eq!(s.field().selection(), Some(0..5));
+        // Ctrl+X: the selection goes to the clipboard now, the text changes, the launcher stays.
+        let out = press(&mut s, &fx, 0x58, Mods::CTRL);
+        assert_eq!(out.first(), Some(&Effect::CopyNow("open ".into())));
+        assert!(out.contains(&Effect::Relayout), "{out:?}");
+        assert_eq!((s.query_text(), s.field().selection()), ("file", None));
+        // Nothing selected: Ctrl+X does nothing.
+        assert!(press(&mut s, &fx, 0x58, Mods::CTRL).is_empty());
+        // Shift+Home selects to the start and Ctrl+C copies the selection.
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        press(&mut s, &fx, VK_HOME, Mods::SHIFT);
+        assert_eq!(press(&mut s, &fx, VK_C, Mods::CTRL), [Effect::CopyNow("file".into())]);
+        // Ctrl+Delete removes up to the next word.
+        let mut s = typed(&fx, "one two");
+        press(&mut s, &fx, VK_HOME, Mods::NONE);
+        assert!(!press(&mut s, &fx, VK_DELETE, Mods::CTRL).is_empty());
+        assert_eq!(s.query_text(), "two");
     }
 }
