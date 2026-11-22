@@ -734,13 +734,11 @@ pub fn on_tray_changed() {
     dispatch(DataEvent::TrayChanged);
 }
 
-/// `ShellEvent::StartApps` reached the UI: stores the catalog and refreshes the Start menu if open.
-pub fn on_start_apps(list: Vec<crate::shell_thread::StartApp>) {
-    // The index the shell thread read for this catalog: the launcher and the Start menu each copy what they need from it,
-    // then it is dropped here.
-    let index = crate::start_search::take_app_index();
-    popup_launcher::on_catalog(&list, index.as_ref());
-    popup_startmenu::store_apps(list, index.as_ref());
+/// `ShellEvent::StartApps` reached the UI: one listing for both (L3 T17). The launcher keeps the arena (with a chord
+/// set), the Start menu makes its rows of it (when open), and the catalog is refreshed in an open Start menu.
+pub fn on_start_apps(apps: std::sync::Arc<crate::launcher::arena::Arena>) {
+    popup_startmenu::store_apps(&apps);
+    popup_launcher::on_catalog(apps);
     if current() == Some(PopupKind::StartMenu) {
         dispatch(DataEvent::StartMenuChanged);
     }

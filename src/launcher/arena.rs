@@ -30,7 +30,9 @@ const CHARS: usize = 9;
 const TGT: usize = 10;
 const SECTIONS: usize = 11;
 
-/// Record sizes.
+/// Record sizes. An entry (C.1): name 0, folded 6, initials 12 (u32 offset, u16 length each), words 18 (u32 first,
+/// u16 count), Start's keys 24 (u32, u32), rank 32; apps: id 36 (u32, u16), inbox 42 (u16), Start's rank 44 (u32);
+/// settings: target 36 (u16), args 38 (u32, u32), zero padding from 46.
 const ENT_SIZE: usize = 48;
 const DICT_REC: usize = 16;
 const CUR_POST: usize = 8;
@@ -39,7 +41,7 @@ const TGT_REC: usize = 8;
 /// The key line of a settings buffer, at most.
 const KEY_MAX: usize = 2048;
 /// A string, at most; the words of a name, at most.
-const STR_MAX: usize = 64 * 1024;
+pub const STR_MAX: usize = 64 * 1024;
 const WORDS_MAX: usize = 64;
 /// An app without an inbox entry.
 const NO_INBOX: u16 = 0xFFFF;
@@ -317,7 +319,8 @@ pub fn check(bytes: &[u8], kind: Kind, key: Option<&str>, caps: Caps) -> Result<
             if inbox != NO_INBOX && usize::from(inbox) >= INBOX.len() {
                 return Err(ArenaError::BadInbox);
             }
-            44
+            // 44..48: Start's rank (any value), so an app record has no padding.
+            ENT_SIZE
         } else {
             if short(36)? >= tgt_n {
                 return Err(ArenaError::BadTarget);
@@ -406,9 +409,10 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// `bytes` if `check` accepts them.
-    pub fn new(bytes: Vec<u8>, kind: Kind, key: Option<&str>, caps: Caps) -> Result<Arena, ArenaError> {
+    /// `bytes` if `check` accepts them, in a block of exactly their length (a read or an encoding leaves slack).
+    pub fn new(mut bytes: Vec<u8>, kind: Kind, key: Option<&str>, caps: Caps) -> Result<Arena, ArenaError> {
         let layout = check(&bytes, kind, key, caps)?;
+        bytes.shrink_to_fit();
         Ok(Arena { bytes, layout })
     }
 
@@ -533,11 +537,21 @@ impl<'a> CatalogView<'a> {
         (target, args)
     }
 
-    /// Start's packed keywords of a setting (lowercase, unfolded).
-    #[allow(dead_code)] // T18 lets Start read them from the arena
+    /// Start's packed keywords (`Keys`' text: lowercase, unfolded): of an app, Windows' synonyms of its name as Start
+    /// searches them; of a setting, Start's keywords.
     pub fn start_keys(&self, i: usize) -> &'a str {
         let rec = self.rec(i);
         self.text(u32_at(rec, 24), u32_at(rec, 28).map(|l| l as usize))
+    }
+
+    /// Start's popularity rank of entry `i`: of an app, the rank of its own id (without the launcher's classic-program
+    /// fallback, so Start orders its matches as it always did); of a setting, `rank`.
+    pub fn start_rank(&self, i: usize) -> u32 {
+        if self.layout.kind == Kind::Apps {
+            u32_at(self.rec(i), 44).unwrap_or(u32::MAX)
+        } else {
+            self.rank(i)
+        }
     }
 
     /// Entry `i` for matching: names and words borrowed from the buffer, no keywords (the hidden tiers come from `index`).
@@ -593,6 +607,8 @@ struct Ent<'a> {
     words: Vec<u16>,
     rank: u32,
     start_keys: &'a str,
+    /// Apps only (settings: unused).
+    start_rank: u32,
     id: &'a str,
     inbox: u16,
     target: &'a str,
@@ -628,7 +644,8 @@ pub fn encode_apps(entries: &[CatApp], caps: Caps) -> Result<Vec<u8>, ArenaError
             initials: &a.initials,
             words: normalized_words(&a.cand()),
             rank: a.rank,
-            start_keys: "",
+            start_keys: a.start_keys.packed(),
+            start_rank: a.start_rank,
             id: &a.id,
             inbox: a.inbox.unwrap_or(NO_INBOX),
             target: "",
@@ -651,6 +668,7 @@ pub fn encode_settings(key: &str, entries: &[SettingIn], caps: Caps) -> Result<V
             words: normalized_words(&s.row.cand()),
             rank: s.row.rank,
             start_keys: &s.start_keys,
+            start_rank: s.row.rank,
             id: "",
             inbox: NO_INBOX,
             target: &s.target,
@@ -719,6 +737,7 @@ fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps) -> Result<Vec<u8>, Ar
             put_u32(&mut ent_sec, small(st.intern(e.id))?);
             put_u16(&mut ent_sec, u16::try_from(e.id.len()).map_err(|_| ArenaError::StringTooLong)?);
             put_u16(&mut ent_sec, e.inbox);
+            put_u32(&mut ent_sec, e.start_rank);
         } else {
             if e.target.is_empty() {
                 return Err(ArenaError::BadTarget);
@@ -872,7 +891,14 @@ mod tests {
         let mut apps: Vec<CatApp> = (0..40)
             .map(|i| {
                 let name = format!("{} {}", WORDS_LIST[i % 24], WORDS_LIST[(i * 5 + 1) % 24]);
-                CatApp::new(&format!("Vendor.App{i}!App"), &name, keys(&mut r), (r.next_u64() % 500) as u32)
+                let mut a =
+                    CatApp::new(&format!("Vendor.App{i}!App"), &name, keys(&mut r), (r.next_u64() % 500) as u32);
+                // Start's own copy: Windows' synonyms unfolded, and the rank without the classic fallback.
+                if i % 3 == 0 {
+                    a.start_keys = Keys::from(&[("Wi-Fi Réseau", 4), (WORDS_LIST[i % 24], 9)][..]);
+                    a.start_rank = 10_000 + i as u32;
+                }
+                a
             })
             .collect();
         apps.push(CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 7));
@@ -916,8 +942,9 @@ mod tests {
             assert_eq!(c.words.iter().collect::<Vec<_>>(), want.words.iter().collect::<Vec<_>>());
             assert_eq!(c.words.len(), want.words.len());
             assert_eq!(v.names(i), app.extra);
-            assert_eq!(v.start_keys(i), "");
+            assert_eq!((v.start_keys(i), v.start_rank(i)), (app.start_keys.packed(), app.start_rank));
         }
+        assert!((0..v.len()).any(|i| v.start_keys(i).contains("réseau") && v.start_rank(i) != v.rank(i)));
         let calc = (0..v.len()).find(|&i| v.name(i) == "Calcolatrice").unwrap();
         assert!(v.names(calc).contains(&"calculator"));
         let (settings, s) = settings_arena();
@@ -930,7 +957,7 @@ mod tests {
             assert_eq!(c.words.iter().collect::<Vec<_>>(), want.words.iter().collect::<Vec<_>>());
             assert_eq!(v.target(i), (st.target.as_str(), st.args.as_deref()));
             assert_eq!(v.start_keys(i), st.start_keys);
-            assert_eq!(v.id(i), "");
+            assert_eq!((v.id(i), v.start_rank(i)), ("", st.row.rank));
         }
         // Out of range answers empty.
         assert_eq!((v.name(999), v.cand(999).folded, v.target(999), v.rank(999)), ("", "", ("", None), u32::MAX));
@@ -1042,8 +1069,9 @@ mod tests {
         assert_eq!(sets(&|b, _| b[SETTINGS_HEADER.len()] = 1), Err(BadKey));
         assert_eq!(check(s.raw(), Kind::Settings, Some("other|fmt 2"), Caps::BENCH), Err(BadKey));
         assert_eq!(check(s.raw(), Kind::Settings, Some("a|b|fmt 2"), Caps::BENCH).map(|l| l.entries()), Ok(60));
-        assert_eq!(apps(&|b, l| b[ent(l, 0) + ENT_SIZE - 1] = 1), Err(BadPadding));
         assert_eq!(sets(&|b, l| b[ent(l, 0) + ENT_SIZE - 1] = 1), Err(BadPadding));
+        // An app record has no padding: its last four bytes are Start's rank, any value.
+        assert_eq!(apps(&|b, l| b[ent(l, 0) + ENT_SIZE - 1] = 1).map(|l| l.entries()), Ok(a.len()));
         // 2. rest_len, the total, the caps, the checksum.
         assert_eq!(
             apps(&|b, l| {

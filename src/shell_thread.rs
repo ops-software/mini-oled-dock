@@ -21,9 +21,9 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
@@ -66,6 +66,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
+use crate::launcher::arena::{Arena, Caps, Kind as ArenaKind};
+use crate::launcher::catalog;
 use crate::launcher::gesture::{is_marker, is_network_file, Gesture};
 use crate::launcher::web::{check_authority, MAX_URL_BYTES};
 use crate::log;
@@ -193,8 +195,9 @@ pub enum ShellRequest {
     NetworkRelease,
     /// Volume module disabled: shuts the `AudioController` down and drops it.
     AudioRelease,
-    /// Start menu (Win double tap) and the launcher: enumerates `shell:AppsFolder` ->
-    /// `ShellEvent::StartApps`; then, as `icons` says, queues the Start menu's icons (see `IconPlan`).
+    /// Start menu (Win double tap) and the launcher: lists `shell:AppsFolder` (in an `--start-apps`
+    /// child, `list_apps_arena`) -> `ShellEvent::StartApps`; then, as `icons` says, queues the Start
+    /// menu's icons (see `IconPlan`).
     ListStartApps { icon_px: u32, icons: IconPlan },
     /// One batch of Start menu icons -> `ShellEvent::StartIcons`. Queued by `ListStartApps` only;
     /// low priority like `ResolveApp`.
@@ -284,8 +287,9 @@ pub enum ShellEvent {
     AudioSessions(Vec<audio::AppSession>),
     /// Status of the active network connection (reply to `NetworkQuery`).
     Network(crate::net::NetInfo),
-    /// The AppsFolder catalog (reply to `ListStartApps`), in enumeration order.
-    StartApps(Vec<StartApp>),
+    /// The AppsFolder catalogue (reply to `ListStartApps`) as one checked arena, sorted by name: listed by an
+    /// `--start-apps` child (in-process when the child fails). Start makes its rows from it, the launcher keeps it.
+    StartApps(Arc<Arena>),
     /// Icons of Start menu apps at `icon_px` (`None` = the app has none: the menu keeps a placeholder).
     StartIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
     /// The settings catalog of the Start menu search is ready (`start_search::settings`).
@@ -725,14 +729,13 @@ impl Shell {
 
     // -------------------------------------------------------------- Start menu
 
-    /// `ListStartApps`: publishes the catalog, then queues the icons the UI does not have yet.
+    /// `ListStartApps`: lists the catalogue (`list_apps_arena`), queues the icons the UI does not have yet, then publishes
+    /// it. One listing serves Start and the launcher.
     fn list_start_apps(&mut self, icon_px: u32, icons: &IconPlan) {
-        let t = Instant::now();
-        let apps = enum_apps_folder();
-        log!("shell: Start menu: {} apps listed in {} ms", apps.len(), t.elapsed().as_millis());
-        queue_start_icons(&mut self.start_px, &mut self.start_sent, &mut self.pending, &apps, icon_px, icons);
-        // The search data the menu attaches to the catalog (read here, never on the UI thread).
-        crate::start_search::load_app_index();
+        let apps = Arc::new(list_apps_arena());
+        let v = apps.view();
+        let ids = (0..v.len()).map(|i| v.id(i));
+        queue_start_icons(&mut self.start_px, &mut self.start_sent, &mut self.pending, ids, icon_px, icons);
         push_event(self.ui, ShellEvent::StartApps(apps));
     }
 
@@ -1324,6 +1327,105 @@ pub(crate) fn enum_apps_folder() -> Vec<StartApp> {
         }
     }
     out
+}
+
+// -------------------------------------------------------------- the apps child (L3 T17)
+
+/// The flag of the child mode that lists the AppsFolder catalogue (`run_apps_child`); not combinable.
+pub(crate) const APPS_FLAG: &str = "--start-apps";
+/// How long the shell thread waits for the apps child: it takes about 0.3 s, and this thread also runs every launch.
+const APPS_CHILD_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most the dock reads back from the apps child: the apps arena's own cap.
+const APPS_CHILD_MAX_BYTES: u64 = Caps::APPS.bytes as u64;
+/// Exit code of `--start-apps` when nothing was listed (AppsFolder unavailable or empty): the dock then lists in-process.
+const APPS_EXIT_EMPTY: i32 = 3;
+
+/// The catalogue of one `ListStartApps`, from an `--start-apps` child (`update::run_capture`: no window, the dock's
+/// job, at most the apps arena's cap read, 5 s), taken only as `apps_from_child` checks it. A child that cannot start,
+/// fails, or prints anything the check refuses is logged (once per process) and the catalogue is listed here as before,
+/// through the same encoder; after a child that ran out of time every later listing of this process is made here, so a
+/// hung child never holds this thread 5 s twice. The AppsFolder enumeration and Windows' app index (the shell modules and
+/// the parse of two index files) then load only in the child, which takes them with it when it exits.
+fn list_apps_arena() -> Arena {
+    static CHILD_OFF: AtomicBool = AtomicBool::new(false);
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !CHILD_OFF.load(Relaxed) {
+        let t = Instant::now();
+        let out = std::env::current_exe()
+            .map_err(|e| format!("no exe path: {e}"))
+            .and_then(|exe| crate::update::run_capture(&exe, &[APPS_FLAG], APPS_CHILD_TIMEOUT, APPS_CHILD_MAX_BYTES));
+        match apps_from_child(out) {
+            Ok(a) => {
+                log!("shell: Start menu: {} apps listed in {} ms (child)", a.len(), t.elapsed().as_millis());
+                return a;
+            }
+            Err(why) => {
+                let hung = t.elapsed() >= APPS_CHILD_TIMEOUT;
+                if hung {
+                    CHILD_OFF.store(true, Relaxed);
+                }
+                if !WARNED.swap(true, Relaxed) || hung {
+                    let rest = if hung { " from now on" } else { "" };
+                    log!("shell: Start menu: the apps process failed ({why}), listing in-process{rest}");
+                }
+            }
+        }
+    }
+    let t = Instant::now();
+    let list = enum_apps_folder();
+    crate::start_search::load_app_index();
+    let index = crate::start_search::take_app_index();
+    let arena = catalog::build_apps(&list, index.as_ref()).unwrap_or_else(|e| {
+        log!("shell: Start menu: the catalogue of {} apps was not kept: {e}", list.len());
+        Arena::default()
+    });
+    log!("shell: Start menu: {} apps listed in {} ms", arena.len(), t.elapsed().as_millis());
+    arena
+}
+
+/// What the dock keeps of an `--start-apps` child's `run_capture` result: the arena, when the child exited 0 and its
+/// whole output passes `arena::check` (header, sizes, every reference and order, the checksum) under the apps caps;
+/// otherwise the reason. The bytes are untrusted: nothing is read from them before the check.
+fn apps_from_child(out: Result<(i32, Vec<u8>), String>) -> Result<Arena, String> {
+    let (code, bytes) = out?;
+    if code != 0 {
+        return Err(format!("exit code {code}"));
+    }
+    let n = bytes.len();
+    Arena::new(bytes, ArenaKind::Apps, None, Caps::APPS).map_err(|e| format!("{n} bytes refused: {e}"))
+}
+
+/// `--start-apps`, in the child `list_apps_arena` starts: the AppsFolder catalogue and Windows' app index, folded and
+/// indexed by the in-process path's entry builder and encoder, written to stdout as one apps arena. It touches no data
+/// folder, logger, mutex or console, reads no input and writes nothing but stdout. Exit 0 = an arena written; 1 = COM,
+/// the encoder or stdout failed; 3 = nothing listed.
+pub fn run_apps_child() -> i32 {
+    use std::io::Write;
+    // SAFETY: the first COM call of this thread (the child's main thread); paired with CoUninitialize below.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return 1;
+    }
+    let list = enum_apps_folder();
+    let code = if list.is_empty() {
+        APPS_EXIT_EMPTY
+    } else {
+        crate::start_search::load_app_index();
+        let index = crate::start_search::take_app_index();
+        match catalog::encode_app_list(&list, index.as_ref()) {
+            Ok(bytes) => {
+                let mut stdout = std::io::stdout().lock();
+                match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+                    Ok(()) => 0,
+                    Err(_) => 1,
+                }
+            }
+            Err(_) => 1,
+        }
+    };
+    // SAFETY: paired with the successful CoInitializeEx above; the listing released every COM object it made.
+    unsafe { CoUninitialize() };
+    code
 }
 
 /// Index in `apps` of the app that sent a notification: same id as the AUMID, then same display
@@ -2414,14 +2516,14 @@ fn next_request(pending: &mut VecDeque<ShellRequest>) -> Option<ShellRequest> {
     idx.and_then(|i| pending.remove(i))
 }
 
-/// The Start menu's part of `ListStartApps`. `IconPlan::All`: the icons not sent yet at `icon_px` are
-/// queued as `StartIcons` batches, the pins (`first`) first; a new size starts over. `IconPlan::None`
-/// (the launcher's catalogue) touches nothing.
-fn queue_start_icons(
+/// The Start menu's part of `ListStartApps`, over the catalogue's `ids` (the arena's order, by name).
+/// `IconPlan::All`: the icons not sent yet at `icon_px` are queued as `StartIcons` batches, the pins
+/// (`first`) first; a new size starts over. `IconPlan::None` (the launcher's catalogue) touches nothing.
+fn queue_start_icons<'a>(
     start_px: &mut u32,
     sent: &mut HashSet<String>,
     pending: &mut VecDeque<ShellRequest>,
-    apps: &[StartApp],
+    ids: impl IntoIterator<Item = &'a str>,
     icon_px: u32,
     plan: &IconPlan,
 ) {
@@ -2432,7 +2534,7 @@ fn queue_start_icons(
         sent.clear();
         pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
     }
-    let mut missing: Vec<String> = apps.iter().filter(|a| !sent.contains(&a.id)).map(|a| a.id.clone()).collect();
+    let mut missing: Vec<String> = ids.into_iter().filter(|id| !sent.contains(*id)).map(str::to_string).collect();
     // Pins first (stable sort: the catalog order is kept inside each group).
     missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
     sent.extend(missing.iter().cloned());
@@ -2575,6 +2677,48 @@ mod tests {
         assert!(apps.len() > 10, "too few apps: {}", apps.len());
         assert!(store > 0, "no Store app found");
         assert!(with_icon * 10 >= probe.len() * 8, "too many apps without an icon");
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    /// L3 T17: the apps arena of this machine's catalogue, as the `--start-apps` child makes it (run by hand:
+    /// `cargo test -- --ignored --nocapture real_apps_arena_size_printed`). Prints sizes and times only, no name.
+    #[test]
+    #[ignore = "reads this machine's AppsFolder and app index"]
+    fn real_apps_arena_size_printed() {
+        // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let t = Instant::now();
+        let list = enum_apps_folder();
+        let listed = t.elapsed();
+        let t = Instant::now();
+        crate::start_search::load_app_index();
+        let index = crate::start_search::take_app_index();
+        let read = t.elapsed();
+        let t = Instant::now();
+        let bytes = catalog::encode_app_list(&list, index.as_ref()).expect("the catalogue encodes");
+        let encoded = t.elapsed();
+        let mut checks: Vec<Duration> = (0..51)
+            .map(|_| {
+                let t = Instant::now();
+                assert!(apps_from_child(Ok((0, bytes.clone()))).is_ok());
+                t.elapsed()
+            })
+            .collect();
+        checks.sort();
+        let a = apps_from_child(Ok((0, bytes.clone()))).expect("the child's bytes check");
+        let v = a.view();
+        let start_keys: usize = (0..v.len()).map(|i| v.start_keys(i).len()).sum();
+        println!(
+            "{} apps: listed in {listed:?}, index read in {read:?}, encoded in {encoded:?}; arena {} B ({start_keys} B of \
+             Start's synonyms), checked in {:?} (median of 51, with the copy)",
+            v.len(),
+            a.bytes(),
+            checks[25]
+        );
+        assert!(v.len() <= list.len() && v.len() > 10, "{} of {}", v.len(), list.len());
         if hr.is_ok() {
             // SAFETY: paired with the successful CoInitializeEx above.
             unsafe { CoUninitialize() };
@@ -2967,20 +3111,57 @@ mod tests {
 
     #[test]
     fn icon_plan_none_leaves_start_sent() {
-        let app = |id: &str| StartApp { id: id.into(), name: id.into() };
-        let apps = [app("a"), app("b"), app("c")];
+        // The ids as the arena holds them (sorted by name).
+        let apps = ["a", "b", "c"];
         let mut px = 48u32;
         let mut sent = HashSet::from(["a".to_string()]);
         let mut pending: VecDeque<ShellRequest> = VecDeque::new();
         pending.push_back(ShellRequest::StartIcons { icon_px: 48, ids: vec!["z".into()] });
-        queue_start_icons(&mut px, &mut sent, &mut pending, &apps, 32, &IconPlan::None);
+        queue_start_icons(&mut px, &mut sent, &mut pending, apps, 32, &IconPlan::None);
         assert_eq!((px, sent.len(), pending.len()), (48, 1, 1), "the launcher's catalogue changes nothing of Start's");
-        queue_start_icons(&mut px, &mut sent, &mut pending, &apps, 48, &IconPlan::All { first: vec!["C".into()] });
+        queue_start_icons(&mut px, &mut sent, &mut pending, apps, 48, &IconPlan::All { first: vec!["C".into()] });
         assert_eq!((px, sent.len(), pending.len()), (48, 3, 2));
         assert!(matches!(&pending[1], ShellRequest::StartIcons { icon_px: 48, ids } if *ids == ["c", "b"]));
         // A new size starts Start's icons over.
-        queue_start_icons(&mut px, &mut sent, &mut pending, &apps, 64, &IconPlan::All { first: Vec::new() });
+        queue_start_icons(&mut px, &mut sent, &mut pending, apps, 64, &IconPlan::All { first: Vec::new() });
         assert_eq!((px, sent.len(), pending.len()), (64, 3, 1));
+    }
+
+    /// L3 T17: what the dock takes from an `--start-apps` child is checked whole before it is used, and any failure is a
+    /// reason (the caller then lists in-process).
+    #[test]
+    fn apps_child_output_checked() {
+        let list = [
+            StartApp { id: "Vendor.Tool".into(), name: "Tool".into() },
+            StartApp { id: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(), name: "Calculator".into() },
+        ];
+        let valid = catalog::encode_app_list(&list, None).unwrap();
+        // A valid encoding with exit 0: the arena, sorted by name, without the slack of the read buffer.
+        let mut read = Vec::with_capacity(valid.len() * 2);
+        read.extend_from_slice(&valid);
+        let a = apps_from_child(Ok((0, read))).unwrap();
+        assert_eq!((a.len(), a.view().name(0), a.view().id(1)), (2, "Calculator", "Vendor.Tool"));
+        assert_eq!(a.bytes(), valid.len(), "only the bytes of the arena stay");
+        // A child that failed, printed nothing, printed something else, or printed a damaged or longer arena.
+        assert!(apps_from_child(Ok((1, valid.clone()))).unwrap_err().contains("exit code 1"));
+        assert!(apps_from_child(Ok((-1, valid.clone()))).is_err());
+        assert!(apps_from_child(Ok((0, Vec::new()))).is_err());
+        assert!(apps_from_child(Ok((0, b"mini-oled-dock apps-catalog 1\nhello".to_vec()))).is_err());
+        assert!(apps_from_child(Ok((0, (0..4096u32).map(|i| (i * 7) as u8).collect()))).is_err());
+        for at in [0, 40, valid.len() / 2, valid.len() - 1] {
+            let mut b = valid.clone();
+            b[at] ^= 0x10;
+            assert!(apps_from_child(Ok((0, b))).is_err(), "a flip at {at}");
+        }
+        let mut longer = valid.clone();
+        longer.extend_from_slice(&[0; 8]);
+        assert!(apps_from_child(Ok((0, longer))).is_err());
+        assert!(apps_from_child(Ok((0, valid[..valid.len() - 8].to_vec()))).is_err());
+        // A settings arena is no apps arena.
+        let settings = crate::launcher::arena::test_settings(&[("Display", &[], 1)]);
+        assert!(apps_from_child(Ok((0, settings.raw().to_vec()))).is_err());
+        // `run_capture`'s own reason (no start, timeout, too much output) is passed on.
+        assert_eq!(apps_from_child(Err("timeout".into())).unwrap_err(), "timeout");
     }
 
     #[test]

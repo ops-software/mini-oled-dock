@@ -2,13 +2,13 @@
 //! read from the files Windows itself ships. Nothing here is a list of ours.
 //!
 //! MEMORY: nothing here stays loaded longer than it is used. The app index is read for each
-//! catalog and handed over to the menu, which keeps only the few keywords of the installed apps
-//! (`take_app_index`). The typo rewrites (1.4 MB) are read from disk only for a query that finds
-//! nothing (`converted`). The settings catalog is kept packed (`Keys`, a shared target: its ~1500
+//! catalog by the `--start-apps` child (the shell thread only when the child failed), whose arena
+//! carries only the few keywords of the installed apps (`take_app_index`, L3 T17). The typo
+//! rewrites (1.4 MB) are read from disk only for a query that finds nothing (`converted`). The settings catalog is kept packed (`Keys`, a shared target: its ~1500
 //! entries cost under 1 MB) while a Start menu is in use and freed with the rest of its data
 //! (`release_settings`, a minute after the last one closed).
 //!
-//! APPS (`AppIndex`, read by the shell thread with each catalog):
+//! APPS (`AppIndex`, read with each catalog in the `--start-apps` child):
 //!  * `appssynonyms.txt`: `*|<app name>\t*|<query>[:wux:...]\t<penalty>`, e.g. "rdp" for Remote
 //!    Desktop Connection, "lol" for League of Legends, and thousands of typo corrections;
 //!  * `appsglobals.txt`: `<app id>\t<rank>`, how popular an app is worldwide (lower = more);
@@ -124,6 +124,17 @@ impl Keys {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The packed text itself (one `<keyword>\t<penalty>` per line), nothing parsed: what an arena stores for Start.
+    pub(crate) fn packed(&self) -> &str {
+        &self.0
+    }
+
+    /// Keywords from packed text (`packed`'s, read back from an arena). Nothing is parsed here; a line that is not
+    /// `<keyword>\t<penalty>` is skipped when the keywords are read, as for any `Keys`.
+    pub(crate) fn from_packed(text: &str) -> Keys {
+        Keys(text.to_string())
     }
 
     /// The same keywords sorted, each once with its best penalty, in exactly the memory they need.
@@ -426,7 +437,7 @@ pub(crate) struct AppIndex {
 
 static APP_INDEX: Mutex<Option<AppIndex>> = Mutex::new(None);
 
-/// Reads the app index. On the shell thread, before each catalog is published.
+/// Reads the app index: in the `--start-apps` child, or on the shell thread when the child failed.
 pub(crate) fn load_app_index() {
     let t = Instant::now();
     let synonyms = parse_synonyms(&read_index("appssynonyms.txt"));
@@ -440,8 +451,8 @@ pub(crate) fn load_app_index() {
     *APP_INDEX.lock().unwrap_or_else(|p| p.into_inner()) = Some(AppIndex { synonyms, ranks, default_rank });
 }
 
-/// Hands the app index over (`None` if there is none): the menu copies what the installed apps
-/// need and drops the rest.
+/// Hands the app index over (`None` if there is none): the apps entry builder copies what the
+/// installed apps need into the arena, and the rest is dropped.
 pub(crate) fn take_app_index() -> Option<AppIndex> {
     APP_INDEX.lock().unwrap_or_else(|p| p.into_inner()).take()
 }

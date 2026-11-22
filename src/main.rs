@@ -195,6 +195,9 @@ pub struct Args {
     /// `--update-fetch`: the update check's GET in a child of the dock, its answer on stdout
     /// (`update::run_fetch_child`); combines with nothing.
     pub update_fetch: bool,
+    /// `--start-apps`: the AppsFolder catalogue listed in a child of the dock, its arena on stdout
+    /// (`shell_thread::run_apps_child`); combines with nothing.
+    pub start_apps: bool,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -245,6 +248,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--purge-data" => a.purge_data = true,
             "--update-check" => a.update_check = true,
             "--update-fetch" => a.update_fetch = true,
+            "--start-apps" => a.start_apps = true,
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
@@ -253,6 +257,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     if a.update_fetch && flags > 1 {
         return Err("--update-fetch cannot be combined with other arguments".into());
+    }
+    if a.start_apps && flags > 1 {
+        return Err("--start-apps cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
@@ -1070,6 +1077,11 @@ fn main() -> std::process::ExitCode {
     if args.update_fetch {
         return std::process::ExitCode::from(update::run_fetch_child().clamp(0, 255) as u8);
     }
+    // --start-apps: the AppsFolder catalogue listed in a child of the dock (`shell_thread::list_apps_arena`); stdout
+    // only, no data folder, logger, mutex or console.
+    if args.start_apps {
+        return std::process::ExitCode::from(shell_thread::run_apps_child().clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1280,11 +1292,14 @@ mod tests {
         let f = p(&[update::FETCH_FLAG]).unwrap(); // the flag the dock starts its child with
         assert!(f.update_fetch && !f.update_check);
         assert!(!p(&["--update-check"]).unwrap().update_fetch);
+        let s = p(&[shell_thread::APPS_FLAG]).unwrap(); // the flag of the apps child (L3 T17)
+        assert!(s.start_apps && !s.settings && !s.autostart && !s.update_fetch);
+        assert!(!p(&["--autostart"]).unwrap().start_apps);
     }
 
     #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 12] = [
+        let bad: [&[&str]; 16] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1297,6 +1312,10 @@ mod tests {
             &["--update-check", "--update-fetch"],
             &["--version", "--update-fetch"],
             &["--update-fetch", "--update-fetch"],
+            &["--start-apps", "--autostart"],
+            &["--settings", "--start-apps"],
+            &["--start-apps", "--update-fetch"],
+            &["--start-apps", "--start-apps"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");

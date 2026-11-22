@@ -33,6 +33,10 @@ pub struct CatApp {
     pub inbox: Option<u16>,
     /// Microsoft's popularity rank, smaller is better.
     pub rank: u32,
+    /// What Start searches the app with (L3 T17: its rows are made from the same arena): Windows' synonyms of the name as
+    /// Windows wrote them (lowercase, unfolded, no inbox synonym) and the rank of the app's own id (no classic fallback).
+    pub start_keys: Keys,
+    pub start_rank: u32,
 }
 
 impl CatApp {
@@ -60,6 +64,8 @@ impl CatApp {
             extra,
             inbox,
             rank,
+            start_keys: Keys::default(),
+            start_rank: rank,
         }
     }
 
@@ -134,16 +140,36 @@ fn rank_of(a: &StartApp, x: &AppIndex) -> u32 {
     classic.unwrap_or(x.default_rank)
 }
 
-/// The catalogue of one `StartApps` event: names folded, words and initials built, the keywords of the installed apps
-/// copied out of Windows' app index (which the caller drops) and the inbox names attached; sorted by name.
+/// The longest id or name an entry may have: every string of an arena entry is at most this long (the folded name may
+/// grow a little).
+const NAME_MAX: usize = 4 * 1024;
+
+/// `keys` cut after its last whole line that fits one arena string (Start's copy of one app's synonyms; this machine's
+/// longest is about 6 KB).
+fn start_copy(keys: &Keys) -> Keys {
+    let text = keys.packed();
+    if text.len() <= arena::STR_MAX {
+        return keys.clone();
+    }
+    let head = text.get(..arena::STR_MAX).unwrap_or_default();
+    Keys::from_packed(head.get(..head.rfind('\n').map_or(0, |n| n + 1)).unwrap_or_default())
+}
+
+/// The catalogue of one listing: names folded, words and initials built, the keywords of the installed apps copied out
+/// of Windows' app index (which the caller drops), the inbox names attached, and Start's own copy of the synonyms and the
+/// rank; sorted by name. An app no arena can hold (no id, no name, an id or name over 4 KiB) is left out.
 pub fn ingest(list: &[StartApp], index: Option<&AppIndex>) -> Vec<CatApp> {
     let mut apps: Vec<CatApp> = list
         .iter()
+        .filter(|a| !a.id.is_empty() && !a.name.is_empty() && a.id.len() <= NAME_MAX && a.name.len() <= NAME_MAX)
         .map(|a| {
-            let (keys, rank) = index.map_or((Keys::default(), 0), |x| {
-                (x.synonyms.get(&a.name.to_lowercase()).map(fold_keys).unwrap_or_default(), rank_of(a, x))
-            });
-            CatApp::new(&a.id, &a.name, keys, rank)
+            let Some(x) = index else { return CatApp::new(&a.id, &a.name, Keys::default(), 0) };
+            let synonyms = x.synonyms.get(&a.name.to_lowercase());
+            let keys = synonyms.map(fold_keys).unwrap_or_default();
+            let mut app = CatApp::new(&a.id, &a.name, keys, rank_of(a, x));
+            app.start_keys = synonyms.map(start_copy).unwrap_or_default();
+            app.start_rank = x.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(x.default_rank);
+            app
         })
         .collect();
     apps.sort_by(|a, b| a.folded.cmp(&b.folded).then_with(|| a.name.cmp(&b.name)));
@@ -160,11 +186,15 @@ pub fn fold_settings(list: &[Setting]) -> Vec<SettingRow> {
         .collect()
 }
 
-/// The apps catalogue of one `StartApps` event as an arena (L3 T16): `ingest`, encoded, checked and the folded entries dropped,
-/// so the launcher keeps one block of bytes instead of thousands.
+/// The apps catalogue of one listing as the bytes of its arena: what the `--start-apps` child writes (L3 T17).
+pub fn encode_app_list(list: &[StartApp], index: Option<&AppIndex>) -> Result<Vec<u8>, ArenaError> {
+    arena::encode_apps(&ingest(list, index), Caps::APPS)
+}
+
+/// The apps catalogue of one listing as an arena (L3 T16): `ingest`, encoded, checked and the folded entries dropped, so
+/// the dock keeps one block of bytes instead of thousands. Made in process only when the `--start-apps` child failed.
 pub fn build_apps(list: &[StartApp], index: Option<&AppIndex>) -> Result<Arena, ArenaError> {
-    let apps = ingest(list, index);
-    Arena::new(arena::encode_apps(&apps, Caps::APPS)?, Kind::Apps, None, Caps::APPS)
+    Arena::new(encode_app_list(list, index)?, Kind::Apps, None, Caps::APPS)
 }
 
 /// The key line of an arena made in this process (a cache file's key names what it was built from, T18).
@@ -344,6 +374,39 @@ mod tests {
         assert_eq!(rank("Blocco note"), 3_114, "no rank of its own: the classic program's");
         assert_eq!(rank("Calcolatrice"), 77, "its own rank is kept");
         assert_eq!(rank("Unknown"), 12_813, "no entry: the default");
+    }
+
+    /// L3 T17: the entry builder keeps Start's own copy (Windows' synonyms as written, the rank of the app's own id), and
+    /// leaves out what no arena can hold instead of failing the whole catalogue.
+    #[test]
+    fn ingest_keeps_starts_copy_and_drops_what_no_arena_holds() {
+        let mut index = AppIndex { default_rank: 50, ..AppIndex::default() };
+        index.synonyms.insert("connessione desktop remoto".into(), Keys::from(&[("RDP", 10), ("Remoto", 40)][..]));
+        index.ranks.insert("{1ac14e77-02e7-4e5d-b744-2eb1ae5198b7}\\notepad.exe".into(), 3);
+        let mut huge = Keys::default();
+        for i in 0..8_000 {
+            huge.push(&format!("typo{i:05}"), i);
+        }
+        assert!(huge.packed().len() > arena::STR_MAX);
+        index.synonyms.insert("huge".into(), huge);
+        let list = [
+            StartApp { id: "RDC.exe".into(), name: "Connessione Desktop Remoto".into() },
+            StartApp { id: "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".into(), name: "Blocco note".into() },
+            StartApp { id: String::new(), name: "No id".into() },
+            StartApp { id: "Long.exe".into(), name: "x".repeat(70_000) },
+            StartApp { id: "Huge.exe".into(), name: "Huge".into() },
+        ];
+        let apps = ingest(&list, Some(&index));
+        let names: Vec<&str> = apps.iter().map(|a| &*a.name).collect();
+        assert_eq!(names, ["Blocco note", "Connessione Desktop Remoto", "Huge"]);
+        assert_eq!((apps[0].rank, apps[0].start_rank), (3, 50), "Start keeps the rank of the app's own id");
+        assert_eq!(apps[1].start_keys, Keys::from(&[("RDP", 10), ("Remoto", 40)][..]), "as Windows wrote them");
+        let cut = apps[2].start_keys.packed();
+        assert!(cut.len() <= arena::STR_MAX && cut.ends_with('\n') && cut.starts_with("typo00000\t0\n"));
+        let a = build_apps(&list, Some(&index)).unwrap();
+        assert_eq!((a.len(), a.view().start_keys(1), a.view().start_rank(0)), (3, apps[1].start_keys.packed(), 50));
+        // No index: no keywords, rank 0, as Start had it.
+        assert!(ingest(&list, None).iter().all(|a| a.start_keys.packed().is_empty() && a.start_rank == 0));
     }
 
     #[test]

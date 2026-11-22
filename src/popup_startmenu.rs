@@ -63,6 +63,8 @@ use windows::Win32::Foundation::RECT;
 use crate::config::StartStyle;
 use crate::i18n::tr;
 use crate::icons::IconBitmap;
+use crate::launcher::arena::Arena;
+use crate::launcher::catalog;
 use crate::launcher::strings;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
@@ -244,24 +246,26 @@ pub(crate) fn release() {
     shell_thread::request(ShellRequest::StartRelease);
 }
 
-/// `ShellEvent::StartApps`: replaces the catalog (sorted by name).
-pub(crate) fn store_apps(list: Vec<StartApp>, index: Option<&start_search::AppIndex>) {
-    // `index`: read by the shell thread before it sent the catalog, taken by the caller (`popup::on_start_apps`; `None`
-    // in tests and previews). The apps copy their own few keywords below.
-    let mut apps: Vec<App> = list
-        .into_iter()
-        .map(|a| {
-            let lower = a.name.to_lowercase();
-            let (keys, rank) = index.map_or((Keys::default(), 0), |x| {
-                let rank = x.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(x.default_rank);
-                (x.synonyms.get(&lower).cloned().unwrap_or_default(), rank)
-            });
-            App { keys, rank, lower, id: a.id, name: a.name }
-        })
-        .collect();
-    apps.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.name.cmp(&b.name)));
+/// `ShellEvent::StartApps`: replaces the catalog (sorted by name) while the menu is open. The rows are made from the
+/// listing's arena (L3 T17), which carries what Start searches with exactly as before: Windows' synonyms of each name as
+/// Windows wrote them and the rank of the app's own id.
+pub(crate) fn store_apps(arena: &Arena) {
     STORE.with(|s| match s.try_borrow_mut() {
         Ok(mut s) if s.open => {
+            let v = arena.view();
+            let mut apps: Vec<App> = (0..v.len())
+                .map(|i| {
+                    let name = v.name(i);
+                    App {
+                        id: v.id(i).to_string(),
+                        name: name.to_string(),
+                        lower: name.to_lowercase(),
+                        keys: Keys::from_packed(v.start_keys(i)),
+                        rank: v.start_rank(i),
+                    }
+                })
+                .collect();
+            apps.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.name.cmp(&b.name)));
             s.apps = apps;
             s.loaded = true;
         }
@@ -1004,7 +1008,9 @@ pub(crate) fn preview_new(
             *s = Store { icon_px: px, open: true, ..Store::default() };
         }
     });
-    store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect(), None);
+    let list: Vec<StartApp> =
+        apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect();
+    store_apps(&catalog::build_apps(&list, None).unwrap_or_default());
     store_icons(px, apps.into_iter().map(|(id, _, b)| (id, Some(b))).collect());
     let mut c = make();
     c.requested = true;
@@ -2314,9 +2320,50 @@ mod tests {
             let s = s.borrow();
             assert!(s.apps.is_empty() && s.icons.is_empty() && !s.loaded && !s.open);
         });
-        store_apps(vec![StartApp { id: "x".into(), name: "X".into() }], None);
+        store_apps(&catalog::build_apps(&[StartApp { id: "x".into(), name: "X".into() }], None).unwrap());
         assert!(!store_icons(32, vec![("x".into(), Some(IconBitmap::new(32, 32)))]), "closed menu ignores late icons");
         STORE.with(|s| assert!(s.borrow().apps.is_empty()));
+    }
+
+    /// L3 T17: Start's rows made from the apps arena (what the `--start-apps` child lists) are the rows Start made from
+    /// the list and Windows' app index before: the same ids, names, order, synonyms (as Windows wrote them) and ranks.
+    #[test]
+    fn store_apps_from_an_arena() {
+        let mut index = start_search::AppIndex { default_rank: 900, ..Default::default() };
+        index.synonyms.insert("connessione desktop remoto".into(), Keys::from(&[("RDP", 10), ("Remoto", 40)][..]));
+        index.ranks.insert("rdc.exe".into(), 3);
+        // An inbox app with no rank of its own: the launcher ranks it as its classic program, Start as before.
+        index.ranks.insert("{1ac14e77-02e7-4e5d-b744-2eb1ae5198b7}\\notepad.exe".into(), 7);
+        let list = vec![
+            StartApp { id: "Zeta.exe".into(), name: "Zeta".into() },
+            StartApp { id: "RDC.exe".into(), name: "Connessione Desktop Remoto".into() },
+            StartApp { id: "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".into(), name: "Blocco note".into() },
+        ];
+        // The rows of the old `store_apps(list, Some(&index))`.
+        let mut old: Vec<(String, String, String, Keys, u32)> = list
+            .iter()
+            .map(|a| {
+                let lower = a.name.to_lowercase();
+                let rank = index.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(index.default_rank);
+                let keys = index.synonyms.get(&lower).cloned().unwrap_or_default();
+                (a.id.clone(), a.name.clone(), lower, keys, rank)
+            })
+            .collect();
+        old.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        let arena = catalog::build_apps(&list, Some(&index)).unwrap();
+        let notepad = (0..arena.len()).find(|&i| arena.view().name(i) == "Blocco note").unwrap();
+        assert_eq!(arena.view().rank(notepad), 7, "the launcher's rank");
+        STORE.with(|s| *s.borrow_mut() = Store { open: true, ..Store::default() });
+        store_apps(&arena);
+        let rows: Vec<(String, String, String, Keys, u32)> = STORE.with(|s| {
+            let s = s.borrow();
+            assert!(s.loaded);
+            s.apps.iter().map(|a| (a.id.clone(), a.name.clone(), a.lower.clone(), a.keys.clone(), a.rank)).collect()
+        });
+        assert_eq!(rows, old);
+        assert_eq!(rows[0].4, 900, "Start keeps the default rank of an app with no rank of its own");
+        assert_eq!(rank(&Cand { lower: &rows[1].2, keys: &rows[1].3, rank: rows[1].4 }, "rdp"), Some((1, 10)));
+        release_store();
     }
 
     fn named(lower: &str) -> Cand<'_> {

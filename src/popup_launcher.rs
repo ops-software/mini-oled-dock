@@ -43,8 +43,8 @@ use crate::launcher::web::{self, Engine, Template};
 use crate::launcher_sys::{RealHook, RealSys};
 use crate::log;
 use crate::render::Metrics;
-use crate::shell_thread::{IconPlan, LaunchKind, ShellRequest, StartApp};
-use crate::start_search::{self, AppIndex, Holder, Setting};
+use crate::shell_thread::{IconPlan, LaunchKind, ShellRequest};
+use crate::start_search::{self, Holder, Setting};
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
 /// Height of the empty panel, the field alone (logical px, SPEC 5.2.3).
@@ -2013,22 +2013,15 @@ fn ask_catalogue() {
     }
 }
 
-/// `ShellEvent::StartApps` (`popup::on_start_apps`, which took Windows' app index for this catalogue): the launcher keeps its
-/// own folded copy, swapped in at the next keystroke. Nothing happens without a chord.
-pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
+/// `ShellEvent::StartApps` (`popup::on_start_apps`): the launcher keeps the arena the shell thread listed and checked
+/// (folded and indexed in the `--start-apps` child, nothing built here on the UI thread, L3 KEY-11), shared with
+/// nobody once Start has made its rows; swapped in at the next keystroke. Nothing happens without a chord.
+pub(crate) fn on_catalog(apps: Arc<Arena>) {
     if !is_on() {
         return;
     }
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Catalog);
-    let apps = match catalog::build_apps(list, index) {
-        Ok(a) => a,
-        Err(e) => {
-            let n = list.len();
-            log!("launcher: the apps catalogue of {n} entries was not kept: {e}");
-            return;
-        }
-    };
     let (n, bytes) = (apps.len(), apps.bytes());
     let now = RealSys.now_ms();
     if with_ctrl(|c| {
@@ -2478,7 +2471,7 @@ struct Ctrl {
     opts: LauncherOpts,
     num: NumberStyle,
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
-    apps: Arena,
+    apps: Arc<Arena>,
     /// The settings arena, shared with `start_search`'s settings thread that made it.
     settings: Arc<FoldedSettings>,
     windows: Vec<WindowRow>,
@@ -2575,7 +2568,7 @@ impl Ctrl {
             width: style::LAUNCHER_W,
             opts: LauncherOpts::default(),
             num: NumberStyle { decimal: '.', group: ',' },
-            apps: Arena::default(),
+            apps: Arc::default(),
             settings: Arc::default(),
             windows: Vec::new(),
             history: Vec::new(),
@@ -4464,12 +4457,12 @@ mod tests {
     fn chord_off_keeps_no_resident_data() {
         let filled = |dirty: bool, learn: bool| {
             let mut c = Ctrl::new();
-            c.apps = crate::launcher::arena::test_apps(&[(
+            c.apps = Arc::new(crate::launcher::arena::test_apps(&[(
                 "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
                 "Calcolatrice",
                 &[],
                 1,
-            )]);
+            )]));
             c.settings =
                 Arc::new(FoldedSettings { arena: crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]) });
             c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
@@ -5521,12 +5514,12 @@ mod tests {
     fn warm_asks_nothing() {
         // A catalogue is there: an empty field still shows no row, so no icon is asked for.
         with_ctrl(|c| {
-            c.apps = crate::launcher::arena::test_apps(&[(
+            c.apps = Arc::new(crate::launcher::arena::test_apps(&[(
                 "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
                 "Calcolatrice",
                 &[],
                 1,
-            )]);
+            )]));
         });
         let mut s = Surface::new(Metrics { dpi: 96 }).unwrap();
         let mut sys = FakeSys::default();
