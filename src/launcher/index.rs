@@ -108,8 +108,7 @@ pub(super) fn build_sections<'a>(
     st: &mut Strs<'a>,
 ) -> (u32, [Vec<u8>; SECTIONS]) {
     let mut cur: Vec<(&str, u32, u32)> = Vec::new();
-    // The third field of an XML posting is always `XML_KEYWORD_PENALTY`: it lets one sort serve both lists.
-    let mut xml: Vec<(&str, u32, u32)> = Vec::new();
+    let mut xml: Vec<(&str, u32)> = Vec::new();
     let mut targets: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
     let mut seen = [false; 128];
     // The characters above ASCII, sorted and each once (a handful in any catalogue).
@@ -123,7 +122,7 @@ pub(super) fn build_sections<'a>(
             }
             let penalty: u32 = text.parse().unwrap_or(u32::MAX);
             if penalty == XML_KEYWORD_PENALTY {
-                xml.push((k, e, penalty));
+                xml.push((k, e));
             } else {
                 cur.push((k, e, penalty));
             }
@@ -186,10 +185,10 @@ pub(super) fn build_sections<'a>(
         i += run;
     }
     let mut i = 0;
-    while let Some(&(k, ..)) = xml.get(i) {
+    while let Some(&(k, _)) = xml.get(i) {
         let run = xml.get(i..).map_or(0, |r| r.iter().take_while(|e| e.0 == k).count());
         let first = sections.get(XMLP).map_or(0, |p| p.len() / XML_POST);
-        for &(_, e, _) in xml.get(i..i + run).unwrap_or_default() {
+        for &(_, e) in xml.get(i..i + run).unwrap_or_default() {
             if let Some(s) = sections.get_mut(XMLP) {
                 put_u32(s, e);
             }
@@ -200,13 +199,9 @@ pub(super) fn build_sections<'a>(
         }
         i += run;
     }
-    // Sorted by text through the same sort as the keywords: (text, offset, the target's place in `ents`).
-    let mut ents: Vec<(&str, (u32, Vec<u32>))> = targets.into_iter().collect();
-    let mut order: Vec<(&str, u32, u32)> = ents.iter().zip(0u32..).map(|((t, (off, _)), i)| (*t, *off, i)).collect();
-    order.sort_unstable();
-    for (t, off, i) in order {
-        let Some(slot) = ents.get_mut(i as usize) else { continue };
-        let mut es = std::mem::take(&mut slot.1 .1);
+    let mut targets: Vec<(&str, (u32, Vec<u32>))> = targets.into_iter().collect();
+    targets.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (t, (off, mut es)) in targets {
         es.sort_unstable();
         es.dedup();
         let first = sections.get(FUZP).map_or(0, |p| p.len() / XML_POST);
