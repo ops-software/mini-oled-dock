@@ -1,0 +1,1064 @@
+//! One open of the launcher (SPEC 5.2.9, 5.2.11): keys in, effects out. The session decides what a key does and
+//! returns the effects in the order the host runs them; launcher_sys.rs executes them (L1a-15c), so nothing here calls
+//! Windows and the tests' fake port is a `Vec<Effect>`. Order matters: a switch activates its window while the dock still
+//! holds the foreground and hides after; a launch hides first so Explorer gets the foreground grant; a copy hides with
+//! the restore so the text lands where the user came from.
+
+use super::field::{Edit, FieldOut, KeyEvent, Motion, TextField};
+use super::gesture::Gesture;
+use super::model::{Batch, CommandId, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId, RunLine, Verb};
+use super::providers::{self, Budget, Context, LauncherOpts, Results};
+use super::query;
+use super::rank;
+use super::runline;
+use super::verbs;
+
+/// What the host does for the session, in order ("after close" effects run in `after_close`, L1a-15c).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Effect {
+    /// Close the launcher; `restore` gives the foreground back to the window of the open.
+    Hide {
+        restore: bool,
+    },
+    /// Activate this window (the bar's activation), before the hide.
+    Switch(isize),
+    /// WM_CLOSE to this window; the launcher stays.
+    CloseWindow(isize),
+    Launch(LaunchReq),
+    /// To the clipboard, after the hide and the restore.
+    Copy(Box<str>),
+    /// The field's selection to the clipboard now: the launcher stays open.
+    CopyNow(Box<str>),
+    Power(CommandId),
+    /// The window menu of the window of the open, after the restore.
+    WindowMenu,
+    /// Settings > Launcher (L1b).
+    OpenSettings,
+    /// Forget a learned row (frecency, L1b).
+    Forget(ItemKey),
+    /// Forget a run-history line.
+    ForgetRun(Box<str>),
+    /// Icons of these app ids (the view asks for the rows it shows).
+    RequestIcons(Vec<Box<str>>),
+    /// Ask the files provider for this generation (L2).
+    RequestFiles(u64),
+    /// Nothing matched: ask Windows' typo rewrite for this generation (tier 7, L1a-15d).
+    RequestRewrite {
+        gen: u64,
+    },
+    /// Read the clipboard's text and hand it to `Session::paste` (Ctrl+V, Shift+Insert).
+    Paste,
+    /// The rows changed: lay the panel out again.
+    Relayout,
+    /// Only the caret, the selection or the selected row changed.
+    Redraw,
+}
+
+/// A launch, mapped to a shell request by launcher_sys.rs (L1a-12i).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LaunchReq {
+    App(Box<str>),
+    AppAdmin(Box<str>),
+    RevealApp(Box<str>),
+    /// The index into the held settings list; the controller, which holds the list, takes its target and arguments.
+    Setting {
+        index: u32,
+    },
+    OpenPath(Box<str>),
+    RevealPath(Box<str>),
+    Command(RunLine),
+    Console(RunLine),
+    /// Built only here, only with a Gesture and the review conditions (L1a-9).
+    RunAsTyped {
+        line: RunLine,
+        gesture: Gesture,
+    },
+    Url(Box<str>),
+    Registry,
+}
+
+/// A key the hook kept while the launcher was not yet foreground, rebuilt by the view (L1a-15b).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReplayKey {
+    Text(char),
+    Key(KeyEvent),
+}
+
+/// The mode chip: a recognised prefix taken out of the field.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Chip {
+    id: ProviderId,
+    prefix: Box<str>,
+}
+
+const VK_BACK: u16 = 0x08;
+const VK_TAB: u16 = 0x09;
+const VK_RETURN: u16 = 0x0D;
+const VK_ESCAPE: u16 = 0x1B;
+const VK_SPACE: u16 = 0x20;
+const VK_PRIOR: u16 = 0x21;
+const VK_NEXT: u16 = 0x22;
+const VK_END: u16 = 0x23;
+const VK_HOME: u16 = 0x24;
+const VK_LEFT: u16 = 0x25;
+const VK_UP: u16 = 0x26;
+const VK_RIGHT: u16 = 0x27;
+const VK_DOWN: u16 = 0x28;
+const VK_INSERT: u16 = 0x2D;
+const VK_DELETE: u16 = 0x2E;
+const VK_A: u16 = 0x41;
+const VK_C: u16 = 0x43;
+const VK_E: u16 = 0x45;
+const VK_V: u16 = 0x56;
+const VK_W: u16 = 0x57;
+const VK_F4: u16 = 0x73;
+
+const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
+
+/// One open of the launcher.
+#[derive(Debug)]
+pub struct Session {
+    field: TextField,
+    chip: Option<Chip>,
+    results: Results,
+    /// The generation of the current rows: one per change of the text.
+    gen: u64,
+    /// Keys typed before the launcher was foreground are being replayed (L1a-15b).
+    replaying: bool,
+    /// Visible rows (PgUp, PgDn).
+    rows: u8,
+    /// The selection was made by arrow keys or the pointer, not taken by default (Ctrl+W, 5.2.9).
+    picked: bool,
+    /// The generation that last asked for the typo rewrite.
+    rewrite_asked: Option<u64>,
+    budget: Budget,
+    /// The mode and the folded text of the current rows (Tab).
+    mode: Mode,
+    folded: String,
+}
+
+fn mru_window(cx: &Context, group: &str) -> Option<isize> {
+    cx.windows.iter().find(|w| *w.group_key == *group).map(|w| w.hwnd)
+}
+
+/// The app id of an app row; a running app row carries its group key as payload and its id in its icon.
+fn app_id(item: &Item) -> Option<&str> {
+    match (&item.payload, &item.icon) {
+        (Payload::AppId(id), _) | (Payload::Group(_), IconRef::App(id)) if item.kind == Kind::App => Some(id),
+        _ => None,
+    }
+}
+
+/// A drive-letter path (a group key can also be an AUMID, which has no folder to show).
+fn is_drive_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.first().is_some_and(u8::is_ascii_alphabetic) && b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\')
+}
+
+fn launch(req: LaunchReq) -> Vec<Effect> {
+    vec![Effect::Hide { restore: false }, Effect::Launch(req)]
+}
+
+fn copy_after_hide(text: &str) -> Vec<Effect> {
+    vec![Effect::Hide { restore: true }, Effect::Copy(text.into())]
+}
+
+fn run_line(r: &RunLine) -> LaunchReq {
+    if runline::runs_in_console(r) {
+        LaunchReq::Console(r.clone())
+    } else {
+        LaunchReq::Command(r.clone())
+    }
+}
+
+impl Session {
+    /// A new open. With keep_query the previous query comes back fully selected, so typing replaces it (5.2.3).
+    pub fn open(opts: &LauncherOpts, last_query: Option<&str>) -> Session {
+        let mut field = TextField::new();
+        if let Some(q) = last_query.filter(|q| opts.keep_query && !q.is_empty()) {
+            field.set_text_selected(q);
+        }
+        Session {
+            field,
+            chip: None,
+            results: Results::default(),
+            gen: 0,
+            replaying: false,
+            rows: opts.rows,
+            picked: false,
+            rewrite_asked: None,
+            budget: Budget::default(),
+            mode: Mode::Mixed,
+            folded: String::new(),
+        }
+    }
+
+    pub fn rows(&self) -> &[Item] {
+        self.results.rows()
+    }
+
+    pub fn selected(&self) -> Option<&Item> {
+        self.results.selected()
+    }
+
+    pub fn selected_index(&self) -> Option<usize> {
+        self.results.selected_index()
+    }
+
+    /// The field's text (without the chip's prefix).
+    pub fn query_text(&self) -> &str {
+        self.field.text()
+    }
+
+    pub fn field(&self) -> &TextField {
+        &self.field
+    }
+
+    pub fn chip(&self) -> Option<ProviderId> {
+        self.chip.as_ref().map(|c| c.id)
+    }
+
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+
+    /// The query as typed, prefix included: what keep_query brings back at the next open.
+    pub fn last_query(&self) -> String {
+        let mut raw = String::from(self.chip.as_ref().map_or("", |c| &*c.prefix));
+        raw.push_str(self.field.text());
+        raw
+    }
+
+    /// Notice rows (5.5.2), shown first from the next query.
+    pub fn set_notices(&mut self, notices: Vec<Item>) {
+        self.results.set_notices(notices);
+    }
+
+    /// Runs the query again as a new generation: the rows of a kept query at open.
+    pub fn refresh(&mut self, cx: &Context) -> Vec<Effect> {
+        self.requery(cx)
+    }
+
+    /// A late batch (files, the typo rewrite): false when it belongs to another generation.
+    pub fn late(&mut self, b: Batch, cx: &Context) -> bool {
+        let _ = cx;
+        self.results.late(b, self.gen)
+    }
+
+    /// Alt+F4, SC_CLOSE and WM_CLOSE: the final Esc.
+    pub fn close_request(&mut self) -> Vec<Effect> {
+        vec![Effect::Hide { restore: true }]
+    }
+
+    /// The chord again while open: the final Esc.
+    pub fn chord_again(&mut self) -> Vec<Effect> {
+        vec![Effect::Hide { restore: true }]
+    }
+
+    /// Typed characters (WM_CHAR). Control characters are keys, handled by `key`, never text.
+    pub fn chars(&mut self, s: &str, cx: &Context) -> Vec<Effect> {
+        let text: String = s.chars().filter(|c| !c.is_control()).collect();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.edit(Edit::Insert(text), cx)
+    }
+
+    /// The clipboard's text (after `Effect::Paste`): line breaks and tabs become spaces, cut at 256 characters;
+    /// control and bidi characters are kept and drawn as markers.
+    pub fn paste(&mut self, text: &str, cx: &Context) -> Vec<Effect> {
+        self.edit(Edit::Insert(text.into()), cx)
+    }
+
+    /// The keys the hook kept before the launcher was foreground. They behave as typed, except that Enter never runs a
+    /// destructive row (it stays selected: the user typed blind) and Ctrl+Shift+Enter never has a gesture. A key that
+    /// closes the launcher ends the replay.
+    pub fn replay(&mut self, keys: &[ReplayKey], cx: &Context) -> Vec<Effect> {
+        self.replaying = true;
+        let mut out = Vec::new();
+        for k in keys {
+            let fx = match *k {
+                ReplayKey::Text(c) => {
+                    let mut buf = [0u8; 4];
+                    self.chars(c.encode_utf8(&mut buf), cx)
+                }
+                ReplayKey::Key(ev) => self.key(ev, None, cx),
+            };
+            let closes = fx.iter().any(|e| matches!(e, Effect::Hide { .. }));
+            out.extend(fx);
+            if closes {
+                break;
+            }
+        }
+        self.replaying = false;
+        let relayout = out.contains(&Effect::Relayout);
+        let redraw = out.contains(&Effect::Redraw);
+        let gen = self.gen;
+        out.retain(|e| match e {
+            Effect::Relayout | Effect::Redraw => false,
+            Effect::RequestRewrite { gen: g } => *g == gen,
+            _ => true,
+        });
+        if !out.iter().any(|e| matches!(e, Effect::Hide { .. })) {
+            if relayout {
+                out.push(Effect::Relayout);
+            } else if redraw {
+                out.push(Effect::Redraw);
+            }
+        }
+        out
+    }
+
+    /// One key down (WM_KEYDOWN or WM_SYSKEYDOWN). `gesture` is the hook's proof of a person's Ctrl+Shift+Enter.
+    pub fn key(&mut self, ev: KeyEvent, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        let m = ev.mods;
+        let plain = m == Mods::NONE;
+        let ctrl = m.has(Mods::CTRL);
+        let shift = m.has(Mods::SHIFT);
+        let motion = |by: Motion, word: Motion| Edit::Move { by: if ctrl { word } else { by }, extend: shift };
+        match ev.vk {
+            VK_SPACE if m.has(Mods::ALT) => self.chord_again(),
+            VK_F4 if m == Mods::ALT => self.close_request(),
+            VK_ESCAPE if plain => self.escape(cx),
+            VK_RETURN if ev.repeat => Vec::new(),
+            VK_RETURN => self.enter(m, gesture, cx),
+            VK_E if m == CTRL_SHIFT => self.reveal(cx),
+            VK_C if m == Mods::CTRL => self.copy(cx),
+            VK_V if m == Mods::CTRL => vec![Effect::Paste],
+            VK_INSERT if m == Mods::SHIFT => vec![Effect::Paste],
+            VK_A if m == Mods::CTRL => self.edit(Edit::SelectAll, cx),
+            VK_W if m == Mods::CTRL && !ev.repeat => self.close_window(cx),
+            VK_DELETE if m == Mods::SHIFT && !ev.repeat => self.forget(),
+            VK_BACK if plain && self.chip.is_some() && self.field.caret() == 0 && self.field.selection().is_none() => {
+                self.unchip(cx)
+            }
+            VK_BACK if plain => self.edit(Edit::Backspace, cx),
+            VK_BACK if m == Mods::CTRL => self.edit(Edit::DeleteWordLeft, cx),
+            VK_DELETE if plain => self.edit(Edit::Delete, cx),
+            VK_DELETE if m == Mods::CTRL => self.edit(Edit::DeleteWordRight, cx),
+            VK_LEFT if !m.has(Mods::ALT) => self.edit(motion(Motion::CharLeft, Motion::WordLeft), cx),
+            VK_RIGHT if !m.has(Mods::ALT) => self.edit(motion(Motion::CharRight, Motion::WordRight), cx),
+            VK_HOME if m == Mods::CTRL => self.select_edge(true),
+            VK_END if m == Mods::CTRL => self.select_edge(false),
+            VK_HOME if plain || m == Mods::SHIFT => self.edit(Edit::Move { by: Motion::Home, extend: shift }, cx),
+            VK_END if plain || m == Mods::SHIFT => self.edit(Edit::Move { by: Motion::End, extend: shift }, cx),
+            VK_UP if plain => self.move_selection(-1),
+            VK_DOWN if plain => self.move_selection(1),
+            VK_PRIOR if plain => self.move_selection(-isize::from(self.rows.max(1))),
+            VK_NEXT if plain => self.move_selection(isize::from(self.rows.max(1))),
+            VK_TAB if plain => self.complete(cx),
+            _ => Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------------- the field and the query
+
+    fn edit(&mut self, e: Edit, cx: &Context) -> Vec<Effect> {
+        let insert = matches!(e, Edit::Insert(_));
+        match self.field.apply(e) {
+            FieldOut::Unchanged => Vec::new(),
+            FieldOut::CaretOnly => vec![Effect::Redraw],
+            FieldOut::Changed => {
+                if insert {
+                    self.take_chip(cx);
+                }
+                self.requery(cx)
+            }
+        }
+    }
+
+    /// A prefix just typed at the start of the field becomes the mode chip (5.2.4).
+    fn take_chip(&mut self, cx: &Context) {
+        if self.chip.is_some() {
+            return;
+        }
+        let text = self.field.text();
+        let Some((len, id, _)) = cx.opts.prefixes.find(text) else { return };
+        if self.field.caret() < len {
+            return;
+        }
+        let (Some(prefix), Some(rest)) = (text.get(..len), text.get(len..)) else { return };
+        let caret = self.field.caret() - len;
+        self.chip = Some(Chip { id, prefix: prefix.into() });
+        let rest = String::from(rest);
+        self.field.set_text(&rest);
+        self.field.set_caret(caret);
+    }
+
+    /// Backspace at caret 0: the chip goes back into the field as text, the caret after it.
+    fn unchip(&mut self, cx: &Context) -> Vec<Effect> {
+        let Some(chip) = self.chip.take() else { return Vec::new() };
+        let mut text = String::from(&*chip.prefix);
+        text.push_str(self.field.text());
+        self.field.set_text(&text);
+        self.field.set_caret(chip.prefix.len());
+        self.requery(cx)
+    }
+
+    /// The text changed: a new generation, new rows, the default selection.
+    fn requery(&mut self, cx: &Context) -> Vec<Effect> {
+        self.gen += 1;
+        self.picked = false;
+        let raw = self.last_query();
+        let q = query::parse_query(&raw, &cx.opts.prefixes, cx.num, self.gen);
+        let top = providers::query_all(&q, cx, &mut self.budget);
+        self.results.sync(&q, top);
+        self.mode = q.mode;
+        self.folded.clone_from(&q.folded);
+        let mut fx = vec![Effect::Relayout];
+        let nothing = q.mode == Mode::Mixed && !q.folded.is_empty() && !self.results.has_matches();
+        if nothing && self.rewrite_asked != Some(self.gen) {
+            self.rewrite_asked = Some(self.gen);
+            fx.push(Effect::RequestRewrite { gen: self.gen });
+        }
+        fx
+    }
+
+    /// The Esc ladder: (the action list, L1b), then the query and the chip, then the final Esc.
+    fn escape(&mut self, cx: &Context) -> Vec<Effect> {
+        if !self.field.is_empty() || self.chip.is_some() {
+            self.field.clear();
+            self.chip = None;
+            return self.requery(cx);
+        }
+        vec![Effect::Hide { restore: true }]
+    }
+
+    /// Tab: in Run mode the selected suggestion (or the first one) goes into the field; otherwise the selected row's
+    /// name when it starts with the query.
+    fn complete(&mut self, cx: &Context) -> Vec<Effect> {
+        let pick = if self.mode == Mode::Only(ProviderId::Run) {
+            let sel = self.selected().filter(|r| r.kind == Kind::RunSuggestion);
+            sel.or_else(|| self.rows().iter().find(|r| r.kind == Kind::RunSuggestion)).map(|r| r.title.clone())
+        } else {
+            self.selected().map(|r| r.title.clone()).filter(|t| {
+                let mut f = String::with_capacity(t.len());
+                rank::fold(t, &mut f);
+                !self.folded.is_empty() && f.starts_with(&self.folded)
+            })
+        };
+        let Some(text) = pick else { return Vec::new() };
+        self.set_field(&text, cx)
+    }
+
+    /// Puts a completion in the field, after the prefix (as a chip or as typed text), and runs it.
+    fn set_field(&mut self, text: &str, cx: &Context) -> Vec<Effect> {
+        let inline = match self.chip {
+            Some(_) => None,
+            None => cx.opts.prefixes.find(self.field.text()).and_then(|(len, ..)| self.field.text().get(..len)),
+        };
+        let mut new = String::from(inline.unwrap_or(""));
+        new.push_str(text);
+        if new == self.field.text() {
+            return Vec::new();
+        }
+        self.field.set_text(&new);
+        self.requery(cx)
+    }
+
+    // ---------------------------------------------------------------- the selection
+
+    fn move_selection(&mut self, delta: isize) -> Vec<Effect> {
+        let n = self.rows().len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let last = n - 1;
+        let next = match self.selected_index() {
+            None => 0,
+            Some(i) => i.saturating_add_signed(delta).min(last),
+        };
+        self.pick(next)
+    }
+
+    fn select_edge(&mut self, first: bool) -> Vec<Effect> {
+        match self.rows().len() {
+            0 => Vec::new(),
+            n => self.pick(if first { 0 } else { n - 1 }),
+        }
+    }
+
+    /// The user chose a row (arrows, pointer).
+    fn pick(&mut self, i: usize) -> Vec<Effect> {
+        let moved = self.selected_index() != Some(i);
+        if !self.results.select_index(i) {
+            return Vec::new();
+        }
+        self.picked = true;
+        if moved {
+            vec![Effect::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    // ---------------------------------------------------------------- verbs
+
+    /// Enter and its modifiers on the selected row (table 5.2.8).
+    fn enter(&mut self, m: Mods, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        let Some(item) = self.selected().cloned() else { return Vec::new() };
+        if self.replaying && item.destructive {
+            // Typed blind before the launcher showed: it stays selected for a real Enter.
+            return Vec::new();
+        }
+        match m {
+            Mods::NONE => self.primary(&item, cx),
+            Mods::SHIFT => self.shift_enter(&item),
+            Mods::CTRL => self.reveal(cx),
+            CTRL_SHIFT => self.run_as_admin(&item, gesture, cx),
+            _ => Vec::new(),
+        }
+    }
+
+    fn primary(&mut self, item: &Item, cx: &Context) -> Vec<Effect> {
+        let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
+        if !item.verbs.has(verbs::primary(item.kind, running)) {
+            return Vec::new();
+        }
+        match &item.payload {
+            Payload::AppId(id) => launch(LaunchReq::App(id.clone())),
+            Payload::Group(g) => match mru_window(cx, g) {
+                Some(h) => vec![Effect::Switch(h), Effect::Hide { restore: false }],
+                None => Vec::new(),
+            },
+            Payload::Hwnd(h) => vec![Effect::Switch(*h), Effect::Hide { restore: false }],
+            Payload::Setting(index) => launch(LaunchReq::Setting { index: *index }),
+            Payload::Command(id) => command(*id),
+            Payload::Value { shown, .. } => copy_after_hide(shown),
+            Payload::RunLine(r) => launch(run_line(r)),
+            Payload::Url(u) => launch(LaunchReq::Url(u.clone())),
+            Payload::Path { path, .. } => launch(LaunchReq::OpenPath(path.clone())),
+            Payload::None => Vec::new(),
+        }
+    }
+
+    /// Shift+Enter: a new instance of an app, the raw value of an answer, a line in a console kept open.
+    fn shift_enter(&mut self, item: &Item) -> Vec<Effect> {
+        match (&item.kind, &item.payload) {
+            (Kind::App, _) => app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into()))),
+            (Kind::Answer, Payload::Value { raw, .. }) => copy_after_hide(raw),
+            (Kind::RunLine | Kind::RunSuggestion, Payload::RunLine(r)) => launch(LaunchReq::Console(r.clone())),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Ctrl+Enter and Ctrl+Shift+E: show the app, the program of a window or the path in its folder.
+    fn reveal(&mut self, cx: &Context) -> Vec<Effect> {
+        let Some(item) = self.selected() else { return Vec::new() };
+        if !item.verbs.has(Verb::Reveal) {
+            return Vec::new();
+        }
+        let req = match (&item.kind, &item.payload) {
+            (Kind::App, _) => app_id(item).map(|id| LaunchReq::RevealApp(id.into())),
+            (Kind::Window, Payload::Group(g)) => is_drive_path(g).then(|| LaunchReq::RevealPath(g.clone())),
+            (Kind::Window, Payload::Hwnd(h)) => cx
+                .windows
+                .iter()
+                .find(|w| w.hwnd == *h)
+                .filter(|w| is_drive_path(&w.group_key))
+                .map(|w| LaunchReq::RevealPath(w.group_key.clone())),
+            (_, Payload::Path { path, .. }) => Some(LaunchReq::RevealPath(path.clone())),
+            _ => None,
+        };
+        req.map_or_else(Vec::new, launch)
+    }
+
+    /// Ctrl+Shift+Enter. An app asks UAC through Explorer (no gesture needed: the app is the catalogue's); a run
+    /// suggestion only goes into the field, where it becomes typed text. The typed line needs the gesture and the
+    /// review conditions (L1a-9): until then it does nothing.
+    fn run_as_admin(&mut self, item: &Item, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        let _ = gesture;
+        match (&item.kind, &item.payload) {
+            (Kind::App, _) if item.verbs.has(Verb::RunAsAdmin) => {
+                app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::AppAdmin(id.into())))
+            }
+            (Kind::RunSuggestion, Payload::RunLine(r)) => {
+                let line = r.line.clone();
+                self.set_field(&line, cx)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Ctrl+C: the field's selection now; otherwise the selected row's text, after the hide.
+    fn copy(&mut self, cx: &Context) -> Vec<Effect> {
+        if let Some(sel) = self.field.selected_text() {
+            return vec![Effect::CopyNow(sel.into())];
+        }
+        let Some(item) = self.selected() else { return Vec::new() };
+        if !item.verbs.has(Verb::Copy) {
+            return Vec::new();
+        }
+        let text: Option<&str> = match &item.payload {
+            Payload::Value { shown, .. } => Some(shown),
+            Payload::RunLine(r) => Some(&r.line),
+            Payload::Url(u) => Some(u),
+            Payload::Path { path, .. } => Some(path),
+            Payload::Hwnd(h) => cx.windows.iter().find(|w| w.hwnd == *h).and_then(|w| w.title.as_deref()),
+            _ => Some(&item.title),
+        };
+        text.map_or_else(Vec::new, copy_after_hide)
+    }
+
+    /// Ctrl+W: WM_CLOSE to the window of a row the user chose by arrow or pointer, never to the default row; the row
+    /// goes, the launcher stays.
+    fn close_window(&mut self, cx: &Context) -> Vec<Effect> {
+        if !self.picked {
+            return Vec::new();
+        }
+        let Some(item) = self.selected() else { return Vec::new() };
+        if !item.verbs.has(Verb::CloseWindow) {
+            return Vec::new();
+        }
+        let hwnd = match &item.payload {
+            Payload::Hwnd(h) => Some(*h),
+            Payload::Group(g) => mru_window(cx, g),
+            _ => None,
+        };
+        let Some(h) = hwnd else { return Vec::new() };
+        let key = item.key;
+        self.results.remove(key);
+        self.picked = false;
+        vec![Effect::CloseWindow(h), Effect::Relayout]
+    }
+
+    /// Shift+Delete: a history line is forgotten and leaves the list; an app's learned rank is forgotten (L1b).
+    fn forget(&mut self) -> Vec<Effect> {
+        let Some(item) = self.selected() else { return Vec::new() };
+        if !item.verbs.has(Verb::Forget) {
+            return Vec::new();
+        }
+        match (&item.kind, &item.payload) {
+            (Kind::RunSuggestion, Payload::RunLine(r)) => {
+                let (key, line) = (item.key, r.line.clone());
+                self.results.remove(key);
+                vec![Effect::ForgetRun(line), Effect::Relayout]
+            }
+            _ => vec![Effect::Forget(item.key)],
+        }
+    }
+}
+
+/// What a command row runs: power commands after the hide, the window menu after the restore.
+fn command(id: CommandId) -> Vec<Effect> {
+    match id {
+        CommandId::Lock | CommandId::Sleep | CommandId::Restart | CommandId::ShutDown | CommandId::SignOut => {
+            vec![Effect::Hide { restore: false }, Effect::Power(id)]
+        }
+        CommandId::Registry => launch(LaunchReq::Registry),
+        CommandId::WindowMenu => vec![Effect::Hide { restore: true }, Effect::WindowMenu],
+        // L2-6.
+        CommandId::ClipboardHistory => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::launcher::model::FileClass;
+    use crate::launcher::providers::tests::{Fx, NOTEPAD_KEY};
+
+    const NOTEPAD_ID: &str = "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App";
+    const CALC_ID: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+
+    fn k(vk: u16, mods: Mods) -> KeyEvent {
+        KeyEvent { vk, mods, repeat: false, sys: mods.has(Mods::ALT) }
+    }
+
+    fn open(fx: &Fx) -> Session {
+        Session::open(&fx.opts, None)
+    }
+
+    /// The session after typing `text` one character at a time.
+    fn typed(fx: &Fx, text: &str) -> Session {
+        let mut s = open(fx);
+        for c in text.chars() {
+            let mut b = [0u8; 4];
+            s.chars(c.encode_utf8(&mut b), &fx.cx());
+        }
+        s
+    }
+
+    fn press(s: &mut Session, fx: &Fx, vk: u16, mods: Mods) -> Vec<Effect> {
+        s.key(k(vk, mods), None, &fx.cx())
+    }
+
+    fn sel_title(s: &Session) -> Option<&str> {
+        s.selected().map(|r| &*r.title)
+    }
+
+    #[test]
+    fn enter_on_running_app_switches_shift_enter_opens() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "blocco");
+        assert_eq!(sel_title(&s), Some("Blocco note"));
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Switch(0x1001), Effect::Hide { restore: false }]
+        );
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::SHIFT),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App(NOTEPAD_ID.into()))]
+        );
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::CTRL),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::RevealApp(NOTEPAD_ID.into()))]
+        );
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, CTRL_SHIFT),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::AppAdmin(NOTEPAD_ID.into()))]
+        );
+        // A held Enter does nothing more.
+        let held = KeyEvent { repeat: true, ..k(VK_RETURN, Mods::NONE) };
+        assert!(s.key(held, None, &fx.cx()).is_empty());
+        // A running program the catalogue does not know switches to its window too.
+        let mut s = typed(&fx, "footool");
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Switch(0x2002), Effect::Hide { restore: false }]
+        );
+        // A group with no window left does nothing.
+        let mut fx2 = Fx::new();
+        let mut s = typed(&fx2, "blocco");
+        fx2.windows.clear();
+        assert!(press(&mut s, &fx2, VK_RETURN, Mods::NONE).is_empty());
+    }
+
+    #[test]
+    fn sl_enter_never_sleeps() {
+        let fx = Fx::new();
+        for q in ["s", "sl", "sle", "re", "sh", "spe"] {
+            let mut s = typed(&fx, q);
+            let fx_enter = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+            assert!(!fx_enter.iter().any(|e| matches!(e, Effect::Power(_))), "{q}: {fx_enter:?}");
+        }
+        // Chosen by arrow, it runs: no confirmation dialog (Q4).
+        let mut s = typed(&fx, "sl");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Power(CommandId::Sleep)]
+        );
+    }
+
+    #[test]
+    fn esc_ladder() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "calc");
+        assert!(!s.rows().is_empty());
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout]);
+        assert_eq!((s.query_text(), s.rows().len()), ("", 0));
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Hide { restore: true }]);
+        // The chip goes with the query.
+        let mut s = typed(&fx, "=3");
+        assert_eq!((s.chip(), s.query_text()), (Some(ProviderId::Calc), "3"));
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout]);
+        assert_eq!((s.chip(), s.query_text()), (None, ""));
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Hide { restore: true }]);
+    }
+
+    #[test]
+    fn chord_again_is_final_esc() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "calc");
+        assert_eq!(s.chord_again(), [Effect::Hide { restore: true }]);
+        assert_eq!(press(&mut s, &fx, VK_SPACE, Mods::ALT), [Effect::Hide { restore: true }]);
+        assert_eq!(press(&mut s, &fx, VK_SPACE, Mods::ALT.with(Mods::SHIFT)), [Effect::Hide { restore: true }]);
+        assert_eq!(s.query_text(), "calc", "the query is the controller's to keep or drop");
+    }
+
+    #[test]
+    fn close_request_is_final_esc() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "calc");
+        assert_eq!(s.close_request(), [Effect::Hide { restore: true }]);
+        assert_eq!(press(&mut s, &fx, VK_F4, Mods::ALT), [Effect::Hide { restore: true }]);
+    }
+
+    #[test]
+    fn ctrl_c_copies_field_selection_else_row() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "calc");
+        assert_eq!(press(&mut s, &fx, VK_A, Mods::CTRL), [Effect::Redraw]);
+        assert_eq!(press(&mut s, &fx, VK_C, Mods::CTRL), [Effect::CopyNow("calc".into())]);
+        press(&mut s, &fx, VK_RIGHT, Mods::NONE);
+        assert_eq!(
+            press(&mut s, &fx, VK_C, Mods::CTRL),
+            [Effect::Hide { restore: true }, Effect::Copy("Calcolatrice".into())]
+        );
+        // A "<" row copies the window's title.
+        let mut s = typed(&fx, "<senza");
+        assert_eq!(
+            press(&mut s, &fx, VK_C, Mods::CTRL),
+            [Effect::Hide { restore: true }, Effect::Copy("Senza titolo - Blocco note".into())]
+        );
+        // Nothing selected: nothing.
+        let mut s = typed(&fx, "sl");
+        assert!(press(&mut s, &fx, VK_C, Mods::CTRL).is_empty());
+    }
+
+    #[test]
+    fn copy_restores_then_copies() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "=3,5*2");
+        assert_eq!(s.selected().unwrap().kind, Kind::Answer);
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: true }, Effect::Copy("7".into())]
+        );
+        let mut s = typed(&fx, "1000,5*2");
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::SHIFT),
+            [Effect::Hide { restore: true }, Effect::Copy("2001".into())],
+            "the raw value"
+        );
+        // The window menu restores first too.
+        let mut s = typed(&fx, "window menu");
+        assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [Effect::Hide { restore: true }, Effect::WindowMenu]);
+    }
+
+    #[test]
+    fn launches_hide_without_restore() {
+        let fx = Fx::new();
+        let hide = Effect::Hide { restore: false };
+        let cases: [(&str, Effect); 6] = [
+            ("calcolatrice", Effect::Launch(LaunchReq::App(CALC_ID.into()))),
+            ("lock", Effect::Power(CommandId::Lock)),
+            ("schermo", Effect::Launch(LaunchReq::Setting { index: 1 })),
+            ("www.example.com", Effect::Launch(LaunchReq::Url("https://www.example.com".into()))),
+            (":", Effect::Launch(LaunchReq::Registry)),
+            ("zzqq", Effect::Launch(LaunchReq::Url("https://www.google.com/search?q=zzqq".into()))),
+        ];
+        for (q, then) in cases {
+            let mut s = typed(&fx, q);
+            assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [hide.clone(), then], "{q}");
+        }
+        // Run lines: a known console program in a console, Shift+Enter any line in a console.
+        let mut s = typed(&fx, ">ping 1.1.1.1");
+        let Some(Effect::Launch(LaunchReq::Console(r))) = press(&mut s, &fx, VK_RETURN, Mods::NONE).pop() else {
+            panic!()
+        };
+        assert_eq!(&*r.line, "ping 1.1.1.1");
+        let mut s = typed(&fx, ">notepad x.txt");
+        let fx_enter = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert!(matches!(&fx_enter[..], [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::Command(_))]));
+        let fx_shift = press(&mut s, &fx, VK_RETURN, Mods::SHIFT);
+        assert!(matches!(&fx_shift[..], [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::Console(_))]));
+    }
+
+    #[test]
+    fn ctrl_w_never_on_the_default_row() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "<");
+        assert_eq!(s.rows().len(), 2);
+        assert!(press(&mut s, &fx, VK_W, Mods::CTRL).is_empty(), "the default row");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(press(&mut s, &fx, VK_W, Mods::CTRL), [Effect::CloseWindow(0x2002), Effect::Relayout]);
+        assert_eq!(s.rows().len(), 1, "the row goes, the launcher stays");
+        assert!(press(&mut s, &fx, VK_W, Mods::CTRL).is_empty(), "the row that took its place is not chosen yet");
+        // An app row chosen by arrow closes its most recent window.
+        let mut s = typed(&fx, "blocco");
+        assert!(press(&mut s, &fx, VK_W, Mods::CTRL).is_empty());
+        assert!(press(&mut s, &fx, VK_UP, Mods::NONE).is_empty(), "an arrow on the row it is on chooses it");
+        assert_eq!(press(&mut s, &fx, VK_W, Mods::CTRL), [Effect::CloseWindow(0x1001), Effect::Relayout]);
+        // Not on an app that is not running, and the choice is forgotten at the next keystroke.
+        let mut s = typed(&fx, "calcolatric");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert!(press(&mut s, &fx, VK_W, Mods::CTRL).is_empty());
+        let mut s = typed(&fx, "<");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        s.chars("f", &fx.cx());
+        assert!(press(&mut s, &fx, VK_W, Mods::CTRL).is_empty());
+    }
+
+    #[test]
+    fn open_path_is_passed_untouched() {
+        let fx = Fx::new();
+        let path = "C:\\Users\\%USERNAME%\\a b.txt";
+        let mut s = typed(&fx, path);
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::OpenPath(path.into()))]
+        );
+        assert_eq!(
+            press(&mut s, &fx, VK_E, CTRL_SHIFT),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::RevealPath(path.into()))]
+        );
+        // An executable path is shown in its folder, never opened, until live check 6.
+        let mut s = typed(&fx, "c:\\tools\\setup.exe");
+        assert!(press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty());
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert!(matches!(s.selected().unwrap().payload, Payload::Path { class: FileClass::Executable, .. }));
+        assert!(press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty());
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::CTRL),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::RevealPath("c:\\tools\\setup.exe".into()))]
+        );
+    }
+
+    #[test]
+    fn keep_query_selected_on_open() {
+        let mut fx = Fx::new();
+        fx.opts.keep_query = true;
+        let mut s = Session::open(&fx.opts, Some("calc"));
+        assert_eq!(s.query_text(), "calc");
+        assert_eq!(s.field().selection(), Some(0..4));
+        assert_eq!(s.refresh(&fx.cx()), [Effect::Relayout]);
+        assert_eq!(sel_title(&s), Some("Calcolatrice"));
+        s.chars("x", &fx.cx());
+        assert_eq!(s.query_text(), "x", "typing replaces it");
+        fx.opts.keep_query = false;
+        let s = Session::open(&fx.opts, Some("calc"));
+        assert_eq!((s.query_text(), s.field().selection()), ("", None));
+        // What comes back next time is the query as typed, prefix included.
+        let s = typed(&fx, "=3+4");
+        assert_eq!((s.query_text(), s.last_query().as_str()), ("3+4", "=3+4"));
+    }
+
+    #[test]
+    fn replayed_enter_never_runs_a_destructive_row() {
+        let fx = Fx::new();
+        let mut s = open(&fx);
+        let mut keys: Vec<ReplayKey> = "shut".chars().map(ReplayKey::Text).collect();
+        keys.push(ReplayKey::Key(k(VK_RETURN, Mods::NONE)));
+        let out = s.replay(&keys, &fx.cx());
+        assert!(!out.iter().any(|e| matches!(e, Effect::Power(_) | Effect::Hide { .. })), "{out:?}");
+        assert_eq!(s.selected().unwrap().payload, Payload::Command(CommandId::ShutDown), "selected, waiting");
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Power(CommandId::ShutDown)]
+        );
+        // Every other key behaves as typed, and a replayed Enter acts on the replayed text's rows.
+        let mut s = open(&fx);
+        let mut keys: Vec<ReplayKey> = "calc".chars().map(ReplayKey::Text).collect();
+        keys.push(ReplayKey::Key(k(VK_RETURN, Mods::NONE)));
+        keys.push(ReplayKey::Text('z'));
+        let out = s.replay(&keys, &fx.cx());
+        assert_eq!(out, [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App(CALC_ID.into()))]);
+        assert_eq!(s.query_text(), "calc", "keys after the close are not replayed");
+        // The repaints of a replay come once, at its end.
+        let mut s = open(&fx);
+        let out = s.replay(&[ReplayKey::Text('s'), ReplayKey::Text('t')], &fx.cx());
+        assert_eq!(out, [Effect::Relayout]);
+    }
+
+    #[test]
+    fn no_rows_requests_a_rewrite_once() {
+        let fx = Fx::new();
+        let mut s = open(&fx);
+        let mut asked = Vec::new();
+        for c in ["x", "q", "z", "j"] {
+            let out = s.chars(c, &fx.cx());
+            let gens: Vec<u64> = out
+                .iter()
+                .filter_map(|e| match e {
+                    Effect::RequestRewrite { gen } => Some(*gen),
+                    _ => None,
+                })
+                .collect();
+            assert!(gens.len() <= 1);
+            asked.extend(gens);
+        }
+        assert_eq!(asked, [1, 2, 3, 4], "one per generation");
+        assert!(press(&mut s, &fx, VK_LEFT, Mods::NONE).iter().all(|e| !matches!(e, Effect::RequestRewrite { .. })));
+        // Rows, an empty query or another mode: no rewrite.
+        let mut s = open(&fx);
+        assert!(s.chars("c", &fx.cx()).iter().all(|e| !matches!(e, Effect::RequestRewrite { .. })));
+        let mut s = typed(&fx, ">");
+        assert!(s.chars("q", &fx.cx()).iter().all(|e| !matches!(e, Effect::RequestRewrite { .. })));
+    }
+
+    #[test]
+    fn backspace_at_caret_0_turns_the_chip_into_text() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "=3");
+        press(&mut s, &fx, VK_HOME, Mods::NONE);
+        assert_eq!(press(&mut s, &fx, VK_BACK, Mods::NONE), [Effect::Relayout]);
+        assert_eq!((s.chip(), s.query_text(), s.field().caret()), (None, "=3", 1));
+        press(&mut s, &fx, VK_BACK, Mods::NONE);
+        assert_eq!(s.query_text(), "3");
+        // A prefix becomes a chip only when typed at the start, and a word prefix needs its space.
+        let s = typed(&fx, "file");
+        assert_eq!(s.chip(), None);
+        let s = typed(&fx, "file ");
+        assert_eq!((s.chip(), s.query_text()), (Some(ProviderId::Files), ""));
+    }
+
+    #[test]
+    fn enter_after_a_late_batch_acts_on_the_selected_row() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "st");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(sel_title(&s), Some("Visual Studio Code"));
+        let row = crate::launcher::providers::tests::file_row("studio.txt", FileClass::Other);
+        assert!(s.late(Batch { gen: s.gen(), from: ProviderId::Files, items: vec![row.clone()], done: true }, &fx.cx()));
+        assert!(!s.late(Batch { gen: s.gen() - 1, from: ProviderId::Files, items: vec![row], done: true }, &fx.cx()));
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App("Microsoft.VisualStudioCode".into()))]
+        );
+    }
+
+    #[test]
+    fn run_mode_tab_shift_delete_and_suggestions() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, ">pi");
+        assert_eq!(s.selected().unwrap().kind, Kind::RunLine, "the typed line first");
+        assert_eq!(press(&mut s, &fx, VK_TAB, Mods::NONE), [Effect::Relayout]);
+        assert_eq!((s.chip(), s.query_text()), (Some(ProviderId::Run), "ping 1.1.1.1"));
+        // Ctrl+Shift+Enter on a suggestion only puts it in the field; on the typed line it waits for L1a-9.
+        let mut s = typed(&fx, ">no");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(s.selected().unwrap().kind, Kind::RunSuggestion);
+        let out = s.key(k(VK_RETURN, CTRL_SHIFT), Some(Gesture::for_test(7)), &fx.cx());
+        assert_eq!(out, [Effect::Relayout]);
+        assert_eq!(s.query_text(), "notepad c:\\temp\\a.txt");
+        assert_eq!(s.selected().unwrap().kind, Kind::RunLine);
+        assert!(s.key(k(VK_RETURN, CTRL_SHIFT), Some(Gesture::for_test(8)), &fx.cx()).is_empty());
+        // Shift+Delete forgets a history line, never a known command.
+        let mut s = typed(&fx, ">p");
+        let ping = s.rows().iter().position(|r| &*r.title == "ping 1.1.1.1").unwrap();
+        for _ in 0..ping {
+            press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        }
+        assert_eq!(
+            press(&mut s, &fx, VK_DELETE, Mods::SHIFT),
+            [Effect::ForgetRun("ping 1.1.1.1".into()), Effect::Relayout]
+        );
+        assert!(s.rows().iter().all(|r| &*r.title != "ping 1.1.1.1"));
+        let known = s.rows().iter().position(|r| r.kind == Kind::RunSuggestion).unwrap();
+        s.results.select_index(known);
+        assert!(press(&mut s, &fx, VK_DELETE, Mods::SHIFT).is_empty());
+        // Tab in Mixed mode completes a name that starts with the query.
+        let mut s = typed(&fx, "calco");
+        press(&mut s, &fx, VK_TAB, Mods::NONE);
+        assert_eq!(s.query_text(), "Calcolatrice");
+        let _ = NOTEPAD_KEY;
+    }
+
+    #[test]
+    fn selection_keys_never_wrap() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "st");
+        let n = s.rows().len();
+        assert_eq!(press(&mut s, &fx, VK_UP, Mods::NONE), Vec::<Effect>::new(), "already on the first row");
+        assert_eq!(press(&mut s, &fx, VK_NEXT, Mods::NONE), [Effect::Redraw]);
+        assert_eq!(s.selected_index(), Some(n - 1));
+        assert!(press(&mut s, &fx, VK_DOWN, Mods::NONE).is_empty());
+        press(&mut s, &fx, VK_HOME, Mods::CTRL);
+        assert_eq!(s.selected_index(), Some(0));
+        press(&mut s, &fx, VK_END, Mods::CTRL);
+        assert_eq!(s.selected_index(), Some(n - 1));
+        press(&mut s, &fx, VK_PRIOR, Mods::NONE);
+        assert_eq!(s.selected_index(), Some(0));
+        // Ctrl+V and Shift+Insert ask for the clipboard; the text comes back through paste.
+        assert_eq!(press(&mut s, &fx, VK_V, Mods::CTRL), [Effect::Paste]);
+        assert_eq!(press(&mut s, &fx, VK_INSERT, Mods::SHIFT), [Effect::Paste]);
+        s.paste("a\r\nb", &fx.cx());
+        assert_eq!(s.query_text(), "sta  b");
+        // Characters from WM_CHAR never carry control codes into the field.
+        s.chars("\u{1}\r", &fx.cx());
+        assert_eq!(s.query_text(), "sta  b");
+    }
+}

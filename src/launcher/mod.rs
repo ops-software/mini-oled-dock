@@ -15,6 +15,7 @@ pub mod providers;
 pub mod query;
 pub mod rank;
 pub mod runline;
+pub mod session;
 pub mod strings;
 pub mod style;
 pub mod verbs;
