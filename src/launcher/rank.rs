@@ -330,6 +330,32 @@ pub fn match_all(cands: &[Cand], q: &str, out: &mut Vec<(usize, u8)>) {
     }
 }
 
+/// The characters of the trimmed query `q` for the fuzzy tier, and how many; None when it has more than `FUZZY_MAX_Q`.
+pub(crate) fn fuzzy_chars(q: &str) -> Option<([char; FUZZY_MAX_Q], usize)> {
+    let mut qc = ['\0'; FUZZY_MAX_Q];
+    let mut m = 0;
+    for ch in q.trim().chars() {
+        let slot = qc.get_mut(m)?;
+        *slot = ch;
+        m += 1;
+    }
+    Some((qc, m))
+}
+
+/// The edits tier 8 allows a query of `m` characters.
+pub(crate) fn fuzzy_dist(m: usize) -> usize {
+    match m {
+        0..=3 => 0,
+        4..=7 => 1,
+        _ => 2,
+    }
+}
+
+/// Tier 8's subsequence test: a query of 3+ characters without spaces runs through the shown name with at most 2 gaps.
+pub(crate) fn subsequence_name(c: &Cand, qc: &[char]) -> bool {
+    qc.len() >= 3 && qc.iter().all(|ch| !ch.is_whitespace()) && subsequence_gaps(c.folded, qc, 2)
+}
+
 const FUZZY_MAX_Q: usize = 32;
 const FUZZY_BUF: usize = FUZZY_MAX_Q + 3;
 
@@ -337,22 +363,10 @@ const FUZZY_BUF: usize = FUZZY_MAX_Q + 3;
 /// (query of 4+ characters; 2 at 8+) of a word prefix of the shown name or of one of its other names (`extra`). Names
 /// only: a hidden keyword is never compared. Allocates nothing.
 pub fn match_fuzzy(c: &Cand, q: &str) -> Option<u8> {
-    let q = q.trim();
-    let mut qc = ['\0'; FUZZY_MAX_Q];
-    let mut m = 0;
-    for ch in q.chars() {
-        let slot = qc.get_mut(m)?;
-        *slot = ch;
-        m += 1;
-    }
+    let (qc, m) = fuzzy_chars(q)?;
     let qc = qc.get(..m)?;
-    let dist = match m {
-        0..=3 => 0,
-        4..=7 => 1,
-        _ => 2,
-    };
-    let compact = |t: &str| subsequence_gaps(t, qc, 2);
-    if m >= 3 && qc.iter().all(|ch| !ch.is_whitespace()) && compact(c.folded) {
+    let dist = fuzzy_dist(m);
+    if subsequence_name(c, qc) {
         return Some(T_FUZZY);
     }
     if dist == 0 {
@@ -473,6 +487,148 @@ fn near_prefix_one_pass(t: &str, q: &[char], dist: usize) -> bool {
     (lo..=n).any(|len| get(&prev, len) <= limit)
 }
 
+/// `near_prefix_one_pass` over targets given in byte order, sharing the work of their common prefixes (a trie walked in
+/// order). The distance table is computed one column per character of the target, only inside the band |i - j| <= dist,
+/// and a target that shares with the previous one the prefix up to where that one matched, or where its band went all above
+/// `dist`, is answered without computing a cell. Allocates nothing (a few hundred bytes on the stack).
+pub struct PrefixWalk<'q> {
+    q: &'q [char],
+    dist: usize,
+    /// The longest prefix of a target that is looked at: the query plus the distance.
+    lim: usize,
+    /// The shortest one that may match.
+    lo: usize,
+    /// Column j (the first j characters of the target) at `j * COL + i`, i the characters of the query.
+    cols: [u8; COL * (FUZZY_BUF + 1)],
+    /// The previous target's characters, 1-based.
+    tch: [char; FUZZY_BUF + 1],
+    /// Columns of the previous target that hold valid values.
+    prev_len: usize,
+    /// The prefix length where the previous target matched, or usize::MAX.
+    found: usize,
+    /// The prefix length where the previous target's band went all above `dist`, or usize::MAX.
+    cut: usize,
+}
+
+const COL: usize = FUZZY_MAX_Q + 1;
+/// Above every distance that can matter.
+const FAR: u8 = 100;
+
+impl<'q> PrefixWalk<'q> {
+    /// A walk of `q` (at most `FUZZY_MAX_Q` characters) at distance `dist` (at most 2).
+    pub fn new(q: &'q [char], dist: usize) -> PrefixWalk<'q> {
+        let m = q.len();
+        let mut w = PrefixWalk {
+            q,
+            dist,
+            lim: m + dist,
+            lo: m.saturating_sub(dist).max(1),
+            cols: [FAR; COL * (FUZZY_BUF + 1)],
+            tch: ['\0'; FUZZY_BUF + 1],
+            prev_len: 0,
+            found: usize::MAX,
+            cut: usize::MAX,
+        };
+        for i in 0..=m.min(dist) {
+            w.set(0, i, i as u8);
+        }
+        w
+    }
+
+    fn get(&self, j: usize, i: usize) -> u8 {
+        self.cols.get(j * COL + i).copied().unwrap_or(FAR)
+    }
+
+    fn set(&mut self, j: usize, i: usize, v: u8) {
+        if let Some(s) = self.cols.get_mut(j * COL + i) {
+            *s = v;
+        }
+    }
+
+    /// The answer of `near_prefix_one_pass(t, q, dist)` for the next target `t` (targets in byte order).
+    pub fn next(&mut self, t: &str) -> bool {
+        let (m, d) = (self.q.len(), self.dist);
+        // The characters shared with the previous target, up to the prefix length that matters.
+        let shared = self.lim.min(self.prev_len);
+        let mut l = 0;
+        let mut chars = t.chars();
+        let mut pending: Option<char> = None;
+        while l < shared {
+            match chars.next() {
+                Some(c) if Some(c) == self.tch.get(l + 1).copied() => l += 1,
+                other => {
+                    pending = other;
+                    break;
+                }
+            }
+        }
+        if self.found <= l {
+            self.prev_len = l.max(self.found);
+            return true;
+        }
+        if self.cut <= l {
+            self.prev_len = l;
+            return false;
+        }
+        self.found = usize::MAX;
+        self.cut = usize::MAX;
+        let mut j = l;
+        // When the loop above stopped at `shared` (not at a mismatch), the next character is still unread.
+        let mut next = pending.or_else(|| if l < shared { None } else { chars.next() });
+        while let Some(c) = next {
+            if j >= self.lim {
+                break;
+            }
+            j += 1;
+            if let Some(slot) = self.tch.get_mut(j) {
+                *slot = c;
+            }
+            let mut col = [FAR; COL];
+            let mut min = FAR;
+            if j <= d {
+                if let Some(s) = col.first_mut() {
+                    *s = j as u8;
+                }
+                min = j as u8;
+            }
+            let ilo = j.saturating_sub(d).max(1);
+            let ihi = (j + d).min(m);
+            #[cfg(test)]
+            OSA_CELLS.with(|n| n.set(n.get() + (ihi + 1).saturating_sub(ilo) as u64));
+            for i in ilo..=ihi {
+                let a = self.q.get(i - 1).copied().unwrap_or('\0');
+                let left = col.get(i - 1).copied().unwrap_or(FAR);
+                let mut best = (self.get(j - 1, i - 1) + u8::from(a != c)).min(self.get(j - 1, i) + 1).min(left + 1);
+                let swapped = i > 1 && j > 1 && self.q.get(i - 2) == Some(&c) && self.tch.get(j - 1) == Some(&a);
+                if swapped {
+                    best = best.min(self.get(j - 2, i - 2) + 1);
+                }
+                let best = best.min(FAR);
+                if let Some(s) = col.get_mut(i) {
+                    *s = best;
+                }
+                min = min.min(best);
+            }
+            for (i, &v) in col.iter().enumerate() {
+                self.set(j, i, v);
+            }
+            if j >= self.lo && usize::from(col.get(m).copied().unwrap_or(FAR)) <= d {
+                self.found = j;
+                self.prev_len = j;
+                return true;
+            }
+            if usize::from(min) > d {
+                self.cut = j;
+                self.prev_len = j;
+                return false;
+            }
+            next = chars.next();
+        }
+        self.prev_len = j;
+        false
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// The OSA cells `near_prefix_one_pass` computed on this thread (KEY-3's count, per query on the bench).
@@ -573,6 +729,51 @@ mod tests {
         let mut out = String::new();
         fold(s, &mut out);
         out
+    }
+
+    /// The walk answers like `near_prefix_reference` on each target, for sorted targets: the sharing of prefixes never changes an
+    /// answer.
+    #[test]
+    fn prefix_walk_equals_the_reference() {
+        use crate::launcher::testkit::XorShift;
+        let mut all: Vec<String> = vec![String::new()];
+        let mut from = 0;
+        for _ in 0..5 {
+            let end = all.len();
+            for i in from..end {
+                for ch in ['a', 'b', 'c'] {
+                    all.push(format!("{}{ch}", all[i]));
+                }
+            }
+            from = end;
+        }
+        let mut targets = all.clone();
+        targets.extend(["ab c", "a bc", "é", "éa", "ab é"].map(String::from));
+        targets.sort();
+        let mut queries: Vec<String> = all.iter().filter(|s| !s.is_empty()).cloned().collect();
+        queries.extend(["abcabc", "cbacba", "aaaaaa", "ab c", "éa"].map(String::from));
+        let check = |targets: &[String], queries: &[String]| {
+            for q in queries {
+                let qc: Vec<char> = q.chars().collect();
+                for dist in 0..=2 {
+                    let mut walk = PrefixWalk::new(&qc, dist);
+                    for t in targets {
+                        assert_eq!(walk.next(t), near_prefix_reference(t, &qc, dist), "{t:?} {q:?} {dist}");
+                    }
+                }
+            }
+        };
+        check(&targets, &queries);
+        // Seeded: 300 sorted targets and 300 queries over six letters, up to 12 characters.
+        let mut r = XorShift::new(0x0518);
+        let mut word = |max: u64| -> String {
+            let n = 1 + (r.next_u64() % max) as usize;
+            (0..n).map(|_| char::from(b'a' + (r.next_u64() % 6) as u8)).collect()
+        };
+        let mut targets: Vec<String> = (0..300).map(|_| word(12)).collect();
+        targets.sort();
+        let queries: Vec<String> = (0..300).map(|_| word(12)).collect();
+        check(&targets, &queries);
     }
 
     #[test]

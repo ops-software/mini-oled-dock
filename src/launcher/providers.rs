@@ -312,6 +312,47 @@ struct Scratch {
     title: Indexed,
     /// The dictionary's hidden matches of the query (L3 T9), sorted by entry.
     hidden: Vec<Hit>,
+    /// The dictionary's near-prefix matches of the query for the fuzzy tier (L3 T10), sorted by entry.
+    near: Vec<u32>,
+}
+
+/// The fuzzy tier over a catalogue with a dictionary: the query's characters, whether the subsequence test may run, and
+/// the entries with a near-prefix match in `out`.
+struct FuzzyQuery {
+    chars: [char; 32],
+    len: usize,
+    subsequence: bool,
+}
+
+impl FuzzyQuery {
+    fn chars(&self) -> &[char] {
+        self.chars.get(..self.len).unwrap_or_default()
+    }
+}
+
+/// `rank::match_fuzzy`'s work for the whole catalogue at once, or None when there is no dictionary of it (the caller scans).
+fn fuzzy_matches(ix: Option<IndexView>, len: usize, q: &str, out: &mut Vec<u32>) -> Option<FuzzyQuery> {
+    out.clear();
+    let v = ix.filter(|v| v.entries() == len)?;
+    // A query of more than 32 characters has no fuzzy tier: nothing matches.
+    let Some((chars, len)) = rank::fuzzy_chars(q) else {
+        return Some(FuzzyQuery { chars: ['\0'; 32], len: 0, subsequence: false });
+    };
+    let qc = chars.get(..len).unwrap_or_default();
+    v.fuzzy(qc, rank::fuzzy_dist(len), out);
+    // A character in no name rules the subsequence test out for every candidate.
+    Some(FuzzyQuery { chars, len, subsequence: v.foreign(qc) == 0 })
+}
+
+/// The fuzzy tier of entry `i` (`near` sorted by entry, `cur` moving forward): the subsequence test on its shown name or a
+/// near-prefix match of one of its names.
+fn fuzzy_of(f: &FuzzyQuery, c: &Cand, near: &[u32], cur: &mut usize, i: usize) -> Option<u8> {
+    let i = u32::try_from(i).unwrap_or(u32::MAX);
+    while near.get(*cur).is_some_and(|&e| e < i) {
+        *cur += 1;
+    }
+    let by_near = near.get(*cur) == Some(&i);
+    (by_near || f.subsequence && rank::subsequence_name(c, f.chars())).then_some(rank::T_FUZZY)
 }
 
 /// The dictionary answer for `q` over a catalogue of `len` entries, into `out`; false (and `out` empty) when there is no
@@ -475,12 +516,17 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
     // With a cap at the names there is nothing hidden to read: those tiers could not pass the cap.
     let names_only = !fuzzy && max_tier != u8::MAX;
     let indexed = names_only || !fuzzy && hidden_matches(cx.apps_ix, cx.apps.len(), text, &mut s.hidden);
-    let mut at = 0;
+    let fz =
+        if fuzzy && max_tier == u8::MAX { fuzzy_matches(cx.apps_ix, cx.apps.len(), text, &mut s.near) } else { None };
+    let (mut at, mut near_at) = (0, 0);
     for (i, app) in cx.apps.iter().enumerate() {
         let c = app.cand();
         let hid = if indexed && !names_only { hidden_of(&s.hidden, &mut at, i) } else { None };
         let tier = match (fuzzy, indexed) {
-            (true, _) => rank::match_fuzzy(&c, text),
+            (true, _) => match &fz {
+                Some(f) => fuzzy_of(f, &c, &s.near, &mut near_at, i),
+                None => rank::match_fuzzy(&c, text),
+            },
             (false, true) => rank::match_tiers_with(&c, text, hid),
             (false, false) => rank::match_tiers(&c, text),
         };
@@ -696,12 +742,16 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratc
     let capped = q.mode == Mode::Mixed;
     let mut hidden = Vec::with_capacity(if capped { HIDDEN_SETTINGS_CAP } else { 0 });
     let indexed = !fuzzy && hidden_matches(cx.settings_ix, cx.settings.len(), &q.folded, &mut s.hidden);
-    let mut at = 0;
+    let fz = if fuzzy { fuzzy_matches(cx.settings_ix, cx.settings.len(), &q.folded, &mut s.near) } else { None };
+    let (mut at, mut near_at) = (0, 0);
     for (i, row) in cx.settings.iter().enumerate() {
         let c = row.cand();
         let hid = if indexed { hidden_of(&s.hidden, &mut at, i) } else { None };
         let tier = match (fuzzy, indexed) {
-            (true, _) => rank::match_fuzzy(&c, &q.folded),
+            (true, _) => match &fz {
+                Some(f) => fuzzy_of(f, &c, &s.near, &mut near_at, i),
+                None => rank::match_fuzzy(&c, &q.folded),
+            },
             (false, true) => rank::match_tiers_with(&c, &q.folded, hid),
             (false, false) => rank::match_tiers(&c, &q.folded),
         };
@@ -2035,6 +2085,60 @@ mod bench {
         }
         println!("most OSA cells in one query: {} ({:?})", worst.0, worst.1);
         assert!(worst.0 <= MAX_OSA_CELLS, "{} OSA cells for {:?}", worst.0, worst.1);
+    }
+
+    /// The Context of `big` without its dictionaries: every provider scans (the reference the dictionaries must equal).
+    fn scan_cx(big: &Big) -> Context<'_> {
+        Context { apps_ix: None, settings_ix: None, ..big.cx() }
+    }
+
+    /// L3 T9 and T10: with the dictionaries a query gives the same rows, scores and order as the scan, for every prefix of
+    /// the bench's queries (the first 150: the scan is the slow side) and for one-edit and two-edit typos of the first word
+    /// of 200 names (the fuzzy tier).
+    #[test]
+    fn fuzzy_index_equals_scan() {
+        let big = Big::new(1);
+        let (fast, slow) = (big.cx(), scan_cx(&big));
+        let run = |cx: &Context, raw: &str| {
+            let q = query::parse_query(raw, &big.opts.prefixes, NUM, 1);
+            let top = query_all(&q, cx, &mut Budget::default()).into_sorted();
+            top.into_iter().map(|i| (i.title, i.score)).collect::<Vec<(Box<str>, Score)>>()
+        };
+        let mut texts: Vec<String> = Vec::new();
+        for raw in queries().iter().take(150) {
+            let mut end = 0;
+            for ch in raw.chars() {
+                end += ch.len_utf8();
+                texts.push(raw[..end].to_string());
+            }
+        }
+        let mut r = XorShift::new(0xB0B + 9);
+        for app in big.apps.iter().step_by(10).take(200) {
+            let word: Vec<char> = app.folded.split(' ').next().unwrap_or("").chars().collect();
+            if word.len() < 4 {
+                continue;
+            }
+            let mut one = word.clone();
+            one.swap(1, 2);
+            texts.push(one.iter().collect());
+            let mut two = word.clone();
+            let k = (r.next_u64() as usize) % two.len();
+            two.remove(k);
+            two.insert(0, 'q');
+            texts.push(two.iter().collect());
+            let mut three = word;
+            three.pop();
+            three.push('z');
+            three.insert(1, 'x');
+            texts.push(three.iter().collect());
+        }
+        let mut fuzzy_rows = 0;
+        for raw in &texts {
+            let (a, b) = (run(&fast, raw), run(&slow, raw));
+            assert_eq!(a, b, "{raw:?}");
+            fuzzy_rows += a.iter().filter(|(_, s)| s.tier == rank::T_FUZZY).count();
+        }
+        assert!(fuzzy_rows > 0, "the typos reach the fuzzy tier");
     }
 
     /// KEY-2: no keyword line is read on the key path: the hidden tiers come from the dictionaries.
