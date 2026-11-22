@@ -832,16 +832,23 @@ impl Session {
             VK_HOME if plain => self.action_move(isize::MIN),
             VK_END if plain => self.action_move(isize::MAX),
             VK_RETURN if plain && !ev.repeat => self.run_action(cx),
-            VK_BACK | VK_DELETE if plain => {
-                self.actions = None;
-                let mut fx = self.key(ev, gesture, cx);
-                if !fx.contains(&Effect::Relayout) {
-                    fx.push(Effect::Relayout);
-                }
-                fx
-            }
+            // Editing chords close the list and act on the field, as typing does.
+            VK_BACK | VK_DELETE if plain || m == Mods::CTRL => self.close_and_edit(ev, gesture, cx),
+            VK_X | VK_A | VK_V if m == Mods::CTRL => self.close_and_edit(ev, gesture, cx),
+            VK_INSERT if m == Mods::SHIFT => self.close_and_edit(ev, gesture, cx),
+            VK_LEFT | VK_RIGHT if !m.has(Mods::ALT) => self.close_and_edit(ev, gesture, cx),
             _ => Vec::new(),
         }
+    }
+
+    /// Closes the action list and hands the key to the field; the panel gives the list's room back.
+    fn close_and_edit(&mut self, ev: KeyEvent, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        self.actions = None;
+        let mut fx = self.key(ev, gesture, cx);
+        if !fx.contains(&Effect::Relayout) {
+            fx.push(Effect::Relayout);
+        }
+        fx
     }
 
     fn action_move(&mut self, delta: isize) -> Vec<Effect> {
@@ -1877,7 +1884,7 @@ mod tests {
         assert_eq!(s.action_list().map(ActionList::sel), Some(0));
         // The row behind it did not move, and keys the list does not know wait.
         assert_eq!(sel_title(&s), Some("Blocco note"));
-        assert!(press(&mut s, &fx, VK_LEFT, Mods::NONE).is_empty());
+        assert!(press(&mut s, &fx, VK_LEFT, Mods::ALT).is_empty());
         assert!(press(&mut s, &fx, VK_C, Mods::CTRL).is_empty());
         assert!(s.action_list().is_some());
         // A held Enter does nothing.
@@ -1933,6 +1940,27 @@ mod tests {
         let out = press(&mut s, &fx, VK_BACK, Mods::NONE);
         assert!(s.action_list().is_none() && out.contains(&Effect::Relayout), "{out:?}");
         assert_eq!(s.query_text(), "blocc");
+        // Editing chords close it too and act on the field: a paste, a word delete, select all, a caret move.
+        for (vk, m) in [(VK_V, Mods::CTRL), (VK_INSERT, Mods::SHIFT)] {
+            open_list(&mut s, &fx);
+            let out = press(&mut s, &fx, vk, m);
+            assert!(
+                s.action_list().is_none() && out.contains(&Effect::Paste) && out.contains(&Effect::Relayout),
+                "{out:?}"
+            );
+        }
+        s.paste("z", &fx.cx());
+        assert_eq!(s.query_text(), "bloccz");
+        open_list(&mut s, &fx);
+        press(&mut s, &fx, VK_BACK, Mods::CTRL);
+        assert!(s.action_list().is_none());
+        assert_eq!(s.query_text(), "");
+        let mut s = typed(&fx, "blocco");
+        for (vk, m) in [(VK_A, Mods::CTRL), (VK_LEFT, Mods::NONE), (VK_RIGHT, Mods::CTRL), (VK_X, Mods::CTRL)] {
+            open_list(&mut s, &fx);
+            let out = press(&mut s, &fx, vk, m);
+            assert!(s.action_list().is_none() && out.contains(&Effect::Relayout), "{vk:#x}: {out:?}");
+        }
         // The chord and Alt+F4 still close the launcher itself.
         open_list(&mut s, &fx);
         assert_eq!(press(&mut s, &fx, VK_SPACE, Mods::ALT), [Effect::Hide { restore: true }]);
