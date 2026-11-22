@@ -150,7 +150,8 @@ fn runas_is_built_only_where_allowed() {
 
 const LOG_OK: [&str; 9] = ["n", "len", "count", "ms", "us", "gen", "seq", "kind:?", "id:?"];
 const LOG_OK_MORE: [&str; 2] = ["bytes", "e"];
-const LOG_OK_PROBE: [&str; 3] = ["image", "t", "m"];
+/// The probe also names an image, tick times and the steps of an open's split (numbers).
+const LOG_OK_PROBE: [&str; 7] = ["image", "t", "m", "queue", "prepare", "window", "render"];
 
 fn in_logged_files(path: &str) -> bool {
     (path.starts_with("src/launcher/") && path != "src/launcher/lints.rs" && path != "src/launcher/testkit.rs")
@@ -294,6 +295,10 @@ fn launcher_logs_carry_no_text() {
     let probe = "log!(\"probe: {image} {t} {m}\");";
     assert!(log_violations("src/launcher_probe.rs", probe).is_empty());
     assert_eq!(log_violations("src/launcher_sys.rs", probe).len(), 3);
+    let split = "log!(\"probe: {ms} ms (queue {queue}, prepare {prepare}, window {window}, render {render})\");";
+    assert!(log_violations("src/launcher_probe.rs", split).is_empty());
+    assert_eq!(log_violations("src/popup_launcher.rs", split).len(), 4, "the split's names are the probe's only");
+    assert_eq!(log_violations("src/launcher_probe.rs", "log!(\"probe: {query}\");").len(), 1);
     // an identifier ending in log is not the macro
     assert!(log_violations("src/launcher/session.rs", "blog!(\"{}\", x);").is_empty());
     // shell_thread region

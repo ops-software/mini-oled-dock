@@ -101,7 +101,7 @@ impl HookPort for RealHook {
 pub(crate) struct RealSys;
 
 /// The monitor `pick` names; the primary one when there is no better answer.
-fn target_monitor(pick: MonitorPick) -> HMONITOR {
+pub(crate) fn target_monitor(pick: MonitorPick) -> HMONITOR {
     let primary = POINT::default();
     // SAFETY: GetCursorPos writes the POINT it is given; the Monitor* calls accept any point or window (a null
     // foreground included) and fall back to the primary monitor.
@@ -280,7 +280,7 @@ fn power_action(id: CommandId) -> Option<crate::power::PowerAction> {
 }
 
 /// The effective DPI of a monitor (96 when it cannot be read).
-fn monitor_dpi(mon: HMONITOR) -> u32 {
+pub(crate) fn monitor_dpi(mon: HMONITOR) -> u32 {
     let (mut x, mut y) = (0u32, 0u32);
     // SAFETY: both out pointers are valid for the call; a stale monitor handle only makes it fail.
     match unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut x, &mut y) } {

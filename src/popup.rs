@@ -1128,6 +1128,8 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     }
     // `current_hwnd` and `tick_soon` reach the open popup's window.
     POPUP_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::render_start(kind == PopupKind::Launcher);
     if !render(true) {
         close_inner("initial render failed");
         return false;
@@ -1841,6 +1843,24 @@ pub(crate) fn on_launcher_timer(h: HWND, id: usize) -> bool {
 /// The launcher's popup window, created if needed (`launcher_sys::chord_is_free` registers its probe on it).
 pub(crate) fn popup_hwnd() -> Option<HWND> {
     ensure_window_for(PopupKind::Launcher)
+}
+
+/// The launcher's warm timer (`popup_launcher::warm_window`, L3 T22): the launcher's window is created if needed (hidden:
+/// it is never shown, presented or activated here), and an empty launcher is laid out and painted once on a surface at
+/// `dpi`, dropped at once (for a few ms at 125 %: the 800 x 90 panel DIB, the text scratch DIB and the fonts, about
+/// 0.5 MB). The first open then finds the window and the paint code paged in.
+pub(crate) fn warm_launcher(dpi: u32) {
+    if !is_available() || ensure_window_for(PopupKind::Launcher).is_none() {
+        return;
+    }
+    let mut surf = match Surface::new(Metrics { dpi: dpi.max(96) }) {
+        Ok(s) => s,
+        Err(e) => {
+            log!("popup: Surface::new failed (launcher warm): {e}");
+            return;
+        }
+    };
+    popup_launcher::warm_content(&mut surf);
 }
 
 /// Fires the content's `tick` once after about `ms` (re-arms the 1 s tick timer, which `close_inner`

@@ -96,6 +96,15 @@ struct OpenProbe {
     chord_time: u32,
     focused: bool,
     present_ms: Option<u32>,
+    /// The split of `present_ms` (T22, live check L-3): the post's wait from the chord's `kb.time` to the chord flow (ms,
+    /// on the same clock), then `prepare_open`, the window (the host's open up to its first render: the window, the
+    /// surface and the content) and that render (us).
+    queue_ms: u32,
+    prepare_us: u32,
+    window_us: u32,
+    render_us: u32,
+    /// The end of the last step measured.
+    mark: Instant,
     keys: u32,
     /// From the entry of a key message to the return of `UpdateLayeredWindow` (us), and its wait in the queue (ms).
     work: Samples,
@@ -132,6 +141,11 @@ pub fn opened(chord_time: u32) {
         chord_time,
         focused: false,
         present_ms: None,
+        queue_ms: now().wrapping_sub(chord_time),
+        prepare_us: 0,
+        window_us: 0,
+        render_us: 0,
+        mark: Instant::now(),
         keys: 0,
         work: Samples::new(),
         queue: Samples::new(),
@@ -154,12 +168,37 @@ pub fn open_failed() {
     });
 }
 
+/// The microseconds since `mark`, which moves to now.
+fn lap(mark: &mut Instant) -> u32 {
+    let t = Instant::now();
+    let us = u32::try_from(t.duration_since(*mark).as_micros()).unwrap_or(u32::MAX);
+    *mark = t;
+    us
+}
+
+/// The chord flow's `prepare_open` returned.
+pub fn prepared() {
+    with_open(|p| p.prepare_us = lap(&mut p.mark));
+}
+
+/// `popup::open` is about to render the first frame of a popup; `launcher`: it is the launcher's.
+pub fn render_start(launcher: bool) {
+    if launcher {
+        with_open(|p| {
+            if p.present_ms.is_none() {
+                p.window_us = lap(&mut p.mark);
+            }
+        });
+    }
+}
+
 /// `popup::open` presented the first frame of a popup; `launcher`: it was the launcher's.
 pub fn presented(launcher: bool) {
     if launcher {
         let t = now();
         with_open(|p| {
             if p.present_ms.is_none() {
+                p.render_us = lap(&mut p.mark);
                 p.present_ms = Some(t.wrapping_sub(p.chord_time));
             }
         });
@@ -252,10 +291,87 @@ pub fn closed() {
         log!("launcher probe: queue p95 {ms} ms");
     }
     if let Some(ms) = p.present_ms {
-        log!("launcher probe: chord to present {ms} ms");
+        let (queue, prepare, window, render) = (p.queue_ms, p.prepare_us, p.window_us, p.render_us);
+        log!(
+            "launcher probe: chord to present {ms} ms (queue {queue} ms, prepare {prepare} us, window {window} us, render {render} us)"
+        );
     }
     if let Some((us, count)) = hook_p99(&p.hook_base) {
         log!("launcher probe: hook p99 {us} us over {count} events");
+    }
+}
+
+/// MEM-2's budget for the icons the launcher keeps between opens (T20 makes it the cache's byte cap).
+const ICON_CACHE_BUDGET: usize = 163_840;
+
+/// At each close: the pixel bytes of the icons kept between opens (live check L-4's fill cycle).
+pub fn icon_cache(bytes: usize) {
+    if probe_on() {
+        let n = ICON_CACHE_BUDGET;
+        log!("launcher probe: icon cache {bytes} B of {n}");
+    }
+}
+
+/// The launcher's UI-thread handlers that KEY-11 bounds: none may take more than `UI_WORK_US` outside a key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiWork {
+    Catalog,
+    SettingsReady,
+    PrepareOpen,
+    Icons,
+}
+
+/// KEY-11: 2 ms.
+const UI_WORK_US: u32 = 2_000;
+
+/// A handler that took `us` is logged.
+fn ui_work_over(us: u32) -> bool {
+    us > UI_WORK_US
+}
+
+/// Times one handler from `ui_work` to its drop (every return of the handler).
+pub struct UiTimer {
+    what: UiWork,
+    t0: Instant,
+}
+
+/// The start of a handler of `what`; the line `launcher probe: ui work <name> N us` comes at the drop when it took more
+/// than 2,000 us.
+pub fn ui_work(what: UiWork) -> UiTimer {
+    UiTimer { what, t0: Instant::now() }
+}
+
+impl Drop for UiTimer {
+    fn drop(&mut self) {
+        let us = u32::try_from(self.t0.elapsed().as_micros()).unwrap_or(u32::MAX);
+        if !ui_work_over(us) || !probe_on() {
+            return;
+        }
+        match self.what {
+            UiWork::Catalog => log!("launcher probe: ui work on_catalog {us} us"),
+            UiWork::SettingsReady => log!("launcher probe: ui work on_settings_ready {us} us"),
+            UiWork::PrepareOpen => log!("launcher probe: ui work prepare_open {us} us"),
+            UiWork::Icons => log!("launcher probe: ui work on_icons {us} us"),
+        }
+    }
+}
+
+/// `DOCK_LAUNCHER_NO_WARM=1`: the warm timer skips the window warm (`popup_launcher::warm_window`) and nothing else, for
+/// the two series of live check L-3 (c). Read once; each skip is logged.
+pub fn no_warm() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = switch(&ON, "DOCK_LAUNCHER_NO_WARM");
+    if on && probe_on() {
+        log!("launcher probe: window warm skipped (NO_WARM)");
+    }
+    on
+}
+
+/// The warm timer's window warm, started at `t0`, is done.
+pub fn warmed(t0: Instant) {
+    if probe_on() {
+        let us = u32::try_from(t0.elapsed().as_micros()).unwrap_or(u32::MAX);
+        log!("launcher probe: window warm {us} us");
     }
 }
 
@@ -401,6 +517,23 @@ mod tests {
         }
         assert_eq!(s.len(), 64, "at most 64 values per open");
         assert_eq!(s.percentiles().map(|p| p.2), Some(63), "the first 64 are kept");
+    }
+
+    #[test]
+    fn ui_work_over_two_ms_is_logged() {
+        assert!(!ui_work_over(0));
+        assert!(!ui_work_over(2_000), "KEY-11: 2 ms is within the budget");
+        assert!(ui_work_over(2_001));
+        assert!(ui_work_over(u32::MAX));
+    }
+
+    #[test]
+    fn the_split_laps_from_the_last_mark() {
+        // No timing is asserted: a mark 5 ms in the past gives at least 5,000 us, and the mark moves to now.
+        let start = Instant::now() - Duration::from_millis(5);
+        let mut mark = start;
+        assert!(lap(&mut mark) >= 5_000);
+        assert!(mark > start, "the next step is measured from here");
     }
 
     #[test]

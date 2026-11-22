@@ -589,6 +589,8 @@ impl Launcher {
         hook.end(self.open_seq);
         #[cfg(feature = "owner-probe")]
         crate::launcher_probe::closed();
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::icon_cache(icon_cache_bytes());
         if self.restore && self.fg_at_open != 0 {
             sys.restore(self.fg_at_open);
         }
@@ -1593,6 +1595,7 @@ pub(crate) fn on_timer(hwnd: HWND, id: usize) {
         crate::msg::TIMER_LAUNCHER_WARM => {
             if is_on() {
                 ask_catalogue();
+                warm_window();
             }
         }
         crate::msg::TIMER_LAUNCHER_SAVE => save_state(),
@@ -1704,6 +1707,87 @@ pub(crate) fn is_on() -> bool {
     ON.with(Cell::get)
 }
 
+/// The pixel bytes of the icons kept between opens (the probe's line at each close).
+#[cfg(feature = "owner-probe")]
+fn icon_cache_bytes() -> usize {
+    with_ctrl(|c| c.icons.iter().map(|(_, b)| b.pixels.len() * std::mem::size_of::<u32>()).sum()).unwrap_or(0)
+}
+
+/// The launcher was opened in this process: its window, surface and paint code are paged in (`warm_window`).
+fn note_open() {
+    OPENED.with(|o| o.set(true));
+}
+
+fn opened_in_process() -> bool {
+    OPENED.with(Cell::get)
+}
+
+/// The warm timer warms the window only while no popup is open (the shared window is in use, and a hidden paint would
+/// cost its user) and only when no open has paged the code in yet.
+fn warm_window_due(popup_open: bool, opened: bool) -> bool {
+    !popup_open && !opened
+}
+
+/// The warm timer makes sure of the settings cache only with the Settings provider on: otherwise the settings child would
+/// run after every start for nothing.
+#[allow(dead_code)] // the warm timer's settings-cache call (`start_search::ensure_settings_cache(false)`, L3 T18)
+fn warm_settings_due(opts: &LauncherOpts) -> bool {
+    opts.mask.has(ProviderId::Settings)
+}
+
+/// `TIMER_LAUNCHER_WARM`, after the listing (L3 T22, B6): the first open after a start would page in the window, the
+/// surface and the paint code on the chord's path. Here instead, off screen and only until the first open of the process:
+/// the launcher's window is created hidden, an empty launcher is laid out and painted on a surface at the target monitor's
+/// DPI, and the surface is dropped at once. Nothing stays but the window (the one every open uses); the transient pages go back at the next hidden trim.
+/// Not warmed: the settings rows, the keyboard focus (TSF) and the icons, which would stay resident in every session.
+fn warm_window() {
+    if !warm_window_due(super::current().is_some(), opened_in_process()) {
+        return;
+    }
+    let Some(pick) = with_ctrl(|c| c.pick) else { return };
+    // The probe's A/B of live check L-3 (c) skips the warm itself, nothing else.
+    #[cfg(feature = "owner-probe")]
+    let skip = crate::launcher_probe::no_warm();
+    #[cfg(not(feature = "owner-probe"))]
+    let skip = false;
+    if !skip {
+        let dpi = crate::launcher_sys::monitor_dpi(crate::launcher_sys::target_monitor(pick));
+        #[cfg(feature = "owner-probe")]
+        let t0 = std::time::Instant::now();
+        super::warm_launcher(dpi);
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::warmed(t0);
+    }
+    crate::mem::rearm();
+}
+
+/// `popup::warm_launcher`'s layout and paint on `s`: see `warm_on`.
+pub(crate) fn warm_content(s: &mut Surface) -> bool {
+    warm_on(s, &mut RealSys)
+}
+
+/// A throwaway launcher with the config's options and shape and an empty field, laid out and painted once on `s`. It
+/// takes nothing an open shows (no pending notice, no kept query, no icon) and asks for nothing: an empty field has no
+/// rows. False when the controller is busy or the surface cannot be sized.
+fn warm_on(s: &mut Surface, sys: &mut dyn SysPort) -> bool {
+    let Some(mut l) = with_ctrl(|c| {
+        let mut l = Launcher::with_session(Session::open(&c.opts, None));
+        l.set_shape(c.width, c.opts.rows);
+        l
+    }) else {
+        return false;
+    };
+    // The rows' icon size at this DPI already: `size` then leaves the cache's icon size to the opens.
+    l.icon_px = u32::try_from(s.metrics().px(style::ICON_M)).unwrap_or(l.icon_px);
+    let (w, h) = l.size(s);
+    if let Err(e) = s.resize(w.max(1), h.max(1)) {
+        log!("launcher: the warm surface could not be sized: {e}");
+        return false;
+    }
+    l.paint_on(s, None, None, sys);
+    true
+}
+
 /// Asks the shell thread for the catalogue, unless an answer is on its way.
 fn ask_catalogue() {
     let now = RealSys.now_ms();
@@ -1725,6 +1809,8 @@ pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
     if !is_on() {
         return;
     }
+    #[cfg(feature = "owner-probe")]
+    let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Catalog);
     let apps = catalog::ingest(list, index);
     let n = apps.len();
     let now = RealSys.now_ms();
@@ -1741,6 +1827,8 @@ pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
 
 /// `ShellEvent::StartSettings`: the settings list is built; when the launcher holds it, its rows are folded now.
 pub(crate) fn on_settings_ready() {
+    #[cfg(feature = "owner-probe")]
+    let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::SettingsReady);
     if is_on() && start_search::holds_settings(Holder::Launcher) {
         fold_held_settings();
     }
@@ -1764,6 +1852,8 @@ pub(crate) fn on_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>) {
     if !is_on() {
         return;
     }
+    #[cfg(feature = "owner-probe")]
+    let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Icons);
     let mut ids = Vec::new();
     let px = with_ctrl(|c| c.icon_px).unwrap_or(icon_px);
     for (id, bmp) in icons {
@@ -1885,6 +1975,9 @@ fn release_resident() {
 /// What an open needs before its window shows (`SysPort::prepare_open`): the settings held (and folded when they are
 /// already loaded), the windows listed, the history asked for the first time, the catalogue listed when it has not been.
 pub(crate) fn prepare_open() {
+    #[cfg(feature = "owner-probe")]
+    let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::PrepareOpen);
+    note_open();
     if let Some(h) = crate::launcher_sys::timer_window() {
         // SAFETY: a timer of the dock window (same thread); killing an id that is not armed fails harmlessly.
         let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
@@ -2360,6 +2453,8 @@ thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     /// The dock window receives the session notifications (registered once, at the first chord).
     static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    /// The launcher opened at least once in this process (`note_open`): the warm timer has nothing left to warm.
+    static OPENED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The config changed (and once at start): the hook's chord, and with a chord the options the next open uses. With no
@@ -2820,10 +2915,12 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
                     c.pt.on(PtEvent::FirstChord);
                 }
             });
-            sys.prepare_open();
-            hook.shown(true);
             #[cfg(feature = "owner-probe")]
             crate::launcher_probe::opened(sent_time);
+            sys.prepare_open();
+            #[cfg(feature = "owner-probe")]
+            crate::launcher_probe::prepared();
+            hook.shown(true);
             if !sys.open(pick, top_percent) {
                 #[cfg(feature = "owner-probe")]
                 crate::launcher_probe::open_failed();
@@ -3206,6 +3303,8 @@ mod tests {
         owner_fg: bool,
         scans: u32,
         ops: Vec<Op>,
+        /// Every request to the shell thread (the icons' included).
+        shells: Vec<String>,
     }
 
     impl SysPort for FakeSys {
@@ -3256,7 +3355,9 @@ mod tests {
         }
         fn close_window(&mut self, _h: isize) {}
         fn window_menu(&mut self, _h: isize) {}
-        fn shell(&mut self, _r: ShellRequest) {}
+        fn shell(&mut self, r: ShellRequest) {
+            self.shells.push(format!("{r:?}"));
+        }
         fn power(&mut self, _id: CommandId) {}
         fn open_settings(&mut self) {}
         fn arm(&mut self, id: usize, ms: u32) {
@@ -4979,6 +5080,71 @@ mod tests {
         held_flow(&mut |_| false);
         assert_eq!(notice_titles(&new_launcher()), [strings::pt_alt_shift_space_held()]);
         with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    // ---- L3 T22: the warm timer
+
+    #[test]
+    fn warm_content_takes_no_notice_and_no_query() {
+        with_ctrl(|c| {
+            c.opts.keep_query = true;
+            c.last_query = Some("calc".into());
+            c.notice = Some(LaunchKind::App);
+            c.chord_held = true;
+        });
+        let mut s = Surface::new(Metrics { dpi: 120 }).unwrap();
+        assert!(warm_on(&mut s, &mut FakeSys::default()), "laid out and painted");
+        assert_ne!(s.size(), (0, 0));
+        with_ctrl(|c| {
+            assert_eq!(c.last_query.as_deref(), Some("calc"), "the kept query waits for the next open");
+            assert_eq!(c.notice, Some(LaunchKind::App), "the refused launch's notice waits for the next open");
+            assert!(c.chord_held);
+            assert_eq!(c.icon_px, style::ICON_M as u32, "the cache's icon size is left to the opens");
+        })
+        .unwrap();
+        // The next open shows them.
+        let l = new_launcher();
+        assert_eq!(l.session.query_text(), "calc");
+        assert!(l.session.rows().iter().any(|r| &*r.title == strings::launch_failed()));
+        with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    #[test]
+    fn warm_asks_nothing() {
+        use crate::start_search::Keys;
+        // A catalogue is there: an empty field still shows no row, so no icon is asked for.
+        with_ctrl(|c| {
+            c.apps =
+                vec![CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 1)];
+        });
+        let mut s = Surface::new(Metrics { dpi: 96 }).unwrap();
+        let mut sys = FakeSys::default();
+        assert!(warm_on(&mut s, &mut sys));
+        assert!(sys.shells.is_empty(), "no shell request, no icon request: {:?}", sys.shells);
+        assert!(sys.ops.is_empty(), "no timer, no open: {:?}", sys.ops);
+        with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    #[test]
+    fn warm_skipped_when_a_popup_is_open_or_after_an_open() {
+        assert!(warm_window_due(false, false), "after a start: no popup open, never opened");
+        assert!(!warm_window_due(true, false), "a popup is open");
+        assert!(!warm_window_due(false, true), "an open already paged the code in");
+        assert!(!warm_window_due(true, true));
+        // An open marks the process for good: a chord switched off and on again does not warm again.
+        assert!(!opened_in_process());
+        note_open();
+        assert!(opened_in_process());
+        with_ctrl(|c| *c = Ctrl::new());
+        assert!(opened_in_process(), "the mark is the process's, not the controller's");
+    }
+
+    #[test]
+    fn warm_ensures_settings_only_with_the_provider_on() {
+        let on = LauncherOpts::default();
+        assert!(warm_settings_due(&on));
+        let off = LauncherOpts { mask: on.mask.with(ProviderId::Settings, false), ..LauncherOpts::default() };
+        assert!(!warm_settings_due(&off), "no settings child after every start for nothing");
     }
 
     #[test]
