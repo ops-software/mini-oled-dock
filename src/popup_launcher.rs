@@ -1882,6 +1882,18 @@ impl Ctrl {
         }
     }
 
+    /// The chord was switched off: a changed history is written one last time (the request returned), then nothing the
+    /// launcher kept between opens stays (SPEC 5.5.6: chord Off holds no resident data).
+    fn chord_off(&mut self) -> Option<ShellRequest> {
+        let save = (self.dirty && self.learn).then(|| ShellRequest::LauncherStateSave {
+            frecency: None,
+            run: Some(history::render_run(&self.history)),
+            delete: false,
+        });
+        *self = Ctrl::new();
+        save
+    }
+
     /// The providers' context of one keystroke: borrowed, nothing copied.
     fn context(&self) -> Context<'_> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
@@ -1918,7 +1930,22 @@ pub(crate) fn on_config() {
     match (was, chord.is_some()) {
         (false, false) => {}
         (true, false) => {
-            with_ctrl(|c| c.last_query = None);
+            // An open launcher closes first, so what its close records lands in the state dropped below.
+            if super::current() == Some(PopupKind::Launcher) {
+                super::close("launcher chord off");
+            }
+            let save = with_ctrl(Ctrl::chord_off).flatten();
+            start_search::release_settings_for(Holder::Launcher);
+            if let Some(h) = crate::launcher_sys::timer_window() {
+                for id in crate::msg::TIMER_LAUNCHER_SHRINK..=crate::msg::TIMER_LAUNCHER_PT {
+                    // SAFETY: timers of the dock window (same thread); killing an id that is not armed fails harmlessly.
+                    let _ = unsafe { KillTimer(Some(h), id) };
+                }
+            }
+            if let Some(r) = save {
+                crate::shell_thread::request(r);
+            }
+            crate::mem::released_data();
             log!("launcher: chord off");
         }
         (_, true) => {
@@ -3220,6 +3247,50 @@ mod tests {
         foreground_flow(&mut hook, &FakeSys { d3d: true, ..FakeSys::default() });
         assert_eq!(hook.passes.last(), Some(&PassFlags::FULLSCREEN), "exclusive D3D passes anyway");
         with_ctrl(|c| c.over_fullscreen_pass = true);
+    }
+
+    #[test]
+    fn chord_off_keeps_no_resident_data() {
+        use crate::start_search::Keys;
+        let filled = |dirty: bool, learn: bool| {
+            let mut c = Ctrl::new();
+            c.apps =
+                vec![CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 1)];
+            c.settings = vec![SettingRow::new(0, "Schermo", Keys::default(), 1)];
+            c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
+            c.history = vec!["ping 1.1.1.1".into()];
+            c.last_query = Some("calc".into());
+            c.listed_at_ms = 5;
+            c.dirty = dirty;
+            c.learn = learn;
+            c
+        };
+        let empty = |c: &Ctrl| {
+            c.apps.is_empty()
+                && c.settings.is_empty()
+                && c.windows.is_empty()
+                && c.icons.len() == 0
+                && c.history.is_empty()
+                && c.setting_list.is_empty()
+                && c.last_query.is_none()
+                && c.listed_at_ms == 0
+                && !c.dirty
+        };
+        // A changed history is written one last time, then nothing is kept.
+        let mut c = filled(true, true);
+        let save = c.chord_off();
+        assert!(
+            matches!(&save, Some(ShellRequest::LauncherStateSave { run: Some(r), delete: false, .. }) if !r.is_empty()),
+            "{save:?}"
+        );
+        assert!(empty(&c));
+        // Nothing changed, or learn is off: nothing is written.
+        let mut c = filled(false, true);
+        assert!(c.chord_off().is_none());
+        assert!(empty(&c));
+        let mut c = filled(true, false);
+        assert!(c.chord_off().is_none());
+        assert!(empty(&c));
     }
 
     #[test]
