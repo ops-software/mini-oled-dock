@@ -1,7 +1,9 @@
 //! The launcher popup (SPEC-launcher 5.2, 5.3 and 5.5): the content the popup host shows for `PopupKind::Launcher`.
 //! L1a-13 added the stub; L1a-14 (this file) is the view: layout and painting of the field, the mode chip, the result rows,
-//! the detail and review lines, the hint and the scrollbar, all from the `Session` the content holds. L1a-15 wires the
-//! chord flow (keys, effects, the Context) through the signatures that exist here.
+//! the detail and review lines, the hint and the scrollbar, all from the `Session` the content holds. L1a-15 adds the
+//! controller: the chord flow from the hook's post to an open launcher (or to nothing, with the type-ahead ended), which
+//! reaches the hook and Windows through two small ports, `HookPort` and `SysPort` (real in launcher_sys.rs, recorders
+//! in the tests).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::cell::{Cell, RefCell};
@@ -12,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::KillTimer;
 
 use super::{center_y, Content, HitMap, PopupKind, Reply};
 use crate::glyphs;
+use crate::hook::{self, PassFlags, PostAction};
 use crate::icons::IconBitmap;
 use crate::launcher::gesture;
 use crate::launcher::model::{GlyphId, IconRef, Item, Kind, Payload, ProviderId, Verb};
@@ -20,6 +23,8 @@ use crate::launcher::session::Session;
 use crate::launcher::strings;
 use crate::launcher::style;
 use crate::launcher::verbs;
+use crate::launcher_sys::{RealHook, RealSys};
+use crate::log;
 use crate::render::Metrics;
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
@@ -258,6 +263,8 @@ pub(crate) struct Launcher {
     hold_shrink: bool,
     /// Ticks the scrollbar still shows after a scroll.
     bar_ticks: Cell<u8>,
+    /// The sequence of the chord post that opened it (`hook::LAUNCHER_SEQ`): its type-ahead window is ended at the close.
+    open_seq: u32,
 }
 
 impl Launcher {
@@ -277,7 +284,20 @@ impl Launcher {
             shown_h: 0,
             hold_shrink: false,
             bar_ticks: Cell::new(0),
+            open_seq: 0,
         }
+    }
+
+    /// The chord again while open (the controller's `OpenPlan::Close`): the final Esc.
+    pub(crate) fn chord_again(&mut self) -> Reply {
+        Reply::Close
+    }
+
+    /// The close, with the popup already hidden: the hook stops treating the launcher as shown and the type-ahead window
+    /// of the open's post ends (a no-op when the first activation took it).
+    fn finish(&mut self, hook: &mut dyn HookPort) {
+        hook.shown(false);
+        hook.end(self.open_seq);
     }
 
     /// The session the keys and the late batches go to (L1a-15).
@@ -806,11 +826,21 @@ impl Content for Launcher {
     fn focus_lost_closes(&self) -> bool {
         true
     }
+
+    fn after_close(&mut self) {
+        self.finish(&mut RealHook);
+    }
+
+    fn launcher(&mut self) -> Option<&mut Launcher> {
+        Some(self)
+    }
 }
 
-/// The content of a new launcher popup (`popup::make_content`).
+/// The content of a new launcher popup (`popup::make_content`), for the post the controller is opening.
 pub(crate) fn new() -> Box<dyn Content> {
-    Box::new(Launcher::with_session(Session::open(&LauncherOpts::default(), None)))
+    let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
+    l.open_seq = with_ctrl(|c| c.open_seq).unwrap_or(0);
+    Box::new(l)
 }
 
 /// Once, at the end of `popup::init` (wired by L1a-15): nothing to set up yet.
@@ -822,6 +852,174 @@ pub(crate) fn init() {}
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
     // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
     let _ = unsafe { KillTimer(Some(hwnd), id) };
+}
+
+// ---------------------------------------------------------------- the controller (L1a-15)
+
+/// What the controller asks of the keyboard hook: hook.rs's statics in the dock (`launcher_sys::RealHook`), a recorder in
+/// the tests.
+pub(crate) trait HookPort {
+    /// `hook::ack_launcher`: the post of `seq` arrived.
+    fn ack(&mut self, seq: u32);
+    /// `hook::end_typeahead`: the keys typed after the chord of `seq` are discarded (a no-op for another sequence).
+    fn end(&mut self, seq: u32);
+    /// `hook::set_launcher_shown`.
+    fn shown(&mut self, on: bool);
+    /// `hook::set_pass_flags`.
+    fn pass(&mut self, flags: PassFlags);
+    /// The newest sequence the hook issued and the newest it failed open on (`LAUNCHER_SEQ`, `LAST_FAILOPEN_SEQ`).
+    fn seqs(&self) -> (u32, u32);
+    /// `hook::alt_tracked_down`.
+    fn alt_down(&self) -> bool;
+}
+
+/// What the controller asks of Windows: Win32 and the popup host in the dock (`launcher_sys::RealSys`), a recorder in the
+/// tests.
+pub(crate) trait SysPort {
+    /// `GetTickCount`: the clock of the hook's `kb.time`.
+    fn now(&self) -> u32;
+    /// Exclusive Direct3D fullscreen (`SHQueryUserNotificationState` is `QUNS_RUNNING_D3D_FULL_SCREEN`).
+    fn d3d_fullscreen(&self) -> bool;
+    /// The foreground window covers its whole monitor (`ui::foreground_is_fullscreen`).
+    fn fullscreen_foreground(&self) -> bool;
+    /// The launcher is the open popup.
+    fn launcher_open(&self) -> bool;
+    /// Opens the launcher centred on the monitor `pick` names; false when nothing is shown (no popups, no surface).
+    fn open(&mut self, pick: MonitorPick, top_percent: u8) -> bool;
+    /// The chord while the launcher is open: its close request (the final Esc).
+    fn close_launcher(&mut self);
+    /// `SendInput` of these (vk, up) events, tagged `hook::INJECT_TAG`.
+    fn inject(&mut self, keys: &[(u16, bool)]);
+}
+
+/// Which monitor the launcher opens on (`launcher.monitor`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // on_config reads launcher.monitor (L1a-15d)
+pub(crate) enum MonitorPick {
+    /// The one under the pointer.
+    Pointer,
+    /// The one of the foreground window.
+    Active,
+    Primary,
+}
+
+/// What a chord post leads to (spec rule 8 and 5.2.12).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OpenPlan {
+    /// Nothing opens: a dropped post, or a fullscreen window in front.
+    Nothing,
+    /// Open the launcher.
+    TryOpen,
+    /// The launcher is open: close it like the final Esc.
+    Close,
+}
+
+/// The plan of a post: `action` is `hook::post_verdict`'s; an exclusive D3D fullscreen (`quns_d3d`) always passes, a
+/// fullscreen foreground window (`fs_window`) passes while `launcher.over_fullscreen` is "pass".
+fn open_plan(action: PostAction, quns_d3d: bool, fs_window: bool, over_fullscreen_pass: bool) -> OpenPlan {
+    match action {
+        PostAction::Drop => OpenPlan::Nothing,
+        PostAction::Close => OpenPlan::Close,
+        PostAction::Open if quns_d3d || (fs_window && over_fullscreen_pass) => OpenPlan::Nothing,
+        PostAction::Open => OpenPlan::TryOpen,
+    }
+}
+
+/// The controller's state between opens (an open's own state is in its content, `Launcher`).
+struct Ctrl {
+    /// The sequence of the post being opened (read by `new`).
+    open_seq: u32,
+    /// `launcher.monitor`, `launcher.top_percent` and `launcher.over_fullscreen == "pass"`.
+    pick: MonitorPick,
+    top_percent: u8,
+    over_fullscreen_pass: bool,
+    /// The pass flags the hook was last given.
+    flags: PassFlags,
+}
+
+impl Ctrl {
+    fn new() -> Ctrl {
+        Ctrl {
+            open_seq: 0,
+            pick: MonitorPick::Pointer,
+            top_percent: crate::config::LAUNCHER_TOP_PERCENT.2,
+            over_fullscreen_pass: true,
+            flags: PassFlags::default(),
+        }
+    }
+}
+
+thread_local! {
+    /// Touched only while a chord is set: the paths that exist without the launcher never reach it.
+    static CTRL: RefCell<Ctrl> = RefCell::new(Ctrl::new());
+}
+
+/// Runs `f` on the controller's state; None (logged) on a re-entry, never a panic.
+fn with_ctrl<R>(f: impl FnOnce(&mut Ctrl) -> R) -> Option<R> {
+    CTRL.with(|c| match c.try_borrow_mut() {
+        Ok(mut g) => Some(f(&mut g)),
+        Err(_) => {
+            log!("launcher: controller state already in use (re-entry), operation skipped");
+            None
+        }
+    })
+}
+
+/// `WM_DOCK_LAUNCHER`: the hook swallowed the chord and posted `seq` with the key's `kb.time`.
+pub(crate) fn on_chord(seq: u32, sent_time: u32) {
+    chord_flow(seq, sent_time, &mut RealHook, &mut RealSys);
+}
+
+/// The chord flow of one post. Every plan that does not end in an open launcher ends the type-ahead window of this post
+/// first, so the next key reaches the window behind and the keys already kept are never replayed by a later chord.
+fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn SysPort) -> OpenPlan {
+    hook.ack(seq);
+    let (newest, failopen) = hook.seqs();
+    let action = hook::post_verdict(seq, sent_time, sys.now(), newest, failopen, sys.launcher_open());
+    let defaults = (MonitorPick::Pointer, crate::config::LAUNCHER_TOP_PERCENT.2, true);
+    let (pick, top_percent, over_pass) =
+        with_ctrl(|c| (c.pick, c.top_percent, c.over_fullscreen_pass)).unwrap_or(defaults);
+    let (d3d, fs) = if action == PostAction::Open {
+        let d3d = sys.d3d_fullscreen();
+        (d3d, !d3d && over_pass && sys.fullscreen_foreground())
+    } else {
+        (false, false)
+    };
+    let plan = open_plan(action, d3d, fs, over_pass);
+    match plan {
+        OpenPlan::Nothing => {
+            hook.end(seq);
+            if action == PostAction::Open {
+                // The state changed without a foreground change: the hook passes the next chords too.
+                if let Some(flags) = with_ctrl(|c| {
+                    c.flags = c.flags.with(PassFlags::FULLSCREEN);
+                    c.flags
+                }) {
+                    hook.pass(flags);
+                }
+                log!("launcher: chord over a fullscreen window, nothing opens");
+            } else {
+                log!("launcher: chord post {seq} dropped (stale)");
+            }
+        }
+        OpenPlan::Close => {
+            hook.end(seq);
+            sys.close_launcher();
+        }
+        OpenPlan::TryOpen => {
+            with_ctrl(|c| c.open_seq = seq);
+            hook.shown(true);
+            if !sys.open(pick, top_percent) {
+                hook.shown(false);
+                hook.end(seq);
+                // The window menu opens as Windows would have opened it.
+                let keys = hook::reinject_plan(hook.alt_down());
+                sys.inject(keys.keys());
+                log!("launcher: the launcher could not open, the chord goes back to Windows");
+            }
+        }
+    }
+    plan
 }
 
 // ---------------------------------------------------------------- preview scenes (mock data, nothing runs)
@@ -1092,6 +1290,174 @@ impl Content for FieldPair {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    // ---- the controller's ports, recorded
+
+    #[derive(Default)]
+    struct FakeHook {
+        acks: Vec<u32>,
+        ends: Vec<u32>,
+        shown: Vec<bool>,
+        passes: Vec<PassFlags>,
+        newest: u32,
+        failopen: u32,
+        alt: bool,
+    }
+
+    impl HookPort for FakeHook {
+        fn ack(&mut self, seq: u32) {
+            self.acks.push(seq);
+        }
+        fn end(&mut self, seq: u32) {
+            self.ends.push(seq);
+        }
+        fn shown(&mut self, on: bool) {
+            self.shown.push(on);
+        }
+        fn pass(&mut self, flags: PassFlags) {
+            self.passes.push(flags);
+        }
+        fn seqs(&self) -> (u32, u32) {
+            (self.newest, self.failopen)
+        }
+        fn alt_down(&self) -> bool {
+            self.alt
+        }
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    enum Op {
+        Open,
+        CloseLauncher,
+        Inject(Vec<(u16, bool)>),
+    }
+
+    #[derive(Default)]
+    struct FakeSys {
+        now: u32,
+        d3d: bool,
+        fs: bool,
+        open_ok: bool,
+        is_open: bool,
+        ops: Vec<Op>,
+    }
+
+    impl SysPort for FakeSys {
+        fn now(&self) -> u32 {
+            self.now
+        }
+        fn d3d_fullscreen(&self) -> bool {
+            self.d3d
+        }
+        fn fullscreen_foreground(&self) -> bool {
+            self.fs
+        }
+        fn launcher_open(&self) -> bool {
+            self.is_open
+        }
+        fn open(&mut self, _pick: MonitorPick, _top_percent: u8) -> bool {
+            self.ops.push(Op::Open);
+            self.open_ok
+        }
+        fn close_launcher(&mut self) {
+            self.ops.push(Op::CloseLauncher);
+        }
+        fn inject(&mut self, keys: &[(u16, bool)]) {
+            self.ops.push(Op::Inject(keys.to_vec()));
+        }
+    }
+
+    /// A post of `seq` sent at 1000 and handled at `now`, the hook's newest sequence `newest`.
+    fn post(seq: u32, now: u32, newest: u32, sys: FakeSys) -> (OpenPlan, FakeHook, FakeSys) {
+        let mut h = FakeHook { newest, ..FakeHook::default() };
+        let mut s = FakeSys { now, ..sys };
+        let plan = super::chord_flow(seq, 1_000, &mut h, &mut s);
+        (plan, h, s)
+    }
+
+    fn fresh() -> FakeSys {
+        FakeSys { open_ok: true, ..FakeSys::default() }
+    }
+
+    #[test]
+    fn chord_flow() {
+        // 5.2.12 and rule 8, every combination.
+        for d3d in [false, true] {
+            for fs in [false, true] {
+                for pass in [false, true] {
+                    assert_eq!(open_plan(PostAction::Drop, d3d, fs, pass), OpenPlan::Nothing);
+                    assert_eq!(open_plan(PostAction::Close, d3d, fs, pass), OpenPlan::Close, "closing is always safe");
+                    let want = if d3d || (fs && pass) { OpenPlan::Nothing } else { OpenPlan::TryOpen };
+                    assert_eq!(open_plan(PostAction::Open, d3d, fs, pass), want, "d3d {d3d} fs {fs} pass {pass}");
+                }
+            }
+        }
+        // Through the flow: acknowledged first, whatever follows.
+        let (plan, h, s) = post(5, 1_010, 5, fresh());
+        assert_eq!((plan, h.acks.as_slice(), s.ops.as_slice()), (OpenPlan::TryOpen, &[5][..], &[Op::Open][..]));
+        assert_eq!(post(5, 1_301, 5, fresh()).0, OpenPlan::Nothing, "stale");
+        assert_eq!(post(4, 1_010, 5, fresh()).0, OpenPlan::Nothing, "superseded");
+        let mut h = FakeHook { newest: 5, failopen: 5, ..FakeHook::default() };
+        let failed_open = super::chord_flow(5, 1_000, &mut h, &mut FakeSys { now: 1_010, ..fresh() });
+        assert_eq!(failed_open, OpenPlan::Nothing, "failed open");
+        let (plan, _, s) = post(5, 1_301, 5, FakeSys { is_open: true, ..fresh() });
+        assert_eq!((plan, s.ops.as_slice()), (OpenPlan::Close, &[Op::CloseLauncher][..]), "a stale post still closes");
+        // Exclusive D3D always passes; a borderless fullscreen window passes with over_fullscreen "pass" (the default).
+        assert_eq!(post(5, 1_010, 5, FakeSys { d3d: true, ..fresh() }).0, OpenPlan::Nothing);
+        let (plan, h, s) = post(5, 1_010, 5, FakeSys { fs: true, ..fresh() });
+        assert_eq!(plan, OpenPlan::Nothing);
+        assert!(s.ops.is_empty(), "nothing opens and nothing is re-injected into a game");
+        assert!(h.passes.last().is_some_and(|f| f.has(PassFlags::FULLSCREEN)), "the next chords pass too");
+        with_ctrl(|c| c.over_fullscreen_pass = false);
+        assert_eq!(post(5, 1_010, 5, FakeSys { fs: true, ..fresh() }).0, OpenPlan::TryOpen, "over_fullscreen \"open\"");
+        assert_eq!(post(5, 1_010, 5, FakeSys { d3d: true, ..fresh() }).0, OpenPlan::Nothing, "D3D passes anyway");
+        with_ctrl(|c| c.over_fullscreen_pass = true);
+    }
+
+    #[test]
+    fn every_outcome_but_open_ends_the_typeahead() {
+        // Dropped, fullscreen, closing and failed open: the post's window ends at once.
+        for (what, seq, now, sys) in [
+            ("stale", 7, 1_400, fresh()),
+            ("superseded", 6, 1_010, fresh()),
+            ("fullscreen", 7, 1_010, FakeSys { fs: true, ..fresh() }),
+            ("closing", 7, 1_010, FakeSys { is_open: true, ..fresh() }),
+            ("failed open", 7, 1_010, FakeSys { open_ok: false, ..fresh() }),
+        ] {
+            let (plan, h, _) = post(seq, now, 7, sys);
+            assert_eq!(plan == OpenPlan::TryOpen, what == "failed open", "{what}: only the failed open tried");
+            assert_eq!(h.ends, [seq], "{what}");
+        }
+        // An open keeps its window until the activation takes it or the close ends it.
+        let (plan, mut h, _) = post(7, 1_010, 7, fresh());
+        assert_eq!((plan, h.ends.len(), h.shown.as_slice()), (OpenPlan::TryOpen, 0, &[true][..]));
+        let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
+        l.open_seq = with_ctrl(|c| c.open_seq).unwrap();
+        assert_eq!(l.open_seq, 7, "the content opens for the post being opened");
+        l.finish(&mut h);
+        assert_eq!((h.ends.as_slice(), h.shown.as_slice()), (&[7][..], &[true, false][..]));
+    }
+
+    #[test]
+    fn failed_open_resets_shown_and_reinjects() {
+        let mut h = FakeHook { newest: 3, alt: true, ..FakeHook::default() };
+        let mut s = FakeSys { now: 1_010, open_ok: false, ..FakeSys::default() };
+        super::chord_flow(3, 1_000, &mut h, &mut s);
+        assert_eq!(h.shown, [true, false]);
+        assert_eq!(h.ends, [3]);
+        assert_eq!(s.ops, [Op::Open, Op::Inject(vec![(0x20, false), (0x20, true)])], "Alt still down: Space only");
+        let mut h = FakeHook { newest: 3, alt: false, ..FakeHook::default() };
+        let mut s = FakeSys { now: 1_010, open_ok: false, ..FakeSys::default() };
+        super::chord_flow(3, 1_000, &mut h, &mut s);
+        assert_eq!(
+            s.ops.last(),
+            Some(&Op::Inject(vec![(0x12, false), (0x20, false), (0x20, true), (0x12, true)])),
+            "Alt already up: Alt down, Space, Alt up"
+        );
+        // A successful open injects nothing.
+        let (_, _, s) = post(3, 1_010, 3, fresh());
+        assert_eq!(s.ops, [Op::Open]);
+    }
 
     fn surface(dpi: u32) -> Surface {
         let mut s = Surface::new(Metrics { dpi }).unwrap();

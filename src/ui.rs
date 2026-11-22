@@ -490,6 +490,11 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             on_app_menu_cmd(wp.0 as u32);
             Some(LRESULT(0))
         }
+        // The launcher's chord (posted by the hook only while a chord is set): wParam = sequence, lParam = kb.time.
+        crate::msg::WM_DOCK_LAUNCHER => {
+            popup::popup_launcher::on_chord(wp.0 as u32, lp.0 as u32);
+            Some(LRESULT(0))
+        }
         WM_DOCK_APPS_DIRTY => {
             if wp.0 as u32 == EVENT_SYSTEM_FOREGROUND {
                 on_shell_hook(h, HSHELL_WINDOWACTIVATED, lp.0);

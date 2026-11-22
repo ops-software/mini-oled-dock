@@ -569,7 +569,6 @@ impl PassFlags {
         self.0 & f.0 != 0
     }
 
-    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
     pub const fn with(self, f: PassFlags) -> PassFlags {
         PassFlags(self.0 | f.0)
     }
@@ -1132,7 +1131,6 @@ pub(crate) enum PostAction {
 
 /// Rule 8: a stale (over STALE_POST_MS), superseded (below the newest sequence) or failed-open post opens nothing; any
 /// post closes an open launcher (closing is always safe). Sequences and times compare with wrapping.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub(crate) fn post_verdict(
     seq: u32,
@@ -1154,13 +1152,11 @@ pub(crate) fn post_verdict(
 
 /// The keys the UI injects when the launcher cannot open, so the window menu opens as Windows would have: (vk, up),
 /// all tagged INJECT_TAG.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub struct InjectPlan {
     pub keys: [(u16, bool); 4],
     pub len: u8,
 }
 
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 impl InjectPlan {
     pub fn keys(&self) -> &[(u16, bool)] {
         self.keys.get(..usize::from(self.len)).unwrap_or(&[])
@@ -1169,7 +1165,6 @@ impl InjectPlan {
 
 /// With Alt still down: Space down, Space up. With Alt already up: Alt down, Space down, Space up, Alt up. The real
 /// Space up stays swallowed (the plan has its own), so no key is left held.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn reinject_plan(alt_tracked_down: bool) -> InjectPlan {
     let sp = VK_SPACE_;
@@ -1247,13 +1242,11 @@ pub fn set_launcher_chord(chord: Option<ChordSpec>) {
 }
 
 /// UI: why the chord passes (fullscreen, remote, yield), on every foreground change.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn set_pass_flags(flags: PassFlags) {
     PASS_FLAGS.store(flags.0, Relaxed);
 }
 
 /// UI, first thing on WM_DOCK_LAUNCHER: the post of `seq` arrived.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn ack_launcher(seq: u32) {
     #[cfg(feature = "owner-probe")]
     crate::launcher_probe::freeze_ui_once();
@@ -1262,14 +1255,12 @@ pub fn ack_launcher(seq: u32) {
 
 /// UI: true right before the launcher's ShowWindow, false at its close (a chord while shown closes the launcher and
 /// opens no type-ahead window).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn set_launcher_shown(on: bool) {
     LAUNCHER_SHOWN.store(on, Relaxed);
 }
 
 /// UI: the post of `seq` opens nothing (dropped, failed open, fullscreen, a closing chord): its keys are discarded. A
 /// no-op for another sequence.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn end_typeahead(seq: u32) {
     let _ = RING.end(seq);
 }
@@ -1293,7 +1284,6 @@ pub fn take_gesture_time() -> Option<u32> {
 }
 
 /// UI: Alt is down as the hook tracks it (for `reinject_plan`).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn alt_tracked_down() -> bool {
     load_mods().alt_down()
 }

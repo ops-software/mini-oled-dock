@@ -358,6 +358,10 @@ pub(crate) trait Content {
     fn closing(&mut self) {}
     /// The popup is already hidden: run the actions to perform AFTER closing here.
     fn after_close(&mut self) {}
+    /// The launcher's content (`with_launcher`); None for every other kind.
+    fn launcher(&mut self) -> Option<&mut popup_launcher::Launcher> {
+        None
+    }
 }
 
 /// Clickable zones of a content (client coordinates, physical px). The last one added wins.
@@ -560,13 +564,24 @@ pub fn close_unless_launcher(reason: &str) {
 
 /// Opens popup `kind` centred on `c.work` (the launcher), first closing any other popup: the open path of `toggle`
 /// with the placement of `Centred`. false when nothing is shown (no popups, no surface, or the first render failed).
-// The launcher's chord flow (L1a-15) calls it; until then nothing does.
-#[allow(dead_code)]
 pub fn open_centred(kind: PopupKind, c: Centred) -> bool {
     if !is_available() {
         return false;
     }
     open(kind, Anchor { item: c.work, bar: c.work, top: false, dpi: c.dpi }, Some(c))
+}
+
+/// Runs `f` on the open launcher's content and applies its reply (the launcher's controller reaches its open content
+/// through it, never while a content method runs). false when the launcher is not the open popup.
+pub(crate) fn with_launcher(f: impl FnOnce(&mut popup_launcher::Launcher) -> Reply) -> bool {
+    let reply = with(|st| st.open.as_mut().and_then(|o| o.content.launcher()).map(f)).flatten();
+    match reply {
+        Some(r) => {
+            apply(r);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Links the open popup to the bar's show/hide animation (Win with `win_opens_start`): its own fade

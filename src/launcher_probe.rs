@@ -38,7 +38,6 @@ pub fn record_hook_us(d: Duration) {
 
 /// `DOCK_TEST_FREEZE_UI_MS`: the first launcher acknowledgement stalls the UI thread this long (the frozen-UI case of
 /// live check 7), the launcher's own copy of WS-C 17.1 step 6, whose helper exists only in debug builds.
-#[allow(dead_code)] // called by hook::ack_launcher, which the chord flow (L1a-15) calls
 pub fn freeze_ui_once() {
     static FREEZE_MS: OnceLock<Option<u64>> = OnceLock::new();
     static FROZE: AtomicBool = AtomicBool::new(false);
