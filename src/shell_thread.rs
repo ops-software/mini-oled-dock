@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -65,6 +66,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
+use crate::launcher::gesture::{is_marker, Gesture};
 use crate::log;
 use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
 
@@ -117,8 +119,8 @@ impl AdminTool {
     }
 }
 
-/// Verb for `IShellDispatch2::ShellExecute`. Closed on purpose: `RunAs` is built only by `launch_admin`
-/// and `launch_app_admin`.
+/// Verb for `IShellDispatch2::ShellExecute`. Closed on purpose: `RunAs` is built only by `launch_admin`,
+/// `launch_app_admin` and `run_as_typed_with`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verb {
     Open,
@@ -144,8 +146,8 @@ pub enum ShellRequest {
     Launch { target: String, args: Option<String> },
     /// Start menu "(admin)" entries: asks the desktop shell (Explorer, medium integrity) to run a FIXED
     /// tool with the `runas` verb, so Windows shows its UAC prompt. The dock's own token is never used;
-    /// without the desktop shell the launch is refused. Only this request and `LaunchAppAdmin` carry
-    /// `runas`.
+    /// without the desktop shell the launch is refused. Only this request, `LaunchAppAdmin` and
+    /// `RunAsTyped` carry `runas`.
     LaunchAdmin(AdminTool),
     /// Start menu "Run as administrator" on an app of the catalog: the desktop shell runs
     /// `shell:AppsFolder\<id>` with the `runas` verb (UAC prompt, the dock's token never used), as
@@ -211,6 +213,12 @@ pub enum ShellRequest {
     /// `updated_exe_path`, no `is_dir`, no working directory).
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     OpenPath { path: String },
+    /// Run as administrator a typed line or a file row's quoted path (Ctrl+Shift+Enter): `line` split
+    /// at `file` (a byte range of it), run by the desktop shell with `runas` (Windows' UAC prompt; the
+    /// dock's token is never used). Carries the hook-proven `Gesture`; built only by launcher_sys.rs
+    /// (lint 1). The only launcher request with `runas`.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    RunAsTyped { line: String, file: Range<usize>, gesture: Gesture },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -248,6 +256,7 @@ pub enum ShellEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchKind {
     Path,
+    Admin,
 }
 
 /// Shell thread handle; passed to `stop`.
@@ -547,7 +556,7 @@ impl Shell {
             ShellRequest::LaunchAppAdmin { id } => launch_app_admin(&id),
             ShellRequest::RevealApp { id } => reveal_app(&id),
             // launcher arms: begin
-            req @ ShellRequest::OpenPath { .. } => launcher_launch(self.ui, req),
+            req @ (ShellRequest::OpenPath { .. } | ShellRequest::RunAsTyped { .. }) => launcher_launch(self.ui, req),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -1661,6 +1670,7 @@ fn shell_exec(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> 
 fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
     match req {
         ShellRequest::OpenPath { .. } => Some(LaunchKind::Path),
+        ShellRequest::RunAsTyped { .. } => Some(LaunchKind::Admin),
         _ => None,
     }
 }
@@ -1684,6 +1694,13 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             }
             r
         }
+        ShellRequest::RunAsTyped { line, file, gesture } => {
+            let r = run_as_typed_with(&line, file, &gesture, &mut exec);
+            if r.is_ok() {
+                log!("shell: RunAsTyped ({} chars) via the desktop shell (runas, UAC prompt)", line.chars().count());
+            }
+            r
+        }
         _ => return,
     };
     if let Err(err) = &r {
@@ -1704,6 +1721,64 @@ fn open_path_with(path: &str, exec: Exec) -> Result<(), String> {
         return Err("refused: an empty path or a control character".into());
     }
     exec(path, None, None, Verb::Open)
+}
+
+/// The file and the arguments of a run line, split where the launcher's syntax-only classification
+/// put the file (`file`, a byte range of `line`): the arguments are the trimmed text after the file
+/// (after its closing quote when it was quoted). Only the opening quote may stand before the file, and
+/// the file must end at a word break or at its closing quote; anything else (a range out of bounds or
+/// off a character boundary included) is refused, never a panic. With `console` the file is
+/// `<sys>\cmd.exe` and the arguments `/k ` and the whole trimmed line. Nothing is looked up or expanded.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn command_parts(
+    line: &str,
+    file: Range<usize>,
+    console: bool,
+    sys: &Path,
+) -> Result<(String, Option<String>), &'static str> {
+    let part = line.get(file.clone()).ok_or("the file range does not split the line")?;
+    if part.trim().is_empty() {
+        return Err("an empty file");
+    }
+    let quoted = match line.get(..file.start).map(str::trim_start) {
+        Some("") => false,
+        Some("\"") => true,
+        _ => return Err("text before the file"),
+    };
+    let rest = line.get(file.end..).ok_or("the file range does not split the line")?;
+    let rest = match (quoted, rest.strip_prefix('"')) {
+        (true, Some(after)) => after,
+        (true, None) if rest.is_empty() => rest,
+        (false, _) if rest.is_empty() || rest.starts_with(char::is_whitespace) => rest,
+        _ => return Err("the file does not end where its range ends"),
+    };
+    if console {
+        if !sys.is_absolute() {
+            return Err("no system directory");
+        }
+        return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(format!("/k {}", line.trim()))));
+    }
+    let args = rest.trim();
+    Ok((part.to_string(), (!args.is_empty()).then(|| args.to_string())))
+}
+
+/// `RunAsTyped`: the line split by `command_parts` and run by the desktop shell with `runas`, whether or
+/// not the dock is elevated (as `launch_admin`), so Windows' UAC prompt names the program and the dock's
+/// token is never used. Refused here again, whatever the launcher checked: any control or bidi
+/// character in the line (what is shown is what runs), a range that does not split it, a network file
+/// (`\\server` or `//server`). `_proof` is the hook-proven gesture the request carries: nothing
+/// reaches this without one.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exec) -> Result<(), String> {
+    if line.chars().any(is_marker) {
+        return Err("refused: a control or bidi character".into());
+    }
+    let (file, args) = command_parts(line, file, false, Path::new("")).map_err(|e| format!("refused: {e}"))?;
+    let start = file.trim_start();
+    if start.starts_with("\\\\") || start.starts_with("//") {
+        return Err("refused: a network file".into());
+    }
+    exec(&file, args.as_deref(), None, Verb::RunAs)
 }
 
 // launcher requests: end
@@ -1775,8 +1850,8 @@ pub(crate) fn desktop_registered() -> bool {
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
 /// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, show)`
 /// (`SW_SHOWNORMAL` except the hidden PowerShell export, see `desktop_open_hidden`).
-/// `verb` is `Open` for every launch except `launch_admin` / `launch_app_admin` (`RunAs`: Explorer asks
-/// UAC, not the dock).
+/// `verb` is `Open` for every launch except `launch_admin` / `launch_app_admin` / `run_as_typed_with`
+/// (`RunAs`: Explorer asks UAC, not the dock).
 /// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
 fn desktop_shell_execute(
@@ -2117,5 +2192,75 @@ mod tests {
         ));
         assert!(failure_event(LaunchKind::Path, &Ok(())).is_none());
         assert_eq!(launch_kind(&ShellRequest::OpenPath { path: "C:\\a.txt".into() }), Some(LaunchKind::Path));
+    }
+
+    /// (line, file range) as the launcher's run mode splits it.
+    fn run_line(s: &str) -> (String, Range<usize>) {
+        let r = crate::launcher::runline::classify(s).expect("a run line");
+        (r.line.to_string(), r.file)
+    }
+
+    #[test]
+    fn runas_refuses_unc_and_markers() {
+        let g = Gesture::for_test(1);
+        let mut calls = Vec::new();
+        let bad = [
+            "\\\\server\\share\\setup.exe",
+            "\"\\\\server\\x.exe\" -y",
+            "//server/share/x.exe",
+            "notepad a\u{202E}b",
+            "notepad\tx",
+            "cmd /c \u{200F}x",
+            "x\u{061C}y",
+            "notepad a\u{85}b",
+        ];
+        for s in bad {
+            let (line, file) = run_line(s);
+            let r = run_as_typed_with(&line, file, &g, &mut recorder(&mut calls, true));
+            assert!(r.is_err(), "{s:?}");
+        }
+        assert!(calls.is_empty(), "{calls:?}");
+        let (line, file) = run_line("notepad C:\\temp\\a.txt");
+        assert!(run_as_typed_with(&line, file, &g, &mut recorder(&mut calls, true)).is_ok());
+        assert_eq!(calls.len(), 1);
+        let (f, a, d, v) = &calls[0];
+        assert_eq!(
+            (f.as_str(), a.as_deref(), d.as_deref(), v.as_str()),
+            ("notepad", Some("C:\\temp\\a.txt"), None, "runas")
+        );
+    }
+
+    #[test]
+    fn runas_refuses_a_bad_range() {
+        let g = Gesture::for_test(1);
+        let mut calls = Vec::new();
+        let ranges =
+            [("cmd", 0..99), ("\u{e9}", 1..2), ("cmd", Range { start: 3, end: 1 }), ("cmd", 0..0), ("cmd", 1..3)];
+        for (line, file) in ranges {
+            let shown = format!("{file:?}");
+            let e = run_as_typed_with(line, file, &g, &mut recorder(&mut calls, true)).expect_err(&shown);
+            // What the shell thread logs for a refusal: the kind and the reason, never the line.
+            assert!(!e.contains(line), "{e}");
+        }
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn launcher_requests_split_lines() {
+        let sys = Path::new("C:\\Windows\\System32");
+        let quoted = "\"C:\\Program Files\\x.exe\" -y";
+        assert_eq!(run_line(quoted).1, 1..23);
+        assert_eq!(
+            command_parts(quoted, 1..23, false, sys),
+            Ok(("C:\\Program Files\\x.exe".into(), Some("-y".into())))
+        );
+        assert_eq!(command_parts("notepad", 0..7, false, sys), Ok(("notepad".into(), None)));
+        assert_eq!(command_parts("notepad   a.txt ", 0..7, false, sys), Ok(("notepad".into(), Some("a.txt".into()))));
+        let (line, file) = run_line("\"C:\\x y.exe\"");
+        assert_eq!(command_parts(&line, file, false, sys), Ok(("C:\\x y.exe".into(), None)));
+        // A range that does not end where the file ends, or leaves text before it, is no split.
+        assert!(command_parts(quoted, 1..5, false, sys).is_err());
+        assert!(command_parts("notepad a.txt", 0..4, false, sys).is_err());
+        assert!(command_parts("x notepad", 2..9, false, sys).is_err());
     }
 }
