@@ -671,7 +671,15 @@ impl Surface {
 
     /// Like `text` with a font made for this one call, `px` physical px tall and of `weight`, in the dock's text face. Returns
     /// the width. Only the Q7 field-size candidate of the preview needs a size the six fonts do not have.
-    pub(crate) fn text_sized(&mut self, s: &str, x: i32, y: i32, size: (i32, i32), rgb: (u32, u32, u32), alpha: u32) -> i32 {
+    pub(crate) fn text_sized(
+        &mut self,
+        s: &str,
+        x: i32,
+        y: i32,
+        size: (i32, i32),
+        rgb: (u32, u32, u32),
+        alpha: u32,
+    ) -> i32 {
         let (px, weight) = size;
         let Ok(font) = create_font(self.gdi.dc_txt(), &TEXT_FACES, px, weight) else { return 0 };
         let w = self.gdi.text_width(s, font, self.metrics.px(7));

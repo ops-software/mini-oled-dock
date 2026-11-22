@@ -706,7 +706,8 @@ pub fn equals_shape(u: f32, v: f32) -> bool {
 /// Command prompt: a chevron and an underscore (run lines).
 pub fn prompt_shape(u: f32, v: f32) -> bool {
     let st = half();
-    polyline(u, v, &[(3.5, 4.5), (7.5, 8.0), (3.5, 11.5)], st) || dist_seg(u, v, 8.8, snap(12.0), 12.8, snap(12.0)) <= st
+    polyline(u, v, &[(3.5, 4.5), (7.5, 8.0), (3.5, 11.5)], st)
+        || dist_seg(u, v, 8.8, snap(12.0), 12.8, snap(12.0)) <= st
 }
 
 /// Application window: frame with a title bar (open windows).
@@ -754,7 +755,18 @@ pub fn executable_shape(u: f32, v: f32) -> bool {
 pub fn copy_shape(u: f32, v: f32) -> bool {
     let st = half();
     rrect_outline(u, v, 2.5, 5.5, 10.5, 14.0, 1.5)
-        || polyline(u, v, &[(snap(5.5), 3.2), (snap(5.5), snap(2.0)), (snap(13.5), snap(2.0)), (snap(13.5), snap(10.5)), (11.8, snap(10.5))], st)
+        || polyline(
+            u,
+            v,
+            &[
+                (snap(5.5), 3.2),
+                (snap(5.5), snap(2.0)),
+                (snap(13.5), snap(2.0)),
+                (snap(13.5), snap(10.5)),
+                (11.8, snap(10.5)),
+            ],
+            st,
+        )
 }
 
 /// Page with text lines (Log).
