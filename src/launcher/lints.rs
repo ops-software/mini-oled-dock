@@ -281,6 +281,56 @@ fn log_violations(path: &str, text: &str) -> Vec<String> {
     v
 }
 
+/// The functions of launcher_sys.rs that hold what the user copies (plan L2 CLIP-1): their log lines name an error at
+/// most (no text, no length), and they are the only callers of the clipboard reader in the dock.
+const CLIP_FNS: [&str; 3] = ["fn clipboard_text(", "fn clipboard_marks(", "fn set_clipboard_text("];
+/// The ones of `CLIP_FNS` that read the clipboard, at the user's paste only.
+const CLIP_READERS: [&str; 2] = ["fn clipboard_text(", "fn clipboard_marks("];
+
+/// Offset of the test module: the first `#[cfg(test)]` that, past any other attributes, starts a `mod` (a `#[cfg(test)]`
+/// import above it does not count); the text length when there is none.
+fn test_mod_start(text: &str) -> usize {
+    for (at, cfg) in text.match_indices("#[cfg(test)]") {
+        let mut rest = text.get(at + cfg.len()..).unwrap_or("").trim_start();
+        while rest.starts_with("#[") {
+            rest = rest.get(rest.find(']').map_or(rest.len(), |i| i + 1)..).unwrap_or("").trim_start();
+        }
+        if rest.starts_with("mod ") {
+            return at;
+        }
+    }
+    text.len()
+}
+
+fn clip_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    let code = text.get(..test_mod_start(text)).unwrap_or(text);
+    let mut readers = Vec::new();
+    if path == "src/launcher_sys.rs" {
+        for sig in CLIP_FNS {
+            let Some((b, e)) = fn_body(code, sig, 0) else {
+                v.push(format!("{path}: {sig}..) is missing"));
+                continue;
+            };
+            if CLIP_READERS.contains(&sig) {
+                readers.push((b, e));
+            }
+            for (at, call) in log_calls(code.get(b..e).unwrap_or("")) {
+                if !placeholders(call).unwrap_or_default().iter().all(|p| p == "e") {
+                    v.push(format!("{path}:{}: a clipboard log line may name an error only", line_of(code, b + at)));
+                }
+            }
+        }
+    }
+    for (at, _) in code.match_indices("GetClipboardData(") {
+        let call = !code.get(..at).and_then(|t| t.chars().next_back()).is_some_and(is_ident);
+        if call && !readers.iter().any(|&(b, e)| b <= at && at < e) {
+            v.push(format!("{path}:{}: the clipboard is read outside the paste", line_of(code, at)));
+        }
+    }
+    v
+}
+
 #[test]
 fn launcher_logs_carry_no_text() {
     let good = "fn f() { log!(\"launcher: {n} rows in {ms} ms, {kind:?} {{braces}}\", a, b); }";
@@ -318,6 +368,25 @@ fn launcher_logs_carry_no_text() {
     let swapped = "// launcher requests: end\n// launcher requests: begin\n";
     assert_eq!(log_violations("src/shell_thread.rs", swapped).len(), 1);
     let all = scan_tree(log_violations);
+    assert!(all.is_empty(), "{all:#?}");
+    // the clipboard functions (CLIP-1): an error at most, and the clipboard is read nowhere else
+    let sys = |marks_log: &str, text_log: &str| {
+        format!(
+            "fn clipboard_marks() {{ {marks_log} GetClipboardData(1); }}\nfn clipboard_text() {{ {text_log} \
+             GetClipboardData(13); }}\nfn set_clipboard_text(t: &str) {{ log!(\"launcher: failed {{e}}\"); }}\n"
+        )
+    };
+    assert!(clip_violations("src/launcher_sys.rs", &sys("", "log!(\"launcher: failed {e}\");")).is_empty());
+    let len = sys("", "log!(\"launcher: {n} units\", n);");
+    assert_eq!(clip_violations("src/launcher_sys.rs", &len).len(), 1, "not even a length");
+    assert_eq!(clip_violations("src/launcher_sys.rs", &sys("log!(\"{}\", s);", "")).len(), 1);
+    assert_eq!(clip_violations("src/launcher_sys.rs", "fn clipboard_text() {}").len(), 2, "a renamed one fails");
+    assert_eq!(clip_violations("src/ui.rs", "fn f() { GetClipboardData(13); }").len(), 1, "read nowhere else");
+    assert!(clip_violations("src/ui.rs", "use x::{GetClipboardData, OpenClipboard};").is_empty(), "an import");
+    let tests = "#[cfg(test)]\nuse a::b;\nfn f() {}\n#[cfg(test)]\n#[allow(x)]\nmod tests { fn g() { GetClipboardData(13); } }";
+    assert!(clip_violations("src/ui.rs", tests).is_empty(), "test code may read it");
+    assert_eq!(clip_violations("src/ui.rs", &tests.replace("fn f() {}", "fn f() { GetClipboardData(1); }")).len(), 1);
+    let all = scan_tree(clip_violations);
     assert!(all.is_empty(), "{all:#?}");
 }
 

@@ -296,6 +296,22 @@ impl TextField {
     }
 }
 
+/// The privacy marks a clipboard can carry (plan L2 D8), read before its text: the registered formats
+/// `ExcludeClipboardContentFromMonitorProcessing` and `Clipboard Viewer Ignore` (present or not), and the DWORD of
+/// `CanIncludeInClipboardHistory`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct ClipMarks {
+    pub exclude_monitor: bool,
+    pub viewer_ignore: bool,
+    /// None: the format is absent; the reader gives 0 for one it cannot read whole.
+    pub history: Option<u32>,
+}
+
+/// A paste the app that copied the text marked private: refused, and its text is never read (CLIP-1).
+pub fn paste_refused(marks: ClipMarks) -> bool {
+    marks.exclude_monitor || marks.viewer_ignore || marks.history == Some(0)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -831,5 +847,20 @@ mod tests {
                 assert_eq!(out, FieldOut::Unchanged);
             }
         }
+    }
+
+    #[test]
+    fn paste_refused_vectors() {
+        let none = ClipMarks::default();
+        assert!(!paste_refused(none), "no mark: pasted");
+        assert!(!paste_refused(ClipMarks { history: Some(1), ..none }), "history allowed and no mark: pasted");
+        // Each mark alone refuses.
+        assert!(paste_refused(ClipMarks { exclude_monitor: true, ..none }));
+        assert!(paste_refused(ClipMarks { viewer_ignore: true, ..none }));
+        assert!(paste_refused(ClipMarks { history: Some(0), ..none }));
+        // A mark refuses whatever the history flag says.
+        assert!(paste_refused(ClipMarks { exclude_monitor: true, history: Some(1), ..none }));
+        assert!(paste_refused(ClipMarks { viewer_ignore: true, history: Some(1), ..none }));
+        assert!(paste_refused(ClipMarks { exclude_monitor: true, viewer_ignore: true, history: Some(0) }));
     }
 }

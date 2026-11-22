@@ -203,6 +203,14 @@ pub fn launch_failed() -> &'static str {
     tr("Couldn't start it: Explorer isn't answering", "Impossibile avviarlo: Esplora risorse non risponde")
 }
 
+/// The notice of a refused paste: the app that copied the text marked it private, so it was never read (plan L2 D8).
+pub fn paste_private() -> &'static str {
+    tr(
+        "Not pasted: the app that copied it marked it private",
+        "Non incollato: l'app che l'ha copiato lo ha segnato come privato",
+    )
+}
+
 /// The window name (the launcher keeps this static name for screen readers).
 pub fn window_name() -> &'static str {
     tr("Launcher", "Launcher")

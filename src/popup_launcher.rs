@@ -601,12 +601,15 @@ impl Launcher {
                 Effect::Switch(h) => self.switch = Some(h),
                 Effect::CloseWindow(h) => sys.close_window(h),
                 Effect::CopyNow(text) => sys.copy(&text),
-                Effect::Paste => {
-                    if let Some(text) = sys.paste() {
+                Effect::Paste => match sys.paste() {
+                    Pasted::Text(text) => {
                         let more = self.session.paste(&text, cx);
                         reply = reply.merge(self.run(more, cx, sys));
                     }
-                }
+                    // Marked private: nothing was read, the field stays as it is and a notice says why.
+                    Pasted::Private => reply = reply.merge(self.show_notices(vec![private_paste_row()], cx, sys)),
+                    Pasted::Empty => {}
+                },
                 Effect::ForgetRun(line) => self.forgotten.push(line),
                 // Nothing matched: Windows' typo rewrite is read on the shell thread (a 1.4 MB file) and comes back as a
                 // late batch of this generation (`converted`).
@@ -1874,6 +1877,11 @@ fn chord_held_row() -> Item {
     notice_row("chord-held", strings::pt_alt_shift_space_held(), None)
 }
 
+/// The row of a paste refused because the app that copied the text marked it private (no action).
+fn private_paste_row() -> Item {
+    notice_row("private-paste", strings::paste_private(), None)
+}
+
 /// A notice row (5.5.2): an info mark, the text, no verb.
 fn notice_row(id: &str, title: &str, detail: Option<&str>) -> Item {
     use crate::launcher::model::{ItemKey, Score, VerbSet};
@@ -2313,8 +2321,9 @@ pub(crate) trait SysPort {
     fn restore(&mut self, h: isize);
     /// The text to the clipboard (`CF_UNICODETEXT`).
     fn copy(&mut self, text: &str);
-    /// The clipboard's text, at most 64 KiB of it.
-    fn paste(&mut self) -> Option<String>;
+    /// The clipboard's text, at most 64 KiB of it, unless the app that copied it marked it private (`paste_refused`):
+    /// then its text is never read.
+    fn paste(&mut self) -> Pasted;
     /// Ctrl+W: `WM_CLOSE` posted to `h`.
     fn close_window(&mut self, h: isize);
     /// The window menu of `h` (`WM_SYSCOMMAND` `SC_KEYMENU` posted), when `h` is a window to act on.
@@ -2379,6 +2388,16 @@ fn gesture_for(ev: &KeyEvent, hook: &mut dyn HookPort, sys: &dyn SysPort) -> Opt
     #[cfg(feature = "owner-probe")]
     crate::launcher_probe::gesture(hook_time, sys.msg_time());
     Gesture::from_key(ev, hook_time, sys.msg_time(), sys.msg_extra(), hook::INJECT_TAG, sys.now())
+}
+
+/// What a paste found on the clipboard (`SysPort::paste`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Pasted {
+    Text(String),
+    /// The app that copied it marked it private (`launcher::field::paste_refused`): its text was never read.
+    Private,
+    /// No text on the clipboard, or the clipboard could not be opened.
+    Empty,
 }
 
 /// What one kept key types.
@@ -3678,8 +3697,8 @@ mod tests {
         fn activate(&mut self, _h: isize) {}
         fn restore(&mut self, _h: isize) {}
         fn copy(&mut self, _text: &str) {}
-        fn paste(&mut self) -> Option<String> {
-            None
+        fn paste(&mut self) -> Pasted {
+            Pasted::Empty
         }
         fn close_window(&mut self, _h: isize) {}
         fn window_menu(&mut self, _h: isize) {}
@@ -3852,6 +3871,8 @@ mod tests {
     #[derive(Default)]
     struct EffectSys {
         clip: Option<String>,
+        /// The app that copied `clip` marked it private: the port never reads it.
+        private: bool,
         ops: Vec<String>,
         msg_time: u32,
         now: u32,
@@ -3899,9 +3920,13 @@ mod tests {
         fn copy(&mut self, text: &str) {
             self.ops.push(format!("Copy({text})"));
         }
-        fn paste(&mut self) -> Option<String> {
+        fn paste(&mut self) -> Pasted {
             self.ops.push("Paste".into());
-            self.clip.clone()
+            match &self.clip {
+                _ if self.private => Pasted::Private,
+                Some(text) => Pasted::Text(text.clone()),
+                None => Pasted::Empty,
+            }
         }
         fn close_window(&mut self, h: isize) {
             self.ops.push(format!("CloseWindow({h:#x})"));
@@ -4468,6 +4493,37 @@ mod tests {
         // Nothing on the clipboard: nothing changes.
         let mut sys = EffectSys::default();
         assert_eq!(key(&mut l, &fx, &mut sys, 0x2D, Mods::SHIFT), Reply::None);
+    }
+
+    #[test]
+    fn private_paste_shows_a_row_and_keeps_the_field() {
+        use crate::launcher::model::VerbSet;
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "calc");
+        let sel = l.session.selected().map(|r| r.key);
+        // The app that copied it marked it private: the port hands nothing over, a notice says why.
+        let mut sys = EffectSys { clip: Some("hunter2".into()), private: true, ..EffectSys::default() };
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x56, Mods::CTRL), Reply::Relayout);
+        assert_eq!(l.session.query_text(), "calc", "the field is unchanged");
+        assert_eq!(sys.ops.first().map(String::as_str), Some("Paste"));
+        let notices: Vec<&Item> = l.session.rows().iter().filter(|r| r.kind == Kind::Notice).collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(&*notices[0].title, strings::paste_private());
+        assert_eq!(notices[0].verbs, VerbSet::empty(), "no action: Enter on it does nothing");
+        assert_eq!(l.session.selected().map(|r| r.key), sel, "the typed query's row stays the default");
+        // Shift+Insert, marked again: still one notice.
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x2D, Mods::SHIFT), Reply::Relayout);
+        assert_eq!(l.session.rows().iter().filter(|r| r.kind == Kind::Notice).count(), 1);
+        assert_eq!(l.session.query_text(), "calc");
+        // A text without a mark pastes as before.
+        let mut sys = EffectSys { clip: Some(" x".into()), ..EffectSys::default() };
+        key(&mut l, &fx, &mut sys, 0x56, Mods::CTRL);
+        assert_eq!(l.session.query_text(), "calc x");
+        assert_eq!(strings::paste_private(), "Not pasted: the app that copied it marked it private");
+        crate::i18n::with_italian(true, || {
+            assert_eq!(strings::paste_private(), "Non incollato: l'app che l'ha copiato lo ha segnato come privato");
+        });
     }
 
     // ---- 15d: config, pass flags, session events, the typo rewrite

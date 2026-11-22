@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
 };
@@ -21,7 +21,8 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     CreateFileMappingW, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, MapViewOfFile, UnmapViewOfFile,
@@ -56,12 +57,13 @@ use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
 #[cfg(test)]
 use crate::launcher::arena::Arena;
 use crate::launcher::arena::{self, ArenaError, Caps, CatalogView, Kind as ArenaKind, Layout};
+use crate::launcher::field::{paste_refused, ClipMarks};
 use crate::launcher::model::{CommandId, Mods, NumberStyle, WindowRow};
 use crate::launcher::powertoys;
 use crate::launcher::rank;
 use crate::launcher::session::LaunchReq;
 use crate::log;
-use crate::popup::popup_launcher::{typed_of, HookPort, Launcher, MonitorPick, SysPort, Typed};
+use crate::popup::popup_launcher::{typed_of, HookPort, Launcher, MonitorPick, Pasted, SysPort, Typed};
 use crate::popup::{self, Centred, PopupKind};
 use crate::shell_thread::ShellRequest;
 
@@ -205,29 +207,79 @@ fn set_clipboard_text(text: &str) {
     }
 }
 
-/// The clipboard's `CF_UNICODETEXT`, at most 64 KiB of it (up to its first NUL).
-fn clipboard_text() -> Option<String> {
+/// The clipboard's `CF_UNICODETEXT` for a paste, at most 64 KiB of it (up to its first NUL); `Private` when the app
+/// that copied it marked it private (`clipboard_marks`), and then the text is never read.
+fn clipboard_text() -> Pasted {
     const MAX_UNITS: usize = 32 * 1024;
     // SAFETY: the clipboard is opened and closed here, on this thread; the block the clipboard owns is read only while
     // locked, within GlobalSize, and never freed here.
     unsafe {
-        OpenClipboard(Some(crate::hwnd())).ok()?;
-        let text = (|| {
-            let h = GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()?;
-            let mem = HGLOBAL(h.0);
-            let units = (GlobalSize(mem) / 2).min(MAX_UNITS);
-            let p = GlobalLock(mem).cast::<u16>().cast_const();
-            if p.is_null() {
-                return None;
-            }
-            let all = std::slice::from_raw_parts(p, units);
-            let len = all.iter().position(|&u| u == 0).unwrap_or(units);
-            let s = String::from_utf16_lossy(all.get(..len).unwrap_or(&[]));
-            let _ = GlobalUnlock(mem);
-            Some(s)
-        })();
+        if OpenClipboard(Some(crate::hwnd())).is_err() {
+            return Pasted::Empty;
+        }
+        let text = if paste_refused(clipboard_marks()) {
+            Pasted::Private
+        } else {
+            (|| {
+                let h = GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()?;
+                let mem = HGLOBAL(h.0);
+                let units = (GlobalSize(mem) / 2).min(MAX_UNITS);
+                let p = GlobalLock(mem).cast::<u16>().cast_const();
+                if p.is_null() {
+                    return None;
+                }
+                let all = std::slice::from_raw_parts(p, units);
+                let len = all.iter().position(|&u| u == 0).unwrap_or(units);
+                let s = String::from_utf16_lossy(all.get(..len).unwrap_or(&[]));
+                let _ = GlobalUnlock(mem);
+                Some(s)
+            })()
+            .map_or(Pasted::Empty, Pasted::Text)
+        };
         let _ = CloseClipboard();
         text
+    }
+}
+
+/// The privacy marks on the clipboard `clipboard_text` holds open (plan L2 D8): which mark formats are there, and the
+/// 4 bytes of `CanIncludeInClipboardHistory`; nothing else of the clipboard is read. A format that cannot be registered
+/// counts as present and a flag that cannot be read whole as 0: what cannot be checked is refused.
+fn clipboard_marks() -> ClipMarks {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    let id = |name: PCWSTR| {
+        // SAFETY: a NUL-terminated literal; a name gives the same id for the whole session.
+        let id = unsafe { RegisterClipboardFormatW(name) };
+        if id == 0 && !LOGGED.swap(true, Relaxed) {
+            log!("launcher: a clipboard mark format could not be registered, such pastes are refused");
+        }
+        (id != 0).then_some(id)
+    };
+    // SAFETY: no preconditions; it asks whether the format is on the clipboard.
+    let there = |id: u32| unsafe { IsClipboardFormatAvailable(id) }.is_ok();
+    // SAFETY: the clipboard is open on this thread; the block it owns is read only while locked, within GlobalSize (at
+    // least the 4 bytes read), and never freed here.
+    let flag = |id: u32| unsafe {
+        let mem = HGLOBAL(GetClipboardData(id).ok()?.0);
+        if GlobalSize(mem) < 4 {
+            return None;
+        }
+        let p = GlobalLock(mem).cast::<u8>().cast_const();
+        if p.is_null() {
+            return None;
+        }
+        let v = <[u8; 4]>::try_from(std::slice::from_raw_parts(p, 4)).ok().map(u32::from_le_bytes);
+        let _ = GlobalUnlock(mem);
+        v
+    };
+    let history = match id(w!("CanIncludeInClipboardHistory")) {
+        Some(h) if !there(h) => None,
+        Some(h) => Some(flag(h).unwrap_or(0)),
+        None => Some(0),
+    };
+    ClipMarks {
+        exclude_monitor: id(w!("ExcludeClipboardContentFromMonitorProcessing")).is_none_or(there),
+        viewer_ignore: id(w!("Clipboard Viewer Ignore")).is_none_or(there),
+        history,
     }
 }
 
@@ -455,7 +507,7 @@ impl SysPort for RealSys {
         set_clipboard_text(text);
     }
 
-    fn paste(&mut self) -> Option<String> {
+    fn paste(&mut self) -> Pasted {
         clipboard_text()
     }
 
