@@ -304,6 +304,20 @@ impl SysPort for RealSys {
         crate::ui::foreground_is_fullscreen()
     }
 
+    fn remote_foreground(&self) -> bool {
+        // SAFETY: no preconditions.
+        let h = unsafe { GetForegroundWindow() };
+        if h.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        // SAFETY: `pid` is writable for the call; a stale window only yields 0.
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        // SAFETY: no preconditions.
+        let me = unsafe { GetCurrentProcessId() };
+        pid != 0 && pid != me && image_matches(pid, powertoys::is_remote_client)
+    }
+
     fn launcher_open(&self) -> bool {
         popup::current() == Some(PopupKind::Launcher)
     }
@@ -528,10 +542,15 @@ thread_local! {
 /// At most this many chord owners are waited on (Command Palette and PowerToys Run, each perhaps twice in a restart).
 const MAX_OWNER_WAITS: usize = 4;
 
-/// The image of process `pid` is a chord owner (`powertoys::is_chord_owner`). Read-only: the process is opened with
-/// PROCESS_QUERY_LIMITED_INFORMATION and closed at once; its path is read into the stack (a path over 512 characters is
-/// not a PowerToys install and is skipped).
+/// The image of process `pid` is a chord owner (`powertoys::is_chord_owner`).
 fn image_is_owner(pid: u32) -> bool {
+    image_matches(pid, powertoys::is_chord_owner)
+}
+
+/// The full image path of process `pid` passes `test`. Read-only: the process is opened with
+/// PROCESS_QUERY_LIMITED_INFORMATION and closed at once; its path is read into the stack, nothing is allocated (a path
+/// over 512 characters is neither a PowerToys install nor a remote client and is skipped).
+fn image_matches(pid: u32, test: fn(&[u16]) -> bool) -> bool {
     // SAFETY: OpenProcess has no preconditions; the handle is closed below.
     let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return false };
     let mut buf = [0u16; 512];
@@ -540,7 +559,7 @@ fn image_is_owner(pid: u32) -> bool {
     let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) };
     // SAFETY: the handle opened above, closed once.
     let _ = unsafe { CloseHandle(process) };
-    ok.is_ok() && buf.get(..len as usize).is_some_and(powertoys::is_chord_owner)
+    ok.is_ok() && buf.get(..len as usize).is_some_and(test)
 }
 
 /// The process ids of the running chord owners (5.7: by image name; PowerToys.exe alone never counts). One

@@ -1,7 +1,8 @@
 //! Leaving PowerToys (SPEC-launcher 5.7): which running programs hold the chord by their own keyboard hook, and the
-//! policy the launcher follows while one runs. Pure: the process list, the chord's outcome and the foreground events
-//! come from the caller (launcher_sys.rs finds the processes and waits on their exit, popup_launcher.rs feeds the
-//! events); nothing of PowerToys is read, changed or ended.
+//! policy the launcher follows while one runs; and the remote-desktop and VM clients the chord goes to while one of them
+//! is in front (5.2.13). Pure: the process list, the chord's outcome and the foreground events come from the caller
+//! (launcher_sys.rs finds the processes and waits on their exit, popup_launcher.rs feeds the events); nothing of
+//! PowerToys is read, changed or ended.
 
 /// The image file names of the programs that answer Alt+Space with a low-level keyboard hook: PowerToys Command Palette
 /// and PowerToys Run. S-PT did not record them on the owner's machine (PowerToys was closed for the L0 session), so these
@@ -17,15 +18,30 @@ pub const ANSWER_MS: u32 = 400;
 /// Unanswered passes in a row that make the launcher take the chord.
 pub const MAX_UNANSWERED: u8 = 2;
 
-/// The file name of a full image path (after the last `\` or `/`) is one of `CHORD_OWNERS`, ASCII case ignored. UTF-16
-/// in, as Windows hands the path over: nothing is allocated per process.
-pub fn is_chord_owner(path: &[u16]) -> bool {
+/// The image file names of the remote-desktop and VM clients that send key combinations to their session (5.2.13, (u)):
+/// Remote Desktop Connection, the Remote Desktop client of Windows App and Azure Virtual Desktop, and Hyper-V's Virtual
+/// Machine Connection. While a window of one of them is in front, the hook's REMOTE flag passes the chord to the session.
+pub const REMOTE_CLIENTS: [&str; 3] = ["mstsc.exe", "msrdc.exe", "vmconnect.exe"];
+
+/// The file name of a full image path (after the last `\` or `/`) is one of `names`, ASCII case ignored. UTF-16 in, as
+/// Windows hands the path over: nothing is allocated per process.
+fn file_name_in(path: &[u16], names: &[&str]) -> bool {
     let sep = |c: &u16| *c == u16::from(b'\\') || *c == u16::from(b'/');
     let name = path.rsplit(sep).next().unwrap_or(path);
-    CHORD_OWNERS.iter().any(|owner| {
-        owner.len() == name.len()
-            && owner.bytes().zip(name).all(|(o, &n)| u8::try_from(n).is_ok_and(|n| n.eq_ignore_ascii_case(&o)))
+    names.iter().any(|known| {
+        known.len() == name.len()
+            && known.bytes().zip(name).all(|(k, &n)| u8::try_from(n).is_ok_and(|n| n.eq_ignore_ascii_case(&k)))
     })
+}
+
+/// The image is one of `CHORD_OWNERS`.
+pub fn is_chord_owner(path: &[u16]) -> bool {
+    file_name_in(path, &CHORD_OWNERS)
+}
+
+/// The image is one of `REMOTE_CLIENTS` (the foreground window's process, at each foreground change).
+pub fn is_remote_client(path: &[u16]) -> bool {
+    file_name_in(path, &REMOTE_CLIENTS)
 }
 
 /// Where the launcher stands with a chord owner (5.7).
@@ -204,6 +220,35 @@ mod tests {
     const CMDPAL: &str = "C:\\Program Files\\PowerToys\\WinUI3Apps\\Microsoft.CmdPal.UI.exe";
     const RUNNER: &str = "C:\\Program Files\\PowerToys\\PowerToys.exe";
     const NOTEPAD: &str = "C:\\Windows\\System32\\notepad.exe";
+
+    #[test]
+    fn remote_flag_from_image_names() {
+        // The foreground process's image as QueryFullProcessImageNameW gives it: the input of the REMOTE pass flag.
+        let remote = [
+            "C:\\Windows\\System32\\mstsc.exe",
+            "C:\\Program Files\\Remote Desktop\\msrdc.exe",
+            "C:\\Windows\\System32\\vmconnect.exe",
+            "c:/windows/system32/MSTSC.EXE",
+            "msrdc.exe",
+        ];
+        for image in remote {
+            assert!(is_remote_client(&w(image)), "{image}");
+            assert!(!is_chord_owner(&w(image)), "{image}: a remote client is not a chord owner");
+        }
+        let local = [
+            NOTEPAD,
+            CMDPAL,
+            RUNNER,
+            "C:\\x\\mstsc.exe.lnk",
+            "C:\\x\\xmstsc.exe",
+            "C:\\mstsc.exe\\notepad.exe",
+            "C:\\x\\vmconnect",
+            "",
+        ];
+        for image in local {
+            assert!(!is_remote_client(&w(image)), "{image}");
+        }
+    }
 
     #[test]
     fn chord_owners_by_file_name() {

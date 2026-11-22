@@ -1906,6 +1906,9 @@ pub(crate) trait SysPort {
     fn d3d_fullscreen(&self) -> bool;
     /// The foreground window covers its whole monitor (`ui::foreground_is_fullscreen`).
     fn fullscreen_foreground(&self) -> bool;
+    /// The foreground window belongs to a remote-desktop or VM client (`powertoys::is_remote_client` of its process's
+    /// image, 5.2.13).
+    fn remote_foreground(&self) -> bool;
     /// The launcher is the open popup.
     fn launcher_open(&self) -> bool;
     /// Opens the launcher centred on the monitor `pick` names; false when nothing is shown (no popups, no surface).
@@ -2559,15 +2562,21 @@ fn foreground_flow(hook: &mut dyn HookPort, sys: &dyn SysPort) {
     let over_pass = with_ctrl(|c| c.over_fullscreen_pass).unwrap_or(true);
     let d3d = sys.d3d_fullscreen();
     let fs = !d3d && over_pass && sys.fullscreen_foreground();
+    // A remote-desktop or VM client in front: the chord goes to its session (5.2.13). The launcher in front is the
+    // dock's own process, never a remote client, so its chord still closes it.
+    let remote = sys.remote_foreground();
     // YIELD while Command Palette answers the chord (L1b-5), never while the launcher is open: its chord closes it.
     let pt_yield = with_ctrl(|c| c.pt_on && c.pt.yields()).unwrap_or(false) && !sys.launcher_open();
-    // REMOTE comes with its detection (L1b-6); the owner probe can force YIELD (S-PT).
+    // The owner probe can force YIELD (S-PT).
     #[cfg(feature = "owner-probe")]
     let yield_ = pt_yield || crate::launcher_probe::force_yield();
     #[cfg(not(feature = "owner-probe"))]
     let yield_ = pt_yield;
-    let flags = pass_flags(d3d, fs, over_pass, false, yield_);
-    with_ctrl(|c| c.flags = flags);
+    let flags = pass_flags(d3d, fs, over_pass, remote, yield_);
+    let was_remote = with_ctrl(|c| std::mem::replace(&mut c.flags, flags).has(PassFlags::REMOTE)) == Some(true);
+    if remote && !was_remote {
+        log!("launcher: a remote or VM client is in front, the chord goes to its session");
+    }
     hook.pass(flags);
 }
 
@@ -3069,6 +3078,8 @@ mod tests {
         is_open: bool,
         /// The window in front can take the window menu.
         menu_ok: bool,
+        /// The window in front belongs to a remote-desktop or VM client.
+        remote: bool,
         /// A chord owner runs (the PowerToys check), and the window asked about is one of its; the looks so far.
         owners: bool,
         owner_fg: bool,
@@ -3085,6 +3096,9 @@ mod tests {
         }
         fn fullscreen_foreground(&self) -> bool {
             self.fs
+        }
+        fn remote_foreground(&self) -> bool {
+            self.remote
         }
         fn launcher_open(&self) -> bool {
             self.is_open
@@ -3288,6 +3302,9 @@ mod tests {
             false
         }
         fn fullscreen_foreground(&self) -> bool {
+            false
+        }
+        fn remote_foreground(&self) -> bool {
             false
         }
         fn launcher_open(&self) -> bool {
@@ -4012,6 +4029,30 @@ mod tests {
         loaded.absorb(&mine);
         assert_eq!(loaded.boost(key, 1_800_000_000), 2 * 16, "the counts add, the later time wins");
         with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    #[test]
+    fn remote_client_in_front_passes_the_chord() {
+        // A remote-desktop or VM client in front: REMOTE, so the hook passes the chord to its session (no post); a
+        // fullscreen session keeps it with over_fullscreen "open" and through a FULLSCREEN pass note; a local window in
+        // front clears it.
+        with_ctrl(|c| {
+            c.over_fullscreen_pass = true;
+            c.flags = PassFlags::default();
+        });
+        let mut hook = FakeHook::default();
+        foreground_flow(&mut hook, &FakeSys { remote: true, ..FakeSys::default() });
+        assert_eq!(hook.passes, [PassFlags::REMOTE]);
+        assert_eq!(with_ctrl(|c| c.flags), Some(PassFlags::REMOTE));
+        with_ctrl(|c| c.over_fullscreen_pass = false);
+        foreground_flow(&mut hook, &FakeSys { remote: true, fs: true, ..FakeSys::default() });
+        assert_eq!(hook.passes.last(), Some(&PassFlags::REMOTE), "over_fullscreen \"open\": still the session's");
+        with_ctrl(|c| c.over_fullscreen_pass = true);
+        pass_note(&mut hook, &FakeSys { remote: true, fs: true, ..FakeSys::default() });
+        assert_eq!(hook.passes.last(), Some(&PassFlags::FULLSCREEN.with(PassFlags::REMOTE)));
+        foreground_flow(&mut hook, &FakeSys::default());
+        assert_eq!(hook.passes.last(), Some(&PassFlags::default()), "a local window: the chord opens again");
+        assert_eq!(with_ctrl(|c| c.flags), Some(PassFlags::default()));
     }
 
     #[test]
