@@ -189,10 +189,6 @@ const KIND_FILE: u8 = 6;
 /// score, so a full `TopK` never drops them.
 const PINNED: Score = Score { tier: 0, learned: Reverse(u16::MAX), idle: false, kind: 0, rank: 0, len: 0 };
 
-/// The implicit run line of Mixed mode sorts below every row matched at tiers 0-5 (5.2.4: "below the app rows"); T7
-/// places it after the top hit instead.
-const IMPLICIT_RUN_TIER: u8 = 6;
-
 /// In Mixed mode at most this many settings rows that only a hidden word matched (tiers 4, 6 and 7).
 const HIDDEN_SETTINGS_CAP: usize = 3;
 
@@ -736,14 +732,9 @@ fn run(q: &Query, cx: &Context, top: &mut TopK) {
     match query::implicit(text, &|w| runline::known_for(w).is_some()) {
         Some(Implicit::Command) => {
             let Some(line) = runline::classify(text) else { return };
-            let score = Score {
-                tier: IMPLICIT_RUN_TIER,
-                learned: Reverse(0),
-                idle: true,
-                kind: KIND_RUN,
-                rank: 0,
-                len: chars_u16(text),
-            };
+            // `Results::sync` places it: right after a top hit that matched by a name, else first. Pinned, so a full
+            // `TopK` never drops it.
+            let score = Score { kind: KIND_RUN, ..PINNED };
             if top.accepts(&score) {
                 let detail = run_detail(&line.line);
                 top.push(run_item(line, Kind::RunLine, detail, verbs(Kind::RunLine, false, None), score));
@@ -822,18 +813,25 @@ fn is_executable_file(r: &Item) -> bool {
     matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. })
 }
 
-/// The rows of the current query in the merge order of 5.2.6 (notices, the answer, the ranked rows, late rows, the
-/// web row) and the selection, kept by `ItemKey`. Late rows are only ever added below the synchronous rows and never
-/// move a row at or above the selection; every row belongs to the generation of the last `sync`.
+/// The rows of the current query in the merge order of 5.2.6 (notices, the answer, the ranked rows with the implicit run
+/// row after the top hit, late rows) and the selection, kept by `ItemKey`. The web row is not a ranked row: it has its
+/// own slot, the position `min(n, visible - 1)` among the `n` other rows, so it is on screen however many rows match.
+/// Late rows are only ever added below the synchronous rows and never move a row at or above the selection; every row
+/// belongs to the generation of the last `sync`.
 #[derive(Debug, Default)]
 pub struct Results {
+    /// The view order, the web row included at `web_at`.
     rows: Vec<Item>,
     sel: Option<ItemKey>,
     gen: u64,
-    /// Notices, the answer and the ranked rows: the rows of the keystroke's own frame.
+    /// Notices, the answer and the ranked rows (the web row not counted): the rows of the keystroke's own frame.
     sync_len: usize,
-    /// Late rows right after them, above the web row.
+    /// Late rows right after them (the web row not counted).
     late_len: usize,
+    /// Where the web row sits in `rows`.
+    web_at: Option<usize>,
+    /// The rows the view shows (`LauncherOpts::rows`), as the last `sync` was given them.
+    visible: usize,
     /// The query was in Mixed mode, where an executable file row is never the default.
     mixed: bool,
     /// The field holds text: a notice's choice is never the default then, so Enter runs what was typed for.
@@ -878,18 +876,57 @@ impl Results {
         }
     }
 
-    /// Whether anything but notices and the web row answered: when nothing did, tier 7 is worth asking.
+    /// Whether anything but notices and the web row answered: when nothing did, the typo rewrite is worth asking.
     pub fn has_matches(&self) -> bool {
         self.rows.iter().any(|r| r.kind != Kind::Notice && r.key != web_search_key())
     }
 
-    /// The synchronous rows of a keystroke. A new generation drops every older row and takes the default selection; the
-    /// same generation again (a refresh) keeps its late rows and the selected key when it is still there.
-    pub fn sync(&mut self, q: &Query, top: TopK) {
+    /// Where the web row goes among `n` other rows: after them, but never below the last visible row.
+    fn web_slot(&self, n: usize) -> usize {
+        n.min(self.visible.saturating_sub(1))
+    }
+
+    /// Puts the web row (when there is one) at its slot among the other rows. It only ever moves down: the other rows
+    /// only grow in number between two syncs.
+    fn place_web(&mut self) {
+        let Some(w) = self.web_at else { return };
+        if w >= self.rows.len() {
+            return;
+        }
+        let item = self.rows.remove(w);
+        let at = self.web_slot(self.rows.len());
+        self.rows.insert(at, item);
+        self.web_at = Some(at);
+    }
+
+    /// The position in `rows` of the `k`-th row that is not the web row.
+    fn row_of_other(&self, k: usize) -> usize {
+        match self.web_at {
+            Some(w) if k >= w => k + 1,
+            _ => k,
+        }
+    }
+
+    /// `rows.insert`, keeping `web_at` right.
+    fn insert_row(&mut self, at: usize, item: Item) {
+        self.rows.insert(at, item);
+        if let Some(w) = self.web_at.as_mut() {
+            if at <= *w {
+                *w += 1;
+            }
+        }
+    }
+
+    /// The synchronous rows of a keystroke; `visible` is the number of rows the view shows. A new generation drops every
+    /// older row and takes the default selection; the same generation again (a refresh) keeps its late rows and the
+    /// selected key when it is still there.
+    pub fn sync(&mut self, q: &Query, top: TopK, visible: usize) {
         let same = q.gen == self.gen;
         let keep = if same { self.sel } else { None };
         let late = if same { self.take_late() } else { Vec::new() };
+        self.visible = visible.max(1);
         self.rows.clear();
+        self.web_at = None;
         self.rows.extend(self.notices.iter().cloned());
         let mut web = None;
         let mut ranked = Vec::with_capacity(top.len());
@@ -902,21 +939,38 @@ impl Results {
                 ranked.push(item);
             }
         }
+        if q.mode == Mode::Mixed {
+            // The implicit run row follows a top hit that matched by a name (tiers 0-2), else it is the first ranked row.
+            if let Some(i) = ranked.iter().position(|r| r.from == ProviderId::Run && r.kind == Kind::RunLine) {
+                let run = ranked.remove(i);
+                let named_top = ranked.first().is_some_and(|r| r.score.tier <= rank::T_WORD);
+                ranked.insert(usize::from(named_top).min(ranked.len()), run);
+            }
+        }
         self.rows.append(&mut ranked);
         self.sync_len = self.rows.len();
         self.late_len = late.len();
         self.rows.extend(late);
-        self.rows.extend(web);
+        if let Some(w) = web {
+            self.rows.push(w);
+            self.web_at = Some(self.rows.len() - 1);
+            self.place_web();
+        }
         self.gen = q.gen;
         self.mixed = q.mode == Mode::Mixed;
         self.typed = !q.raw.is_empty();
         self.sel = keep.filter(|k| self.rows.iter().any(|r| r.key == *k)).or_else(|| self.default_key(q));
     }
 
-    /// The rows added after the last `sync` (they sit after the synchronous rows, around the web row).
+    /// The rows added after the last `sync`, the web row taken out (it is placed again by the next `sync`).
     fn take_late(&mut self) -> Vec<Item> {
+        if let Some(w) = self.web_at.take() {
+            if w < self.rows.len() {
+                self.rows.remove(w);
+            }
+        }
         let start = self.sync_len.min(self.rows.len());
-        self.rows.drain(start..).filter(|r| r.key != web_search_key()).collect()
+        self.rows.drain(start..).collect()
     }
 
     fn may_default(&self, r: &Item) -> bool {
@@ -937,22 +991,26 @@ impl Results {
         self.rows.iter().find(|r| alone && r.key == web && !r.verbs.is_empty()).map(|r| r.key)
     }
 
-    /// A late batch (files, tier 7). False, and nothing changes, unless it is of the current generation. Its rows go
-    /// below the synchronous and earlier late rows, above the web row, unless the web row is selected: then below it.
-    /// A row already shown is not added twice. With nothing selected, the first late row that may be the default is.
+    /// A late batch (files, L2). False, and nothing changes, unless it is of the current generation. Its rows go below
+    /// the synchronous and earlier late rows and before the web row's slot (the web row moves down while it is the last
+    /// row, and stays at the last visible row once the rows fill the view), unless the selection is at or below the web
+    /// row: then they go after everything and nothing moves. A row already shown is not added twice. With nothing
+    /// selected, the first late row that may be the default is.
     pub fn late(&mut self, b: Batch, current_gen: u64) -> bool {
         if b.gen != current_gen || b.gen != self.gen {
             return false;
         }
-        let first_late = self.sync_len + self.late_len;
-        let below_web = self.selected_index().is_some_and(|i| i >= first_late);
-        let mut at = if below_web { self.rows.len() } else { first_late };
+        let below_web = match (self.web_at, self.selected_index()) {
+            (Some(w), Some(i)) => i >= w,
+            _ => false,
+        };
+        let mut at = if below_web { self.rows.len() } else { self.row_of_other(self.sync_len + self.late_len) };
         let from = at;
         for item in b.items {
             if self.rows.iter().any(|r| r.key == item.key) {
                 continue;
             }
-            self.rows.insert(at, item);
+            self.insert_row(at, item);
             at += 1;
             if !below_web {
                 self.late_len += 1;
@@ -961,6 +1019,9 @@ impl Results {
         if self.sel.is_none() {
             let added = self.rows.get(from..at).unwrap_or(&[]);
             self.sel = added.iter().find(|r| !r.destructive && self.may_default(r)).map(|r| r.key);
+        }
+        if !below_web {
+            self.place_web();
         }
         true
     }
@@ -971,11 +1032,31 @@ impl Results {
     pub fn remove(&mut self, key: ItemKey) -> Option<Item> {
         self.notices.retain(|n| n.key != key);
         let i = self.rows.iter().position(|r| r.key == key)?;
+        let was_other = self.web_at != Some(i);
+        let k = match self.web_at {
+            Some(w) if i > w => i - 1,
+            _ => i,
+        };
         let item = self.rows.remove(i);
-        if i < self.sync_len {
-            self.sync_len -= 1;
-        } else if i < self.sync_len + self.late_len {
-            self.late_len -= 1;
+        match self.web_at {
+            Some(w) if w == i => self.web_at = None,
+            Some(w) if i < w => self.web_at = Some(w - 1),
+            _ => {}
+        }
+        if was_other {
+            if k < self.sync_len {
+                self.sync_len -= 1;
+            } else if k < self.sync_len + self.late_len {
+                self.late_len -= 1;
+            }
+            // The web row only moves down, so only while the selection is above it.
+            let selected_below = match (self.web_at, self.selected_index()) {
+                (Some(w), Some(s)) => s >= w,
+                _ => false,
+            };
+            if !selected_below {
+                self.place_web();
+            }
         }
         if self.sel == Some(key) {
             let next = self.rows.get(i).or_else(|| self.rows.last());
@@ -1100,7 +1181,7 @@ pub(crate) mod tests {
         /// The results of a query of generation `gen`.
         pub(crate) fn sync(&self, res: &mut Results, raw: &str, gen: u64) {
             let q = query::parse_query(raw, &self.opts.prefixes, NUM_IT, gen);
-            res.sync(&q, query_all(&q, &self.cx(), &mut Budget::default()));
+            res.sync(&q, query_all(&q, &self.cx(), &mut Budget::default()), usize::from(self.opts.rows));
         }
     }
 
@@ -1160,6 +1241,91 @@ pub(crate) mod tests {
         // A row already there is not added twice.
         assert!(res.late(files(3, &["zzqq.txt"]), 3));
         assert_eq!(res.rows().len(), 2);
+    }
+
+    fn web_index(res: &Results) -> usize {
+        res.rows().iter().position(|r| r.key == web_search_key()).unwrap()
+    }
+
+    #[test]
+    fn run_row_after_the_top_name_hit() {
+        let mut fx = Fx::new();
+        fx.apps = vec![CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calculator", Keys::default(), 5)];
+        for i in 0..11 {
+            fx.apps.push(CatApp::new(&format!("Calc{i}.exe"), &format!("Calc {i:02}"), Keys::default(), 10 + i));
+        }
+        let mut res = Results::default();
+        fx.sync(&mut res, "calc", 1);
+        assert!(res.rows().len() > 12, "twelve apps and the run row: {}", res.rows().len());
+        assert_eq!(res.rows()[0].title.as_ref(), "Calculator");
+        assert_eq!((res.rows()[1].kind, res.rows()[1].title.as_ref()), (Kind::RunLine, "calc"));
+        assert_eq!(res.selected_index(), Some(0), "the name hit stays the default");
+        assert_eq!(web_index(&res), 7, "the web row is the last of the 8 visible");
+    }
+
+    #[test]
+    fn run_row_first_after_a_hidden_top() {
+        let mut fx = Fx::new();
+        fx.apps = vec![CatApp::new(
+            "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe",
+            "Command Prompt",
+            Keys::from(&[("ipconfig", 1_500)][..]),
+            5,
+        )];
+        let mut res = Results::default();
+        fx.sync(&mut res, "ipconfig", 1);
+        assert_eq!((res.rows()[0].kind, res.rows()[0].title.as_ref()), (Kind::RunLine, "ipconfig"));
+        assert_eq!(res.rows()[1].title.as_ref(), "Command Prompt", "found by its synonym only");
+        assert_eq!(res.selected_index(), Some(0), "the run row is the default");
+    }
+
+    #[test]
+    fn web_row_always_visible_from_3_chars() {
+        let mut fx = Fx::new();
+        fx.apps = (0..20)
+            .map(|i| CatApp::new(&format!("Zeta{i}.exe"), &format!("Zeta {i:02}"), Keys::default(), i))
+            .collect();
+        let mut res = Results::default();
+        fx.sync(&mut res, "zet", 1);
+        assert_eq!(res.rows().len(), 21);
+        assert_eq!(web_index(&res), 7, "row 8 of 8 whatever matched");
+        assert_ne!(res.selected().unwrap().key, web_search_key());
+        // Two matches: the web row follows them.
+        fx.apps.truncate(2);
+        fx.sync(&mut res, "zet", 2);
+        assert_eq!(web_index(&res), 2);
+        assert_eq!(res.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn late_rows_fill_up_to_the_web_slot() {
+        let mut fx = Fx::new();
+        fx.apps =
+            (0..5).map(|i| CatApp::new(&format!("Zeta{i}.exe"), &format!("Zeta {i}"), Keys::default(), i)).collect();
+        let mut res = Results::default();
+        fx.sync(&mut res, "zet", 1);
+        assert_eq!(web_index(&res), 5, "five rows, then the web row");
+        let before = keys(&res);
+        assert!(res.late(files(1, &["zet.a", "zet.b", "zet.c", "zet.d"]), 1));
+        let titles: Vec<&str> = res.rows().iter().map(|r| &*r.title).collect();
+        assert_eq!(titles[..5], ["Zeta 0", "Zeta 1", "Zeta 2", "Zeta 3", "Zeta 4"]);
+        assert_eq!(titles[5..7], ["zet.a", "zet.b"], "two late rows fill the view");
+        assert_eq!(web_index(&res), 7, "the web row is the 8th");
+        assert_eq!(titles[8..], ["zet.c", "zet.d"], "the other two go below it");
+        assert_eq!(keys(&res)[..5], before[..5], "no row at or above the selection moved");
+        // With the web row selected, the whole batch goes after it and it does not move.
+        fx.sync(&mut res, "zet", 2);
+        let web = web_index(&res);
+        assert!(res.select_index(web));
+        assert!(res.late(files(2, &["zet.a", "zet.b", "zet.c", "zet.d"]), 2));
+        assert_eq!(web_index(&res), 5);
+        assert_eq!(res.selected().unwrap().key, web_search_key());
+        assert_eq!(res.rows().len(), 10);
+        assert!(res.rows()[6..].iter().all(|r| r.from == ProviderId::Files));
+        // A row taken out above the web row pulls it up only as far as the slot allows.
+        let key = res.rows()[0].key;
+        assert!(res.remove(key).is_some());
+        assert_eq!(res.rows().len(), 9);
     }
 
     #[test]

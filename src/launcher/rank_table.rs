@@ -219,7 +219,7 @@ impl Shown {
         let q = query::parse_query(raw, &w.opts.prefixes, w.num, 1);
         let top = providers::query_all(&q, &w.cx(), &mut Budget::default());
         let mut res = Results::default();
-        res.sync(&q, top);
+        res.sync(&q, top, usize::from(w.opts.rows));
         Shown {
             rows: res.rows().to_vec(),
             sel: res.selected_index(),

@@ -667,7 +667,7 @@ impl Session {
         let raw = self.last_query();
         let q = query::parse_query(&raw, &cx.opts.prefixes, cx.num, self.gen);
         let top = providers::query_all(&q, cx, &mut self.budget);
-        self.results.sync(&q, top);
+        self.results.sync(&q, top, usize::from(cx.opts.rows));
         self.mode = q.mode;
         self.folded.clone_from(&q.folded);
         let mut fx = vec![Effect::Relayout];
