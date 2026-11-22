@@ -267,6 +267,8 @@ pub(crate) struct Ctx<'a> {
     pub trust_elevated: bool,
     /// A PowerToys chord owner (Command Palette or PowerToys Run) is running (`popup_launcher::pt_detected`).
     pub powertoys: bool,
+    /// The last chord picked on the Launcher page was refused because another app holds it: `Some(shift)` is Alt+Shift+Space.
+    pub chord_held: Option<bool>,
 }
 
 // ------------------------------------------------------------------ helpers moved from the old popup
@@ -402,6 +404,25 @@ pub(crate) fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
             }
         }
         _ => {}
+    }
+}
+
+/// The notice under the Shortcut row after a refused pick.
+fn chord_held_text(shift: bool) -> &'static str {
+    if shift {
+        tr("Another app holds Alt+Shift+Space", "Un'altra app usa Alt+Maiusc+Spazio")
+    } else {
+        tr("Another app holds Alt+Space", "Un'altra app usa Alt+Spazio")
+    }
+}
+
+/// The chord an edit would newly take, to be probed first: `Some(shift)` for a pick of Alt+Space or Alt+Shift+Space that
+/// differs from the config's. Off, the current chord and every other edit need no probe.
+pub(crate) fn chord_to_probe(e: Edit, current: &str) -> Option<bool> {
+    match e {
+        Edit::Choose(Setting::LauncherChord, 0) if current != "alt+space" => Some(false),
+        Edit::Choose(Setting::LauncherChord, 1) if current != "alt+shift+space" => Some(true),
+        _ => None,
     }
 }
 
@@ -1144,6 +1165,14 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             sc,
         ),
     ];
+    if let Some(shift) = ctx.chord_held {
+        v.push(row(
+            glyphs::info_shape,
+            tr("Not changed", "Non cambiata"),
+            None,
+            Control::Status(chord_held_text(shift).to_string()),
+        ));
+    }
     if ctx.powertoys && c.launcher.chord == "alt+space" {
         v.push(choice(
             glyphs::info_shape,
@@ -1281,6 +1310,7 @@ mod tests {
             log_path: None,
             trust_elevated: false,
             powertoys: false,
+            chord_held: None,
         }
     }
 
@@ -1778,7 +1808,13 @@ mod tests {
         c.launcher.prefixes.insert("#".into(), "calc".into());
         let r = launcher_rows(&c, false);
         assert!(toggle_of(&r, Setting::LauncherProvider("calc")).and_then(|t| t.2).unwrap().ends_with("Prefix \"#\""));
-        assert!(r.iter().any(|x| matches!(&x.control, Control::Status(s) if s.contains('#') && s.contains("??") && s.ends_with("file  #"))));
+        let table = r.iter().find_map(|x| match &x.control {
+            Control::Status(s) if s.contains("??") => Some(s.clone()),
+            _ => None,
+        });
+        let table = table.unwrap();
+        assert!(table.contains('#'), "{table}");
+        assert!(table.ends_with("file  #"), "{table}");
         // The table reads in the defaults' order, the owner's own prefixes after them.
         let d = launcher_rows(&Config::default(), false);
         assert!(d.iter().any(|x| x.control == Control::Status("=  >  <  ??  $  )  :  file".into())));
@@ -1811,6 +1847,20 @@ mod tests {
         assert_eq!((d.launcher.chord.as_str(), d.launcher.offer_done), ("alt+shift+space", true));
         apply_edit(&mut d, Edit::Choose(Setting::LauncherPowerToys, 1), &sc);
         assert_eq!((d.launcher.with_powertoys.as_str(), d.launcher.powertoys_done), ("take", true));
+        // Only a pick of another chord is probed; Off and the current chord are not.
+        let pick = |j| Edit::Choose(Setting::LauncherChord, j);
+        assert_eq!(chord_to_probe(pick(0), "off"), Some(false));
+        assert_eq!(chord_to_probe(pick(1), "alt+space"), Some(true));
+        assert_eq!(chord_to_probe(pick(0), "alt+space"), None);
+        assert_eq!(chord_to_probe(pick(2), "alt+space"), None);
+        assert_eq!(chord_to_probe(Edit::Choose(Setting::LauncherMonitor, 0), "off"), None);
+        // A refused pick leaves a line under the Shortcut row.
+        let st = idle();
+        let mut cx = ctx(&sc, &st);
+        cx.chord_held = Some(true);
+        let r = rows(Page::Launcher, &Config::default(), &cx);
+        assert!(r.iter().any(|x| x.control == Control::Status("Another app holds Alt+Shift+Space".into())));
+        assert!(!launcher_rows(&Config::default(), false).iter().any(|x| x.label == "Not changed"));
         // Every value the page writes is one the config accepts untouched.
         for set in
             [Setting::LauncherChord, Setting::LauncherPowerToys, Setting::LauncherMonitor, Setting::LauncherFullscreen]

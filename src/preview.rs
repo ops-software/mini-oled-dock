@@ -703,6 +703,7 @@ fn settings_png_with(
         log_path: Some("C:\\ProgramData\\mini-oled-dock\\dock.log"),
         trust_elevated: false,
         powertoys: false,
+        chord_held: None,
     };
     // The mini bar is drawn by the bar renderer, which reads the global config.
     crate::config::set(c.clone());

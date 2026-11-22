@@ -1103,6 +1103,7 @@ mod tests {
             log_path: None,
             trust_elevated: false,
             powertoys: false,
+            chord_held: None,
         }
     }
 

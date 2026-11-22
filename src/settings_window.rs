@@ -238,6 +238,8 @@ struct Win {
     dpi: u32,
     client: (i32, i32),
     page: Page,
+    /// A chord pick refused because another app holds it (`settings_pages::chord_to_probe`); shown under the row.
+    chord_held: Option<bool>,
     focus: Focus,
     scroll: i32,
     /// Wheel delta not yet turned into a notch.
@@ -461,6 +463,7 @@ impl Win {
             log_path: self.log_path.as_deref(),
             trust_elevated: self.trust_elevated,
             powertoys: crate::popup::popup_launcher::pt_detected(),
+            chord_held: self.chord_held,
         }
     }
 
@@ -613,6 +616,16 @@ impl Win {
 
     /// A click on a setting: written at once and applied.
     fn save(&mut self, e: Edit) {
+        if matches!(e, Edit::Choose(settings_pages::Setting::LauncherChord, _)) {
+            // A new chord is written only while no other app holds it, as the offer in Start does.
+            let probe = settings_pages::chord_to_probe(e, &config::get().launcher.chord);
+            self.chord_held = probe.filter(|shift| !crate::launcher_sys::chord_is_free(*shift));
+            if self.chord_held.is_some() {
+                log!("settings: another app holds the launcher chord, nothing written");
+                self.refresh();
+                return;
+            }
+        }
         if let Err(err) = config::modify(|c| apply_edit(c, e, &self.screens)) {
             // Not writable (or the write failed): the change still applies for this session.
             log!("settings: saving failed ({err}), applied in memory only");
@@ -815,6 +828,7 @@ fn open_window(inst: HINSTANCE) -> Result<(), String> {
         dpi,
         client,
         page: Page::Appearance,
+        chord_held: None,
         focus: Focus::Nav,
         scroll: 0,
         wheel: 0,
