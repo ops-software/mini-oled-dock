@@ -3579,12 +3579,15 @@ fn is_foreground(h: HWND) -> bool {
     fg == h
 }
 
-/// Presses and releases F15 (a key no app uses): unlocks SetForegroundWindow.
+/// Presses and releases F15 (a key no app uses): unlocks SetForegroundWindow. Tagged INJECT_TAG like every key the dock
+/// injects (launcher lint 13): an owner-probe build that accepts injected keys would otherwise buffer it as typed.
 /// Returns the number of events accepted by SendInput.
 fn send_f15() -> u32 {
     let ev = |flags: KEYBD_EVENT_FLAGS| INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_F15, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: VK_F15, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: hook::INJECT_TAG },
+        },
     };
     let inputs = [ev(KEYBD_EVENT_FLAGS(0)), ev(KEYEVENTF_KEYUP)];
     // SAFETY: slice of 2 initialized INPUTs; cbSize = size_of::<INPUT>() as required.

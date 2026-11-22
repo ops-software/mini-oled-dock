@@ -826,6 +826,41 @@ fn system_keys_are_routed_in_one_place() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- lint 13: every key the dock injects carries its tag ----------------------------------------------------------
+
+/// Every `dwExtraInfo:` of the dock's code (its tests aside) is INJECT_TAG. An owner-probe build that accepts injected
+/// keys (`hook::admitted`) tells the dock's own events from a test agent's by that tag alone: an untagged injection
+/// would reach the Win key, the chord and the type-ahead there as a key press.
+fn tag_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    let end = test_start(text);
+    for (at, _) in text.match_indices("dwExtraInfo:") {
+        if at >= end {
+            break;
+        }
+        let rest = text.get(at + "dwExtraInfo:".len()..).unwrap_or("");
+        let value = rest.split([',', '}']).next().unwrap_or("").trim();
+        if !value.ends_with("INJECT_TAG") {
+            v.push(format!("{path}:{}: an injected event without INJECT_TAG ({value})", line_of(text, at)));
+        }
+    }
+    v
+}
+
+#[test]
+fn injected_keys_carry_the_tag() {
+    let tagged = "KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: hook::INJECT_TAG }";
+    assert!(tag_violations("src/ui.rs", tagged).is_empty());
+    assert!(tag_violations("src/hook.rs", "dwExtraInfo: INJECT_TAG,\n").is_empty());
+    assert!(tag_violations("src/shell_thread.rs", "dwExtraInfo: crate::hook::INJECT_TAG,").is_empty());
+    let bare = "KEYBDINPUT { wVk: VK_F15, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 }";
+    assert_eq!(tag_violations("src/ui.rs", bare), ["src/ui.rs:1: an injected event without INJECT_TAG (0)"]);
+    // Tests build hook structs with any extra info.
+    assert!(tag_violations("src/hook.rs", &format!("#[cfg(test)]\nmod tests {{\n{bare}\n}}")).is_empty());
+    let all = scan_tree(tag_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {

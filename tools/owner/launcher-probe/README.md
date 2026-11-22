@@ -31,10 +31,11 @@ The dock built with `--features owner-probe` (never a release the owner installs
 driven by a test agent instead of physical presses: `DOCK_LAUNCHER_ACCEPT_INJECTED=1`, read once when the keyboard
 hook starts. With it, the hook treats keys injected by other apps (LLKHF_INJECTED without the dock's own INJECT_TAG)
 as physical, for everything it does with them: the Win key, the launcher chord, the type-ahead and the gesture
-evidence of Ctrl+Shift+Enter. Its purpose is the L0 session (L0-2) run with SendInput while the owner is away. The
-dock's own tagged re-injections still pass through untouched. The dock log says so at start (`launcher probe:
-injected keys count as physical`). A build without the feature has no such code path and the variable name is not
-in its binary: every release ignores injected keys.
+evidence of Ctrl+Shift+Enter. Its purpose is the L0 session (L0-2) run with SendInput while the owner is away. Every
+key the dock injects itself carries that tag (the F15 of its foreground fallback too: launcher lint 13) and still
+passes through untouched. The dock log says so at start (`launcher probe: injected keys count as physical`). A build
+without the feature has no such code path and the variable name is not in its binary: every release ignores injected
+keys.
 
 Results obtained with synthetic keys must be labelled as such: they show what the dock does with SendInput, not with
 a person's key presses (for example the hook's kb.time of a synthetic key is stamped by SendInput).
