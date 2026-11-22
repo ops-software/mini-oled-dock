@@ -8,11 +8,17 @@
 
 use std::sync::atomic::Ordering::Relaxed;
 
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
-use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
@@ -20,10 +26,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime, GetShellWindow, IsWindow,
+    IsWindowVisible, PostMessageW, SetTimer, SC_KEYMENU, WM_CLOSE, WM_SYSCOMMAND,
+};
 
 use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
-use crate::launcher::model::Mods;
+use crate::launcher::model::{CommandId, Mods};
 use crate::launcher::session::LaunchReq;
 use crate::log;
 use crate::popup::popup_launcher::{typed_of, HookPort, Launcher, MonitorPick, SysPort, Typed};
@@ -61,6 +70,14 @@ impl HookPort for RealHook {
     fn take(&mut self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
         hook::take_typeahead(seq, out)
     }
+
+    fn reset_mods(&mut self) {
+        hook::reset_modifiers();
+    }
+
+    fn gesture_time(&mut self) -> Option<u32> {
+        hook::take_gesture_time()
+    }
 }
 
 /// Windows and the popup host, for the controller (UI thread only).
@@ -85,6 +102,114 @@ fn target_monitor(pick: MonitorPick) -> HMONITOR {
             MonitorPick::Primary => MonitorFromPoint(primary, MONITOR_DEFAULTTOPRIMARY),
         }
     }
+}
+
+fn hw(h: isize) -> HWND {
+    HWND(h as *mut core::ffi::c_void)
+}
+
+/// Hidden by DWM (another virtual desktop, a suspended app): not a window to give the foreground to.
+fn cloaked(h: HWND) -> bool {
+    let mut v = 0u32;
+    // SAFETY: `v` is a writable u32, the size passed is its size; a stale window only makes the call fail.
+    let r = unsafe {
+        DwmGetWindowAttribute(h, DWMWA_CLOAKED, (&mut v as *mut u32).cast(), std::mem::size_of::<u32>() as u32)
+    };
+    r.is_ok() && v != 0
+}
+
+/// A window the window menu can act on: not null, not the desktop, still there.
+fn acts_on(h: isize) -> bool {
+    if h == 0 {
+        return false;
+    }
+    let w = hw(h);
+    // SAFETY: the three calls accept any handle and have no other preconditions.
+    unsafe { IsWindow(Some(w)).as_bool() && w != GetDesktopWindow() && w != GetShellWindow() }
+}
+
+/// `text` to the clipboard as `CF_UNICODETEXT`, owned by the dock window (a clipboard opened without an owner refuses
+/// `SetClipboardData` after `EmptyClipboard`).
+fn set_clipboard_text(text: &str) {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: the clipboard is opened and closed here, on this thread; the global block is written within its size
+    // (`wide.len()` units) while locked and handed to the clipboard, which owns it from then on (freed here only when
+    // SetClipboardData refused it).
+    unsafe {
+        if let Err(e) = OpenClipboard(Some(crate::hwnd())) {
+            log!("launcher: OpenClipboard failed: {e}");
+            return;
+        }
+        let r = (|| -> windows::core::Result<()> {
+            EmptyClipboard()?;
+            let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)?;
+            let p = GlobalLock(mem).cast::<u16>();
+            if p.is_null() {
+                let _ = GlobalFree(Some(mem));
+                return Err(windows::core::Error::from_thread());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+            let _ = GlobalUnlock(mem);
+            if let Err(e) = SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(mem.0))) {
+                let _ = GlobalFree(Some(mem));
+                return Err(e);
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        if let Err(e) = r {
+            log!("launcher: the copy to the clipboard failed: {e}");
+        }
+    }
+}
+
+/// The clipboard's `CF_UNICODETEXT`, at most 64 KiB of it (up to its first NUL).
+fn clipboard_text() -> Option<String> {
+    const MAX_UNITS: usize = 32 * 1024;
+    // SAFETY: the clipboard is opened and closed here, on this thread; the block the clipboard owns is read only while
+    // locked, within GlobalSize, and never freed here.
+    unsafe {
+        OpenClipboard(Some(crate::hwnd())).ok()?;
+        let text = (|| {
+            let h = GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()?;
+            let mem = HGLOBAL(h.0);
+            let units = (GlobalSize(mem) / 2).min(MAX_UNITS);
+            let p = GlobalLock(mem).cast::<u16>().cast_const();
+            if p.is_null() {
+                return None;
+            }
+            let all = std::slice::from_raw_parts(p, units);
+            let len = all.iter().position(|&u| u == 0).unwrap_or(units);
+            let s = String::from_utf16_lossy(all.get(..len).unwrap_or(&[]));
+            let _ = GlobalUnlock(mem);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        text
+    }
+}
+
+/// The only `SetTimer` of the launcher (lint 7): a one-shot on the popup window; `popup_launcher::on_timer` kills it
+/// before it acts.
+fn arm_once(id: usize, ms: u32) {
+    let Some(hwnd) = popup::last_hwnd() else { return };
+    // SAFETY: our popup window (same thread); its wnd_proc forwards the launcher's ids to popup_launcher::on_timer.
+    if unsafe { SetTimer(Some(hwnd), id, ms, None) } == 0 {
+        log!("launcher: SetTimer failed");
+    }
+}
+
+/// The power action of a command row.
+fn power_action(id: CommandId) -> Option<crate::power::PowerAction> {
+    use crate::power::PowerAction;
+    Some(match id {
+        CommandId::Lock => PowerAction::Lock,
+        CommandId::Sleep => PowerAction::Sleep,
+        CommandId::Restart => PowerAction::Restart,
+        CommandId::ShutDown => PowerAction::Shutdown,
+        CommandId::SignOut => PowerAction::SignOut,
+        CommandId::Registry | CommandId::WindowMenu | CommandId::ClipboardHistory => return None,
+    })
 }
 
 /// The effective DPI of a monitor (96 when it cannot be read).
@@ -184,6 +309,87 @@ impl SysPort for RealSys {
             ToUnicodeEx(u32::from(rec.vk), u32::from(rec.scan), &state, &mut buf, 0x4, Some(GetKeyboardLayout(0)))
         };
         typed_of(n, &buf)
+    }
+
+    fn foreground(&self) -> isize {
+        // SAFETY: no preconditions.
+        unsafe { GetForegroundWindow() }.0 as isize
+    }
+
+    fn activate(&mut self, h: isize) {
+        crate::apps::activate_window(h);
+    }
+
+    fn restore(&mut self, h: isize) {
+        let w = hw(h);
+        // SAFETY: IsWindowVisible accepts any handle.
+        if h != 0 && unsafe { IsWindowVisible(w) }.as_bool() && !cloaked(w) {
+            crate::ui::force_foreground(w);
+        }
+    }
+
+    fn copy(&mut self, text: &str) {
+        set_clipboard_text(text);
+    }
+
+    fn paste(&mut self) -> Option<String> {
+        clipboard_text()
+    }
+
+    fn close_window(&mut self, h: isize) {
+        // SAFETY: PostMessageW accepts any handle; a window that is gone makes it fail.
+        if let Err(e) = unsafe { PostMessageW(Some(hw(h)), WM_CLOSE, WPARAM(0), LPARAM(0)) } {
+            log!("launcher: PostMessageW(WM_CLOSE) failed: {e}");
+        }
+    }
+
+    fn window_menu(&mut self, h: isize) {
+        if !acts_on(h) {
+            log!("launcher: no window for the window menu");
+            return;
+        }
+        // SAFETY: as above; SC_KEYMENU with ' ' opens the window menu as Alt+Space does.
+        let r = unsafe { PostMessageW(Some(hw(h)), WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0x20)) };
+        if let Err(e) = r {
+            log!("launcher: PostMessageW(SC_KEYMENU) failed: {e}");
+        }
+    }
+
+    fn shell(&mut self, r: ShellRequest) {
+        crate::shell_thread::request(r);
+    }
+
+    fn power(&mut self, id: CommandId) {
+        if let Some(a) = power_action(id) {
+            crate::power::run(a);
+        }
+    }
+
+    fn open_settings(&mut self) {
+        // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
+        let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) };
+        if let Err(e) = r {
+            log!("launcher: PostMessageW(WM_DOCK_OPEN_SETTINGS) failed: {e}");
+        }
+    }
+
+    fn arm(&mut self, id: usize, ms: u32) {
+        arm_once(id, ms);
+    }
+
+    fn msg_time(&self) -> u32 {
+        // SAFETY: no preconditions; the time of the message being handled, on the GetTickCount clock.
+        unsafe { GetMessageTime() as u32 }
+    }
+
+    fn msg_extra(&self) -> usize {
+        // SAFETY: no preconditions.
+        unsafe { GetMessageExtraInfo() }.0 as usize
+    }
+
+    fn now_ms(&self) -> u64 {
+        // SAFETY: no preconditions.
+        unsafe { GetTickCount64() }
     }
 }
 

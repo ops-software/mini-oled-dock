@@ -79,6 +79,13 @@ pub enum LaunchReq {
     Registry,
 }
 
+impl LaunchReq {
+    /// The launches that end in Windows' UAC prompt: the hook forgets its tracked modifiers after them (5.2.11).
+    pub fn elevates(&self) -> bool {
+        matches!(self, LaunchReq::AppAdmin(_) | LaunchReq::RunAsTyped { .. })
+    }
+}
+
 /// A key the hook kept while the launcher was not yet foreground, rebuilt by the view (L1a-15b).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReplayKey {

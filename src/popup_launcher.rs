@@ -18,9 +18,9 @@ use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
 use crate::launcher::catalog::CatApp;
 use crate::launcher::field::KeyEvent;
-use crate::launcher::gesture;
+use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::model::{
-    GlyphId, IconRef, Item, Kind, Mods, NumberStyle, Payload, ProviderId, SettingRow, Verb, WindowRow,
+    CommandId, GlyphId, IconRef, Item, Kind, Mods, NumberStyle, Payload, ProviderId, SettingRow, Verb, WindowRow,
 };
 use crate::launcher::providers::{Context, LauncherOpts};
 use crate::launcher::runline;
@@ -31,6 +31,7 @@ use crate::launcher::verbs;
 use crate::launcher_sys::{RealHook, RealSys};
 use crate::log;
 use crate::render::Metrics;
+use crate::shell_thread::ShellRequest;
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
 /// Height of the empty panel, the field alone (logical px, SPEC 5.2.3).
@@ -61,6 +62,11 @@ const MAX_LINES: usize = style::MAX_REVIEW_LINES;
 
 const ID_FIELD: u32 = 1;
 const ID_ROW: u32 = 100;
+
+/// The panel keeps its height while keys come faster than this (`TIMER_LAUNCHER_SHRINK`, SPEC 5.3).
+const SHRINK_MS: u32 = 120;
+const VK_RETURN: u16 = 0x0D;
+const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
 
 // ---------------------------------------------------------------- text runs and markers
 
@@ -274,6 +280,16 @@ pub(crate) struct Launcher {
     taken: bool,
     /// The session's effects that run after the close, in order.
     queued: Vec<Effect>,
+    /// The window in front when the chord came: the restore and the window menu act on it.
+    fg_at_open: isize,
+    /// The close gives the foreground back to `fg_at_open` (a `Hide` with restore; never a close without one).
+    restore: bool,
+    /// The window a Switch activates, in `closing`: before the hide, while the dock still holds the foreground.
+    switch: Option<isize>,
+    /// Run-history lines forgotten by Shift+Delete, taken out of the controller's history after the key.
+    forgotten: Vec<Box<str>>,
+    /// The icon size of the rows at the surface's DPI (`StartIconsFor`).
+    icon_px: u32,
 }
 
 impl Launcher {
@@ -296,6 +312,11 @@ impl Launcher {
             open_seq: 0,
             taken: false,
             queued: Vec::new(),
+            fg_at_open: 0,
+            restore: false,
+            switch: None,
+            forgotten: Vec::new(),
+            icon_px: style::ICON_M as u32,
         }
     }
 
@@ -331,32 +352,132 @@ impl Launcher {
         view.merge(self.run(fx, cx, sys))
     }
 
-    /// Runs the session's effects in order: the view's at once, the others after the close.
-    fn run(&mut self, fx: Vec<Effect>, _cx: &Context, _sys: &mut dyn SysPort) -> Reply {
+    /// Runs the session's effects in order. The view's, the field's copy, Ctrl+W and the paste act at once; a Switch
+    /// waits for `closing` (before the hide); a `Hide` closes, with or without the restore; launches, power commands,
+    /// the window menu and the row's copy run after the close, in `finish`.
+    fn run(&mut self, fx: Vec<Effect>, cx: &Context, sys: &mut dyn SysPort) -> Reply {
         let mut reply = Reply::None;
         for e in fx {
             match e {
                 Effect::Relayout => reply = reply.merge(Reply::Relayout),
                 Effect::Redraw => reply = reply.merge(Reply::Redraw),
-                Effect::Hide { .. } => reply = Reply::Close,
-                other => self.queued.push(other),
+                Effect::Hide { restore } => {
+                    self.restore = restore;
+                    reply = Reply::Close;
+                }
+                Effect::Switch(h) => self.switch = Some(h),
+                Effect::CloseWindow(h) => sys.close_window(h),
+                Effect::CopyNow(text) => sys.copy(&text),
+                Effect::Paste => {
+                    if let Some(text) = sys.paste() {
+                        let more = self.session.paste(&text, cx);
+                        reply = reply.merge(self.run(more, cx, sys));
+                    }
+                }
+                Effect::RequestIcons(ids) => {
+                    let ids = ids.into_iter().map(String::from).collect();
+                    sys.shell(ShellRequest::StartIconsFor { icon_px: self.icon_px, ids });
+                }
+                Effect::ForgetRun(line) => self.forgotten.push(line),
+                // Tier 7 (L1a-15d), learned ranks (L1b) and files (L2).
+                Effect::RequestRewrite { .. } | Effect::Forget(_) | Effect::RequestFiles(_) => {}
+                e @ (Effect::Launch(_)
+                | Effect::Copy(_)
+                | Effect::Power(_)
+                | Effect::WindowMenu
+                | Effect::OpenSettings) => {
+                    self.queued.push(e);
+                }
+            }
+        }
+        // A switch without a hide (none today) is not left waiting for a close.
+        if reply != Reply::Close {
+            if let Some(h) = self.switch.take() {
+                sys.activate(h);
             }
         }
         reply
     }
 
-    /// The chord again while open (the controller's `OpenPlan::Close`): the final Esc.
-    pub(crate) fn chord_again(&mut self) -> Reply {
-        Reply::Close
+    /// A key down for the session; `gesture` is `gesture_for`'s.
+    fn on_key(&mut self, ev: KeyEvent, gesture: Option<Gesture>, cx: &Context, sys: &mut dyn SysPort) -> Reply {
+        let fx = self.session.key(ev, gesture, cx);
+        let reply = self.run(fx, cx, sys);
+        self.typed(reply, sys)
     }
 
-    /// The close, with the popup already hidden: the hook stops treating the launcher as shown and the type-ahead window
-    /// of the open's post ends (a no-op when the first activation took it).
-    fn finish(&mut self, hook: &mut dyn HookPort) {
+    /// After a keystroke: a new layout waits to shrink until no key came for `SHRINK_MS`.
+    fn typed(&mut self, reply: Reply, sys: &mut dyn SysPort) -> Reply {
+        if reply == Reply::Relayout {
+            self.hold_shrink = true;
+            sys.arm(crate::msg::TIMER_LAUNCHER_SHRINK, SHRINK_MS);
+        }
+        reply
+    }
+
+    /// Alt+F4, SC_CLOSE and WM_CLOSE: the final Esc (the restore included).
+    fn on_close_request(&mut self, cx: &Context, sys: &mut dyn SysPort) -> Reply {
+        let fx = self.session.close_request();
+        self.run(fx, cx, sys)
+    }
+
+    /// The chord while open: the final Esc.
+    fn chord_again_on(&mut self, cx: &Context, sys: &mut dyn SysPort) -> Reply {
+        let fx = self.session.chord_again();
+        self.run(fx, cx, sys)
+    }
+
+    /// The host is closing the popup, still shown: a Switch activates its window now.
+    fn closing_on(&mut self, sys: &mut dyn SysPort) {
+        if let Some(h) = self.switch.take() {
+            sys.activate(h);
+        }
+    }
+
+    /// The forgotten run lines leave the controller's history (outside the context's borrow).
+    fn forget_runs(&mut self) {
+        if self.forgotten.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(&mut self.forgotten);
+        with_ctrl(|c| c.history.retain(|h| !lines.contains(h)));
+    }
+
+    /// The chord again while open (the controller's `OpenPlan::Close`): the final Esc.
+    pub(crate) fn chord_again(&mut self) -> Reply {
+        ctx(|cx| self.chord_again_on(cx, &mut RealSys)).unwrap_or(Reply::Close)
+    }
+
+    /// The close, with the popup already hidden, in this order: the hook stops treating the launcher as shown and the
+    /// type-ahead window of the open's post ends (a no-op when the first activation took it); with the restore, the window
+    /// the user came from gets the foreground back; then the queued effects. So a copy lands where the user came from,
+    /// and launches leave the foreground to Explorer's grant.
+    fn finish(&mut self, hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
         hook.shown(false);
         hook.end(self.open_seq);
-        // The effects of the close run on the system port (L1a-15c).
-        self.queued.clear();
+        if self.restore && self.fg_at_open != 0 {
+            sys.restore(self.fg_at_open);
+        }
+        for e in std::mem::take(&mut self.queued) {
+            match e {
+                Effect::Launch(r) => {
+                    let elevates = r.elevates();
+                    // A setting's target comes with the settings rows the controller holds (L1a-16).
+                    if let Some(req) = crate::launcher_sys::to_request(r, &|_| None) {
+                        sys.shell(req);
+                    }
+                    if elevates {
+                        // The secure desktop of the UAC prompt can lose the releases the hook would see.
+                        hook.reset_mods();
+                    }
+                }
+                Effect::Power(id) => sys.power(id),
+                Effect::WindowMenu => sys.window_menu(self.fg_at_open),
+                Effect::Copy(text) => sys.copy(&text),
+                Effect::OpenSettings => sys.open_settings(),
+                _ => {}
+            }
+        }
     }
 
     /// The session the keys and the late batches go to (L1a-15).
@@ -383,8 +504,6 @@ impl Launcher {
     }
 
     /// A shrink waits (while the user types) or is let go (120 ms without a keystroke): growing is never held.
-    // The TIMER_LAUNCHER_SHRINK of L1a-15 toggles it.
-    #[allow(dead_code)]
     pub(crate) fn hold_shrink(&mut self, on: bool) {
         self.hold_shrink = on;
     }
@@ -784,6 +903,7 @@ impl Content for Launcher {
     }
 
     fn size(&mut self, s: &Surface) -> (i32, i32) {
+        self.icon_px = u32::try_from(s.metrics().px(style::ICON_M)).unwrap_or(24);
         let g = self.layout(s);
         // The review of the selected row is measured with the real font, for the session's conditions.
         if let (Some(lines), Some(key)) = (self.review_lines(s), self.session.selected().map(|i| i.key)) {
@@ -833,9 +953,49 @@ impl Content for Launcher {
         id >= ID_ROW
     }
 
-    fn click(&mut self, _id: u32) -> Reply {
-        // L1a-15 maps a row click to `Session::click` with the Context.
-        Reply::None
+    fn click(&mut self, id: u32) -> Reply {
+        let Some(row) = id.checked_sub(ID_ROW).and_then(|r| usize::try_from(r).ok()) else { return Reply::None };
+        let mut sys = RealSys;
+        let now = sys.now_ms();
+        ctx(|cx| {
+            let fx = self.session.click(row, now, cx);
+            self.run(fx, cx, &mut sys)
+        })
+        .unwrap_or(Reply::None)
+    }
+
+    fn pointer(&mut self, x: i32, y: i32) -> Reply {
+        let row = self.hit(x, y).and_then(|id| id.checked_sub(ID_ROW)).and_then(|r| usize::try_from(r).ok());
+        let mut sys = RealSys;
+        let now = sys.now_ms();
+        ctx(|cx| {
+            let fx = self.session.pointer(x, y, row, now);
+            self.run(fx, cx, &mut sys)
+        })
+        .unwrap_or(Reply::None)
+    }
+
+    fn key_ex(&mut self, ev: KeyEvent) -> Option<Reply> {
+        let mut sys = RealSys;
+        let gesture = gesture_for(&ev, &mut RealHook, &sys);
+        let reply = ctx(|cx| self.on_key(ev, gesture, cx, &mut sys));
+        self.forget_runs();
+        reply
+    }
+
+    fn char(&mut self, c: char) -> Reply {
+        let mut sys = RealSys;
+        ctx(|cx| {
+            let mut buf = [0u8; 4];
+            let fx = self.session.chars(c.encode_utf8(&mut buf), cx);
+            let reply = self.run(fx, cx, &mut sys);
+            self.typed(reply, &mut sys)
+        })
+        .unwrap_or(Reply::None)
+    }
+
+    fn close_request(&mut self) -> Reply {
+        ctx(|cx| self.on_close_request(cx, &mut RealSys)).unwrap_or(Reply::Close)
     }
 
     fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
@@ -884,8 +1044,12 @@ impl Content for Launcher {
         true
     }
 
+    fn closing(&mut self) {
+        self.closing_on(&mut RealSys);
+    }
+
     fn after_close(&mut self) {
-        self.finish(&mut RealHook);
+        self.finish(&mut RealHook, &mut RealSys);
     }
 
     fn launcher(&mut self) -> Option<&mut Launcher> {
@@ -896,7 +1060,10 @@ impl Content for Launcher {
 /// The content of a new launcher popup (`popup::make_content`), for the post the controller is opening.
 pub(crate) fn new() -> Box<dyn Content> {
     let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
-    l.open_seq = with_ctrl(|c| c.open_seq).unwrap_or(0);
+    if let Some((seq, fg)) = with_ctrl(|c| (c.open_seq, c.fg_at_open)) {
+        l.open_seq = seq;
+        l.fg_at_open = fg;
+    }
     Box::new(l)
 }
 
@@ -909,6 +1076,12 @@ pub(crate) fn init() {}
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
     // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
     let _ = unsafe { KillTimer(Some(hwnd), id) };
+    if id == crate::msg::TIMER_LAUNCHER_SHRINK {
+        super::with_launcher(|l| {
+            l.hold_shrink(false);
+            Reply::Relayout
+        });
+    }
 }
 
 // ---------------------------------------------------------------- the controller (L1a-15)
@@ -930,6 +1103,10 @@ pub(crate) trait HookPort {
     fn alt_down(&self) -> bool;
     /// `hook::take_typeahead`: the keys typed after the chord of `seq`, once (0 for another sequence or an ended one).
     fn take(&mut self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize;
+    /// `hook::reset_modifiers` (after an admin launch, a lock or a suspend).
+    fn reset_mods(&mut self);
+    /// `hook::take_gesture_time`: the kb.time of the last physical Ctrl+Shift+Enter, consumed.
+    fn gesture_time(&mut self) -> Option<u32>;
 }
 
 /// What the controller asks of Windows: Win32 and the popup host in the dock (`launcher_sys::RealSys`), a recorder in the
@@ -952,6 +1129,43 @@ pub(crate) trait SysPort {
     /// What a kept key types with the UI thread's keyboard layout and its recorded modifiers (`ToUnicodeEx`, keyboard
     /// state left unchanged).
     fn translate(&mut self, rec: &KeyRec) -> Typed;
+    /// `GetForegroundWindow`.
+    fn foreground(&self) -> isize;
+    /// A Switch: the bar's activation of one window (`apps::activate_window`).
+    fn activate(&mut self, h: isize);
+    /// The foreground back to `h` (`ui::force_foreground`), when it is still visible and not cloaked.
+    fn restore(&mut self, h: isize);
+    /// The text to the clipboard (`CF_UNICODETEXT`).
+    fn copy(&mut self, text: &str);
+    /// The clipboard's text, at most 64 KiB of it.
+    fn paste(&mut self) -> Option<String>;
+    /// Ctrl+W: `WM_CLOSE` posted to `h`.
+    fn close_window(&mut self, h: isize);
+    /// The window menu of `h` (`WM_SYSCOMMAND` `SC_KEYMENU` posted), when `h` is a window to act on.
+    fn window_menu(&mut self, h: isize);
+    /// One request to the shell thread.
+    fn shell(&mut self, r: ShellRequest);
+    /// Lock, sleep, restart, shut down, sign out (`power::run`).
+    fn power(&mut self, id: CommandId);
+    /// Settings > Launcher.
+    fn open_settings(&mut self);
+    /// One of the launcher's one-shot timers on the popup window.
+    fn arm(&mut self, id: usize, ms: u32);
+    /// `GetMessageTime` and `GetMessageExtraInfo` of the key message being handled.
+    fn msg_time(&self) -> u32;
+    fn msg_extra(&self) -> usize;
+    /// `GetTickCount64` (the pointer's and the click's clock).
+    fn now_ms(&self) -> u64;
+}
+
+/// The proof of a person's Ctrl+Shift+Enter (SPEC 5.4.9), built only for that key: the hook's evidence is consumed by
+/// it and by nothing else.
+fn gesture_for(ev: &KeyEvent, hook: &mut dyn HookPort, sys: &dyn SysPort) -> Option<Gesture> {
+    if ev.vk != VK_RETURN || ev.mods != CTRL_SHIFT {
+        return None;
+    }
+    let hook_time = hook.gesture_time();
+    Gesture::from_key(ev, hook_time, sys.msg_time(), sys.msg_extra(), hook::INJECT_TAG, sys.now())
 }
 
 /// What one kept key types.
@@ -1029,8 +1243,9 @@ fn open_plan(action: PostAction, quns_d3d: bool, fs_window: bool, over_fullscree
 
 /// The controller's state between opens (an open's own state is in its content, `Launcher`).
 struct Ctrl {
-    /// The sequence of the post being opened (read by `new`).
+    /// The sequence of the post being opened and the window in front when its chord came (read by `new`).
     open_seq: u32,
+    fg_at_open: isize,
     /// `launcher.monitor`, `launcher.top_percent` and `launcher.over_fullscreen == "pass"`.
     pick: MonitorPick,
     top_percent: u8,
@@ -1051,6 +1266,7 @@ impl Ctrl {
     fn new() -> Ctrl {
         Ctrl {
             open_seq: 0,
+            fg_at_open: 0,
             pick: MonitorPick::Pointer,
             top_percent: crate::config::LAUNCHER_TOP_PERCENT.2,
             over_fullscreen_pass: true,
@@ -1149,7 +1365,11 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
             sys.close_launcher();
         }
         OpenPlan::TryOpen => {
-            with_ctrl(|c| c.open_seq = seq);
+            let fg = sys.foreground();
+            with_ctrl(|c| {
+                c.open_seq = seq;
+                c.fg_at_open = fg;
+            });
             hook.shown(true);
             if !sys.open(pick, top_percent) {
                 hook.shown(false);
@@ -1447,6 +1667,8 @@ mod tests {
         /// The type-ahead ring: its post's sequence and its keys.
         ring: (u32, Vec<KeyRec>),
         takes: Vec<u32>,
+        resets: u32,
+        gesture: Option<u32>,
     }
 
     impl HookPort for FakeHook {
@@ -1478,6 +1700,12 @@ mod tests {
                 *slot = *k;
             }
             keys.len().min(RING_CAP)
+        }
+        fn reset_mods(&mut self) {
+            self.resets += 1;
+        }
+        fn gesture_time(&mut self) -> Option<u32> {
+            self.gesture.take()
         }
     }
 
@@ -1529,9 +1757,31 @@ mod tests {
                 c => Typed::Text(char::from_u32(u32::from(c)).unwrap().to_string()),
             }
         }
+        fn foreground(&self) -> isize {
+            0x5005
+        }
+        fn activate(&mut self, _h: isize) {}
+        fn restore(&mut self, _h: isize) {}
+        fn copy(&mut self, _text: &str) {}
+        fn paste(&mut self) -> Option<String> {
+            None
+        }
+        fn close_window(&mut self, _h: isize) {}
+        fn window_menu(&mut self, _h: isize) {}
+        fn shell(&mut self, _r: ShellRequest) {}
+        fn power(&mut self, _id: CommandId) {}
+        fn open_settings(&mut self) {}
+        fn arm(&mut self, _id: usize, _ms: u32) {}
+        fn msg_time(&self) -> u32 {
+            0
+        }
+        fn msg_extra(&self) -> usize {
+            0
+        }
+        fn now_ms(&self) -> u64 {
+            u64::from(self.now)
+        }
     }
-
-    const VK_RETURN: u16 = 0x0D;
 
     /// A kept key that types `c`.
     fn ch(c: char) -> KeyRec {
@@ -1641,6 +1891,278 @@ mod tests {
         FakeSys { open_ok: true, ..FakeSys::default() }
     }
 
+    // ---- 15c: effects and the system port
+
+    #[derive(Default)]
+    struct EffectSys {
+        clip: Option<String>,
+        ops: Vec<String>,
+        msg_time: u32,
+        now: u32,
+    }
+
+    impl SysPort for EffectSys {
+        fn now(&self) -> u32 {
+            self.now
+        }
+        fn d3d_fullscreen(&self) -> bool {
+            false
+        }
+        fn fullscreen_foreground(&self) -> bool {
+            false
+        }
+        fn launcher_open(&self) -> bool {
+            true
+        }
+        fn open(&mut self, _pick: MonitorPick, _top_percent: u8) -> bool {
+            true
+        }
+        fn close_launcher(&mut self) {}
+        fn inject(&mut self, _keys: &[(u16, bool)]) {}
+        fn translate(&mut self, _rec: &KeyRec) -> Typed {
+            Typed::Key
+        }
+        fn foreground(&self) -> isize {
+            0x7777
+        }
+        fn activate(&mut self, h: isize) {
+            self.ops.push(format!("Switch({h:#x})"));
+        }
+        fn restore(&mut self, h: isize) {
+            self.ops.push(format!("Restore({h:#x})"));
+        }
+        fn copy(&mut self, text: &str) {
+            self.ops.push(format!("Copy({text})"));
+        }
+        fn paste(&mut self) -> Option<String> {
+            self.ops.push("Paste".into());
+            self.clip.clone()
+        }
+        fn close_window(&mut self, h: isize) {
+            self.ops.push(format!("CloseWindow({h:#x})"));
+        }
+        fn window_menu(&mut self, h: isize) {
+            self.ops.push(format!("WindowMenu({h:#x})"));
+        }
+        fn shell(&mut self, r: ShellRequest) {
+            self.ops.push(format!("Shell({r:?})"));
+        }
+        fn power(&mut self, id: CommandId) {
+            self.ops.push(format!("Power({id:?})"));
+        }
+        fn open_settings(&mut self) {
+            self.ops.push("OpenSettings".into());
+        }
+        fn arm(&mut self, id: usize, ms: u32) {
+            self.ops.push(format!("Arm({id}, {ms})"));
+        }
+        fn msg_time(&self) -> u32 {
+            self.msg_time
+        }
+        fn msg_extra(&self) -> usize {
+            0
+        }
+        fn now_ms(&self) -> u64 {
+            u64::from(self.now)
+        }
+    }
+
+    const FG: isize = 0x7777;
+
+    /// A launcher opened over the window FG, `text` typed.
+    fn typed(fx: &crate::launcher::providers::tests::Fx, text: &str) -> Launcher {
+        let mut l = opened(9);
+        l.fg_at_open = FG;
+        l.session.chars(text, &fx.cx());
+        l
+    }
+
+    fn key(
+        l: &mut Launcher,
+        fx: &crate::launcher::providers::tests::Fx,
+        sys: &mut EffectSys,
+        vk: u16,
+        mods: Mods,
+    ) -> Reply {
+        let ev = KeyEvent { vk, mods, repeat: false, sys: mods.has(Mods::ALT) };
+        l.on_key(ev, None, &fx.cx(), sys)
+    }
+
+    /// What the host does on a close: `closing`, the hide, then `after_close`; the sys records "Hide" for the hide.
+    fn host_close(l: &mut Launcher, hook: &mut FakeHook, sys: &mut EffectSys) {
+        l.closing_on(sys);
+        sys.ops.push("Hide".into());
+        l.finish(hook, sys);
+    }
+
+    /// The ops without the shrink timer the keystrokes arm.
+    fn ops(sys: &EffectSys) -> Vec<String> {
+        sys.ops.iter().filter(|o| !o.starts_with("Arm(")).cloned().collect()
+    }
+
+    #[test]
+    fn switch_runs_before_hide_launch_after() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // A running app: its window is activated before the hide, while the dock still holds the foreground.
+        let mut l = typed(&fx, "blocco");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE), Reply::Close);
+        assert!(ops(&sys).is_empty(), "nothing runs inside the key handler: {:?}", sys.ops);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Switch(0x1001)", "Hide"]);
+        // A new instance: hidden first, launched after (Explorer gets the foreground grant).
+        let mut l = typed(&fx, "blocco");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::SHIFT), Reply::Close);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        let got = ops(&sys);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], "Hide");
+        assert!(got[1].starts_with("Shell(LauncherLaunch") && got[1].contains("Microsoft.WindowsNotepad"), "{got:?}");
+    }
+
+    #[test]
+    fn copy_restores_then_copies() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "=3,5*2");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE), Reply::Close);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)", "Copy(7)"]);
+        // The window menu acts on the window the user came from, after the restore.
+        let mut l = typed(&fx, "window menu");
+        let mut sys = EffectSys::default();
+        key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)", "WindowMenu(0x7777)"]);
+        // Ctrl+C on a selection in the field copies now and the launcher stays.
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        key(&mut l, &fx, &mut sys, 0x41, Mods::CTRL);
+        assert_ne!(key(&mut l, &fx, &mut sys, 0x43, Mods::CTRL), Reply::Close);
+        assert_eq!(ops(&sys), ["Copy(calc)"]);
+    }
+
+    #[test]
+    fn alt_f4_restores_like_esc() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        assert_eq!(l.on_close_request(&fx.cx(), &mut sys), Reply::Close, "WM_CLOSE and SC_CLOSE");
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)"]);
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x73, Mods::ALT), Reply::Close, "Alt+F4 as a key");
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)"]);
+        // The final Esc: the first clears the query, the second closes and restores.
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        assert_ne!(key(&mut l, &fx, &mut sys, 0x1B, Mods::NONE), Reply::Close);
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x1B, Mods::NONE), Reply::Close);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)"]);
+        // The chord again while open: the same.
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        assert_eq!(l.chord_again_on(&fx.cx(), &mut sys), Reply::Close);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)"]);
+    }
+
+    #[test]
+    fn launches_do_not_restore() {
+        use crate::launcher::gesture::Gesture;
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        for (q, mods) in [("calcolatrice", Mods::NONE), ("> ping 1.1.1.1", Mods::NONE), ("lock", Mods::NONE)] {
+            let mut l = typed(&fx, q);
+            let mut sys = EffectSys::default();
+            assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, mods), Reply::Close, "{q}");
+            let mut hook = FakeHook::default();
+            host_close(&mut l, &mut hook, &mut sys);
+            let got = ops(&sys);
+            assert_eq!(got.first().map(String::as_str), Some("Hide"), "{q}: {got:?}");
+            assert!(!got.iter().any(|o| o.starts_with("Restore")), "{q}: {got:?}");
+            assert_eq!(got.len(), 2, "{q}: one launch: {got:?}");
+            assert_eq!(hook.resets, 0, "{q}");
+        }
+        // Run as administrator: no restore either, and the hook forgets its tracked modifiers.
+        let ctrl_shift = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
+        let mut l = typed(&fx, "calcolatrice");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, ctrl_shift), Reply::Close);
+        let mut hook = FakeHook::default();
+        host_close(&mut l, &mut hook, &mut sys);
+        assert!(ops(&sys)[1].starts_with("Shell(LauncherAppAdmin"), "{:?}", sys.ops);
+        assert_eq!(hook.resets, 1);
+        // A typed line with the hook's proof of a person's Ctrl+Shift+Enter.
+        let mut l = typed(&fx, "> cmd /c dir");
+        let key_ = l.session.selected().unwrap().key;
+        l.session.set_review_lines(key_, 1);
+        let mut sys = EffectSys { msg_time: 5_000, now: 5_010, ..EffectSys::default() };
+        let ev = KeyEvent { vk: VK_RETURN, mods: ctrl_shift, repeat: false, sys: false };
+        let mut hook = FakeHook { gesture: Some(5_000), ..FakeHook::default() };
+        let g = gesture_for(&ev, &mut hook, &sys);
+        assert_eq!(g, Some(Gesture::for_test(5_000)));
+        assert_eq!(l.on_key(ev, g, &fx.cx(), &mut sys), Reply::Close);
+        host_close(&mut l, &mut hook, &mut sys);
+        assert!(!ops(&sys).iter().any(|o| o.starts_with("Restore")));
+        assert_eq!(hook.resets, 1, "after RunAsTyped too");
+        // Only Ctrl+Shift+Enter consumes the hook's evidence; a time that is not the message's is no proof.
+        let mut hook = FakeHook { gesture: Some(5_000), ..FakeHook::default() };
+        let plain = KeyEvent { vk: VK_RETURN, mods: Mods::NONE, repeat: false, sys: false };
+        assert_eq!(gesture_for(&plain, &mut hook, &sys), None);
+        assert_eq!(hook.gesture, Some(5_000), "left for the real press");
+        let mut hook = FakeHook { gesture: Some(4_999), ..FakeHook::default() };
+        assert_eq!(gesture_for(&ev, &mut hook, &sys), None);
+    }
+
+    #[test]
+    fn inactive_close_never_restores() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // WA_INACTIVE, the retries ended, a lock or a suspend: the host closes without a Hide from the session.
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        let mut hook = FakeHook::default();
+        l.on_focus(false, &fx.cx(), &mut hook, &mut sys);
+        host_close(&mut l, &mut hook, &mut sys);
+        assert_eq!(ops(&sys), ["Hide"]);
+        assert_eq!(hook.ends, [9, 9], "the focus loss and the close both end the window");
+    }
+
+    #[test]
+    fn app_switch_with_no_window_does_nothing() {
+        use crate::launcher::providers::tests::Fx;
+        let mut fx = Fx::new();
+        let mut l = typed(&fx, "blocco");
+        fx.windows.clear();
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE), Reply::None, "the launcher stays open");
+        assert!(ops(&sys).is_empty());
+        assert_eq!(l.switch, None, "never the bar's cycle or minimise");
+    }
+
+    #[test]
+    fn paste_reads_the_clipboard_into_the_field() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "");
+        let mut sys = EffectSys { clip: Some("calc\r\n".into()), ..EffectSys::default() };
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x56, Mods::CTRL), Reply::Relayout);
+        assert_eq!(l.session.query_text().trim_end(), "calc");
+        assert_eq!(sys.ops.first().map(String::as_str), Some("Paste"));
+        assert!(sys.ops.contains(&format!("Arm({}, {SHRINK_MS})", crate::msg::TIMER_LAUNCHER_SHRINK)), "{:?}", sys.ops);
+        // Nothing on the clipboard: nothing changes.
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x2D, Mods::SHIFT), Reply::None);
+    }
+
     #[test]
     fn chord_flow() {
         // 5.2.12 and rule 8, every combination.
@@ -1696,7 +2218,7 @@ mod tests {
         let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
         l.open_seq = with_ctrl(|c| c.open_seq).unwrap();
         assert_eq!(l.open_seq, 7, "the content opens for the post being opened");
-        l.finish(&mut h);
+        l.finish(&mut h, &mut FakeSys::default());
         assert_eq!((h.ends.as_slice(), h.shown.as_slice()), (&[7][..], &[true, false][..]));
     }
 

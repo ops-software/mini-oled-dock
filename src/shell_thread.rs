@@ -238,7 +238,6 @@ pub enum ShellRequest {
     /// Icons of the launcher's visible rows that lack one -> `ShellEvent::LauncherIcons`. Not a
     /// low-priority request: it runs ahead of the Start menu's batches, and a newer one replaces the
     /// pending one. It never reads or changes what the Start menu was sent.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     StartIconsFor { icon_px: u32, ids: Vec<String> },
     /// A query that found nothing: Windows' typo rewrite of it (`start_search::converted`, a 1.4 MB
     /// read kept off the UI thread) -> `ShellEvent::LauncherConverted`. A newer one replaces the

@@ -786,7 +786,6 @@ impl KeyRec {
             | (u64::from(self.ext) << 56)
     }
 
-    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
     fn unpack(v: u64) -> KeyRec {
         KeyRec {
             time: v as u32,
@@ -871,7 +870,6 @@ impl Ring {
     }
 
     /// UI: ends the window of `seq` and copies its keys, once. 0 when another window opened during the copy.
-    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
     pub(crate) fn take(&self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
         let Some(len) = self.end(seq) else { return 0 };
         let mut n = 0;
@@ -1181,7 +1179,6 @@ pub(crate) fn pack_gesture_time(t: u32) -> u64 {
     (1 << 32) | u64::from(t)
 }
 
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub(crate) fn unpack_gesture_time(v: u64) -> Option<u32> {
     if v >> 32 == 1 {
         Some(v as u32)
@@ -1266,19 +1263,16 @@ pub fn end_typeahead(seq: u32) {
 }
 
 /// UI, once, at the launcher's activation: the keys typed after the chord of `seq`, in order.
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn take_typeahead(seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
     RING.take(seq, out)
 }
 
 /// UI: forget the tracked modifiers (after lock, suspend and every admin launch).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn reset_modifiers() {
     RESET_MODS.fetch_add(1, Relaxed);
 }
 
 /// UI: the kb.time of the last physical Ctrl+Shift+Enter, consumed (one swap: the whole value or nothing).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn take_gesture_time() -> Option<u32> {
     unpack_gesture_time(GESTURE_TIME.swap(0, Relaxed))
 }

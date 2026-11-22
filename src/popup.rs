@@ -1785,6 +1785,13 @@ fn timer_owner(id: usize) -> TimerOwner {
     }
 }
 
+/// The window of the open popup (or of the last one), read without the popup state: the launcher arms its one-shots on
+/// it from inside its own key handling, while the state is borrowed.
+pub(crate) fn last_hwnd() -> Option<HWND> {
+    let h = POPUP_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    (h != 0).then_some(HWND(h as *mut _))
+}
+
 /// The window the launcher's one-shots are armed on, created if needed, so they can be armed before the first open.
 // The launcher's timers (L1a-15, L1a-16) arm through it; until then nothing does.
 #[allow(dead_code)]
