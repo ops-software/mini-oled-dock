@@ -287,7 +287,7 @@ mod comparator {
         a.set(1, 1, 0xFF00_0001);
         let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("golden-roundtrip").join("diff.png");
         let _ = std::fs::remove_file(&path);
-        write_diff(&path, &g, &a, &vec![false; 64]);
+        write_diff(&path, &g, &a, &[false; 64]);
         let d = decode_png(&path).unwrap();
         assert_eq!((d.w, d.h), (24, 8));
         assert_eq!(d.get(16 + 1, 1), 0xFFFF_0000);
