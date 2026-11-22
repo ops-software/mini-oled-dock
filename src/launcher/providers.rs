@@ -3,14 +3,14 @@
 //! query together with the result rows) and the providers themselves, run by `query_all` in the order of 5.4.1.
 //! Nothing here reads a file, the registry or the network; time is only counted (`Budget`), never asserted.
 
-use super::catalog::CatApp;
+use super::arena::CatalogView;
 use super::commands::{self, Command, COMMANDS};
 use super::frecency::Frecency;
 use super::gesture::GESTURE_TIME_MATCHES;
 use super::index::{Hit, IndexView};
 use super::model::{
     Batch, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, NumberStyle, Payload, ProviderId,
-    ProviderMask, Query, Score, SettingRow, Verb, VerbSet, WindowRow,
+    ProviderMask, Query, Score, Verb, VerbSet, WindowRow,
 };
 use super::query::{self, Implicit, PrefixTable};
 use super::rank::{self, Cand, Indexed};
@@ -50,12 +50,10 @@ impl Default for LauncherOpts {
 /// What one keystroke reads: borrowed from data the controller owns, built per keystroke without a copy.
 #[derive(Clone, Copy)]
 pub struct Context<'a> {
-    pub apps: &'a [CatApp],
-    pub settings: &'a [SettingRow],
-    /// The keyword dictionaries of `apps` and `settings` (L3 T9). A dictionary built over another number of entries is not
-    /// used: the provider scans the keywords of each candidate instead (the reference the dictionary must equal).
-    pub apps_ix: Option<IndexView<'a>>,
-    pub settings_ix: Option<IndexView<'a>>,
+    /// The catalogues, read in place (L3 T16): names, word starts and the dictionaries of the hidden and fuzzy tiers. The
+    /// settings view is empty while the settings are not held.
+    pub apps: CatalogView<'a>,
+    pub settings: CatalogView<'a>,
     /// One per window, most recently used first.
     pub windows: &'a [WindowRow],
     /// Run history, newest first.
@@ -330,18 +328,17 @@ impl FuzzyQuery {
     }
 }
 
-/// `rank::match_fuzzy`'s work for the whole catalogue at once, or None when there is no dictionary of it (the caller scans).
-fn fuzzy_matches(ix: Option<IndexView>, len: usize, q: &str, out: &mut Vec<u32>) -> Option<FuzzyQuery> {
+/// `rank::match_fuzzy`'s work for the whole catalogue at once.
+fn fuzzy_matches(v: IndexView, q: &str, out: &mut Vec<u32>) -> FuzzyQuery {
     out.clear();
-    let v = ix.filter(|v| v.entries() == len)?;
     // A query of more than 32 characters has no fuzzy tier: nothing matches.
     let Some((chars, len)) = rank::fuzzy_chars(q) else {
-        return Some(FuzzyQuery { chars: ['\0'; 32], len: 0, subsequence: false });
+        return FuzzyQuery { chars: ['\0'; 32], len: 0, subsequence: false };
     };
     let qc = chars.get(..len).unwrap_or_default();
     v.fuzzy(qc, rank::fuzzy_dist(len), out);
     // A character in no name rules the subsequence test out for every candidate.
-    Some(FuzzyQuery { chars, len, subsequence: v.foreign(qc) == 0 })
+    FuzzyQuery { chars, len, subsequence: v.foreign(qc) == 0 }
 }
 
 /// The fuzzy tier of entry `i` (`near` sorted by entry, `cur` moving forward): the subsequence test on its shown name or a
@@ -355,18 +352,11 @@ fn fuzzy_of(f: &FuzzyQuery, c: &Cand, near: &[u32], cur: &mut usize, i: usize) -
     (by_near || f.subsequence && rank::subsequence_name(c, f.chars())).then_some(rank::T_FUZZY)
 }
 
-/// The dictionary answer for `q` over a catalogue of `len` entries, into `out`; false (and `out` empty) when there is no
-/// dictionary of that catalogue: the caller scans.
-fn hidden_matches(ix: Option<IndexView>, len: usize, q: &str, out: &mut Vec<Hit>) -> bool {
+/// The dictionary answer for `q` over a catalogue, into `out`.
+fn hidden_matches(v: IndexView, q: &str, out: &mut Vec<Hit>) {
     out.clear();
-    match ix.filter(|v| v.entries() == len) {
-        Some(v) => {
-            let q = q.trim();
-            v.hidden(q, q.chars().count(), out);
-            true
-        }
-        None => false,
-    }
+    let q = q.trim();
+    v.hidden(q, q.chars().count(), out);
 }
 
 /// The hidden match of entry `i` in `hits` (sorted by entry); `cur` only moves forward, so a pass over the entries in order
@@ -472,25 +462,26 @@ fn calc(q: &Query, top: &mut TopK) {
 // ---- apps and the open windows merged into them
 
 /// The bar's group of this catalogue app: the same AUMID (ignoring case) or the same folded name as the bar's.
-fn same_program(app: &CatApp, w: &WindowRow) -> bool {
-    w.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&app.id)) || *w.name_folded == *app.folded
+fn same_program(apps: &CatalogView, i: usize, w: &WindowRow) -> bool {
+    w.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(apps.id(i))) || *w.name_folded == *apps.cand(i).folded
 }
 
-fn app_item(app: &CatApp, win: Option<&WindowRow>, score: Score) -> Item {
+fn app_item(apps: &CatalogView, i: usize, win: Option<&WindowRow>, score: Score) -> Item {
+    let (id, name): (Box<str>, Box<str>) = (apps.id(i).into(), apps.name(i).into());
     Item {
-        key: ItemKey::of(ProviderId::Apps, &app.id),
+        key: ItemKey::of(ProviderId::Apps, &id),
         from: ProviderId::Apps,
         kind: Kind::App,
-        title: app.name.clone(),
+        title: name,
         detail: None,
         // A running app keeps its catalogue icon, and with it its id (the session's Open, Reveal and Run as
         // administrator of a running app read it there).
-        icon: IconRef::App(app.id.clone()),
+        icon: IconRef::App(id.clone()),
         score,
         verbs: verbs(Kind::App, win.is_some(), None),
         payload: match win {
             Some(w) => Payload::Group(w.group_key.clone()),
-            None => Payload::AppId(app.id.clone()),
+            None => Payload::AppId(id),
         },
         destructive: false,
     }
@@ -515,45 +506,39 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
     // The hidden tiers come from the dictionary.
     // With a cap at the names there is nothing hidden to read: those tiers could not pass the cap.
     let names_only = !fuzzy && max_tier != u8::MAX;
-    let indexed = names_only || !fuzzy && hidden_matches(cx.apps_ix, cx.apps.len(), text, &mut s.hidden);
-    let fz =
-        if fuzzy && max_tier == u8::MAX { fuzzy_matches(cx.apps_ix, cx.apps.len(), text, &mut s.near) } else { None };
+    let hidden_on = !fuzzy && !names_only;
+    if hidden_on {
+        hidden_matches(cx.apps.index(), text, &mut s.hidden);
+    }
+    let fz = (fuzzy && max_tier == u8::MAX).then(|| fuzzy_matches(cx.apps.index(), text, &mut s.near));
     let (mut at, mut near_at) = (0, 0);
-    for (i, app) in cx.apps.iter().enumerate() {
-        let c = app.cand();
-        let hid = if indexed && !names_only { hidden_of(&s.hidden, &mut at, i) } else { None };
-        let tier = match (fuzzy, indexed) {
-            (true, _) => match &fz {
+    for i in 0..cx.apps.len() {
+        let c = cx.apps.cand(i);
+        let hid = if hidden_on { hidden_of(&s.hidden, &mut at, i) } else { None };
+        let tier = if fuzzy {
+            match &fz {
                 Some(f) => fuzzy_of(f, &c, &s.near, &mut near_at, i),
                 None => rank::match_fuzzy(&c, text),
-            },
-            (false, true) => rank::match_tiers_with(&c, text, hid),
-            (false, false) => rank::match_tiers(&c, text),
+            }
+        } else {
+            rank::match_tiers_with(&c, text, hid)
         };
         let Some(tier) = tier.filter(|t| *t <= max_tier) else { continue };
         hits += 1;
-        let score_of = |running: bool| {
-            if indexed {
-                rank::score_hidden(&c, tier, running, KIND_APP, hid)
-            } else {
-                rank::score_for(&c, text, tier, running, KIND_APP)
-            }
-        };
+        let score_of = |running: bool| rank::score_hidden(&c, tier, running, KIND_APP, hid);
         // Look for the running window only when the row could stay: running is the better of the two scores.
-        let learned = learned_boost(cx, ProviderId::Apps, &app.id);
+        let learned = learned_boost(cx, ProviderId::Apps, cx.apps.id(i));
         if !top.accepts(&Score { learned, ..score_of(true) }) {
             continue;
         }
-        let win = cx.windows.iter().position(|w| same_program(app, w));
+        let win = cx.windows.iter().position(|w| same_program(&cx.apps, i, w));
         let score = Score { learned, ..score_of(win.is_some()) };
         if top.accepts(&score) {
-            keep_best(&mut best, top.cap, score, &app.name, (i, win));
+            keep_best(&mut best, top.cap, score, cx.apps.name(i), (i, win));
         }
     }
     for (score, _, (i, win)) in best {
-        if let Some(app) = cx.apps.get(i) {
-            top.push(app_item(app, win.and_then(|w| cx.windows.get(w)), score));
-        }
+        top.push(app_item(&cx.apps, i, win.and_then(|w| cx.windows.get(w)), score));
     }
     if !cx.opts.mask.has(ProviderId::Windows) {
         return hits;
@@ -570,7 +555,7 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         let Some(tier) = tier_of(&c, text, fuzzy).filter(|t| *t <= max_tier) else { continue };
         hits += 1;
         let score = c.score(tier, true, KIND_WINDOW);
-        if !top.accepts(&score) || cx.apps.iter().any(|a| same_program(a, w)) {
+        if !top.accepts(&score) || (0..cx.apps.len()).any(|i| same_program(&cx.apps, i, w)) {
             continue;
         }
         keep_best(&mut best, top.cap, score, &w.name, w);
@@ -741,47 +726,41 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratc
     // Mixed mode: the rows only a hidden word matched are the best HIDDEN_SETTINGS_CAP of their own (L3 T6); "$" has no cap.
     let capped = q.mode == Mode::Mixed;
     let mut hidden = Vec::with_capacity(if capped { HIDDEN_SETTINGS_CAP } else { 0 });
-    let indexed = !fuzzy && hidden_matches(cx.settings_ix, cx.settings.len(), &q.folded, &mut s.hidden);
-    let fz = if fuzzy { fuzzy_matches(cx.settings_ix, cx.settings.len(), &q.folded, &mut s.near) } else { None };
+    if !fuzzy {
+        hidden_matches(cx.settings.index(), &q.folded, &mut s.hidden);
+    }
+    let fz = fuzzy.then(|| fuzzy_matches(cx.settings.index(), &q.folded, &mut s.near));
     let (mut at, mut near_at) = (0, 0);
-    for (i, row) in cx.settings.iter().enumerate() {
-        let c = row.cand();
-        let hid = if indexed { hidden_of(&s.hidden, &mut at, i) } else { None };
-        let tier = match (fuzzy, indexed) {
-            (true, _) => match &fz {
-                Some(f) => fuzzy_of(f, &c, &s.near, &mut near_at, i),
-                None => rank::match_fuzzy(&c, &q.folded),
-            },
-            (false, true) => rank::match_tiers_with(&c, &q.folded, hid),
-            (false, false) => rank::match_tiers(&c, &q.folded),
+    for i in 0..cx.settings.len() {
+        let c = cx.settings.cand(i);
+        let hid = if fuzzy { None } else { hidden_of(&s.hidden, &mut at, i) };
+        let tier = match &fz {
+            Some(f) => fuzzy_of(f, &c, &s.near, &mut near_at, i),
+            None => rank::match_tiers_with(&c, &q.folded, hid),
         };
         let Some(tier) = tier else { continue };
         hits += 1;
-        let learned = learned_boost(cx, ProviderId::Settings, &row.name);
-        let base = if indexed {
-            rank::score_hidden(&c, tier, false, KIND_SETTING, hid)
-        } else {
-            rank::score_for(&c, &q.folded, tier, false, KIND_SETTING)
-        };
-        let score = Score { learned, ..base };
+        let learned = learned_boost(cx, ProviderId::Settings, cx.settings.name(i));
+        let score = Score { learned, ..rank::score_hidden(&c, tier, false, KIND_SETTING, hid) };
         if capped && matches!(tier, rank::T_SYN_EQ | rank::T_SYN_PREFIX | rank::T_BAG_EQ) {
-            keep_best(&mut hidden, HIDDEN_SETTINGS_CAP, score, &row.name, row);
+            keep_best(&mut hidden, HIDDEN_SETTINGS_CAP, score, cx.settings.name(i), i);
         } else if top.accepts(&score) {
-            keep_best(&mut best, top.cap, score, &row.name, row);
+            keep_best(&mut best, top.cap, score, cx.settings.name(i), i);
         }
     }
     best.extend(hidden);
-    for (score, _, row) in best {
+    for (score, _, i) in best {
+        let name = cx.settings.name(i);
         top.push(Item {
-            key: ItemKey::of(ProviderId::Settings, &row.name),
+            key: ItemKey::of(ProviderId::Settings, name),
             from: ProviderId::Settings,
             kind: Kind::Setting,
-            title: row.name.clone(),
+            title: name.into(),
             detail: None,
             icon: IconRef::Glyph(GlyphId::Gear),
             score,
             verbs: verbs(Kind::Setting, false, None),
-            payload: Payload::Setting(row.index),
+            payload: Payload::Setting(u32::try_from(i).unwrap_or(u32::MAX)),
             destructive: false,
         });
     }
@@ -1206,8 +1185,9 @@ impl Results {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub(crate) mod tests {
     use super::*;
-    use crate::launcher::catalog;
-    use crate::launcher::index::IndexBuf;
+    use crate::launcher::arena::{self, Arena};
+    use crate::launcher::catalog::CatApp;
+    use crate::launcher::model::SettingRow;
 
     pub(crate) fn item(title: &str, score: Score) -> Item {
         Item {
@@ -1282,15 +1262,13 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn cx(&self) -> Context<'_> {
-            // The tests change `apps` and `settings` between keystrokes: the dictionaries are rebuilt (and leaked: a test
-            // process is short) for every context, so they always match the rows.
-            let apps_ix: &'static IndexBuf = Box::leak(Box::new(catalog::index_apps(&self.apps)));
-            let settings_ix: &'static IndexBuf = Box::leak(Box::new(catalog::index_settings(&self.settings)));
+            // The tests change `apps` and `settings` between keystrokes: the arenas are rebuilt (and leaked: a test process
+            // is short) for every context, so they always match the rows.
+            let apps: &'static Arena = Box::leak(Box::new(arena::of_apps(&self.apps)));
+            let settings: &'static Arena = Box::leak(Box::new(arena::of_settings(&self.settings)));
             Context {
-                apps: &self.apps,
-                settings: &self.settings,
-                apps_ix: Some(apps_ix.view()),
-                settings_ix: Some(settings_ix.view()),
+                apps: apps.view(),
+                settings: settings.view(),
                 windows: &self.windows,
                 history: &self.history,
                 opts: &self.opts,
@@ -1903,8 +1881,9 @@ mod bench {
     //! tier checks per query: they count, they never time) and, in the CI bench job only (release, `--ignored`), the
     //! time of the same queries against a reference workload of the same process.
     use super::*;
-    use crate::launcher::catalog;
-    use crate::launcher::index::IndexBuf;
+    use crate::launcher::arena::{self, Arena};
+    use crate::launcher::catalog::CatApp;
+    use crate::launcher::model::SettingRow;
     use crate::launcher::rank::TIER_CHECKS;
     use crate::launcher::testkit::{allocations_during, XorShift};
     use std::time::Instant;
@@ -1958,8 +1937,8 @@ mod bench {
         settings: Vec<SettingRow>,
         windows: Vec<WindowRow>,
         history: Vec<Box<str>>,
-        apps_ix: IndexBuf,
-        settings_ix: IndexBuf,
+        apps_arena: Arena,
+        settings_arena: Arena,
         opts: LauncherOpts,
         /// A full 1,000-entry state: the keystroke reads it for every matched candidate.
         learned: Frecency,
@@ -2020,16 +1999,14 @@ mod bench {
             for row in settings.iter().step_by(3).take(400) {
                 learned.pick(ItemKey::of(ProviderId::Settings, &row.name), 1_780_000_000, false);
             }
-            let (apps_ix, settings_ix) = (catalog::index_apps(&apps), catalog::index_settings(&settings));
-            Big { apps, settings, windows, history, apps_ix, settings_ix, opts: LauncherOpts::default(), learned }
+            let (apps_arena, settings_arena) = (arena::of_apps(&apps), arena::of_settings(&settings));
+            Big { apps, settings, windows, history, apps_arena, settings_arena, opts: LauncherOpts::default(), learned }
         }
 
         fn cx(&self) -> Context<'_> {
             Context {
-                apps: &self.apps,
-                settings: &self.settings,
-                apps_ix: Some(self.apps_ix.view()),
-                settings_ix: Some(self.settings_ix.view()),
+                apps: self.apps_arena.view(),
+                settings: self.settings_arena.view(),
                 windows: &self.windows,
                 history: &self.history,
                 opts: &self.opts,
@@ -2109,60 +2086,6 @@ mod bench {
         assert!(worst.0 <= MAX_OSA_CELLS, "{} OSA cells for {:?}", worst.0, worst.1);
     }
 
-    /// The Context of `big` without its dictionaries: every provider scans (the reference the dictionaries must equal).
-    fn scan_cx(big: &Big) -> Context<'_> {
-        Context { apps_ix: None, settings_ix: None, ..big.cx() }
-    }
-
-    /// L3 T9 and T10: with the dictionaries a query gives the same rows, scores and order as the scan, for every prefix of
-    /// the first 150 bench queries (the scan is the slow side; `dictionaries_equal_scan_on_the_bench` covers all 1,000) and for one-edit and two-edit typos of the first word
-    /// of 200 names (the fuzzy tier).
-    #[test]
-    fn fuzzy_index_equals_scan() {
-        let big = Big::new(1);
-        let (fast, slow) = (big.cx(), scan_cx(&big));
-        let run = |cx: &Context, raw: &str| {
-            let q = query::parse_query(raw, &big.opts.prefixes, NUM, 1);
-            let top = query_all(&q, cx, &mut Budget::default()).into_sorted();
-            top.into_iter().map(|i| (i.title, i.score)).collect::<Vec<(Box<str>, Score)>>()
-        };
-        let mut texts: Vec<String> = Vec::new();
-        for raw in queries().iter().take(150) {
-            let mut end = 0;
-            for ch in raw.chars() {
-                end += ch.len_utf8();
-                texts.push(raw[..end].to_string());
-            }
-        }
-        let mut r = XorShift::new(0xB0B + 9);
-        for app in big.apps.iter().step_by(10).take(200) {
-            let word: Vec<char> = app.folded.split(' ').next().unwrap_or("").chars().collect();
-            if word.len() < 4 {
-                continue;
-            }
-            let mut one = word.clone();
-            one.swap(1, 2);
-            texts.push(one.iter().collect());
-            let mut two = word.clone();
-            let k = (r.next_u64() as usize) % two.len();
-            two.remove(k);
-            two.insert(0, 'q');
-            texts.push(two.iter().collect());
-            let mut three = word;
-            three.pop();
-            three.push('z');
-            three.insert(1, 'x');
-            texts.push(three.iter().collect());
-        }
-        let mut fuzzy_rows = 0;
-        for raw in &texts {
-            let (a, b) = (run(&fast, raw), run(&slow, raw));
-            assert_eq!(a, b, "{raw:?}");
-            fuzzy_rows += a.iter().filter(|(_, s)| s.tier == rank::T_FUZZY).count();
-        }
-        assert!(fuzzy_rows > 0, "the typos reach the fuzzy tier");
-    }
-
     /// L3 T9 and T10, per candidate: for every one of the 1,000 queries and every prefix of each, the dictionaries answer
     /// like the scans over the bench's apps and settings (the hidden tiers: `hidden` against `hidden_best`; the fuzzy
     /// tier: `fuzzy` plus `subsequence_name` against `match_fuzzy`). No `query_all` runs, so the slow side is cheap.
@@ -2172,8 +2095,7 @@ mod bench {
         let apps: Vec<_> = big.apps.iter().map(CatApp::cand).collect();
         let settings: Vec<_> = big.settings.iter().map(SettingRow::cand).collect();
         let (mut hidden_hits, mut fuzzy_hits) = (0usize, 0usize);
-        for (cands, ix) in [(&apps, &big.apps_ix), (&settings, &big.settings_ix)] {
-            let view = ix.view();
+        for (cands, view) in [(&apps, big.apps_arena.view().index()), (&settings, big.settings_arena.view().index())] {
             assert_eq!(view.entries(), cands.len());
             let (mut hits, mut near) = (Vec::new(), Vec::new());
             for raw in queries() {
@@ -2211,6 +2133,17 @@ mod bench {
             }
         }
         assert!(hidden_hits > 0 && fuzzy_hits > 0);
+    }
+
+    /// MEM-2: the 400-app catalogue (the first 400 apps of the bench) is one block of at most 160 KiB.
+    #[test]
+    fn apps_arena_fits() {
+        let big = Big::new(1);
+        let first: Vec<CatApp> = big.apps.iter().take(400).cloned().collect();
+        let a = arena::of_apps(&first);
+        println!("400 apps: {} B in one block", a.raw().len());
+        assert!(a.raw().len() <= 160 * 1024);
+        assert_eq!(a.len(), 400);
     }
 
     /// KEY-2: no keyword line is read on the key path: the hidden tiers come from the dictionaries.

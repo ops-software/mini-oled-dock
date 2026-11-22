@@ -4,10 +4,12 @@
 
 use std::collections::HashMap;
 
+use super::arena::{self, Arena, ArenaError, Caps, Kind, SettingIn};
+#[cfg(test)]
 use super::index::IndexBuf;
 use super::keywords;
 use super::model::SettingRow;
-use super::rank::{self, Cand, Indexed};
+use super::rank::{self, Cand, Indexed, Words};
 use crate::icons::IconBitmap;
 use crate::shell_thread::StartApp;
 use crate::start_search::{AppIndex, Keys, Setting};
@@ -21,12 +23,14 @@ pub struct CatApp {
     pub name: Box<str>,
     pub folded: Box<str>,
     /// Start offsets of the words of `folded`.
-    pub words: Box<[u16]>,
+    pub words: Box<[u8]>,
     pub initials: Box<str>,
     /// Windows' synonyms of the app (AppIndex).
     pub keys: Keys,
     /// The other names of an inbox program (`keywords::INBOX`), already folded: matched like the shown name.
     pub extra: &'static [&'static str],
+    /// The index of the inbox entry in `keywords::INBOX` (what the arena stores).
+    pub inbox: Option<u16>,
     /// Microsoft's popularity rank, smaller is better.
     pub rank: u32,
 }
@@ -36,15 +40,15 @@ impl CatApp {
     /// the keywords with penalty 1.
     pub fn new(id: &str, name: &str, keys: Keys, rank: u32) -> CatApp {
         let x = Indexed::new(name);
-        let (keys, extra) = match inbox_of(id, &x.folded) {
-            Some((_, e)) => {
+        let (keys, extra, inbox) = match inbox_of(id, &x.folded) {
+            Some((at, e)) => {
                 let mut k = keys;
                 for s in e.synonyms {
                     k.push(s, 1);
                 }
-                (k.tidy(), e.names)
+                (k.tidy(), e.names, Some(at))
             }
-            None => (keys, &[][..]),
+            None => (keys, &[][..], None),
         };
         CatApp {
             id: id.into(),
@@ -54,6 +58,7 @@ impl CatApp {
             initials: x.initials.into(),
             keys,
             extra,
+            inbox,
             rank,
         }
     }
@@ -61,9 +66,9 @@ impl CatApp {
     pub fn cand(&self) -> Cand<'_> {
         Cand {
             folded: &self.folded,
-            words: &self.words,
+            words: Words::new(&self.words),
             initials: &self.initials,
-            keys: &self.keys,
+            keys: (&self.keys).into(),
             extra: self.extra,
             rank: self.rank,
         }
@@ -95,9 +100,9 @@ impl SettingRow {
     pub fn cand(&self) -> Cand<'_> {
         Cand {
             folded: &self.folded,
-            words: &self.words,
+            words: Words::new(&self.words),
             initials: &self.initials,
-            keys: &self.keys,
+            keys: (&self.keys).into(),
             extra: &[],
             rank: self.rank,
         }
@@ -155,30 +160,50 @@ pub fn fold_settings(list: &[Setting]) -> Vec<SettingRow> {
         .collect()
 }
 
+/// The apps catalogue of one `StartApps` event as an arena (L3 T16): `ingest`, encoded, checked and the folded entries dropped,
+/// so the launcher keeps one block of bytes instead of thousands.
+pub fn build_apps(list: &[StartApp], index: Option<&AppIndex>) -> Result<Arena, ArenaError> {
+    let apps = ingest(list, index);
+    Arena::new(arena::encode_apps(&apps, Caps::APPS)?, Kind::Apps, None, Caps::APPS)
+}
+
+/// The key line of an arena made in this process (a cache file's key names what it was built from, T18).
+pub const IN_PROCESS_KEY: &str = "in-process|fmt 2";
+
 /// The keyword dictionary of the apps (L3 T9), built when the catalogue arrives.
+#[cfg(test)]
 pub fn index_apps(apps: &[CatApp]) -> IndexBuf {
     IndexBuf::build(apps.iter().enumerate().map(|(i, a)| (u32::try_from(i).unwrap_or(u32::MAX), a.cand())))
 }
 
 /// The keyword dictionary of the settings rows (L3 T9), built when the rows are folded.
+#[cfg(test)]
 pub fn index_settings(rows: &[SettingRow]) -> IndexBuf {
     IndexBuf::build(rows.iter().enumerate().map(|(i, r)| (u32::try_from(i).unwrap_or(u32::MAX), r.cand())))
 }
 
-/// The launcher's settings rows and their keyword dictionary: made from the held list off the UI thread (`start_search`
-/// builds them on a settings thread, L3 KEY-11) and shared with the list they index.
+/// The launcher's settings as one arena: made from the held list off the UI thread (`start_search` builds it on a settings
+/// thread, L3 KEY-11) and shared with the list it indexes (the entry at position i is the setting at index i).
 #[derive(Default, Debug)]
 pub struct FoldedSettings {
-    pub rows: Vec<SettingRow>,
-    pub index: IndexBuf,
+    pub arena: Arena,
 }
 
 impl FoldedSettings {
-    /// `fold_settings` of `list`, then `index_settings` of the rows.
-    pub fn new(list: &[Setting]) -> FoldedSettings {
-        let rows = fold_settings(list);
-        let index = index_settings(&rows);
-        FoldedSettings { rows, index }
+    /// `fold_settings` of `list`, encoded and checked.
+    pub fn new(list: &[Setting]) -> Result<FoldedSettings, ArenaError> {
+        let ins: Vec<SettingIn> = fold_settings(list)
+            .into_iter()
+            .zip(list)
+            .map(|(row, s)| SettingIn {
+                row,
+                target: s.target.to_string(),
+                args: s.args.as_ref().map(|a| a.to_string()),
+                start_keys: String::new(),
+            })
+            .collect();
+        let bytes = arena::encode_settings(IN_PROCESS_KEY, &ins, Caps::SETTINGS)?;
+        Ok(FoldedSettings { arena: Arena::new(bytes, Kind::Settings, Some(IN_PROCESS_KEY), Caps::SETTINGS)? })
     }
 }
 
@@ -236,7 +261,7 @@ mod tests {
     #[test]
     fn cat_app_folds_once_and_finds_its_keywords() {
         let a = CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 3);
-        assert_eq!((&*a.folded, &*a.initials, &*a.words), ("calcolatrice", "c", &[0u16][..]));
+        assert_eq!((&*a.folded, &*a.initials, &*a.words), ("calcolatrice", "c", &[0u8, 0][..]));
         assert!(a.extra.contains(&"calculator"));
         assert_eq!(rank::match_tiers(&a.cand(), "calculator"), Some(0), "the other language's name is a name");
         let s = SettingRow::new(7, "Accessibilità", Keys::default(), 1);

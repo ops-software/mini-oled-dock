@@ -21,12 +21,12 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
-use crate::launcher::catalog::{self, CatApp, FoldedSettings, IconCache};
+use crate::launcher::arena::{self, Arena, Caps, Kind as ArenaKind, SettingIn};
+use crate::launcher::catalog::{self, FoldedSettings, IconCache};
 use crate::launcher::field::KeyEvent;
 use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::history;
-use crate::launcher::index::IndexBuf;
 use crate::launcher::model::{
     Batch, Choice, CommandId, GlyphId, IconRef, Item, ItemKey, KeyChord, Kind, Mode, Mods, NumberStyle, Payload,
     ProviderId, ProviderMask, Verb, WindowRow,
@@ -2021,19 +2021,24 @@ pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
     }
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Catalog);
-    let apps = catalog::ingest(list, index);
-    let apps_ix = catalog::index_apps(&apps);
-    let (n, bytes) = (apps.len(), apps_ix.bytes());
+    let apps = match catalog::build_apps(list, index) {
+        Ok(a) => a,
+        Err(e) => {
+            let n = list.len();
+            log!("launcher: the apps catalogue of {n} entries was not kept: {e}");
+            return;
+        }
+    };
+    let (n, bytes) = (apps.len(), apps.bytes());
     let now = RealSys.now_ms();
     if with_ctrl(|c| {
         c.apps = apps;
-        c.apps_ix = apps_ix;
         c.listed_at_ms = now.max(1);
         c.listing_since = None;
     })
     .is_some()
     {
-        log!("launcher: catalogue of {n} apps, keyword index {bytes} B");
+        log!("launcher: catalogue of {n} apps, {bytes} B");
     }
 }
 
@@ -2194,7 +2199,7 @@ pub(crate) fn prepare_open() {
         let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
     }
     start_search::hold_settings(Holder::Launcher);
-    if with_ctrl(|c| c.settings.rows.is_empty()) == Some(true) {
+    if with_ctrl(|c| c.settings.arena.is_empty()) == Some(true) {
         fold_held_settings();
     }
     let windows = crate::launcher_sys::window_rows();
@@ -2473,10 +2478,8 @@ struct Ctrl {
     opts: LauncherOpts,
     num: NumberStyle,
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
-    apps: Vec<CatApp>,
-    /// The keyword dictionary of `apps` (L3 T9), built where they are.
-    apps_ix: IndexBuf,
-    /// The settings rows and their keyword dictionary, shared with `start_search`'s settings thread that made them.
+    apps: Arena,
+    /// The settings arena, shared with `start_search`'s settings thread that made it.
     settings: Arc<FoldedSettings>,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
@@ -2572,8 +2575,7 @@ impl Ctrl {
             width: style::LAUNCHER_W,
             opts: LauncherOpts::default(),
             num: NumberStyle { decimal: '.', group: ',' },
-            apps: Vec::new(),
-            apps_ix: IndexBuf::default(),
+            apps: Arena::default(),
             settings: Arc::default(),
             windows: Vec::new(),
             history: Vec::new(),
@@ -2654,10 +2656,8 @@ impl Ctrl {
     fn context(&self) -> Context<'_> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
         Context {
-            apps: &self.apps,
-            settings: &self.settings.rows,
-            apps_ix: Some(self.apps_ix.view()),
-            settings_ix: Some(self.settings.index.view()),
+            apps: self.apps.view(),
+            settings: self.settings.arena.view(),
             windows: &self.windows,
             history: &self.history,
             opts: &self.opts,
@@ -3242,7 +3242,18 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         apps.push(CatApp::new(id, name, Keys::default(), 10 + u32::try_from(i).unwrap_or(0)));
         icons.push((id.to_lowercase(), crate::preview::mock_icon(*letter, *rgb, 64)));
     }
-    let settings = vec![SettingRow::new(0, tr("Display", "Schermo"), Keys::default(), 1)];
+    let settings = vec![SettingIn {
+        row: SettingRow::new(0, tr("Display", "Schermo"), Keys::default(), 1),
+        target: "ms-settings:display".into(),
+        args: None,
+        start_keys: String::new(),
+    }];
+    let apps_arena = arena::encode_apps(&apps, Caps::APPS)
+        .and_then(|b| Arena::new(b, ArenaKind::Apps, None, Caps::APPS))
+        .unwrap_or_default();
+    let settings_arena = arena::encode_settings(catalog::IN_PROCESS_KEY, &settings, Caps::SETTINGS)
+        .and_then(|b| Arena::new(b, ArenaKind::Settings, Some(catalog::IN_PROCESS_KEY), Caps::SETTINGS))
+        .unwrap_or_default();
     let window = |hwnd: isize, key: &str, name: &str, title: &str| {
         let mut folded = String::new();
         rank::fold(name, &mut folded);
@@ -3274,10 +3285,8 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     let history: Vec<Box<str>> = vec!["ping 1.1.1.1".into()];
     let opts = LauncherOpts::default();
     let cx = Context {
-        apps: &apps,
-        settings: &settings,
-        apps_ix: None,
-        settings_ix: None,
+        apps: apps_arena.view(),
+        settings: settings_arena.view(),
         windows: &windows,
         history: &history,
         opts: &opts,
@@ -4453,16 +4462,16 @@ mod tests {
 
     #[test]
     fn chord_off_keeps_no_resident_data() {
-        use crate::launcher::model::SettingRow;
-        use crate::start_search::Keys;
         let filled = |dirty: bool, learn: bool| {
             let mut c = Ctrl::new();
-            c.apps =
-                vec![CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 1)];
-            c.settings = Arc::new(FoldedSettings {
-                rows: vec![SettingRow::new(0, "Schermo", Keys::default(), 1)],
-                index: IndexBuf::default(),
-            });
+            c.apps = crate::launcher::arena::test_apps(&[(
+                "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+                "Calcolatrice",
+                &[],
+                1,
+            )]);
+            c.settings =
+                Arc::new(FoldedSettings { arena: crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]) });
             c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
             c.history = vec!["ping 1.1.1.1".into()];
             c.last_query = Some("calc".into());
@@ -4473,7 +4482,7 @@ mod tests {
         };
         let empty = |c: &Ctrl| {
             c.apps.is_empty()
-                && c.settings.rows.is_empty()
+                && c.settings.arena.is_empty()
                 && c.windows.is_empty()
                 && c.icons.len() == 0
                 && c.history.is_empty()
@@ -4797,10 +4806,8 @@ mod tests {
         static LEARNED: std::sync::OnceLock<Frecency> = std::sync::OnceLock::new();
         let opts = OPTS.get_or_init(LauncherOpts::default);
         crate::launcher::providers::Context {
-            apps: &[],
-            settings: &[],
-            apps_ix: None,
-            settings_ix: None,
+            apps: Default::default(),
+            settings: Default::default(),
             windows: &[],
             history: &[],
             opts,
@@ -5512,11 +5519,14 @@ mod tests {
 
     #[test]
     fn warm_asks_nothing() {
-        use crate::start_search::Keys;
         // A catalogue is there: an empty field still shows no row, so no icon is asked for.
         with_ctrl(|c| {
-            c.apps =
-                vec![CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 1)];
+            c.apps = crate::launcher::arena::test_apps(&[(
+                "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+                "Calcolatrice",
+                &[],
+                1,
+            )]);
         });
         let mut s = Surface::new(Metrics { dpi: 96 }).unwrap();
         let mut sys = FakeSys::default();

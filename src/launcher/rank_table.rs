@@ -7,11 +7,11 @@
 
 use std::borrow::Cow;
 
-use super::catalog::{self, CatApp};
+use super::arena::Arena;
+use super::catalog;
 use super::frecency::Frecency;
-use super::index::IndexBuf;
 use super::keywords;
-use super::model::{Item, Kind, NumberStyle, ProviderId, SettingRow};
+use super::model::{Item, Kind, NumberStyle, ProviderId};
 use super::providers::{self, web_search_key, Budget, Context, LauncherOpts, Results};
 use super::query::{self, Implicit};
 use super::rank;
@@ -141,10 +141,8 @@ const SETTINGS_IT: &[SetRow] = &[
 
 /// One language's catalogues, built the way the dock builds them.
 struct World {
-    apps: Vec<CatApp>,
-    settings: Vec<SettingRow>,
-    apps_ix: IndexBuf,
-    settings_ix: IndexBuf,
+    apps: Arena,
+    settings: Arena,
     opts: LauncherOpts,
     learned: Frecency,
     num: NumberStyle,
@@ -166,7 +164,7 @@ impl World {
                 index.ranks.insert(id.to_lowercase(), *r);
             }
         }
-        let apps = catalog::ingest(&list, Some(&index));
+        let apps = catalog::build_apps(&list, Some(&index)).unwrap();
         let rows = if italian { SETTINGS_IT } else { SETTINGS_EN };
         let held: Vec<Setting> = rows
             .iter()
@@ -185,10 +183,8 @@ impl World {
                 }
             })
             .collect();
-        let settings = catalog::fold_settings(&held);
+        let settings = catalog::FoldedSettings::new(&held).unwrap().arena;
         World {
-            apps_ix: catalog::index_apps(&apps),
-            settings_ix: catalog::index_settings(&settings),
             apps,
             settings,
             opts: LauncherOpts::default(),
@@ -199,10 +195,8 @@ impl World {
 
     fn cx(&self) -> Context<'_> {
         Context {
-            apps: &self.apps,
-            settings: &self.settings,
-            apps_ix: Some(self.apps_ix.view()),
-            settings_ix: Some(self.settings_ix.view()),
+            apps: self.apps.view(),
+            settings: self.settings.view(),
             windows: &[],
             history: &[],
             opts: &self.opts,

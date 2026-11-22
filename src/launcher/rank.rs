@@ -53,8 +53,8 @@ fn fold_char(c: char, out: &mut String) {
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Indexed {
     pub folded: String,
-    /// Byte offsets into `folded` where a word starts.
-    pub words: Vec<u16>,
+    /// Byte offsets into `folded` where a word starts, as little-endian u16 (read through `Words`).
+    pub words: Vec<u8>,
     pub initials: String,
 }
 
@@ -80,7 +80,7 @@ impl Indexed {
                 let before = self.folded.len();
                 if starts {
                     if let Ok(off) = u16::try_from(before) {
-                        self.words.push(off);
+                        self.words.extend_from_slice(&off.to_le_bytes());
                     }
                 }
                 fold_char(c, &mut self.folded);
@@ -99,7 +99,58 @@ impl Indexed {
     }
 
     pub fn cand<'a>(&'a self, keys: &'a Keys, extra: &'a [&'static str], rank: u32) -> Cand<'a> {
-        Cand { folded: &self.folded, words: &self.words, initials: &self.initials, keys, extra, rank }
+        Cand {
+            folded: &self.folded,
+            words: Words::new(&self.words),
+            initials: &self.initials,
+            keys: keys.into(),
+            extra,
+            rank,
+        }
+    }
+}
+
+/// The word starts of a name: a little-endian u16 byte slice, so an arena (which cannot promise alignment) lends them
+/// without a copy.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Words<'a>(&'a [u8]);
+
+impl<'a> Words<'a> {
+    #[cfg(test)]
+    pub const EMPTY: Words<'static> = Words(&[]);
+
+    pub fn new(bytes: &'a [u8]) -> Words<'a> {
+        Words(bytes)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len() / 2
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u16> + 'a {
+        self.0.chunks_exact(2).filter_map(|c| Some(u16::from_le_bytes(c.try_into().ok()?)))
+    }
+}
+
+/// The hidden keywords of a candidate, as packed text: only the in-memory fixtures that feed `IndexBuf::build` and the
+/// reference scans of the tests carry any. A candidate of an arena carries none (`EMPTY`): its hidden tiers come from the
+/// arena's dictionaries.
+#[derive(Clone, Copy, Default)]
+pub struct KeysRef<'a>(Option<&'a Keys>);
+
+impl<'a> KeysRef<'a> {
+    pub const EMPTY: KeysRef<'static> = KeysRef(None);
+
+    /// The keywords and their penalty texts, as `Keys::raw`.
+    pub fn raw(&self) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.0.into_iter().flat_map(|k| k.raw())
+    }
+}
+
+impl<'a> From<&'a Keys> for KeysRef<'a> {
+    fn from(k: &'a Keys) -> KeysRef<'a> {
+        KeysRef(Some(k))
     }
 }
 
@@ -108,10 +159,10 @@ impl Indexed {
 pub struct Cand<'a> {
     pub folded: &'a str,
     /// Word start offsets into `folded`.
-    pub words: &'a [u16],
+    pub words: Words<'a>,
     pub initials: &'a str,
     /// Windows' synonyms (start_search), already lowercase.
-    pub keys: &'a Keys,
+    pub keys: KeysRef<'a>,
     /// The other names (aliases: an inbox program's names in both languages, a command's names and words), already
     /// folded: matched like the shown name.
     pub extra: &'a [&'static str],
@@ -283,7 +334,7 @@ fn alias_starts(a: &str) -> impl Iterator<Item = usize> + '_ {
 /// The best name-like tier (0-2) over the shown name and every alias in `c.extra`. The UI language only chooses the shown
 /// name: an alias in the other language matches the same way. Allocates nothing.
 pub fn name_tier(c: &Cand, q: &str) -> Option<u8> {
-    let mut best = name_like(c.folded, q, c.words.iter().map(|&w| usize::from(w)));
+    let mut best = name_like(c.folded, q, c.words.iter().map(usize::from));
     for a in c.extra {
         if best == Some(0) {
             break;
@@ -372,8 +423,7 @@ pub fn match_fuzzy(c: &Cand, q: &str) -> Option<u8> {
     if dist == 0 {
         return None;
     }
-    let name =
-        c.words.iter().filter_map(|&w| c.folded.get(usize::from(w)..)).any(|t| near_prefix_one_pass(t, qc, dist));
+    let name = c.words.iter().filter_map(|w| c.folded.get(usize::from(w)..)).any(|t| near_prefix_one_pass(t, qc, dist));
     let alias = |k: &str| {
         near_prefix_one_pass(k, qc, dist)
             || k.match_indices(' ').any(|(i, _)| k.get(i + 1..).is_some_and(|t| near_prefix_one_pass(t, qc, dist)))
@@ -1507,24 +1557,28 @@ it|zzzz|-|0
         assert!(cands.iter().all(|c| match_tiers(c, " ").is_none() && match_fuzzy(c, "").is_none()));
     }
 
+    fn words_of(x: &Indexed) -> Vec<u16> {
+        Words::new(&x.words).iter().collect()
+    }
+
     #[test]
     fn index_splits_words_and_builds_initials() {
         let x = Indexed::new("VisualStudio Code");
         assert_eq!(x.folded, "visualstudio code");
-        assert_eq!(x.words, vec![0, 6, 13]);
+        assert_eq!(words_of(&x), vec![0, 6, 13]);
         assert_eq!(x.initials, "vsc");
         let y = Indexed::new("Gestione attività (x64)");
         assert_eq!(y.folded, "gestione attivita (x64)");
-        assert_eq!(y.words, vec![0, 9, 19]);
+        assert_eq!(words_of(&y), vec![0, 9, 19]);
         assert_eq!(y.initials, "gax");
         let z = Indexed::new("PowerShell 7-preview");
         assert_eq!(z.initials, "ps7p");
-        assert_eq!(Indexed::new("").words, Vec::<u16>::new());
+        assert_eq!(words_of(&Indexed::new("")), Vec::<u16>::new());
         assert_eq!(Indexed::new("---").initials, "");
         // Folding can lengthen a name; offsets stay inside the folded text.
         let w = Indexed::new("Straße Ærø");
         assert_eq!(w.folded, "strasse aero");
-        assert_eq!(w.words, vec![0, 8]);
+        assert_eq!(words_of(&w), vec![0, 8]);
     }
 
     #[test]

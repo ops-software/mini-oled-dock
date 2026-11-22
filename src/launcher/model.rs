@@ -498,7 +498,7 @@ pub struct SettingRow {
     pub name: Box<str>,
     pub folded: Box<str>,
     /// Start offsets of the words of `folded`.
-    pub words: Box<[u16]>,
+    pub words: Box<[u8]>,
     pub initials: Box<str>,
     pub keys: Keys,
     pub rank: u32,

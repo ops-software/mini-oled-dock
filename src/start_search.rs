@@ -581,13 +581,22 @@ pub(crate) fn launcher_settings() -> Option<(Arc<Vec<Setting>>, Arc<FoldedSettin
     }
 }
 
+/// The launcher's settings arena of `list`; one that cannot be made (a name past the arena's limits, say) is logged and the
+/// launcher searches no settings, as before the list was there.
+fn fold_or_empty(list: &[Setting]) -> Arc<FoldedSettings> {
+    Arc::new(FoldedSettings::new(list).unwrap_or_else(|e| {
+        log!("start search: the launcher's settings catalogue was not built: {e}");
+        FoldedSettings::default()
+    }))
+}
+
 /// Folds `list` for the launcher on a short-lived thread (normal priority: the launcher waits for these rows, and pages a
 /// background thread touches get a low memory priority).
 fn fold_for_launcher(list: Arc<Vec<Setting>>) {
     let spawned = std::thread::Builder::new().name("start-settings".into()).spawn(move || {
         let mut list = list;
         loop {
-            let mut folded = Some(Arc::new(FoldedSettings::new(&list)));
+            let mut folded = Some(fold_or_empty(&list));
             let next = {
                 let mut h = held();
                 fold_done(&mut h, &list, &mut folded, holds_settings(Holder::Launcher))
@@ -638,7 +647,7 @@ pub(crate) fn load_settings() {
         let mut folded = holds_settings(Holder::Launcher).then(|| {
             // SAFETY: pseudo-handle of the current thread; ends the background mode begun above, harmless if it fails.
             let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
-            Arc::new(FoldedSettings::new(&list))
+            fold_or_empty(&list)
         });
         // Released while it was being built: not kept (decided under the lock a release clears it with; what is not
         // kept is dropped after it).
@@ -1337,12 +1346,12 @@ mod tests {
 
     fn held_list(n: usize) -> (Arc<Vec<Setting>>, Arc<FoldedSettings>) {
         let list = Arc::new(sample(n));
-        let folded = Arc::new(FoldedSettings::new(&list));
+        let folded = Arc::new(FoldedSettings::new(&list).unwrap());
         (list, folded)
     }
 
     fn ready_with(ask: LauncherAsk, list: &Arc<Vec<Setting>>) -> bool {
-        matches!(ask, LauncherAsk::Ready(l, f) if Arc::ptr_eq(&l, list) && f.rows.len() == list.len() && f.index.bytes() > 0)
+        matches!(ask, LauncherAsk::Ready(l, f) if Arc::ptr_eq(&l, list) && f.arena.len() == list.len() && f.arena.bytes() > 0)
     }
 
     #[test]
@@ -1466,6 +1475,39 @@ mod tests {
         assert!(idx.ranks.len() > 1000 && idx.default_rank > 0);
         println!("rkdp -> {:?}", converted("rkdp"));
         release_app_index();
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    /// The arena of the settings of THIS machine, through `build_settings` and the entry builder (run by hand: `cargo test --
+    /// --ignored --nocapture real_settings_arena_size_printed`): its size, and what `check` costs at every open.
+    #[test]
+    #[ignore]
+    fn real_settings_arena_size_printed() {
+        // SAFETY: COM for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let list = build_settings();
+        let folded = FoldedSettings::new(&list).expect("the settings of this machine fit the arena");
+        let bytes = folded.arena.raw();
+        let kinds = crate::launcher::arena::Kind::Settings;
+        let caps = crate::launcher::arena::Caps::SETTINGS;
+        let mut times: Vec<std::time::Duration> = (0..51)
+            .map(|_| {
+                let t = Instant::now();
+                std::hint::black_box(crate::launcher::arena::check(bytes, kinds, None, caps)).expect("checks");
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        println!(
+            "{} settings, arena {} B (cap {}), check median {:?} over 51 runs",
+            list.len(),
+            bytes.len(),
+            caps.bytes,
+            times.get(25)
+        );
         if hr.is_ok() {
             // SAFETY: paired with the successful CoInitializeEx above.
             unsafe { CoUninitialize() };

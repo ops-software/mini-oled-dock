@@ -28,12 +28,12 @@ const XML_POST: usize = 4;
 /// The hidden match of one entry: (entry, tier, penalty).
 pub type Hit = (u32, u8, u32);
 
-fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+pub(super) fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     let end = at.checked_add(4)?;
     Some(u32::from_le_bytes(b.get(at..end)?.try_into().ok()?))
 }
 
-fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+pub(super) fn u16_at(b: &[u8], at: usize) -> Option<u16> {
     let end = at.checked_add(2)?;
     Some(u16::from_le_bytes(b.get(at..end)?.try_into().ok()?))
 }
@@ -42,13 +42,16 @@ fn put_u32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_le_bytes());
 }
 
+#[cfg(test)]
 fn align4(v: &mut Vec<u8>) {
     while !v.len().is_multiple_of(4) {
         v.push(0);
     }
 }
 
-/// The owned bytes of an index: the strings and the sections.
+/// The owned bytes of an index: the strings and the sections. The dock searches the index inside an arena; this owned form is
+/// what the reference tests and benches build to compare it with.
+#[cfg(test)]
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct IndexBuf {
     entries: u32,
@@ -57,122 +60,14 @@ pub struct IndexBuf {
     bounds: [(u32, u32); SECTIONS],
 }
 
+#[cfg(test)]
 impl IndexBuf {
     /// The index of the keywords and names of `entries` ((position, candidate)). A keyword whose penalty is
     /// `XML_KEYWORD_PENALTY` goes to the XML dictionary, any other to the curated one with its penalty. The fuzzy targets are the
     /// word suffixes of every shown name and of every other name (L3 T10), each with the entries that have it.
     pub fn build<'a>(entries: impl Iterator<Item = (u32, Cand<'a>)>) -> IndexBuf {
-        let mut cur: Vec<(&str, u32, u32)> = Vec::new();
-        let mut xml: Vec<(&str, u32)> = Vec::new();
-        let mut targets: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
-        let mut seen = [false; 128];
-        let mut other: BTreeSet<char> = BTreeSet::new();
         let mut st = Strs::default();
-        let mut n = 0u32;
-        for (e, c) in entries {
-            n = n.max(e.saturating_add(1));
-            for (k, text) in c.keys.raw() {
-                if k.len() > usize::from(u16::MAX) {
-                    continue;
-                }
-                let penalty: u32 = text.parse().unwrap_or(u32::MAX);
-                if penalty == XML_KEYWORD_PENALTY {
-                    xml.push((k, e));
-                } else {
-                    cur.push((k, e, penalty));
-                }
-            }
-            // Names are stored once; a target is a slice of one (the first occurrence of its text).
-            let mut add = |t: &'a str, off: usize| {
-                if t.is_empty() || t.len() > usize::from(u16::MAX) {
-                    return;
-                }
-                let at = u32::try_from(off).unwrap_or(u32::MAX);
-                targets.entry(t).or_insert_with(|| (at, Vec::new())).1.push(e);
-            };
-            let off = st.intern(c.folded);
-            for &w in c.words {
-                let w = usize::from(w);
-                if let Some(t) = c.folded.get(w..) {
-                    add(t, off + w);
-                }
-            }
-            for a in c.extra {
-                let off = st.intern(a);
-                add(a, off);
-                for (i, _) in a.match_indices(' ') {
-                    if let Some(t) = a.get(i + 1..) {
-                        add(t, off + i + 1);
-                    }
-                }
-            }
-            for ch in c.folded.chars().chain(c.extra.iter().flat_map(|a| a.chars())) {
-                match seen.get_mut(ch as usize) {
-                    Some(s) => *s = true,
-                    None => {
-                        other.insert(ch);
-                    }
-                }
-            }
-        }
-        // Sorted by (keyword, entry, penalty): a keyword twice on one entry keeps its best penalty.
-        cur.sort_unstable();
-        cur.dedup_by(|later, first| later.0 == first.0 && later.1 == first.1);
-        xml.sort_unstable();
-        xml.dedup();
-        let mut sections: [Vec<u8>; SECTIONS] = Default::default();
-        let mut i = 0;
-        while let Some(&(k, ..)) = cur.get(i) {
-            let run = cur.get(i..).map_or(0, |r| r.iter().take_while(|e| e.0 == k).count());
-            let first = sections.get(CURP).map_or(0, |p| p.len() / CUR_POST);
-            for &(_, e, p) in cur.get(i..i + run).unwrap_or_default() {
-                if let Some(s) = sections.get_mut(CURP) {
-                    put_u32(s, e);
-                    put_u32(s, p);
-                }
-            }
-            let off = st.intern(k);
-            if let Some(s) = sections.get_mut(CUR) {
-                record(s, off, k.len(), first, run);
-            }
-            i += run;
-        }
-        let mut i = 0;
-        while let Some(&(k, _)) = xml.get(i) {
-            let run = xml.get(i..).map_or(0, |r| r.iter().take_while(|e| e.0 == k).count());
-            let first = sections.get(XMLP).map_or(0, |p| p.len() / XML_POST);
-            for &(_, e) in xml.get(i..i + run).unwrap_or_default() {
-                if let Some(s) = sections.get_mut(XMLP) {
-                    put_u32(s, e);
-                }
-            }
-            let off = st.intern(k);
-            if let Some(s) = sections.get_mut(XML) {
-                record(s, off, k.len(), first, run);
-            }
-            i += run;
-        }
-        let mut targets: Vec<(&str, (u32, Vec<u32>))> = targets.into_iter().collect();
-        targets.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        for (t, (off, mut es)) in targets {
-            es.sort_unstable();
-            es.dedup();
-            let first = sections.get(FUZP).map_or(0, |p| p.len() / XML_POST);
-            if let Some(s) = sections.get_mut(FUZP) {
-                for e in &es {
-                    put_u32(s, *e);
-                }
-            }
-            if let Some(s) = sections.get_mut(FUZ) {
-                record(s, off as usize, t.len(), first, es.len());
-            }
-        }
-        if let Some(s) = sections.get_mut(CHARS) {
-            let ascii = seen.iter().enumerate().filter(|(_, on)| **on).filter_map(|(c, _)| char::from_u32(c as u32));
-            for ch in ascii.chain(other.iter().copied()) {
-                put_u32(s, ch as u32);
-            }
-        }
+        let (n, sections) = build_sections(entries, &mut st);
         let mut b = IndexBuf { entries: n, strs: st.bytes, ..IndexBuf::default() };
         for (id, s) in sections.iter().enumerate() {
             align4(&mut b.secs);
@@ -206,16 +101,135 @@ impl IndexBuf {
     }
 }
 
+/// The seven index sections of `entries` (C.1's ids 3 to 9) and the entry count, the strings interned into `st` (an arena
+/// shares them with its own fields).
+pub(super) fn build_sections<'a>(
+    entries: impl Iterator<Item = (u32, Cand<'a>)>,
+    st: &mut Strs<'a>,
+) -> (u32, [Vec<u8>; SECTIONS]) {
+    let mut cur: Vec<(&str, u32, u32)> = Vec::new();
+    let mut xml: Vec<(&str, u32)> = Vec::new();
+    let mut targets: HashMap<&str, (u32, Vec<u32>)> = HashMap::new();
+    let mut seen = [false; 128];
+    let mut other: BTreeSet<char> = BTreeSet::new();
+    let mut n = 0u32;
+    for (e, c) in entries {
+        n = n.max(e.saturating_add(1));
+        for (k, text) in c.keys.raw() {
+            if k.len() > usize::from(u16::MAX) {
+                continue;
+            }
+            let penalty: u32 = text.parse().unwrap_or(u32::MAX);
+            if penalty == XML_KEYWORD_PENALTY {
+                xml.push((k, e));
+            } else {
+                cur.push((k, e, penalty));
+            }
+        }
+        // Names are stored once; a target is a slice of one (the first occurrence of its text).
+        let mut add = |t: &'a str, off: usize| {
+            if t.is_empty() || t.len() > usize::from(u16::MAX) {
+                return;
+            }
+            let at = u32::try_from(off).unwrap_or(u32::MAX);
+            targets.entry(t).or_insert_with(|| (at, Vec::new())).1.push(e);
+        };
+        let off = st.intern(c.folded);
+        for w in c.words.iter() {
+            let w = usize::from(w);
+            if let Some(t) = c.folded.get(w..) {
+                add(t, off + w);
+            }
+        }
+        for a in c.extra {
+            let off = st.intern(a);
+            add(a, off);
+            for (i, _) in a.match_indices(' ') {
+                if let Some(t) = a.get(i + 1..) {
+                    add(t, off + i + 1);
+                }
+            }
+        }
+        for ch in c.folded.chars().chain(c.extra.iter().flat_map(|a| a.chars())) {
+            match seen.get_mut(ch as usize) {
+                Some(s) => *s = true,
+                None => {
+                    other.insert(ch);
+                }
+            }
+        }
+    }
+    // Sorted by (keyword, entry, penalty): a keyword twice on one entry keeps its best penalty.
+    cur.sort_unstable();
+    cur.dedup_by(|later, first| later.0 == first.0 && later.1 == first.1);
+    xml.sort_unstable();
+    xml.dedup();
+    let mut sections: [Vec<u8>; SECTIONS] = Default::default();
+    let mut i = 0;
+    while let Some(&(k, ..)) = cur.get(i) {
+        let run = cur.get(i..).map_or(0, |r| r.iter().take_while(|e| e.0 == k).count());
+        let first = sections.get(CURP).map_or(0, |p| p.len() / CUR_POST);
+        for &(_, e, p) in cur.get(i..i + run).unwrap_or_default() {
+            if let Some(s) = sections.get_mut(CURP) {
+                put_u32(s, e);
+                put_u32(s, p);
+            }
+        }
+        let off = st.intern(k);
+        if let Some(s) = sections.get_mut(CUR) {
+            record(s, off, k.len(), first, run);
+        }
+        i += run;
+    }
+    let mut i = 0;
+    while let Some(&(k, _)) = xml.get(i) {
+        let run = xml.get(i..).map_or(0, |r| r.iter().take_while(|e| e.0 == k).count());
+        let first = sections.get(XMLP).map_or(0, |p| p.len() / XML_POST);
+        for &(_, e) in xml.get(i..i + run).unwrap_or_default() {
+            if let Some(s) = sections.get_mut(XMLP) {
+                put_u32(s, e);
+            }
+        }
+        let off = st.intern(k);
+        if let Some(s) = sections.get_mut(XML) {
+            record(s, off, k.len(), first, run);
+        }
+        i += run;
+    }
+    let mut targets: Vec<(&str, (u32, Vec<u32>))> = targets.into_iter().collect();
+    targets.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (t, (off, mut es)) in targets {
+        es.sort_unstable();
+        es.dedup();
+        let first = sections.get(FUZP).map_or(0, |p| p.len() / XML_POST);
+        if let Some(s) = sections.get_mut(FUZP) {
+            for e in &es {
+                put_u32(s, *e);
+            }
+        }
+        if let Some(s) = sections.get_mut(FUZ) {
+            record(s, off as usize, t.len(), first, es.len());
+        }
+    }
+    if let Some(s) = sections.get_mut(CHARS) {
+        let ascii = seen.iter().enumerate().filter(|(_, on)| **on).filter_map(|(c, _)| char::from_u32(c as u32));
+        for ch in ascii.chain(other.iter().copied()) {
+            put_u32(s, ch as u32);
+        }
+    }
+    (n, sections)
+}
+
 /// The strings of an index, each once.
 #[derive(Default)]
-struct Strs<'a> {
+pub(super) struct Strs<'a> {
     seen: HashMap<&'a str, u32>,
-    bytes: Vec<u8>,
+    pub(super) bytes: Vec<u8>,
 }
 
 impl<'a> Strs<'a> {
     /// The offset of `s` in the bytes, stored on the first call.
-    fn intern(&mut self, s: &'a str) -> usize {
+    pub(super) fn intern(&mut self, s: &'a str) -> usize {
         if let Some(&off) = self.seen.get(s) {
             return off as usize;
         }
@@ -242,6 +256,15 @@ struct Rec<'a> {
     count: usize,
 }
 
+impl Rec<'_> {
+    /// The postings of the record inside a posting section of `posts` postings: a range the record claims beyond the
+    /// section is cut to it (a validated arena never claims one; the view does not rely on that).
+    fn run(&self, posts: usize) -> std::ops::Range<usize> {
+        let first = self.first.min(posts);
+        first..self.first.saturating_add(self.count).min(posts)
+    }
+}
+
 /// A searchable index over borrowed bytes (an owned `IndexBuf`, later a mapped arena).
 #[derive(Clone, Copy, Debug)]
 pub struct IndexView<'a> {
@@ -255,7 +278,8 @@ impl<'a> IndexView<'a> {
         IndexView { entries, strs, secs }
     }
 
-    /// The number of entries the index was built over: a caller whose catalogue has another length does not use it.
+    /// The number of entries the index was built over.
+    #[cfg(test)]
     pub fn entries(&self) -> usize {
         self.entries as usize
     }
@@ -317,13 +341,15 @@ impl<'a> IndexView<'a> {
             return;
         }
         let (fuz, fuzp) = (self.sec(FUZ), self.sec(FUZP));
+        // No more entries than the posting section holds: a lying record cannot make the answer longer than the buffer.
+        let posts = fuzp.len() / XML_POST;
         let mut walk = PrefixWalk::new(qc, dist);
         for t in 0..fuz.len() / REC {
             let Some(r) = self.rec(fuz, t) else { continue };
             let Ok(text) = std::str::from_utf8(r.text) else { continue };
             if walk.next(text) {
-                for p in r.first..r.first.saturating_add(r.count) {
-                    if let Some(e) = u32_at(fuzp, p.saturating_mul(XML_POST)) {
+                for p in r.run(posts).take(posts.saturating_sub(out.len())) {
+                    if let Some(e) = u32_at(fuzp, p.saturating_mul(XML_POST)).filter(|&e| e < self.entries) {
                         out.push(e);
                     }
                 }
@@ -345,6 +371,9 @@ impl<'a> IndexView<'a> {
         }
         let cur = self.sec(CUR);
         let curp = self.sec(CURP);
+        let (cur_posts, xml_posts) = (curp.len() / CUR_POST, self.sec(XMLP).len() / XML_POST);
+        // The answer holds at most one hit per posting of the buffer, whatever the records claim.
+        let cap = cur_posts.saturating_add(xml_posts);
         let lo = self.lower_bound(cur, q);
         let prefixes = |f: &mut dyn FnMut(&Rec<'a>, bool)| {
             let mut k = lo;
@@ -361,23 +390,24 @@ impl<'a> IndexView<'a> {
             }
         };
         let mut total = 0usize;
-        prefixes(&mut |r, _| total = total.saturating_add(r.count));
+        prefixes(&mut |r, _| total = total.saturating_add(r.run(cur_posts).len()));
         let xml = self.sec(XML);
         let xmlp = self.sec(XMLP);
         let xr = self.rec(xml, self.lower_bound(xml, q)).filter(|r| r.text == q);
-        out.reserve(total.saturating_add(xr.as_ref().map_or(0, |r| r.count)));
+        out.reserve(total.saturating_add(xr.as_ref().map_or(0, |r| r.run(xml_posts).len())).min(cap));
         prefixes(&mut |r, eq| {
             let tier = if eq { T_SYN_EQ } else { T_SYN_PREFIX };
-            for p in r.first..r.first.saturating_add(r.count) {
+            for p in r.run(cur_posts).take(cap.saturating_sub(out.len())) {
                 let at = p.saturating_mul(CUR_POST);
-                if let (Some(e), Some(pen)) = (u32_at(curp, at), at.checked_add(4).and_then(|a| u32_at(curp, a))) {
+                let e = u32_at(curp, at).filter(|&e| e < self.entries);
+                if let (Some(e), Some(pen)) = (e, at.checked_add(4).and_then(|a| u32_at(curp, a))) {
                     out.push((e, tier, pen));
                 }
             }
         });
         if let Some(r) = xr {
-            for p in r.first..r.first.saturating_add(r.count) {
-                if let Some(e) = u32_at(xmlp, p.saturating_mul(XML_POST)) {
+            for p in r.run(xml_posts).take(cap.saturating_sub(out.len())) {
+                if let Some(e) = u32_at(xmlp, p.saturating_mul(XML_POST)).filter(|&e| e < self.entries) {
                     out.push((e, T_BAG_EQ, XML_KEYWORD_PENALTY));
                 }
             }
@@ -629,7 +659,14 @@ mod tests {
             settings.iter().map(|r| r.keys.raw().map(|(k, p)| k.len() + p.len() + 2).sum::<usize>()).sum();
         // Nameless candidates: only the keyword sections and their strings are built.
         fn bare(r: &SettingRow) -> rank::Cand<'_> {
-            rank::Cand { folded: "", words: &[], initials: "", keys: &r.keys, extra: &[], rank: 0 }
+            rank::Cand {
+                folded: "",
+                words: rank::Words::EMPTY,
+                initials: "",
+                keys: (&r.keys).into(),
+                extra: &[],
+                rank: 0,
+            }
         }
         let keywords = IndexBuf::build(settings.iter().enumerate().map(|(i, r)| (i as u32, bare(r))));
         let all = catalog::index_settings(&settings);
