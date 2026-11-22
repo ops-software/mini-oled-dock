@@ -1082,6 +1082,9 @@ impl StartMenu {
         self.scroll = self.scroll.min(self.max_scroll());
         if let Some(s) = self.sel {
             self.sel = if self.results.is_empty() { None } else { Some(s.min(self.results.len() - 1)) };
+        } else if searching {
+            // Typed before the data arrived: the first app that shows up becomes the default, never the offer.
+            self.sel = self.default_sel();
         }
         self.layout_over();
         self.rebuild_hits();
@@ -1485,9 +1488,14 @@ impl StartMenu {
         self.scroll = 0;
         self.refresh();
         // The offer row is first but never the default: Enter after typing opens the first app, not the offer.
-        let first = usize::from(self.results.first() == Some(&Item::Offer));
-        self.sel = (self.searching() && self.results.len() > first).then_some(first);
+        self.sel = self.default_sel();
         Reply::Redraw
+    }
+
+    /// The result Enter opens while searching: the first one, skipping the offer row.
+    fn default_sel(&self) -> Option<usize> {
+        let first = usize::from(self.results.first() == Some(&Item::Offer));
+        (self.searching() && self.results.len() > first).then_some(first)
     }
 
     /// Moves the selection by `delta` results (clamped); the first move from no selection lands on
@@ -2185,7 +2193,7 @@ impl Content for StartMenu {
             VK_HOME => self.move_sel(i64::MIN / 2),
             VK_END => self.move_sel(i64::MAX / 2),
             VK_RETURN => {
-                let target = self.sel.or((self.searching() && !self.results.is_empty()).then_some(0));
+                let target = self.sel.or(self.default_sel());
                 match target.and_then(|i| self.results.get(i)).map(Self::item_target) {
                     Some(t) => self.activate(t),
                     None => Reply::None,
@@ -2524,6 +2532,24 @@ mod tests {
         assert_eq!(c.button(ID_ROW, Button::Right), Reply::None);
         assert_eq!(c.click(ID_ROW + 1), Reply::Close);
         assert_eq!(c.pending, Some(Pending::App("a".into())));
+        release_store();
+    }
+
+    #[test]
+    fn enter_without_a_selection_skips_the_offer_row() {
+        let apps = vec![("a".to_string(), "Alpha".to_string(), IconBitmap::new(32, 32))];
+        drop(preview_new(apps, "", StartStyle::Compact, None));
+        let mut c = make();
+        c.query = "al".into();
+        c.results = vec![Item::Offer, Item::App(0)];
+        c.sel = None;
+        assert_eq!(c.key(VK_RETURN), Some(Reply::Close));
+        assert_eq!(c.pending, Some(Pending::App("a".into())));
+        // Only the offer: nothing to open.
+        c.pending = None;
+        c.results = vec![Item::Offer];
+        assert_eq!(c.key(VK_RETURN), Some(Reply::None));
+        assert!(c.pending.is_none());
         release_store();
     }
 
