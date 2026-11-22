@@ -1,6 +1,6 @@
-//! Low-level keyboard hook (WH_KEYBOARD_LL) for the Win key pressed "alone".
+//! Low-level keyboard hook (WH_KEYBOARD_LL) for the Win key pressed "alone", and the launcher's chord.
 //!
-//! Rules (see README for the limits):
+//! Win key rules (see README for the limits):
 //!  * Win down  -> stores `win_down`, `other=false`, SWALLOWS the event.
 //!  * first other key down while `win_down` -> SWALLOWS that one too and injects
 //!    with a SINGLE SendInput the pair [WIN down, key down] (extra-info = INJECT_TAG
@@ -17,13 +17,34 @@
 //!  * Stuck state (release lost on the secure desktop): if more than REPEAT_WINDOW_MS
 //!    have passed since the last Win event, the first other key does NOT inject anything.
 //!
+//! Launcher chord rules (SPEC-launcher 5.5.4), only while the UI has set a chord (`set_launcher_chord`); without
+//! one the callback loads one atomic and behaves as above:
+//!  * Modifiers come from the hook's own events (Alt, Ctrl, Shift per side; Win from the Win state above). One with
+//!    no event for MOD_STALE_MS is re-read from the async key state, and `reset_modifiers` (lock, suspend, an admin
+//!    launch) forgets them all: a lost release can only make the chord pass, never match a bare Space.
+//!  * The chord key down with exactly the chord's modifiers (AltGr is Ctrl+Alt: never Alt+Space) and no Win:
+//!    passed in fullscreen and remote sessions; passed with WM_DOCK_LAUNCHER_YIELDED while Command Palette answers;
+//!    failed open (passed, one log line per sequence) when the UI thread left a post unacknowledged for
+//!    ACK_TIMEOUT_MS; otherwise swallowed, the menu-mask key injected under Alt (so the Alt release opens no menu
+//!    bar) and WM_DOCK_LAUNCHER posted with the next sequence number and kb.time. Its repeats and its release go
+//!    the way its down went. The UI opens nothing for a stale, superseded or failed-open post (`post_verdict`).
+//!  * Type-ahead: a chord that will open the launcher opens a window of TYPEAHEAD_MS in which every other key down
+//!    (modifiers, Win, keys pressed with Win and the repeats of a key Windows already holds excepted) is swallowed
+//!    into a ring of RING_CAP keys tagged with the post's sequence. The UI takes the ring of the sequence it opened and replays it, or ends it when nothing
+//!    opens; the hook expires it at the first key after the deadline. An up is swallowed only when its down was.
+//!  * The ring's control word (sequence, OPEN, ENDED, length) is changed by both threads only by compare-exchange,
+//!    except the hook's open of a new window: a buffered key is in the UI's copy or passed to Windows, never both.
+//!  * Gesture evidence: the whole kb.time of a physical Ctrl+Shift+Enter is kept for the launcher's run as
+//!    administrator; the UI consumes it once (`take_gesture_time`). It never swallows.
+//!
 //! The callback does NO I/O nor heavy work (LL hook timeout ~300 ms):
 //! it only posts messages to the window, which logs and acts.
 //!
 //! The hook lives in a dedicated thread (`hook`) that only runs a message loop: the callback
 //! is served by that thread, independently of rendering, timers and logging of the UI thread.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -35,7 +56,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
-    VIRTUAL_KEY, VK_LWIN, VK_RWIN,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, PeekMessageW, PostMessageW, PostThreadMessageW,
@@ -43,7 +64,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-use crate::msg::{WM_DOCK_DIAG, WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY};
+use crate::msg::{
+    WM_DOCK_DIAG, WM_DOCK_LAUNCHER, WM_DOCK_LAUNCHER_YIELDED, WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY,
+};
 use crate::{hwnd, log};
 
 /// Events for WM_DOCK_WINKEY (log only).
@@ -150,6 +173,15 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
         }
         if msg.message == WM_HOOK_REINSTALL {
             reinstall();
+            continue;
+        }
+        if msg.message == WM_HOOK_NOTE {
+            if msg.wParam.0 == NOTE_LAUNCHER_FAIL_OPEN {
+                let seq = msg.lParam.0 as u32;
+                log!(
+                    "hook: launcher chord failed open (seq {seq}): the UI thread did not acknowledge for {ACK_TIMEOUT_MS} ms"
+                );
+            }
             continue;
         }
         // SAFETY: `msg` just filled by GetMessageW (the thread has no windows: in practice
@@ -270,11 +302,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
 
 /// Returns true if the event must be swallowed.
 fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
-    if kb.dwExtraInfo == INJECT_TAG {
-        return false; // our own re-injected event
-    }
-    if kb.flags.0 & LLKHF_INJECTED.0 != 0 {
-        return false; // injected by another app: not a physical key
+    if !physical(kb.flags.0, kb.dwExtraInfo) {
+        return false; // our own re-injected event, or injected by another app: not a physical key
     }
     let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
     let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
@@ -282,6 +311,13 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         return false;
     }
     let vk = kb.vkCode;
+    if LAUNCHER_CHORD.load(Relaxed) & CHORD_SET != 0 {
+        let mods = mods_step(vk, down, kb.time);
+        note_gesture(&GESTURE_TIME, kb.flags.0, kb.dwExtraInfo, vk, down, mods, kb.time);
+        if let Some(swallow) = launcher_step(kb, down, mods) {
+            return swallow;
+        }
+    }
     let is_win = vk == u32::from(VK_LWIN.0) || vk == u32::from(VK_RWIN.0);
 
     if is_win {
@@ -394,6 +430,22 @@ fn key_down_input(vk: u32, scan: u32, extended: bool) -> INPUT {
     }
 }
 
+/// A key up tagged INJECT_TAG (the launcher's menu-mask key).
+fn key_up_input(vk: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk as u16),
+                wScan: 0,
+                dwFlags: KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: INJECT_TAG,
+            },
+        },
+    }
+}
+
 /// Injects [WIN down, key down] with ONE call: the two events enter the queue
 /// contiguously and in order, regardless of when the callback returns.
 /// Returns true if both were accepted.
@@ -459,6 +511,901 @@ fn diag(msg: u32, kb: &KBDLLHOOKSTRUCT, swallowed: bool) {
     let _ = unsafe { PostMessageW(Some(hwnd()), WM_DOCK_DIAG, WPARAM(w), LPARAM(fg.0 as isize)) };
 }
 
+// ------------------------------------------------------------------ the launcher chord (SPEC-launcher 5.5.4)
+//
+// Everything below runs only while the UI has set a chord (`set_launcher_chord`): without one `handle_key` loads one
+// atomic and goes on exactly as before. Every function of this block denies unwrap, expect and indexing: a panic in
+// the callback (`extern "system"`) aborts the dock.
+
+pub(crate) use crate::launcher::model::{ChordSpec, Mods};
+
+/// Thread message (hook thread -> itself): a note to log outside the callback. wParam = `NOTE_*`, lParam = a sequence.
+/// WS-C's name and meaning (P0-wsC 17.1 and 17.3): wParam values 1-15 belong to WS-C, 16-31 to the launcher.
+const WM_HOOK_NOTE: u32 = WM_APP + 19;
+/// `WM_HOOK_NOTE`: the launcher chord failed open; lParam = the unacknowledged sequence.
+const NOTE_LAUNCHER_FAIL_OPEN: usize = 16;
+
+/// A post may stay unacknowledged this long before the chord fails open (the name and value of WS-C 17.1).
+pub const ACK_TIMEOUT_MS: u32 = 1500;
+/// The UI opens nothing for a post older than this (`post_verdict`).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub const STALE_POST_MS: u32 = 300;
+/// The type-ahead window after the post of a chord that will open the launcher.
+pub const TYPEAHEAD_MS: u32 = 500;
+/// A tracked modifier with no event for this long is re-read from the async key state; a chord key held by the
+/// launcher with no event for this long lost its release.
+pub const MOD_STALE_MS: u32 = 1500;
+/// Keys a type-ahead window keeps; later ones are swallowed and dropped (spec rule 6).
+pub const RING_CAP: usize = 32;
+/// The menu-mask key injected under Alt when the chord is swallowed, so the Alt release opens no menu bar: an
+/// unassigned VK. S-ALTSPACE may choose left Ctrl (0xA2) instead (L1a-10 step 8).
+const MASK_KEY_DEFAULT: u32 = 0xE8;
+
+const VK_RETURN_: u32 = 0x0D;
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+const VK_SPACE_: u16 = 0x20;
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+const VK_MENU_: u16 = 0x12;
+const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
+/// `LAUNCHER_CHORD`: bits 0-7 the vk, 8-11 the modifiers, bit 12 set.
+const CHORD_SET: u32 = 1 << 12;
+
+/// Why the chord passes instead of opening the launcher (set by the UI on every foreground change).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PassFlags(pub u8);
+
+impl PassFlags {
+    pub const FULLSCREEN: PassFlags = PassFlags(1);
+    pub const REMOTE: PassFlags = PassFlags(2);
+    pub const YIELD: PassFlags = PassFlags(4);
+
+    pub const fn has(self, f: PassFlags) -> bool {
+        self.0 & f.0 != 0
+    }
+
+    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+    pub const fn with(self, f: PassFlags) -> PassFlags {
+        PassFlags(self.0 | f.0)
+    }
+}
+
+/// Hook-thread view of the posts to the UI thread (WS-C 17.1's struct, verbatim). Pure: the statics are loaded into
+/// it and stored back. The launcher has its own instance and its own sequence space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AckWatch {
+    sent: u32,
+    sent_at: u32,
+    ack_seen: u32,
+}
+
+impl AckWatch {
+    /// On every key event: true = a post has been unacknowledged for ACK_TIMEOUT_MS.
+    fn check(&mut self, acked: u32, now: u32) -> bool {
+        if acked != self.ack_seen {
+            self.ack_seen = acked;
+            if acked != self.sent {
+                self.sent_at = now; // progress: the rest gets a fresh window
+            }
+        }
+        self.sent != acked && now.wrapping_sub(self.sent_at) >= ACK_TIMEOUT_MS
+    }
+
+    /// A post is about to be sent: its sequence number.
+    fn on_post(&mut self, acked: u32, now: u32) -> u32 {
+        if self.sent == acked {
+            self.sent_at = now; // first outstanding post starts the window
+        }
+        self.sent = self.sent.wrapping_add(1);
+        self.sent
+    }
+}
+
+/// Alt, Ctrl and Shift as the hook saw them, per side (the bits of `SIDES`); `last` is the time of the last modifier
+/// event, `reset_seen` the last `RESET_MODS` value applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModTrack {
+    down: u8,
+    last: u32,
+    reset_seen: u32,
+}
+
+/// (bit in `ModTrack::down`, vk, modifier): left and right Alt, Ctrl and Shift.
+const SIDES: [(u8, u32, Mods); 6] = [
+    (1, 0xA4, Mods::ALT),
+    (2, 0xA5, Mods::ALT),
+    (4, 0xA2, Mods::CTRL),
+    (8, 0xA3, Mods::CTRL),
+    (16, 0xA0, Mods::SHIFT),
+    (32, 0xA1, Mods::SHIFT),
+];
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+const ALT_BITS: u8 = 1 | 2;
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl ModTrack {
+    fn on_key(&mut self, vk: u32, down: bool, time: u32) {
+        let Some(&(bit, _, _)) = SIDES.iter().find(|s| s.1 == vk) else { return };
+        if down {
+            self.down |= bit;
+        } else {
+            self.down &= !bit;
+        }
+        self.last = time;
+    }
+
+    fn mods(&self, win: bool) -> Mods {
+        let held = SIDES.iter().filter(|s| self.down & s.0 != 0).fold(Mods::NONE, |m, s| m.with(s.2));
+        if win {
+            held.with(Mods::WIN)
+        } else {
+            held
+        }
+    }
+
+    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+    fn alt_down(&self) -> bool {
+        self.down & ALT_BITS != 0
+    }
+
+    /// A tracked modifier with no event for MOD_STALE_MS is kept only if the async key state still reads it down (a
+    /// release lost on the secure desktop); the next check is MOD_STALE_MS later.
+    fn repair(&mut self, now: u32, async_down: impl Fn(u32) -> bool) {
+        if self.down == 0 || now.wrapping_sub(self.last) <= MOD_STALE_MS {
+            return;
+        }
+        for &(bit, vk, _) in &SIDES {
+            if self.down & bit != 0 && !async_down(vk) {
+                self.down &= !bit;
+            }
+        }
+        self.last = now;
+    }
+
+    /// `reset_modifiers` was called since the last event (lock, suspend, an admin launch): forget every modifier.
+    fn reset_if(&mut self, reset: u32) {
+        if reset != self.reset_seen {
+            self.reset_seen = reset;
+            self.down = 0;
+        }
+    }
+}
+
+/// One event of the modifier tracking, in the order of spec rule 1: the reset first, then the event, then the repair.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn track_step(t: &mut ModTrack, reset: u32, vk: u32, down: bool, time: u32, async_down: impl Fn(u32) -> bool) {
+    t.reset_if(reset);
+    t.on_key(vk, down, time);
+    t.repair(time, async_down);
+}
+
+/// The chord key's press as the hook handles it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SpaceState {
+    #[default]
+    Idle,
+    /// Swallowed (posted): its repeats and its release are swallowed too.
+    Swallowed,
+    /// Passed to Windows: its repeats and its release pass too.
+    Passed,
+}
+
+impl SpaceState {
+    fn from_u8(v: u8) -> SpaceState {
+        match v {
+            1 => SpaceState::Swallowed,
+            2 => SpaceState::Passed,
+            _ => SpaceState::Idle,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            SpaceState::Idle => 0,
+            SpaceState::Swallowed => 1,
+            SpaceState::Passed => 2,
+        }
+    }
+}
+
+/// One physical key event as the chord rules see it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyEv {
+    pub vk: u32,
+    pub scan: u32,
+    pub ext: bool,
+    pub down: bool,
+    pub time: u32,
+    /// A down of a key Windows already holds (its async state before this event reads down): a repeat of a press
+    /// whose down reached Windows. Such a press stays Windows' whole, its repeats and its release included.
+    pub held: bool,
+}
+
+/// The ring's control word: bits 32-63 the sequence of the post that opened the window, bit 9 OPEN, bit 8 ENDED,
+/// bits 0-5 the length.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct RingCtl(pub u64);
+
+impl RingCtl {
+    const OPEN: u64 = 1 << 9;
+    const ENDED: u64 = 1 << 8;
+    const LEN: u64 = 0x3F;
+
+    /// A new window for this sequence, empty.
+    fn opened(seq: u32) -> RingCtl {
+        RingCtl((u64::from(seq) << 32) | Self::OPEN)
+    }
+
+    fn seq(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    fn is_open(self) -> bool {
+        self.0 & Self::OPEN != 0
+    }
+
+    fn is_ended(self) -> bool {
+        self.0 & Self::ENDED != 0
+    }
+
+    fn len(self) -> usize {
+        (self.0 & Self::LEN) as usize
+    }
+
+    fn ended(self) -> RingCtl {
+        RingCtl(self.0 | Self::ENDED)
+    }
+
+    /// One more entry; the caller has checked that the length is below RING_CAP.
+    fn pushed(self) -> RingCtl {
+        RingCtl(self.0.wrapping_add(1))
+    }
+}
+
+/// A key the type-ahead ring kept: a down, with the modifiers tracked when it was pressed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KeyRec {
+    pub vk: u16,
+    pub scan: u16,
+    pub ext: bool,
+    pub mods: Mods,
+    pub time: u32,
+}
+
+impl KeyRec {
+    /// time:32 | scan:12 | vk:8 | mods:4 | ext:1.
+    fn pack(self) -> u64 {
+        u64::from(self.time)
+            | (u64::from(self.scan & 0xFFF) << 32)
+            | (u64::from(self.vk & 0xFF) << 44)
+            | (u64::from(self.mods.0 & 0xF) << 52)
+            | (u64::from(self.ext) << 56)
+    }
+
+    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+    fn unpack(v: u64) -> KeyRec {
+        KeyRec {
+            time: v as u32,
+            scan: ((v >> 32) & 0xFFF) as u16,
+            vk: ((v >> 44) & 0xFF) as u16,
+            mods: Mods(((v >> 52) & 0xF) as u8),
+            ext: (v >> 56) & 1 != 0,
+        }
+    }
+}
+
+/// What `Ring::try_push` did with a key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Push {
+    /// In the ring: the UI replays it, or drops it with the window.
+    Stored,
+    /// The window holds RING_CAP keys already: swallowed and dropped.
+    Full,
+    /// No open window for this sequence (the UI ended it): the key passes to Windows.
+    Closed,
+}
+
+/// The type-ahead ring. Both threads change `ctl` only by compare-exchange, except the hook's `open` (only the hook
+/// issues sequence numbers, so a UI compare-exchange for an older sequence always fails): a buffered key is either in
+/// the copy the UI takes or reported `Closed` to the hook, which passes it; never both, never neither.
+pub(crate) struct Ring {
+    ctl: AtomicU64,
+    slots: [AtomicU64; RING_CAP],
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl Ring {
+    pub(crate) const fn new() -> Ring {
+        Ring { ctl: AtomicU64::new(0), slots: [const { AtomicU64::new(0) }; RING_CAP] }
+    }
+
+    fn ctl(&self) -> RingCtl {
+        RingCtl(self.ctl.load(Acquire))
+    }
+
+    /// Hook: a new window for this sequence, length 0.
+    fn open(&self, seq: u32) {
+        self.ctl.store(RingCtl::opened(seq).0, Release);
+    }
+
+    /// Hook: keeps one key in the open window of `seq`.
+    fn try_push(&self, seq: u32, entry: u64) -> Push {
+        let c = self.ctl();
+        if !c.is_open() || c.is_ended() || c.seq() != seq {
+            return Push::Closed;
+        }
+        let Some(slot) = self.slots.get(c.len()) else { return Push::Full };
+        slot.store(entry, Release);
+        match self.ctl.compare_exchange(c.0, c.pushed().0, Release, Relaxed) {
+            Ok(_) => Push::Stored,
+            Err(_) => Push::Closed, // the UI ended the window in between
+        }
+    }
+
+    /// Hook: the window of `seq` is past its deadline (one compare-exchange; the UI may have ended it already).
+    fn expire(&self, seq: u32) {
+        let c = self.ctl();
+        if c.is_open() && !c.is_ended() && c.seq() == seq {
+            let _ = self.ctl.compare_exchange(c.0, c.ended().0, AcqRel, Relaxed);
+        }
+    }
+
+    /// UI: ends the open window of `seq`; its length, or None when there is no such window (or it already ended).
+    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+    pub(crate) fn end(&self, seq: u32) -> Option<usize> {
+        let mut cur = self.ctl.load(Acquire);
+        loop {
+            let c = RingCtl(cur);
+            if !c.is_open() || c.is_ended() || c.seq() != seq {
+                return None;
+            }
+            match self.ctl.compare_exchange_weak(cur, c.ended().0, AcqRel, Acquire) {
+                Ok(_) => return Some(c.len()),
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// UI: ends the window of `seq` and copies its keys, once. 0 when another window opened during the copy.
+    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+    pub(crate) fn take(&self, seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
+        let Some(len) = self.end(seq) else { return 0 };
+        let mut n = 0;
+        for (slot, rec) in self.slots.iter().zip(out.iter_mut()).take(len) {
+            *rec = KeyRec::unpack(slot.load(Acquire));
+            n += 1;
+        }
+        if self.ctl().seq() != seq {
+            return 0;
+        }
+        n
+    }
+}
+
+/// The chord rules' inputs and the hook's own state, loaded from the statics on each event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct ChordState {
+    // UI-owned: loaded on each event, never stored back by the hook.
+    chord: Option<ChordSpec>,
+    flags: PassFlags,
+    acked: u32,
+    shown: bool,
+    // Hook-owned: loaded and stored back by the hook thread only (`mods` and `win_down` are computed per event).
+    mods: Mods,
+    win_down: bool,
+    ack: AckWatch,
+    space: SpaceState,
+    /// The time of the chord key's last event while it was swallowed or passed.
+    space_time: u32,
+    post_time: u32,
+    /// A snapshot of the ring's control word.
+    ring: RingCtl,
+    /// Vks whose down was swallowed into the ring (their up is swallowed too).
+    buffered_down: [u64; 4],
+    last_failopen: u32,
+}
+
+/// What the hook does with one key event of the launcher's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    Pass,
+    /// Pass, and post WM_DOCK_LAUNCHER_YIELDED (the UI runs the PowerToys answer check).
+    PassNotify,
+    /// Swallow and post WM_DOCK_LAUNCHER with this sequence.
+    SwallowPost(u32),
+    SwallowSilent,
+    /// Swallow into the type-ahead ring (a pass when the ring is closed).
+    Buffer,
+    /// Pass: the UI has not acknowledged a post for ACK_TIMEOUT_MS.
+    FailOpen,
+}
+
+/// The injected filter of `handle_key` as a function: false for LLKHF_INJECTED (from any integrity level) or our tag.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn physical(flags: u32, extra: usize) -> bool {
+    extra != INJECT_TAG && flags & LLKHF_INJECTED.0 == 0
+}
+
+const fn is_modifier(vk: u32) -> bool {
+    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5)
+}
+
+const fn is_win(vk: u32) -> bool {
+    matches!(vk, 0x5B | 0x5C)
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl ChordState {
+    /// The vk's down was swallowed into the ring.
+    fn buffered(&self, vk: u32) -> bool {
+        let i = (vk / 64) as usize;
+        self.buffered_down.get(i).is_some_and(|w| w & (1u64 << (vk % 64)) != 0)
+    }
+
+    fn set_buffered(&mut self, vk: u32, on: bool) {
+        let i = (vk / 64) as usize;
+        if let Some(w) = self.buffered_down.get_mut(i) {
+            if on {
+                *w |= 1u64 << (vk % 64);
+            } else {
+                *w &= !(1u64 << (vk % 64));
+            }
+        }
+    }
+
+    /// The type-ahead window is open, not ended and within TYPEAHEAD_MS of its post.
+    fn live(&self, time: u32) -> bool {
+        self.ring.is_open() && !self.ring.is_ended() && time.wrapping_sub(self.post_time) <= TYPEAHEAD_MS
+    }
+
+    /// The chord key's state for an event at `time`: a swallowed or passed press with no event for MOD_STALE_MS lost
+    /// its release (the secure desktop), so it is over (auto-repeat renews it far more often than that).
+    fn space_now(&self, time: u32) -> SpaceState {
+        if self.space != SpaceState::Idle && time.wrapping_sub(self.space_time) > MOD_STALE_MS {
+            SpaceState::Idle
+        } else {
+            self.space
+        }
+    }
+
+    /// The hook-owned fields after the verdict `v` (`resolve_launcher`); `pushed` is the ring's answer to a Buffer.
+    pub(crate) fn after(&mut self, v: Option<&Verdict>, ev: KeyEv, pushed: Option<Push>) {
+        let Some(chord) = self.chord else { return };
+        let chord_key = ev.vk == u32::from(chord.vk);
+        if chord_key {
+            self.space = self.space_now(ev.time);
+        }
+        if self.ring.is_open() && !self.ring.is_ended() && !self.live(ev.time) {
+            self.ring = self.ring.ended(); // past its deadline: the caller expires the ring
+        }
+        match v {
+            Some(Verdict::SwallowPost(seq)) => {
+                let _ = self.ack.check(self.acked, ev.time);
+                let _ = self.ack.on_post(self.acked, ev.time);
+                self.space = SpaceState::Swallowed;
+                if !self.shown {
+                    // This chord opens the launcher: its type-ahead window. A closing chord opens none.
+                    self.post_time = ev.time;
+                    self.ring = RingCtl::opened(*seq);
+                }
+            }
+            Some(Verdict::FailOpen) => {
+                let _ = self.ack.check(self.acked, ev.time);
+                self.last_failopen = self.ack.sent;
+                self.space = SpaceState::Passed;
+            }
+            Some(Verdict::Pass | Verdict::PassNotify) if ev.down => self.space = SpaceState::Passed,
+            Some(Verdict::Buffer) => {
+                if matches!(pushed, Some(Push::Stored | Push::Full)) {
+                    self.set_buffered(ev.vk, true);
+                }
+            }
+            Some(Verdict::SwallowSilent) if !ev.down => self.set_buffered(ev.vk, false),
+            None if ev.down => self.set_buffered(ev.vk, false),
+            _ => {}
+        }
+        if chord_key {
+            if !ev.down {
+                self.space = SpaceState::Idle; // any release ends the press
+            } else if self.space != SpaceState::Idle {
+                self.space_time = ev.time;
+            }
+        }
+    }
+}
+
+/// The chord rules (SPEC 5.5.4 rules 1-6), in order. None: not the launcher's key (the Win branch decides).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn resolve_launcher(s: &ChordState, ev: KeyEv) -> Option<Verdict> {
+    // 1. No chord: nothing changes for users without one.
+    let chord = s.chord?;
+    // 2. The chord key.
+    if ev.vk == u32::from(chord.vk) {
+        match (s.space_now(ev.time), ev.down) {
+            (SpaceState::Swallowed, _) => return Some(Verdict::SwallowSilent),
+            (SpaceState::Passed, _) => return Some(Verdict::Pass),
+            (SpaceState::Idle, true) if s.mods == chord.mods && !s.win_down && !ev.held => {
+                if s.flags.has(PassFlags::FULLSCREEN) || s.flags.has(PassFlags::REMOTE) {
+                    return Some(Verdict::Pass);
+                }
+                if s.flags.has(PassFlags::YIELD) {
+                    return Some(Verdict::PassNotify);
+                }
+                let mut ack = s.ack;
+                if ack.check(s.acked, ev.time) {
+                    return Some(Verdict::FailOpen);
+                }
+                return Some(Verdict::SwallowPost(s.ack.sent.wrapping_add(1)));
+            }
+            (SpaceState::Idle, _) => {}
+        }
+    }
+    // 3. Type-ahead: inside a live window every key but modifiers, Win, Win chords and the repeats of a key Windows
+    //    already holds goes to the ring; an up is swallowed only when its down was.
+    if s.live(ev.time) {
+        if !ev.down {
+            return s.buffered(ev.vk).then_some(Verdict::SwallowSilent);
+        }
+        if is_modifier(ev.vk) || is_win(ev.vk) || s.win_down || ev.held {
+            return None;
+        }
+        return Some(Verdict::Buffer);
+    }
+    // 4. Outside a window: the up of a swallowed down is swallowed; a down with its bit set is a stale bit (its up was
+    //    lost), which `after` clears.
+    if s.buffered(ev.vk) && !ev.down {
+        return Some(Verdict::SwallowSilent);
+    }
+    // 5. Everything else.
+    None
+}
+
+/// What the callback does besides swallowing or passing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    Nothing,
+    /// Mask the Alt release, then post WM_DOCK_LAUNCHER with this sequence.
+    Post(u32),
+    /// Post WM_DOCK_LAUNCHER_YIELDED.
+    Yielded,
+    /// Note to the hook thread (logged outside the callback): this sequence failed open.
+    FailOpenNote(u32),
+}
+
+/// Swallowed (Some(true)), passed by the launcher (Some(false)) or not the launcher's (None).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn swallow_of(v: Option<Verdict>, pushed: Option<Push>) -> Option<bool> {
+    match v? {
+        Verdict::Pass | Verdict::PassNotify | Verdict::FailOpen => Some(false),
+        Verdict::SwallowPost(_) | Verdict::SwallowSilent => Some(true),
+        Verdict::Buffer => Some(!matches!(pushed, Some(Push::Closed))),
+    }
+}
+
+/// One event through the chord rules on `ring`: the verdict, the ring's push, open or expiry, and the state after.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn chord_step(s: &mut ChordState, ring: &Ring, ev: KeyEv) -> (Option<bool>, Act) {
+    s.ring = ring.ctl();
+    let before = s.ring;
+    let failopen_before = s.last_failopen;
+    let v = resolve_launcher(s, ev);
+    let pushed = (v == Some(Verdict::Buffer)).then(|| {
+        let rec = KeyRec {
+            vk: (ev.vk & 0xFF) as u16,
+            scan: (ev.scan & 0xFFF) as u16,
+            ext: ev.ext,
+            mods: s.mods,
+            time: ev.time,
+        };
+        ring.try_push(before.seq(), rec.pack())
+    });
+    s.after(v.as_ref(), ev, pushed);
+    if s.ring != before {
+        if s.ring.is_ended() {
+            ring.expire(before.seq());
+        } else {
+            ring.open(s.ring.seq());
+        }
+    }
+    let act = match v {
+        Some(Verdict::SwallowPost(seq)) => Act::Post(seq),
+        Some(Verdict::PassNotify) => Act::Yielded,
+        Some(Verdict::FailOpen) if s.last_failopen != failopen_before => Act::FailOpenNote(s.last_failopen),
+        _ => Act::Nothing,
+    };
+    (swallow_of(v, pushed), act)
+}
+
+/// What the UI does with a WM_DOCK_LAUNCHER post (spec rule 8).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PostAction {
+    Open,
+    Close,
+    Drop,
+}
+
+/// Rule 8: a stale (over STALE_POST_MS), superseded (below the newest sequence) or failed-open post opens nothing; any
+/// post closes an open launcher (closing is always safe). Sequences and times compare with wrapping.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn post_verdict(
+    seq: u32,
+    sent_time: u32,
+    now: u32,
+    newest: u32,
+    last_failopen: u32,
+    open: bool,
+) -> PostAction {
+    let stale = now.wrapping_sub(sent_time) > STALE_POST_MS;
+    let superseded = (newest.wrapping_sub(seq) as i32) > 0;
+    let failed_open = (last_failopen.wrapping_sub(seq) as i32) >= 0;
+    match (open, stale || superseded || failed_open) {
+        (true, _) => PostAction::Close,
+        (false, true) => PostAction::Drop,
+        (false, false) => PostAction::Open,
+    }
+}
+
+/// The keys the UI injects when the launcher cannot open, so the window menu opens as Windows would have: (vk, up),
+/// all tagged INJECT_TAG.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub struct InjectPlan {
+    pub keys: [(u16, bool); 4],
+    pub len: u8,
+}
+
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+impl InjectPlan {
+    pub fn keys(&self) -> &[(u16, bool)] {
+        self.keys.get(..usize::from(self.len)).unwrap_or(&[])
+    }
+}
+
+/// With Alt still down: Space down, Space up. With Alt already up: Alt down, Space down, Space up, Alt up. The real
+/// Space up stays swallowed (the plan has its own), so no key is left held.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn reinject_plan(alt_tracked_down: bool) -> InjectPlan {
+    let sp = VK_SPACE_;
+    if alt_tracked_down {
+        InjectPlan { keys: [(sp, false), (sp, true), (0, false), (0, false)], len: 2 }
+    } else {
+        InjectPlan { keys: [(VK_MENU_, false), (sp, false), (sp, true), (VK_MENU_, true)], len: 4 }
+    }
+}
+
+/// The hook's gesture evidence: the whole kb.time and a separate valid bit (a "| 1" on the time would change every
+/// even time and fail the launcher's time equality on half of all presses).
+pub(crate) fn pack_gesture_time(t: u32) -> u64 {
+    (1 << 32) | u64::from(t)
+}
+
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub(crate) fn unpack_gesture_time(v: u64) -> Option<u32> {
+    if v >> 32 == 1 {
+        Some(v as u32)
+    } else {
+        None
+    }
+}
+
+/// Spec rule 7: a physical Enter down with tracked Ctrl and Shift and no Alt or Win stores its kb.time (never swallows).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn note_gesture(slot: &AtomicU64, flags: u32, extra: usize, vk: u32, down: bool, mods: Mods, time: u32) {
+    if down && vk == VK_RETURN_ && mods == CTRL_SHIFT && physical(flags, extra) {
+        slot.store(pack_gesture_time(time), Relaxed);
+    }
+}
+
+// UI-written (Relaxed: one writer each).
+static LAUNCHER_CHORD: AtomicU32 = AtomicU32::new(0);
+static PASS_FLAGS: AtomicU8 = AtomicU8::new(0);
+static LAUNCHER_ACKED: AtomicU32 = AtomicU32::new(0);
+static LAUNCHER_SHOWN: AtomicBool = AtomicBool::new(false);
+static RESET_MODS: AtomicU32 = AtomicU32::new(0);
+// Hook-written (Relaxed: one writer each).
+/// The newest sequence the hook issued (`AckWatch::sent`).
+pub static LAUNCHER_SEQ: AtomicU32 = AtomicU32::new(0);
+static LAUNCHER_ACK_SENT_AT: AtomicU32 = AtomicU32::new(0);
+static LAUNCHER_ACK_SEEN: AtomicU32 = AtomicU32::new(0);
+/// The newest sequence the hook failed open on.
+pub static LAST_FAILOPEN_SEQ: AtomicU32 = AtomicU32::new(0);
+static SPACE_STATE: AtomicU8 = AtomicU8::new(0);
+static SPACE_TIME: AtomicU32 = AtomicU32::new(0);
+static TA_POST_TIME: AtomicU32 = AtomicU32::new(0);
+static BUFFERED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// `ModTrack::down` (bits 0-7) and `reset_seen` (bits 32-63).
+static MODS: AtomicU64 = AtomicU64::new(0);
+static MODS_LAST: AtomicU32 = AtomicU32::new(0);
+/// The menu-mask key: 0xE8 by default, 0xA2 left Ctrl, 0 none (the owner-probe switch, L1a-10 step 7).
+static MASK_KEY: AtomicU32 = AtomicU32::new(MASK_KEY_DEFAULT);
+// Shared by protocol.
+/// The type-ahead ring (its compare-exchange protocol: `Ring`).
+static RING: Ring = Ring::new();
+/// `pack_gesture_time(kb.time)`, stored by the hook, consumed by the UI with one swap.
+static GESTURE_TIME: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+fn pack_chord(chord: Option<ChordSpec>) -> u32 {
+    chord.map_or(0, |c| u32::from(c.vk & 0xFF) | (u32::from(c.mods.0 & 0xF) << 8) | CHORD_SET)
+}
+
+fn unpack_chord(v: u32) -> Option<ChordSpec> {
+    (v & CHORD_SET != 0).then_some(ChordSpec { vk: (v & 0xFF) as u16, mods: Mods(((v >> 8) & 0xF) as u8) })
+}
+
+/// UI: the launcher's chord (None: off, and the hook leaves every key to the Win branch).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn set_launcher_chord(chord: Option<ChordSpec>) {
+    LAUNCHER_CHORD.store(pack_chord(chord), Relaxed);
+}
+
+/// UI: why the chord passes (fullscreen, remote, yield), on every foreground change.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn set_pass_flags(flags: PassFlags) {
+    PASS_FLAGS.store(flags.0, Relaxed);
+}
+
+/// UI, first thing on WM_DOCK_LAUNCHER: the post of `seq` arrived.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn ack_launcher(seq: u32) {
+    LAUNCHER_ACKED.store(seq, Relaxed);
+}
+
+/// UI: true right before the launcher's ShowWindow, false at its close (a chord while shown closes the launcher and
+/// opens no type-ahead window).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn set_launcher_shown(on: bool) {
+    LAUNCHER_SHOWN.store(on, Relaxed);
+}
+
+/// UI: the post of `seq` opens nothing (dropped, failed open, fullscreen, a closing chord): its keys are discarded. A
+/// no-op for another sequence.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn end_typeahead(seq: u32) {
+    let _ = RING.end(seq);
+}
+
+/// UI, once, at the launcher's activation: the keys typed after the chord of `seq`, in order.
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn take_typeahead(seq: u32, out: &mut [KeyRec; RING_CAP]) -> usize {
+    RING.take(seq, out)
+}
+
+/// UI: forget the tracked modifiers (after lock, suspend and every admin launch).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn reset_modifiers() {
+    RESET_MODS.fetch_add(1, Relaxed);
+}
+
+/// UI: the kb.time of the last physical Ctrl+Shift+Enter, consumed (one swap: the whole value or nothing).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn take_gesture_time() -> Option<u32> {
+    unpack_gesture_time(GESTURE_TIME.swap(0, Relaxed))
+}
+
+/// UI: Alt is down as the hook tracks it (for `reinject_plan`).
+#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
+pub fn alt_tracked_down() -> bool {
+    load_mods().alt_down()
+}
+
+fn load_mods() -> ModTrack {
+    let v = MODS.load(Relaxed);
+    ModTrack { down: (v & 0xFF) as u8, last: MODS_LAST.load(Relaxed), reset_seen: (v >> 32) as u32 }
+}
+
+/// Spec rule 1 on the statics: the tracked modifiers after this event, Win from the Win branch's state.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn mods_step(vk: u32, down: bool, time: u32) -> Mods {
+    let mut t = load_mods();
+    // SAFETY: GetAsyncKeyState has no preconditions; the high bit (negative) means "down".
+    let async_down = |vk: u32| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+    track_step(&mut t, RESET_MODS.load(Relaxed), vk, down, time, async_down);
+    MODS.store(u64::from(t.down) | (u64::from(t.reset_seen) << 32), Relaxed);
+    MODS_LAST.store(t.last, Relaxed);
+    t.mods(WIN_DOWN.load(Relaxed))
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn load_chord_state(mods: Mods) -> ChordState {
+    let mut buffered_down = [0u64; 4];
+    for (d, b) in buffered_down.iter_mut().zip(BUFFERED.iter()) {
+        *d = b.load(Relaxed);
+    }
+    ChordState {
+        chord: unpack_chord(LAUNCHER_CHORD.load(Relaxed)),
+        flags: PassFlags(PASS_FLAGS.load(Relaxed)),
+        acked: LAUNCHER_ACKED.load(Relaxed),
+        shown: LAUNCHER_SHOWN.load(Relaxed),
+        mods,
+        win_down: WIN_DOWN.load(Relaxed),
+        ack: AckWatch {
+            sent: LAUNCHER_SEQ.load(Relaxed),
+            sent_at: LAUNCHER_ACK_SENT_AT.load(Relaxed),
+            ack_seen: LAUNCHER_ACK_SEEN.load(Relaxed),
+        },
+        space: SpaceState::from_u8(SPACE_STATE.load(Relaxed)),
+        space_time: SPACE_TIME.load(Relaxed),
+        post_time: TA_POST_TIME.load(Relaxed),
+        ring: RingCtl::default(),
+        buffered_down,
+        last_failopen: LAST_FAILOPEN_SEQ.load(Relaxed),
+    }
+}
+
+/// Stores the hook-owned fields back (the ring changes through its own protocol).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn store_chord_state(s: &ChordState) {
+    LAUNCHER_SEQ.store(s.ack.sent, Relaxed);
+    LAUNCHER_ACK_SENT_AT.store(s.ack.sent_at, Relaxed);
+    LAUNCHER_ACK_SEEN.store(s.ack.ack_seen, Relaxed);
+    LAST_FAILOPEN_SEQ.store(s.last_failopen, Relaxed);
+    SPACE_STATE.store(s.space.to_u8(), Relaxed);
+    SPACE_TIME.store(s.space_time, Relaxed);
+    TA_POST_TIME.store(s.post_time, Relaxed);
+    for (b, d) in BUFFERED.iter().zip(s.buffered_down.iter()) {
+        b.store(*d, Relaxed);
+    }
+}
+
+/// The launcher's part of the callback: Some(swallow) when the event was the launcher's, None for the Win branch.
+/// O(1), no allocation, no logging: at most one SendInput and one PostMessage.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launcher_step(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods) -> Option<bool> {
+    // SAFETY: GetAsyncKeyState has no preconditions. Inside the callback it reads the state from before this event
+    // (LowLevelKeyboardProc's documentation), so a down it reads as down is a repeat of a press Windows already has.
+    let held = down && unsafe { GetAsyncKeyState(kb.vkCode as i32) } < 0;
+    let ev =
+        KeyEv { vk: kb.vkCode, scan: kb.scanCode, ext: kb.flags.0 & LLKHF_EXTENDED.0 != 0, down, time: kb.time, held };
+    let mut s = load_chord_state(mods);
+    let (swallow, act) = chord_step(&mut s, &RING, ev);
+    store_chord_state(&s);
+    match act {
+        Act::Nothing => {}
+        Act::Post(seq) => {
+            // A failed SendInput still posts (the mask is cosmetic); a failed post stays unacknowledged, which fails
+            // open on the next chord, and its window expires at the deadline.
+            send_mask();
+            post_launcher(WM_DOCK_LAUNCHER, seq as usize, kb.time);
+        }
+        Act::Yielded => post_launcher(WM_DOCK_LAUNCHER_YIELDED, 0, kb.time),
+        Act::FailOpenNote(seq) => {
+            // SAFETY: PostThreadMessageW is thread-safe; this thread has a message queue (thread_main's PeekMessageW).
+            let _ = unsafe {
+                PostThreadMessageW(
+                    GetCurrentThreadId(),
+                    WM_HOOK_NOTE,
+                    WPARAM(NOTE_LAUNCHER_FAIL_OPEN),
+                    LPARAM(seq as isize),
+                )
+            };
+        }
+    }
+    swallow
+}
+
+fn post_launcher(msg: u32, wparam: usize, time: u32) {
+    let h = hwnd();
+    if h.0.is_null() {
+        return; // without this check PostMessageW(NULL) would post to the hook thread
+    }
+    // SAFETY: PostMessageW is thread-safe; the error is ignored (no I/O in the callback).
+    let _ = unsafe { PostMessageW(Some(h), msg, WPARAM(wparam), LPARAM(time as isize)) };
+}
+
+/// [MASK_KEY down, MASK_KEY up], tagged, while Alt is still down: the Alt release is then no lone Alt tap.
+fn send_mask() {
+    let vk = MASK_KEY.load(Relaxed);
+    if vk == 0 {
+        return;
+    }
+    let inputs = [key_down_input(vk, 0, false), key_up_input(vk)];
+    // SAFETY: slice of 2 initialized INPUTs; cbSize = size_of::<INPUT>() as required. The injected events re-enter
+    // the callback with INJECT_TAG and pass through.
+    let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +1426,657 @@ mod tests {
         assert_eq!(repair_plan(true, false, false, false, STALE), Skip, "lone Win held with no auto-repeat");
         assert_eq!(repair_plan(true, false, false, false, LONE_STUCK_MS), Skip, "lone Win at the limit: still held");
         assert_eq!(repair_plan(true, false, false, false, LONG), ClearThenGo, "lone release lost on the secure desktop");
+    }
+
+    // ------------------------------------------------------------------ the launcher chord
+
+    use crate::launcher::field::KeyEvent;
+    use crate::launcher::gesture::Gesture;
+    use std::sync::Barrier;
+
+    const SPACE: u32 = 0x20;
+    const ENTER: u32 = 0x0D;
+    const LALT: u32 = 0xA4;
+    const RALT: u32 = 0xA5;
+    const LCTRL: u32 = 0xA2;
+    const LSHIFT: u32 = 0xA0;
+    const LWIN: u32 = 0x5B;
+    const KEY_A: u32 = 0x41;
+    const KEY_C: u32 = 0x43;
+    const KEY_E: u32 = 0x45;
+    const ALT_SPACE: ChordSpec = ChordSpec { vk: 0x20, mods: Mods::ALT };
+    const ALT_SHIFT: Mods = Mods(Mods::ALT.0 | Mods::SHIFT.0);
+    const CTRL_SHIFT_: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
+
+    /// Chord Alt+Space, nothing pressed, acked = sent = 0.
+    fn st() -> ChordState {
+        ChordState { chord: Some(ALT_SPACE), ..ChordState::default() }
+    }
+
+    fn ev(vk: u32, down: bool, t: u32) -> KeyEv {
+        KeyEv { vk, scan: vk & 0x7F, ext: false, down, time: t, held: false }
+    }
+
+    /// The hook's side of a keyboard: its tracked modifiers, its chord state and a local ring; `seen` is what Windows
+    /// got (the passed events), `posts` the sequences posted to the UI, `notes` the fail-open notes.
+    struct Kbd {
+        s: ChordState,
+        ring: Ring,
+        track: ModTrack,
+        seen: Vec<(u32, bool)>,
+        posts: Vec<u32>,
+        notes: Vec<u32>,
+    }
+
+    impl Kbd {
+        fn new() -> Kbd {
+            Kbd {
+                s: st(),
+                ring: Ring::new(),
+                track: ModTrack::default(),
+                seen: Vec::new(),
+                posts: Vec::new(),
+                notes: Vec::new(),
+            }
+        }
+
+        /// One physical event; Some(true) swallowed, Some(false) passed by the launcher, None not the launcher's.
+        fn key(&mut self, vk: u32, down: bool, t: u32) -> Option<bool> {
+            track_step(&mut self.track, 0, vk, down, t, |_| true);
+            self.s.mods = self.track.mods(self.s.win_down);
+            // Windows' async state: the last event of this key it got was a down.
+            let held = down && self.seen.iter().rev().find(|e| e.0 == vk).is_some_and(|e| e.1);
+            let (swallow, act) = chord_step(&mut self.s, &self.ring, KeyEv { held, ..ev(vk, down, t) });
+            match act {
+                Act::Post(seq) => self.posts.push(seq),
+                Act::FailOpenNote(seq) => self.notes.push(seq),
+                Act::Yielded | Act::Nothing => {}
+            }
+            if swallow != Some(true) {
+                self.seen.push((vk, down));
+            }
+            swallow
+        }
+
+        /// Alt down, Space down, Space up, Alt up from `t`: the swallow results of the four.
+        fn chord(&mut self, t: u32) -> [Option<bool>; 4] {
+            [
+                self.key(LALT, true, t - 10),
+                self.key(SPACE, true, t),
+                self.key(SPACE, false, t + 20),
+                self.key(LALT, false, t + 30),
+            ]
+        }
+
+        fn tap(&mut self, vk: u32, t: u32) -> (Option<bool>, Option<bool>) {
+            (self.key(vk, true, t), self.key(vk, false, t + 5))
+        }
+
+        fn take(&self, seq: u32) -> Vec<u32> {
+            let mut out = [KeyRec::default(); RING_CAP];
+            let n = self.ring.take(seq, &mut out);
+            out[..n].iter().map(|r| u32::from(r.vk)).collect()
+        }
+    }
+
+    /// Every key Windows saw go down came back up, and no up came without its down (repeats are downs of a held key).
+    fn balanced(seen: &[(u32, bool)]) -> bool {
+        let mut held: Vec<u32> = Vec::new();
+        for &(vk, down) in seen {
+            match (down, held.iter().position(|&h| h == vk)) {
+                (true, None) => held.push(vk),
+                (true, Some(_)) => {}
+                (false, Some(i)) => {
+                    held.remove(i);
+                }
+                (false, None) => return false,
+            }
+        }
+        held.is_empty()
+    }
+
+    #[test]
+    fn resolve_launcher_table() {
+        let down = |mods: Mods| {
+            let mut s = st();
+            s.mods = mods;
+            resolve_launcher(&s, ev(SPACE, true, 100))
+        };
+        assert_eq!(down(Mods::ALT), Some(Verdict::SwallowPost(1)), "Alt+Space");
+        assert_eq!(down(Mods(Mods::CTRL.0 | Mods::ALT.0)), None, "AltGr is Ctrl+Alt");
+        assert_eq!(down(Mods::SHIFT), None, "Shift+Space");
+        assert_eq!(down(Mods::NONE), None, "Space");
+        assert_eq!(down(ALT_SHIFT), None, "Alt+Shift+Space is not Alt+Space");
+        let mut s = st();
+        s.chord = Some(ChordSpec { vk: 0x20, mods: ALT_SHIFT });
+        s.mods = ALT_SHIFT;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), Some(Verdict::SwallowPost(1)), "Alt+Shift+Space");
+        s.mods = Mods::ALT;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), None);
+        // Win held.
+        let mut s = st();
+        s.mods = Mods::ALT.with(Mods::WIN);
+        s.win_down = true;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), None, "Win held");
+        // The next sequence number.
+        let mut s = st();
+        s.mods = Mods::ALT;
+        s.ack = AckWatch { sent: 7, sent_at: 50, ack_seen: 7 };
+        s.acked = 7;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), Some(Verdict::SwallowPost(8)));
+        // Each pass flag.
+        for (f, v) in [
+            (PassFlags::FULLSCREEN, Verdict::Pass),
+            (PassFlags::REMOTE, Verdict::Pass),
+            (PassFlags::YIELD, Verdict::PassNotify),
+            (PassFlags::FULLSCREEN.with(PassFlags::YIELD), Verdict::Pass),
+        ] {
+            let mut s = st();
+            s.mods = Mods::ALT;
+            s.flags = f;
+            assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), Some(v), "{f:?}");
+        }
+        // Repeats and the release of a swallowed Space are swallowed; a passed Space passes, its release too.
+        let mut s = st();
+        s.mods = Mods::ALT;
+        s.space = SpaceState::Swallowed;
+        s.space_time = 90;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), Some(Verdict::SwallowSilent), "repeat");
+        assert_eq!(resolve_launcher(&s, ev(SPACE, false, 120)), Some(Verdict::SwallowSilent), "release");
+        s.mods = Mods::NONE;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, false, 120)), Some(Verdict::SwallowSilent), "Alt let go first");
+        s.space = SpaceState::Passed;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), Some(Verdict::Pass));
+        assert_eq!(resolve_launcher(&s, ev(SPACE, false, 120)), Some(Verdict::Pass));
+        // A swallowed press whose release was lost (secure desktop) does not eat the next press.
+        let mut s = st();
+        s.space = SpaceState::Swallowed;
+        s.space_time = 100;
+        assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100 + MOD_STALE_MS + 1)), None);
+        // No chord: nothing is the launcher's, and nothing changes.
+        let mut k = Kbd::new();
+        k.s.chord = None;
+        for (vk, down, t) in
+            [(LALT, true, 0), (SPACE, true, 10), (KEY_A, true, 20), (KEY_A, false, 30), (SPACE, false, 40)]
+        {
+            let before = k.s;
+            assert_eq!(k.key(vk, down, t), None);
+            assert_eq!(k.s, ChordState { mods: k.s.mods, ..before });
+        }
+        assert!(k.posts.is_empty() && !k.ring.ctl().is_open());
+    }
+
+    #[test]
+    fn physical_filter() {
+        assert!(!physical(LLKHF_INJECTED.0, 0), "injected");
+        assert!(!physical(LLKHF_INJECTED.0 | 0x02, 0), "injected from a lower integrity level");
+        assert!(!physical(0, INJECT_TAG), "our own tag");
+        assert!(physical(LLKHF_EXTENDED.0, 0));
+        assert!(physical(0, 0));
+    }
+
+    #[test]
+    fn unacked_1500_fails_open() {
+        // Post at 10,000; the next chord at 11,499 is still swallowed.
+        let mut k = Kbd::new();
+        assert_eq!(k.chord(10_000), [None, Some(true), Some(true), None]);
+        assert_eq!(k.posts, [1]);
+        assert_eq!(k.chord(11_499)[1], Some(true));
+        assert_eq!(k.posts, [1, 2]);
+        // At 11,500 it fails open: passed, with one note, and LAST_FAILOPEN_SEQ is the first sequence.
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.chord(11_500), [None, Some(false), Some(false), None], "the press and its release pass");
+        assert_eq!((k.s.last_failopen, k.notes.as_slice()), (1, &[1][..]));
+        assert_eq!(k.chord(11_600)[1], Some(false), "still failing open");
+        assert_eq!(k.notes, [1], "one note per sequence");
+        assert!(balanced(&k.seen));
+        // The UI acknowledges: the next chord is swallowed and posted again.
+        k.s.acked = 1;
+        assert_eq!(k.chord(12_000)[1], Some(true));
+        assert_eq!(k.posts, [1, 2]);
+        // Progress (an acknowledged post) gives the rest a fresh window.
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        k.chord(11_000);
+        k.s.acked = 1;
+        assert_eq!(k.chord(11_600)[1], Some(true), "#1 acknowledged at 11,600: #2 gets 1500 ms from now");
+        assert_eq!(k.chord(13_099)[1], Some(true));
+        assert_eq!(k.chord(13_100)[1], Some(false));
+        assert_eq!(k.notes, [4]);
+    }
+
+    #[test]
+    fn typeahead_window() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.tap(KEY_A, 10_100), (Some(true), Some(true)), "typed after the chord: kept for the launcher");
+        assert_eq!(k.key(SPACE, true, 10_200), Some(true), "a plain Space too");
+        assert_eq!(k.key(SPACE, false, 10_210), Some(true));
+        assert_eq!(k.key(KEY_C, true, 10_500), Some(true), "500 ms after the post");
+        assert_eq!(k.key(KEY_C, false, 10_501), Some(true), "its down was kept, so its up is too");
+        assert_eq!(k.tap(KEY_E, 10_501), (None, None), "501 ms: passed");
+        assert!(balanced(&k.seen));
+        // Taken before the deadline, the ring holds the downs in order.
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        k.tap(KEY_A, 10_100);
+        k.key(KEY_C, true, 10_200);
+        assert_eq!(k.take(1), [KEY_A, KEY_C]);
+        let mut out = [KeyRec::default(); RING_CAP];
+        assert_eq!(k.ring.take(1, &mut out), 0);
+        assert_eq!(k.key(KEY_C, false, 10_250), Some(true), "the up of a taken key stays swallowed");
+        assert_eq!(k.tap(KEY_E, 10_260), (None, None), "the window ended at the take");
+    }
+
+    #[test]
+    fn ring_records_what_the_ui_replays() {
+        let mut k = Kbd::new();
+        k.key(LALT, true, 9_990);
+        k.key(SPACE, true, 10_000);
+        k.key(SPACE, false, 10_020);
+        k.key(0x73, true, 10_030);
+        k.key(LALT, false, 10_040);
+        k.key(LSHIFT, true, 10_050);
+        k.key(KEY_A, true, 10_060);
+        let mut out = [KeyRec::default(); RING_CAP];
+        assert_eq!(k.ring.take(1, &mut out), 2);
+        assert_eq!(out[0], KeyRec { vk: 0x73, scan: 0x73 & 0x7F, ext: false, mods: Mods::ALT, time: 10_030 }, "Alt+F4");
+        assert_eq!(out[1], KeyRec { vk: 0x41, scan: 0x41, ext: false, mods: Mods::SHIFT, time: 10_060 });
+        let r = KeyRec { vk: 0xFF, scan: 0xFFF, ext: true, mods: Mods(0xF), time: u32::MAX };
+        assert_eq!(KeyRec::unpack(r.pack()), r);
+    }
+
+    #[test]
+    fn ring_discarded_after_deadline() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        k.tap(KEY_A, 10_100);
+        assert_eq!(k.key(KEY_E, true, 10_501), None, "the first key after the deadline passes");
+        assert!(k.ring.ctl().is_ended(), "and expires the ring");
+        assert!(k.take(1).is_empty());
+        assert_eq!(k.key(KEY_E, false, 10_510), None);
+    }
+
+    #[test]
+    fn ring_overflow_drops_beyond_32() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        let vks: Vec<u32> = (0x30..=0x39).chain(0x41..=0x57).collect();
+        assert_eq!(vks.len(), 33);
+        for (i, &vk) in vks.iter().enumerate() {
+            assert_eq!(k.key(vk, true, 10_100 + i as u32 * 10), Some(true), "{vk:#x}");
+        }
+        assert_eq!(k.key(0x57, false, 10_450), Some(true), "the 33rd: swallowed, not stored, its up swallowed");
+        let taken = k.take(1);
+        assert_eq!(taken.len(), 32);
+        assert!(!taken.contains(&0x57));
+        assert_eq!(taken, &vks[..32]);
+    }
+
+    #[test]
+    fn modifiers_never_buffered() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        for (i, vk) in [LSHIFT, 0xA1, LCTRL, 0xA3, LALT, RALT, 0x10, 0x11, 0x12, LWIN, 0x5C].into_iter().enumerate() {
+            let t = 10_100 + i as u32 * 20;
+            assert_eq!(k.tap(vk, t), (None, None), "{vk:#x}");
+        }
+        assert!(k.take(1).is_empty());
+        assert!(balanced(&k.seen));
+    }
+
+    #[test]
+    fn win_chord_during_typeahead_is_not_buffered() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.key(LWIN, true, 10_090), None, "the Win branch takes it");
+        k.s.win_down = true; // what the Win branch records
+                             // E reaches the Win branch, whose other_key_down injects Win+E (not run here: it calls SendInput).
+        assert_eq!(k.key(KEY_E, true, 10_100), None);
+        assert_eq!(k.key(KEY_E, false, 10_150), None);
+        assert_eq!(k.key(LWIN, false, 10_160), None);
+        k.s.win_down = false;
+        assert!(k.take(1).is_empty(), "never an \"e\" in the launcher");
+    }
+
+    #[test]
+    fn up_of_an_unbuffered_down_passes() {
+        let mut k = Kbd::new();
+        assert_eq!(k.key(KEY_A, true, 9_900), None, "pressed before the chord");
+        k.chord(10_000);
+        assert_eq!(k.key(KEY_A, false, 10_050), None, "released inside the window: Windows saw its down");
+        assert!(balanced(&k.seen));
+    }
+
+    #[test]
+    fn repeats_of_a_held_key_stay_with_windows() {
+        // An arrow held before the chord: its repeats inside the window pass, and so does its release.
+        let mut k = Kbd::new();
+        assert_eq!(k.key(0x28, true, 9_900), None);
+        k.chord(10_000);
+        for t in [10_050, 10_083, 10_116] {
+            assert_eq!(k.key(0x28, true, t), None, "a repeat of a press Windows has");
+        }
+        assert_eq!(k.key(0x28, false, 10_130), None);
+        assert!(k.take(1).is_empty());
+        assert!(balanced(&k.seen), "{:?}", k.seen);
+        // Space held, then Alt: Space's repeats are no chord.
+        let mut k = Kbd::new();
+        assert_eq!(k.key(SPACE, true, 10_000), None);
+        k.key(LALT, true, 10_100);
+        assert_eq!(k.key(SPACE, true, 10_133), None);
+        assert_eq!(k.key(SPACE, false, 10_150), None);
+        k.key(LALT, false, 10_160);
+        assert!(k.posts.is_empty());
+        assert!(balanced(&k.seen), "{:?}", k.seen);
+        // A buffered key's own repeats stay buffered (Windows never got its down).
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.key(KEY_A, true, 10_100), Some(true));
+        assert_eq!(k.key(KEY_A, true, 10_133), Some(true));
+        assert_eq!(k.key(KEY_A, false, 10_140), Some(true));
+        assert_eq!(k.take(1), [KEY_A, KEY_A]);
+        assert!(balanced(&k.seen));
+    }
+
+    #[test]
+    fn stale_buffered_bit_cleared_by_a_passed_down() {
+        let mut k = Kbd::new();
+        k.s.buffered_down = [0, 1 << (KEY_A - 64), 0, 0];
+        assert!(k.s.buffered(KEY_A));
+        assert_eq!(k.key(KEY_A, true, 20_000), None, "no live window: its down passes");
+        assert!(!k.s.buffered(KEY_A), "and clears the stale bit");
+        assert_eq!(k.key(KEY_A, false, 20_050), None, "so its up passes too");
+        assert!(balanced(&k.seen));
+    }
+
+    #[test]
+    fn dropped_post_ends_the_window() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.ring.ctl(), RingCtl::opened(1));
+        assert_eq!(k.ring.end(1), Some(0), "the UI drops the post at 10,005 and ends the window");
+        k.s.acked = 1;
+        assert_eq!(k.tap(KEY_A, 10_010), (None, None), "passed, not in the ring");
+        assert!(k.take(1).is_empty());
+        // The hook's view raced the end: its push is refused and the key passes.
+        let ring = Ring::new();
+        ring.open(5);
+        assert_eq!(ring.try_push(5, 1), Push::Stored);
+        assert_eq!(ring.end(5), Some(1));
+        assert_eq!(ring.try_push(5, 2), Push::Closed);
+        assert_eq!(swallow_of(Some(Verdict::Buffer), Some(Push::Closed)), Some(false));
+        assert_eq!(swallow_of(Some(Verdict::Buffer), Some(Push::Full)), Some(true));
+        let mut s = st();
+        s.after(Some(&Verdict::Buffer), ev(KEY_A, true, 10), Some(Push::Closed));
+        assert!(!s.buffered(KEY_A), "a passed key leaves no bit");
+        assert_eq!(ring.try_push(4, 3), Push::Closed, "another sequence");
+    }
+
+    #[test]
+    fn ring_of_an_older_post_never_replayed() {
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        for (i, vk) in [0x53, 0x48, 0x55, 0x54, ENTER].into_iter().enumerate() {
+            assert_eq!(k.tap(vk, 10_100 + i as u32 * 20), (Some(true), Some(true)));
+        }
+        assert_eq!(k.ring.end(1), Some(5), "post 1 dropped: the UI ends its window");
+        k.s.acked = 1;
+        assert_eq!(k.chord(10_300)[1], Some(true));
+        assert_eq!(k.posts, [1, 2]);
+        assert_eq!(k.tap(KEY_C, 10_350), (Some(true), Some(true)));
+        assert_eq!(k.take(1), Vec::<u32>::new(), "\"shut\" and Enter are gone");
+        assert_eq!(k.take(2), [KEY_C]);
+    }
+
+    #[test]
+    fn closing_chord_opens_no_window() {
+        let mut k = Kbd::new();
+        k.s.shown = true;
+        assert_eq!(k.chord(10_000)[1], Some(true));
+        assert_eq!(k.posts, [1], "posted: the UI closes the launcher");
+        assert_eq!(k.tap(KEY_A, 10_010), (None, None), "typed for the window behind");
+        assert!(!k.ring.ctl().is_open());
+    }
+
+    #[test]
+    fn take_after_end_is_empty() {
+        let ring = Ring::new();
+        ring.open(3);
+        assert_eq!(ring.try_push(3, KeyRec { vk: 0x41, ..KeyRec::default() }.pack()), Push::Stored);
+        assert_eq!(ring.end(3), Some(1));
+        assert_eq!(ring.end(3), None);
+        let mut out = [KeyRec::default(); RING_CAP];
+        assert_eq!(ring.take(3, &mut out), 0);
+        assert_eq!(Ring::new().take(0, &mut out), 0, "never opened");
+    }
+
+    #[test]
+    fn take_is_once() {
+        let ring = Ring::new();
+        ring.open(9);
+        for vk in [0x41u16, 0x42] {
+            assert_eq!(ring.try_push(9, KeyRec { vk, ..KeyRec::default() }.pack()), Push::Stored);
+        }
+        let mut out = [KeyRec::default(); RING_CAP];
+        assert_eq!(ring.take(8, &mut out), 0, "another sequence");
+        assert_eq!(ring.take(9, &mut out), 2);
+        assert_eq!((out[0].vk, out[1].vk), (0x41, 0x42));
+        assert_eq!(ring.take(9, &mut out), 0);
+        // Sequences wrap freely: OPEN, not a non-zero sequence, marks a window.
+        ring.open(0);
+        assert_eq!(ring.try_push(0, 7), Push::Stored);
+        assert_eq!(ring.take(0, &mut out), 1);
+    }
+
+    #[test]
+    fn ring_take_races_push_without_loss() {
+        const ROUNDS: u32 = 10_000;
+        const PUSHES: u32 = 40;
+        let ring = Ring::new();
+        let start = Barrier::new(2);
+        let done = Barrier::new(2);
+        let xorshift = |x: &mut u64| {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            *x
+        };
+        let (pushed, taken) = std::thread::scope(|sc| {
+            let pusher = sc.spawn(|| {
+                let mut rng = 0x5EED_u64;
+                let mut all = Vec::new();
+                for round in 0..ROUNDS {
+                    ring.open(round);
+                    start.wait();
+                    let mut res = Vec::new();
+                    for i in 1..=PUSHES {
+                        for _ in 0..xorshift(&mut rng) % 4 {
+                            std::hint::spin_loop();
+                        }
+                        res.push(ring.try_push(round, KeyRec { time: i, ..KeyRec::default() }.pack()));
+                    }
+                    all.push(res);
+                    done.wait();
+                }
+                all
+            });
+            let taker = sc.spawn(|| {
+                let mut rng = 0xC0FFEE_u64;
+                let mut all = Vec::new();
+                for round in 0..ROUNDS {
+                    start.wait();
+                    for _ in 0..xorshift(&mut rng) % 256 {
+                        std::hint::spin_loop();
+                    }
+                    let mut out = [KeyRec::default(); RING_CAP];
+                    let n = ring.take(round, &mut out);
+                    all.push(out[..n].iter().map(|r| r.time).collect::<Vec<u32>>());
+                    done.wait();
+                }
+                all
+            });
+            (pusher.join().unwrap(), taker.join().unwrap())
+        });
+        for (round, (res, got)) in pushed.iter().zip(&taken).enumerate() {
+            let stored: Vec<u32> = (1..=PUSHES).zip(res).filter(|(_, p)| **p == Push::Stored).map(|(i, _)| i).collect();
+            assert_eq!(*got, stored, "round {round}: every stored key is in the copy, no other");
+            for (i, p) in (1..=PUSHES).zip(res) {
+                match p {
+                    Push::Stored => assert!(got.contains(&i)),
+                    Push::Closed => assert!(!got.contains(&i), "round {round}: {i} passed and taken"),
+                    Push::Full => assert!(i > RING_CAP as u32 && !got.contains(&i)),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_mods_clears_tracked_alt() {
+        let mut t = ModTrack::default();
+        track_step(&mut t, 0, LALT, true, 100, |_| true);
+        assert_eq!(t.mods(false), Mods::ALT);
+        track_step(&mut t, 1, KEY_A, true, 200, |_| true);
+        assert_eq!(t.mods(false), Mods::NONE, "RESET_MODS moved: tracked Alt cleared first");
+        track_step(&mut t, 1, LALT, false, 300, |_| true);
+        track_step(&mut t, 1, LSHIFT, true, 400, |_| true);
+        assert_eq!(t.mods(false), Mods::SHIFT, "the same reset counts once");
+        assert_eq!(t.mods(true), Mods::SHIFT.with(Mods::WIN));
+        // With the chord: a lost Shift release cleared by the reset can only make Alt+Shift+Space pass.
+        let mut k = Kbd::new();
+        k.s.chord = Some(ChordSpec { vk: 0x20, mods: ALT_SHIFT });
+        k.key(LSHIFT, true, 100);
+        track_step(&mut k.track, 1, LALT, true, 200, |_| true);
+        k.s.mods = k.track.mods(false);
+        assert_eq!(resolve_launcher(&k.s, ev(SPACE, true, 210)), None);
+    }
+
+    #[test]
+    fn stale_modifier_repaired_after_1500_ms() {
+        let mut t = ModTrack::default();
+        t.on_key(LALT, true, 1_000);
+        t.on_key(LSHIFT, true, 1_000);
+        t.repair(2_500, |_| false);
+        assert_eq!(t.mods(false), ALT_SHIFT, "1500 ms: not stale yet");
+        t.repair(2_501, |_| true);
+        assert_eq!(t.mods(false), ALT_SHIFT, "stale but still down");
+        t.repair(4_002, |vk| vk == LSHIFT);
+        assert_eq!(t.mods(false), Mods::SHIFT, "Alt's release was lost: cleared; Shift really held");
+        assert!(!t.alt_down());
+        // Right-side keys are tracked on their own.
+        let mut t = ModTrack::default();
+        t.on_key(RALT, true, 0);
+        t.on_key(LALT, true, 0);
+        t.on_key(LALT, false, 5);
+        assert!(t.alt_down(), "right Alt still down");
+    }
+
+    #[test]
+    fn gesture_time_only_for_physical_ctrl_shift_enter() {
+        let slot = AtomicU64::new(0);
+        let cs = CTRL_SHIFT_;
+        note_gesture(&slot, 0, 0, ENTER, true, cs, 5);
+        assert_eq!(slot.swap(0, Relaxed), pack_gesture_time(5));
+        let none = [
+            (0, 0, ENTER, true, cs.with(Mods::ALT), "an Alt-held Enter"),
+            (0, 0, ENTER, true, Mods::CTRL, "a lone Ctrl+Enter"),
+            (0, 0, ENTER, true, cs.with(Mods::WIN), "Win held"),
+            (LLKHF_INJECTED.0, 0, ENTER, true, cs, "an injected Ctrl+Shift+Enter"),
+            (0, INJECT_TAG, ENTER, true, cs, "our own injection"),
+            (0, 0, ENTER, false, cs, "the release"),
+            (0, 0, KEY_E, true, cs, "Ctrl+Shift+E"),
+        ];
+        for (flags, extra, vk, down, mods, what) in none {
+            note_gesture(&slot, flags, extra, vk, down, mods, 7);
+            assert_eq!(slot.load(Relaxed), 0, "{what}");
+        }
+    }
+
+    #[test]
+    fn gesture_time_round_trips_into_from_key() {
+        let cse = KeyEvent { vk: 0x0D, mods: CTRL_SHIFT_, repeat: false, sys: false };
+        for t in [0, 1, 2, 1_000_000, 1_000_001, u32::MAX - 1, u32::MAX] {
+            let hook = unpack_gesture_time(pack_gesture_time(t));
+            assert_eq!(hook, Some(t));
+            assert!(Gesture::from_key(&cse, hook, t, 0, INJECT_TAG, t.wrapping_add(5)).is_some(), "{t}");
+            assert!(
+                Gesture::from_key(&cse, hook, t.wrapping_add(1), 0, INJECT_TAG, t.wrapping_add(5)).is_none(),
+                "{t}"
+            );
+        }
+        assert_eq!(unpack_gesture_time(0), None, "nothing stored");
+        // Once through the static, as handle_key stores it (no other test touches GESTURE_TIME).
+        let t = 1_000_001;
+        note_gesture(&GESTURE_TIME, 0, 0, ENTER, true, CTRL_SHIFT_, t);
+        let hook = take_gesture_time();
+        assert_eq!(hook, Some(t));
+        assert!(Gesture::from_key(&cse, hook, t, 0, INJECT_TAG, t + 5).is_some());
+        assert_eq!(take_gesture_time(), None, "consumed");
+    }
+
+    #[test]
+    fn stale_chord_never_opens() {
+        use PostAction::*;
+        // seq, sent at, now, newest, last failed open, open.
+        assert_eq!(post_verdict(1, 1_000, 1_300, 1, 0, false), Open);
+        assert_eq!(post_verdict(1, 1_000, 1_301, 1, 0, false), Drop, "301 ms late");
+        assert_eq!(post_verdict(1, 1_000, 1_301, 1, 0, true), Close, "closing is always safe");
+        assert_eq!(post_verdict(1, 1_000, 1_010, 2, 0, false), Drop, "superseded");
+        assert_eq!(post_verdict(1, 1_000, 1_010, 2, 0, true), Close);
+        assert_eq!(post_verdict(3, 1_000, 1_010, 3, 3, false), Drop, "failed open");
+        assert_eq!(post_verdict(2, 1_000, 1_010, 3, 3, false), Drop);
+        assert_eq!(post_verdict(4, 1_000, 1_010, 4, 3, false), Open);
+        assert_eq!(post_verdict(4, 1_000, 1_010, 4, 3, true), Close);
+        // Wrapping clocks and sequences.
+        assert_eq!(post_verdict(0, u32::MAX - 100, 50, 0, u32::MAX, false), Open);
+        assert_eq!(post_verdict(u32::MAX, 0, 10, 0, 0, false), Drop, "u32::MAX is older than 0");
+        // Three queued posts open at most once.
+        let mut open = false;
+        let mut opened = 0;
+        for seq in 1..=3 {
+            match post_verdict(seq, 1_000, 1_100, 3, 0, open) {
+                Open => {
+                    open = true;
+                    opened += 1;
+                }
+                Close => open = false,
+                Drop => {}
+            }
+        }
+        assert_eq!((opened, open), (1, true));
+        // All stale: none opens.
+        assert!((1..=3).all(|seq| post_verdict(seq, 1_000, 2_000, 3, 0, false) == Drop));
+    }
+
+    #[test]
+    fn reinject_plan_pairs() {
+        let p = reinject_plan(true);
+        assert_eq!(p.keys(), [(0x20, false), (0x20, true)], "Alt still down: Space down, Space up");
+        let p = reinject_plan(false);
+        assert_eq!(p.keys(), [(0x12, false), (0x20, false), (0x20, true), (0x12, true)]);
+    }
+
+    #[test]
+    fn swallowed_down_ui_says_pass_then_up() {
+        // The popup cannot open: the UI re-injects the plan (tagged, so the hook passes it), then the real up arrives.
+        for alt_released_first in [false, true] {
+            let mut k = Kbd::new();
+            k.key(LALT, true, 9_990);
+            assert_eq!(k.key(SPACE, true, 10_000), Some(true));
+            if alt_released_first {
+                k.key(LALT, false, 10_005);
+            }
+            assert_eq!(post_verdict(1, 10_000, 10_010, 1, 0, false), PostAction::Open);
+            let plan = reinject_plan(k.track.alt_down());
+            k.seen.extend(plan.keys().iter().map(|&(vk, up)| (u32::from(vk), !up))); // the SendInput recorder
+            k.ring.end(1);
+            assert_eq!(k.key(SPACE, false, 10_050), Some(true), "the real up stays swallowed");
+            if !alt_released_first {
+                k.key(LALT, false, 10_060);
+            }
+            assert!(balanced(&k.seen), "{:?}", k.seen);
+            assert_eq!(k.seen.iter().filter(|e| e.0 == SPACE).count(), 2, "one Space down, one Space up");
+        }
     }
 }

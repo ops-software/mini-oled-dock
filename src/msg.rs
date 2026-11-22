@@ -71,9 +71,19 @@ pub const WM_DOCK_OPEN_SETTINGS: u32 = WM_APP + 40;
 /// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
 /// Consecutive posts may be coalesced: re-read `update::status()`.
 pub const WM_DOCK_UPDATE: u32 = WM_APP + 17;
+/// hook -> UI: the launcher's chord was swallowed. wParam = the sequence number (`hook::LAUNCHER_SEQ`), lParam =
+/// `kb.time` of the key (GetTickCount clock). The UI calls `hook::ack_launcher(seq)` before anything else, then
+/// `hook::post_verdict` decides (open, close or drop).
+pub const WM_DOCK_LAUNCHER: u32 = WM_APP + 24;
+/// hook -> UI: the chord passed under the YIELD flag (PowerToys answers it). wParam = 0, lParam = `kb.time`.
+pub const WM_DOCK_LAUNCHER_YIELDED: u32 = WM_APP + 25;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
+// `WM_APP + 18` and `+ 19` are RESERVED by WS-C: the config change and `WM_HOOK_NOTE`, the hook thread's message to
+// itself (defined privately in `hook.rs`). `WM_HOOK_NOTE`'s wParam values 1-15 belong to WS-C (1 fail-open on,
+// 2 fail-open off, 3 test stall, 4 bar shown, 5 bar hidden) and 16-31 to the launcher (16 =
+// `NOTE_LAUNCHER_FAIL_OPEN`). `WM_APP + 20..23` stay for shell-thread messages.
 
 // -------------------------------------- THREAD messages (PostThreadMessageW)
 

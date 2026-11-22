@@ -349,6 +349,10 @@ fn probe_violations(path: &str, text: &str) -> Vec<String> {
     }
     if path != "src/launcher_probe.rs" {
         for (at, _) in text.match_indices("DOCK_LAUNCHER_") {
+            // A switch name starts at a word boundary: WM_DOCK_LAUNCHER_YIELDED is a window message, not a switch.
+            if text.get(..at).and_then(|t| t.chars().next_back()).is_some_and(is_ident) {
+                continue;
+            }
             v.push(format!("{path}:{}: DOCK_LAUNCHER_ switch outside launcher_probe.rs", line_of(text, at)));
         }
         if path != "src/hook.rs" {
@@ -377,6 +381,8 @@ fn probe_violations(path: &str, text: &str) -> Vec<String> {
 fn probe_switches_only_in_owner_builds() {
     assert_eq!(probe_violations("src/ui.rs", "std::env::var(\"DOCK_LAUNCHER_X\")").len(), 1);
     assert!(probe_violations("src/launcher_probe.rs", "std::env::var(\"DOCK_LAUNCHER_X\")").is_empty());
+    assert!(probe_violations("src/msg.rs", "pub const WM_DOCK_LAUNCHER_YIELDED: u32 = 1;").is_empty());
+    assert_eq!(probe_violations("src/hook.rs", "let s = \"DOCK_LAUNCHER_MASK\";").len(), 1);
     assert_eq!(probe_violations("src/launcher/session.rs", "DOCK_TEST_FREEZE_UI_MS").len(), 1);
     assert!(probe_violations("src/hook.rs", "DOCK_TEST_FREEZE_UI_MS").is_empty());
     assert!(probe_violations("src/launcher_probe.rs", "DOCK_TEST_FREEZE_UI_MS").is_empty());
