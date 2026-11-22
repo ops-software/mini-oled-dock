@@ -1957,8 +1957,11 @@ pub(crate) fn on_yielded(kb_time: u32) {
     crate::launcher_probe::yielded(on.then_some(kb_time));
 }
 
-/// `WM_DOCK_LAUNCHER_PASSED`: the hook passed a chord under FULLSCREEN.
-pub(crate) fn on_passed() {
+/// `WM_DOCK_LAUNCHER_PASSED` (wParam the newest sequence the hook issued): the hook passed a chord under FULLSCREEN or
+/// failed open.
+pub(crate) fn on_passed(seq: u32) {
+    // First: every post before this note was handled, so a lost one no longer fails the next chords open.
+    hook::resync_launcher(seq);
     if ON.with(Cell::get) {
         pass_note(&mut RealHook, &RealSys);
     }
@@ -1967,8 +1970,10 @@ pub(crate) fn on_passed() {
 /// A window can leave fullscreen without a foreground change (F11 in a browser, Esc out of a video, a borderless
 /// player): each chord passed under FULLSCREEN computes the flags again, so a stale flag loses one press (5.2.12).
 fn pass_note(hook: &mut dyn HookPort, sys: &dyn SysPort) {
+    // A fail-open's note comes without FULLSCREEN: only a flag that was set and cleared is logged.
+    let was = with_ctrl(|c| c.flags.has(PassFlags::FULLSCREEN)) == Some(true);
     foreground_flow(hook, sys);
-    if with_ctrl(|c| c.flags.has(PassFlags::FULLSCREEN)) == Some(false) {
+    if was && with_ctrl(|c| c.flags.has(PassFlags::FULLSCREEN)) == Some(false) {
         log!("launcher: no fullscreen window in front any more, the next chord opens");
     }
 }

@@ -80,8 +80,10 @@ pub const WM_DOCK_LAUNCHER_YIELDED: u32 = WM_APP + 25;
 /// launcher -> dock window: the close a type-ahead replay asked for at the launcher's first activation, posted so it
 /// runs outside that activation (`popup_launcher::on_focus`). wParam = the open's sequence, lParam = 0.
 pub const WM_DOCK_LAUNCHER_CLOSE: u32 = WM_APP + 26;
-/// hook -> UI: the chord passed under the FULLSCREEN flag. The UI computes the pass flags again: a window can leave
-/// fullscreen without a foreground change. wParam = 0, lParam = `kb.time`.
+/// hook -> UI: the chord passed under the FULLSCREEN flag, or failed open. wParam = the newest sequence the hook issued
+/// (`hook::LAUNCHER_SEQ`), lParam = `kb.time`. The UI calls `hook::resync_launcher(wParam)` first (every post before
+/// the note was handled, a lost one included), then computes the pass flags again: a window can leave fullscreen
+/// without a foreground change.
 pub const WM_DOCK_LAUNCHER_PASSED: u32 = WM_APP + 27;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)

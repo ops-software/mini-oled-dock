@@ -25,8 +25,8 @@
 //!  * The chord key down with exactly the chord's modifiers (AltGr is Ctrl+Alt: never Alt+Space) and no Win:
 //!    passed in fullscreen (with WM_DOCK_LAUNCHER_PASSED, so the UI checks the flag again) and remote sessions;
 //!    passed with WM_DOCK_LAUNCHER_YIELDED while Command Palette answers;
-//!    failed open (passed, one log line per sequence) when the UI thread left a post unacknowledged for
-//!    ACK_TIMEOUT_MS; otherwise swallowed, the menu-mask key injected under Alt (so the Alt release opens no menu
+//!    failed open (passed, one log line per sequence, and WM_DOCK_LAUNCHER_PASSED with the newest sequence, which a
+//!    live UI acknowledges) when the UI thread left a post unacknowledged for ACK_TIMEOUT_MS; otherwise swallowed, the menu-mask key injected under Alt (so the Alt release opens no menu
 //!    bar) and WM_DOCK_LAUNCHER posted with the next sequence number and kb.time. Its repeats and its release go
 //!    the way its down went. The UI opens nothing for a stale, superseded or failed-open post (`post_verdict`).
 //!  * Type-ahead: a chord that will open the launcher opens a window of TYPEAHEAD_MS in which every other key down
@@ -1081,10 +1081,15 @@ enum Act {
     Post(u32),
     /// Post WM_DOCK_LAUNCHER_YIELDED.
     Yielded,
-    /// Post WM_DOCK_LAUNCHER_PASSED.
-    Passed,
-    /// Note to the hook thread (logged outside the callback): this sequence failed open.
-    FailOpenNote(u32),
+    /// Post WM_DOCK_LAUNCHER_PASSED with the newest sequence issued (the UI acknowledges it, `resync_launcher`).
+    Passed(u32),
+    /// Failed open: post WM_DOCK_LAUNCHER_PASSED with the newest sequence issued, so a live UI acknowledges it and the
+    /// next chord is posted again (a lost post is never acknowledged otherwise); `note`: this sequence failed open for
+    /// the first time, noted to the hook thread (logged outside the callback).
+    FailOpen {
+        seq: u32,
+        note: bool,
+    },
 }
 
 /// Swallowed (Some(true)), passed by the launcher (Some(false)) or not the launcher's (None).
@@ -1125,8 +1130,8 @@ fn chord_step(s: &mut ChordState, ring: &Ring, ev: KeyEv) -> (Option<bool>, Act)
     let act = match v {
         Some(Verdict::SwallowPost(seq)) => Act::Post(seq),
         Some(Verdict::PassNotify) => Act::Yielded,
-        Some(Verdict::PassFullscreen) => Act::Passed,
-        Some(Verdict::FailOpen) if s.last_failopen != failopen_before => Act::FailOpenNote(s.last_failopen),
+        Some(Verdict::PassFullscreen) => Act::Passed(s.ack.sent),
+        Some(Verdict::FailOpen) => Act::FailOpen { seq: s.ack.sent, note: s.last_failopen != failopen_before },
         _ => Act::Nothing,
     };
     (swallow_of(v, pushed), act)
@@ -1283,6 +1288,14 @@ pub fn ack_launcher(seq: u32) {
     LAUNCHER_ACKED.store(seq, Relaxed);
 }
 
+/// UI, first thing on WM_DOCK_LAUNCHER_PASSED (wParam the newest sequence the hook issued): every post up to `seq` was
+/// handled (posted messages keep their order), a lost one included, so the hook stops failing open. The owner probe's
+/// freeze stays on the chord's own acknowledgement (`ack_launcher`).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn resync_launcher(seq: u32) {
+    LAUNCHER_ACKED.store(seq, Relaxed);
+}
+
 /// UI: true right before the launcher's ShowWindow, false at its close (a chord while shown closes the launcher and
 /// opens no type-ahead window).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -1382,7 +1395,7 @@ fn store_chord_state(s: &ChordState) {
 }
 
 /// The launcher's part of the callback: Some(swallow) when the event was the launcher's, None for the Win branch.
-/// O(1), no allocation, no logging: at most one SendInput and one PostMessage.
+/// O(1), no allocation, no logging: at most one SendInput and one PostMessage (and a fail-open's note to this thread).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launcher_step(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods) -> Option<bool> {
     // SAFETY: GetAsyncKeyState has no preconditions. Inside the callback it reads the state from before this event
@@ -1397,22 +1410,26 @@ fn launcher_step(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods) -> Option<bool> {
         Act::Nothing => {}
         Act::Post(seq) => {
             // A failed SendInput still posts (the mask is cosmetic); a failed post stays unacknowledged, which fails
-            // open on the next chord, and its window expires at the deadline.
+            // open on the next chord (whose note lets a live UI acknowledge it again), and its window expires at the
+            // deadline.
             send_mask();
             post_launcher(WM_DOCK_LAUNCHER, seq as usize, kb.time);
         }
         Act::Yielded => post_launcher(WM_DOCK_LAUNCHER_YIELDED, 0, kb.time),
-        Act::Passed => post_launcher(WM_DOCK_LAUNCHER_PASSED, 0, kb.time),
-        Act::FailOpenNote(seq) => {
-            // SAFETY: PostThreadMessageW is thread-safe; this thread has a message queue (thread_main's PeekMessageW).
-            let _ = unsafe {
-                PostThreadMessageW(
-                    GetCurrentThreadId(),
-                    WM_HOOK_NOTE,
-                    WPARAM(NOTE_LAUNCHER_FAIL_OPEN),
-                    LPARAM(seq as isize),
-                )
-            };
+        Act::Passed(seq) => post_launcher(WM_DOCK_LAUNCHER_PASSED, seq as usize, kb.time),
+        Act::FailOpen { seq, note } => {
+            post_launcher(WM_DOCK_LAUNCHER_PASSED, seq as usize, kb.time);
+            if note {
+                // SAFETY: PostThreadMessageW is thread-safe; this thread has a message queue (thread_main's PeekMessageW).
+                let _ = unsafe {
+                    PostThreadMessageW(
+                        GetCurrentThreadId(),
+                        WM_HOOK_NOTE,
+                        WPARAM(NOTE_LAUNCHER_FAIL_OPEN),
+                        LPARAM(seq as isize),
+                    )
+                };
+            }
         }
     }
     swallow
@@ -1501,8 +1518,11 @@ mod tests {
         seen: Vec<(u32, bool)>,
         posts: Vec<u32>,
         notes: Vec<u32>,
-        /// The WM_DOCK_LAUNCHER_PASSED notes (a chord passed under FULLSCREEN).
+        /// The WM_DOCK_LAUNCHER_PASSED notes of a chord passed under FULLSCREEN.
         passed: u32,
+        /// The wParam of every WM_DOCK_LAUNCHER_PASSED note (FULLSCREEN passes and fail-opens): the sequence the UI
+        /// acknowledges.
+        passed_seqs: Vec<u32>,
     }
 
     impl Kbd {
@@ -1515,6 +1535,7 @@ mod tests {
                 posts: Vec::new(),
                 notes: Vec::new(),
                 passed: 0,
+                passed_seqs: Vec::new(),
             }
         }
 
@@ -1527,8 +1548,16 @@ mod tests {
             let (swallow, act) = chord_step(&mut self.s, &self.ring, KeyEv { held, ..ev(vk, down, t) });
             match act {
                 Act::Post(seq) => self.posts.push(seq),
-                Act::FailOpenNote(seq) => self.notes.push(seq),
-                Act::Passed => self.passed += 1,
+                Act::FailOpen { seq, note } => {
+                    if note {
+                        self.notes.push(seq);
+                    }
+                    self.passed_seqs.push(seq);
+                }
+                Act::Passed(seq) => {
+                    self.passed += 1;
+                    self.passed_seqs.push(seq);
+                }
                 Act::Yielded | Act::Nothing => {}
             }
             if swallow != Some(true) {
@@ -1694,6 +1723,36 @@ mod tests {
         assert_eq!(k.chord(13_099)[1], Some(true));
         assert_eq!(k.chord(13_100)[1], Some(false));
         assert_eq!(k.notes, [4]);
+    }
+
+    #[test]
+    fn a_lost_post_fails_open_until_the_ui_reads_the_note() {
+        // Post 1 is lost (PostMessageW failed): the UI never acknowledges it.
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        assert_eq!(k.posts, [1]);
+        // The next chord, 1,500 ms later, fails open and notes the newest sequence to the dock window.
+        assert_eq!(k.chord(11_500), [None, Some(false), Some(false), None]);
+        assert_eq!((k.notes.as_slice(), k.passed_seqs.as_slice()), (&[1][..], &[1][..]));
+        // A live UI acknowledges the noted sequence (`resync_launcher`): the next chord is swallowed, posted and opens.
+        k.s.acked = k.passed_seqs[0];
+        assert_eq!(k.chord(11_600)[1], Some(true));
+        assert_eq!(k.posts, [1, 2]);
+        assert_eq!(post_verdict(2, 11_600, 11_610, 2, k.s.last_failopen, false), PostAction::Open);
+        assert!(balanced(&k.seen));
+        // While the UI does not answer, every chord fails open and notes again (the log note stays one per sequence).
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        k.chord(11_500);
+        assert_eq!(k.chord(11_700)[1], Some(false));
+        assert_eq!((k.notes.as_slice(), k.passed_seqs.as_slice()), (&[1][..], &[1, 1][..]));
+        // A chord passed under FULLSCREEN carries the newest sequence too.
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        k.s.acked = 1;
+        k.s.flags = PassFlags::FULLSCREEN;
+        assert_eq!(k.chord(10_500)[1], Some(false));
+        assert_eq!((k.passed, k.passed_seqs.as_slice()), (1, &[1][..]));
     }
 
     #[test]
