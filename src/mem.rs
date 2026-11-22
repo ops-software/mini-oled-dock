@@ -6,10 +6,12 @@
 
 use crate::log;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use windows::Win32::Foundation::HANDLE;
+use std::sync::Mutex;
+use windows::Win32::Foundation::{HANDLE, HMODULE};
 use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
 use windows::Win32::System::ProcessStatus::{
-    EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    EmptyWorkingSet, EnumProcessModules, GetModuleBaseNameW, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetGuiResources, GetProcessHandleCount, GR_GDIOBJECTS, GR_USEROBJECTS,
@@ -23,6 +25,103 @@ static LAST_HIDDEN_TRIM: AtomicUsize = AtomicUsize::new(0);
 
 /// Set when data was just freed: the next hidden period trims again (`take_rearm`, consumed by `trim_tick`).
 static REARM: AtomicBool = AtomicBool::new(false);
+
+/// Most modules whose base and name are tracked (the process has about 80; the count itself is never capped).
+const MAX_MODULES: usize = 512;
+
+/// The module set seen by the last `log_memory`: bases and their names (parallel, at most `MAX_MODULES`), None until
+/// the first sample, which is only a baseline.
+static MODULES: Mutex<Option<(Vec<usize>, Vec<String>)>> = Mutex::new(None);
+
+/// Bases that appeared in `now` and bases that left `prev`, each in the order of its own list, duplicates once.
+/// An empty `prev` returns everything as added: the caller treats the first sample as a baseline and logs no names.
+fn module_delta(prev: &[usize], now: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut added: Vec<usize> = Vec::new();
+    for &b in now {
+        if !prev.contains(&b) && !added.contains(&b) {
+            added.push(b);
+        }
+    }
+    let mut removed: Vec<usize> = Vec::new();
+    for &b in prev {
+        if !now.contains(&b) && !removed.contains(&b) {
+            removed.push(b);
+        }
+    }
+    (added, removed)
+}
+
+/// Loaded modules of this process: the true count and the first `MAX_MODULES` bases. No heap allocation for the call.
+fn enum_modules() -> Option<(usize, Vec<usize>)> {
+    let mut mods = [HMODULE::default(); MAX_MODULES];
+    let mut needed = 0u32;
+    // SAFETY: the array is writable for `cb` bytes and `needed` for the call; the pseudo handle is always valid.
+    let r = unsafe {
+        EnumProcessModules(GetCurrentProcess(), mods.as_mut_ptr(), std::mem::size_of_val(&mods) as u32, &mut needed)
+    };
+    if r.is_err() {
+        return None;
+    }
+    let total = needed as usize / std::mem::size_of::<HMODULE>();
+    Some((total, mods.iter().take(total.min(MAX_MODULES)).map(|m| m.0 as usize).collect()))
+}
+
+/// Base name of a loaded module ("?" when it cannot be read).
+fn module_name(base: usize) -> String {
+    let mut buf = [0u16; 260];
+    // SAFETY: the buffer is writable for its length; a stale handle only makes the call fail.
+    let n = unsafe { GetModuleBaseNameW(GetCurrentProcess(), Some(HMODULE(base as *mut _)), &mut buf) } as usize;
+    if n == 0 {
+        "?".to_string()
+    } else {
+        String::from_utf16_lossy(&buf[..n.min(buf.len())])
+    }
+}
+
+/// Logs `RAM modules +a.dll -b.dll` when the module set changed since the last call (the first call is a baseline).
+/// Returns the module count.
+fn log_module_changes() -> Option<usize> {
+    let (total, now) = enum_modules()?;
+    let mut guard = MODULES.lock().unwrap_or_else(|e| e.into_inner());
+    let line = match guard.as_mut() {
+        None => {
+            let names = now.iter().map(|&b| module_name(b)).collect();
+            *guard = Some((now, names));
+            None
+        }
+        Some((prev, names)) => {
+            let (added, removed) = module_delta(prev, &now);
+            if added.is_empty() && removed.is_empty() {
+                None
+            } else {
+                let mut parts: Vec<String> = Vec::with_capacity(added.len() + removed.len());
+                let mut new_names: Vec<String> = Vec::with_capacity(now.len());
+                for &b in &now {
+                    match prev.iter().position(|&p| p == b) {
+                        Some(i) => new_names.push(std::mem::take(&mut names[i])),
+                        None => new_names.push(module_name(b)),
+                    }
+                }
+                for &b in &added {
+                    let i = now.iter().position(|&x| x == b).unwrap_or(0);
+                    parts.push(format!("+{}", new_names[i]));
+                }
+                for &b in &removed {
+                    let i = prev.iter().position(|&x| x == b).unwrap_or(0);
+                    parts.push(format!("-{}", names[i]));
+                }
+                *names = new_names;
+                *prev = now;
+                Some(parts.join(" "))
+            }
+        }
+    };
+    drop(guard);
+    if let Some(l) = line {
+        log!("RAM modules {l}");
+    }
+    Some(total)
+}
 
 /// Snapshot of the process memory counters (bytes).
 struct Counters {
@@ -69,8 +168,9 @@ pub fn log_memory() {
     let (gdi, user) = unsafe {
         (GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS))
     };
+    let modules = log_module_changes().unwrap_or(0);
     log!(
-        "RAM private={} KB  ws={} KB  peak_ws={} KB  handles={handles}  gdi={gdi}  user={user}",
+        "RAM private={} KB  ws={} KB  peak_ws={} KB  handles={handles}  gdi={gdi}  user={user}  modules={modules}",
         c.private / 1024,
         c.working_set / 1024,
         c.peak_working_set / 1024
@@ -150,6 +250,26 @@ pub fn trim(reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_delta_cases() {
+        assert_eq!(module_delta(&[1, 2, 3], &[1, 2, 3]), (vec![], vec![]));
+        assert_eq!(module_delta(&[1, 2, 3], &[1, 3, 4]), (vec![4], vec![2]));
+        // Stable order: each list in the order of its own input.
+        assert_eq!(module_delta(&[9, 5, 7], &[8, 6, 5]), (vec![8, 6], vec![9, 7]));
+        // An empty prev adds everything: the caller treats the first sample as a baseline and logs no names.
+        assert_eq!(module_delta(&[], &[1, 2]), (vec![1, 2], vec![]));
+        // Duplicates count once.
+        assert_eq!(module_delta(&[1, 1], &[2, 2, 1]), (vec![2], vec![]));
+        assert_eq!(module_delta(&[1, 1, 3], &[2]), (vec![2], vec![1, 3]));
+    }
+
+    #[test]
+    fn module_count_is_live() {
+        let (total, bases) = enum_modules().expect("EnumProcessModules");
+        assert!(total >= 3 && bases.len() == total.min(MAX_MODULES));
+        assert!(module_name(bases[0]).to_lowercase().ends_with(".exe"));
+    }
 
     #[test]
     fn hidden_trim_is_remembered() {
