@@ -882,7 +882,7 @@ mod tests {
         let g = layout(M, &src, full - 100, 10_000, 0);
         assert!(!g.column && g.w <= full - 100);
         let th = g.cards[0].thumb.map(|t| t.bottom - t.top).unwrap();
-        assert!(th < THUMB_H && th >= THUMB_MIN_H);
+        assert!((THUMB_MIN_H..THUMB_H).contains(&th));
         // Not even at the minimum height: title-only column, clamped to its limits.
         let narrow = row_width(M, THUMB_MIN_H, &src) - 1;
         let g = layout(M, &src, narrow, 10_000, 10_000);
