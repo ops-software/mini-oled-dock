@@ -132,7 +132,7 @@ Manual updating still works: run `--install` from a downloaded `dock.exe`. Diagn
 
 If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
 
-**Uninstall:** `--uninstall` removes the logon task and the Add/Remove Programs entry and keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). `--uninstall --remove`, which Settings → Apps → Installed apps also runs, stops the dock, restores the taskbar, deletes `%ProgramFiles%\mini-oled-dock` (a file still in use goes at the next restart) and the downloaded updates, and keeps your settings, logs and icons. `--uninstall --remove --purge-data` also deletes `%ProgramData%\mini-oled-dock`. Add `--quiet` to either form for a silent run.
+**Uninstall:** `--uninstall` removes the logon task and the Add/Remove Programs entry and keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). `--uninstall --remove`, which Settings → Apps → Installed apps also runs, stops the dock, restores the taskbar (and stops with an error, deleting nothing, if Explorer did not answer: run `dock.exe --restore`, then uninstall again), deletes `%ProgramFiles%\mini-oled-dock` (a file still in use goes at the next restart) and the downloaded updates, and keeps your settings, logs and icons. `--uninstall --remove --purge-data` also deletes `%ProgramData%\mini-oled-dock`. Add `--quiet` to either form for a silent run.
 
 ## Usage
 
