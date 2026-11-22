@@ -3081,7 +3081,7 @@ fn missing_start_icons<'a>(
     }
     let mut missing: Vec<String> = ids.into_iter().filter(|id| !sent.contains(*id)).map(str::to_string).collect();
     // Pins first (stable sort: the catalog order is kept inside each group).
-    missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
+    crate::tinysort::sort_by_key(&mut missing, |id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
     sent.extend(missing.iter().cloned());
     Some(missing)
 }

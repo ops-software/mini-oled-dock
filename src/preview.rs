@@ -894,7 +894,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 .enumerate()
                 .map(|(i, (n, b))| (n.to_lowercase(), n.to_string(), Some(b.clone()), i < TRAY_BAR))
                 .collect();
-            rows.sort_by_key(|r| r.1.to_lowercase());
+            crate::tinysort::sort_by_key(&mut rows, |r| r.1.to_lowercase());
             crate::popup_tray::preview_new(cells, rows, name == "popup_tray_customize")
         }
         _ => return None,
