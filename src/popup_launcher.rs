@@ -44,15 +44,19 @@ use crate::start_search::{self, AppIndex, Holder, Setting};
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
 /// Height of the empty panel, the field alone (logical px, SPEC 5.2.3).
-const EMPTY_H: i32 = 62;
+const EMPTY_H: i32 = style::FIELD_Y + style::FIELD_H + style::FIELD_Y;
 /// Height of the mode chip (logical px).
-const CHIP_H: i32 = 24;
+const CHIP_H: i32 = 28;
 /// Horizontal padding of the mode chip.
 const CHIP_PAD: i32 = style::S_3;
 /// Gap between the chip and the query.
 const CHIP_GAP: i32 = 8;
 /// Height of the caret (logical px, SPEC 5.3).
-const CARET_H: i32 = 18;
+const CARET_H: i32 = style::FIELD_CARET_H;
+/// The caret of the 38 / 13 field of the Q7 record scene.
+const PAIR_CARET_H: i32 = 18;
+/// Room between the query and the field's right edge.
+const FIELD_PAD_R: i32 = 16;
 /// Distance of the name from the top of a row that has a detail line, and of the detail from the name.
 const NAME_TOP: i32 = 4;
 const DETAIL_GAP: i32 = 2;
@@ -88,7 +92,7 @@ struct Run {
 
 /// The width of each character of `text` as it is drawn (a marker by its display text).
 fn char_widths(s: &Surface, text: &str) -> Vec<i32> {
-    text.chars().map(|c| s.text_width(&unit(c).text, Font::Normal)).collect()
+    text.chars().map(|c| s.text_width(&unit(c).text, Font::Query)).collect()
 }
 
 /// The width of the characters of `text` before the byte offset `at`.
@@ -695,7 +699,7 @@ impl Launcher {
         let w = m.px(self.width);
         let inset = m.px(style::S_4);
         let field =
-            rect_wh(m.px(style::FIELD_X), m.px(style::FIELD_Y), w - 2 * m.px(style::FIELD_X), m.px(style::SEARCH_H));
+            rect_wh(m.px(style::FIELD_X), m.px(style::FIELD_Y), w - 2 * m.px(style::FIELD_X), m.px(style::FIELD_H));
         self.follow_caret(s, &field);
         let rows = self.session.rows();
         let total = rows.len();
@@ -793,7 +797,7 @@ impl Launcher {
         if let Some(p) = self.session.chip() {
             tx += chip_width(s, p) + m.px(CHIP_GAP);
         }
-        (tx, field.right - m.px(style::S_4) - tx)
+        (tx, field.right - m.px(FIELD_PAD_R) - tx)
     }
 
     // ------------------------------------------------------------ painting
@@ -804,8 +808,9 @@ impl Launcher {
         let r = m.px(style::R_S);
         s.fill_rr(f, r, WHITE, if hot { style::FILL_CONTROL_HOT } else { style::FILL_CONTROL });
         s.stroke_rr(f, r, m.px(1).max(1), style::RIM_CONTROL);
-        let gs = m.px(style::ICON_S);
-        let gx = f.left + m.px(16);
+        // The magnifier is centred in the icon column the rows use.
+        let gs = m.px(style::FIELD_ICON);
+        let gx = m.px(style::ICON_X) + (m.px(style::ICON_M) - gs) / 2;
         s.glyph(gx, f.top + (f.bottom - f.top - gs) / 2, gs, style::FG_SECONDARY, &super::popup_startmenu::magnifier);
         let lit = self.foreground;
         let text_alpha = if lit { style::FG_PRIMARY } else { style::FG_TERTIARY };
@@ -828,7 +833,7 @@ impl Launcher {
             }
         }
         let (tx, room) = self.query_room(s, &f);
-        let lh = s.line_height(Font::Normal);
+        let lh = s.line_height(Font::Query);
         let ty = center_y(&f, lh);
         let ch = m.px(CARET_H);
         let cy = f.top + (f.bottom - f.top - ch) / 2;
@@ -837,7 +842,7 @@ impl Launcher {
         s.set_clip(Some(rect_wh(tx, f.top, room.max(0), f.bottom - f.top)));
         if text.is_empty() {
             if self.session.chip().is_none() {
-                s.text(strings::placeholder(), tx, ty, Font::Normal, WHITE, style::FG_TERTIARY);
+                s.text(strings::placeholder(), tx, ty, Font::Query, WHITE, style::FG_TERTIARY);
             }
         } else {
             let field = self.session.field();
@@ -858,7 +863,7 @@ impl Launcher {
                 }
                 at += w;
             }
-            draw_runs(s, &runs, tx + start_x.unwrap_or(0) - scroll, ty, Font::Normal, text_alpha);
+            draw_runs(s, &runs, tx + start_x.unwrap_or(0) - scroll, ty, Font::Query, text_alpha);
         }
         if lit {
             let widths = char_widths(s, text);
@@ -2426,7 +2431,7 @@ impl Content for FieldPair {
                 let ty = center_y(&rc, s.line_height(Font::Normal));
                 s.text(PAIR_QUERY, tx, ty, Font::Normal, WHITE, style::FG_PRIMARY);
                 let cx = tx + s.text_width(PAIR_QUERY, Font::Normal) + m.px(1);
-                let ch = m.px(CARET_H);
+                let ch = m.px(PAIR_CARET_H);
                 s.fill_rr(
                     rect_wh(cx, rc.top + (rc.bottom - rc.top - ch) / 2, m.px(1).max(1), ch),
                     0,
@@ -3464,16 +3469,16 @@ mod tests {
     fn layout_numbers() {
         let s = surface(96);
         let mut empty = scene_launcher(PreviewScene::Empty);
-        assert_eq!(empty.size(&s), (640, 62), "empty: the field alone, 12 + 38 + 12");
+        assert_eq!(empty.size(&s), (640, 72), "empty: the field alone, 12 + 48 + 12");
         let mut l = many_rows();
         let (w, h) = l.size(&s);
         let n = l.session.rows().len();
         assert!(n >= 5, "the fixture gives five rows or more, got {n}");
-        assert_eq!((w, h), (640, 58 + 44 * i32::try_from(n).unwrap() + 12));
+        assert_eq!((w, h), (640, 68 + 44 * i32::try_from(n).unwrap() + 12));
         let g = l.geo.borrow().clone();
-        assert_eq!((g.field.left, g.field.top, g.field.right, g.field.bottom), (12, 12, 628, 50));
+        assert_eq!((g.field.left, g.field.top, g.field.right, g.field.bottom), (12, 12, 628, 60));
         let first = g.rows.first().unwrap();
-        assert_eq!((first.rect.left, first.rect.top, first.rect.right), (12, 58, 628));
+        assert_eq!((first.rect.left, first.rect.top, first.rect.right), (12, 68, 628));
         assert_eq!(first.rect.bottom - first.rect.top, 44);
         let m = s.metrics();
         assert_eq!(m.px(style::NAME_X), 56, "the query and every name share the column at 56");
@@ -3485,15 +3490,15 @@ mod tests {
     }
 
     #[test]
-    fn eight_rows_are_422_high() {
-        // Eight rows of 44 and nothing else: 58 + 8 * 44 + 12.
+    fn eight_rows_are_432_high() {
+        // Eight rows of 44 and nothing else: 68 + 8 * 44 + 12.
         let s = surface(96);
         let mut l = scene_launcher(PreviewScene::Apps);
         l.max_rows = 8;
         let (_, h) = l.size(&s);
         let n = i32::try_from(l.session.rows().len()).unwrap().min(8);
-        assert_eq!(h, 58 + n * 44 + 12);
-        assert_eq!(58 + 8 * 44 + 12, 422);
+        assert_eq!(h, 68 + n * 44 + 12);
+        assert_eq!(68 + 8 * 44 + 12, 432);
     }
 
     /// The DIB of the real run-review scene at 144 DPI, with the rows below the review filled to `rows` at the measured
@@ -3533,10 +3538,10 @@ mod tests {
         let all = l.geo.borrow().rows.len();
         assert!(all >= 4);
         // Room for three rows only.
-        l.limit((i32::MAX, 58 + 3 * 44 + 12));
+        l.limit((i32::MAX, 68 + 3 * 44 + 12));
         let (_, h) = l.size(&s);
         assert_eq!(l.geo.borrow().rows.len(), 3);
-        assert!(h <= 58 + 3 * 44 + 12, "the panel stays inside the limit: {h}");
+        assert!(h <= 68 + 3 * 44 + 12, "the panel stays inside the limit: {h}");
         // The selection stays visible when it moves past them.
         assert!(l.geo.borrow().first == 0);
     }
@@ -3556,7 +3561,7 @@ mod tests {
         // Growing is never held.
         let mut g = scene_launcher(PreviewScene::Empty);
         g.hold_shrink(true);
-        assert_eq!(g.size(&s).1, 62);
+        assert_eq!(g.size(&s).1, 72);
     }
 
     /// A context with nothing in it: a keystroke finds no row.
@@ -3711,7 +3716,7 @@ mod tests {
     fn wheel_scrolls_without_moving_the_selection_back() {
         let s = surface(96);
         let mut l = many_rows();
-        l.limit((i32::MAX, 58 + 3 * 44 + 12));
+        l.limit((i32::MAX, 68 + 3 * 44 + 12));
         l.size(&s);
         let total = l.session.rows().len();
         assert!(total > 3);

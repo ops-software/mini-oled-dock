@@ -61,7 +61,15 @@ pub const BUSY_DELAY: u32 = 300;
 
 pub const FIELD_X: i32 = 12;
 pub const FIELD_Y: i32 = 12;
-pub const LIST_Y: i32 = 58;
+/// The launcher's field (Q7, the 48 / 18 candidate): 48 px high, the query 18 px (`Font::Query`), the magnifier 16 px,
+/// the size of every icon of the rows' glyph style, centred in the icon column of the rows, the caret as tall as the
+/// query's line.
+pub const FIELD_H: i32 = 48;
+pub const FIELD_ICON: i32 = ICON_S;
+pub const FIELD_CARET_H: i32 = 24;
+/// Field bottom to the first row.
+pub const FIELD_LIST_GAP: i32 = 8;
+pub const LIST_Y: i32 = FIELD_Y + FIELD_H + FIELD_LIST_GAP;
 pub const NAME_X: i32 = 56;
 pub const ICON_X: i32 = 24;
 pub const HINT_RIGHT_INSET: i32 = 24;
@@ -83,6 +91,12 @@ mod tests {
         assert_eq!((ROW_COMFORT, ROW_COMPACT, SEARCH_H), (44, 34, 38));
         assert_eq!(OPEN_INDICATOR, 120);
         assert_eq!(ACCENT_ATTENTION, (255, 140, 0));
+    }
+
+    #[test]
+    fn the_field_is_the_48_candidate_and_the_list_follows_it() {
+        assert_eq!((FIELD_H, FIELD_CARET_H, FIELD_ICON), (48, 24, 16));
+        assert_eq!(LIST_Y, FIELD_Y + FIELD_H + 8);
     }
 
     #[test]

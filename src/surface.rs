@@ -12,6 +12,7 @@
 //!
 //! THREADING: UI thread only (GDI objects of the thread).
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
@@ -79,6 +80,8 @@ pub enum Font {
     Title,
     /// 12 px, weight 400: descriptions under the options of the Settings window.
     Caption,
+    /// 18 px, weight 400: the launcher's query (Q7). Made on first use, so surfaces that never draw it do not pay for it.
+    Query,
 }
 
 impl Font {
@@ -90,6 +93,8 @@ impl Font {
             Font::Big => 3,
             Font::Title => 4,
             Font::Caption => 5,
+            // Not in the table: `Surface::face` makes it.
+            Font::Query => 1,
         }
     }
 }
@@ -503,6 +508,8 @@ pub struct Surface {
     gdi: Gdi,
     fonts: [HFONT; 6],
     lhs: [i32; 6],
+    /// The `Font::Query` font and its line height, made by the first `face` call that needs it.
+    query: Cell<Option<(HFONT, i32)>>,
     /// Clipping rectangle (physical px) applied to every write; `None` = the whole DIB.
     clip: Option<RECT>,
 }
@@ -544,7 +551,7 @@ impl Surface {
         let gdi = Gdi::new()?;
         // On error `gdi` is dropped, which deletes the DCs.
         let (fonts, lhs) = build_fonts(gdi.dc_txt(), m)?;
-        Ok(Surface { metrics: m, gdi, fonts, lhs, clip: None })
+        Ok(Surface { metrics: m, gdi, fonts, lhs, query: Cell::new(None), clip: None })
     }
 
     /// Current metrics.
@@ -665,7 +672,7 @@ impl Surface {
             return;
         }
         let w = self.text_width(s, font);
-        let f = (self.fonts[font.idx()], self.lhs[font.idx()]);
+        let f = self.face(font);
         self.gdi.text(&mut cv, s, x, y, f, w, rgb, alpha);
     }
 
@@ -693,12 +700,30 @@ impl Surface {
 
     /// Width in physical px of `s` with `font`.
     pub fn text_width(&self, s: &str, font: Font) -> i32 {
-        self.gdi.text_width(s, self.fonts[font.idx()], self.metrics.px(7))
+        self.gdi.text_width(s, self.face(font).0, self.metrics.px(7))
     }
 
     /// Line height (physical px) of `font`.
     pub fn line_height(&self, font: Font) -> i32 {
-        self.lhs[font.idx()]
+        self.face(font).1
+    }
+
+    /// The GDI font and line height of `font`. `Font::Query` is made on the first call (a failure falls back to
+    /// `Normal`, and is tried again next time).
+    fn face(&self, font: Font) -> (HFONT, i32) {
+        if font == Font::Query {
+            if let Some(q) = self.query.get() {
+                return q;
+            }
+            let dc = self.gdi.dc_txt();
+            if let Ok(f) = create_font(dc, &TEXT_FACES, self.metrics.px(18), 400) {
+                let q = (f, line_height(dc, f));
+                self.query.set(Some(q));
+                return q;
+            }
+        }
+        let i = font.idx();
+        (self.fonts[i], self.lhs[i])
     }
 
     /// `s` truncated with "…" so that `text_width <= max_w`.
@@ -769,6 +794,9 @@ impl Drop for Surface {
     /// Releases the fonts; the DIBs and the DCs are released by the `Gdi` field.
     fn drop(&mut self) {
         delete_fonts(&self.fonts);
+        if let Some((f, _)) = self.query.take() {
+            delete_font(f);
+        }
     }
 }
 
@@ -1037,6 +1065,15 @@ mod tests {
         let c = s.line_height(Font::Caption);
         assert!(c >= s.line_height(Font::Small) && c <= s.line_height(Font::Normal));
         assert!(s.text_width("Appearance", Font::Title) > s.text_width("Appearance", Font::Bold));
+    }
+
+    #[test]
+    fn query_font_is_made_on_first_use_and_is_larger_than_normal() {
+        let s = Surface::new(M).expect("surface");
+        assert!(s.query.get().is_none(), "not made with the surface");
+        assert!(s.line_height(Font::Query) > s.line_height(Font::Normal));
+        assert!(s.query.get().is_some());
+        assert!(s.text_width("calc", Font::Query) > s.text_width("calc", Font::Normal));
     }
 
     #[test]
