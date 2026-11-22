@@ -224,6 +224,10 @@ pub enum ShellRequest {
     /// `cmd.exe` from `system_dir`.
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     LaunchCommand { line: String, file: Range<usize>, console: bool },
+    /// Show a result's file or folder selected in File Explorer (`explorer.exe /select,"<path>"` from
+    /// the Windows folder), in one shell call: the path is never looked at on disk.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    RevealPath { path: String },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -263,6 +267,7 @@ pub enum LaunchKind {
     Path,
     Command,
     Admin,
+    Reveal,
 }
 
 /// Shell thread handle; passed to `stop`.
@@ -564,7 +569,8 @@ impl Shell {
             // launcher arms: begin
             req @ (ShellRequest::OpenPath { .. }
             | ShellRequest::RunAsTyped { .. }
-            | ShellRequest::LaunchCommand { .. }) => launcher_launch(self.ui, req),
+            | ShellRequest::LaunchCommand { .. }
+            | ShellRequest::RevealPath { .. }) => launcher_launch(self.ui, req),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -1680,6 +1686,7 @@ fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
         ShellRequest::OpenPath { .. } => Some(LaunchKind::Path),
         ShellRequest::RunAsTyped { .. } => Some(LaunchKind::Admin),
         ShellRequest::LaunchCommand { .. } => Some(LaunchKind::Command),
+        ShellRequest::RevealPath { .. } => Some(LaunchKind::Reveal),
         _ => None,
     }
 }
@@ -1715,6 +1722,14 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             let r = launch_command_with(&line, file, console, &sys, &mut exec);
             if r.is_ok() {
                 log!("shell: LaunchCommand ({} chars) via the desktop shell", line.chars().count());
+            }
+            r
+        }
+        ShellRequest::RevealPath { path } => {
+            let windows = system_dir().and_then(|s| s.parent().map(Path::to_path_buf)).unwrap_or_default();
+            let r = reveal_path_with(&path, &windows, &mut exec);
+            if r.is_ok() {
+                log!("shell: RevealPath ({} chars) via the desktop shell", path.chars().count());
             }
             r
         }
@@ -1805,6 +1820,21 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
 fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), String> {
     let (file, args) = command_parts(line, file, console, sys).map_err(|e| format!("refused: {e}"))?;
     exec(&file, args.as_deref(), None, Verb::Open)
+}
+
+/// `RevealPath`: refuses an empty path or one with a double quote (it would end the `/select`
+/// argument) or a control character (as `app_target_path`), then exactly one shell call:
+/// `<windows>\explorer.exe /select,"<path>"`. Not through `launch`, whose `is_dir` would touch the path.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn reveal_path_with(path: &str, windows: &Path, exec: Exec) -> Result<(), String> {
+    if path.trim().is_empty() || path.contains('"') || path.chars().any(char::is_control) {
+        return Err("refused: an empty path, a double quote or a control character".into());
+    }
+    if !windows.is_absolute() {
+        return Err("no Windows folder".into());
+    }
+    let explorer = windows.join("explorer.exe");
+    exec(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")), None, Verb::Open)
 }
 
 // launcher requests: end
@@ -2309,5 +2339,31 @@ mod tests {
         calls.clear();
         assert!(launch_command_with(&line, file, true, Path::new(""), &mut recorder(&mut calls, true)).is_err());
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn reveal_path_refuses_quotes() {
+        let windows = Path::new("C:\\Windows");
+        let mut calls = Vec::new();
+        for bad in ["", "C:\\a\".txt", "C:\\a.txt\" /e,C:\\", "C:\\a\nb", "C:\\a\u{9F}b"] {
+            assert!(reveal_path_with(bad, windows, &mut recorder(&mut calls, true)).is_err(), "{bad:?}");
+        }
+        assert!(reveal_path_with("C:\\a.txt", Path::new(""), &mut recorder(&mut calls, true)).is_err());
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn reveal_path_is_one_shell_call() {
+        let mut calls = Vec::new();
+        assert!(reveal_path_with("C:\\x y\\a.txt", Path::new("C:\\Windows"), &mut recorder(&mut calls, true)).is_ok());
+        assert_eq!(
+            calls,
+            [(
+                "C:\\Windows\\explorer.exe".to_string(),
+                Some("/select,\"C:\\x y\\a.txt\"".to_string()),
+                None,
+                Verb::Open
+            )]
+        );
     }
 }
