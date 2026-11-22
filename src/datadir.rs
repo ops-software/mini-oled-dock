@@ -15,6 +15,9 @@
 //!    (`write_atomic`), so the ACE is never lost and the replace is atomic.
 //!  * `<root>\config.json.bak`, `dock.log`, `dock.log.1`, `taskbar-state`, `cache\`: admin-only
 //!    write (they inherit the root DACL).
+//!  * `<root>\cache\<SID>\`: the launcher's history of the shell user with that SID
+//!    (`user_cache_dir`): its own protected DACL, SYSTEM and Administrators full control, that user
+//!    read only, no ACE for BUILTIN\Users (who can read the rest of the root).
 //!  * `<root>\icons\`: extra ACEs let the token user add files (and change the files inside). Since
 //!    the user can create entries there, custom icons are opened WITHOUT following reparse points,
 //!    must be single-link regular files whose final path is exactly `<icons>\<name>`, and are decoded
@@ -115,6 +118,12 @@ const MASK_WRITE_LIKE: u32 =
 /// SDDL of the root: owner Administrators, protected DACL, inheritable to files and subfolders.
 fn root_sddl() -> String {
     format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x{MASK_READ_EXECUTE:x};;;BU)")
+}
+
+/// SDDL of `cache\<user>` (the launcher's history): SYSTEM and Administrators full control, `user` read
+/// only, inherited by the files; no BUILTIN\Users ACE, so no other account reads it.
+fn user_cache_sddl(user: &str) -> Option<String> {
+    is_sid_string(user).then(|| format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;{user})"))
 }
 
 /// SDDL of `config.json`: like the root (not inheritable: it is a file) plus read + write data for `user`.
@@ -277,6 +286,24 @@ pub fn config_path() -> Option<PathBuf> {
 /// `<root>\cache` (icon PNG cache), only if verified.
 pub fn cache_dir() -> Option<PathBuf> {
     root_ref().filter(|r| r.cache_ok).map(|r| r.path.join(CACHE_NAME))
+}
+
+/// `<root>\cache\<sid>`, the launcher's history folder of the shell user `sid`, created or checked and
+/// re-secured with `user_cache_sddl` (elevated, verified root only). Anything that is not a SID string is
+/// refused before it reaches a path or an SDDL string.
+#[allow(dead_code)] // the shell thread's launcher state files (next commit)
+pub fn user_cache_dir(sid: &str) -> Result<PathBuf, String> {
+    let sddl = user_cache_sddl(sid).ok_or_else(|| "not a SID".to_string())?;
+    let r = writable_root()?;
+    if !r.cache_ok {
+        return Err("no verified cache folder".into());
+    }
+    let path = r.path.join(CACHE_NAME).join(sid);
+    let mut notes = Vec::new();
+    match ensure_subdir(&path, Some(&sddl), true, &mut notes) {
+        Some(_) => Ok(path),
+        None => Err(notes.join("; ")),
+    }
 }
 
 /// `<root>\icons` (the user's custom PNGs), only if verified.
@@ -1195,6 +1222,22 @@ mod tests {
         assert!(config_sddl("S-1-5)(A;;FA;;;WD").is_none());
         assert!(icons_sddl("WD").is_none());
         assert!(config_sddl("").is_none());
+    }
+
+    #[test]
+    fn user_cache_sddl_has_no_users_ace() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let s = user_cache_sddl(sid).unwrap_or_default();
+        assert_eq!(s, "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;S-1-5-21-1-2-3-1001)");
+        assert!(!s.contains(";BU)") && !s.contains("S-1-5-32-545"), "no BUILTIN\\Users ACE: {s}");
+        assert!(SecDesc::from_sddl(&s).is_ok(), "{s}");
+        // Neither an SDDL injection nor a path is ever made of something that is not a SID.
+        for bad in ["S-1-5)(A;OICI;FA;;;WD", "WD", "", "S-1-", "..", "S-1-5-21-1\\..\\x", "s-1-5-18"] {
+            assert!(user_cache_sddl(bad).is_none(), "{bad:?}");
+            assert!(user_cache_dir(bad).is_err(), "{bad:?}");
+        }
+        // Unit tests never call init(): nothing is created.
+        assert!(user_cache_dir(sid).is_err());
     }
 
     #[test]
