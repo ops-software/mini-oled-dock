@@ -7,6 +7,7 @@ use super::catalog::CatApp;
 use super::commands::{self, Command, COMMANDS};
 use super::frecency::Frecency;
 use super::gesture::GESTURE_TIME_MATCHES;
+use super::index::{Hit, IndexView};
 use super::model::{
     Batch, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, NumberStyle, Payload, ProviderId,
     ProviderMask, Query, Score, SettingRow, Verb, VerbSet, WindowRow,
@@ -51,6 +52,10 @@ impl Default for LauncherOpts {
 pub struct Context<'a> {
     pub apps: &'a [CatApp],
     pub settings: &'a [SettingRow],
+    /// The keyword dictionaries of `apps` and `settings` (L3 T9). A dictionary built over another number of entries is not
+    /// used: the provider scans the keywords of each candidate instead (the reference the dictionary must equal).
+    pub apps_ix: Option<IndexView<'a>>,
+    pub settings_ix: Option<IndexView<'a>>,
     /// One per window, most recently used first.
     pub windows: &'a [WindowRow],
     /// Run history, newest first.
@@ -199,7 +204,7 @@ thread_local! {
 }
 
 /// A provider's time budget per keystroke (5.4.1), counted in every build and never asserted (house rule 8).
-pub const BUDGET_US: u64 = 2_000;
+pub const BUDGET_US: u64 = 1_000;
 
 /// Overruns of the budget in a row, one counter per provider.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -305,6 +310,32 @@ fn spend(spent: &mut [u64; 11], ran: &mut [bool; 11], id: ProviderId, since: Ins
 struct Scratch {
     name: Indexed,
     title: Indexed,
+    /// The dictionary's hidden matches of the query (L3 T9), sorted by entry.
+    hidden: Vec<Hit>,
+}
+
+/// The dictionary answer for `q` over a catalogue of `len` entries, into `out`; false (and `out` empty) when there is no
+/// dictionary of that catalogue: the caller scans.
+fn hidden_matches(ix: Option<IndexView>, len: usize, q: &str, out: &mut Vec<Hit>) -> bool {
+    out.clear();
+    match ix.filter(|v| v.entries() == len) {
+        Some(v) => {
+            let q = q.trim();
+            v.hidden(q, q.chars().count(), out);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The hidden match of entry `i` in `hits` (sorted by entry); `cur` only moves forward, so a pass over the entries in order
+/// costs one step per hit.
+fn hidden_of(hits: &[Hit], cur: &mut usize, i: usize) -> Option<(u8, u32)> {
+    let i = u32::try_from(i).unwrap_or(u32::MAX);
+    while hits.get(*cur).is_some_and(|h| h.0 < i) {
+        *cur += 1;
+    }
+    hits.get(*cur).filter(|h| h.0 == i).map(|h| (h.1, h.2))
 }
 
 /// Runs one provider; returns how many candidates it matched by tiers (0 for the providers that do not rank).
@@ -317,7 +348,7 @@ fn run_one(id: ProviderId, q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK,
         ProviderId::Apps => apps(q, cx, fuzzy, top, s),
         ProviderId::Windows => windows(q, cx, fuzzy, top, s),
         ProviderId::Commands => commands(q, cx, fuzzy, top, s),
-        ProviderId::Settings => settings(q, cx, fuzzy, top),
+        ProviderId::Settings => settings(q, cx, fuzzy, top, s),
         ProviderId::Run => {
             run(q, cx, top);
             0
@@ -440,17 +471,35 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
     };
     let mut hits = 0;
     let mut best = Vec::with_capacity(top.cap);
+    // The hidden tiers come from the dictionary.
+    // With a cap at the names there is nothing hidden to read: those tiers could not pass the cap.
+    let names_only = !fuzzy && max_tier != u8::MAX;
+    let indexed = names_only || !fuzzy && hidden_matches(cx.apps_ix, cx.apps.len(), text, &mut s.hidden);
+    let mut at = 0;
     for (i, app) in cx.apps.iter().enumerate() {
         let c = app.cand();
-        let Some(tier) = tier_of(&c, text, fuzzy).filter(|t| *t <= max_tier) else { continue };
+        let hid = if indexed && !names_only { hidden_of(&s.hidden, &mut at, i) } else { None };
+        let tier = match (fuzzy, indexed) {
+            (true, _) => rank::match_fuzzy(&c, text),
+            (false, true) => rank::match_tiers_with(&c, text, hid),
+            (false, false) => rank::match_tiers(&c, text),
+        };
+        let Some(tier) = tier.filter(|t| *t <= max_tier) else { continue };
         hits += 1;
+        let score_of = |running: bool| {
+            if indexed {
+                rank::score_hidden(&c, tier, running, KIND_APP, hid)
+            } else {
+                rank::score_for(&c, text, tier, running, KIND_APP)
+            }
+        };
         // Look for the running window only when the row could stay: running is the better of the two scores.
         let learned = learned_boost(cx, ProviderId::Apps, &app.id);
-        if !top.accepts(&Score { learned, ..rank::score_for(&c, text, tier, true, KIND_APP) }) {
+        if !top.accepts(&Score { learned, ..score_of(true) }) {
             continue;
         }
         let win = cx.windows.iter().position(|w| same_program(app, w));
-        let score = Score { learned, ..rank::score_for(&c, text, tier, win.is_some(), KIND_APP) };
+        let score = Score { learned, ..score_of(win.is_some()) };
         if top.accepts(&score) {
             keep_best(&mut best, top.cap, score, &app.name, (i, win));
         }
@@ -640,18 +689,31 @@ fn registry(q: &Query, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
 }
 
 /// The settings catalogue, already folded and split at load: nothing is folded per candidate.
-fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK) -> usize {
+fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
     let mut hits = 0;
     let mut best = Vec::with_capacity(top.cap);
     // Mixed mode: the rows only a hidden word matched are the best HIDDEN_SETTINGS_CAP of their own (L3 T6); "$" has no cap.
     let capped = q.mode == Mode::Mixed;
     let mut hidden = Vec::with_capacity(if capped { HIDDEN_SETTINGS_CAP } else { 0 });
-    for row in cx.settings {
+    let indexed = !fuzzy && hidden_matches(cx.settings_ix, cx.settings.len(), &q.folded, &mut s.hidden);
+    let mut at = 0;
+    for (i, row) in cx.settings.iter().enumerate() {
         let c = row.cand();
-        let Some(tier) = tier_of(&c, &q.folded, fuzzy) else { continue };
+        let hid = if indexed { hidden_of(&s.hidden, &mut at, i) } else { None };
+        let tier = match (fuzzy, indexed) {
+            (true, _) => rank::match_fuzzy(&c, &q.folded),
+            (false, true) => rank::match_tiers_with(&c, &q.folded, hid),
+            (false, false) => rank::match_tiers(&c, &q.folded),
+        };
+        let Some(tier) = tier else { continue };
         hits += 1;
         let learned = learned_boost(cx, ProviderId::Settings, &row.name);
-        let score = Score { learned, ..rank::score_for(&c, &q.folded, tier, false, KIND_SETTING) };
+        let base = if indexed {
+            rank::score_hidden(&c, tier, false, KIND_SETTING, hid)
+        } else {
+            rank::score_for(&c, &q.folded, tier, false, KIND_SETTING)
+        };
+        let score = Score { learned, ..base };
         if capped && matches!(tier, rank::T_SYN_EQ | rank::T_SYN_PREFIX | rank::T_BAG_EQ) {
             keep_best(&mut hidden, HIDDEN_SETTINGS_CAP, score, &row.name, row);
         } else if top.accepts(&score) {
@@ -1081,6 +1143,8 @@ impl Results {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub(crate) mod tests {
     use super::*;
+    use crate::launcher::catalog;
+    use crate::launcher::index::IndexBuf;
 
     pub(crate) fn item(title: &str, score: Score) -> Item {
         Item {
@@ -1155,9 +1219,15 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn cx(&self) -> Context<'_> {
+            // The tests change `apps` and `settings` between keystrokes: the dictionaries are rebuilt (and leaked: a test
+            // process is short) for every context, so they always match the rows.
+            let apps_ix: &'static IndexBuf = Box::leak(Box::new(catalog::index_apps(&self.apps)));
+            let settings_ix: &'static IndexBuf = Box::leak(Box::new(catalog::index_settings(&self.settings)));
             Context {
                 apps: &self.apps,
                 settings: &self.settings,
+                apps_ix: Some(apps_ix.view()),
+                settings_ix: Some(settings_ix.view()),
                 windows: &self.windows,
                 history: &self.history,
                 opts: &self.opts,
@@ -1761,6 +1831,8 @@ mod bench {
     //! tier checks per query: they count, they never time) and, in the CI bench job only (release, `--ignored`), the
     //! time of the same queries against a reference workload of the same process.
     use super::*;
+    use crate::launcher::catalog;
+    use crate::launcher::index::IndexBuf;
     use crate::launcher::rank::TIER_CHECKS;
     use crate::launcher::testkit::{allocations_during, XorShift};
     use std::time::Instant;
@@ -1814,6 +1886,8 @@ mod bench {
         settings: Vec<SettingRow>,
         windows: Vec<WindowRow>,
         history: Vec<Box<str>>,
+        apps_ix: IndexBuf,
+        settings_ix: IndexBuf,
         opts: LauncherOpts,
         /// A full 1,000-entry state: the keystroke reads it for every matched candidate.
         learned: Frecency,
@@ -1874,13 +1948,16 @@ mod bench {
             for row in settings.iter().step_by(3).take(400) {
                 learned.pick(ItemKey::of(ProviderId::Settings, &row.name), 1_780_000_000, false);
             }
-            Big { apps, settings, windows, history, opts: LauncherOpts::default(), learned }
+            let (apps_ix, settings_ix) = (catalog::index_apps(&apps), catalog::index_settings(&settings));
+            Big { apps, settings, windows, history, apps_ix, settings_ix, opts: LauncherOpts::default(), learned }
         }
 
         fn cx(&self) -> Context<'_> {
             Context {
                 apps: &self.apps,
                 settings: &self.settings,
+                apps_ix: Some(self.apps_ix.view()),
+                settings_ix: Some(self.settings_ix.view()),
                 windows: &self.windows,
                 history: &self.history,
                 opts: &self.opts,
@@ -1958,6 +2035,20 @@ mod bench {
         }
         println!("most OSA cells in one query: {} ({:?})", worst.0, worst.1);
         assert!(worst.0 <= MAX_OSA_CELLS, "{} OSA cells for {:?}", worst.0, worst.1);
+    }
+
+    /// KEY-2: no keyword line is read on the key path: the hidden tiers come from the dictionaries.
+    #[test]
+    fn no_keyword_parsed_per_key() {
+        use crate::start_search::KEY_SCANS;
+        let big = Big::new(1);
+        let cx = big.cx();
+        for raw in queries() {
+            let q = query::parse_query(&raw, &big.opts.prefixes, NUM, 1);
+            let before = KEY_SCANS.with(std::cell::Cell::get);
+            let _ = query_all(&q, &cx, &mut Budget::default());
+            assert_eq!(KEY_SCANS.with(std::cell::Cell::get), before, "{raw:?} read keyword text");
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 use super::catalog::{self, CatApp};
 use super::frecency::Frecency;
+use super::index::IndexBuf;
 use super::keywords;
 use super::model::{Item, Kind, NumberStyle, ProviderId, SettingRow};
 use super::providers::{self, web_search_key, Budget, Context, LauncherOpts, Results};
@@ -142,6 +143,8 @@ const SETTINGS_IT: &[SetRow] = &[
 struct World {
     apps: Vec<CatApp>,
     settings: Vec<SettingRow>,
+    apps_ix: IndexBuf,
+    settings_ix: IndexBuf,
     opts: LauncherOpts,
     learned: Frecency,
     num: NumberStyle,
@@ -182,9 +185,12 @@ impl World {
                 }
             })
             .collect();
+        let settings = catalog::fold_settings(&held);
         World {
+            apps_ix: catalog::index_apps(&apps),
+            settings_ix: catalog::index_settings(&settings),
             apps,
-            settings: catalog::fold_settings(&held),
+            settings,
             opts: LauncherOpts::default(),
             learned: Frecency::new(),
             num: if italian { IT_NUM } else { EN_NUM },
@@ -195,6 +201,8 @@ impl World {
         Context {
             apps: &self.apps,
             settings: &self.settings,
+            apps_ix: Some(self.apps_ix.view()),
+            settings_ix: Some(self.settings_ix.view()),
             windows: &[],
             history: &[],
             opts: &self.opts,

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use super::index::IndexBuf;
 use super::keywords;
 use super::model::SettingRow;
 use super::rank::{self, Cand, Indexed};
@@ -152,6 +153,16 @@ pub fn fold_settings(list: &[Setting]) -> Vec<SettingRow> {
         .enumerate()
         .map(|(i, s)| SettingRow::new(u32::try_from(i).unwrap_or(u32::MAX), &s.name, fold_keys(&s.keys), s.rank))
         .collect()
+}
+
+/// The keyword dictionary of the apps (L3 T9), built when the catalogue arrives.
+pub fn index_apps(apps: &[CatApp]) -> IndexBuf {
+    IndexBuf::build(apps.iter().enumerate().map(|(i, a)| (u32::try_from(i).unwrap_or(u32::MAX), a.cand())))
+}
+
+/// The keyword dictionary of the settings rows (L3 T9), built when the rows are folded.
+pub fn index_settings(rows: &[SettingRow]) -> IndexBuf {
+    IndexBuf::build(rows.iter().enumerate().map(|(i, r)| (u32::try_from(i).unwrap_or(u32::MAX), r.cand())))
 }
 
 /// Icons kept between opens (at most `ICON_CACHE_CAP`), the least recently used dropped first.

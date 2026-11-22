@@ -130,14 +130,20 @@ impl Cand<'_> {
 /// The score of a match of `tier`. In the hidden tiers (4, 6, 7) the synonym's penalty orders the rows before the kind:
 /// `kind` is 0 and `rank` the penalty. Elsewhere it is `Cand::score` (5.4.1's order).
 pub fn score_for(c: &Cand, q: &str, tier: u8, running: bool, kind: u8) -> Score {
-    let mut s = c.score(tier, running, kind);
     if matches!(tier, T_SYN_EQ | T_SYN_PREFIX | T_BAG_EQ) {
         let q = q.trim();
-        if let Some((t, penalty)) = hidden_best(c, q, q.chars().count()) {
-            if t == tier {
-                s.kind = 0;
-                s.rank = penalty;
-            }
+        return score_hidden(c, tier, running, kind, hidden_best(c, q, q.chars().count()));
+    }
+    c.score(tier, running, kind)
+}
+
+/// `score_for` when the hidden match is already known (the keyword dictionary's answer, L3 T9): nothing is scanned.
+pub fn score_hidden(c: &Cand, tier: u8, running: bool, kind: u8, hidden: Option<(u8, u32)>) -> Score {
+    let mut s = c.score(tier, running, kind);
+    if let Some((t, penalty)) = hidden {
+        if t == tier && matches!(tier, T_SYN_EQ | T_SYN_PREFIX | T_BAG_EQ) {
+            s.kind = 0;
+            s.rank = penalty;
         }
     }
     s
@@ -156,7 +162,17 @@ pub fn match_tiers(c: &Cand, q: &str) -> Option<u8> {
     if q.is_empty() {
         return None;
     }
-    tiers(c, q)
+    tiers_by(c, q, |chars| hidden_best(c, q, chars))
+}
+
+/// `match_tiers` when the hidden match of the candidate is already known (the keyword dictionary's answer, L3 T9): the
+/// same stages, the same answers, no keyword text read.
+pub fn match_tiers_with(c: &Cand, q: &str, hidden: Option<(u8, u32)>) -> Option<u8> {
+    let q = q.trim();
+    if q.is_empty() {
+        return None;
+    }
+    tiers_by(c, q, |_| hidden)
 }
 
 /// Counts one stage of `tiers` (name, initials, hidden word, substring): at most 4 per candidate (the bench's linear
@@ -281,7 +297,7 @@ pub fn name_tier(c: &Cand, q: &str) -> Option<u8> {
 
 /// `match_tiers` for a trimmed query that is not empty: a name (0-2), the initials (3), a curated synonym equal to the
 /// query (4), every word inside the shown name (5), then the other hidden word (6 or 7). Hidden words never beat a name.
-fn tiers(c: &Cand, q: &str) -> Option<u8> {
+fn tiers_by(c: &Cand, q: &str, hidden: impl FnOnce(usize) -> Option<(u8, u32)>) -> Option<u8> {
     stage();
     if let Some(t) = name_tier(c, q) {
         return Some(t);
@@ -292,7 +308,7 @@ fn tiers(c: &Cand, q: &str) -> Option<u8> {
         return Some(T_INITIALS);
     }
     stage();
-    let hidden = hidden_best(c, q, chars).map(|(t, _)| t);
+    let hidden = hidden(chars).map(|(t, _)| t);
     if hidden == Some(T_SYN_EQ) {
         return hidden;
     }

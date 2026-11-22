@@ -25,6 +25,7 @@ use crate::launcher::field::KeyEvent;
 use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::history;
+use crate::launcher::index::IndexBuf;
 use crate::launcher::model::{
     Batch, Choice, CommandId, GlyphId, IconRef, Item, ItemKey, KeyChord, Kind, Mode, Mods, NumberStyle, Payload,
     ProviderId, ProviderMask, SettingRow, Verb, WindowRow,
@@ -1812,16 +1813,18 @@ pub(crate) fn on_catalog(list: &[StartApp], index: Option<&AppIndex>) {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Catalog);
     let apps = catalog::ingest(list, index);
-    let n = apps.len();
+    let apps_ix = catalog::index_apps(&apps);
+    let (n, bytes) = (apps.len(), apps_ix.bytes());
     let now = RealSys.now_ms();
     if with_ctrl(|c| {
         c.apps = apps;
+        c.apps_ix = apps_ix;
         c.listed_at_ms = now.max(1);
         c.listing_since = None;
     })
     .is_some()
     {
-        log!("launcher: catalogue of {n} apps");
+        log!("launcher: catalogue of {n} apps, keyword index {bytes} B");
     }
 }
 
@@ -1841,8 +1844,10 @@ fn fold_held_settings() {
         return;
     }
     let rows = catalog::fold_settings(&list);
+    let rows_ix = catalog::index_settings(&rows);
     with_ctrl(|c| {
         c.settings = rows;
+        c.settings_ix = rows_ix;
         c.setting_list = list;
     });
 }
@@ -1963,6 +1968,7 @@ fn release_resident() {
     }
     let _ = with_ctrl(|c| {
         c.settings = Vec::new();
+        c.settings_ix = IndexBuf::default();
         c.setting_list = Arc::default();
         c.windows = Vec::new();
         c.failed_query = None;
@@ -2264,6 +2270,9 @@ struct Ctrl {
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
     apps: Vec<CatApp>,
     settings: Vec<SettingRow>,
+    /// The keyword dictionaries of `apps` and `settings` (L3 T9), built where they are.
+    apps_ix: IndexBuf,
+    settings_ix: IndexBuf,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
     /// What was picked (L1b-3): read by every keystroke, written 2 s after a close that changed it.
@@ -2354,6 +2363,8 @@ impl Ctrl {
             num: NumberStyle { decimal: '.', group: ',' },
             apps: Vec::new(),
             settings: Vec::new(),
+            apps_ix: IndexBuf::default(),
+            settings_ix: IndexBuf::default(),
             windows: Vec::new(),
             history: Vec::new(),
             frecency: Frecency::new(),
@@ -2435,6 +2446,8 @@ impl Ctrl {
         Context {
             apps: &self.apps,
             settings: &self.settings,
+            apps_ix: Some(self.apps_ix.view()),
+            settings_ix: Some(self.settings_ix.view()),
             windows: &self.windows,
             history: &self.history,
             opts: &self.opts,
@@ -3053,6 +3066,8 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     let cx = Context {
         apps: &apps,
         settings: &settings,
+        apps_ix: None,
+        settings_ix: None,
         windows: &windows,
         history: &history,
         opts: &opts,
@@ -4569,6 +4584,8 @@ mod tests {
         crate::launcher::providers::Context {
             apps: &[],
             settings: &[],
+            apps_ix: None,
+            settings_ix: None,
             windows: &[],
             history: &[],
             opts,

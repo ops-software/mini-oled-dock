@@ -68,6 +68,12 @@ const SETTINGS_APP: &str =
 pub(crate) struct Keys(String);
 
 #[cfg(test)]
+thread_local! {
+    /// The non-empty keyword lists read through `Keys::raw` or `Keys::iter` on this thread (KEY-2: none per key).
+    pub(crate) static KEY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 static NO_KEYS: Keys = Keys(String::new());
 
 impl Keys {
@@ -92,11 +98,19 @@ impl Keys {
     /// The keywords and their penalty texts, nothing parsed: the launcher parses a penalty only for a keyword that
     /// matched.
     pub(crate) fn raw(&self) -> impl Iterator<Item = (&str, &str)> {
+        #[cfg(test)]
+        if !self.0.is_empty() {
+            KEY_SCANS.with(|n| n.set(n.get() + 1));
+        }
         self.0.lines().filter_map(|l| l.rsplit_once('\t'))
     }
 
     /// The keywords and their penalties, in the order they were added.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, u32)> {
+        #[cfg(test)]
+        if !self.0.is_empty() {
+            KEY_SCANS.with(|n| n.set(n.get() + 1));
+        }
         self.0.lines().filter_map(|l| {
             let (key, penalty) = l.rsplit_once('\t')?;
             Some((key, penalty.parse().ok()?))

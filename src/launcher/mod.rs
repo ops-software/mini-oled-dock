@@ -8,6 +8,7 @@ pub mod field;
 pub mod frecency;
 pub mod gesture;
 pub mod history;
+pub mod index;
 pub mod keywords;
 pub mod model;
 pub mod powertoys;
