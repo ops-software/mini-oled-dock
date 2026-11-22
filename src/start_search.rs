@@ -141,7 +141,8 @@ impl Keys {
     /// The same keywords sorted, each once with its best penalty, in exactly the memory they need.
     pub(crate) fn tidy(&self) -> Keys {
         let mut all: Vec<(&str, u32)> = self.iter().collect();
-        all.sort();
+        // whole tuples: equal ones are the same, so an unstable sort gives the same list
+        all.sort_unstable();
         all.dedup_by(|later, first| later.0 == first.0);
         let mut out = Keys(String::with_capacity(self.0.len()));
         for (key, penalty) in all {
@@ -1138,7 +1139,8 @@ fn catalog_key(dir: &Path) -> Option<String> {
             Some((e.file_name().to_string_lossy().to_lowercase(), m.len(), t))
         })
         .collect();
-    files.sort();
+    // whole tuples: equal ones are the same, so an unstable sort gives the same list
+    files.sort_unstable();
     // SAFETY: no arguments, no preconditions.
     let lang = unsafe { GetUserDefaultUILanguage() };
     catalog_key_of(&dock_identity(), &windows_build(), lang, &files)

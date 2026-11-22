@@ -192,7 +192,8 @@ impl Frecency {
     /// The bytes of the file, the most recent pick first (a stable order, so an unchanged state writes the same bytes).
     pub fn render(&self) -> Vec<u8> {
         let mut rows: Vec<&Entry> = self.entries.iter().collect();
-        rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        // the keys are unique: the order is total, so an unstable sort gives the same bytes
+        rows.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
         let mut s = String::with_capacity(HEADER.len().saturating_add(1).saturating_add(rows.len().saturating_mul(34)));
         s.push_str(HEADER);
         s.push('\n');

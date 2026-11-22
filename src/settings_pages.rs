@@ -1235,8 +1235,10 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     ));
     v.push(header(tr("Prefixes", "Prefissi"), None));
     // The defaults in their table order, then the owner's own.
-    let mut keys: Vec<&str> = c.launcher.prefixes.keys().map(String::as_str).collect();
-    keys.sort_by_key(|k| config::LAUNCHER_PREFIXES.iter().position(|(p, _)| p == k).unwrap_or(usize::MAX));
+    let own = |k: &&str| !config::LAUNCHER_PREFIXES.iter().any(|(p, _)| p == k);
+    let mut keys: Vec<&str> =
+        config::LAUNCHER_PREFIXES.iter().map(|(p, _)| *p).filter(|p| c.launcher.prefixes.contains_key(*p)).collect();
+    keys.extend(c.launcher.prefixes.keys().map(String::as_str).filter(own));
     let table = keys.iter().map(|p| p.trim_end()).collect::<Vec<_>>().join("  ");
     v.push(row(
         glyphs::text_shape,
