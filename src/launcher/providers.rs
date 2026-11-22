@@ -864,7 +864,7 @@ fn run(q: &Query, cx: &Context, top: &mut TopK) {
             }
         }
         Some(Implicit::Path) => {
-            let dir = text.ends_with(['\\', '/']);
+            let dir = names_folder(text);
             let (kind, class, glyph) = match (dir, file_class(text)) {
                 (true, _) => (Kind::Folder, FileClass::Other, GlyphId::Folder),
                 (false, FileClass::Executable) => (Kind::File, FileClass::Executable, GlyphId::Executable),
@@ -886,6 +886,19 @@ fn run(q: &Query, cx: &Context, top: &mut TopK) {
         }
         Some(Implicit::Url) | None => {}
     }
+}
+
+/// A typed path names a folder when it ends in a separator or its last part has no dot (`C:\Windows`, `shell:startup`).
+/// Syntax only: no file-system call (5.4.9). A settings URI is never a folder.
+pub fn names_folder(path: &str) -> bool {
+    if path.ends_with(['\\', '/']) {
+        return true;
+    }
+    if path.get(..12).is_some_and(|p| p.eq_ignore_ascii_case("ms-settings:")) {
+        return false;
+    }
+    let name = path.rsplit(['\\', '/', ':']).next().unwrap_or(path);
+    !name.is_empty() && !name.contains('.')
 }
 
 // ---- web
@@ -1806,6 +1819,15 @@ pub(crate) mod tests {
         let exe = &fx.rows("c:\\tools\\setup.EXE")[0];
         assert!(!exe.verbs.has(Verb::Open), "executables open only after live check 6");
         assert_eq!(fx.rows("C:\\tools\\")[0].kind, Kind::Folder);
+        // A typed folder has no dot in its last part: the folder glyph, by syntax alone (5.4.9).
+        for typed in ["C:\\Windows", "\\\\srv\\share", "shell:startup"] {
+            let row = &fx.rows(typed)[0];
+            assert_eq!((row.kind, &row.icon), (Kind::Folder, &IconRef::Glyph(GlyphId::Folder)), "{typed}");
+            assert!(matches!(&row.payload, Payload::Path { dir: true, .. }), "{typed}");
+        }
+        let settings_uri = &fx.rows("ms-settings:display")[0];
+        assert_eq!(settings_uri.kind, Kind::File, "a settings URI is not a folder");
+        assert!(names_folder("C:\\tools\\") && !names_folder("C:\\tools\\setup.exe") && !names_folder("ms-settings:"));
         let url = &fx.rows("www.example.com")[0];
         assert_eq!((url.kind, url.payload.clone()), (Kind::Web, Payload::Url("https://www.example.com".into())));
         assert!(fx.rows(":").iter().any(|r| r.payload == Payload::Command(CommandId::Registry)));
