@@ -278,18 +278,19 @@ fn appbar_shell(msg: u32, hwnd: HWND, lparam: u32) -> usize {
 }
 
 fn get_state(tray: HWND) -> u32 {
-    try_get_state(tray).unwrap_or(0)
+    try_get_state(tray).0.unwrap_or(0)
 }
 
 /// `ABM_GETSTATE` like `get_state` (direct send, then `SHAppBarMessage`), but `None` when the read failed: the
 /// direct send was not delivered and the fallback answered 0, which is also what a failed forward returns.
-fn try_get_state(tray: HWND) -> Option<u32> {
+/// The flag is true when the direct send answered: false means Explorer is slow right now.
+fn try_get_state(tray: HWND) -> (Option<u32>, bool) {
     if let Some(v) = appbar_direct(ABM_GETSTATE, tray, 0) {
-        return Some(v as u32 & ABS_MASK);
+        return (Some(v as u32 & ABS_MASK), true);
     }
     log!("taskbar: direct AppBar {ABM_GETSTATE} send failed, falling back to SHAppBarMessage");
     let v = appbar_shell(ABM_GETSTATE, tray, 0);
-    (v != 0).then_some(v as u32 & ABS_MASK)
+    ((v != 0).then_some(v as u32 & ABS_MASK), false)
 }
 
 /// The log line for a new state read by `hide_all` (`None` = the read failed) after `prev` (a `LAST_STATE`
@@ -434,6 +435,23 @@ fn edge_owner_from_reply(reply: Option<usize>, tray: isize, is_window: impl Fn(i
         EdgeOwner::Held(owner)
     } else {
         EdgeOwner::Free
+    }
+}
+
+/// Why `hide_all` does not ask who holds the edge of a taskbar in state `state`, with the owner that then counts, or
+/// `None` to ask. `primary`: the first taskbar is Explorer's `Shell_TrayWnd`. `answered`: the direct ABM_GETSTATE
+/// send just before was delivered; without it Explorer is slow, the question would most likely go unanswered after
+/// another `EDGE_QUERY_TIMEOUT_MS` and wait in Explorer's queue ahead of ABM_SETSTATE, so the request goes out
+/// unasked, as 1.4.2 did (fail open). Pure.
+fn edge_not_asked(state: u32, primary: bool, answered: bool) -> Option<(EdgeOwner, String)> {
+    if state & ABS_AUTOHIDE != 0 {
+        Some((EdgeOwner::Free, "auto-hide on".to_string()))
+    } else if !primary {
+        Some((EdgeOwner::Free, "first taskbar is not Shell_TrayWnd".to_string()))
+    } else if !answered {
+        Some((EdgeOwner::NoAnswer, "state read failed".to_string()))
+    } else {
+        None
     }
 }
 
@@ -792,9 +810,15 @@ pub fn hide_all() {
     if RESTORING.load(Relaxed) {
         return;
     }
-    let read = try_get_state(first);
+    let (read, answered) = try_get_state(first);
     if let Some(line) = state_change_line(LAST_STATE.swap(read.unwrap_or(STATE_UNKNOWN), Relaxed), read) {
         log!("{line}");
+    }
+    // A restore that began while the read waited (nested WM_ENDSESSION, watchdog) sends nothing more, not even the
+    // edge question: return here, as the checks below would. Not a later check: `restored_externally` clears
+    // `HIDDEN` and answers true once only.
+    if RESTORING.load(Relaxed) || restored_externally() {
+        return;
     }
     // A failed read counts as auto-hide off: the request is sent as 1.4.2 did (fail open).
     let state = read.unwrap_or(0);
@@ -809,13 +833,11 @@ pub fn hide_all() {
     // Only the primary taskbar's edge is asked about, and only when auto-hide is off: Explorer's primary
     // Shell_TrayWnd serves the AppBar messages, and ABM_SETSTATE registers the primary taskbar alone, so a
     // holder on a secondary's edge never holds the request back. Without the primary taskbar first in the
-    // list nothing is asked. No answer sends the request as 1.4.2 did (fail open).
-    let (owner, asked) = if state & ABS_AUTOHIDE != 0 {
-        (EdgeOwner::Free, Err("auto-hide on".to_string()))
-    } else if !primary {
-        (EdgeOwner::Free, Err("first taskbar is not Shell_TrayWnd".to_string()))
-    } else {
-        autohide_edge_owner(first)
+    // list nothing is asked, nor after a direct state read that failed (`edge_not_asked`). No answer sends the
+    // request as 1.4.2 did (fail open).
+    let (owner, asked) = match edge_not_asked(state, primary, answered) {
+        Some((owner, why)) => (owner, Err(why)),
+        None => autohide_edge_owner(first),
     };
     match autohide_action(state, owner) {
         AutoHideAction::Nothing => {}
@@ -1381,6 +1403,29 @@ mod tests {
         );
         let no_rect = Err("GetWindowRect failed".to_string());
         assert_eq!(edge_check_text(EdgeOwner::NoAnswer, &no_rect), " (edge not asked: GetWindowRect failed)");
+    }
+
+    #[test]
+    fn edge_is_asked_only_after_a_direct_state_read() {
+        use EdgeOwner::{Free, NoAnswer};
+        let not = |owner, why: &str| Some((owner, why.to_string()));
+        assert_eq!(edge_not_asked(0, true, true), None);
+        assert_eq!(edge_not_asked(ABS_ALWAYSONTOP, true, true), None);
+        // The direct ABM_GETSTATE send failed: Explorer is slow, the request is sent unasked (fail open, as 1.4.2).
+        assert_eq!(edge_not_asked(0, true, false), not(NoAnswer, "state read failed"));
+        assert_eq!(edge_not_asked(ABS_ALWAYSONTOP, true, false), not(NoAnswer, "state read failed"));
+        assert_eq!(edge_not_asked(ABS_AUTOHIDE, true, true), not(Free, "auto-hide on"));
+        assert_eq!(edge_not_asked(ABS_AUTOHIDE, true, false), not(Free, "auto-hide on"));
+        assert_eq!(edge_not_asked(ABS_MASK, true, false), not(Free, "auto-hide on"));
+        assert_eq!(edge_not_asked(0, false, true), not(Free, "first taskbar is not Shell_TrayWnd"));
+        assert_eq!(edge_not_asked(0, false, false), not(Free, "first taskbar is not Shell_TrayWnd"));
+        // Whatever the reason, the decision is the one of 1171772 for that owner: a failed read still sends.
+        for (state, primary, answered) in [(0, true, false), (ABS_ALWAYSONTOP, true, false), (0, false, false)] {
+            let (owner, _) = edge_not_asked(state, primary, answered).unwrap();
+            assert_eq!(autohide_action(state, owner), AutoHideAction::Send, "state {state}, {primary}, {answered}");
+        }
+        let failed = Err("state read failed".to_string());
+        assert_eq!(edge_check_text(NoAnswer, &failed), " (edge not asked: state read failed)");
     }
 
     #[test]
