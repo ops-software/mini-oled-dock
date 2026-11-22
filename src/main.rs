@@ -316,44 +316,47 @@ thread_local! {
     static TRIM: RefCell<TrimState> = RefCell::new(TrimState::default());
 }
 
+/// The trim decision of one tick: `rearm` (data was freed since the last trim, `mem::take_rearm`) allows one more
+/// "hidden" trim in the current hidden period; the 4 s hidden delay, the 60 s gap and "never with a popup or Settings
+/// window open" stay.
+fn trim_step(s: &mut TrimState, now: Instant, visible: bool, popup: bool, rearm: bool) -> Option<&'static str> {
+    if rearm {
+        s.trimmed = false;
+    }
+    let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
+    let mut go = None;
+    if !visible && !popup {
+        let since = *s.hidden_since.get_or_insert(now);
+        if !s.trimmed && rate_ok && now.duration_since(since) >= TRIM_HIDDEN_DELAY {
+            go = Some("hidden");
+        }
+        s.last_activity = Some(now);
+    } else {
+        s.hidden_since = None;
+        s.trimmed = false;
+        if popup {
+            s.last_activity = Some(now);
+        } else {
+            let base = *s.last_activity.get_or_insert(now);
+            if rate_ok && now.duration_since(base) >= TRIM_VISIBLE_IDLE {
+                go = Some("visible-idle");
+                s.last_activity = Some(now);
+            }
+        }
+    }
+    if go.is_some() {
+        s.trimmed = true;
+        s.last_trim = Some(now);
+    }
+    go
+}
+
 /// Decides whether to trim memory now; never during show/hide animations (4 s hidden delay).
 fn trim_tick() {
-    let now = Instant::now();
     let visible = ui::is_visible();
     // An open Settings window counts like an open popup: no trim under the user's hands.
     let popup = popup::is_open() || settings_window::is_open();
-    let go = TRIM.with(|s| {
-        let mut s = s.borrow_mut();
-        if mem::take_rearm() {
-            s.trimmed = false;
-        }
-        let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
-        let mut go = None;
-        if !visible && !popup {
-            let since = *s.hidden_since.get_or_insert(now);
-            if !s.trimmed && rate_ok && now.duration_since(since) >= TRIM_HIDDEN_DELAY {
-                go = Some("hidden");
-            }
-            s.last_activity = Some(now);
-        } else {
-            s.hidden_since = None;
-            s.trimmed = false;
-            if popup {
-                s.last_activity = Some(now);
-            } else {
-                let base = *s.last_activity.get_or_insert(now);
-                if rate_ok && now.duration_since(base) >= TRIM_VISIBLE_IDLE {
-                    go = Some("visible-idle");
-                    s.last_activity = Some(now);
-                }
-            }
-        }
-        if go.is_some() {
-            s.trimmed = true;
-            s.last_trim = Some(now);
-        }
-        go
-    });
+    let go = TRIM.with(|s| trim_step(&mut s.borrow_mut(), Instant::now(), visible, popup, mem::take_rearm()));
     if let Some(reason) = go {
         mem::trim(reason);
     }
@@ -1205,6 +1208,42 @@ mod tests {
         assert!(auto_install_busy(true, false, false), "popup open");
         assert!(auto_install_busy(false, false, true), "fullscreen app");
         assert!(!auto_install_busy(false, false, false));
+    }
+
+    #[test]
+    fn rearm_trims_again_once() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        // Hidden for 4 s trims once.
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(2), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        // Still hidden at 60 s with no rearm: nothing.
+        assert_eq!(trim_step(&mut s, at(60), false, false, false), None);
+        // Rearm at 70 s while hidden: a trim at 70 s.
+        assert_eq!(trim_step(&mut s, at(70), false, false, true), Some("hidden"));
+        // Rearm at 75 s: nothing until the gap (130 s) is over, then one.
+        assert_eq!(trim_step(&mut s, at(75), false, false, true), None);
+        assert_eq!(trim_step(&mut s, at(100), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(129), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(130), false, false, false), Some("hidden"));
+        assert_eq!(trim_step(&mut s, at(200), false, false, false), None);
+
+        // A rearm while visible does not trim; the bar hidden at t trims at t + 4 s.
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), true, false, true), None);
+        assert_eq!(trim_step(&mut s, at(10), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(13), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(14), false, false, false), Some("hidden"));
+
+        // A popup open plus a rearm: no trim; the trim comes 4 s after the popup closes, the bar still hidden.
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), false, true, true), None);
+        assert_eq!(trim_step(&mut s, at(30), false, true, false), None);
+        assert_eq!(trim_step(&mut s, at(31), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(34), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(35), false, false, false), Some("hidden"));
     }
 
     #[test]

@@ -253,6 +253,8 @@ fn spawn_worker(job: impl FnOnce() + Send + 'static) -> bool {
     }
     let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
         job();
+        // A check or a download frees buffers the heap keeps committed: the next hidden period trims again.
+        crate::mem::rearm();
         BUSY.store(false, Ordering::Release);
     });
     if let Err(e) = spawned {

@@ -649,6 +649,8 @@ pub(crate) fn load_settings() {
             store_built(&mut h, &mut list, &mut folded, started, holds_settings(Holder::Launcher))
         };
         drop((list, folded));
+        // The build left megabytes of freed blocks that the heap keeps committed: the next hidden period trims again.
+        crate::mem::rearm();
         if kept {
             // An open menu searches again: what is typed may match a setting; the launcher takes its rows.
             crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);

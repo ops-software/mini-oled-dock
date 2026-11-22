@@ -1901,7 +1901,10 @@ fn on_start_release(hwnd: HWND) {
     let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
     if start_release_due(current()) {
         popup_startmenu::release();
-        // Only with the launcher on: without a chord Start's release is what 1.4.3 did.
+        // The shell thread's COM libraries are freed with the release; the catalog and icons freed here are trimmed in
+        // the next hidden period (M1 F3), and the free-threaded ones are unloaded by a second pass 11 minutes on (F4).
+        crate::mem::rearm();
+        // With the launcher on its release also trims at once while the bar is hidden.
         if popup_launcher::is_on() {
             crate::mem::released_data();
         }
