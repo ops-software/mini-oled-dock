@@ -1783,6 +1783,7 @@ pub(crate) fn on_state(frecency: Option<Vec<u8>>, run: Option<Vec<u8>>) {
             history::push_front(&mut loaded, line);
         }
         c.history = loaded;
+        c.state_arrived = true;
         // Picks made before the file arrived are added to what it holds.
         let mut learned = frecency.map_or_else(Frecency::new, |b| Frecency::parse(&b));
         learned.absorb(&c.frecency);
@@ -1811,6 +1812,16 @@ pub(crate) fn forget_history() {
 
 /// `TIMER_LAUNCHER_SAVE`: a changed history is written (the shell thread writes it for the shell user).
 fn save_state() {
+    let waiting = with_ctrl(|c| {
+        // The files were not read yet: a write now would replace them with the picks alone. The picks stay in memory
+        // and are absorbed on load.
+        c.learn && (c.dirty || c.frec_dirty) && !c.state_arrived
+    })
+    .unwrap_or(false);
+    if waiting {
+        crate::launcher_sys::arm_once(crate::msg::TIMER_LAUNCHER_SAVE, SAVE_MS);
+        return;
+    }
     let req = with_ctrl(|c| {
         let (run, frec) = (std::mem::take(&mut c.dirty), std::mem::take(&mut c.frec_dirty));
         if !(run || frec) || !c.learn {
@@ -2150,6 +2161,8 @@ struct Ctrl {
     /// last write.
     learn: bool,
     state_loaded: bool,
+    /// The load reply arrived (`on_state`): only then is a write safe.
+    state_arrived: bool,
     dirty: bool,
     frec_dirty: bool,
     /// The last close that launched something: when it hid, and the query as typed (kept for the reopen of a refused launch
@@ -2229,6 +2242,7 @@ impl Ctrl {
             listing_since: None,
             learn: true,
             state_loaded: false,
+            state_arrived: false,
             dirty: false,
             frec_dirty: false,
             hidden_at_ms: 0,
@@ -2266,6 +2280,7 @@ impl Ctrl {
             self.dirty = false;
             self.frec_dirty = false;
             self.state_loaded = false;
+            self.state_arrived = false;
         }
     }
 
@@ -3999,6 +4014,20 @@ mod tests {
         let mut c = filled(true, false);
         assert!(c.chord_off().is_none());
         assert!(empty(&c));
+    }
+
+    #[test]
+    fn a_pick_is_not_written_before_the_files_were_read() {
+        let key = ItemKey::of(ProviderId::Apps, "calc");
+        with_ctrl(|c| {
+            *c = Ctrl::new();
+            c.learn_pick(key);
+        });
+        save_state();
+        assert_eq!(with_ctrl(|c| c.frec_dirty), Some(true), "kept for the load");
+        with_ctrl(|c| c.state_arrived = true);
+        save_state();
+        assert_eq!(with_ctrl(|c| c.frec_dirty), Some(false), "written once the files were read");
     }
 
     #[test]

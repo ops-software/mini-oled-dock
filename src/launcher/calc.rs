@@ -502,9 +502,10 @@ fn factorial(v: f64) -> Option<f64> {
     finite((2..=v as u32).fold(1.0, |acc, i| acc * f64::from(i)))
 }
 
-/// A trigonometric result that is zero but for the noise of pi (sin(pi) is 1.2e-16) shows as 0.
-fn snap(v: f64) -> f64 {
-    if v.abs() < 1e-15 {
+/// A trigonometric result that is zero but for the noise of pi (sin(pi) is 1.2e-16) shows as 0; a tiny argument keeps
+/// its tiny result (sin(1e-20) is 1e-20).
+fn snap(arg: f64, v: f64) -> f64 {
+    if v.abs() < 1e-15 && arg.abs() >= 1e-6 {
         0.0
     } else {
         v
@@ -526,9 +527,9 @@ fn apply(f: Func, args: &[f64]) -> Option<f64> {
         (Func::Ln, [x]) if *x > 0.0 => x.ln(),
         (Func::Log, [x]) if *x > 0.0 => x.log10(),
         (Func::Log2, [x]) if *x > 0.0 => x.log2(),
-        (Func::Sin, [x]) => snap(x.sin()),
-        (Func::Cos, [x]) => snap(x.cos()),
-        (Func::Tan, [x]) => snap(x.tan()),
+        (Func::Sin, [x]) => snap(*x, x.sin()),
+        (Func::Cos, [x]) => snap(*x, x.cos()),
+        (Func::Tan, [x]) => snap(*x, x.tan()),
         (Func::Min, [first, rest @ ..]) => rest.iter().fold(*first, |a, b| a.min(*b)),
         (Func::Max, [first, rest @ ..]) => rest.iter().fold(*first, |a, b| a.max(*b)),
         _ => return None,
@@ -888,6 +889,7 @@ mod tests {
             ("log2(1024)", Some("10")),
             ("log2(0)", None),
             ("sin(0)", Some("0")),
+            ("sin(1e-20)", Some("1e-20")),
             ("sin(pi)", Some("0")),
             ("sin(pi/2)", Some("1")),
             ("cos(0)", Some("1")),
