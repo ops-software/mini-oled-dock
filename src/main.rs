@@ -45,6 +45,8 @@ mod i18n;
 mod icons;
 mod jumplist;
 mod launcher;
+#[cfg(feature = "owner-probe")]
+mod launcher_probe;
 mod logger;
 mod mem;
 mod metrics;

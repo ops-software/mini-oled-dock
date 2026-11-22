@@ -126,6 +126,8 @@ pub struct HookThread {
 /// Starts the `hook` thread and waits for the installation result. Must be called AFTER
 /// creating the dock window (the callback posts messages to `hwnd()`).
 pub fn start() -> Result<HookThread, String> {
+    #[cfg(feature = "owner-probe")]
+    MASK_KEY.store(crate::launcher_probe::mask_key(), Relaxed);
     let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let join = std::thread::Builder::new()
@@ -286,12 +288,16 @@ fn uninstall() {
 }
 
 unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    #[cfg(feature = "owner-probe")]
+    let started = std::time::Instant::now();
     if code == HC_ACTION as i32 {
         // SAFETY: for HC_ACTION in a WH_KEYBOARD_LL hook, lparam points to a
         // KBDLLHOOKSTRUCT valid for the whole duration of the callback.
         let kb = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
         let swallowed = handle_key(wp.0 as u32, kb);
         diag(wp.0 as u32, kb, swallowed);
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::record_hook_us(started.elapsed());
         if swallowed {
             return LRESULT(1);
         }
@@ -1217,7 +1223,7 @@ static BUFFERED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// `ModTrack::down` (bits 0-7) and `reset_seen` (bits 32-63).
 static MODS: AtomicU64 = AtomicU64::new(0);
 static MODS_LAST: AtomicU32 = AtomicU32::new(0);
-/// The menu-mask key: 0xE8 by default, 0xA2 left Ctrl, 0 none (the owner-probe switch, L1a-10 step 7).
+/// The menu-mask key: 0xE8 by default; owner-probe builds read their mask switch at start (0xA2 left Ctrl, 0 none).
 static MASK_KEY: AtomicU32 = AtomicU32::new(MASK_KEY_DEFAULT);
 // Shared by protocol.
 /// The type-ahead ring (its compare-exchange protocol: `Ring`).
@@ -1249,6 +1255,8 @@ pub fn set_pass_flags(flags: PassFlags) {
 /// UI, first thing on WM_DOCK_LAUNCHER: the post of `seq` arrived.
 #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn ack_launcher(seq: u32) {
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::freeze_ui_once();
     LAUNCHER_ACKED.store(seq, Relaxed);
 }
 
