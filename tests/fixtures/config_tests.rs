@@ -61,7 +61,7 @@ fn every_fixture_parses_to_its_snapshot() {
         }
         n += 1;
     }
-    assert!(n >= 25, "fixtures went missing: {n}"); // 16 tag shapes + 9 edge shapes
+    assert!(n >= 26, "fixtures went missing: {n}"); // 16 tag shapes + 9 edge shapes + the owner's file
 }
 
 #[test]

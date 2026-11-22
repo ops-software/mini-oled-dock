@@ -1,0 +1,110 @@
+{
+  "language": "auto",
+  "position": "top",
+  "monitor": "",
+  "autohide": true,
+  "window_previews": true,
+  "win_opens_start": false,
+  "hide_native_taskbar": true,
+  "pinned": [
+    {
+      "key": "c:\\windows\\explorer.exe",
+      "name": "Esplora risorse",
+      "launch": "C:\\Windows\\explorer.exe"
+    },
+    {
+      "key": "F0DC299D809B9700",
+      "name": "Zen",
+      "launch": "C:\\Program Files\\Zen Browser\\zen.exe"
+    },
+    {
+      "key": "c:\\users\\user\\appdata\\local\\discord\\app-*\\discord.exe",
+      "name": "Discord",
+      "launch": "C:\\Users\\user\\AppData\\Local\\Discord\\app-1.0.9269\\Discord.exe"
+    },
+    {
+      "key": "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App",
+      "name": "WhatsApp",
+      "launch": "shell:AppsFolder\\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+    },
+    {
+      "key": "c:\\users\\user\\appdata\\local\\programs\\stremio\\stremio-shell-ng.exe",
+      "name": "Stremio",
+      "launch": "C:\\Users\\user\\AppData\\Local\\Programs\\Stremio\\stremio-shell-ng.exe"
+    }
+  ],
+  "start_pins": [],
+  "start_folders": [],
+  "start_style": "compact",
+  "start_grid": false,
+  "names": {},
+  "show_date": true,
+  "show_volume_percent": true,
+  "show_tray": true,
+  "show_notifications": true,
+  "show_volume": true,
+  "show_network": false,
+  "show_metrics": false,
+  "show_battery": "auto",
+  "battery_percent": true,
+  "battery_percent_inside": false,
+  "show_clock": true,
+  "show_desktop_button": true,
+  "show_start_button": false,
+  "display_mode": "icon_text",
+  "app_icon_size": 20,
+  "app_text_size": 14,
+  "tray_icon_size": 18,
+  "module_size": 105,
+  "background": "#000000",
+  "bar_opacity": 100,
+  "settings_window_size": [
+    860,
+    594
+  ],
+  "time_format": "HH:mm",
+  "show_seconds": true,
+  "date_format": "ddd d MMM",
+  "tray_hidden_guids": [
+    "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae77-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae82-23e3-4229-82c1-e41cb67d5b9c"
+  ],
+  "tray_hidden": [
+    "msiafterburner.exe#197480"
+  ],
+  "app_order": [],
+  "tray_order": [
+    "699e423d-73da-42ba-b94e-881ff8672467",
+    "razerappengine.exe#3",
+    "steam.exe#1",
+    "blip.exe#1",
+    "e5768d8b-6936-4f45-b1ad-4c5fb414cb35",
+    "wallpaper64.exe#1000",
+    "fbed1924-0f0e-4ae6-87d3-246dcd41eee1",
+    "powertoys.exe#1",
+    "msiafterburner.exe#132114",
+    "de1bec15-0ed1-3859-9497-fb8004042c23",
+    "fdm.exe#0",
+    "bootstrapper.exe#1",
+    "sensorpanel.exe#2",
+    "173fe6b0-4599-c2df-da9e-f5296eb20725",
+    "msiafterburner.exe#197562",
+    "2753843f-159d-d110-d927-eec24e4d97dd"
+  ],
+  "modules_order": [
+    "volume",
+    "clock",
+    "notifications",
+    "show_desktop",
+    "power"
+  ],
+  "audio_layout": "Mo-S-X",
+  "notif_prompted": false,
+  "update_check": true,
+  "update_auto_install": true,
+  "last_update_check": "2026-11-21T17:45:49Z",
+  "update_available": "v1.4.2"
+}
