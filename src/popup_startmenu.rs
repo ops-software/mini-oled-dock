@@ -66,7 +66,7 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
 use crate::render::Metrics;
-use crate::shell_thread::{self, ShellRequest, StartApp};
+use crate::shell_thread::{self, IconPlan, ShellRequest, StartApp};
 use crate::start_search::{self, Keys};
 use crate::surface::{
     rect_wh, Font, Surface, HOVER_ALPHA, PANEL_BORDER_ALPHA, ROW_RADIUS, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE,
@@ -304,7 +304,7 @@ fn request_catalog(px: u32) {
         Err(_) => px,
     });
     let first = crate::config::get().start_pins.clone();
-    shell_thread::request(ShellRequest::ListStartApps { icon_px: px, first });
+    shell_thread::request(ShellRequest::ListStartApps { icon_px: px, icons: IconPlan::All { first } });
     // The settings the search also finds: built in the background, unless they are still there.
     start_search::load_settings();
 }

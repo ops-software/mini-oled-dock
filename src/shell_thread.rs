@@ -192,10 +192,9 @@ pub enum ShellRequest {
     NetworkRelease,
     /// Volume module disabled: shuts the `AudioController` down and drops it.
     AudioRelease,
-    /// Start menu (Win double tap): enumerates `shell:AppsFolder` -> `ShellEvent::StartApps`, then
-    /// queues the icons not sent yet at `icon_px` (the ids in `first`, the menu pins, go first) as
-    /// `StartIcons` batches, which run behind every other request.
-    ListStartApps { icon_px: u32, first: Vec<String> },
+    /// Start menu (Win double tap) and the launcher: enumerates `shell:AppsFolder` ->
+    /// `ShellEvent::StartApps`; then, as `icons` says, queues the Start menu's icons (see `IconPlan`).
+    ListStartApps { icon_px: u32, icons: IconPlan },
     /// One batch of Start menu icons -> `ShellEvent::StartIcons`. Queued by `ListStartApps` only;
     /// low priority like `ResolveApp`.
     StartIcons { icon_px: u32, ids: Vec<String> },
@@ -244,6 +243,28 @@ pub enum ShellRequest {
     /// no failure).
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     LauncherRevealApp { id: String },
+    /// Icons of the launcher's visible rows that lack one -> `ShellEvent::LauncherIcons`. Not a
+    /// low-priority request: it runs ahead of the Start menu's batches, and a newer one replaces the
+    /// pending one. It never reads or changes what the Start menu was sent.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    StartIconsFor { icon_px: u32, ids: Vec<String> },
+    /// A query that found nothing: Windows' typo rewrite of it (`start_search::converted`, a 1.4 MB
+    /// read kept off the UI thread) -> `ShellEvent::LauncherConverted`. A newer one replaces the
+    /// pending one.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LauncherConvert { gen: u64, query: String },
+}
+
+/// The icons a `ListStartApps` queues.
+#[derive(Clone, Debug)]
+pub enum IconPlan {
+    /// The Start menu: the icons not sent yet at `icon_px` (the ids in `first`, the menu pins, go
+    /// first) as `StartIcons` batches, which run behind every other request.
+    All { first: Vec<String> },
+    /// The launcher's catalogue: none, and what the Start menu was sent is left as it is (the
+    /// launcher asks for its rows' icons with `StartIconsFor`).
+    #[allow(dead_code)] // sent by the launcher (L1a-16)
+    None,
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -275,6 +296,13 @@ pub enum ShellEvent {
     /// the shared requests (`Launch`, `LaunchAppAdmin`, `RevealApp`).
     #[allow(dead_code)] // read by the launcher (L1a-17)
     LaunchFailed { kind: LaunchKind },
+    /// Icons of launcher rows at `icon_px` (reply to `StartIconsFor`; `None` = the app has none).
+    #[allow(dead_code)] // read by the launcher (L1a-15)
+    LauncherIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
+    /// What Windows Search reads the query of generation `gen` as (reply to `LauncherConvert`);
+    /// `None` = no rewrite.
+    #[allow(dead_code)] // read by the launcher (L1a-15)
+    LauncherConverted { gen: u64, meant: Option<String> },
 }
 
 /// What a failed launcher launch was (`ShellEvent::LaunchFailed`).
@@ -561,14 +589,9 @@ impl Shell {
     fn pump(&mut self, rx: &Receiver<ShellRequest>) {
         loop {
             while let Ok(r) = rx.try_recv() {
-                self.pending.push_back(r);
+                enqueue(&mut self.pending, r);
             }
-            let idx = self
-                .pending
-                .iter()
-                .position(|r| !matches!(r, ShellRequest::ResolveApp(_) | ShellRequest::StartIcons { .. }))
-                .or(if self.pending.is_empty() { None } else { Some(0) });
-            let Some(req) = idx.and_then(|i| self.pending.remove(i)) else { break };
+            let Some(req) = next_request(&mut self.pending) else { break };
             self.handle_request(req);
         }
     }
@@ -597,6 +620,8 @@ impl Shell {
             | ShellRequest::LauncherLaunch { .. }
             | ShellRequest::LauncherAppAdmin { .. }
             | ShellRequest::LauncherRevealApp { .. }) => launcher_launch(self.ui, req),
+            ShellRequest::StartIconsFor { icon_px, ids } => launcher_icons(self.ui, icon_px, ids),
+            ShellRequest::LauncherConvert { gen, query } => launcher_convert(self.ui, gen, &query),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -669,7 +694,7 @@ impl Shell {
                     a.shutdown();
                 }
             }
-            ShellRequest::ListStartApps { icon_px, first } => self.list_start_apps(icon_px, &first),
+            ShellRequest::ListStartApps { icon_px, icons } => self.list_start_apps(icon_px, &icons),
             ShellRequest::StartSettingsReady => push_event(self.ui, ShellEvent::StartSettings),
             ShellRequest::StartRelease => {
                 start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending);
@@ -695,27 +720,14 @@ impl Shell {
     // -------------------------------------------------------------- Start menu
 
     /// `ListStartApps`: publishes the catalog, then queues the icons the UI does not have yet.
-    fn list_start_apps(&mut self, icon_px: u32, first: &[String]) {
+    fn list_start_apps(&mut self, icon_px: u32, icons: &IconPlan) {
         let t = Instant::now();
         let apps = enum_apps_folder();
         log!("shell: Start menu: {} apps listed in {} ms", apps.len(), t.elapsed().as_millis());
-        let icon_px = icon_px.clamp(8, 256);
-        if icon_px != self.start_px {
-            self.start_px = icon_px;
-            self.start_sent.clear();
-            self.pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
-        }
-        let mut missing: Vec<String> =
-            apps.iter().filter(|a| !self.start_sent.contains(&a.id)).map(|a| a.id.clone()).collect();
-        // Pins first (stable sort: the catalog order is kept inside each group).
-        missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
-        self.start_sent.extend(missing.iter().cloned());
+        queue_start_icons(&mut self.start_px, &mut self.start_sent, &mut self.pending, &apps, icon_px, icons);
         // The search data the menu attaches to the catalog (read here, never on the UI thread).
         crate::start_search::load_app_index();
         push_event(self.ui, ShellEvent::StartApps(apps));
-        for chunk in missing.chunks(START_ICON_BATCH) {
-            self.pending.push_back(ShellRequest::StartIcons { icon_px, ids: chunk.to_vec() });
-        }
     }
 
     // -------------------------------------------------------------- name and icon
@@ -1796,6 +1808,30 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
     }
 }
 
+/// `StartIconsFor`: the icons of the launcher's rows, made at `icon_px` (clamped as the Start menu's).
+/// Start's `start_px` and `start_sent` are not touched.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launcher_icons(ui: isize, icon_px: u32, ids: Vec<String>) {
+    let icon_px = icon_px.clamp(8, 256);
+    let icons = ids
+        .into_iter()
+        .map(|id| {
+            let b = start_icon(&id, icon_px);
+            (id, b)
+        })
+        .collect();
+    push_event(ui, ShellEvent::LauncherIcons { icon_px, icons });
+}
+
+/// `LauncherConvert`: Windows' typo rewrite of a query that found nothing, read here so the UI thread
+/// never reads the 1.4 MB file.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launcher_convert(ui: isize, gen: u64, query: &str) {
+    log!("shell: LauncherConvert ({} chars)", query.chars().count());
+    let meant = crate::start_search::converted(query);
+    push_event(ui, ShellEvent::LauncherConverted { gen, meant });
+}
+
 /// `OpenPath`: refuses an empty path or one with a control character, then exactly one shell call
 /// with the path as it is: no `updated_exe_path`, no `is_dir`, no working directory, so nothing
 /// the launcher found or the user typed touches the file system from the elevated process.
@@ -2166,6 +2202,54 @@ fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) -> Result<
     // SAFETY: `sei` initialized with the correct cbSize; the strings (NUL-terminated HSTRINGs) live
     // until the end of the function, which returns after ShellExecuteExW.
     unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| format!("ShellExecuteExW: {e}"))
+}
+
+/// Puts a request in the queue. A newer launcher icon request or typo rewrite replaces the pending one:
+/// only the latest keystroke's rows matter.
+fn enqueue(pending: &mut VecDeque<ShellRequest>, r: ShellRequest) {
+    match r {
+        ShellRequest::StartIconsFor { .. } => pending.retain(|p| !matches!(p, ShellRequest::StartIconsFor { .. })),
+        ShellRequest::LauncherConvert { .. } => pending.retain(|p| !matches!(p, ShellRequest::LauncherConvert { .. })),
+        _ => {}
+    }
+    pending.push_back(r);
+}
+
+/// The next request to run: the oldest one that is not a slow name/icon resolution or a Start menu icon
+/// batch, otherwise the oldest of those.
+fn next_request(pending: &mut VecDeque<ShellRequest>) -> Option<ShellRequest> {
+    let idx = pending
+        .iter()
+        .position(|r| !matches!(r, ShellRequest::ResolveApp(_) | ShellRequest::StartIcons { .. }))
+        .or(if pending.is_empty() { None } else { Some(0) });
+    idx.and_then(|i| pending.remove(i))
+}
+
+/// The Start menu's part of `ListStartApps`. `IconPlan::All`: the icons not sent yet at `icon_px` are
+/// queued as `StartIcons` batches, the pins (`first`) first; a new size starts over. `IconPlan::None`
+/// (the launcher's catalogue) touches nothing.
+fn queue_start_icons(
+    start_px: &mut u32,
+    sent: &mut HashSet<String>,
+    pending: &mut VecDeque<ShellRequest>,
+    apps: &[StartApp],
+    icon_px: u32,
+    plan: &IconPlan,
+) {
+    let IconPlan::All { first } = plan else { return };
+    let icon_px = icon_px.clamp(8, 256);
+    if icon_px != *start_px {
+        *start_px = icon_px;
+        sent.clear();
+        pending.retain(|r| !matches!(r, ShellRequest::StartIcons { .. }));
+    }
+    let mut missing: Vec<String> = apps.iter().filter(|a| !sent.contains(&a.id)).map(|a| a.id.clone()).collect();
+    // Pins first (stable sort: the catalog order is kept inside each group).
+    missing.sort_by_key(|id| !first.iter().any(|f| f.eq_ignore_ascii_case(id)));
+    sent.extend(missing.iter().cloned());
+    for chunk in missing.chunks(START_ICON_BATCH) {
+        pending.push_back(ShellRequest::StartIcons { icon_px, ids: chunk.to_vec() });
+    }
 }
 
 /// `StartRelease`: a reopened Start menu starts from nothing, so the next `ListStartApps` resends every icon.
@@ -2572,5 +2656,56 @@ mod tests {
             assert_eq!(reported(r), Some(*kind), "{r:?}");
             assert!(launch_kind(r).and_then(|k| failure_event(k, &Ok(()))).is_none(), "{r:?}");
         }
+    }
+
+    #[test]
+    fn start_icons_for_replaces_a_pending_one() {
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        let ids = |s: &str| vec![s.to_string()];
+        enqueue(&mut pending, ShellRequest::StartIcons { icon_px: 48, ids: ids("c") });
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
+        enqueue(&mut pending, ShellRequest::VolumeRefresh);
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("b") });
+        assert_eq!(pending.len(), 3);
+        // Start's release forgets its own batches only.
+        let (mut px, mut sent) = (48u32, HashSet::from(["c".to_string()]));
+        start_release(&mut px, &mut sent, &mut pending);
+        assert_eq!(pending.len(), 2);
+        enqueue(&mut pending, ShellRequest::StartIcons { icon_px: 48, ids: ids("d") });
+        // Not a low-priority request: it runs ahead of the Start menu's batches, and only the newest is left.
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::VolumeRefresh)));
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIconsFor { ids, .. }) if ids == ["b"]));
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIcons { .. })));
+        assert!(next_request(&mut pending).is_none());
+    }
+
+    #[test]
+    fn icon_plan_none_leaves_start_sent() {
+        let app = |id: &str| StartApp { id: id.into(), name: id.into() };
+        let apps = [app("a"), app("b"), app("c")];
+        let mut px = 48u32;
+        let mut sent = HashSet::from(["a".to_string()]);
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        pending.push_back(ShellRequest::StartIcons { icon_px: 48, ids: vec!["z".into()] });
+        queue_start_icons(&mut px, &mut sent, &mut pending, &apps, 32, &IconPlan::None);
+        assert_eq!((px, sent.len(), pending.len()), (48, 1, 1), "the launcher's catalogue changes nothing of Start's");
+        queue_start_icons(&mut px, &mut sent, &mut pending, &apps, 48, &IconPlan::All { first: vec!["C".into()] });
+        assert_eq!((px, sent.len(), pending.len()), (48, 3, 2));
+        assert!(matches!(&pending[1], ShellRequest::StartIcons { icon_px: 48, ids } if *ids == ["c", "b"]));
+        // A new size starts Start's icons over.
+        queue_start_icons(&mut px, &mut sent, &mut pending, &apps, 64, &IconPlan::All { first: Vec::new() });
+        assert_eq!((px, sent.len(), pending.len()), (64, 3, 1));
+    }
+
+    #[test]
+    fn launcher_convert_replaces_a_pending_one() {
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 1, query: "rkd".into() });
+        enqueue(&mut pending, ShellRequest::VolumeRefresh);
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 2, query: "rkdp".into() });
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: Vec::new() });
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::VolumeRefresh)));
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::LauncherConvert { gen: 2, .. })));
     }
 }
