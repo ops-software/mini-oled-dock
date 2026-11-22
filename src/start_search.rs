@@ -30,10 +30,10 @@
 //! All of it is undocumented: a missing or different file only means fewer results. The Windows
 //! folder comes from the API, never from the environment.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -41,7 +41,9 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY};
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+};
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, SHLoadIndirectString, KF_FLAG_DEFAULT};
 
@@ -273,7 +275,8 @@ pub(crate) fn parse_settings_xml(xml: &str) -> Vec<RawSetting> {
             let page = b.find("Type=\"Page\">").and_then(|i| {
                 let rest = &b[i + 12..];
                 let name = rest[..rest.find('<')?].trim();
-                (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then(|| name.to_string())
+                (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                    .then(|| name.to_string())
             });
             Some(RawSetting {
                 id: tag(b, "Filename")?,
@@ -354,7 +357,12 @@ pub(crate) fn load_app_index() {
     let t = Instant::now();
     let synonyms = parse_synonyms(&read_index("appssynonyms.txt"));
     let (ranks, default_rank) = parse_ranks(&read_index("appsglobals.txt"));
-    log!("start search: {} apps with synonyms, {} ranks in {} ms", synonyms.len(), ranks.len(), t.elapsed().as_millis());
+    log!(
+        "start search: {} apps with synonyms, {} ranks in {} ms",
+        synonyms.len(),
+        ranks.len(),
+        t.elapsed().as_millis()
+    );
     *APP_INDEX.lock().unwrap_or_else(|p| p.into_inner()) = Some(AppIndex { synonyms, ranks, default_rank });
 }
 
@@ -408,7 +416,12 @@ pub(crate) fn load_settings() {
         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
         let t = Instant::now();
         let (list, cached) = load_or_build_settings();
-        log!("start search: {} settings in {} ms{}", list.len(), t.elapsed().as_millis(), if cached { " (disk cache)" } else { "" });
+        log!(
+            "start search: {} settings in {} ms{}",
+            list.len(),
+            t.elapsed().as_millis(),
+            if cached { " (disk cache)" } else { "" }
+        );
         // Released while it was being built: not kept.
         if SETTINGS_STARTED.load(Relaxed) {
             *SETTINGS.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(list));
@@ -524,7 +537,8 @@ fn build_settings() -> Vec<Setting> {
         let Some(name) = resolve(&raw.description) else { continue };
         let lower = name.to_lowercase();
         let rank = ranks.get(&raw.id.to_lowercase()).copied().unwrap_or(default_rank);
-        let target: Cow<'static, str> = if target == SETTINGS_APP { Cow::Borrowed(SETTINGS_APP) } else { Cow::Owned(target) };
+        let target: Cow<'static, str> =
+            if target == SETTINGS_APP { Cow::Borrowed(SETTINGS_APP) } else { Cow::Owned(target) };
         let keywords = resolve_keywords(&raw.keywords);
         let entry = by_name.entry(lower.clone()).or_insert_with(|| {
             let keys = synonyms.get(&lower).cloned().unwrap_or_default();
@@ -749,8 +763,16 @@ fn decode_catalog(bytes: &[u8], key: &str) -> Option<Vec<Setting>> {
             u32::MAX => None,
             n => Some(r.str(n)?.to_string()),
         };
-        let target: Cow<'static, str> = if target == SETTINGS_APP { Cow::Borrowed(SETTINGS_APP) } else { Cow::Owned(target.to_string()) };
-        list.push(Setting { name: name.to_string(), lower: name.to_lowercase(), keys: Keys(keys.to_string()), rank, target, args });
+        let target: Cow<'static, str> =
+            if target == SETTINGS_APP { Cow::Borrowed(SETTINGS_APP) } else { Cow::Owned(target.to_string()) };
+        list.push(Setting {
+            name: name.to_string(),
+            lower: name.to_lowercase(),
+            keys: Keys(keys.to_string()),
+            rank,
+            target,
+            args,
+        });
     }
     r.0.is_empty().then_some(list)
 }
@@ -763,7 +785,8 @@ fn load_or_build_settings() -> (Vec<Setting>, bool) {
     let key = catalog_key(&windir.join(r"ImmersiveControlPanel\Settings"));
     let path = crate::datadir::cache_dir().map(|d| d.join(CACHE_NAME));
     if let (Some(key), Some(path)) = (&key, &path) {
-        if let Some(list) = crate::datadir::read_file(path, CACHE_MAX, true).ok().and_then(|b| decode_catalog(&b, key)) {
+        if let Some(list) = crate::datadir::read_file(path, CACHE_MAX, true).ok().and_then(|b| decode_catalog(&b, key))
+        {
             return (list, true);
         }
     }
@@ -821,7 +844,8 @@ mod tests {
         assert_eq!((ranks["chrome"], ranks[r"{1ac1}\cmd.exe"], ranks.len()), (3000, 3525, 2));
         assert_eq!(default, 3526);
         assert_eq!(parse_ranks("").1, 0);
-        let conv = "market\t~\t~\t0\r\nspelling\truhn\trun\t10003\r\nspelling\trkdp\trdp\t10237\r\nspelling\ta\ta\t1\r\n";
+        let conv =
+            "market\t~\t~\t0\r\nspelling\truhn\trun\t10003\r\nspelling\trkdp\trdp\t10237\r\nspelling\ta\ta\t1\r\n";
         assert_eq!(convert(conv, "rkdp"), Some("rdp"));
         assert_eq!(convert(conv, " ruhn "), Some("run"));
         assert_eq!(convert(conv, "rdp"), None);
@@ -852,18 +876,33 @@ mod tests {
         assert_eq!(raw[0].keywords, "@{windows?ms-resource://a/b/HighKeywords}");
         assert_eq!(raw[1].keywords, "@@shell32.dll,-1@shell32.dll,-2");
         let win = Path::new(r"C:\Windows");
-        assert_eq!(setting_launch(&raw[0], win), Some((SETTINGS_APP.to_string(), Some("page=SettingsPageRemoteDesktop".into()))));
+        assert_eq!(
+            setting_launch(&raw[0], win),
+            Some((SETTINGS_APP.to_string(), Some("page=SettingsPageRemoteDesktop".into())))
+        );
         assert_eq!(
             setting_launch(&raw[1], win),
-            Some((r"C:\Windows\system32\rundll32.exe".to_string(), Some("shell32.dll,Control_RunDLL a.cpl,,5 & x".into())))
+            Some((
+                r"C:\Windows\system32\rundll32.exe".to_string(),
+                Some("shell32.dll,Control_RunDLL a.cpl,,5 & x".into())
+            ))
         );
         let link = |l: &str| {
-            let r = RawSetting { id: "i".into(), description: "d".into(), keywords: String::new(), page: None, deep_link: Some(l.into()) };
+            let r = RawSetting {
+                id: "i".into(),
+                description: "d".into(),
+                keywords: String::new(),
+                page: None,
+                deep_link: Some(l.into()),
+            };
             setting_launch(&r, win)
         };
         assert_eq!(
             link(r"Microsoft.PowerOptions\pagePlanSettings"),
-            Some((r"C:\Windows\System32\control.exe".to_string(), Some("/name Microsoft.PowerOptions /page pagePlanSettings".into())))
+            Some((
+                r"C:\Windows\System32\control.exe".to_string(),
+                Some("/name Microsoft.PowerOptions /page pagePlanSettings".into())
+            ))
         );
         assert_eq!(link("Microsoft.Fonts").unwrap().1.as_deref(), Some("/name Microsoft.Fonts"));
         assert_eq!(link("shell:::{A}"), Some(("shell:::{A}".to_string(), None)));
@@ -890,7 +929,11 @@ mod tests {
                     name,
                     keys: keys.tidy(),
                     rank: i as u32 * 7,
-                    target: if i % 3 == 0 { Cow::Owned(format!(r"C:\Windows\System32\t{i}.exe")) } else { Cow::Borrowed(SETTINGS_APP) },
+                    target: if i % 3 == 0 {
+                        Cow::Owned(format!(r"C:\Windows\System32\t{i}.exe"))
+                    } else {
+                        Cow::Borrowed(SETTINGS_APP)
+                    },
                     args: (i % 5 != 0).then(|| format!("page=p{i}")),
                 }
             })
@@ -906,7 +949,10 @@ mod tests {
         assert!(bytes.starts_with(b"mini-oled-dock settings-catalog 1\n"));
         let back = decode_catalog(&bytes, KEY).unwrap();
         assert_eq!(back, list);
-        assert!(back.iter().filter(|s| matches!(s.target, Cow::Borrowed(_))).count() > 100, "the shared target stays shared");
+        assert!(
+            back.iter().filter(|s| matches!(s.target, Cow::Borrowed(_))).count() > 100,
+            "the shared target stays shared"
+        );
         assert_eq!(decode_catalog(&encode_catalog(KEY, &[]).unwrap(), KEY).unwrap(), Vec::new());
     }
 
@@ -1039,7 +1085,12 @@ mod tests {
         assert!(list.iter().any(|s| s.target.to_lowercase().ends_with("control.exe")));
         let bytes: usize = list
             .iter()
-            .map(|s| s.name.capacity() + s.lower.capacity() + s.keys.0.capacity() + s.args.as_ref().map_or(0, String::capacity))
+            .map(|s| {
+                s.name.capacity()
+                    + s.lower.capacity()
+                    + s.keys.0.capacity()
+                    + s.args.as_ref().map_or(0, String::capacity)
+            })
             .sum::<usize>()
             + list.capacity() * std::mem::size_of::<Setting>();
         println!("settings catalog: about {} KB kept", bytes / 1024);

@@ -692,7 +692,12 @@ pub fn eval(text: &str, num: NumberStyle) -> Option<Answer> {
         Some(b) => Some(format_base(v, b)?),
     };
     if let Some(text) = as_base {
-        return Some(Answer { shown: text.clone(), raw: text, normalised: normalise(&lexed.toks, num), thousands_note: lexed.note });
+        return Some(Answer {
+            shown: text.clone(),
+            raw: text,
+            normalised: normalise(&lexed.toks, num),
+            thousands_note: lexed.note,
+        });
     }
     let raw = format_plain(v, num);
     let shown = if v.abs() >= TWO_53 { format!("≈ {raw}") } else { raw.clone() };
@@ -1118,11 +1123,12 @@ mod tests {
         let mut r = XorShift::new(0xCA1C);
         let styles = [IT, EN];
         let alphabet = [
-            '0', '1', '2', '9', '.', ',', '+', '-', '*', '/', '^', '%', '(', ')', ' ', 'x', '×', '÷', '!', '°', ';', 'e', 'p', 'i',
-            'b', 'o', 'F',
+            '0', '1', '2', '9', '.', ',', '+', '-', '*', '/', '^', '%', '(', ')', ' ', 'x', '×', '÷', '!', '°', ';',
+            'e', 'p', 'i', 'b', 'o', 'F',
         ];
         let glue = ["1", "2", "(", ")", ";", "!", "+"];
-        let words = ["pi", "e", "sqrt(", "min(", "max(", "log2(", "sin(", "0x", "0b", "0o", " in ", "hex", "bin", "1e", "1e5"];
+        let words =
+            ["pi", "e", "sqrt(", "min(", "max(", "log2(", "sin(", "0x", "0b", "0o", " in ", "hex", "bin", "1e", "1e5"];
         for i in 0..100_000 {
             let n = styles[i % 2];
             let t = if i % 3 == 0 {
