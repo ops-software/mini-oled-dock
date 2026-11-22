@@ -23,7 +23,8 @@
 //!    no event for MOD_STALE_MS is re-read from the async key state, and `reset_modifiers` (lock, suspend, an admin
 //!    launch) forgets them all: a lost release can only make the chord pass, never match a bare Space.
 //!  * The chord key down with exactly the chord's modifiers (AltGr is Ctrl+Alt: never Alt+Space) and no Win:
-//!    passed in fullscreen and remote sessions; passed with WM_DOCK_LAUNCHER_YIELDED while Command Palette answers;
+//!    passed in fullscreen (with WM_DOCK_LAUNCHER_PASSED, so the UI checks the flag again) and remote sessions;
+//!    passed with WM_DOCK_LAUNCHER_YIELDED while Command Palette answers;
 //!    failed open (passed, one log line per sequence) when the UI thread left a post unacknowledged for
 //!    ACK_TIMEOUT_MS; otherwise swallowed, the menu-mask key injected under Alt (so the Alt release opens no menu
 //!    bar) and WM_DOCK_LAUNCHER posted with the next sequence number and kb.time. Its repeats and its release go
@@ -65,7 +66,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::msg::{
-    WM_DOCK_DIAG, WM_DOCK_LAUNCHER, WM_DOCK_LAUNCHER_YIELDED, WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY,
+    WM_DOCK_DIAG, WM_DOCK_LAUNCHER, WM_DOCK_LAUNCHER_PASSED, WM_DOCK_LAUNCHER_YIELDED, WM_DOCK_START_MENU,
+    WM_DOCK_TOGGLE, WM_DOCK_WINKEY,
 };
 use crate::{hwnd, log};
 
@@ -913,6 +915,9 @@ pub enum Verdict {
     Pass,
     /// Pass, and post WM_DOCK_LAUNCHER_YIELDED (the UI runs the PowerToys answer check).
     PassNotify,
+    /// Pass under FULLSCREEN, and post WM_DOCK_LAUNCHER_PASSED: the UI checks the flag again (a window can leave
+    /// fullscreen without a foreground change), so a stale flag loses one press.
+    PassFullscreen,
     /// Swallow and post WM_DOCK_LAUNCHER with this sequence.
     SwallowPost(u32),
     SwallowSilent,
@@ -998,7 +1003,9 @@ impl ChordState {
                 self.last_failopen = self.ack.sent;
                 self.space = SpaceState::Passed;
             }
-            Some(Verdict::Pass | Verdict::PassNotify) if ev.down => self.space = SpaceState::Passed,
+            Some(Verdict::Pass | Verdict::PassNotify | Verdict::PassFullscreen) if ev.down => {
+                self.space = SpaceState::Passed
+            }
             Some(Verdict::Buffer) => {
                 if matches!(pushed, Some(Push::Stored | Push::Full)) {
                     self.set_buffered(ev.vk, true);
@@ -1029,7 +1036,12 @@ pub(crate) fn resolve_launcher(s: &ChordState, ev: KeyEv) -> Option<Verdict> {
             (SpaceState::Swallowed, _) => return Some(Verdict::SwallowSilent),
             (SpaceState::Passed, _) => return Some(Verdict::Pass),
             (SpaceState::Idle, true) if s.mods == chord.mods && !s.win_down && !ev.held => {
-                if s.flags.has(PassFlags::FULLSCREEN) || s.flags.has(PassFlags::REMOTE) {
+                // FULLSCREEN can be stale (a window left fullscreen without a foreground change): the note asks the UI
+                // to check it again.
+                if s.flags.has(PassFlags::FULLSCREEN) {
+                    return Some(Verdict::PassFullscreen);
+                }
+                if s.flags.has(PassFlags::REMOTE) {
                     return Some(Verdict::Pass);
                 }
                 if s.flags.has(PassFlags::YIELD) {
@@ -1072,6 +1084,8 @@ enum Act {
     Post(u32),
     /// Post WM_DOCK_LAUNCHER_YIELDED.
     Yielded,
+    /// Post WM_DOCK_LAUNCHER_PASSED.
+    Passed,
     /// Note to the hook thread (logged outside the callback): this sequence failed open.
     FailOpenNote(u32),
 }
@@ -1080,7 +1094,7 @@ enum Act {
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn swallow_of(v: Option<Verdict>, pushed: Option<Push>) -> Option<bool> {
     match v? {
-        Verdict::Pass | Verdict::PassNotify | Verdict::FailOpen => Some(false),
+        Verdict::Pass | Verdict::PassNotify | Verdict::PassFullscreen | Verdict::FailOpen => Some(false),
         Verdict::SwallowPost(_) | Verdict::SwallowSilent => Some(true),
         Verdict::Buffer => Some(!matches!(pushed, Some(Push::Closed))),
     }
@@ -1114,6 +1128,7 @@ fn chord_step(s: &mut ChordState, ring: &Ring, ev: KeyEv) -> (Option<bool>, Act)
     let act = match v {
         Some(Verdict::SwallowPost(seq)) => Act::Post(seq),
         Some(Verdict::PassNotify) => Act::Yielded,
+        Some(Verdict::PassFullscreen) => Act::Passed,
         Some(Verdict::FailOpen) if s.last_failopen != failopen_before => Act::FailOpenNote(s.last_failopen),
         _ => Act::Nothing,
     };
@@ -1390,6 +1405,7 @@ fn launcher_step(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods) -> Option<bool> {
             post_launcher(WM_DOCK_LAUNCHER, seq as usize, kb.time);
         }
         Act::Yielded => post_launcher(WM_DOCK_LAUNCHER_YIELDED, 0, kb.time),
+        Act::Passed => post_launcher(WM_DOCK_LAUNCHER_PASSED, 0, kb.time),
         Act::FailOpenNote(seq) => {
             // SAFETY: PostThreadMessageW is thread-safe; this thread has a message queue (thread_main's PeekMessageW).
             let _ = unsafe {
@@ -1488,6 +1504,8 @@ mod tests {
         seen: Vec<(u32, bool)>,
         posts: Vec<u32>,
         notes: Vec<u32>,
+        /// The WM_DOCK_LAUNCHER_PASSED notes (a chord passed under FULLSCREEN).
+        passed: u32,
     }
 
     impl Kbd {
@@ -1499,6 +1517,7 @@ mod tests {
                 seen: Vec::new(),
                 posts: Vec::new(),
                 notes: Vec::new(),
+                passed: 0,
             }
         }
 
@@ -1512,6 +1531,7 @@ mod tests {
             match act {
                 Act::Post(seq) => self.posts.push(seq),
                 Act::FailOpenNote(seq) => self.notes.push(seq),
+                Act::Passed => self.passed += 1,
                 Act::Yielded | Act::Nothing => {}
             }
             if swallow != Some(true) {
@@ -1588,10 +1608,11 @@ mod tests {
         assert_eq!(resolve_launcher(&s, ev(SPACE, true, 100)), Some(Verdict::SwallowPost(8)));
         // Each pass flag.
         for (f, v) in [
-            (PassFlags::FULLSCREEN, Verdict::Pass),
+            (PassFlags::FULLSCREEN, Verdict::PassFullscreen),
             (PassFlags::REMOTE, Verdict::Pass),
             (PassFlags::YIELD, Verdict::PassNotify),
-            (PassFlags::FULLSCREEN.with(PassFlags::YIELD), Verdict::Pass),
+            (PassFlags::FULLSCREEN.with(PassFlags::YIELD), Verdict::PassFullscreen),
+            (PassFlags::FULLSCREEN.with(PassFlags::REMOTE), Verdict::PassFullscreen),
         ] {
             let mut s = st();
             s.mods = Mods::ALT;
@@ -1626,6 +1647,16 @@ mod tests {
             assert_eq!(k.s, ChordState { mods: k.s.mods, ..before });
         }
         assert!(k.posts.is_empty() && !k.ring.ctl().is_open());
+        // A chord passed under FULLSCREEN posts one note per press (not for its repeat or release), so the UI checks
+        // the flag again: a window can leave fullscreen without a foreground change.
+        let mut k = Kbd::new();
+        k.s.flags = PassFlags::FULLSCREEN;
+        assert_eq!(k.chord(1_000), [None, Some(false), Some(false), None]);
+        assert_eq!((k.passed, k.posts.len()), (1, 0));
+        k.key(LALT, true, 1_990);
+        let press = [k.key(SPACE, true, 2_000), k.key(SPACE, true, 2_030)];
+        assert_eq!(press, [Some(false); 2], "the press and its repeat pass");
+        assert_eq!(k.passed, 2, "one note for the press, none for its repeat");
     }
 
     #[test]

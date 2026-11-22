@@ -503,6 +503,11 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             popup::popup_launcher::on_yielded(lp.0 as u32);
             Some(LRESULT(0))
         }
+        // The chord passed under FULLSCREEN (posted only while a chord is set): the pass flags are computed again.
+        crate::msg::WM_DOCK_LAUNCHER_PASSED => {
+            popup::popup_launcher::on_passed();
+            Some(LRESULT(0))
+        }
         // The close the launcher's first activation asked for, run outside it (posted by the launcher only): wParam =
         // the open's sequence.
         crate::msg::WM_DOCK_LAUNCHER_CLOSE => {

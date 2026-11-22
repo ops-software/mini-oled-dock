@@ -1951,6 +1951,22 @@ pub(crate) fn on_yielded(kb_time: u32) {
     crate::launcher_probe::yielded(on.then_some(kb_time));
 }
 
+/// `WM_DOCK_LAUNCHER_PASSED`: the hook passed a chord under FULLSCREEN.
+pub(crate) fn on_passed() {
+    if ON.with(Cell::get) {
+        pass_note(&mut RealHook, &RealSys);
+    }
+}
+
+/// A window can leave fullscreen without a foreground change (F11 in a browser, Esc out of a video, a borderless
+/// player): each chord passed under FULLSCREEN computes the flags again, so a stale flag loses one press (5.2.12).
+fn pass_note(hook: &mut dyn HookPort, sys: &dyn SysPort) {
+    foreground_flow(hook, sys);
+    if with_ctrl(|c| c.flags.has(PassFlags::FULLSCREEN)) == Some(false) {
+        log!("launcher: no fullscreen window in front any more, the next chord opens");
+    }
+}
+
 /// The pass flags of the window now in front, to the hook (a chord's FULLSCREEN is recomputed here).
 fn foreground_flow(hook: &mut dyn HookPort, sys: &dyn SysPort) {
     let over_pass = with_ctrl(|c| c.over_fullscreen_pass).unwrap_or(true);
@@ -3153,6 +3169,22 @@ mod tests {
         foreground_flow(&mut hook, &FakeSys { d3d: true, ..FakeSys::default() });
         assert_eq!(hook.passes.last(), Some(&PassFlags::FULLSCREEN), "exclusive D3D passes anyway");
         with_ctrl(|c| c.over_fullscreen_pass = true);
+    }
+
+    #[test]
+    fn pass_note_rechecks_fullscreen() {
+        // The note of a chord passed under FULLSCREEN computes the flags again: still fullscreen, the next chord passes
+        // too; the window left fullscreen without a foreground change, the flag clears and the next chord opens.
+        with_ctrl(|c| {
+            c.over_fullscreen_pass = true;
+            c.flags = PassFlags::FULLSCREEN;
+        });
+        let mut hook = FakeHook::default();
+        pass_note(&mut hook, &FakeSys { fs: true, ..FakeSys::default() });
+        assert_eq!(hook.passes, [PassFlags::FULLSCREEN]);
+        pass_note(&mut hook, &FakeSys { fs: false, ..FakeSys::default() });
+        assert_eq!(hook.passes.last(), Some(&PassFlags::default()), "the stale flag clears");
+        assert_eq!(with_ctrl(|c| c.flags), Some(PassFlags::default()));
     }
 
     #[test]
