@@ -47,6 +47,7 @@ mod jumplist;
 mod launcher;
 #[cfg(feature = "owner-probe")]
 mod launcher_probe;
+mod launcher_sys;
 mod logger;
 mod mem;
 mod metrics;

@@ -210,38 +210,30 @@ pub enum ShellRequest {
     // `ShellEvent::LaunchFailed`; the shared requests above never do. Logged as kind and length only.
     /// Open a file or folder of a result row: the path as it is, in one desktop-shell call (no
     /// `updated_exe_path`, no `is_dir`, no working directory).
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     OpenPath { path: String },
     /// Run as administrator a typed line or a file row's quoted path (Ctrl+Shift+Enter): `line` split
     /// at `file` (a byte range of it), run by the desktop shell with `runas` (Windows' UAC prompt; the
     /// dock's token is never used). Carries the hook-proven `Gesture`; built only by launcher_sys.rs
     /// (lint 1). The only launcher request with `runas`.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     RunAsTyped { line: String, file: Range<usize>, gesture: Gesture },
     /// Run a typed line (Enter) as it was typed: `line` split at `file`, unexpanded, no working
     /// directory. With `console` (a console program, or Shift+Enter) it runs as `cmd.exe /k <line>`,
     /// `cmd.exe` from `system_dir`.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     LaunchCommand { line: String, file: Range<usize>, console: bool },
     /// Show a result's file or folder selected in File Explorer (`explorer.exe /select,"<path>"` from
     /// the Windows folder), in one shell call: the path is never looked at on disk.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     RevealPath { path: String },
     /// Open a web address (a typed URL or a web search): checked again here, http or https only, and
     /// rebuilt from its parts before it reaches the shell (`rebuild_url`).
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     OpenUrl { url: String },
     /// `Launch` for the launcher (a catalogue app as `shell:AppsFolder\<id>`, a setting's target, the
     /// registry row): the same function, so the same updated-exe and folder logic, which exists for
     /// these targets only; nothing typed reaches it. Unlike `Launch`, a failure pushes `LaunchFailed`.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     LauncherLaunch { target: String, args: Option<String> },
     /// `LaunchAppAdmin` for the launcher: a failure pushes `LaunchFailed`.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     LauncherAppAdmin { id: String },
     /// `RevealApp` for the launcher: a failure pushes `LaunchFailed` (an app with no file to show is
     /// no failure).
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     LauncherRevealApp { id: String },
     /// Icons of the launcher's visible rows that lack one -> `ShellEvent::LauncherIcons`. Not a
     /// low-priority request: it runs ahead of the Start menu's batches, and a newer one replaces the
