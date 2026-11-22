@@ -1153,6 +1153,11 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
         install_mouse_hook();
     }
     let focused = crate::ui::force_foreground(hwnd);
+    // A close during the activation (the content's `focus` runs from WM_ACTIVATE inside SetForegroundWindow) leaves no
+    // popup to arm timers for: the tick would re-arm itself on a closed popup.
+    if with(|st| st.open.as_ref().map(|o| o.hwnd)).flatten() != Some(hwnd) {
+        return true;
+    }
     // SAFETY: `hwnd` is our window; the callbacks are in its wnd_proc.
     unsafe {
         // The foreground can be refused (lock, elevated app in front, a transient null foreground):

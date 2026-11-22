@@ -346,7 +346,8 @@ impl Launcher {
     }
 
     /// `focus` on the ports. At the first activation the keys the hook kept for this open's post are taken and replayed
-    /// into the session in order; losing the foreground ends the window (a no-op after the take).
+    /// into the session in order, and a close they ask for is posted; losing the foreground ends the window (a no-op
+    /// after the take).
     fn on_focus(&mut self, active: bool, cx: &Context, hook: &mut dyn HookPort, sys: &mut dyn SysPort) -> Reply {
         let view = self.set_foreground(active);
         if !active {
@@ -366,7 +367,15 @@ impl Launcher {
             return view;
         }
         let fx = self.session.replay(&keys, cx);
-        view.merge(self.run(fx, cx, sys))
+        let reply = self.run(fx, cx, sys);
+        // Never a close inside the first activation: it comes from WM_ACTIVATE inside the host's SetForegroundWindow
+        // (`ui::force_foreground`), whose later variants would take the foreground back from the window the close
+        // restores, switches to or launches. The queued effects, the restore and the switch stay as they are and the
+        // close is posted: posted messages come before input, so the keys typed after it still follow it.
+        if reply == Reply::Close && sys.defer_close(self.open_seq) {
+            return view;
+        }
+        view.merge(reply)
     }
 
     /// Runs the session's effects in order. The view's, the field's copy, Ctrl+W and the paste act at once; a Switch
@@ -447,6 +456,16 @@ impl Launcher {
     fn chord_again_on(&mut self, cx: &Context, sys: &mut dyn SysPort) -> Reply {
         let fx = self.session.chord_again();
         self.run(fx, cx, sys)
+    }
+
+    /// The close `on_focus` posted for the open of `seq` (`WM_DOCK_LAUNCHER_CLOSE`): Close for that open, nothing for a
+    /// launcher a later post opened.
+    fn close_posted(&self, seq: u32) -> Reply {
+        if seq == self.open_seq {
+            Reply::Close
+        } else {
+            Reply::None
+        }
     }
 
     /// The host is closing the popup, still shown: a Switch activates its window now.
@@ -1593,6 +1612,9 @@ pub(crate) trait SysPort {
     fn number_style(&self) -> NumberStyle;
     /// Closes the launcher without the session's Hide (no restore).
     fn close_quiet(&mut self);
+    /// Posts the close of the open of `seq` (`WM_DOCK_LAUNCHER_CLOSE`), to run outside the message being handled; false
+    /// when the post failed.
+    fn defer_close(&mut self, seq: u32) -> bool;
 }
 
 /// The proof of a person's Ctrl+Shift+Enter (SPEC 5.4.9), built only for that key: the hook's evidence is consumed by
@@ -1966,6 +1988,12 @@ fn session_end(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
     }
     with_ctrl(|c| c.last_query = None);
     hook.reset_mods();
+}
+
+/// `WM_DOCK_LAUNCHER_CLOSE` (wParam the open's sequence): the close a replay asked for at the first activation
+/// (`Launcher::on_focus`), now outside it; a launcher a later post opened stays.
+pub(crate) fn on_deferred_close(seq: u32) {
+    super::with_launcher(|l| l.close_posted(seq));
 }
 
 /// `ShellEvent::LauncherConverted` (the reply to `LauncherConvert`).
@@ -2410,6 +2438,7 @@ mod tests {
         CloseLauncher,
         CloseQuiet,
         Inject(Vec<(u16, bool)>),
+        DeferClose(u32),
     }
 
     #[derive(Default)]
@@ -2483,6 +2512,10 @@ mod tests {
         fn close_quiet(&mut self) {
             self.ops.push(Op::CloseQuiet);
         }
+        fn defer_close(&mut self, seq: u32) -> bool {
+            self.ops.push(Op::DeferClose(seq));
+            true
+        }
     }
 
     /// A kept key that types `c`.
@@ -2527,12 +2560,19 @@ mod tests {
         // At the first activation: the ring of the open's sequence is taken and acted on.
         let mut l = opened(7);
         let mut hook = FakeHook { ring: (7, ring), ..FakeHook::default() };
-        let reply = l.on_focus(true, &fx.cx(), &mut hook, &mut FakeSys::default());
+        let mut sys = FakeSys::default();
+        let reply = l.on_focus(true, &fx.cx(), &mut hook, &mut sys);
         assert_eq!(hook.takes, [7]);
         assert_eq!(l.session.query_text(), "calc");
-        assert_eq!(reply, Reply::Close, "Enter on the rows of \"calc\" launches");
+        // Enter on the rows of "calc" launches, but never from inside the activation (the host's SetForegroundWindow):
+        // only the focus change now, and the close posted for this open.
+        assert_eq!(reply, Reply::Relayout, "no close from the first activation");
+        assert_eq!(sys.ops, [Op::DeferClose(7)], "one deferred close, for the open's sequence");
         let calc = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
-        assert_eq!(l.queued, [Effect::Launch(LaunchReq::App(calc.into()))], "the Launch of Calcolatrice");
+        assert_eq!(l.queued, [Effect::Launch(LaunchReq::App(calc.into()))], "the Launch of Calcolatrice, still queued");
+        // The posted close closes this open only, not one a later post made.
+        assert_eq!(l.close_posted(7), Reply::Close);
+        assert_eq!(l.close_posted(8), Reply::None);
         // Once per open: a second activation takes nothing.
         l.on_focus(true, &fx.cx(), &mut hook, &mut FakeSys::default());
         assert_eq!(hook.takes, [7]);
@@ -2675,6 +2715,10 @@ mod tests {
         }
         fn close_quiet(&mut self) {
             self.ops.push("CloseQuiet".into());
+        }
+        fn defer_close(&mut self, seq: u32) -> bool {
+            self.ops.push(format!("DeferClose({seq})"));
+            true
         }
     }
 

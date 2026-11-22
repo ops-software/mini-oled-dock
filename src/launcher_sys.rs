@@ -451,6 +451,16 @@ impl SysPort for RealSys {
     fn close_quiet(&mut self) {
         popup::close("session end");
     }
+
+    fn defer_close(&mut self, seq: u32) -> bool {
+        let (msg, wp) = (crate::msg::WM_DOCK_LAUNCHER_CLOSE, WPARAM(seq as usize));
+        // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
+        let r = unsafe { PostMessageW(Some(crate::hwnd()), msg, wp, LPARAM(0)) };
+        if let Err(e) = &r {
+            log!("launcher: PostMessageW(WM_DOCK_LAUNCHER_CLOSE) failed: {e}");
+        }
+        r.is_ok()
+    }
 }
 
 /// The id of the probe's hotkey (the launcher's, "LA").

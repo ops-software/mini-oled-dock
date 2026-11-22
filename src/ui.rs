@@ -503,6 +503,12 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             popup::popup_launcher::on_yielded(lp.0 as u32);
             Some(LRESULT(0))
         }
+        // The close the launcher's first activation asked for, run outside it (posted by the launcher only): wParam =
+        // the open's sequence.
+        crate::msg::WM_DOCK_LAUNCHER_CLOSE => {
+            popup::popup_launcher::on_deferred_close(wp.0 as u32);
+            Some(LRESULT(0))
+        }
         // Registered only once a chord is set (`launcher_sys::watch_sessions`): lock and disconnects.
         windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
             popup::popup_launcher::on_session_change(wp.0 as u32);
@@ -3539,6 +3545,12 @@ pub fn force_foreground(h: HWND) -> bool {
     );
     if ok.as_bool() && is_foreground(h) {
         return true;
+    }
+    // A window hidden meanwhile (a popup closed during its own activation) is not pushed to the front: variants 2 and 3
+    // would take the foreground from the window the close gave it to and leave it on an invisible window.
+    // SAFETY: IsWindowVisible accepts any handle.
+    if !unsafe { IsWindowVisible(h) }.as_bool() {
+        return false;
     }
     let sent = send_f15();
     // SAFETY: `h` is our window.
