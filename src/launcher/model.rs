@@ -374,6 +374,10 @@ impl VerbSet {
         self.0 & (1 << (v as u8)) != 0
     }
 
+    pub const fn without(self, v: Verb) -> VerbSet {
+        VerbSet(self.0 & !(1 << (v as u8)))
+    }
+
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -515,6 +519,7 @@ mod tests {
     fn verb_set_and_mods() {
         let s = VerbSet::empty().with(Verb::Open).with(Verb::Forget);
         assert!(s.has(Verb::Open) && s.has(Verb::Forget) && !s.has(Verb::Copy));
+        assert!(!s.without(Verb::Forget).has(Verb::Forget) && s.without(Verb::Forget).has(Verb::Open));
         assert!(VerbSet::empty().is_empty());
         assert!(Mods(7).has(Mods::CTRL.with(Mods::SHIFT)));
         assert!(!Mods::CTRL.has(Mods::ALT));

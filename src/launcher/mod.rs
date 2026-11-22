@@ -7,6 +7,7 @@ pub mod calc;
 pub mod catalog;
 pub mod commands;
 pub mod field;
+pub mod gesture;
 pub mod history;
 pub mod keywords;
 pub mod model;

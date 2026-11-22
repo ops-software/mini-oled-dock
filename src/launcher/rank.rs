@@ -61,31 +61,41 @@ pub struct Indexed {
 impl Indexed {
     pub fn new(name: &str) -> Indexed {
         let mut x = Indexed::default();
+        x.reset(name);
+        x
+    }
+
+    /// The index of another name, built in place: the buffers are kept, so a provider that indexes names per
+    /// keystroke (window names and titles, the commands in the current language) allocates nothing once they are
+    /// large enough.
+    pub fn reset(&mut self, name: &str) {
+        self.folded.clear();
+        self.words.clear();
+        self.initials.clear();
         let mut in_word = false;
         let mut prev: Option<char> = None;
         for c in name.chars() {
             if c.is_alphanumeric() {
                 let starts = !in_word || prev.is_some_and(|p| p.is_lowercase() && c.is_uppercase());
-                let before = x.folded.len();
+                let before = self.folded.len();
                 if starts {
                     if let Ok(off) = u16::try_from(before) {
-                        x.words.push(off);
+                        self.words.push(off);
                     }
                 }
-                fold_char(c, &mut x.folded);
+                fold_char(c, &mut self.folded);
                 if starts {
-                    if let Some(first) = x.folded.get(before..).and_then(|t| t.chars().next()) {
-                        x.initials.push(first);
+                    if let Some(first) = self.folded.get(before..).and_then(|t| t.chars().next()) {
+                        self.initials.push(first);
                     }
                 }
                 in_word = true;
             } else {
-                fold_char(c, &mut x.folded);
+                fold_char(c, &mut self.folded);
                 in_word = false;
             }
             prev = Some(c);
         }
-        x
     }
 
     pub fn cand<'a>(&'a self, keys: &'a Keys, extra: &'a [&'static str], rank: u32) -> Cand<'a> {

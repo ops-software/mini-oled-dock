@@ -83,6 +83,25 @@ pub fn explorer_not_answering() -> &'static str {
 pub fn thousands() -> &'static str {
     tr("(thousands)", "(migliaia)")
 }
+/// Appended to the detail line of a window that does not answer ("<" mode).
+pub fn not_responding() -> &'static str {
+    tr(" · Not responding", " · Non risponde")
+}
+
+// ---- web, registry
+/// The web row (5.4.8): always names the host of the engine's template.
+pub fn search_web(host: &str, query: &str) -> String {
+    // The host passed validate_template (letters, digits, hyphens, dots), so it holds no "{q}" to replace again.
+    tr("Search {host} for '{q}'", "Cerca '{q}' su {host}").replace("{host}", host).replacen("{q}", query, 1)
+}
+/// The hint row of "??" alone.
+pub fn type_to_search(host: &str) -> String {
+    tr("Type to search {host}", "Scrivi per cercare su {host}").replace("{host}", host)
+}
+/// The one row of the registry mode (":").
+pub fn open_registry_editor() -> &'static str {
+    tr("Open Registry Editor", "Apri l'Editor del Registro di sistema")
+}
 
 // ---- the one-time offer (5.2.1)
 pub fn offer_text() -> &'static str {
