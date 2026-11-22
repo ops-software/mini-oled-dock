@@ -49,8 +49,8 @@ foreach ($line in $tree) {
   $crates[$key] = [pscustomobject]@{ Name = $Matches.n; Version = $Matches.v }
 }
 
-# Licence text -> crates using it.
-$groups = @{}
+# Licence text -> crates using it. Ordinal keys: texts that differ only in letter case stay apart.
+$groups = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([System.StringComparer]::Ordinal)
 foreach ($key in $crates.Keys) {
   $c = $crates[$key]
   $pkg = @($meta.packages | Where-Object { $_.name -eq $c.Name -and $_.version -eq $c.Version })
