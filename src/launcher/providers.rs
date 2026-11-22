@@ -875,7 +875,9 @@ impl Results {
         true
     }
 
-    /// Takes a row out (a closed window, a forgotten line); the selection moves to the row that takes its place.
+    /// Takes a row out (a closed window, a forgotten line). The selection moves to the row that takes its place only
+    /// when that row may be the default and is not destructive (5.2.7): nobody chose it, and Enter runs what is
+    /// selected. Otherwise nothing is selected.
     pub fn remove(&mut self, key: ItemKey) -> Option<Item> {
         let i = self.rows.iter().position(|r| r.key == key)?;
         let item = self.rows.remove(i);
@@ -885,7 +887,8 @@ impl Results {
             self.late_len -= 1;
         }
         if self.sel == Some(key) {
-            self.sel = self.rows.get(i).or_else(|| self.rows.last()).map(|r| r.key);
+            let next = self.rows.get(i).or_else(|| self.rows.last());
+            self.sel = next.filter(|r| !r.destructive && self.may_default(r)).map(|r| r.key);
         }
         Some(item)
     }

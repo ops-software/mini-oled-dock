@@ -1054,6 +1054,41 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_w_never_hands_the_selection_to_a_destructive_row() {
+        use crate::launcher::catalog::CatApp;
+        use crate::launcher::model::WindowRow;
+        use crate::start_search::Keys;
+        let mut fx = Fx::new();
+        fx.apps.push(CatApp::new("ShareX", "ShareX", Keys::default(), 50));
+        fx.windows.push(WindowRow {
+            hwnd: 0x3003,
+            group_key: "c:\\tools\\sharex.exe".into(),
+            aumid: None,
+            name: "ShareX".into(),
+            name_folded: "sharex".into(),
+            title: Some("ShareX".into()),
+            hung: false,
+        });
+        let mut s = typed(&fx, "sh");
+        let titles: Vec<&str> = s.rows().iter().map(|r| &*r.title).collect();
+        assert_eq!(titles[..2], ["ShareX", "Shut down"], "the running app sits right above Shut down");
+        assert!(s.rows()[1].destructive);
+        assert_eq!(sel_title(&s), Some("ShareX"));
+        press(&mut s, &fx, VK_UP, Mods::NONE);
+        assert_eq!(press(&mut s, &fx, VK_W, Mods::CTRL), [Effect::CloseWindow(0x3003), Effect::Relayout]);
+        assert_eq!(s.rows()[0].title.as_ref(), "Shut down", "Shut down took its place");
+        assert!(!s.selected().is_some_and(|r| r.destructive), "never selected by default below 4 characters");
+        let out = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert!(!out.iter().any(|e| matches!(e, Effect::Power(_))), "{out:?}");
+        // Chosen by arrow, it runs (5.2.7).
+        press(&mut s, &fx, VK_HOME, Mods::CTRL);
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Power(CommandId::ShutDown)]
+        );
+    }
+
+    #[test]
     fn open_path_is_passed_untouched() {
         let fx = Fx::new();
         let path = "C:\\Users\\%USERNAME%\\a b.txt";
