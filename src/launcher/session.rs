@@ -84,6 +84,19 @@ pub enum ReplayKey {
     Key(KeyEvent),
 }
 
+/// The row under the pointer, its generation and since when (the 300 ms rule of 5.2.7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Hover {
+    key: ItemKey,
+    gen: u64,
+    since_ms: u64,
+}
+
+/// The pointer takes the selection only after this much travel since the last key (5.2.10).
+const POINTER_TRAVEL_PX: i64 = 8;
+/// A destructive row runs on a click only after this long under the pointer, unchanged (5.2.7).
+const DESTRUCTIVE_HOVER_MS: u64 = 300;
+
 /// The mode chip: a recognised prefix taken out of the field.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Chip {
@@ -135,6 +148,10 @@ pub struct Session {
     /// The mode and the folded text of the current rows (Tab).
     mode: Mode,
     folded: String,
+    /// The pointer's first position after the last key, and whether it has travelled 8 px since.
+    pointer_from: Option<(i32, i32)>,
+    pointer_live: bool,
+    hover: Option<Hover>,
 }
 
 fn mru_window(cx: &Context, group: &str) -> Option<isize> {
@@ -190,6 +207,9 @@ impl Session {
             budget: Budget::default(),
             mode: Mode::Mixed,
             folded: String::new(),
+            pointer_from: None,
+            pointer_live: false,
+            hover: None,
         }
     }
 
@@ -257,6 +277,7 @@ impl Session {
 
     /// Typed characters (WM_CHAR). Control characters are keys, handled by `key`, never text.
     pub fn chars(&mut self, s: &str, cx: &Context) -> Vec<Effect> {
+        self.keyed();
         let text: String = s.chars().filter(|c| !c.is_control()).collect();
         if text.is_empty() {
             return Vec::new();
@@ -267,6 +288,7 @@ impl Session {
     /// The clipboard's text (after `Effect::Paste`): line breaks and tabs become spaces, cut at 256 characters;
     /// control and bidi characters are kept and drawn as markers.
     pub fn paste(&mut self, text: &str, cx: &Context) -> Vec<Effect> {
+        self.keyed();
         self.edit(Edit::Insert(text.into()), cx)
     }
 
@@ -311,6 +333,7 @@ impl Session {
 
     /// One key down (WM_KEYDOWN or WM_SYSKEYDOWN). `gesture` is the hook's proof of a person's Ctrl+Shift+Enter.
     pub fn key(&mut self, ev: KeyEvent, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        self.keyed();
         let m = ev.mods;
         let plain = m == Mods::NONE;
         let ctrl = m.has(Mods::CTRL);
@@ -348,6 +371,65 @@ impl Session {
             VK_NEXT if plain => self.move_selection(isize::from(self.rows.max(1))),
             VK_TAB if plain => self.complete(cx),
             _ => Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------------- the pointer
+
+    /// A key: the pointer has to travel again before it takes the selection.
+    fn keyed(&mut self) {
+        self.pointer_from = None;
+        self.pointer_live = false;
+    }
+
+    /// Notes which row (and generation) is under the pointer and since when.
+    fn hover_at(&mut self, row: Option<usize>, now_ms: u64) {
+        let gen = self.gen;
+        let under = row.and_then(|i| self.rows().get(i)).map(|r| r.key);
+        self.hover = match (under, self.hover) {
+            (Some(key), Some(h)) if h.key == key && h.gen == gen => Some(h),
+            (Some(key), _) => Some(Hover { key, gen, since_ms: now_ms }),
+            (None, _) => None,
+        };
+    }
+
+    /// The pointer moved to (x, y) over `row` (the view's hit test). It takes the selection only after 8 px of travel
+    /// since the last key, so a resting pointer never steals the keyboard's choice.
+    pub fn pointer(&mut self, x: i32, y: i32, row: Option<usize>, now_ms: u64) -> Vec<Effect> {
+        self.hover_at(row, now_ms);
+        let (x0, y0) = *self.pointer_from.get_or_insert((x, y));
+        if !self.pointer_live {
+            let dx = i64::from(x) - i64::from(x0);
+            let dy = i64::from(y) - i64::from(y0);
+            let travel = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+            self.pointer_live = travel >= POINTER_TRAVEL_PX * POINTER_TRAVEL_PX;
+        }
+        match row {
+            Some(i) if self.pointer_live => self.pick(i),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A click on `row` runs its primary verb. A destructive row runs only when that row, of this generation, has been
+    /// under the pointer for 300 ms; an earlier click (or one on a row that just moved there) only selects it.
+    pub fn click(&mut self, row: usize, now_ms: u64, cx: &Context) -> Vec<Effect> {
+        self.hover_at(Some(row), now_ms);
+        let Some(item) = self.rows().get(row).cloned() else { return Vec::new() };
+        let selected = self.pick(row);
+        if item.destructive {
+            let gen = self.gen;
+            let held = self.hover.is_some_and(|h| {
+                h.key == item.key && h.gen == gen && now_ms.saturating_sub(h.since_ms) >= DESTRUCTIVE_HOVER_MS
+            });
+            if !held {
+                return selected;
+            }
+        }
+        let run = self.primary(&item, cx);
+        if run.is_empty() {
+            selected
+        } else {
+            run
         }
     }
 
@@ -1060,5 +1142,79 @@ mod tests {
         // Characters from WM_CHAR never carry control codes into the field.
         s.chars("\u{1}\r", &fx.cx());
         assert_eq!(s.query_text(), "sta  b");
+    }
+
+    #[test]
+    fn destructive_click_needs_300_ms() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "riav");
+        let i = s.rows().iter().position(|r| r.payload == Payload::Command(CommandId::Restart)).unwrap();
+        s.pointer(10, 10, Some(i), 1_000);
+        assert!(!s.click(i, 1_299, &fx.cx()).iter().any(|e| matches!(e, Effect::Power(_))), "too early: selects");
+        assert_eq!(s.selected_index(), Some(i));
+        assert_eq!(s.click(i, 1_300, &fx.cx()), [Effect::Hide { restore: false }, Effect::Power(CommandId::Restart)]);
+        // A click with no hover before it starts the 300 ms.
+        let mut s = typed(&fx, "riav");
+        assert!(!s.click(i, 5_000, &fx.cx()).iter().any(|e| matches!(e, Effect::Power(_))));
+        assert_eq!(s.click(i, 5_300, &fx.cx()), [Effect::Hide { restore: false }, Effect::Power(CommandId::Restart)]);
+        // Moving to another row and back starts again.
+        let mut s = typed(&fx, "riav");
+        s.pointer(10, 10, Some(i), 0);
+        s.pointer(10, 60, None, 200);
+        s.pointer(10, 10, Some(i), 400);
+        assert!(!s.click(i, 600, &fx.cx()).iter().any(|e| matches!(e, Effect::Power(_))));
+        // Any other row runs at the first click.
+        let mut s = typed(&fx, "calcolatrice");
+        assert_eq!(
+            s.click(0, 0, &fx.cx()),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App(CALC_ID.into()))]
+        );
+        assert!(s.click(99, 0, &fx.cx()).is_empty());
+    }
+
+    #[test]
+    fn pointer_needs_8px() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "st");
+        assert_eq!(s.selected_index(), Some(0));
+        assert!(s.pointer(100, 100, Some(2), 0).is_empty());
+        assert!(s.pointer(103, 104, Some(2), 10).is_empty(), "5 px");
+        assert!(s.pointer(105, 106, Some(2), 20).is_empty(), "7.8 px");
+        assert_eq!(s.selected_index(), Some(0));
+        assert_eq!(s.pointer(106, 106, Some(2), 30), [Effect::Redraw], "8.5 px");
+        assert_eq!(s.selected_index(), Some(2));
+        assert_eq!(s.pointer(107, 120, Some(3), 40), [Effect::Redraw]);
+        assert!(s.pointer(107, 121, None, 50).is_empty(), "off the rows the selection stays");
+        assert_eq!(s.selected_index(), Some(3));
+        // A key: the pointer has to travel again.
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(s.selected_index(), Some(4));
+        assert!(s.pointer(108, 106, Some(1), 60).is_empty());
+        assert!(s.pointer(110, 110, Some(1), 70).is_empty());
+        assert_eq!(s.selected_index(), Some(4));
+        // A row chosen by the pointer counts as chosen for Ctrl+W.
+        let mut s = typed(&fx, "<");
+        s.pointer(0, 0, Some(1), 0);
+        s.pointer(0, 20, Some(1), 10);
+        assert_eq!(press(&mut s, &fx, VK_W, Mods::CTRL), [Effect::CloseWindow(0x2002), Effect::Relayout]);
+        // Far-away coordinates do not overflow.
+        let mut s = typed(&fx, "st");
+        s.pointer(i32::MIN, i32::MIN, Some(1), 0);
+        assert_eq!(s.pointer(i32::MAX, i32::MAX, Some(1), 1), [Effect::Redraw]);
+    }
+
+    #[test]
+    fn click_on_a_row_that_just_moved_only_selects() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "ri");
+        assert_eq!(sel_title(&s), Some("Calcolatrice"));
+        s.pointer(10, 10, Some(0), 0);
+        // A keystroke later the row under the resting pointer is Restart, of a new generation.
+        s.chars("a", &fx.cx());
+        assert_eq!(s.rows()[0].payload, Payload::Command(CommandId::Restart));
+        let out = s.click(0, 1_000, &fx.cx());
+        assert!(!out.iter().any(|e| matches!(e, Effect::Power(_) | Effect::Hide { .. })), "{out:?}");
+        assert_eq!(s.selected_index(), Some(0));
+        assert_eq!(s.click(0, 1_300, &fx.cx()), [Effect::Hide { restore: false }, Effect::Power(CommandId::Restart)]);
     }
 }
