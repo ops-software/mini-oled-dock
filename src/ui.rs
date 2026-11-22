@@ -2500,6 +2500,22 @@ fn launch_target(e: &Entry) -> Option<String> {
     }
 }
 
+/// Draws the bar's icon of the group `key` (a `size` px square at `(x, y)`) on a popup surface, for the launcher's rows of
+/// running programs that are not in the catalogue. false when the bar has no icon for it yet, or its state is borrowed.
+pub(crate) fn paint_bar_icon(s: &mut crate::surface::Surface, key: &str, x: i32, y: i32, size: i32) -> bool {
+    UI.with(|u| {
+        let Ok(st) = u.try_borrow() else { return false };
+        let icon = st.entries.iter().find(|e| same_key(&e.key, key) || same_key(&e.group_key, key)).and_then(|e| e.icon.as_ref());
+        match icon {
+            Some(b) => {
+                s.blit(b, x, y, size, 255);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
 pub(crate) fn launch_target_str(target: &str) {
     shell_thread::request(ShellRequest::Launch { target: target.to_string(), args: None });
 }

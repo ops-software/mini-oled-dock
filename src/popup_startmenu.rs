@@ -655,7 +655,7 @@ fn tail_fit(s: &Surface, text: &str, max_w: i32) -> String {
 }
 
 /// Magnifier glyph (16x16 space): a ring and a handle towards the bottom right.
-fn magnifier(u: f32, v: f32) -> bool {
+pub(crate) fn magnifier(u: f32, v: f32) -> bool {
     let (dx, dy) = (u - 6.5, v - 6.5);
     if ((dx * dx + dy * dy).sqrt() - 4.6).abs() <= 0.85 {
         return true;

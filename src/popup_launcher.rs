@@ -1,20 +1,703 @@
-//! The launcher popup (SPEC-launcher 5.2 and 5.5): the content the popup host shows for `PopupKind::Launcher`.
-//! L1a-13 adds this stub (an empty 640 x 62 frame); L1a-14 fills the view and L1a-15 the chord flow, replacing the
-//! bodies and keeping these signatures.
+//! The launcher popup (SPEC-launcher 5.2, 5.3 and 5.5): the content the popup host shows for `PopupKind::Launcher`.
+//! L1a-13 added the stub; L1a-14 (this file) is the view: layout and painting of the field, the mode chip, the result rows,
+//! the detail and review lines, the hint and the scrollbar, all from the `Session` the content holds. L1a-15 wires the
+//! chord flow (keys, effects, the Context) through the signatures that exist here.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use windows::Win32::Foundation::HWND;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::KillTimer;
 
-use super::{Content, PopupKind, Reply};
+use super::{center_y, Content, HitMap, PopupKind, Reply};
+use crate::glyphs;
+use crate::icons::IconBitmap;
+use crate::launcher::gesture;
+use crate::launcher::model::{GlyphId, IconRef, Item, Kind, Payload, ProviderId, Verb};
+use crate::launcher::providers::LauncherOpts;
+use crate::launcher::session::Session;
+use crate::launcher::strings;
 use crate::launcher::style;
-use crate::surface::Surface;
+use crate::launcher::verbs;
+use crate::render::Metrics;
+use crate::surface::{rect_wh, Font, Surface, WHITE};
 
 /// Height of the empty panel, the field alone (logical px, SPEC 5.2.3).
 const EMPTY_H: i32 = 62;
+/// Height of the mode chip (logical px).
+const CHIP_H: i32 = 24;
+/// Horizontal padding of the mode chip.
+const CHIP_PAD: i32 = style::S_3;
+/// Gap between the chip and the query.
+const CHIP_GAP: i32 = 8;
+/// Height of the caret (logical px, SPEC 5.3).
+const CARET_H: i32 = 18;
+/// Distance of the name from the top of a row that has a detail line, and of the detail from the name.
+const NAME_TOP: i32 = 4;
+const DETAIL_GAP: i32 = 2;
+/// The running indicator: 8 x 2, 3 px under the icon.
+const PILL_W: i32 = 8;
+const PILL_H: i32 = 2;
+const PILL_GAP: i32 = 3;
+/// Space between a long name and the hint (logical px).
+const HINT_GAP: i32 = 12;
+/// A hidden-scrollbar countdown in ticks of the popup's 1 s timer: the bar shows for 1 to 2 s after a scroll.
+const SCROLLBAR_TICKS: u8 = 2;
+/// Wheel notches move this many rows.
+const WHEEL_ROWS: usize = 1;
+/// The review and a notice show at most this many lines.
+const MAX_LINES: usize = style::MAX_REVIEW_LINES;
+
+const ID_FIELD: u32 = 1;
+const ID_ROW: u32 = 100;
+
+// ---------------------------------------------------------------- text runs and markers
+
+/// A piece of text drawn in one style: plain, or a marker (SPEC 5.3: a control or bidi character shown visibly).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Run {
+    text: String,
+    marker: bool,
+}
+
+/// The width of each character of `text` as it is drawn (a marker by its display text).
+fn char_widths(s: &Surface, text: &str) -> Vec<i32> {
+    text.chars().map(|c| s.text_width(&unit(c).text, Font::Normal)).collect()
+}
+
+/// The width of the characters of `text` before the byte offset `at`.
+fn prefix_width(widths: &[i32], text: &str, at: usize) -> i32 {
+    let n = text.get(..at).map_or(0, |t| t.chars().count());
+    widths.iter().take(n).sum()
+}
+
+/// How a marker character is drawn: control pictures for C0 and DEL, "<U+XXXX>" for the rest.
+fn marker_text(c: char) -> Option<String> {
+    if !gesture::is_marker(c) {
+        return None;
+    }
+    let u = u32::from(c);
+    Some(match u {
+        0..=0x1F => char::from_u32(0x2400 + u).map_or_else(|| format!("<U+{u:04X}>"), String::from),
+        0x7F => String::from('\u{2421}'),
+        _ => format!("<U+{u:04X}>"),
+    })
+}
+
+/// One character as a run of its own.
+fn unit(c: char) -> Run {
+    match marker_text(c) {
+        Some(text) => Run { text, marker: true },
+        None => Run { text: c.to_string(), marker: false },
+    }
+}
+
+/// Appends a run, merging it into the last one of the same kind.
+fn push_run(runs: &mut Vec<Run>, r: Run) {
+    match runs.last_mut() {
+        Some(last) if last.marker == r.marker => last.text.push_str(&r.text),
+        _ => runs.push(r),
+    }
+}
+
+/// The text as runs: markers apart from the rest.
+fn runs_of(text: &str) -> Vec<Run> {
+    let mut out = Vec::new();
+    for c in text.chars() {
+        push_run(&mut out, unit(c));
+    }
+    out
+}
+
+/// Draws the runs from `x` and returns the x after the last. Markers are FG_SECONDARY with a 2 px ACCENT_ATTENTION
+/// underline.
+fn draw_runs(s: &mut Surface, runs: &[Run], mut x: i32, y: i32, font: Font, alpha: u32) -> i32 {
+    let m = s.metrics();
+    let lh = s.line_height(font);
+    for r in runs {
+        let w = s.text_width(&r.text, font);
+        if r.marker {
+            s.text(&r.text, x, y, font, WHITE, style::FG_SECONDARY);
+            let bar = m.px(2).max(1);
+            s.fill_rr(rect_wh(x, y + lh - bar, w, bar), 0, style::ACCENT_ATTENTION, 255);
+        } else {
+            s.text(&r.text, x, y, font, WHITE, alpha);
+        }
+        x += w;
+    }
+    x
+}
+
+/// Draws `text` on one line in `max_w` px: ellipsized at the end, or clipped when it holds markers.
+fn draw_line(s: &mut Surface, text: &str, x: i32, y: i32, max_w: i32, font: Font, alpha: u32) {
+    if text.chars().any(gesture::is_marker) {
+        let lh = s.line_height(font);
+        s.set_clip(Some(rect_wh(x, y, max_w.max(0), lh)));
+        draw_runs(s, &runs_of(text), x, y, font, alpha);
+        s.set_clip(None);
+    } else {
+        let shown = s.ellipsize(text, font, max_w);
+        s.text(&shown, x, y, font, WHITE, alpha);
+    }
+}
+
+/// `text` cut in the middle with "..." so that it fits `max_w` (a path keeps its end).
+fn ellipsize_middle(s: &Surface, text: &str, font: Font, max_w: i32) -> String {
+    if s.text_width(text, font) <= max_w {
+        return text.to_string();
+    }
+    let n = text.chars().count();
+    let build = |keep: usize| -> String {
+        let (head, tail) = (keep.div_ceil(2), keep / 2);
+        let mut out: String = text.chars().take(head).collect();
+        out.push('\u{2026}');
+        out.extend(text.chars().skip(n.saturating_sub(tail)));
+        out
+    };
+    let (mut lo, mut hi) = (0usize, n.saturating_sub(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if s.text_width(&build(mid), font) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    build(lo)
+}
+
+/// `text` wrapped over lines of `max_w` px: at the last space that fits, else inside a word. Stops one line past
+/// `max_lines`, so the caller can tell a text that does not fit from one that does.
+fn wrap(s: &Surface, text: &str, font: Font, max_w: i32, max_lines: usize) -> Vec<Vec<Run>> {
+    let mut lines: Vec<Vec<Run>> = Vec::new();
+    let mut cur: Vec<Run> = Vec::new();
+    let mut cur_w = 0;
+    let mut last_break: Option<usize> = None;
+    let flush = |units: Vec<Run>| -> Vec<Run> {
+        let mut merged = Vec::new();
+        for u in units {
+            push_run(&mut merged, u);
+        }
+        merged
+    };
+    for c in text.chars() {
+        let u = unit(c);
+        let w = s.text_width(&u.text, font);
+        if cur_w + w > max_w && !cur.is_empty() {
+            let split = last_break.unwrap_or(cur.len());
+            let rest = cur.split_off(split);
+            lines.push(flush(cur));
+            if lines.len() > max_lines {
+                return lines;
+            }
+            cur = rest;
+            cur_w = cur.iter().map(|r| s.text_width(&r.text, font)).sum();
+            last_break = None;
+        }
+        let is_space = !u.marker && u.text == " ";
+        cur.push(u);
+        cur_w += w;
+        if is_space {
+            last_break = Some(cur.len());
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(flush(cur));
+    }
+    lines
+}
+
+// ---------------------------------------------------------------- the view
+
+/// What the last layout decided: rectangles in client px, for painting and for the hit test.
+#[derive(Clone, Default)]
+struct Geo {
+    w: i32,
+    h: i32,
+    field: RECT,
+    /// The visible rows, top to bottom.
+    rows: Vec<RowGeo>,
+    /// The rows that do not fit are below (or above): the scrollbar's track, and the visible window.
+    first: usize,
+    total: usize,
+    track: RECT,
+}
+
+#[derive(Clone)]
+struct RowGeo {
+    idx: usize,
+    rect: RECT,
+    /// The detail shown wrapped over several lines (a review, a notice); empty for the one-line detail.
+    lines: Vec<Vec<Run>>,
+}
 
 /// The launcher's popup content.
-pub(crate) struct Launcher;
+pub(crate) struct Launcher {
+    session: Session,
+    /// Panel width (logical px, 560-880).
+    width: i32,
+    /// Rows shown at most (4-12, the setting).
+    max_rows: usize,
+    /// Largest height the popup may take (physical px).
+    max_h: i32,
+    /// The launcher is the foreground window: caret, selected plate and hint show only then.
+    foreground: bool,
+    /// App icons by lower-case id, the bar's by "bar:" and the lower-case group key.
+    icons: HashMap<String, IconBitmap>,
+    /// First visible row, and the selection the last layout saw (the view follows a new selection, not a wheel).
+    first: Cell<usize>,
+    last_sel: Cell<Option<usize>>,
+    /// Horizontal scroll of the query (physical px) that keeps the caret in the field.
+    scroll: Cell<i32>,
+    /// Visible rows of the last layout, for the wheel.
+    count: Cell<usize>,
+    geo: RefCell<Geo>,
+    /// The height last given to the host, and whether a shrink waits (120 ms without a keystroke).
+    shown_h: i32,
+    hold_shrink: bool,
+    /// Ticks the scrollbar still shows after a scroll.
+    bar_ticks: Cell<u8>,
+}
+
+impl Launcher {
+    fn with_session(session: Session) -> Launcher {
+        Launcher {
+            session,
+            width: style::LAUNCHER_W,
+            max_rows: usize::from(style::ROWS_DEFAULT),
+            max_h: i32::MAX,
+            foreground: false,
+            icons: HashMap::new(),
+            first: Cell::new(0),
+            last_sel: Cell::new(None),
+            scroll: Cell::new(0),
+            count: Cell::new(0),
+            geo: RefCell::new(Geo::default()),
+            shown_h: 0,
+            hold_shrink: false,
+            bar_ticks: Cell::new(0),
+        }
+    }
+
+    /// The session the keys and the late batches go to (L1a-15).
+    // The chord flow of L1a-15 reaches the session through it; until then only the tests do.
+    #[allow(dead_code)]
+    pub(crate) fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    /// Panel width in logical px and the visible rows (the settings of L1a-11).
+    // L1a-15 hands the config's values over at open.
+    #[allow(dead_code)]
+    pub(crate) fn set_shape(&mut self, width: i32, rows: u8) {
+        self.width = width.clamp(*style::WIDTH_RANGE.start(), *style::WIDTH_RANGE.end());
+        self.max_rows =
+            usize::from(rows).clamp(usize::from(*style::ROWS_RANGE.start()), usize::from(*style::ROWS_RANGE.end()));
+    }
+
+    /// An icon arrived: an app id, or "bar:" + group key, lower-case (L1a-16).
+    // The icon cache of L1a-16 fills it.
+    #[allow(dead_code)]
+    pub(crate) fn set_icon(&mut self, key: &str, bmp: IconBitmap) {
+        self.icons.insert(key.to_lowercase(), bmp);
+    }
+
+    /// A shrink waits (while the user types) or is let go (120 ms without a keystroke): growing is never held.
+    // The TIMER_LAUNCHER_SHRINK of L1a-15 toggles it.
+    #[allow(dead_code)]
+    pub(crate) fn hold_shrink(&mut self, on: bool) {
+        self.hold_shrink = on;
+    }
+
+    // ------------------------------------------------------------ layout
+
+    /// The lines under the name of a row: a notice's text or the selected row's review, wrapped; empty for the others.
+    fn detail_lines(&self, s: &Surface, item: &Item, selected: bool) -> Vec<Vec<Run>> {
+        let m = s.metrics();
+        let max_w = hint_right(m, self.width) - m.px(style::NAME_X);
+        if item.kind == Kind::Notice {
+            let Some(text) = item.detail.as_deref() else { return Vec::new() };
+            let mut lines = wrap(s, text, Font::Caption, max_w, MAX_LINES);
+            if lines.len() > MAX_LINES {
+                lines.truncate(MAX_LINES);
+                if let Some(last) = lines.last_mut() {
+                    push_run(last, Run { text: "\u{2026}".to_string(), marker: false });
+                }
+            }
+            return lines;
+        }
+        if !selected || !self.foreground {
+            return Vec::new();
+        }
+        match review_text(item) {
+            Some(text) => {
+                let lines = wrap(s, text, Font::Caption, max_w, MAX_LINES);
+                if lines.len() > MAX_LINES {
+                    Vec::new()
+                } else {
+                    lines
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// How many CAPTION lines the review of the selected row needs, capped one past the limit (the session's measure).
+    fn review_lines(&self, s: &Surface) -> Option<u8> {
+        let item = self.session.selected()?;
+        let text = review_text(item)?;
+        let m = s.metrics();
+        let max_w = hint_right(m, self.width) - m.px(style::NAME_X);
+        let n = wrap(s, text, Font::Caption, max_w, MAX_LINES).len().min(MAX_LINES + 1);
+        u8::try_from(n.max(1)).ok()
+    }
+
+    /// Places everything for the surface's metrics and the session as it is now.
+    fn layout(&self, s: &Surface) -> Geo {
+        let m = s.metrics();
+        let w = m.px(self.width);
+        let inset = m.px(style::S_4);
+        let field =
+            rect_wh(m.px(style::FIELD_X), m.px(style::FIELD_Y), w - 2 * m.px(style::FIELD_X), m.px(style::SEARCH_H));
+        self.follow_caret(s, &field);
+        let rows = self.session.rows();
+        let total = rows.len();
+        if total == 0 {
+            self.count.set(0);
+            self.first.set(0);
+            self.last_sel.set(self.session.selected_index());
+            return Geo { w, h: m.px(EMPTY_H), field, ..Geo::default() };
+        }
+        let top = m.px(style::LIST_Y);
+        let avail = (self.max_h.saturating_sub(top + inset)).max(0);
+        let sel = self.session.selected_index();
+        let base = m.px(style::ROW_COMFORT);
+        let step = m.px(style::REVIEW_LINE);
+        // The rows from `first` that fit: their count and rectangles.
+        let fit = |first: usize| -> Vec<RowGeo> {
+            let mut out: Vec<RowGeo> = Vec::new();
+            let mut y = top;
+            for (idx, item) in rows.iter().enumerate().skip(first).take(self.max_rows) {
+                let lines = self.detail_lines(s, item, sel == Some(idx));
+                let extra = i32::try_from(lines.len().saturating_sub(1)).unwrap_or(0);
+                let h = base + extra * step;
+                if !out.is_empty() && y + h - top > avail {
+                    break;
+                }
+                out.push(RowGeo {
+                    idx,
+                    rect: rect_wh(m.px(style::FIELD_X), y, w - 2 * m.px(style::FIELD_X), h),
+                    lines,
+                });
+                y += h;
+            }
+            out
+        };
+        let mut first = self.first.get().min(total.saturating_sub(1));
+        let mut shown = fit(first);
+        if let (Some(i), true) = (sel, self.last_sel.get() != sel) {
+            if i < first {
+                first = i;
+                shown = fit(first);
+            }
+            while i >= first + shown.len() && first < i {
+                first += 1;
+                shown = fit(first);
+            }
+        }
+        // A wheel past the end, or fewer rows than before: never an empty window.
+        while first > 0 && first + shown.len() > total {
+            first -= 1;
+            shown = fit(first);
+        }
+        if first != self.first.get() {
+            self.bar_ticks.set(SCROLLBAR_TICKS);
+        }
+        self.first.set(first);
+        self.last_sel.set(sel);
+        self.count.set(shown.len());
+        let list_bottom = shown.last().map_or(top, |r| r.rect.bottom);
+        let h = list_bottom + inset;
+        let track = RECT {
+            left: w - m.px(style::SCROLLBAR_X_INSET) - m.px(style::SCROLLBAR_W),
+            top,
+            right: w - m.px(style::SCROLLBAR_X_INSET),
+            bottom: list_bottom,
+        };
+        Geo { w, h, field, rows: shown, first, total, track }
+    }
+
+    /// Keeps the caret inside the query's room (the field's width less the chip and the margins).
+    fn follow_caret(&self, s: &Surface, field: &RECT) {
+        let m = s.metrics();
+        let (_, room) = self.query_room(s, field);
+        let text = self.session.query_text();
+        let widths = char_widths(s, text);
+        let caret_x = prefix_width(&widths, text, self.session.field().caret());
+        let whole: i32 = widths.iter().sum();
+        let mut scroll = self.scroll.get();
+        let slack = m.px(2);
+        if caret_x - scroll > room - slack {
+            scroll = caret_x - room + slack;
+        }
+        if caret_x < scroll {
+            scroll = caret_x;
+        }
+        if whole + slack <= room {
+            scroll = 0;
+        }
+        self.scroll.set(scroll.max(0));
+    }
+
+    /// Where the query starts (physical px) and how wide its room is.
+    fn query_room(&self, s: &Surface, field: &RECT) -> (i32, i32) {
+        let m = s.metrics();
+        let mut tx = m.px(style::NAME_X);
+        if let Some(p) = self.session.chip() {
+            tx += chip_width(s, p) + m.px(CHIP_GAP);
+        }
+        (tx, field.right - m.px(style::S_4) - tx)
+    }
+
+    // ------------------------------------------------------------ painting
+
+    fn paint_field(&self, s: &mut Surface, g: &Geo, hot: bool) {
+        let m = s.metrics();
+        let f = g.field;
+        let r = m.px(style::R_S);
+        s.fill_rr(f, r, WHITE, if hot { style::FILL_CONTROL_HOT } else { style::FILL_CONTROL });
+        s.stroke_rr(f, r, m.px(1).max(1), style::RIM_CONTROL);
+        let gs = m.px(style::ICON_S);
+        let gx = f.left + m.px(16);
+        s.glyph(gx, f.top + (f.bottom - f.top - gs) / 2, gs, style::FG_SECONDARY, &super::popup_startmenu::magnifier);
+        let lit = self.foreground;
+        let text_alpha = if lit { style::FG_PRIMARY } else { style::FG_TERTIARY };
+        if let Some(p) = self.session.chip() {
+            let cw = chip_width(s, p);
+            let ch = m.px(CHIP_H);
+            let rc = rect_wh(m.px(style::NAME_X), f.top + (f.bottom - f.top - ch) / 2, cw, ch);
+            s.fill_rr(rc, m.px(style::R_XS), WHITE, style::FILL_CONTROL_HOT);
+            s.stroke_rr(rc, m.px(style::R_XS), m.px(1).max(1), style::RIM_CONTROL);
+            if let Some(label) = strings::chip(p) {
+                let alpha = if lit { style::FG_SECONDARY } else { style::FG_TERTIARY };
+                s.text(
+                    label,
+                    rc.left + m.px(CHIP_PAD),
+                    center_y(&rc, s.line_height(Font::Caption)),
+                    Font::Caption,
+                    WHITE,
+                    alpha,
+                );
+            }
+        }
+        let (tx, room) = self.query_room(s, &f);
+        let lh = s.line_height(Font::Normal);
+        let ty = center_y(&f, lh);
+        let ch = m.px(CARET_H);
+        let cy = f.top + (f.bottom - f.top - ch) / 2;
+        let scroll = self.scroll.get();
+        let text = self.session.query_text();
+        s.set_clip(Some(rect_wh(tx, f.top, room.max(0), f.bottom - f.top)));
+        if text.is_empty() {
+            if self.session.chip().is_none() {
+                s.text(strings::placeholder(), tx, ty, Font::Normal, WHITE, style::FG_TERTIARY);
+            }
+        } else {
+            let field = self.session.field();
+            let widths = char_widths(s, text);
+            if let Some(sel) = field.selection() {
+                let before = prefix_width(&widths, text, sel.start);
+                let upto = prefix_width(&widths, text, sel.end);
+                let rc = rect_wh(tx + before - scroll, cy, upto - before, ch);
+                s.fill_rr(rc, 0, WHITE, style::FILL_TEXT_SELECTION);
+            }
+            // Only the characters in the room are drawn: a long query is wider than the text scratch.
+            let mut runs: Vec<Run> = Vec::new();
+            let (mut at, mut start_x) = (0, None);
+            for (ch_, w) in text.chars().zip(&widths) {
+                if at + w > scroll && at < scroll + room {
+                    start_x.get_or_insert(at);
+                    push_run(&mut runs, unit(ch_));
+                }
+                at += w;
+            }
+            draw_runs(s, &runs, tx + start_x.unwrap_or(0) - scroll, ty, Font::Normal, text_alpha);
+        }
+        if lit {
+            let widths = char_widths(s, text);
+            let x = tx + prefix_width(&widths, text, self.session.field().caret()) - scroll + m.px(1);
+            s.fill_rr(rect_wh(x, cy, m.px(1).max(1), ch), 0, WHITE, style::FG_HOT);
+        }
+        s.set_clip(None);
+    }
+
+    /// The icon column of a row: the icon, a placeholder, or a glyph; `box_y` is the top of the 24 px box.
+    fn paint_icon(&self, s: &mut Surface, item: &Item, x: i32, box_y: i32, alpha: u32) {
+        let m = s.metrics();
+        let size = m.px(style::ICON_M);
+        let bitmap = match &item.icon {
+            IconRef::App(id) => self.icons.get(&id.to_lowercase()),
+            IconRef::Bar(key) => self.icons.get(&format!("bar:{}", key.to_lowercase())),
+            _ => None,
+        };
+        match (&item.icon, bitmap) {
+            (_, Some(b)) => s.blit(b, x, box_y, size, 255),
+            (IconRef::Bar(key), None) if crate::ui::paint_bar_icon(s, key, x, box_y, size) => {}
+            (IconRef::Glyph(g), _) => {
+                let gs = m.px(style::ICON_S);
+                let off = (size - gs) / 2;
+                s.glyph(x + off, box_y + off, gs, alpha, glyph_shape(*g));
+            }
+            _ => s.fill_rr(rect_wh(x, box_y, size, size), m.px(style::R_XS), WHITE, style::FILL_CONTROL),
+        }
+    }
+
+    fn paint_row(&self, s: &mut Surface, g: &RowGeo, item: &Item, selected: bool, pressed: bool) {
+        let m = s.metrics();
+        let rc = g.rect;
+        let radius = m.px(style::R_S);
+        let base = m.px(style::ROW_COMFORT);
+        let first_line = RECT { bottom: rc.top + base, ..rc };
+        if pressed {
+            s.plate(rc, radius, style::FILL_PRESS);
+        } else if selected {
+            s.plate(rc, radius, style::FILL_HOVER);
+        }
+        let name_alpha = if selected { style::FG_HOT } else { style::FG_PRIMARY };
+        // Icon column.
+        let ix = m.px(style::ICON_X);
+        let iy = rc.top + (base - m.px(style::ICON_M)) / 2;
+        self.paint_icon(s, item, ix, iy, style::FG_SECONDARY);
+        if matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_)) && matches!(item.kind, Kind::App | Kind::Window)
+        {
+            let px = ix + (m.px(style::ICON_M) - m.px(PILL_W)) / 2;
+            let py = iy + m.px(style::ICON_M) + m.px(PILL_GAP);
+            s.fill_rr(rect_wh(px, py, m.px(PILL_W), m.px(PILL_H)), m.px(1), WHITE, style::OPEN_INDICATOR);
+        }
+        // Hint, selected row only.
+        let right = hint_right(m, self.width);
+        let mut name_right = right;
+        if selected && self.foreground {
+            if let Some(hint) = hint_for(item) {
+                let hw = s.text_width(hint, Font::Caption);
+                let y = center_y(&first_line, s.line_height(Font::Caption));
+                s.text(hint, right - hw, y, Font::Caption, WHITE, style::FG_SECONDARY);
+                name_right = right - hw - m.px(HINT_GAP);
+            }
+        }
+        // Name and detail.
+        let nx = m.px(style::NAME_X);
+        let font = if item.kind == Kind::Answer { Font::Bold } else { Font::Normal };
+        let name_alpha = if item.kind == Kind::Answer { style::FG_HOT } else { name_alpha };
+        let nlh = s.line_height(font);
+        let has_detail =
+            item.detail.is_some() && !g.lines.is_empty() || item.detail.is_some() && item.kind != Kind::App;
+        let has_review = !g.lines.is_empty();
+        let ny = if has_detail || has_review { rc.top + m.px(NAME_TOP) } else { center_y(&first_line, nlh) };
+        draw_line(s, &item.title, nx, ny, name_right - nx, font, name_alpha);
+        let dy = ny + nlh + m.px(DETAIL_GAP);
+        if has_review {
+            let step = m.px(style::REVIEW_LINE);
+            for (i, line) in g.lines.iter().enumerate() {
+                let y = dy + i32::try_from(i).unwrap_or(0) * step;
+                draw_runs(s, line, nx, y, Font::Caption, style::FG_SECONDARY);
+            }
+        } else if let Some(detail) = item.detail.as_deref() {
+            let alpha = if detail.contains(strings::thousands()) { style::FG_SECONDARY } else { style::FG_TERTIARY };
+            let max_w = hint_right(m, self.width) - nx;
+            if detail.chars().any(gesture::is_marker) {
+                draw_line(s, detail, nx, dy, max_w, Font::Caption, alpha);
+            } else {
+                let shown = ellipsize_middle(s, detail, Font::Caption, max_w);
+                s.text(&shown, nx, dy, Font::Caption, WHITE, alpha);
+            }
+        }
+    }
+
+    fn paint_scrollbar(&self, s: &mut Surface, g: &Geo, hot: bool) {
+        if g.total <= g.rows.len() || g.rows.is_empty() {
+            return;
+        }
+        if self.bar_ticks.get() == 0 && !hot {
+            return;
+        }
+        let m = s.metrics();
+        let t = g.track;
+        let track_h = (t.bottom - t.top).max(1);
+        let total = i32::try_from(g.total).unwrap_or(i32::MAX).max(1);
+        let thumb = (track_h * i32::try_from(g.rows.len()).unwrap_or(0) / total).max(m.px(16)).min(track_h);
+        let travel = track_h - thumb;
+        let denom = (total - i32::try_from(g.rows.len()).unwrap_or(0)).max(1);
+        let y = t.top + travel * i32::try_from(g.first).unwrap_or(0) / denom;
+        let rc = RECT { top: y, bottom: y + thumb, ..t };
+        s.fill_rr(rc, (t.right - t.left) / 2, WHITE, if hot { style::SCROLLBAR_HOT } else { style::SCROLLBAR_REST });
+    }
+}
+
+/// The right edge of the hint and of the names (physical px): the panel's width less HINT_RIGHT_INSET.
+fn hint_right(m: Metrics, width: i32) -> i32 {
+    m.px(width) - m.px(style::HINT_RIGHT_INSET)
+}
+
+/// The mode chip's width: its label with the padding either side.
+fn chip_width(s: &Surface, p: ProviderId) -> i32 {
+    let m = s.metrics();
+    let label = strings::chip(p).unwrap_or("");
+    s.text_width(label, Font::Caption) + 2 * m.px(CHIP_PAD)
+}
+
+/// The text the review shows whole (SPEC 5.3): the run line, or the path of a file that offers Run as administrator.
+fn review_text(item: &Item) -> Option<&str> {
+    if !item.verbs.has(Verb::RunAsAdmin) {
+        return None;
+    }
+    match (&item.kind, &item.payload) {
+        (Kind::RunLine, Payload::RunLine(r)) => Some(&r.line),
+        (Kind::File, Payload::Path { path, dir: false, .. }) => Some(path),
+        _ => None,
+    }
+}
+
+/// The hint of the selected row: what Enter does (5.3).
+fn hint_for(item: &Item) -> Option<&'static str> {
+    let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
+    let verb = verbs::primary(item.kind, running);
+    if !item.verbs.has(verb) {
+        return None;
+    }
+    Some(match (item.kind, verb) {
+        (Kind::RunLine | Kind::RunSuggestion, _) => strings::hint_run(),
+        (_, Verb::Switch) => strings::hint_switch(),
+        (_, Verb::Copy) => strings::hint_copy(),
+        _ => strings::hint_open(),
+    })
+}
+
+/// The shape of a glyph id.
+fn glyph_shape(g: GlyphId) -> &'static dyn Fn(f32, f32) -> bool {
+    match g {
+        GlyphId::Magnifier => &super::popup_startmenu::magnifier,
+        GlyphId::Equals => &glyphs::equals_shape,
+        GlyphId::Prompt => &glyphs::prompt_shape,
+        GlyphId::Window => &glyphs::window_shape,
+        GlyphId::Document => &glyphs::document_shape,
+        GlyphId::Image => &glyphs::image_shape,
+        GlyphId::Archive => &glyphs::archive_shape,
+        GlyphId::Executable => &glyphs::executable_shape,
+        GlyphId::Copy => &glyphs::copy_shape,
+        GlyphId::Globe => &glyphs::globe_shape,
+        GlyphId::Clock => &glyphs::clock_shape,
+        GlyphId::Folder => &glyphs::folder_shape,
+        GlyphId::Info => &glyphs::info_shape,
+        GlyphId::Gear => &glyphs::gear_shape,
+        GlyphId::Lock => &glyphs::lock_shape,
+        GlyphId::Moon => &glyphs::moon_shape,
+        GlyphId::Restart => &glyphs::restart_shape,
+        GlyphId::Power => &glyphs::power_shape,
+        GlyphId::Exit => &glyphs::exit_shape,
+    }
+}
 
 impl Content for Launcher {
     fn kind(&self) -> PopupKind {
@@ -22,20 +705,98 @@ impl Content for Launcher {
     }
 
     fn size(&mut self, s: &Surface) -> (i32, i32) {
-        let m = s.metrics();
-        (m.px(style::LAUNCHER_W), m.px(EMPTY_H))
+        let g = self.layout(s);
+        // The review of the selected row is measured with the real font, for the session's conditions.
+        if let (Some(lines), Some(key)) = (self.review_lines(s), self.session.selected().map(|i| i.key)) {
+            self.session.set_review_lines(key, lines);
+        }
+        let mut h = g.h;
+        if self.hold_shrink && h < self.shown_h {
+            h = self.shown_h;
+        }
+        self.shown_h = h;
+        let w = g.w;
+        *self.geo.borrow_mut() = g;
+        (w, h)
     }
 
-    fn paint(&self, s: &mut Surface, _hot: Option<u32>, _pressed: Option<u32>) {
+    fn limit(&mut self, max: (i32, i32)) {
+        self.max_h = max.1;
+    }
+
+    fn paint(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>) {
         s.panel();
+        let g = self.layout(s);
+        self.paint_field(s, &g, hot == Some(ID_FIELD));
+        let sel = self.session.selected_index();
+        for rg in &g.rows {
+            let Some(item) = self.session.rows().get(rg.idx) else { continue };
+            let id = ID_ROW + u32::try_from(rg.idx).unwrap_or(0);
+            self.paint_row(s, rg, item, self.foreground && sel == Some(rg.idx), pressed == Some(id));
+        }
+        self.paint_scrollbar(s, &g, false);
+        if let Ok(mut slot) = self.geo.try_borrow_mut() {
+            *slot = g;
+        }
     }
 
-    fn hit(&self, _x: i32, _y: i32) -> Option<u32> {
-        None
+    fn hit(&self, x: i32, y: i32) -> Option<u32> {
+        let g = self.geo.try_borrow().ok()?;
+        let mut map = HitMap::default();
+        map.add(ID_FIELD, g.field);
+        for r in &g.rows {
+            map.add(ID_ROW + u32::try_from(r.idx).unwrap_or(0), r.rect);
+        }
+        map.at(x, y)
+    }
+
+    fn clickable(&self, id: u32) -> bool {
+        id >= ID_ROW
     }
 
     fn click(&mut self, _id: u32) -> Reply {
+        // L1a-15 maps a row click to `Session::click` with the Context.
         Reply::None
+    }
+
+    fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
+        let total = self.session.rows().len();
+        let count = self.count.get();
+        if total <= count || notches == 0 {
+            return Reply::None;
+        }
+        let step = WHEEL_ROWS * usize::try_from(notches.unsigned_abs()).unwrap_or(1);
+        let first = self.first.get();
+        let next = if notches > 0 { first.saturating_sub(step) } else { (first + step).min(total - count) };
+        if next == first {
+            return Reply::None;
+        }
+        self.first.set(next);
+        self.bar_ticks.set(SCROLLBAR_TICKS);
+        Reply::Relayout
+    }
+
+    fn focus(&mut self, active: bool) -> Reply {
+        if self.foreground == active {
+            return Reply::None;
+        }
+        self.foreground = active;
+        // The review and the hint come with the focus, and the review changes the height.
+        Reply::Relayout
+    }
+
+    fn tick(&mut self) -> Reply {
+        match self.bar_ticks.get() {
+            0 => Reply::None,
+            n => {
+                self.bar_ticks.set(n - 1);
+                if n == 1 {
+                    Reply::Redraw
+                } else {
+                    Reply::None
+                }
+            }
+        }
     }
 
     fn wants_sys_keys(&self) -> bool {
@@ -49,7 +810,7 @@ impl Content for Launcher {
 
 /// The content of a new launcher popup (`popup::make_content`).
 pub(crate) fn new() -> Box<dyn Content> {
-    Box::new(Launcher)
+    Box::new(Launcher::with_session(Session::open(&LauncherOpts::default(), None)))
 }
 
 /// Once, at the end of `popup::init` (wired by L1a-15): nothing to set up yet.
@@ -61,4 +822,605 @@ pub(crate) fn init() {}
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
     // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
     let _ = unsafe { KillTimer(Some(hwnd), id) };
+}
+
+// ---------------------------------------------------------------- preview scenes (mock data, nothing runs)
+
+/// The launcher scenes of `--preview` (L1a-18 lists them; the field pair is listed since L1a-14).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PreviewScene {
+    Empty,
+    Inactive,
+    Apps,
+    Running,
+    Calc,
+    Run,
+    RunReview,
+    Windows,
+    Notice,
+    FieldPair,
+}
+
+impl PreviewScene {
+    /// `launcher_empty`, `launcher_field_pair` and so on.
+    pub(crate) fn from_name(name: &str) -> Option<PreviewScene> {
+        Some(match name.strip_prefix("launcher_")? {
+            "empty" => PreviewScene::Empty,
+            "inactive" => PreviewScene::Inactive,
+            "apps" => PreviewScene::Apps,
+            "running" => PreviewScene::Running,
+            "calc" => PreviewScene::Calc,
+            "run" => PreviewScene::Run,
+            "run_review" => PreviewScene::RunReview,
+            "windows" => PreviewScene::Windows,
+            "notice" => PreviewScene::Notice,
+            "field_pair" => PreviewScene::FieldPair,
+            _ => return None,
+        })
+    }
+}
+
+/// A launcher built from fixture data: the catalogue, two running windows and the icons of `preview::mock_icon`.
+pub(crate) fn preview_new(scene: PreviewScene) -> Box<dyn Content> {
+    if scene == PreviewScene::FieldPair {
+        return Box::new(FieldPair);
+    }
+    Box::new(scene_launcher(scene))
+}
+
+/// The launcher of a scene other than the field pair.
+fn scene_launcher(scene: PreviewScene) -> Launcher {
+    use crate::i18n::tr;
+    use crate::launcher::catalog::CatApp;
+    use crate::launcher::model::{ItemKey, NumberStyle, Score, SettingRow, VerbSet, WindowRow};
+    use crate::launcher::providers::Context;
+    use crate::launcher::rank;
+    use crate::launcher::runline;
+    use crate::start_search::Keys;
+    use std::cmp::Reverse;
+
+    let notepad = tr("Notepad", "Blocco note");
+    let calc = tr("Calculator", "Calcolatrice");
+    let apps_def: [(&str, &str, char, u32); 9] = [
+        ("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", calc, 'C', 0x3A3A3A),
+        ("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", notepad, 'N', 0x2B78B8),
+        ("{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}\\Notepad++\\notepad++.exe", "Notepad++", 'N', 0x5C9E31),
+        ("Microsoft.Office.OneNote_8wekyb3d8bbwe!microsoft.onenoteim", "OneNote", 'N', 0x7719AA),
+        ("Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", tr("Sticky Notes", "Note adesive"), 'S', 0xB8860B),
+        ("Mozilla.Firefox", "Firefox", 'F', 0xE66000),
+        ("Microsoft.VisualStudioCode", "Visual Studio Code", 'V', 0x0078D4),
+        ("Microsoft.Windows.Explorer", tr("File Explorer", "Esplora file"), 'F', 0xE8A317),
+        ("Valve.Steam", "Steam", 'S', 0x1B2838),
+    ];
+    let mut apps = Vec::new();
+    let mut icons: Vec<(String, IconBitmap)> = Vec::new();
+    for (i, (id, name, letter, rgb)) in apps_def.iter().enumerate() {
+        apps.push(CatApp::new(id, name, Keys::default(), 10 + u32::try_from(i).unwrap_or(0)));
+        icons.push((id.to_lowercase(), crate::preview::mock_icon(*letter, *rgb, 64)));
+    }
+    let settings = vec![SettingRow::new(0, tr("Display", "Schermo"), Keys::default(), 1)];
+    let window = |hwnd: isize, key: &str, name: &str, title: &str| {
+        let mut folded = String::new();
+        rank::fold(name, &mut folded);
+        WindowRow {
+            hwnd,
+            group_key: key.into(),
+            aumid: None,
+            name: name.into(),
+            name_folded: folded.into(),
+            title: Some(title.into()),
+            hung: false,
+        }
+    };
+    let notepad_key = "c:\\windows\\system32\\notepad.exe";
+    let windows = vec![
+        window(0x1001, notepad_key, notepad, tr("Untitled - Notepad", "Senza titolo - Blocco note")),
+        window(0x2002, "c:\\tools\\footool.exe", "FooTool", "FooTool - main"),
+        window(0x3003, "c:\\program files\\firefox\\firefox.exe", "Firefox", "Dock releases - Mozilla Firefox"),
+    ];
+    icons.push((format!("bar:{notepad_key}"), crate::preview::mock_icon('N', 0x2B78B8, 64)));
+    icons.push((
+        format!("bar:{}", windows.get(1).map_or("", |w| &w.group_key)),
+        crate::preview::mock_icon('F', 0x6B4FBB, 64),
+    ));
+    icons.push((
+        format!("bar:{}", windows.get(2).map_or("", |w| &w.group_key)),
+        crate::preview::mock_icon('F', 0xE66000, 64),
+    ));
+    let history: Vec<Box<str>> = vec!["ping 1.1.1.1".into()];
+    let opts = LauncherOpts::default();
+    let cx = Context {
+        apps: &apps,
+        settings: &settings,
+        windows: &windows,
+        history: &history,
+        known: &runline::KNOWN,
+        opts: &opts,
+        num: NumberStyle {
+            decimal: tr(".", ",").chars().next().unwrap_or('.'),
+            group: tr(",", ".").chars().next().unwrap_or(','),
+        },
+        now_unix: 1_790_000_000,
+    };
+    // The notepad window belongs to the Notepad app: its row shows the running indicator.
+    let mut session = Session::open(&opts, None);
+    let long_line = "> powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\Users\\Public\\Scripts\\cleanup-temp-files.ps1\" \
+        -Days 30 -Recurse -Verbose -LogFile \"C:\\Users\\Public\\Logs\\cleanup-temp-files-2026-11.log\" -Confirm:$false";
+    let query: &str = match scene {
+        PreviewScene::Empty => "",
+        PreviewScene::Inactive | PreviewScene::Running => "note",
+        PreviewScene::Apps => "calc",
+        PreviewScene::Calc => tr("=2.5*4", "=2,5*4"),
+        PreviewScene::Run => "> ping 1.1.1.1",
+        PreviewScene::RunReview => long_line,
+        PreviewScene::Windows => "<",
+        PreviewScene::Notice => "zz",
+        PreviewScene::FieldPair => "",
+    };
+    if !query.is_empty() {
+        session.chars(query, &cx);
+    }
+    if scene == PreviewScene::Notice {
+        let notice = Item {
+            key: ItemKey::of(ProviderId::Apps, "notice"),
+            from: ProviderId::Apps,
+            kind: Kind::Notice,
+            title: tr("PowerToys Command Palette also answers Alt+Space", "PowerToys Command Palette risponde anche ad Alt+Spazio").into(),
+            detail: Some(
+                tr(
+                    "Both launchers would open at once. Turn its Alt+Space shortcut off in PowerToys, or keep this launcher on Alt+Shift+Space.",
+                    "I due launcher si aprirebbero insieme. Disattiva la sua scorciatoia Alt+Spazio in PowerToys, oppure lascia questo launcher su Alt+Maiusc+Spazio.",
+                )
+                .into(),
+            ),
+            icon: IconRef::Glyph(GlyphId::Info),
+            score: Score { tier: 0, learned: Reverse(0), idle: true, kind: 0, rank: 0, len: 0 },
+            verbs: VerbSet::empty(),
+            payload: Payload::None,
+            destructive: false,
+        };
+        session.set_notices(vec![notice]);
+        session.chars("z", &cx);
+    }
+    let mut l = Launcher::with_session(session);
+    for (k, b) in icons {
+        l.icons.insert(k, b);
+    }
+    l.foreground = scene != PreviewScene::Inactive;
+    l
+}
+
+/// The Q7 pair (SPEC 5.3, "Field size"): the same query in Start's search control, in the launcher's (the same control
+/// at the launcher's width) and in the larger candidate, SEARCH_H 48 with a QUERY style of 18/24 in the same face.
+struct FieldPair;
+
+/// The query every field of the pair shows.
+const PAIR_QUERY: &str = "calc";
+/// The candidate's field height and query size (logical px).
+const CANDIDATE_H: i32 = 48;
+const CANDIDATE_QUERY_PX: i32 = 18;
+/// Start's search control width in its 420 px popup (inset 14 each side).
+const START_FIELD_W: i32 = 392;
+/// A caption above each field (logical px).
+const PAIR_CAPTION_H: i32 = 16;
+const PAIR_CAPTION_GAP: i32 = 4;
+const PAIR_GAP: i32 = 12;
+
+impl FieldPair {
+    fn heights() -> [i32; 3] {
+        [style::SEARCH_H, style::SEARCH_H, CANDIDATE_H]
+    }
+}
+
+impl Content for FieldPair {
+    fn kind(&self) -> PopupKind {
+        PopupKind::Launcher
+    }
+
+    fn size(&mut self, s: &Surface) -> (i32, i32) {
+        let m = s.metrics();
+        let blocks: i32 = Self::heights().iter().map(|h| PAIR_CAPTION_H + PAIR_CAPTION_GAP + h + PAIR_GAP).sum();
+        (m.px(style::LAUNCHER_W), m.px(PAIR_GAP + blocks))
+    }
+
+    fn paint(&self, s: &mut Surface, _hot: Option<u32>, _pressed: Option<u32>) {
+        s.panel();
+        let m = s.metrics();
+        let mut y = m.px(PAIR_GAP);
+        let cases = [
+            ("Start 38 / 13", START_FIELD_W, style::SEARCH_H),
+            ("Launcher 38 / 13", style::LAUNCHER_W - 24, style::SEARCH_H),
+            ("Candidate 48 / 18", style::LAUNCHER_W - 24, CANDIDATE_H),
+        ];
+        for (i, (caption, fw, fh)) in cases.into_iter().enumerate() {
+            s.text(caption, m.px(style::FIELD_X), y, Font::Caption, WHITE, style::FG_TERTIARY);
+            y += m.px(PAIR_CAPTION_H + PAIR_CAPTION_GAP);
+            let rc = rect_wh(m.px(style::FIELD_X), y, m.px(fw), m.px(fh));
+            let radius = m.px(style::R_S);
+            s.fill_rr(rc, radius, WHITE, style::FILL_CONTROL);
+            s.stroke_rr(rc, radius, m.px(1).max(1), style::RIM_CONTROL);
+            let gs = m.px(style::ICON_S);
+            let gx = rc.left + if i == 0 { m.px(12) } else { m.px(16) };
+            s.glyph(
+                gx,
+                rc.top + (rc.bottom - rc.top - gs) / 2,
+                gs,
+                style::FG_SECONDARY,
+                &super::popup_startmenu::magnifier,
+            );
+            if i == 0 {
+                // Start's own control (popup_startmenu.rs paint_search): the text 10 px after the glyph, a 200 caret.
+                let tx = gx + gs + m.px(10);
+                let ty = center_y(&rc, s.line_height(Font::Normal));
+                s.text(PAIR_QUERY, tx, ty, Font::Normal, WHITE, style::FG_PRIMARY);
+                let cx = tx + s.text_width(PAIR_QUERY, Font::Normal) + m.px(1);
+                s.fill_rr(rect_wh(cx, ty, m.px(1).max(1), s.line_height(Font::Normal)), 0, WHITE, 200);
+            } else if i == 1 {
+                let tx = m.px(style::NAME_X);
+                let ty = center_y(&rc, s.line_height(Font::Normal));
+                s.text(PAIR_QUERY, tx, ty, Font::Normal, WHITE, style::FG_PRIMARY);
+                let cx = tx + s.text_width(PAIR_QUERY, Font::Normal) + m.px(1);
+                let ch = m.px(CARET_H);
+                s.fill_rr(
+                    rect_wh(cx, rc.top + (rc.bottom - rc.top - ch) / 2, m.px(1).max(1), ch),
+                    0,
+                    WHITE,
+                    style::FG_HOT,
+                );
+            } else {
+                let tx = m.px(style::NAME_X);
+                let (px, lh) = (m.px(CANDIDATE_QUERY_PX), m.px(24));
+                let ty = rc.top + (rc.bottom - rc.top - lh) / 2;
+                let tw =
+                    s.text_sized(PAIR_QUERY, tx, ty + (lh - px) / 2 - m.px(1), (px, 400), WHITE, style::FG_PRIMARY);
+                s.fill_rr(rect_wh(tx + tw, ty, m.px(1).max(1), lh), 0, WHITE, style::FG_HOT);
+            }
+            y += m.px(fh + PAIR_GAP);
+        }
+    }
+
+    fn hit(&self, _x: i32, _y: i32) -> Option<u32> {
+        None
+    }
+
+    fn click(&mut self, _id: u32) -> Reply {
+        Reply::None
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    fn surface(dpi: u32) -> Surface {
+        let mut s = Surface::new(Metrics { dpi }).unwrap();
+        s.resize(1000, 800).unwrap();
+        s
+    }
+
+    /// The "note" scene with eight 44 px rows: a query that matches many (the catalogue and the web row).
+    fn many_rows() -> Launcher {
+        let mut l = scene_launcher(PreviewScene::Running);
+        l.foreground = true;
+        l
+    }
+
+    #[test]
+    fn layout_numbers() {
+        let s = surface(96);
+        let mut empty = scene_launcher(PreviewScene::Empty);
+        assert_eq!(empty.size(&s), (640, 62), "empty: the field alone, 12 + 38 + 12");
+        let mut l = many_rows();
+        let (w, h) = l.size(&s);
+        let n = l.session.rows().len();
+        assert!(n >= 5, "the fixture gives five rows or more, got {n}");
+        assert_eq!((w, h), (640, 58 + 44 * i32::try_from(n).unwrap() + 12));
+        let g = l.geo.borrow().clone();
+        assert_eq!((g.field.left, g.field.top, g.field.right, g.field.bottom), (12, 12, 628, 50));
+        let first = g.rows.first().unwrap();
+        assert_eq!((first.rect.left, first.rect.top, first.rect.right), (12, 58, 628));
+        assert_eq!(first.rect.bottom - first.rect.top, 44);
+        let m = s.metrics();
+        assert_eq!(m.px(style::NAME_X), 56, "the query and every name share the column at 56");
+        assert_eq!(hint_right(m, 640), 616);
+        assert_eq!(hint_right(m, 880), 856);
+        let mut wide = scene_launcher(PreviewScene::Empty);
+        wide.set_shape(880, 8);
+        assert_eq!(wide.size(&s).0, 880);
+    }
+
+    #[test]
+    fn eight_rows_are_422_high() {
+        // Eight rows of 44 and nothing else: 58 + 8 * 44 + 12.
+        let s = surface(96);
+        let mut l = scene_launcher(PreviewScene::Apps);
+        l.max_rows = 8;
+        let (_, h) = l.size(&s);
+        let n = i32::try_from(l.session.rows().len()).unwrap().min(8);
+        assert_eq!(h, 58 + n * 44 + 12);
+        assert_eq!(58 + 8 * 44 + 12, 422);
+    }
+
+    #[test]
+    fn dib_at_144_dpi_within_2_6_mib() {
+        // Eight rows with a three-line notice (+32): the tallest panel the launcher makes.
+        let s = surface(144);
+        let mut l = scene_launcher(PreviewScene::Notice);
+        l.max_rows = 8;
+        let (w, h) = l.size(&s);
+        let rows = l.geo.borrow().rows.len();
+        assert!(rows >= 2, "the notice and the web row at least");
+        assert!(i64::from(w) * i64::from(h) * 4 <= 2_726_297, "{w} x {h} is more than 2.6 MiB");
+        // The worst case by arithmetic: 8 rows, 3 review lines.
+        let worst_h = (58 + 7 * 44 + 44 + 2 * 16 + 12) * 3 / 2;
+        assert!(i64::from(w) * i64::from(worst_h) * 4 <= 2_726_297, "{w} x {worst_h}");
+    }
+
+    #[test]
+    fn rows_shrink_to_fit_the_work_area() {
+        let s = surface(96);
+        let mut l = many_rows();
+        l.size(&s);
+        let all = l.geo.borrow().rows.len();
+        assert!(all >= 4);
+        // Room for three rows only.
+        l.limit((i32::MAX, 58 + 3 * 44 + 12));
+        let (_, h) = l.size(&s);
+        assert_eq!(l.geo.borrow().rows.len(), 3);
+        assert!(h <= 58 + 3 * 44 + 12, "the panel stays inside the limit: {h}");
+        // The selection stays visible when it moves past them.
+        assert!(l.geo.borrow().first == 0);
+    }
+
+    #[test]
+    fn shrinking_waits_but_growing_does_not() {
+        let s = surface(96);
+        let mut l = many_rows();
+        let (_, tall) = l.size(&s);
+        l.hold_shrink(true);
+        l.session_mut().chars("z", &scene_context_free());
+        let (_, held) = l.size(&s);
+        assert_eq!(held, tall, "the panel keeps its height while the user types");
+        l.hold_shrink(false);
+        let (_, free) = l.size(&s);
+        assert!(free < tall, "and shrinks once let go");
+        // Growing is never held.
+        let mut g = scene_launcher(PreviewScene::Empty);
+        g.hold_shrink(true);
+        assert_eq!(g.size(&s).1, 62);
+    }
+
+    /// A context with nothing in it: a keystroke finds no row.
+    fn scene_context_free() -> crate::launcher::providers::Context<'static> {
+        use crate::launcher::model::NumberStyle;
+        static OPTS: std::sync::OnceLock<LauncherOpts> = std::sync::OnceLock::new();
+        let opts = OPTS.get_or_init(LauncherOpts::default);
+        crate::launcher::providers::Context {
+            apps: &[],
+            settings: &[],
+            windows: &[],
+            history: &[],
+            known: &crate::launcher::runline::KNOWN,
+            opts,
+            num: NumberStyle { decimal: '.', group: ',' },
+            now_unix: 0,
+        }
+    }
+
+    #[test]
+    fn hit_finds_the_field_and_the_rows() {
+        let s = surface(96);
+        let mut l = many_rows();
+        l.size(&s);
+        assert_eq!(l.hit(100, 30), Some(ID_FIELD));
+        assert_eq!(l.hit(100, 70), Some(ID_ROW));
+        assert_eq!(l.hit(100, 70 + 44), Some(ID_ROW + 1));
+        assert_eq!(l.hit(2, 2), None, "the panel's own margin");
+        assert!(!l.clickable(ID_FIELD) && l.clickable(ID_ROW));
+    }
+
+    #[test]
+    fn review_of_a_long_line_takes_extra_lines_and_is_measured() {
+        let s = surface(96);
+        let mut l = scene_launcher(PreviewScene::RunReview);
+        let (_, h) = l.size(&s);
+        let rows = l.geo.borrow().rows.clone();
+        let sel = rows.iter().find(|r| r.lines.len() > 1).expect("the selected run line shows its review");
+        assert!(sel.lines.len() <= 3);
+        assert_eq!(sel.rect.bottom - sel.rect.top, 44 + 16 * (i32::try_from(sel.lines.len()).unwrap() - 1));
+        assert!(h >= 58 + 44 + 32);
+        // The session knows the measure: no "too long" refusal for a line that fits.
+        assert_eq!(l.session.admin_refusal(), None);
+        // The same line while the launcher is not foreground shows no review.
+        l.foreground = false;
+        l.size(&s);
+        assert!(l.geo.borrow().rows.iter().all(|r| r.lines.len() <= 1));
+    }
+
+    #[test]
+    fn a_review_over_three_lines_is_refused() {
+        use crate::launcher::gesture::Refusal;
+        let s = surface(96);
+        let mut l = scene_launcher(PreviewScene::Empty);
+        let long = format!("> {}", "WWWWWWW ".repeat(40));
+        l.session_mut().chars(&long, &scene_context_free());
+        l.foreground = true;
+        l.size(&s);
+        assert_eq!(l.session.admin_refusal(), Some(Refusal::TooLong));
+        assert!(l.geo.borrow().rows.iter().all(|r| r.lines.len() <= 1), "no review: the refusal is the detail");
+    }
+
+    #[test]
+    fn caret_stays_in_view() {
+        let s = surface(96);
+        let mut l = scene_launcher(PreviewScene::Empty);
+        l.foreground = true;
+        l.session_mut().chars(&"w".repeat(120), &scene_context_free());
+        l.size(&s);
+        assert!(l.scroll.get() > 0, "a query wider than the field scrolls");
+        let g = l.geo.borrow().clone();
+        let (_, room) = l.query_room(&s, &g.field);
+        let widths = char_widths(&s, l.session.query_text());
+        let caret = prefix_width(&widths, l.session.query_text(), l.session.field().caret());
+        assert!(caret - l.scroll.get() <= room, "the caret is inside the room");
+        // A short text does not scroll.
+        let mut short = scene_launcher(PreviewScene::Apps);
+        short.size(&s);
+        assert_eq!(short.scroll.get(), 0);
+    }
+
+    #[test]
+    fn markers_are_visible_and_split_from_plain_text() {
+        assert_eq!(marker_text('\u{7}').as_deref(), Some("\u{2407}"));
+        assert_eq!(marker_text('\u{0}').as_deref(), Some("\u{2400}"));
+        assert_eq!(marker_text('\u{7f}').as_deref(), Some("\u{2421}"));
+        assert_eq!(marker_text('\u{202E}').as_deref(), Some("<U+202E>"));
+        assert_eq!(marker_text('\u{85}').as_deref(), Some("<U+0085>"));
+        assert_eq!(marker_text('a'), None);
+        let runs = runs_of("ab\u{202E}cd");
+        assert_eq!(runs.len(), 3);
+        assert!(!runs[0].marker && runs[1].marker && !runs[2].marker);
+        assert_eq!(runs[0].text, "ab");
+    }
+
+    #[test]
+    fn wrapping_breaks_at_spaces_and_stops_past_the_limit() {
+        let s = surface(96);
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+        let w = s.text_width("alpha beta gamma delta epsilon", Font::Caption);
+        let lines = wrap(&s, text, Font::Caption, w, 10);
+        assert!(lines.len() >= 3);
+        for l in &lines {
+            let line_w: i32 = l.iter().map(|r| s.text_width(&r.text, Font::Caption)).sum();
+            assert!(line_w <= w + 4, "a line is within the width: {line_w} > {w}");
+        }
+        let joined: String = lines.iter().flatten().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, text, "nothing is lost or ellipsized");
+        let cut = wrap(&s, text, Font::Caption, w, 2);
+        assert_eq!(cut.len(), 3, "one line past the limit tells the caller it does not fit");
+        // A word longer than the line breaks inside it.
+        let long = wrap(&s, &"x".repeat(200), Font::Caption, w, 10);
+        assert!(long.len() >= 2);
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_both_ends() {
+        let s = surface(96);
+        let path = "C:\\Users\\someone\\Documents\\Projects\\dock\\target\\release\\dock.exe";
+        let w = s.text_width("C:\\Users\\some…dock.exe", Font::Caption);
+        let got = ellipsize_middle(&s, path, Font::Caption, w);
+        assert!(got.starts_with("C:\\") && got.ends_with("dock.exe") && got.contains('\u{2026}'), "{got}");
+        assert!(s.text_width(&got, Font::Caption) <= w);
+        assert_eq!(ellipsize_middle(&s, "short", Font::Caption, w), "short");
+    }
+
+    #[test]
+    fn the_hint_names_what_enter_does() {
+        let l = scene_launcher(PreviewScene::Running);
+        let sel = l.session.selected().unwrap();
+        assert_eq!(hint_for(sel), Some("Switch · Enter"), "a running app switches");
+        let calc = scene_launcher(PreviewScene::Calc);
+        assert_eq!(hint_for(calc.session.selected().unwrap()), Some("Copy · Enter"));
+        let run = scene_launcher(PreviewScene::Run);
+        assert_eq!(hint_for(run.session.selected().unwrap()), Some("Run · Enter"));
+        let apps = scene_launcher(PreviewScene::Apps);
+        assert_eq!(hint_for(apps.session.selected().unwrap()), Some("Open · Enter"));
+    }
+
+    #[test]
+    fn wheel_scrolls_without_moving_the_selection_back() {
+        let s = surface(96);
+        let mut l = many_rows();
+        l.limit((i32::MAX, 58 + 3 * 44 + 12));
+        l.size(&s);
+        let total = l.session.rows().len();
+        assert!(total > 3);
+        assert_eq!(l.wheel(-1, 0, 0), Reply::Relayout);
+        l.size(&s);
+        assert_eq!(l.geo.borrow().first, 1, "one notch down is one row");
+        assert_eq!(l.wheel(1, 0, 0), Reply::Relayout);
+        l.size(&s);
+        assert_eq!(l.geo.borrow().first, 0);
+        assert_eq!(l.wheel(1, 0, 0), Reply::None, "at the top already");
+    }
+
+    #[test]
+    fn scrollbar_hides_after_its_ticks() {
+        let mut l = many_rows();
+        l.bar_ticks.set(SCROLLBAR_TICKS);
+        assert_eq!(l.tick(), Reply::None);
+        assert_eq!(l.tick(), Reply::Redraw, "hidden: one redraw");
+        assert_eq!(l.tick(), Reply::None);
+    }
+
+    #[test]
+    fn focus_shows_the_caret_and_the_hint_through_a_relayout() {
+        let mut l = scene_launcher(PreviewScene::Inactive);
+        assert!(!l.foreground);
+        assert_eq!(l.focus(true), Reply::Relayout);
+        assert_eq!(l.focus(true), Reply::None);
+        assert_eq!(l.focus(false), Reply::Relayout);
+    }
+
+    #[test]
+    fn scenes_are_named_and_all_render() {
+        let names = [
+            "launcher_empty",
+            "launcher_inactive",
+            "launcher_apps",
+            "launcher_running",
+            "launcher_calc",
+            "launcher_run",
+            "launcher_run_review",
+            "launcher_windows",
+            "launcher_notice",
+            "launcher_field_pair",
+        ];
+        let s = surface(96);
+        for n in names {
+            let scene = PreviewScene::from_name(n).unwrap_or_else(|| panic!("{n}"));
+            let mut c = preview_new(scene);
+            let (w, h) = c.size(&s);
+            assert!(w > 0 && h >= 62, "{n}: {w} x {h}");
+            let mut s2 = Surface::new(Metrics { dpi: 96 }).unwrap();
+            s2.resize(w, h).unwrap();
+            c.paint(&mut s2, None, None);
+        }
+        assert!(PreviewScene::from_name("launcher_nope").is_none());
+        assert!(PreviewScene::from_name("popup_tray").is_none());
+    }
+
+    #[test]
+    fn glyph_shapes_are_inside_the_box() {
+        use crate::glyphs::*;
+        type Shape = fn(f32, f32) -> bool;
+        let shapes: [(&str, Shape); 8] = [
+            ("equals", equals_shape),
+            ("prompt", prompt_shape),
+            ("window", window_shape),
+            ("document", document_shape),
+            ("image", image_shape),
+            ("archive", archive_shape),
+            ("executable", executable_shape),
+            ("copy", copy_shape),
+        ];
+        for size in [16, 24, 32] {
+            crate::glyphs::set_scale(size);
+            for (name, f) in shapes {
+                let mut any = false;
+                for iu in -16..=48 {
+                    for iv in -16..=48 {
+                        let (u, v) = (iu as f32 * 0.5, iv as f32 * 0.5);
+                        let inside = (0.0..=16.0).contains(&u) && (0.0..=16.0).contains(&v);
+                        let hit = f(u, v);
+                        assert!(inside || !hit, "{name} at {size}: ({u}, {v}) is outside the 16 grid");
+                        any |= hit;
+                    }
+                }
+                assert!(any, "{name} draws something at {size}");
+            }
+        }
+        crate::glyphs::set_scale(16);
+    }
 }

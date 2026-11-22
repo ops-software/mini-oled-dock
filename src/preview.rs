@@ -880,6 +880,10 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 over,
             )
         }
+        n if crate::popup::popup_launcher::PreviewScene::from_name(n).is_some() => {
+            let scene = crate::popup::popup_launcher::PreviewScene::from_name(n)?;
+            crate::popup::popup_launcher::preview_new(scene)
+        }
         "popup_tray" | "popup_tray_customize" => {
             let ic = mock_icons(m, BarSizes::default());
             let bmps: Vec<Arc<IconBitmap>> = ic.tray.into_iter().map(Arc::new).collect();
