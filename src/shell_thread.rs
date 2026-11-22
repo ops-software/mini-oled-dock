@@ -228,6 +228,10 @@ pub enum ShellRequest {
     /// the Windows folder), in one shell call: the path is never looked at on disk.
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     RevealPath { path: String },
+    /// Open a web address (a typed URL or a web search): checked again here, http or https only, and
+    /// rebuilt from its parts before it reaches the shell (`rebuild_url`).
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    OpenUrl { url: String },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -267,6 +271,7 @@ pub enum LaunchKind {
     Path,
     Command,
     Admin,
+    Url,
     Reveal,
 }
 
@@ -570,7 +575,8 @@ impl Shell {
             req @ (ShellRequest::OpenPath { .. }
             | ShellRequest::RunAsTyped { .. }
             | ShellRequest::LaunchCommand { .. }
-            | ShellRequest::RevealPath { .. }) => launcher_launch(self.ui, req),
+            | ShellRequest::RevealPath { .. }
+            | ShellRequest::OpenUrl { .. }) => launcher_launch(self.ui, req),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -1687,6 +1693,7 @@ fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
         ShellRequest::RunAsTyped { .. } => Some(LaunchKind::Admin),
         ShellRequest::LaunchCommand { .. } => Some(LaunchKind::Command),
         ShellRequest::RevealPath { .. } => Some(LaunchKind::Reveal),
+        ShellRequest::OpenUrl { .. } => Some(LaunchKind::Url),
         _ => None,
     }
 }
@@ -1730,6 +1737,13 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             let r = reveal_path_with(&path, &windows, &mut exec);
             if r.is_ok() {
                 log!("shell: RevealPath ({} chars) via the desktop shell", path.chars().count());
+            }
+            r
+        }
+        ShellRequest::OpenUrl { url } => {
+            let r = open_url_with(&url, &mut exec);
+            if r.is_ok() {
+                log!("shell: OpenUrl ({} chars) via the desktop shell", url.chars().count());
             }
             r
         }
@@ -1835,6 +1849,75 @@ fn reveal_path_with(path: &str, windows: &Path, exec: Exec) -> Result<(), String
     }
     let explorer = windows.join("explorer.exe");
     exec(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")), None, Verb::Open)
+}
+
+/// The longest web address `OpenUrl` passes on.
+const MAX_URL_BYTES: usize = 8 * 1024;
+
+/// `OpenUrl`'s check on the shell thread, whatever the launcher checked: an http or https address
+/// rebuilt from its parts, so only what was checked reaches the shell. The scheme in lowercase; a host
+/// of letters, digits, hyphens and dots (no empty label) with an optional numeric port; no user name
+/// or password before the host (refused: "https://bank.it@evil.example" reads as one host and is
+/// another); then the path, query and fragment with every character that is not URL-safe ASCII
+/// percent-encoded as UTF-8, so a quote or a bracket can never end the address inside a browser's
+/// command line. Whitespace and control characters are refused.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn rebuild_url(url: &str) -> Result<String, &'static str> {
+    const KEEP: &str = "-._~:/?#[]@!$&'()*+,;=%";
+    if url.len() > MAX_URL_BYTES {
+        return Err("too long");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("whitespace or a control character");
+    }
+    let (scheme, rest) = url.split_once("://").ok_or("no http or https scheme")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err("no http or https scheme");
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (Some(authority), Some(tail)) = (rest.get(..end), rest.get(end..)) else {
+        return Err("no host");
+    };
+    if authority.contains('@') {
+        return Err("a user name before the host");
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let label_ok = |l: &str| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-');
+    if !host.split('.').all(label_ok) {
+        return Err("not a host name");
+    }
+    if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err()) {
+        return Err("not a port");
+    }
+    let mut out = String::with_capacity(url.len() + 16);
+    out.push_str(&scheme);
+    out.push_str("://");
+    out.push_str(authority);
+    for c in tail.chars() {
+        if c.is_ascii_alphanumeric() || KEEP.contains(c) {
+            out.push(c);
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for b in c.encode_utf8(&mut buf).bytes() {
+            out.push('%');
+            for nibble in [b >> 4, b & 15] {
+                out.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0').to_ascii_uppercase());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `OpenUrl`: the address rebuilt by `rebuild_url`, in one shell call.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn open_url_with(url: &str, exec: Exec) -> Result<(), String> {
+    let url = rebuild_url(url).map_err(|e| format!("refused: {e}"))?;
+    exec(&url, None, None, Verb::Open)
 }
 
 // launcher requests: end
@@ -2365,5 +2448,52 @@ mod tests {
                 Verb::Open
             )]
         );
+    }
+
+    #[test]
+    fn open_url_rebuild() {
+        let ok = |u: &str| rebuild_url(u).unwrap_or_else(|e| panic!("{u}: {e}"));
+        assert_eq!(ok("https://a.it/x?q=1"), "https://a.it/x?q=1");
+        assert_eq!(
+            ok("https://www.google.com/search?q=caf%C3%A9%20x"),
+            "https://www.google.com/search?q=caf%C3%A9%20x"
+        );
+        assert_eq!(ok("HTTPS://a.it"), "https://a.it");
+        assert_eq!(ok("http://a.it:8080/p#top"), "http://a.it:8080/p#top");
+        // What could end the URL inside a handler's command line is percent-encoded, never passed raw.
+        assert_eq!(ok("https://a.it/\"x\"<y>|"), "https://a.it/%22x%22%3Cy%3E%7C");
+        assert_eq!(ok("https://a.it/caff\u{e8}"), "https://a.it/caff%C3%A8");
+        assert_eq!(ok("https://a.it/a\\b"), "https://a.it/a%5Cb");
+        assert_eq!(ok("https://a.it/\u{202E}"), "https://a.it/%E2%80%AE", "a bidi mark is shown, not obeyed");
+        // A user name or password before the host is refused, never passed on (and never kept).
+        for u in ["https://user:pw@a.it/x", "https://a.it@evil.example/", "http://@a.it", "https://a.it\\@evil.example"]
+        {
+            assert!(rebuild_url(u).is_err(), "{u}");
+        }
+        // Other schemes, no scheme, bad hosts and ports, whitespace and controls.
+        for u in [
+            "ftp://a.it/x",
+            "file:///C:/x",
+            "javascript:alert(1)",
+            "ms-settings:display",
+            "shell:AppsFolder",
+            "a.it",
+            "https://",
+            "https:///x",
+            "https://a..it",
+            "https://.a.it",
+            "https://a.it:",
+            "https://a.it:99999",
+            "https://a.it:8a",
+            "https://a b.it",
+            "https://a.it/x y",
+            "https://a.it/\n",
+        ] {
+            assert!(rebuild_url(u).is_err(), "{u:?}");
+        }
+        let mut calls = Vec::new();
+        assert!(open_url_with("HTTPS://a.it/\"", &mut recorder(&mut calls, true)).is_ok());
+        assert!(open_url_with("ftp://a.it", &mut recorder(&mut calls, true)).is_err());
+        assert_eq!(calls, [("https://a.it/%22".to_string(), None, None, Verb::Open)]);
     }
 }
