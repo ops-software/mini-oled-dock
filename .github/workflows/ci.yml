@@ -5,29 +5,177 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      regen:
+        description: Regenerate the golden images on the runner and upload them (never commits)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+env:
+  # Pinned so a new lint cannot turn main red overnight; a bump is a one-line PR with the clippy run attached.
+  # release.yml should adopt the same version (hand-off to WS-B).
+  RUST_TOOLCHAIN: 1.93.1
+
 jobs:
-  test:
+  lint:
     runs-on: windows-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --component rustfmt --component clippy
+          rustup default ${{ env.RUST_TOOLCHAIN }}
           rustc -vV
+
+      - name: Format of the lines this change touches
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $base = "origin/$env:GITHUB_BASE_REF" } else { $base = 'HEAD~1' }
+          pwsh tools/ci/fmt-changed.ps1 -BaseRef $base
+
+      - name: Clippy
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Cache cargo-deny
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\cargo-deny
+          key: cargo-deny-0.20.2-975a22143262
+
+      - name: cargo-deny 0.20.2 (prebuilt, SHA-256 verified)
+        shell: pwsh
+        env:
+          DENY_VERSION: '0.20.2'
+          DENY_SHA256: '975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc'   # sha256 of the .tar.gz asset
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'cargo-deny'
+          if (-not (Test-Path "$dir\cargo-deny.exe")) {
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            $tgz = Join-Path $dir 'cd.tar.gz'
+            Invoke-WebRequest "https://github.com/EmbarkStudios/cargo-deny/releases/download/$env:DENY_VERSION/cargo-deny-$env:DENY_VERSION-x86_64-pc-windows-msvc.tar.gz" -OutFile $tgz
+            if ((Get-FileHash $tgz -Algorithm SHA256).Hash.ToLower() -ne $env:DENY_SHA256) { throw 'cargo-deny: SHA-256 mismatch' }
+            tar -xzf $tgz -C $dir --strip-components=1
+          }
+          "$dir" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+
+      - name: cargo deny
+        run: cargo deny --locked check
+
+  test:
+    runs-on: windows-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            target-test
+          key: test-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
 
       # The test binary must run without a UAC prompt: DOCK_NO_MANIFEST embeds an asInvoker
       # manifest (see build.rs). Separate target dir so the release build keeps its admin manifest.
+      - name: Test-count ratchet
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          RATCHET_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: pwsh tools/ci/ratchet.ps1
+
       - name: Tests
         env:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked
 
+      - name: Golden diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diffs
+          path: target-test/tmp/golden
+          if-no-files-found: ignore
+          retention-days: 14
+
+  size:
+    runs-on: windows-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      # No DOCK_NO_MANIFEST and the default target dir: the release exe keeps its admin manifest (the size is measured on it).
       - name: Release build
         run: cargo build --release --locked
+
+      - name: Size
+        shell: pwsh
+        run: |
+          $n = (Get-Item target/release/dock.exe).Length
+          "dock.exe: $n bytes ($([math]::Round($n / 1024, 1)) KiB)"
+
+      - name: Size ledger
+        env:
+          DOCK_NO_MANIFEST: "1"
+          DOCK_EXE: target/release/dock.exe
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked --test budgets -- --ignored exe_size_within_ledger
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dock-release
+          path: target/release/dock.exe
+          retention-days: 7
+
+  regen-golden:
+    runs-on: windows-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.regen }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      # Never commits and never pushes: the owner downloads the artifact, looks at the PNGs and commits them.
+      - name: Regenerate goldens
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          GOLDEN_CI_REGEN: "1"
+          UPDATE_GOLDEN: "1"
+        run: cargo test --locked --test golden
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: golden-regen
+          path: tests/golden
+          retention-days: 14
