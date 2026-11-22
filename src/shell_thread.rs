@@ -1378,6 +1378,7 @@ const APPS_EXIT_EMPTY: i32 = 3;
 /// through the same encoder; after a child that ran out of time every later listing of this process is made here, so a
 /// hung child never holds this thread 5 s twice. The AppsFolder enumeration and Windows' app index (the shell modules and
 /// the parse of two index files) then load only in the child, which takes them with it when it exits.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn list_apps_arena() -> Arena {
     static CHILD_OFF: AtomicBool = AtomicBool::new(false);
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -1418,6 +1419,7 @@ fn list_apps_arena() -> Arena {
 /// What the dock keeps of an `--start-apps` child's `run_capture` result: the arena, when the child exited 0 and its
 /// whole output passes `arena::check` (header, sizes, every reference and order, the checksum) under the apps caps;
 /// otherwise the reason. The bytes are untrusted: nothing is read from them before the check.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn apps_from_child(out: Result<(i32, Vec<u8>), String>) -> Result<Arena, String> {
     let (code, bytes) = out?;
     if code != 0 {
@@ -1431,6 +1433,7 @@ fn apps_from_child(out: Result<(i32, Vec<u8>), String>) -> Result<Arena, String>
 /// indexed by the in-process path's entry builder and encoder, written to stdout as one apps arena. It touches no data
 /// folder, logger, mutex or console, reads no input and writes nothing but stdout. Exit 0 = an arena written; 1 = COM,
 /// the encoder or stdout failed; 3 = nothing listed.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn run_apps_child() -> i32 {
     use std::io::Write;
     // SAFETY: the first COM call of this thread (the child's main thread); paired with CoUninitialize below.
