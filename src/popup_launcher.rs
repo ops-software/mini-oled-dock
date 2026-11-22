@@ -114,19 +114,32 @@ struct Run {
 }
 
 /// The width up to and including each character of `text` as it is drawn, into `out` (a marker counts by its display
-/// text): one measurement of the whole text, character by character only when the text holds a marker.
-fn query_extents(s: &Surface, text: &str, out: &mut Vec<i32>) {
-    if text.chars().any(gesture::is_marker) {
-        out.clear();
-        let mut total = 0;
-        for c in text.chars() {
-            let mut buf = [0u8; 4];
-            total += s.text_width(marker_text(c).unwrap_or_else(|| c.encode_utf8(&mut buf)), Font::Query);
-            out.push(total);
-        }
-    } else {
+/// text): one measurement of the whole text, or, when it holds a marker, of the text as drawn (`shown`, a scratch whose
+/// capacity is kept).
+fn query_extents(s: &Surface, text: &str, shown: &mut String, out: &mut Vec<i32>) {
+    if !text.chars().any(gesture::is_marker) {
         s.char_extents(text, Font::Query, out);
+        return;
     }
+    shown.clear();
+    for c in text.chars() {
+        match marker_text(c) {
+            Some(m) => shown.push_str(m),
+            None => shown.push(c),
+        }
+    }
+    s.char_extents(shown, Font::Query, out);
+    // One entry per drawn character became one per character of `text`: the extent after its drawn text (forward, in
+    // place: a character's drawn text ends at or after its own position).
+    let mut end = 0usize;
+    for (j, c) in text.chars().enumerate() {
+        end += marker_text(c).map_or(1, |m| m.chars().count());
+        let v = out.get(end.saturating_sub(1)).copied().unwrap_or(0);
+        if let Some(slot) = out.get_mut(j) {
+            *slot = v;
+        }
+    }
+    out.truncate(text.chars().count());
 }
 
 /// The width of the characters of `text` before the byte offset `at`, from the cumulative widths of `query_extents`.
@@ -263,11 +276,11 @@ fn draw_run(s: &mut Surface, text: &str, marker: bool, x: i32, y: i32, font: Fon
     let lh = s.line_height(font);
     let w = s.text_width(text, font);
     if marker {
-        s.text(text, x, y, font, WHITE, style::FG_SECONDARY);
+        s.text_w(text, w, x, y, font, WHITE, style::FG_SECONDARY);
         let bar = m.px(2).max(1);
         s.fill_rr(rect_wh(x, y + lh - bar, w, bar), 0, style::ACCENT_ATTENTION, 255);
     } else {
-        s.text(text, x, y, font, WHITE, alpha);
+        s.text_w(text, w, x, y, font, WHITE, alpha);
     }
     x + w
 }
@@ -373,10 +386,19 @@ fn wrap(s: &Surface, text: &str, font: Font, first_w: i32, max_w: i32, max_lines
 
 // ---------------------------------------------------------------- the view
 
-// Number of `Launcher::layout` calls on this thread (the one-layout-per-key gate).
+// Number of `Launcher::layout` calls on this thread (the one-layout-per-key gate), and of the GDI text-extent calls the
+// field made in the layout and the paint (the field's measurement gate).
 #[cfg(test)]
 thread_local! {
     static LAYOUTS: Cell<u32> = const { Cell::new(0) };
+    static FIELD_EXTENTS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Adds the GDI text-extent calls made since `before` (`surface::EXTENT_CALLS`) to `FIELD_EXTENTS`.
+#[cfg(test)]
+fn count_field_extents(before: u64) {
+    let n = crate::surface::EXTENT_CALLS.with(Cell::get).saturating_sub(before);
+    FIELD_EXTENTS.with(|c| c.set(c.get() + n));
 }
 
 /// What the last layout decided: rectangles in client px, for painting and for the hit test.
@@ -385,6 +407,11 @@ struct Geo {
     w: i32,
     h: i32,
     field: RECT,
+    /// Where the query starts and how wide its room is, and the mode chip's width (0 without a chip), physical px:
+    /// measured by the layout, read by the paint.
+    query_x: i32,
+    room: i32,
+    chip_w: i32,
     /// The visible rows, top to bottom.
     rows: Vec<RowGeo>,
     /// The rows that do not fit are below (or above): the scrollbar's track, and the visible window.
@@ -435,8 +462,12 @@ pub(crate) struct Launcher {
     geo: RefCell<Geo>,
     /// `geo` was laid out by `size` and not yet painted: the paint that follows reads it instead of laying out again.
     fresh: Cell<bool>,
-    /// The cumulative widths of the query's characters (`query_extents`), measured by the layout and read by the paint.
+    /// The cumulative widths of the query's characters (`query_extents`), measured by the layout and read by the paint,
+    /// and the scratch of the query as drawn when it holds a marker.
     extents: RefCell<Vec<i32>>,
+    shown: RefCell<String>,
+    /// The mode chip's width for its provider at a DPI, measured once in an open.
+    chip_w: Cell<Option<(ProviderId, u32, i32)>>,
     /// The height last given to the host, and whether a shrink waits (120 ms without a keystroke).
     shown_h: i32,
     hold_shrink: bool,
@@ -484,6 +515,8 @@ impl Launcher {
             geo: RefCell::new(Geo::default()),
             fresh: Cell::new(false),
             extents: RefCell::new(Vec::new()),
+            shown: RefCell::new(String::new()),
+            chip_w: Cell::new(None),
             shown_h: 0,
             hold_shrink: false,
             bar_ticks: Cell::new(0),
@@ -899,14 +932,19 @@ impl Launcher {
         let inset = m.px(style::S_4);
         let field =
             rect_wh(m.px(style::FIELD_X), m.px(style::FIELD_Y), w - 2 * m.px(style::FIELD_X), m.px(style::FIELD_H));
-        self.follow_caret(s, &field);
+        #[cfg(test)]
+        let before = crate::surface::EXTENT_CALLS.with(Cell::get);
+        let (query_x, room, chip_w) = self.query_room(s, &field);
+        self.follow_caret(s, room);
+        #[cfg(test)]
+        count_field_extents(before);
         let rows = self.session.rows();
         let total = rows.len();
         if total == 0 {
             self.count.set(0);
             self.first.set(0);
             self.last_sel.set(self.session.selected_index());
-            return Geo { w, h: m.px(EMPTY_H), field, ..Geo::default() };
+            return Geo { w, h: m.px(EMPTY_H), field, query_x, room, chip_w, ..Geo::default() };
         }
         let top = m.px(style::LIST_Y);
         let avail = (self.max_h.saturating_sub(top + inset)).max(0);
@@ -990,16 +1028,15 @@ impl Launcher {
             right: w - m.px(style::SCROLLBAR_X_INSET),
             bottom: list_bottom,
         };
-        Geo { w, h, field, rows: shown, first, total, track, actions }
+        Geo { w, h, field, query_x, room, chip_w, rows: shown, first, total, track, actions }
     }
 
-    /// Keeps the caret inside the query's room (the field's width less the chip and the margins).
-    fn follow_caret(&self, s: &Surface, field: &RECT) {
+    /// Keeps the caret inside the query's room (the field's width less the chip and the margins, `query_room`).
+    fn follow_caret(&self, s: &Surface, room: i32) {
         let m = s.metrics();
-        let (_, room) = self.query_room(s, field);
         let text = self.session.query_text();
         let mut extents = self.extents.borrow_mut();
-        query_extents(s, text, &mut extents);
+        query_extents(s, text, &mut self.shown.borrow_mut(), &mut extents);
         let caret_x = prefix_width(&extents, text, self.session.field().caret());
         let whole = extents.last().copied().unwrap_or(0);
         drop(extents);
@@ -1017,14 +1054,28 @@ impl Launcher {
         self.scroll.set(scroll.max(0));
     }
 
-    /// Where the query starts (physical px) and how wide its room is.
-    fn query_room(&self, s: &Surface, field: &RECT) -> (i32, i32) {
+    /// Where the query starts (physical px), how wide its room is, and the mode chip's width (0 without a chip).
+    fn query_room(&self, s: &Surface, field: &RECT) -> (i32, i32, i32) {
         let m = s.metrics();
         let mut tx = m.px(style::NAME_X);
-        if let Some(p) = self.session.chip() {
-            tx += chip_width(s, p) + m.px(CHIP_GAP);
+        let chip = self.session.chip().map(|p| self.chip_width(s, p));
+        if let Some(cw) = chip {
+            tx += cw + m.px(CHIP_GAP);
         }
-        (tx, field.right - m.px(FIELD_PAD_R) - tx)
+        (tx, field.right - m.px(FIELD_PAD_R) - tx, chip.unwrap_or(0))
+    }
+
+    /// `chip_width` of `p`, measured once per provider and DPI in an open (the label does not change while it is open).
+    fn chip_width(&self, s: &Surface, p: ProviderId) -> i32 {
+        let dpi = s.metrics().dpi;
+        if let Some((kept, at, w)) = self.chip_w.get() {
+            if kept == p && at == dpi {
+                return w;
+            }
+        }
+        let w = chip_width(s, p);
+        self.chip_w.set(Some((p, dpi, w)));
+        w
     }
 
     // ------------------------------------------------------------ painting
@@ -1043,15 +1094,17 @@ impl Launcher {
         let lit = self.foreground;
         let text_alpha = if lit { style::FG_PRIMARY } else { style::FG_TERTIARY };
         if let Some(p) = self.session.chip() {
-            let cw = chip_width(s, p);
+            let cw = g.chip_w;
             let ch = m.px(CHIP_H);
             let rc = rect_wh(m.px(style::NAME_X), f.top + (f.bottom - f.top - ch) / 2, cw, ch);
             s.fill_rr(rc, m.px(style::R_XS), WHITE, style::FILL_CONTROL_HOT);
             s.stroke_rr(rc, m.px(style::R_XS), m.px(1).max(1), style::RIM_CONTROL);
             if let Some(label) = strings::chip(p) {
                 let alpha = if lit { style::FG_SECONDARY } else { style::FG_TERTIARY };
-                s.text(
+                // The layout measured the label: the chip is its width with the padding either side.
+                s.text_w(
                     label,
+                    cw - 2 * m.px(CHIP_PAD),
                     rc.left + m.px(CHIP_PAD),
                     center_y(&rc, s.line_height(Font::Caption)),
                     Font::Caption,
@@ -1060,7 +1113,7 @@ impl Launcher {
                 );
             }
         }
-        let (tx, room) = self.query_room(s, &f);
+        let (tx, room) = (g.query_x, g.room);
         let lh = s.line_height(Font::Query);
         let ty = center_y(&f, lh);
         let ch = m.px(CARET_H);
@@ -1077,7 +1130,7 @@ impl Launcher {
             let field = self.session.field();
             // The layout of this paint measured the text; a text of another length is measured again.
             if extents.len() != text.chars().count() {
-                query_extents(s, text, &mut extents);
+                query_extents(s, text, &mut self.shown.borrow_mut(), &mut extents);
             }
             if let Some(sel) = field.selection() {
                 let before = prefix_width(&extents, text, sel.start);
@@ -1225,7 +1278,11 @@ impl Launcher {
             None
         };
         let g = stored.unwrap_or_else(|| self.layout(s));
+        #[cfg(test)]
+        let before = crate::surface::EXTENT_CALLS.with(Cell::get);
         self.paint_field(s, &g, hot == Some(ID_FIELD));
+        #[cfg(test)]
+        count_field_extents(before);
         let sel = self.session.selected_index();
         for rg in &g.rows {
             let Some(item) = self.session.rows().get(rg.idx) else { continue };
@@ -4836,13 +4893,42 @@ mod tests {
 
     #[test]
     fn field_measured_once_per_key() {
-        type_and_paint("calcolatrice", |l, s| {
-            let before = crate::surface::EXTENT_CALLS.with(|c| c.get());
-            l.size(s);
-            l.paint_on(s, None, None, &mut EffectSys::default());
-            let calls = crate::surface::EXTENT_CALLS.with(|c| c.get()) - before;
-            assert!((1..=2).contains(&calls), "{calls} measurements of the field for one key");
-        });
+        // Every GDI text-extent call the field makes counts: the query's extents, the runs drawn, the chip and its label.
+        for text in ["calcolatrice", "$ blue"] {
+            let mut chip = false;
+            type_and_paint(text, |l, s| {
+                FIELD_EXTENTS.with(|c| c.set(0));
+                l.size(s);
+                l.paint_on(s, None, None, &mut EffectSys::default());
+                let calls = FIELD_EXTENTS.with(|c| c.get());
+                assert!(calls <= 2, "{calls} measurements of the field for one key of {text:?}");
+                assert!(calls >= 1 || l.session.query_text().is_empty(), "the field of {text:?} was measured");
+                chip |= l.session.chip().is_some();
+            });
+            assert_eq!(chip, text.starts_with('$'), "the mode chip of {text:?}");
+        }
+    }
+
+    #[test]
+    fn marker_extents_in_one_call() {
+        let s = surface(96);
+        let (mut shown, mut out) = (String::new(), Vec::new());
+        for text in ["ab\u{202E}cd", "\u{7}x\u{0}", "C:\\a\u{1b}b\u{202E}", "\u{202E}"] {
+            let before = crate::surface::EXTENT_CALLS.with(Cell::get);
+            query_extents(&s, text, &mut shown, &mut out);
+            assert_eq!(crate::surface::EXTENT_CALLS.with(Cell::get) - before, 1, "one measurement of {text:?}");
+            // The widths character by character, each by its drawn text, as the field measured them before.
+            let mut total = 0;
+            let each: Vec<i32> = text
+                .chars()
+                .map(|c| {
+                    let mut buf = [0u8; 4];
+                    total += s.text_width(marker_text(c).unwrap_or_else(|| c.encode_utf8(&mut buf)), Font::Query);
+                    total
+                })
+                .collect();
+            assert_eq!(out, each, "the extents of {text:?}");
+        }
     }
 
     #[test]
@@ -4905,9 +4991,9 @@ mod tests {
         l.size(&s);
         assert!(l.scroll.get() > 0, "a query wider than the field scrolls");
         let g = l.geo.borrow().clone();
-        let (_, room) = l.query_room(&s, &g.field);
+        let (_, room, _) = l.query_room(&s, &g.field);
         let mut extents = Vec::new();
-        query_extents(&s, l.session.query_text(), &mut extents);
+        query_extents(&s, l.session.query_text(), &mut String::new(), &mut extents);
         let caret = prefix_width(&extents, l.session.query_text(), l.session.field().caret());
         assert!(caret - l.scroll.get() <= room, "the caret is inside the room");
         // A short text does not scroll.

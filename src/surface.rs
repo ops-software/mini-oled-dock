@@ -333,6 +333,8 @@ impl Gdi {
         if s.is_empty() {
             return 0;
         }
+        #[cfg(test)]
+        EXTENT_CALLS.with(|c| c.set(c.get() + 1));
         let mut wide = self.wide.borrow_mut();
         wide.clear();
         wide.extend(s.encode_utf16());
@@ -759,11 +761,20 @@ impl Surface {
     /// Single-line text with the top-left corner at `(x, y)`; `rgb` non-premultiplied
     /// (white normally, black for today's day on the white plate).
     pub fn text(&mut self, s: &str, x: i32, y: i32, font: Font, rgb: (u32, u32, u32), alpha: u32) {
+        if self.gdi.size().is_none() || s.is_empty() || alpha == 0 {
+            return;
+        }
+        let w = self.text_width(s, font);
+        self.text_w(s, w, x, y, font, rgb, alpha);
+    }
+
+    /// `text` with the width of `s` in `font` already measured by `text_width`: drawn without measuring it again.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn text_w(&mut self, s: &str, w: i32, x: i32, y: i32, font: Font, rgb: (u32, u32, u32), alpha: u32) {
         let Some(mut cv) = self.gdi.canvas(self.clip) else { return };
         if s.is_empty() || alpha == 0 {
             return;
         }
-        let w = self.text_width(s, font);
         let f = self.face(font);
         self.gdi.text(&mut cv, s, x, y, f, w, rgb, alpha);
     }
@@ -1312,7 +1323,8 @@ pub(crate) fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -
     (rad as f32 + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
 }
 
-// Number of `GetTextExtentExPointW` calls on this thread (the measurement gate of the launcher's field).
+// Number of GDI text-extent calls on this thread, `GetTextExtentExPointW` (`char_extents`) and `GetTextExtentPoint32W`
+// (`text_width`, which `text` calls): the measurement gate of the launcher's field.
 #[cfg(test)]
 thread_local! {
     pub(crate) static EXTENT_CALLS: Cell<u64> = const { Cell::new(0) };
