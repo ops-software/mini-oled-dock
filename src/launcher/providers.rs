@@ -5,6 +5,7 @@
 
 use super::catalog::CatApp;
 use super::commands::{self, Command, COMMANDS};
+use super::frecency::Frecency;
 use super::gesture::GESTURE_TIME_MATCHES;
 use super::model::{
     Batch, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, NumberStyle, Payload, ProviderId,
@@ -57,7 +58,9 @@ pub struct Context<'a> {
     pub opts: &'a LauncherOpts,
     /// The locale's number marks, read at open.
     pub num: NumberStyle,
-    #[allow(dead_code)] // L1b-3 (frecency) and L2-4 (date and time) read the clock of the keystroke
+    /// What the user picked (L1b-3); the clock of the keystroke ages it.
+    pub learned: &'a Frecency,
+    #[allow(dead_code)] // L2-4 (date and time) reads the clock of the keystroke
     pub now_unix: i64,
     /// The window in front when the chord came can take the window menu: there, not the desktop, not one of the dock's
     /// own windows. Without one the Window menu row is disabled.
@@ -325,6 +328,15 @@ fn tier_of(c: &Cand, q: &str, fuzzy: bool) -> Option<u8> {
     }
 }
 
+/// The boost of a row the user picked before (L1b-3): nothing is hashed while nothing was learned, and a lookup
+/// allocates nothing.
+fn learned_boost(cx: &Context, provider: ProviderId, id: &str) -> Reverse<u16> {
+    if cx.learned.is_empty() {
+        return Reverse(0);
+    }
+    Reverse(cx.learned.boost(ItemKey::of(provider, id), cx.now_unix))
+}
+
 fn index_u32(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX)
 }
@@ -422,11 +434,12 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         let Some(tier) = tier_of(&c, text, fuzzy).filter(|t| *t <= max_tier) else { continue };
         hits += 1;
         // Look for the running window only when the row could stay: running is the better of the two scores.
-        if !top.accepts(&c.score(tier, true, KIND_APP)) {
+        let learned = learned_boost(cx, ProviderId::Apps, &app.id);
+        if !top.accepts(&Score { learned, ..c.score(tier, true, KIND_APP) }) {
             continue;
         }
         let win = cx.windows.iter().position(|w| same_program(app, w));
-        let score = c.score(tier, win.is_some(), KIND_APP);
+        let score = Score { learned, ..c.score(tier, win.is_some(), KIND_APP) };
         if top.accepts(&score) {
             keep_best(&mut best, top.cap, score, &app.name, (i, win));
         }
@@ -585,8 +598,11 @@ fn command_row(
 fn commands(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
     let mut hits = 0;
     for (i, cmd) in COMMANDS.iter().enumerate().filter(|(_, c)| c.id != CommandId::Registry) {
-        let Some(score) = command_score(cmd, i, q, fuzzy, s) else { continue };
+        let Some(mut score) = command_score(cmd, i, q, fuzzy, s) else { continue };
         hits += 1;
+        if !cmd.destructive {
+            score.learned = learned_boost(cx, ProviderId::Commands, cmd.en);
+        }
         if top.accepts(&score) {
             let mut item = command_item(cmd, ProviderId::Commands, cmd.name(), score);
             if cmd.id == CommandId::WindowMenu && !cx.window_target {
@@ -620,7 +636,8 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK) -> usize {
         let c = row.cand();
         let Some(tier) = tier_of(&c, &q.folded, fuzzy) else { continue };
         hits += 1;
-        let score = c.score(tier, false, KIND_SETTING);
+        let learned = learned_boost(cx, ProviderId::Settings, &row.name);
+        let score = Score { learned, ..c.score(tier, false, KIND_SETTING) };
         if top.accepts(&score) {
             keep_best(&mut best, top.cap, score, &row.name, row);
         }
@@ -1016,12 +1033,13 @@ pub(crate) mod tests {
         pub windows: Vec<WindowRow>,
         pub history: Vec<Box<str>>,
         pub opts: LauncherOpts,
+        pub learned: Frecency,
     }
 
     impl Fx {
         pub(crate) fn new() -> Fx {
             let (apps, settings, windows, history) = fixture();
-            Fx { apps, settings, windows, history, opts: LauncherOpts::default() }
+            Fx { apps, settings, windows, history, opts: LauncherOpts::default(), learned: Frecency::new() }
         }
 
         pub(crate) fn cx(&self) -> Context<'_> {
@@ -1033,6 +1051,7 @@ pub(crate) mod tests {
                 opts: &self.opts,
                 num: NUM_IT,
                 now_unix: 1_790_000_000,
+                learned: &self.learned,
                 window_target: true,
             }
         }
@@ -1204,6 +1223,49 @@ pub(crate) mod tests {
         assert_eq!(res.remove(answer).unwrap().kind, Kind::Answer);
         assert_eq!(res.selected().unwrap().key, web_search_key());
         assert!(res.remove(answer).is_none());
+    }
+
+    #[test]
+    fn learned_pick_rises_inside_its_tier_only() {
+        let mut fx = Fx::new();
+        let base: Vec<Item> = fx.rows("o");
+        let first = base.iter().find(|r| r.from == ProviderId::Apps).unwrap();
+        // The last app of the first app's tier: a learned pick overtakes its equals, never a better tier.
+        let same_tier = base.iter().rposition(|r| r.score.tier == first.score.tier && r.from == ProviderId::Apps);
+        let last = &base[same_tier.unwrap()];
+        assert_ne!(last.key, first.key, "{base:#?}");
+        let before = base.iter().position(|r| r.key == last.key).unwrap();
+        fx.learned.pick(last.key, 1_790_000_000, false);
+        let rows = fx.rows("o");
+        let after = rows.iter().position(|r| r.key == last.key).unwrap();
+        assert!(after < before, "{before} -> {after}");
+        assert!(rows.iter().take(after).all(|r| r.score.tier <= last.score.tier), "only inside the tier");
+        assert_eq!(rows.first().map(|r| &*r.title), Some("Sign out"), "a better tier stays first");
+        assert_eq!(rows[after].score.learned, Reverse(16));
+        // A better tier still wins over any learned count.
+        let first_tier = rows.iter().map(|r| r.score.tier).min().unwrap();
+        assert_eq!(rows[0].score.tier, first_tier);
+        // Settings learn too.
+        let mut fx = Fx::new();
+        fx.learned.pick(ItemKey::of(ProviderId::Settings, "Schermo"), 1_790_000_000, false);
+        let row = fx.rows("schermo").into_iter().find(|r| r.kind == Kind::Setting);
+        assert_eq!(row.map(|r| r.score.learned), Some(Reverse(16)));
+    }
+
+    #[test]
+    fn destructive_rows_ignore_what_is_learned() {
+        let mut fx = Fx::new();
+        for cmd in COMMANDS.iter().filter(|c| c.destructive) {
+            // Even a state edited by hand cannot lift them.
+            fx.learned.entries_for_test(ItemKey::of(ProviderId::Commands, cmd.en));
+        }
+        let rows = fx.rows("shut down");
+        let down = rows.iter().find(|r| r.destructive).unwrap();
+        assert_eq!(down.score.learned, Reverse(0));
+        let mut fx = Fx::new();
+        fx.learned.pick(ItemKey::of(ProviderId::Commands, "Lock"), 1_790_000_000, false);
+        let rows = fx.rows("lock");
+        assert_eq!(rows.iter().find(|r| r.kind == Kind::Command).unwrap().score.learned, Reverse(16));
     }
 
     #[test]
@@ -1512,6 +1574,8 @@ mod bench {
         windows: Vec<WindowRow>,
         history: Vec<Box<str>>,
         opts: LauncherOpts,
+        /// A full 1,000-entry state: the keystroke reads it for every matched candidate.
+        learned: Frecency,
     }
 
     impl Big {
@@ -1529,14 +1593,14 @@ mod bench {
                 s
             };
             let mut r = XorShift::new(0xB0B);
-            let apps = (0..2_000 * scale)
+            let apps: Vec<CatApp> = (0..2_000 * scale)
                 .map(|i| {
                     let n = name(&mut r);
                     CatApp::new(&format!("Vendor.App{i}!App"), &n, Keys::default(), (r.next_u64() % 1_000) as u32)
                 })
                 .collect();
             let mut r = XorShift::new(0xB0B + 1);
-            let settings = (0..1_500 * scale)
+            let settings: Vec<SettingRow> = (0..1_500 * scale)
                 .map(|i| {
                     let n = name(&mut r);
                     let keys = [(*r.pick(&words), 0), (*r.pick(&words), 1)];
@@ -1562,7 +1626,14 @@ mod bench {
                 .collect();
             let mut r = XorShift::new(0xB0B + 3);
             let history = (0..50 * scale).map(|_| format!("ping {}", r.pick(&words)).into()).collect();
-            Big { apps, settings, windows, history, opts: LauncherOpts::default() }
+            let mut learned = Frecency::new();
+            for (i, app) in apps.iter().enumerate().step_by(2).take(600) {
+                learned.pick(ItemKey::of(ProviderId::Apps, &app.id), 1_789_000_000 + i as i64, false);
+            }
+            for row in settings.iter().step_by(3).take(400) {
+                learned.pick(ItemKey::of(ProviderId::Settings, &row.name), 1_780_000_000, false);
+            }
+            Big { apps, settings, windows, history, opts: LauncherOpts::default(), learned }
         }
 
         fn cx(&self) -> Context<'_> {
@@ -1573,6 +1644,7 @@ mod bench {
                 history: &self.history,
                 opts: &self.opts,
                 num: NUM,
+                learned: &self.learned,
                 now_unix: 1_790_000_000,
                 window_target: true,
             }

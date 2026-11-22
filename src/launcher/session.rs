@@ -166,6 +166,8 @@ pub struct Session {
     rows: u8,
     /// The selection was made by arrow keys or the pointer, not taken by default (Ctrl+W, 5.2.9).
     picked: bool,
+    /// The row the last Enter or click ran, when it is one that is learned (L1b-3); the host takes it.
+    learn: Option<ItemKey>,
     /// The generation that last asked for the typo rewrite.
     rewrite_asked: Option<u64>,
     budget: Budget,
@@ -295,6 +297,7 @@ impl Session {
             replaying: false,
             rows: opts.rows,
             picked: false,
+            learn: None,
             rewrite_asked: None,
             budget: Budget::default(),
             mode: Mode::Mixed,
@@ -872,7 +875,8 @@ impl Session {
         match v {
             // A new instance for an app (also a running one); every other row opens as Enter does.
             Verb::Open if item.kind == Kind::App => {
-                app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into())))
+                let fx = app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into())));
+                self.note_pick(item, fx)
             }
             Verb::Open | Verb::Switch => self.primary(item, cx),
             Verb::RunAsAdmin => self.run_as_admin(item, None, cx),
@@ -902,7 +906,31 @@ impl Session {
         }
     }
 
+    /// The key of the row the last action ran, when frecency learns it: apps, settings and the non-destructive
+    /// commands. Answers, run lines, web rows, windows and files are never learned.
+    pub fn take_learn(&mut self) -> Option<ItemKey> {
+        self.learn.take()
+    }
+
+    fn note_pick(&mut self, item: &Item, fx: Vec<Effect>) -> Vec<Effect> {
+        let learned = matches!(
+            (item.from, item.kind),
+            (ProviderId::Apps, Kind::App)
+                | (ProviderId::Settings, Kind::Setting)
+                | (ProviderId::Commands, Kind::Command)
+        );
+        if learned && !item.destructive && !fx.is_empty() {
+            self.learn = Some(item.key);
+        }
+        fx
+    }
+
     fn primary(&mut self, item: &Item, cx: &Context) -> Vec<Effect> {
+        let fx = self.primary_effects(item, cx);
+        self.note_pick(item, fx)
+    }
+
+    fn primary_effects(&mut self, item: &Item, cx: &Context) -> Vec<Effect> {
         let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
         if !item.verbs.has(verbs::primary(item.kind, running)) {
             return Vec::new();
@@ -927,7 +955,10 @@ impl Session {
     /// Shift+Enter: a new instance of an app, the raw value of an answer, a line in a console kept open.
     fn shift_enter(&mut self, item: &Item) -> Vec<Effect> {
         match (&item.kind, &item.payload) {
-            (Kind::App, _) => app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into()))),
+            (Kind::App, _) => {
+                let fx = app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into())));
+                self.note_pick(item, fx)
+            }
             (Kind::Answer, Payload::Value { raw, .. }) => copy_after_hide(raw),
             (Kind::RunLine | Kind::RunSuggestion, Payload::RunLine(r)) => launch(LaunchReq::Console(r.clone())),
             _ => Vec::new(),
@@ -1118,6 +1149,34 @@ mod tests {
 
     fn sel_title(s: &Session) -> Option<&str> {
         s.selected().map(|r| &*r.title)
+    }
+
+    #[test]
+    fn only_apps_settings_and_plain_commands_are_learned() {
+        let fx = Fx::new();
+        let learned = |text: &str, m: Mods| {
+            let mut s = typed(&fx, text);
+            press(&mut s, &fx, VK_RETURN, m);
+            s.take_learn()
+        };
+        let key = |p: ProviderId, id: &str| Some(ItemKey::of(p, id));
+        assert_eq!(learned("calcolatrice", Mods::NONE), key(ProviderId::Apps, CALC_ID));
+        // A new instance and a running app's switch count as picks of the app.
+        assert_eq!(learned("blocco", Mods::SHIFT), key(ProviderId::Apps, NOTEPAD_ID));
+        assert_eq!(learned("blocco", Mods::NONE), key(ProviderId::Apps, NOTEPAD_ID));
+        assert_eq!(learned("schermo", Mods::NONE), key(ProviderId::Settings, "Schermo"));
+        assert_eq!(learned("lock", Mods::NONE), key(ProviderId::Commands, "Lock"));
+        // Never: a destructive command, a typed line, an answer, a web row, a window the catalogue does not know.
+        assert_eq!(learned("shut down", Mods::NONE), None);
+        assert_eq!(learned("> ping 1.1.1.1", Mods::NONE), None);
+        assert_eq!(learned("2+2", Mods::NONE), None);
+        assert_eq!(learned("zzqq", Mods::NONE), None);
+        assert_eq!(learned("footool", Mods::NONE), None);
+        // A key that does nothing learns nothing, and the pick is taken once.
+        assert_eq!(learned("calcolatrice", Mods::ALT), None);
+        let mut s = typed(&fx, "lock");
+        press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert!(s.take_learn().is_some() && s.take_learn().is_none());
     }
 
     #[test]

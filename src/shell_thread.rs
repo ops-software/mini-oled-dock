@@ -301,7 +301,7 @@ pub enum ShellEvent {
     LauncherConverted { gen: u64, meant: Option<String> },
     /// The shell user's SID and the launcher's history files (reply to `LauncherStateLoad`); `None`
     /// for what could not be found or read.
-    #[allow(dead_code)] // `sid` and `frecency` are read by the learned ranks (L1b)
+    #[allow(dead_code)] // `sid` is not read yet
     LauncherState { sid: Option<String>, frecency: Option<Vec<u8>>, run: Option<Vec<u8>> },
 }
 

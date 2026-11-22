@@ -22,10 +22,11 @@ use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
 use crate::launcher::catalog::{self, CatApp, IconCache};
 use crate::launcher::field::KeyEvent;
+use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::history;
 use crate::launcher::model::{
-    Batch, CommandId, GlyphId, IconRef, Item, KeyChord, Kind, Mode, Mods, NumberStyle, Payload, ProviderId,
+    Batch, CommandId, GlyphId, IconRef, Item, ItemKey, KeyChord, Kind, Mode, Mods, NumberStyle, Payload, ProviderId,
     ProviderMask, SettingRow, Verb, WindowRow,
 };
 use crate::launcher::providers::{self, Budget, Context, LauncherOpts};
@@ -332,6 +333,9 @@ pub(crate) struct Launcher {
     switch: Option<isize>,
     /// Run-history lines forgotten by Shift+Delete, taken out of the controller's history after the key.
     forgotten: Vec<Box<str>>,
+    /// The row this open ran (frecency learns it at the close) and the rows Shift+Delete made it forget.
+    learn: Option<ItemKey>,
+    unlearn: Vec<ItemKey>,
     /// The icon size of the rows at the surface's DPI (`StartIconsFor`).
     icon_px: u32,
     /// The titles of the windows were read for this open (the "<" mode, once).
@@ -365,6 +369,8 @@ impl Launcher {
             restore: false,
             switch: None,
             forgotten: Vec::new(),
+            learn: None,
+            unlearn: Vec::new(),
             icon_px: style::ICON_M as u32,
             titles_read: false,
             launched: false,
@@ -419,6 +425,9 @@ impl Launcher {
     /// the window menu and the row's copy run after the close, in `finish`.
     fn run(&mut self, fx: Vec<Effect>, cx: &Context, sys: &mut dyn SysPort) -> Reply {
         let mut reply = Reply::None;
+        if let Some(key) = self.session.take_learn() {
+            self.learn = Some(key);
+        }
         for e in fx {
             match e {
                 Effect::Relayout => reply = reply.merge(Reply::Relayout),
@@ -442,8 +451,10 @@ impl Launcher {
                 Effect::RequestRewrite { gen } => {
                     sys.shell(ShellRequest::LauncherConvert { gen, query: self.session.last_query() });
                 }
-                // Learned ranks (L1b-3), the notices' choice (L1b-5) and files (L2).
-                Effect::Forget(_) | Effect::DismissNotice(_) | Effect::RequestFiles(_) => {}
+                // Shift+Delete on an app, a setting or a command: its learned rank goes (`forget_runs`).
+                Effect::Forget(key) => self.unlearn.push(key),
+                // The notices' choice (L1b-5) and files (L2).
+                Effect::DismissNotice(_) | Effect::RequestFiles(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::Copy(_)
                 | Effect::Power(_)
@@ -535,14 +546,18 @@ impl Launcher {
 
     /// The forgotten run lines leave the controller's history (outside the context's borrow).
     fn forget_runs(&mut self) {
-        if self.forgotten.is_empty() {
+        if self.forgotten.is_empty() && self.unlearn.is_empty() {
             return;
         }
         let lines = std::mem::take(&mut self.forgotten);
+        let keys = std::mem::take(&mut self.unlearn);
         with_ctrl(|c| {
             let before = c.history.len();
             c.history.retain(|h| !lines.contains(h));
             c.dirty |= c.history.len() != before;
+            for key in keys {
+                c.frec_dirty |= c.frecency.forget(key);
+            }
         });
     }
 
@@ -570,6 +585,9 @@ impl Launcher {
             let s = held.get(usize::try_from(i).ok()?)?;
             Some((s.target.to_string(), s.args.clone()))
         };
+        if let Some(key) = self.learn.take() {
+            with_ctrl(|c| c.learn_pick(key));
+        }
         for e in std::mem::take(&mut self.queued) {
             match e {
                 Effect::Launch(r) => {
@@ -1670,7 +1688,7 @@ pub(crate) fn on_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>) {
 
 /// `ShellEvent::LauncherState`: the run history of the shell user (the learned ranks come in L1b). Lines added since the
 /// open stay first.
-pub(crate) fn on_state(run: Option<Vec<u8>>) {
+pub(crate) fn on_state(frecency: Option<Vec<u8>>, run: Option<Vec<u8>>) {
     if !is_on() {
         return;
     }
@@ -1683,18 +1701,38 @@ pub(crate) fn on_state(run: Option<Vec<u8>>) {
             history::push_front(&mut loaded, line);
         }
         c.history = loaded;
+        // Picks made before the file arrived are added to what it holds.
+        let mut learned = frecency.map_or_else(Frecency::new, |b| Frecency::parse(&b));
+        learned.absorb(&c.frecency);
+        c.frec_dirty |= !c.frecency.is_empty();
+        c.frecency = learned;
     });
+}
+
+/// "Forget history" (Settings > Launcher, L1b-7): the run history and every learned rank leave the memory and the files.
+#[allow(dead_code)] // L1b-7 builds the button
+pub(crate) fn forget_history() {
+    let cleared = with_ctrl(|c| {
+        c.history.clear();
+        c.frecency.clear();
+        c.dirty = false;
+        c.frec_dirty = false;
+    });
+    if cleared.is_some() {
+        crate::shell_thread::request(ShellRequest::LauncherStateSave { frecency: None, run: None, delete: true });
+    }
 }
 
 /// `TIMER_LAUNCHER_SAVE`: a changed history is written (the shell thread writes it for the shell user).
 fn save_state() {
     let req = with_ctrl(|c| {
-        if !std::mem::take(&mut c.dirty) || !c.learn {
+        let (run, frec) = (std::mem::take(&mut c.dirty), std::mem::take(&mut c.frec_dirty));
+        if !(run || frec) || !c.learn {
             return None;
         }
         Some(ShellRequest::LauncherStateSave {
-            frecency: None,
-            run: Some(history::render_run(&c.history)),
+            frecency: frec.then(|| c.frecency.render()),
+            run: run.then(|| history::render_run(&c.history)),
             delete: false,
         })
     })
@@ -1999,6 +2037,8 @@ struct Ctrl {
     settings: Vec<SettingRow>,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
+    /// What was picked (L1b-3): read by every keystroke, written 2 s after a close that changed it.
+    frecency: Frecency,
     /// The settings list the rows were folded from (the launch targets), and the icons kept between opens.
     setting_list: Arc<Vec<Setting>>,
     icons: IconCache,
@@ -2012,6 +2052,7 @@ struct Ctrl {
     learn: bool,
     state_loaded: bool,
     dirty: bool,
+    frec_dirty: bool,
     /// The last close that launched something: when it hid, and the query as typed (kept for the reopen of a refused launch
     /// only, at most until the next open or the release).
     hidden_at_ms: u64,
@@ -2069,6 +2110,7 @@ impl Ctrl {
             settings: Vec::new(),
             windows: Vec::new(),
             history: Vec::new(),
+            frecency: Frecency::new(),
             setting_list: Arc::default(),
             icons: IconCache::default(),
             icon_px: style::ICON_M as u32,
@@ -2077,6 +2119,7 @@ impl Ctrl {
             learn: true,
             state_loaded: false,
             dirty: false,
+            frec_dirty: false,
             hidden_at_ms: 0,
             failed_query: None,
             notice: None,
@@ -2097,7 +2140,9 @@ impl Ctrl {
             // Off: what was learned is forgotten and the files are deleted at the next open; on: they are read again.
             self.learn = c.learn;
             self.history.clear();
+            self.frecency.clear();
             self.dirty = false;
+            self.frec_dirty = false;
             self.state_loaded = false;
         }
     }
@@ -2105,13 +2150,23 @@ impl Ctrl {
     /// The chord was switched off: a changed history is written one last time (the request returned), then nothing the
     /// launcher kept between opens stays (SPEC 5.5.6: chord Off holds no resident data).
     fn chord_off(&mut self) -> Option<ShellRequest> {
-        let save = (self.dirty && self.learn).then(|| ShellRequest::LauncherStateSave {
-            frecency: None,
-            run: Some(history::render_run(&self.history)),
+        let save = ((self.dirty || self.frec_dirty) && self.learn).then(|| ShellRequest::LauncherStateSave {
+            frecency: self.frec_dirty.then(|| self.frecency.render()),
+            run: self.dirty.then(|| history::render_run(&self.history)),
             delete: false,
         });
         *self = Ctrl::new();
         save
+    }
+
+    /// The close ran this row: +1 in frecency (not while learning is off).
+    fn learn_pick(&mut self, key: ItemKey) {
+        if !self.learn {
+            return;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        let now = now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        self.frec_dirty |= self.frecency.pick(key, now, false);
     }
 
     /// The providers' context of one keystroke: borrowed, nothing copied.
@@ -2124,6 +2179,7 @@ impl Ctrl {
             history: &self.history,
             opts: &self.opts,
             num: self.num,
+            learned: &self.frecency,
             now_unix: now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             window_target: self.window_ok,
         }
@@ -2493,6 +2549,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
             decimal: tr(".", ",").chars().next().unwrap_or('.'),
             group: tr(",", ".").chars().next().unwrap_or(','),
         },
+        learned: &Frecency::new(),
         now_unix: 1_790_000_000,
         window_target: true,
     };
@@ -3616,6 +3673,51 @@ mod tests {
     }
 
     #[test]
+    fn frecency_is_kept_saved_forgotten_and_dropped() {
+        let key = ItemKey::of(ProviderId::Apps, "calc");
+        // A pick marks the state changed; only the changed file is written.
+        let mut c = Ctrl::new();
+        c.learn_pick(key);
+        assert!(c.frec_dirty && !c.dirty);
+        assert!(c.context().learned.boost(key, i64::MAX / 2) > 0);
+        let mut again = Ctrl::new();
+        again.frecency = Frecency::parse(&c.frecency.render());
+        assert_eq!(again.frecency, c.frecency);
+        let save = c.chord_off();
+        assert!(
+            matches!(&save, Some(ShellRequest::LauncherStateSave { frecency: Some(f), run: None, delete: false }) if f.starts_with(b"mini-oled-dock launcher-frecency 1\n")),
+            "{save:?}"
+        );
+        assert!(c.frecency.is_empty() && !c.frec_dirty, "chord Off keeps nothing");
+        // Learning off: nothing is counted, and switching it off drops what there was.
+        let mut c = Ctrl::new();
+        c.learn = false;
+        c.learn_pick(key);
+        assert!(c.frecency.is_empty() && !c.frec_dirty);
+        let mut c = Ctrl::new();
+        c.learn_pick(key);
+        c.configure(&LauncherConfig { learn: false, ..LauncherConfig::default() });
+        assert!(c.frecency.is_empty() && !c.frec_dirty);
+        // Shift+Delete on a row, and a pick that arrived before the file did.
+        let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
+        l.unlearn.push(key);
+        with_ctrl(|c| {
+            *c = Ctrl::new();
+            c.learn_pick(key);
+            c.frec_dirty = false;
+        });
+        l.forget_runs();
+        assert_eq!(with_ctrl(|c| (c.frecency.is_empty(), c.frec_dirty)), Some((true, true)));
+        let mut loaded = Frecency::new();
+        loaded.pick(key, 1_700_000_000, false);
+        let mut mine = Frecency::new();
+        mine.pick(key, 1_800_000_000, false);
+        loaded.absorb(&mine);
+        assert_eq!(loaded.boost(key, 1_800_000_000), 2 * 16, "the counts add, the later time wins");
+        with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    #[test]
     fn pass_note_rechecks_fullscreen() {
         // The note of a chord passed under FULLSCREEN computes the flags again: still fullscreen, the next chord passes
         // too; the window left fullscreen without a foreground change, the flag clears and the next chord opens.
@@ -3827,6 +3929,7 @@ mod tests {
     fn scene_context_free() -> crate::launcher::providers::Context<'static> {
         use crate::launcher::model::NumberStyle;
         static OPTS: std::sync::OnceLock<LauncherOpts> = std::sync::OnceLock::new();
+        static LEARNED: std::sync::OnceLock<Frecency> = std::sync::OnceLock::new();
         let opts = OPTS.get_or_init(LauncherOpts::default);
         crate::launcher::providers::Context {
             apps: &[],
@@ -3835,6 +3938,7 @@ mod tests {
             history: &[],
             opts,
             num: NumberStyle { decimal: '.', group: ',' },
+            learned: LEARNED.get_or_init(Frecency::new),
             now_unix: 0,
             window_target: true,
         }

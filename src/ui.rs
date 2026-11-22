@@ -1606,8 +1606,8 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::popup_launcher::on_icons(icon_px, icons);
             return false;
         }
-        ShellEvent::LauncherState { run, .. } => {
-            popup::popup_launcher::on_state(run);
+        ShellEvent::LauncherState { frecency, run, .. } => {
+            popup::popup_launcher::on_state(frecency, run);
             return false;
         }
         ShellEvent::LaunchFailed { kind } => {
