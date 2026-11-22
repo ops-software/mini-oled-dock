@@ -393,7 +393,8 @@ fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, Result<(u32, RECT), String>) {
     if unsafe { GetWindowRect(tray, &mut bar) }.is_err() {
         return (EdgeOwner::NoAnswer, Err("GetWindowRect failed".to_string()));
     }
-    // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
+    // SAFETY: MonitorFromWindow takes no pointers; for a taskbar destroyed since GetWindowRect it can
+    // return NULL, and GetMonitorInfoW below then fails and is handled.
     let hm = unsafe { MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has the right `cbSize` and is writable.
@@ -489,7 +490,13 @@ fn set_state(tray: HWND, state: u32) -> bool {
     }
     log!("taskbar: direct ABM_SETSTATE send failed, falling back to SHAppBarMessage");
     appbar_shell(ABM_SETSTATE, tray, state);
-    matches!(appbar_direct(ABM_GETSTATE, tray, 0), Some(v) if (v as u32) & ABS_MASK == state)
+    matches!(appbar_direct(ABM_GETSTATE, tray, 0), Some(v) if state_reads_as(v as u32, state))
+}
+
+/// True when a read-back state matches the wanted one on the auto-hide bit only: ABM_GETSTATE never
+/// reports ABS_ALWAYSONTOP (live fact X2: after ABM_SETSTATE(2) it reads 0). Pure.
+fn state_reads_as(read: u32, want: u32) -> bool {
+    (read ^ want) & ABS_AUTOHIDE == 0
 }
 
 // ------------------------------------------------------------ state file
@@ -1267,6 +1274,16 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_confirms_only_the_auto_hide_bit() {
+        for (r, w) in [(0, 2), (2, 2), (0, 0), (1, 1), (3, 1)] {
+            assert!(state_reads_as(r, w), "{r} {w}");
+        }
+        for (r, w) in [(1, 0), (0, 1), (1, 2)] {
+            assert!(!state_reads_as(r, w), "{r} {w}");
+        }
+    }
 
     #[test]
     fn state_parsing_masks_and_rejects() {
