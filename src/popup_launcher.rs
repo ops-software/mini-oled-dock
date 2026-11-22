@@ -632,8 +632,8 @@ impl Launcher {
     }
 
     /// After a close, with the popup hidden (the host's `after_close`): the icons the rows used stay in the cache, the
-    /// 10-minute release of the settings is armed, a changed history is written 2 s later, and a catalogue older than
-    /// 10 minutes is listed again.
+    /// 10-minute release of the settings is armed, a changed run history or frecency is written 2 s later, and a
+    /// catalogue older than 10 minutes is listed again.
     fn housekeeping(&mut self, sys: &mut dyn SysPort) {
         let used: Vec<String> = self
             .session
@@ -653,7 +653,7 @@ impl Launcher {
             }
             c.hidden_at_ms = now;
             c.failed_query = failed_query;
-            (c.dirty, c.catalogue_stale(now))
+            (c.dirty || c.frec_dirty, c.catalogue_stale(now))
         });
         let (save, stale) = plan.unwrap_or_default();
         sys.arm(crate::msg::TIMER_LAUNCHER_RELEASE, RELEASE_MS);
@@ -3679,6 +3679,41 @@ mod tests {
         sys.now = 700_000;
         l.housekeeping(&mut sys);
         assert!(sys.ops.iter().any(|o| o.contains("ListStartApps") && o.contains("None")), "{:?}", sys.ops);
+    }
+
+    #[test]
+    fn a_learned_pick_or_forget_arms_the_save() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let saves = |sys: &EffectSys| {
+            let id = format!("Arm({},", crate::msg::TIMER_LAUNCHER_SAVE);
+            sys.ops.iter().filter(|o| o.starts_with(&id)).count()
+        };
+        // A new instance of an app is a learned pick: only the frecency changed, and the close arms the save once.
+        with_ctrl(|c| *c = Ctrl::new());
+        let mut l = typed(&fx, "blocco");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::SHIFT), Reply::Close);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(with_ctrl(|c| (c.dirty, c.frec_dirty)), Some((false, true)), "{:?}", sys.ops);
+        let mut sys = EffectSys::default();
+        l.housekeeping(&mut sys);
+        assert_eq!(saves(&sys), 1, "{:?}", sys.ops);
+        // Shift+Delete on a learned row: the forget alone arms it too.
+        let calc = ItemKey::of(ProviderId::Apps, "calc");
+        with_ctrl(|c| {
+            *c = Ctrl::new();
+            c.learn_pick(calc);
+            c.frec_dirty = false;
+        });
+        let mut l = typed(&fx, "x");
+        l.unlearn.push(calc);
+        l.forget_runs();
+        assert_eq!(with_ctrl(|c| (c.dirty, c.frec_dirty)), Some((false, true)));
+        let mut sys = EffectSys::default();
+        l.housekeeping(&mut sys);
+        assert_eq!(saves(&sys), 1, "{:?}", sys.ops);
+        with_ctrl(|c| *c = Ctrl::new());
     }
 
     #[test]
