@@ -54,7 +54,9 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn emit(line: String) {
-    println!("{line}");
+    // Ignore write errors: this also runs in an extern "system" callback, where a panic would abort.
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{line}");
 }
 
 fn err_line(kind: &str, what: &str, e: impl std::fmt::Display) {
