@@ -206,8 +206,9 @@ pub enum ShellRequest {
     /// Click on a notification whose app has no open window: launches the app that sent it, found in
     /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
     OpenNotifApp { aumid: String, name: String },
-    // ---- the launcher's requests (built by launcher_sys.rs only). Each launch that fails pushes
-    // `ShellEvent::LaunchFailed`; the shared requests above never do. Logged as kind and length only.
+    // ---- the launcher's requests (built by launcher_sys.rs only). Each launch whose shell call fails
+    // pushes `ShellEvent::LaunchFailed` (one refused by the checks here first is only logged); the shared
+    // requests above never do. Logged as kind and length only.
     /// Open a file or folder of a result row: the path as it is, in one desktop-shell call (no
     /// `updated_exe_path`, no `is_dir`, no working directory).
     OpenPath { path: String },
@@ -287,8 +288,9 @@ pub enum ShellEvent {
     StartIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
     /// The settings catalog of the Start menu search is ready (`start_search::settings`).
     StartSettings,
-    /// A launcher request did not reach the desktop shell, or the shell refused it. Never pushed for
-    /// the shared requests (`Launch`, `LaunchAppAdmin`, `RevealApp`).
+    /// A launcher request's shell call failed (Explorer not answering, or the shell refused it). Not
+    /// pushed for a request the shell thread's own checks refused before any shell call (only logged),
+    /// and never for the shared requests (`Launch`, `LaunchAppAdmin`, `RevealApp`).
     LaunchFailed { kind: LaunchKind },
     /// Icons of launcher rows at `icon_px` (reply to `StartIconsFor`; `None` = the app has none).
     LauncherIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
@@ -1714,6 +1716,25 @@ fn reveal_app(id: &str) -> Result<(), String> {
 /// reach the shell and start nothing.
 type Exec<'a> = &'a mut dyn FnMut(&str, Option<&str>, Option<&str>, Verb) -> Result<(), String>;
 
+/// Why a launcher launch did not happen.
+#[derive(Debug, PartialEq, Eq)]
+enum Fail {
+    /// Refused by the checks here before any shell call: logged only, no `LaunchFailed` (Explorer was
+    /// never asked, so "Explorer isn't answering" would be false).
+    Refused(&'static str),
+    /// The shell call was made and failed: logged and pushed as `LaunchFailed`.
+    Shell(String),
+}
+
+impl std::fmt::Display for Fail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fail::Refused(why) => write!(f, "refused: {why}"),
+            Fail::Shell(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Whether a launcher request may use plain `ShellExecuteExW` in the dock's own process: only to open
 /// something, and only when the dock is known not to be elevated. A token that cannot be read
 /// (`elevation() == None`) counts as elevated: what the user typed never reaches an admin token.
@@ -1750,13 +1771,14 @@ fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
     }
 }
 
-/// What a launcher launch pushes when it failed.
+/// What a launcher launch pushes when it failed: `LaunchFailed` for a failed shell call only.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn failure_event(kind: LaunchKind, r: &Result<(), String>) -> Option<ShellEvent> {
-    r.is_err().then_some(ShellEvent::LaunchFailed { kind })
+fn failure_event(kind: LaunchKind, r: &Result<(), Fail>) -> Option<ShellEvent> {
+    matches!(r, Err(Fail::Shell(_))).then_some(ShellEvent::LaunchFailed { kind })
 }
 
-/// Runs one launcher launch; a failure is logged (kind and error only) and pushed as `LaunchFailed`.
+/// Runs one launcher launch; a failure is logged (kind and error only), and pushed as `LaunchFailed`
+/// when the shell call failed (`failure_event`).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launcher_launch(ui: isize, req: ShellRequest) {
     let Some(kind) = launch_kind(&req) else { return };
@@ -1800,9 +1822,9 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             r
         }
         // Catalogue ids and settings targets: these functions log as they do for Start.
-        ShellRequest::LauncherLaunch { target, args } => launch(&target, args.as_deref()),
-        ShellRequest::LauncherAppAdmin { id } => launch_app_admin(&id),
-        ShellRequest::LauncherRevealApp { id } => reveal_app(&id),
+        ShellRequest::LauncherLaunch { target, args } => launch(&target, args.as_deref()).map_err(Fail::Shell),
+        ShellRequest::LauncherAppAdmin { id } => launch_app_admin(&id).map_err(Fail::Shell),
+        ShellRequest::LauncherRevealApp { id } => reveal_app(&id).map_err(Fail::Shell),
         _ => return,
     };
     if let Err(err) = &r {
@@ -1976,11 +1998,11 @@ fn launcher_state_save(frecency: Option<Vec<u8>>, run: Option<Vec<u8>>, delete: 
 /// with the path as it is: no `updated_exe_path`, no `is_dir`, no working directory, so nothing
 /// the launcher found or the user typed touches the file system from the elevated process.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn open_path_with(path: &str, exec: Exec) -> Result<(), String> {
+fn open_path_with(path: &str, exec: Exec) -> Result<(), Fail> {
     if path.trim().is_empty() || path.chars().any(char::is_control) {
-        return Err("refused: an empty path or a control character".into());
+        return Err(Fail::Refused("an empty path or a control character"));
     }
-    exec(path, None, None, Verb::Open)
+    exec(path, None, None, Verb::Open).map_err(Fail::Shell)
 }
 
 /// The file and the arguments of a run line, split where the launcher's syntax-only classification
@@ -2030,39 +2052,39 @@ fn command_parts(
 /// network drive letter cannot be told from a local one by syntax). `_proof` is the hook-proven gesture the request
 /// carries: nothing reaches this without one.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exec) -> Result<(), String> {
+fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exec) -> Result<(), Fail> {
     if line.chars().any(is_marker) {
-        return Err("refused: a control or bidi character".into());
+        return Err(Fail::Refused("a control or bidi character"));
     }
-    let (file, args) = command_parts(line, file, false, Path::new("")).map_err(|e| format!("refused: {e}"))?;
+    let (file, args) = command_parts(line, file, false, Path::new("")).map_err(Fail::Refused)?;
     if is_network_file(&file) {
-        return Err("refused: a network file".into());
+        return Err(Fail::Refused("a network file"));
     }
-    exec(&file, args.as_deref(), None, Verb::RunAs)
+    exec(&file, args.as_deref(), None, Verb::RunAs).map_err(Fail::Shell)
 }
 
 /// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /k <line>`), one
 /// shell call with no working directory. Nothing is expanded or looked up here: the line goes to the
 /// shell as typed.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), String> {
-    let (file, args) = command_parts(line, file, console, sys).map_err(|e| format!("refused: {e}"))?;
-    exec(&file, args.as_deref(), None, Verb::Open)
+fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), Fail> {
+    let (file, args) = command_parts(line, file, console, sys).map_err(Fail::Refused)?;
+    exec(&file, args.as_deref(), None, Verb::Open).map_err(Fail::Shell)
 }
 
 /// `RevealPath`: refuses an empty path or one with a double quote (it would end the `/select`
 /// argument) or a control character (as `app_target_path`), then exactly one shell call:
 /// `<windows>\explorer.exe /select,"<path>"`. Not through `launch`, whose `is_dir` would touch the path.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn reveal_path_with(path: &str, windows: &Path, exec: Exec) -> Result<(), String> {
+fn reveal_path_with(path: &str, windows: &Path, exec: Exec) -> Result<(), Fail> {
     if path.trim().is_empty() || path.contains('"') || path.chars().any(char::is_control) {
-        return Err("refused: an empty path, a double quote or a control character".into());
+        return Err(Fail::Refused("an empty path, a double quote or a control character"));
     }
     if !windows.is_absolute() {
-        return Err("no Windows folder".into());
+        return Err(Fail::Refused("no Windows folder"));
     }
     let explorer = windows.join("explorer.exe");
-    exec(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")), None, Verb::Open)
+    exec(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")), None, Verb::Open).map_err(Fail::Shell)
 }
 
 /// The longest web address `OpenUrl` passes on.
@@ -2129,9 +2151,9 @@ fn rebuild_url(url: &str) -> Result<String, &'static str> {
 
 /// `OpenUrl`: the address rebuilt by `rebuild_url`, in one shell call.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn open_url_with(url: &str, exec: Exec) -> Result<(), String> {
-    let url = rebuild_url(url).map_err(|e| format!("refused: {e}"))?;
-    exec(&url, None, None, Verb::Open)
+fn open_url_with(url: &str, exec: Exec) -> Result<(), Fail> {
+    let url = rebuild_url(url).map_err(Fail::Refused)?;
+    exec(&url, None, None, Verb::Open).map_err(Fail::Shell)
 }
 
 // launcher requests: end
@@ -2587,11 +2609,28 @@ mod tests {
         let mut calls = Vec::new();
         let r = open_path_with("C:\\a.txt", &mut recorder(&mut calls, false));
         assert_eq!(calls.len(), 1);
+        assert_eq!(r, Err(Fail::Shell("0x80004005".into())));
         assert!(matches!(
             failure_event(LaunchKind::Path, &r),
             Some(ShellEvent::LaunchFailed { kind: LaunchKind::Path })
         ));
         assert!(failure_event(LaunchKind::Path, &Ok(())).is_none());
+        // Refused here before any shell call: only logged, never "Explorer isn't answering".
+        calls.clear();
+        let (sys, windows, g) = (Path::new("C:\\Windows\\System32"), Path::new("C:\\Windows"), Gesture::for_test(1));
+        let refused = |r: Result<(), Fail>| {
+            assert!(matches!(r, Err(Fail::Refused(_))), "{r:?}");
+            assert!(failure_event(LaunchKind::Path, &r).is_none(), "{r:?}");
+        };
+        refused(open_path_with("", &mut recorder(&mut calls, false)));
+        refused(run_as_typed_with("\\\\server\\x.exe", 0..14, &g, &mut recorder(&mut calls, false)));
+        refused(run_as_typed_with("cmd", 0..99, &g, &mut recorder(&mut calls, false)));
+        refused(launch_command_with("cmd", 0..99, false, sys, &mut recorder(&mut calls, false)));
+        refused(launch_command_with("ping", 0..4, true, Path::new(""), &mut recorder(&mut calls, false)));
+        refused(reveal_path_with("C:\\a\".txt", windows, &mut recorder(&mut calls, false)));
+        refused(reveal_path_with("C:\\a.txt", Path::new(""), &mut recorder(&mut calls, false)));
+        refused(open_url_with("https://user@a.it/", &mut recorder(&mut calls, false)));
+        assert!(calls.is_empty(), "{calls:?}");
         assert_eq!(launch_kind(&ShellRequest::OpenPath { path: "C:\\a.txt".into() }), Some(LaunchKind::Path));
     }
 
@@ -2657,7 +2696,7 @@ mod tests {
             [("cmd", 0..99), ("\u{e9}", 1..2), ("cmd", Range { start: 3, end: 1 }), ("cmd", 0..0), ("cmd", 1..3)];
         for (line, file) in ranges {
             let shown = format!("{file:?}");
-            let e = run_as_typed_with(line, file, &g, &mut recorder(&mut calls, true)).expect_err(&shown);
+            let e = run_as_typed_with(line, file, &g, &mut recorder(&mut calls, true)).expect_err(&shown).to_string();
             // What the shell thread logs for a refusal: the kind and the reason, never the line.
             assert!(!e.contains(line), "{e}");
         }
@@ -2779,7 +2818,7 @@ mod tests {
 
     #[test]
     fn only_launcher_requests_report_failures() {
-        let err: Result<(), String> = Err("0x80004005".into());
+        let err: Result<(), Fail> = Err(Fail::Shell("0x80004005".into()));
         let reported = |r: &ShellRequest| match launch_kind(r).and_then(|k| failure_event(k, &err)) {
             Some(ShellEvent::LaunchFailed { kind }) => Some(kind),
             _ => None,
