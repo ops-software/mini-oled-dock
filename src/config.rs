@@ -1565,6 +1565,10 @@ pub fn toggle_start_pin(id: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/config_tests.rs"]
+mod fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

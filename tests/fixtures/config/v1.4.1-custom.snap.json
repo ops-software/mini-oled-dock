@@ -1,0 +1,98 @@
+{
+  "language": "it",
+  "position": "top",
+  "monitor": "\\\\.\\DISPLAY2",
+  "autohide": false,
+  "window_previews": false,
+  "win_opens_start": true,
+  "hide_native_taskbar": false,
+  "pinned": [
+    {
+      "key": "a.exe",
+      "name": "A",
+      "launch": "C:\\a\\a.exe"
+    },
+    {
+      "key": "b.exe",
+      "name": "B",
+      "launch": "shell:AppsFolder\\B!App"
+    }
+  ],
+  "start_pins": [
+    "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App",
+    "Microsoft.Windows.Explorer"
+  ],
+  "start_folders": [
+    {
+      "name": "Work",
+      "apps": [
+        "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+      ]
+    }
+  ],
+  "start_style": "windows11",
+  "start_grid": true,
+  "names": {
+    "code.exe": "Editor",
+    "steam.exe": "Games"
+  },
+  "show_date": false,
+  "show_volume_percent": false,
+  "show_tray": false,
+  "show_notifications": false,
+  "show_volume": false,
+  "show_network": false,
+  "show_metrics": true,
+  "show_battery": true,
+  "battery_percent": false,
+  "battery_percent_inside": true,
+  "show_clock": false,
+  "show_desktop_button": false,
+  "show_start_button": false,
+  "display_mode": "text",
+  "app_icon_size": 24,
+  "app_text_size": 15,
+  "tray_icon_size": 20,
+  "module_size": 125,
+  "background": "#101820",
+  "bar_opacity": 80,
+  "settings_window_size": [
+    1000,
+    700
+  ],
+  "time_format": "h:mm tt",
+  "show_seconds": true,
+  "date_format": "dddd d MMMM",
+  "tray_hidden_guids": [
+    "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+    "11111111-2222-3333-4444-555555555555"
+  ],
+  "tray_hidden": [
+    "discord.exe#1",
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  ],
+  "app_order": [
+    "steam.exe",
+    "code.exe"
+  ],
+  "tray_order": [
+    "discord.exe#1",
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  ],
+  "modules_order": [
+    "power",
+    "clock",
+    "volume",
+    "network",
+    "notifications",
+    "metrics",
+    "show_desktop",
+    "battery"
+  ],
+  "audio_layout": "M-oSX",
+  "notif_prompted": true,
+  "update_check": false,
+  "update_auto_install": true,
+  "last_update_check": "2026-01-01T00:00:00Z",
+  "update_available": "v9.9.9"
+}

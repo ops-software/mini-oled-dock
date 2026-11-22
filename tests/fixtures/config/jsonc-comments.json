@@ -1,0 +1,9 @@
+// leading comment
+{
+  /* block comment */
+  "position": "top", // trailing comment
+  "names": { "a.exe": "C:\\a//b", "b.exe": "has /* not a comment */ inside" },
+  /* multi
+     line */
+  "show_seconds": true
+}

@@ -1,0 +1,5 @@
+{
+  "position": "top",
+  "a_key_from_the_future": { "nested": [1, 2, 3] },
+  "another_future_key": true
+}
