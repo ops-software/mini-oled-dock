@@ -32,6 +32,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -184,35 +185,82 @@ fn read_index(name: &str) -> String {
 /// What Windows Search reads `query` as, when it has a rewrite for it ("rkdp" is "rdp"). Reads
 /// `appsconversions.txt` from disk each time and keeps nothing: called only for a query that
 /// found nothing.
-// ponytail: a 1.4 MB read on the calling (UI) thread, a millisecond or two from the file cache;
-// ask the shell thread instead if it ever shows in a trace.
+// ponytail: a streamed read (64 KiB held, never the 1.4 MB file) on the calling (UI) thread, a millisecond or two from
+// the file cache; ask the shell thread instead if it ever shows in a trace.
 pub(crate) fn converted(query: &str) -> Option<String> {
     let typed = query.trim().to_lowercase();
     if typed.is_empty() {
         return None;
     }
-    convert(&read_conversions(), &typed).map(str::to_string)
+    convert_stream(open_conversions()?, &typed)
 }
 
-/// `appsconversions.txt` from the profile of the dock's user (see the module notes), or empty.
-fn read_conversions() -> String {
+/// The reader's buffer: the file is never held whole (it is about 1.4 MB), only this much of it.
+const CONVERSIONS_BUF: usize = 64 * 1024;
+/// A row of the file is a few dozen bytes; a longer line is not a row and is skipped.
+const CONVERSIONS_LINE_MAX: u64 = 4096;
+
+fn conversions_reader<R: Read>(r: R) -> BufReader<R> {
+    BufReader::with_capacity(CONVERSIONS_BUF, r)
+}
+
+/// `convert` over a stream, line by line, stopping at the first row that matches. Same answer as `convert` over the
+/// whole text (an invalid UTF-8 byte reads as U+FFFD, as before), at most `MAX_FILE` bytes read, about 68 KiB held.
+pub(crate) fn convert_stream(r: impl Read, typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    let mut r = conversions_reader(r.take(MAX_FILE));
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        line.clear();
+        let n = (&mut r).take(CONVERSIONS_LINE_MAX).read_until(b'\n', &mut line).ok()?;
+        if n == 0 {
+            return None;
+        }
+        if line.last() != Some(&b'\n') && u64::try_from(n).ok() == Some(CONVERSIONS_LINE_MAX) {
+            // Too long for a row: drop the rest of the line.
+            loop {
+                let buf = r.fill_buf().ok()?;
+                if buf.is_empty() {
+                    return None;
+                }
+                match buf.iter().position(|&b| b == b'\n') {
+                    Some(p) => {
+                        r.consume(p.saturating_add(1));
+                        break;
+                    }
+                    None => {
+                        let all = buf.len();
+                        r.consume(all);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(meant) = convert(&String::from_utf8_lossy(&line), typed) {
+            return Some(meant.to_string());
+        }
+    }
+}
+
+/// `appsconversions.txt` from the profile of the dock's user (see the module notes), opened through `datadir`'s checked
+/// opener (no reparse point, a regular file), or nothing.
+fn open_conversions() -> Option<std::fs::File> {
     // SAFETY: valid known-folder id; the returned buffer is freed below.
     let Ok(p) = (unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None) }) else {
-        return String::new();
+        return None;
     };
     // SAFETY: `p` is a NUL-terminated string owned by us until CoTaskMemFree.
     let local = unsafe { p.to_string() }.unwrap_or_default();
     // SAFETY: `p` came from SHGetKnownFolderPath and is not used afterwards.
     unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _)) };
     if local.is_empty() {
-        return String::new();
+        return None;
     }
     let root = Path::new(&local).join(r"Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\LocalState\ConstraintIndex");
-    subdirs(&root)
-        .iter()
-        .find_map(|d| crate::datadir::read_file(&d.join("appsconversions.txt"), MAX_FILE, false).ok())
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default()
+    subdirs(&root).iter().find_map(|d| crate::datadir::open_checked(&d.join("appsconversions.txt"), false).ok())
 }
 
 // ------------------------------------------------------------------ parsers (pure)
@@ -875,6 +923,45 @@ mod tests {
         assert_eq!(convert(conv, "rdp"), None);
         assert_eq!(convert(conv, "a"), None, "a rewrite to itself is nothing");
         assert_eq!(convert(conv, ""), None);
+    }
+
+    const CONV: &str = "market\t~\t~\t0\r\nspelling\truhn\trun\t10003\r\nspelling\trkdp\trdp\t10237\r\nspelling\ta\ta\t1\r\nspelling\tx\n";
+
+    #[test]
+    fn streamed_convert_equals_whole_file() {
+        for q in ["rkdp", " ruhn ", "rdp", "a", "", "x", "RKDP", "market", "spelling"] {
+            let typed = q.trim().to_lowercase();
+            assert_eq!(
+                convert_stream(std::io::Cursor::new(CONV.as_bytes()), &typed),
+                convert(CONV, &typed).map(str::to_string),
+                "{q:?}"
+            );
+        }
+        // No final newline, an invalid byte inside a line, a line longer than any row of Windows' file.
+        let odd = b"spelling\tzz\tyy\t1\r\nspelling\tq\xff\tw\t1\r\nspelling\tlast\tfin";
+        assert_eq!(convert_stream(std::io::Cursor::new(&odd[..]), "zz").as_deref(), Some("yy"));
+        assert_eq!(convert_stream(std::io::Cursor::new(&odd[..]), "last").as_deref(), Some("fin"));
+        let mut long = vec![b'z'; 100_000];
+        long.extend_from_slice(b"\nspelling\tab\tcd\t1\n");
+        assert_eq!(convert_stream(std::io::Cursor::new(long), "ab").as_deref(), Some("cd"), "a long line is skipped");
+    }
+
+    #[test]
+    fn conversions_reader_is_64_kib() {
+        assert_eq!(conversions_reader(std::io::empty()).capacity(), 64 * 1024);
+    }
+
+    #[test]
+    fn typo_rewrite_peak_is_bounded() {
+        // MEM-6: about 1.4 MB of rows, none for the query. The file is never held whole.
+        let row = "spelling\tsomething\tsomewhere\t10003\r\n";
+        let text: String = (0..1_400_000 / row.len()).map(|_| row).collect();
+        assert!(text.len() >= 1_400_000 - row.len());
+        let (hit, peak) = crate::launcher::testkit::peak_bytes_during(|| {
+            convert_stream(std::io::Cursor::new(text.as_bytes()), "nothing like it")
+        });
+        assert_eq!(hit, None);
+        assert!(peak <= 72 * 1024, "peak {peak} bytes");
     }
 
     #[test]

@@ -520,7 +520,7 @@ pub enum FileAcl {
 
 /// Opens `path` for reading WITHOUT following reparse points and checks it is a regular file
 /// (single hard link if `single_link`). Errors keep `NotFound` for a missing file.
-fn open_checked(path: &Path, single_link: bool) -> io::Result<File> {
+pub(crate) fn open_checked(path: &Path, single_link: bool) -> io::Result<File> {
     let f = OpenOptions::new()
         .read(true)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
