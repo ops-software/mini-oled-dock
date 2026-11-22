@@ -736,9 +736,10 @@ mod tests {
     #[test]
     fn prefix_walk_equals_the_reference() {
         use crate::launcher::testkit::XorShift;
+        // Every string over {a, b, c} up to 6 characters (queries); the targets are those of up to 5.
         let mut all: Vec<String> = vec![String::new()];
         let mut from = 0;
-        for _ in 0..5 {
+        for _ in 0..6 {
             let end = all.len();
             for i in from..end {
                 for ch in ['a', 'b', 'c'] {
@@ -747,11 +748,11 @@ mod tests {
             }
             from = end;
         }
-        let mut targets = all.clone();
+        let mut targets: Vec<String> = all.iter().filter(|s| s.len() <= 5).cloned().collect();
         targets.extend(["ab c", "a bc", "é", "éa", "ab é"].map(String::from));
         targets.sort();
         let mut queries: Vec<String> = all.iter().filter(|s| !s.is_empty()).cloned().collect();
-        queries.extend(["abcabc", "cbacba", "aaaaaa", "ab c", "éa"].map(String::from));
+        queries.extend(["ab c", "éa"].map(String::from));
         let check = |targets: &[String], queries: &[String]| {
             for q in queries {
                 let qc: Vec<char> = q.chars().collect();

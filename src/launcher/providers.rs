@@ -2115,7 +2115,7 @@ mod bench {
     }
 
     /// L3 T9 and T10: with the dictionaries a query gives the same rows, scores and order as the scan, for every prefix of
-    /// the bench's queries (the first 150: the scan is the slow side) and for one-edit and two-edit typos of the first word
+    /// the first 150 bench queries (the scan is the slow side; `dictionaries_equal_scan_on_the_bench` covers all 1,000) and for one-edit and two-edit typos of the first word
     /// of 200 names (the fuzzy tier).
     #[test]
     fn fuzzy_index_equals_scan() {
@@ -2161,6 +2161,56 @@ mod bench {
             fuzzy_rows += a.iter().filter(|(_, s)| s.tier == rank::T_FUZZY).count();
         }
         assert!(fuzzy_rows > 0, "the typos reach the fuzzy tier");
+    }
+
+    /// L3 T9 and T10, per candidate: for every one of the 1,000 queries and every prefix of each, the dictionaries answer
+    /// like the scans over the bench's apps and settings (the hidden tiers: `hidden` against `hidden_best`; the fuzzy
+    /// tier: `fuzzy` plus `subsequence_name` against `match_fuzzy`). No `query_all` runs, so the slow side is cheap.
+    #[test]
+    fn dictionaries_equal_scan_on_the_bench() {
+        let big = Big::new(1);
+        let apps: Vec<_> = big.apps.iter().map(CatApp::cand).collect();
+        let settings: Vec<_> = big.settings.iter().map(SettingRow::cand).collect();
+        let (mut hidden_hits, mut fuzzy_hits) = (0usize, 0usize);
+        for (cands, ix) in [(&apps, &big.apps_ix), (&settings, &big.settings_ix)] {
+            let view = ix.view();
+            assert_eq!(view.entries(), cands.len());
+            let (mut hits, mut near) = (Vec::new(), Vec::new());
+            for raw in queries() {
+                let mut end = 0;
+                for ch in raw.chars() {
+                    end += ch.len_utf8();
+                    let part = &raw[..end];
+                    let q = part.trim();
+                    let chars = q.chars().count();
+                    view.hidden(q, chars, &mut hits);
+                    let fz = rank::fuzzy_chars(part).map(|(c, m)| (c, m, rank::fuzzy_dist(m)));
+                    if let Some((c, m, dist)) = &fz {
+                        view.fuzzy(&c[..*m], *dist, &mut near);
+                    }
+                    let mut next = 0;
+                    for (i, c) in cands.iter().enumerate() {
+                        let found = if hits.get(next).is_some_and(|h| h.0 as usize == i) {
+                            next += 1;
+                            Some((hits[next - 1].1, hits[next - 1].2))
+                        } else {
+                            None
+                        };
+                        assert_eq!(found, rank::hidden_best(c, q, chars), "{part:?} entry {i}");
+                        hidden_hits += usize::from(found.is_some());
+                        if let Some((chars, m, _)) = &fz {
+                            let qc = &chars[..*m];
+                            let in_dict = near.binary_search(&(i as u32)).is_ok();
+                            let want = rank::match_fuzzy(c, part).is_some();
+                            assert_eq!(in_dict || rank::subsequence_name(c, qc), want, "{part:?} entry {i}");
+                            fuzzy_hits += usize::from(want);
+                        }
+                    }
+                    assert_eq!(next, hits.len(), "{part:?}: every hit belongs to an entry");
+                }
+            }
+        }
+        assert!(hidden_hits > 0 && fuzzy_hits > 0);
     }
 
     /// KEY-2: no keyword line is read on the key path: the hidden tiers come from the dictionaries.
