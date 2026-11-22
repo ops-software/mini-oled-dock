@@ -51,7 +51,7 @@ pub fn verb_run_as_admin() -> &'static str {
     tr("Run as administrator", "Esegui come amministratore")
 }
 pub fn verb_reveal() -> &'static str {
-    tr("Show in folder", "Mostra nella cartella")
+    tr("Open file location", "Apri percorso file")
 }
 pub fn verb_copy() -> &'static str {
     tr("Copy", "Copia")
