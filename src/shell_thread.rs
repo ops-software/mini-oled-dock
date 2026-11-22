@@ -1390,8 +1390,7 @@ fn list_apps_arena(child: bool) -> Arena {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if child && !CHILD_OFF.load(Relaxed) {
         let t = Instant::now();
-        let out = std::env::current_exe()
-            .map_err(|e| format!("no exe path: {e}"))
+        let out = crate::update::child_exe()
             .and_then(|exe| crate::update::run_capture(&exe, &[APPS_FLAG], APPS_CHILD_TIMEOUT, APPS_CHILD_MAX_BYTES));
         match apps_from_child(out) {
             Ok(a) => {
@@ -1700,9 +1699,9 @@ impl Shell {
 /// both pipes. Err: why, with the ids back.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> Result<IconJob, (String, Vec<String>)> {
-    let exe = match std::env::current_exe() {
+    let exe = match crate::update::child_exe() {
         Ok(exe) => exe,
-        Err(e) => return Err((format!("no exe path: {e}"), ids)),
+        Err(why) => return Err((why, ids)),
     };
     let mut child = match crate::update::spawn_in_job(&exe, &[ICONS_FLAG, &px.to_string()], true) {
         Ok(child) => child,

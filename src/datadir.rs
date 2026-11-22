@@ -614,6 +614,12 @@ fn checked_dir(path: &Path) -> Result<String, String> {
     }
 }
 
+/// true for an existing folder no non-admin can write in: it classifies `Use` as is (a real folder, admin-owned, with an
+/// admin-only DACL). `update::child_exe` asks it of the running exe's folder.
+pub(crate) fn is_admin_only_dir(path: &Path) -> bool {
+    checked_dir(path).is_ok()
+}
+
 /// `<root>\update`, which must already exist and be admin-only.
 fn checked_update_dir(r: &Root) -> Result<PathBuf, String> {
     let update = r.path.join(UPDATE_NAME);

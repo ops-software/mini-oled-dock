@@ -863,7 +863,7 @@ impl SettingsIo for RealIo {
     }
 
     fn child(&mut self) -> Result<(i32, Vec<u8>), String> {
-        let exe = std::env::current_exe().map_err(|e| format!("no exe path: {e}"))?;
+        let exe = crate::update::child_exe()?;
         crate::update::run_capture(&exe, &[SETTINGS_FLAG], SETTINGS_CHILD_TIMEOUT, CACHE_MAX)
     }
 

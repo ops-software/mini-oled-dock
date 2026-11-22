@@ -275,8 +275,7 @@ const FETCH_EXIT_ERROR: i32 = 2;
 /// capped). None = no usable answer, the reason logged once per process (house rule 7 of plan L3):
 /// the caller asks in-process, every time.
 fn fetch_in_child() -> Option<Result<winhttp::Response, String>> {
-    let answer = std::env::current_exe()
-        .map_err(|e| format!("no exe path: {e}"))
+    let answer = child_exe()
         .and_then(|exe| run_capture(&exe, &[FETCH_FLAG], FETCH_TIMEOUT, FETCH_MAX_BYTES))
         .and_then(|(code, out)| decode_fetch(code, out));
     match answer {
@@ -704,6 +703,37 @@ impl JobChild {
 impl AsRawHandle for JobChild {
     fn as_raw_handle(&self) -> RawHandle {
         self.process.as_raw_handle()
+    }
+}
+
+/// The exe of every child the dock starts again (`--update-fetch`, `--start-apps`, `--start-settings`, `--start-icons`):
+/// `std::env::current_exe()` (house rule 7 of plan L3), when it is safe to run with the dock's token. A running exe can be
+/// renamed and another file put at its path, which `current_exe` still names; so an elevated dock (or one whose token
+/// cannot be read) starts itself only from the installed copy or from a folder `datadir` accepts as admin-only. Err
+/// (say, a dock.exe started from Downloads): the caller logs it once and does the work in-process, as when a child
+/// cannot start.
+pub(crate) fn child_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("no exe path: {e}"))?;
+    let installed = crate::autostart::installed_exe().ok();
+    let elevated = shell_thread::elevation() != Some(false);
+    trusted_exe(exe, elevated, installed.as_deref(), datadir::is_admin_only_dir)
+}
+
+/// `child_exe`'s decision on `exe`: unelevated, any file (a child gains nothing the user lacks); elevated, only the
+/// installed copy (`installed`, the same file) or an exe whose folder `admin_dir` accepts.
+fn trusted_exe(
+    exe: PathBuf,
+    elevated: bool,
+    installed: Option<&Path>,
+    admin_dir: impl FnOnce(&Path) -> bool,
+) -> Result<PathBuf, String> {
+    if !elevated
+        || installed.is_some_and(|i| crate::autostart::same_file(&exe, i))
+        || exe.parent().is_some_and(admin_dir)
+    {
+        Ok(exe)
+    } else {
+        Err("the exe is not in an admin-only folder".into())
     }
 }
 
@@ -1461,6 +1491,29 @@ mod tests {
         for (code, out, case) in bad {
             assert!(decode_fetch(code, out).is_err(), "{case}");
         }
+    }
+
+    /// L3 review: an elevated dock starts itself again only from a file no non-admin can swap (the running exe can be
+    /// renamed and another put at its path, which `current_exe` still names): the installed copy, or an exe in a folder
+    /// `datadir` accepts as admin-only. A temporary folder is the user's: refused when elevated, fine when not.
+    #[test]
+    fn children_run_only_an_exe_no_user_can_swap() {
+        let dir = std::env::temp_dir().join(format!("dock_child_exe_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("dock.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let refused = Err("the exe is not in an admin-only folder".to_string());
+        let user_dir = trusted_exe(exe.clone(), true, None, datadir::is_admin_only_dir);
+        let unelevated = trusted_exe(exe.clone(), false, None, |_| false);
+        let installed = trusted_exe(exe.clone(), true, Some(&exe), |_| false);
+        let other = trusted_exe(exe.clone(), true, Some(&dir.join("other.exe")), |_| false);
+        let admin_dir = trusted_exe(exe.clone(), true, None, |d| d == dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(user_dir, refused, "elevated, in a folder the user can write");
+        assert_eq!(unelevated, Ok(exe.clone()), "unelevated: a child gains nothing the user lacks");
+        assert_eq!(installed, Ok(exe.clone()), "the installed copy");
+        assert_eq!(other, refused, "another file than the installed copy");
+        assert_eq!(admin_dir, Ok(exe), "a folder datadir accepts");
     }
 
     /// A child that writes more than a pipe buffer neither blocks nor loses a byte; one that writes more
