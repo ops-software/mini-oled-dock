@@ -219,6 +219,11 @@ pub enum ShellRequest {
     /// (lint 1). The only launcher request with `runas`.
     #[allow(dead_code)] // sent by the launcher (L1a-15)
     RunAsTyped { line: String, file: Range<usize>, gesture: Gesture },
+    /// Run a typed line (Enter) as it was typed: `line` split at `file`, unexpanded, no working
+    /// directory. With `console` (a console program, or Shift+Enter) it runs as `cmd.exe /k <line>`,
+    /// `cmd.exe` from `system_dir`.
+    #[allow(dead_code)] // sent by the launcher (L1a-15)
+    LaunchCommand { line: String, file: Range<usize>, console: bool },
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -256,6 +261,7 @@ pub enum ShellEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchKind {
     Path,
+    Command,
     Admin,
 }
 
@@ -556,7 +562,9 @@ impl Shell {
             ShellRequest::LaunchAppAdmin { id } => launch_app_admin(&id),
             ShellRequest::RevealApp { id } => reveal_app(&id),
             // launcher arms: begin
-            req @ (ShellRequest::OpenPath { .. } | ShellRequest::RunAsTyped { .. }) => launcher_launch(self.ui, req),
+            req @ (ShellRequest::OpenPath { .. }
+            | ShellRequest::RunAsTyped { .. }
+            | ShellRequest::LaunchCommand { .. }) => launcher_launch(self.ui, req),
             // launcher arms: end
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
@@ -1671,6 +1679,7 @@ fn launch_kind(req: &ShellRequest) -> Option<LaunchKind> {
     match req {
         ShellRequest::OpenPath { .. } => Some(LaunchKind::Path),
         ShellRequest::RunAsTyped { .. } => Some(LaunchKind::Admin),
+        ShellRequest::LaunchCommand { .. } => Some(LaunchKind::Command),
         _ => None,
     }
 }
@@ -1698,6 +1707,14 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
             let r = run_as_typed_with(&line, file, &gesture, &mut exec);
             if r.is_ok() {
                 log!("shell: RunAsTyped ({} chars) via the desktop shell (runas, UAC prompt)", line.chars().count());
+            }
+            r
+        }
+        ShellRequest::LaunchCommand { line, file, console } => {
+            let sys = system_dir().unwrap_or_default();
+            let r = launch_command_with(&line, file, console, &sys, &mut exec);
+            if r.is_ok() {
+                log!("shell: LaunchCommand ({} chars) via the desktop shell", line.chars().count());
             }
             r
         }
@@ -1779,6 +1796,15 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
         return Err("refused: a network file".into());
     }
     exec(&file, args.as_deref(), None, Verb::RunAs)
+}
+
+/// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /k <line>`), one
+/// shell call with no working directory. Nothing is expanded or looked up here: the line goes to the
+/// shell as typed.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), String> {
+    let (file, args) = command_parts(line, file, console, sys).map_err(|e| format!("refused: {e}"))?;
+    exec(&file, args.as_deref(), None, Verb::Open)
 }
 
 // launcher requests: end
@@ -2262,5 +2288,26 @@ mod tests {
         assert!(command_parts(quoted, 1..5, false, sys).is_err());
         assert!(command_parts("notepad a.txt", 0..4, false, sys).is_err());
         assert!(command_parts("x notepad", 2..9, false, sys).is_err());
+    }
+
+    #[test]
+    fn launch_command_console_wraps_cmd() {
+        let sys = Path::new("C:\\Windows\\System32");
+        let mut calls = Vec::new();
+        let (line, file) = run_line("ping 1.1.1.1");
+        assert!(launch_command_with(&line, file.clone(), true, sys, &mut recorder(&mut calls, true)).is_ok());
+        let (line2, file2) = run_line("notepad a.txt");
+        assert!(launch_command_with(&line2, file2, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        assert_eq!(
+            calls,
+            [
+                ("C:\\Windows\\System32\\cmd.exe".to_string(), Some("/k ping 1.1.1.1".to_string()), None, Verb::Open),
+                ("notepad".to_string(), Some("a.txt".to_string()), None, Verb::Open),
+            ]
+        );
+        // No system directory: no console, and no guess from the environment.
+        calls.clear();
+        assert!(launch_command_with(&line, file, true, Path::new(""), &mut recorder(&mut calls, true)).is_err());
+        assert!(calls.is_empty());
     }
 }
