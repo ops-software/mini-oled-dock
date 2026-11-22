@@ -61,7 +61,7 @@ pub enum Refusal {
     TooLong,
     /// A control or bidi character: what is shown is not what runs.
     Markers,
-    /// A network path (\\server or //server).
+    /// A network path (`is_network_file`): two leading separators, the NT prefix or a URL.
     Unc,
 }
 
@@ -82,14 +82,33 @@ pub fn is_marker(c: char) -> bool {
         || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+/// A file the shell would fetch from the network, by syntax alone (the text from its first non-blank character): two
+/// leading separators in any mix of `\` and `/` (Windows reads `\\server`, `//server`, `\/server` and `/\server` alike,
+/// `\\?\UNC\` included), the NT prefix `\??\`, or a URL (`<scheme>://`, or `file:` in any case): runas on a URL has no
+/// use, and Explorer resolves `file://server/share` to `\\server\share`. A mapped network drive (`Z:\`) reads as a local
+/// path and cannot be caught by syntax.
+pub fn is_network_file(file: &str) -> bool {
+    let f = file.trim_start();
+    let sep = |c: Option<char>| matches!(c, Some('\\' | '/'));
+    let mut it = f.chars();
+    let (a, b, q, d) = (it.next(), it.next(), it.next(), it.next());
+    let unc = sep(a) && sep(b);
+    let nt = sep(a) && b == Some('?') && q == Some('?') && sep(d);
+    let url = f.split_once("://").is_some_and(|(scheme, _)| {
+        let mut s = scheme.chars();
+        s.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && s.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    unc || nt || url || f.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+}
+
 /// The review conditions (5.4.9, conditions 3 and 4, and the UNC rule of file rows). `lines_needed` is what the view
 /// measured with the real CAPTION font over the review width; 0 means not measured.
 pub fn review_ok(text: &str, lines_needed: u8) -> Result<(), Refusal> {
     if text.chars().any(is_marker) {
         return Err(Refusal::Markers);
     }
-    let start = text.trim_start().trim_start_matches('"');
-    if start.starts_with("\\\\") || start.starts_with("//") {
+    if is_network_file(text.trim_start().trim_start_matches('"')) {
         return Err(Refusal::Unc);
     }
     if lines_needed == 0 || lines_needed > REVIEW_MAX_LINES {
@@ -173,12 +192,28 @@ mod tests {
         for bad in ["a\u{202E}b", "a\u{0}b", "a\tb", "\u{7F}", "\u{85}", "\u{200E}", "\u{2066}x", "\u{061C}"] {
             assert_eq!(review_ok(bad, 1), Err(Refusal::Markers), "{bad:?}");
         }
-        for unc in
-            ["\\\\server\\share\\setup.exe", "//server/share/setup.exe", "\"\\\\server\\x.exe\" -y", " \\\\s\\x.exe"]
-        {
+        for unc in [
+            "\\\\server\\share\\setup.exe",
+            "//server/share/setup.exe",
+            "\"\\\\server\\x.exe\" -y",
+            " \\\\s\\x.exe",
+            // Any two leading separators are a network path to Windows, and so is the NT prefix.
+            "\\/server\\share\\x.exe",
+            "/\\server\\x.exe",
+            "\"\\/server\\x.exe\" -y",
+            "\" \\\\server\\x.exe\"",
+            "\\??\\UNC\\server\\share\\x.exe",
+            // A URL: Explorer resolves file://server/share to \\server\share, and runas on a URL has no use.
+            "file://server/share/setup.exe",
+            "FILE://server/x.exe",
+            "file:\\\\server\\x.exe",
+            "https://example.com/setup.exe",
+        ] {
             assert_eq!(review_ok(unc, 1), Err(Refusal::Unc), "{unc:?}");
         }
         assert_eq!(review_ok("c:\\a\\\\b.exe", 1), Ok(()), "a doubled separator inside is no network path");
+        assert_eq!(review_ok("c:/a//b.exe", 1), Ok(()));
+        assert_eq!(review_ok("shell:AppsFolder\\x", 1), Ok(()), "only a URL scheme is refused, not shell:");
         assert_eq!(Refusal::TooLong.detail(), Some("Line too long to review"));
         assert_eq!(Refusal::Markers.detail(), None);
         assert_eq!(Refusal::Unc.detail(), None);

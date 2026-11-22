@@ -66,7 +66,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
-use crate::launcher::gesture::{is_marker, Gesture};
+use crate::launcher::gesture::{is_marker, is_network_file, Gesture};
 use crate::log;
 use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
 
@@ -2018,16 +2018,16 @@ fn command_parts(
 /// not the dock is elevated (as `launch_admin`), so Windows' UAC prompt names the program and the dock's
 /// token is never used. Refused here again, whatever the launcher checked: any control or bidi
 /// character in the line (what is shown is what runs), a range that does not split it, a network file
-/// (`\\server` or `//server`). `_proof` is the hook-proven gesture the request carries: nothing
-/// reaches this without one.
+/// (`gesture::is_network_file`: two leading separators in any mix of `\` and `/`, `\??\` or a URL; a mapped
+/// network drive letter cannot be told from a local one by syntax). `_proof` is the hook-proven gesture the request
+/// carries: nothing reaches this without one.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exec) -> Result<(), String> {
     if line.chars().any(is_marker) {
         return Err("refused: a control or bidi character".into());
     }
     let (file, args) = command_parts(line, file, false, Path::new("")).map_err(|e| format!("refused: {e}"))?;
-    let start = file.trim_start();
-    if start.starts_with("\\\\") || start.starts_with("//") {
+    if is_network_file(&file) {
         return Err("refused: a network file".into());
     }
     exec(&file, args.as_deref(), None, Verb::RunAs)
@@ -2601,6 +2601,13 @@ mod tests {
             "\\\\server\\share\\setup.exe",
             "\"\\\\server\\x.exe\" -y",
             "//server/share/x.exe",
+            "file://server/share/setup.exe",
+            "File:\\\\server\\x.exe",
+            "https://example.com/setup.exe",
+            "\\/server\\share\\x.exe",
+            "/\\server\\x.exe",
+            "\"\\/server\\x.exe\" -y",
+            "\\??\\UNC\\server\\share\\x.exe",
             "notepad a\u{202E}b",
             "notepad\tx",
             "cmd /c \u{200F}x",
