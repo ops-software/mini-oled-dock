@@ -407,6 +407,12 @@ fn probe_switches_only_in_owner_builds() {
     assert!(probe_violations("src/launcher_probe.rs", "std::env::var(\"DOCK_LAUNCHER_X\")").is_empty());
     assert!(probe_violations("src/msg.rs", "pub const WM_DOCK_LAUNCHER_YIELDED: u32 = 1;").is_empty());
     assert_eq!(probe_violations("src/hook.rs", "let s = \"DOCK_LAUNCHER_MASK\";").len(), 1);
+    // the synthetic-key switch the hook reads (only through launcher_probe, behind the feature)
+    assert_eq!(probe_violations("src/hook.rs", "std::env::var(\"DOCK_LAUNCHER_ACCEPT_INJECTED\")").len(), 1);
+    assert!(probe_violations("src/launcher_probe.rs", "std::env::var(\"DOCK_LAUNCHER_ACCEPT_INJECTED\")").is_empty());
+    let bare = "ACCEPT.store(crate::launcher_probe::accept_injected(), Relaxed);";
+    assert!(probe_violations("src/hook.rs", &format!("{OWNER_PROBE_CFG}\n{bare}")).is_empty());
+    assert_eq!(probe_violations("src/hook.rs", bare).len(), 1);
     assert_eq!(probe_violations("src/launcher/session.rs", "DOCK_TEST_FREEZE_UI_MS").len(), 1);
     assert!(probe_violations("src/hook.rs", "DOCK_TEST_FREEZE_UI_MS").is_empty());
     assert!(probe_violations("src/launcher_probe.rs", "DOCK_TEST_FREEZE_UI_MS").is_empty());

@@ -12,7 +12,8 @@
 //!    posts WM_DOCK_START_MENU instead of the second WM_DOCK_TOGGLE (the first tap already toggled).
 //!  * Win auto-repeat: ignored (swallowed while the press is "pending").
 //!  * Events injected by OTHER apps (LLKHF_INJECTED without our tag): ignored,
-//!    the dock only responds to the physical Win key.
+//!    the dock only responds to the physical Win key. Only an owner-probe build started with the accept-injected
+//!    switch of `launcher_probe` treats them as physical (`accepted`), so a test agent can drive the L0 session.
 //!  * Left + right Win together: the second Win is treated as an "other key".
 //!  * Stuck state (release lost on the secure desktop): if more than REPEAT_WINDOW_MS
 //!    have passed since the last Win event, the first other key does NOT inject anything.
@@ -130,6 +131,8 @@ pub struct HookThread {
 pub fn start() -> Result<HookThread, String> {
     #[cfg(feature = "owner-probe")]
     MASK_KEY.store(crate::launcher_probe::mask_key(), Relaxed);
+    #[cfg(feature = "owner-probe")]
+    ACCEPT_INJECTED.store(crate::launcher_probe::accept_injected(), Relaxed);
     let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let join = std::thread::Builder::new()
@@ -310,7 +313,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
 
 /// Returns true if the event must be swallowed.
 fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
-    if !physical(kb.flags.0, kb.dwExtraInfo) {
+    if !accepted(kb.flags.0, kb.dwExtraInfo) {
         return false; // our own re-injected event, or injected by another app: not a physical key
     }
     let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -933,6 +936,34 @@ pub(crate) fn physical(flags: u32, extra: usize) -> bool {
     extra != INJECT_TAG && flags & LLKHF_INJECTED.0 == 0
 }
 
+/// The filter `handle_key` and `note_gesture` apply: `physical`.
+#[cfg(not(feature = "owner-probe"))]
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn accepted(flags: u32, extra: usize) -> bool {
+    physical(flags, extra)
+}
+
+/// The filter `handle_key` and `note_gesture` apply in an owner-probe build: `admitted` under the accept-injected
+/// switch, which `start` read once into `ACCEPT_INJECTED` (the callback only loads it). With the switch off: `physical`.
+#[cfg(feature = "owner-probe")]
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn accepted(flags: u32, extra: usize) -> bool {
+    admitted(flags, extra, ACCEPT_INJECTED.load(Relaxed))
+}
+
+/// The owner-probe decision as a pure function. `accept_injected` off: `physical`. On (a test agent drives the L0
+/// session with SendInput): every event without our INJECT_TAG, injected by another app or not. Our tagged events still
+/// pass through untouched, or the hook would act on its own re-injections and loop.
+#[cfg(any(test, feature = "owner-probe"))]
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn admitted(flags: u32, extra: usize, accept_injected: bool) -> bool {
+    if accept_injected {
+        extra != INJECT_TAG
+    } else {
+        physical(flags, extra)
+    }
+}
+
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 const fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0xA0..=0xA5)
@@ -1211,7 +1242,7 @@ pub(crate) fn unpack_gesture_time(v: u64) -> Option<u32> {
 /// Spec rule 7: a physical Enter down with tracked Ctrl and Shift and no Alt or Win stores its kb.time (never swallows).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn note_gesture(slot: &AtomicU64, flags: u32, extra: usize, vk: u32, down: bool, mods: Mods, time: u32) {
-    if down && vk == VK_RETURN_ && mods == CTRL_SHIFT && physical(flags, extra) {
+    if down && vk == VK_RETURN_ && mods == CTRL_SHIFT && accepted(flags, extra) {
         slot.store(pack_gesture_time(time), Relaxed);
     }
 }
@@ -1238,6 +1269,9 @@ static MODS: AtomicU64 = AtomicU64::new(0);
 static MODS_LAST: AtomicU32 = AtomicU32::new(0);
 /// The menu-mask key: 0xE8 by default; owner-probe builds read their mask switch at start (0xA2 left Ctrl, 0 none).
 static MASK_KEY: AtomicU32 = AtomicU32::new(MASK_KEY_DEFAULT);
+/// Owner-probe builds: the accept-injected switch, stored by `start` before the hook is installed (`accepted`).
+#[cfg(feature = "owner-probe")]
+static ACCEPT_INJECTED: AtomicBool = AtomicBool::new(false);
 // Shared by protocol.
 /// The type-ahead ring (its compare-exchange protocol: `Ring`).
 static RING: Ring = Ring::new();
@@ -1692,6 +1726,40 @@ mod tests {
         assert!(!physical(0, INJECT_TAG), "our own tag");
         assert!(physical(LLKHF_EXTENDED.0, 0));
         assert!(physical(0, 0));
+    }
+
+    /// The rows of `physical_filter`, and an injection of another app that carries some other extra info.
+    const FILTER_ROWS: [(u32, usize); 7] = [
+        (0, 0),
+        (LLKHF_EXTENDED.0, 0),
+        (LLKHF_INJECTED.0, 0),
+        (LLKHF_INJECTED.0 | 0x02, 0),
+        (LLKHF_INJECTED.0, 0x1234),
+        (0, INJECT_TAG),
+        (LLKHF_INJECTED.0, INJECT_TAG),
+    ];
+
+    #[test]
+    fn probe_switch_off_admits_only_physical_keys() {
+        for (flags, extra) in FILTER_ROWS {
+            assert_eq!(admitted(flags, extra, false), physical(flags, extra), "{flags:#x} {extra:#x}");
+            // The hook's own filter: no build sets the switch in tests (`start` is never called), so it is `physical`.
+            assert_eq!(accepted(flags, extra), physical(flags, extra), "{flags:#x} {extra:#x}");
+        }
+        assert!(!admitted(LLKHF_INJECTED.0 | 0x02, 0, false), "a test agent's key stays ignored");
+    }
+
+    #[test]
+    fn probe_switch_on_admits_other_apps_injections_never_ours() {
+        assert!(admitted(LLKHF_INJECTED.0, 0, true), "another app's injection counts as physical");
+        assert!(admitted(LLKHF_INJECTED.0 | 0x02, 0, true), "also from a lower integrity level (a non-elevated agent)");
+        assert!(admitted(LLKHF_INJECTED.0, 0x1234, true), "any extra info but ours");
+        assert!(admitted(0, 0, true) && admitted(LLKHF_EXTENDED.0, 0, true), "physical keys still count");
+        assert!(!admitted(0, INJECT_TAG, true), "our own tag passes through: the hook would loop on it");
+        assert!(!admitted(LLKHF_INJECTED.0, INJECT_TAG, true), "our own re-injection passes through");
+        for (flags, extra) in FILTER_ROWS {
+            assert_eq!(admitted(flags, extra, true), extra != INJECT_TAG, "{flags:#x} {extra:#x}");
+        }
     }
 
     #[test]

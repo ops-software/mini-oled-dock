@@ -1,6 +1,7 @@
 //! The owner-probe build (L0 and the live checks, SPEC-launcher Labels): switches and timings compiled in only with the
 //! `owner-probe` cargo feature (lint 4), never in a release the owner installs. What the keyboard hook reads (L1a-10
-//! step 7): the menu-mask key, the callback timer and the UI-freeze switch; what the chord flow reads (L1a-15e): the
+//! step 7): the menu-mask key, the callback timer, the UI-freeze switch and the accept-injected switch (L0-2 driven by a
+//! test agent with synthetic keys); what the chord flow reads (L1a-15e): the
 //! DROP, FORCE_YIELD and MOTW_TEST switches; and the probe log lines of an open (numbers and exe file names only, lint 2),
 //! written while `DOCK_LAUNCHER_PROBE=1`. Each switch is read once.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -276,6 +277,23 @@ pub fn timer_armed(id: usize, ms: u32, armed: bool) {
     if armed && probe_on() {
         log!("launcher probe: timer {id:?} armed {ms} ms");
     }
+}
+
+/// `DOCK_LAUNCHER_ACCEPT_INJECTED=1`: the keyboard hook treats keys injected by other apps (LLKHF_INJECTED without the
+/// dock's own INJECT_TAG) as physical, for everything it does with them: the Win key, the launcher chord, the type-ahead
+/// and the gesture evidence. It exists so a test agent can drive the L0 session (L0-2) with SendInput while the owner is
+/// away; events tagged INJECT_TAG still pass through, or the hook would loop on its own re-injections. `hook::start` reads
+/// it once into an atomic that the callback only loads. Results obtained with synthetic keys must be labelled as such:
+/// they show what the dock does with SendInput, not with a person's key presses.
+pub fn accept_injected() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("DOCK_LAUNCHER_ACCEPT_INJECTED").is_ok_and(|v| v.trim() == "1");
+        if on {
+            log!("launcher probe: injected keys count as physical (synthetic-key run, label its results)");
+        }
+        on
+    })
 }
 
 /// `DOCK_LAUNCHER_MASK`: `e8` -> 0xE8, `ctrl` -> 0xA2 (left Ctrl), `none` -> 0; unset or anything else -> 0xE8.
