@@ -204,7 +204,8 @@ pub enum ShellRequest {
     /// and, only while a launcher chord is set, by Start: with no chord Start lists in-process (M1).
     ListStartApps { icon_px: u32, icons: IconPlan, child: bool },
     /// One batch of Start menu icons made on this thread -> `ShellEvent::StartIcons`. Queued by
-    /// `ListStartApps` only when its icons child cannot start; low priority like `ResolveApp`.
+    /// `ListStartApps` only when its icons child cannot start or gave no header; low priority like
+    /// `ResolveApp`.
     StartIcons { icon_px: u32, ids: Vec<String> },
     /// The Start menu closed: its icons child is killed and reaped, the icons sent are forgotten and
     /// the queued `StartIcons` batches dropped.
@@ -270,8 +271,8 @@ pub enum ShellRequest {
 #[derive(Clone, Debug)]
 pub enum IconPlan {
     /// The Start menu: the icons not sent yet at `icon_px` (the ids in `first`, the menu pins, go
-    /// first), made by an `--start-icons` child (L3 T20); when it cannot start, as `StartIcons`
-    /// batches made here, which run behind every other request.
+    /// first), made by an `--start-icons` child (L3 T20); when it cannot start or gave no header, as
+    /// `StartIcons` batches made here, which run behind every other request.
     All { first: Vec<String> },
     /// The launcher's catalogue: none, and what the Start menu was sent is left as it is (the
     /// launcher asks for its rows' icons with `StartIconsFor`).
@@ -468,6 +469,8 @@ struct Shell {
     /// The `--start-icons` child at work for the Start menu and the launcher's, each while it runs (L3 T20).
     start_job: Option<IconJob>,
     launcher_job: Option<IconJob>,
+    /// An icons child of this process gave no header: every later batch is made here, as before T20.
+    icons_child_off: bool,
 }
 
 fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
@@ -495,6 +498,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         start_sent: HashSet::new(),
         start_job: None,
         launcher_job: None,
+        icons_child_off: false,
     };
 
     // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
@@ -1501,13 +1505,36 @@ enum IconClient {
 }
 
 /// What a job's reader thread tells the shell thread: how many of the job's ids were answered (every id before that
-/// index went to the UI), that it ended (both pipes closed: nothing more comes), and that the shell thread stopped the
-/// child on purpose (nothing more of the job goes to the UI, and its cut output is no failure to log).
+/// index went to the UI), that it ended (both pipes closed: nothing more comes), that the shell thread stopped the
+/// child on purpose (nothing more of the job goes to the UI, and its cut output is no failure to log), and that the
+/// child gave no header while nobody stopped it (`icons_in_process`; stored before `ended`): it made no icon, so the
+/// shell thread makes the job's ids itself.
 #[derive(Default)]
 struct IconProgress {
     delivered: AtomicUsize,
     ended: AtomicBool,
     stopped: AtomicBool,
+    no_header: AtomicBool,
+}
+
+/// How a job's output ended, as its reader saw it.
+enum IconEnd {
+    /// Every frame, to a clean end.
+    Done,
+    /// The ids could not be written, or the output ended or differed before its header: the child made no icon (it
+    /// writes the header before its first extraction).
+    NoHeader(String),
+    /// A frame refused, or a read error, after the header: the child was at work on the icons.
+    Broken(String),
+}
+
+/// true when a job's ids are made in-process (house rule 7 of plan L3: never worse than before the child): only when
+/// its child gave no header and the shell thread did not stop it. A child stopped (killed late, so possibly hung, or
+/// replaced) or broken after its header was extracting an icon, which in-process could hang or crash the shell thread:
+/// what it left is not made here.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn icons_in_process(end: &IconEnd, stopped: bool) -> bool {
+    matches!(end, IconEnd::NoHeader(_)) && !stopped
 }
 
 /// One `--start-icons` child at work for a client: the process (only the shell thread waits on it or kills it; the
@@ -1560,18 +1587,23 @@ impl Shell {
         Some((px, ids, delivered))
     }
 
-    /// At each pass of the queue: a job whose child exited and whose reader ended is reaped, a job past its deadline is
-    /// killed and reaped (a hung child; logged once per process). What either left unanswered for the Start menu leaves
-    /// `start_sent`, so its next listing asks for it again.
+    /// At each pass of the queue: a job whose reader ended is reaped once its child exited, or at once when the child
+    /// gave no header; a job past its deadline is killed and reaped (a hung child; logged once per process). The ids of
+    /// a job whose child gave no header are made here (`icons_here`), and so is every later batch of this process
+    /// (`icons_child_off`). What any other job left unanswered for the Start menu leaves `start_sent`, so its next
+    /// listing asks for it again.
     fn reap_icon_jobs(&mut self) {
         for c in [IconClient::Start, IconClient::Launcher] {
             let Some(job) = self.job(c).as_mut() else { continue };
             let exited = !matches!(job.child.try_wait(), Ok(None));
             let late = job.started.elapsed() > job.deadline();
-            if !(late || exited && job.progress.ended.load(SeqCst)) {
+            let ended = job.progress.ended.load(SeqCst);
+            // Stored before `ended`, so read after it.
+            let no_header = ended && job.progress.no_header.load(SeqCst);
+            if !(late || ended && (exited || no_header)) {
                 continue;
             }
-            if late && !exited {
+            if late && !exited && !no_header {
                 static WARNED: AtomicBool = AtomicBool::new(false);
                 if !WARNED.swap(true, Relaxed) {
                     log!(
@@ -1580,11 +1612,31 @@ impl Shell {
                     );
                 }
             }
-            if let Some((_, ids, delivered)) = self.end_job(c) {
-                if c == IconClient::Start {
+            if let Some((px, ids, delivered)) = self.end_job(c) {
+                if no_header {
+                    self.icons_child_off = true;
+                    self.icons_here(c, px, ids.get(delivered..).unwrap_or(&[]).to_vec());
+                } else if c == IconClient::Start {
                     unsend_icons(&mut self.start_sent, &ids, delivered);
                 }
             }
+        }
+    }
+
+    /// Ids a client's child did not make, made here as before T20: the Start menu's queued as `StartIcons` batches
+    /// (they stay in `start_sent`), the launcher's as one `StartIconsFor`, which `launcher_icons` makes while
+    /// `icons_child_off` (the launcher's close or a newer request drops it, as any pending one).
+    fn icons_here(&mut self, c: IconClient, px: u32, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        match c {
+            IconClient::Start => {
+                for chunk in ids.chunks(START_ICON_BATCH) {
+                    self.pending.push_back(ShellRequest::StartIcons { icon_px: px, ids: chunk.to_vec() });
+                }
+            }
+            IconClient::Launcher => enqueue(&mut self.pending, ShellRequest::StartIconsFor { icon_px: px, ids }),
         }
     }
 
@@ -1592,7 +1644,8 @@ impl Shell {
     /// the same size) go first (`next_icon_batch`): killing a batch would otherwise lose its rest for the whole open,
     /// since neither the launcher nor Start asks for an id twice. An id a child cannot take gets no icon; past
     /// `ICON_IDS_MAX` the others are dropped (for Start they leave `start_sent`). Err: the child could not start
-    /// (logged once per process), with the ids to make here, as before.
+    /// (logged once per process) or an icons child of this process gave no header (`icons_child_off`), with the ids to
+    /// make here, as before.
     fn start_icon_job(&mut self, c: IconClient, px: u32, ids: Vec<String>) -> Result<(), Vec<String>> {
         let ids = match self.end_job(c) {
             Some((old_px, old, delivered)) if old_px == px => next_icon_batch(&old, delivered, ids),
@@ -1606,6 +1659,9 @@ impl Shell {
         }
         if batch.is_empty() {
             return Ok(());
+        }
+        if self.icons_child_off {
+            return Err(batch);
         }
         match spawn_icon_job(self.ui, c, px, batch) {
             Ok(job) => {
@@ -1623,8 +1679,8 @@ impl Shell {
     }
 
     /// The Start menu's icons not sent yet (`missing`, at `start_px`): made by its icons child, or queued as
-    /// `StartIcons` batches made here, as before, when the child cannot start. A job at another size is ended first
-    /// (its ids were forgotten with that size).
+    /// `StartIcons` batches made here, as before, when the child cannot start or an icons child gave no header. A job
+    /// at another size is ended first (its ids were forgotten with that size).
     fn start_menu_icons(&mut self, missing: Vec<String>) {
         let px = self.start_px;
         if self.start_job.as_ref().is_some_and(|j| j.px != px) {
@@ -1634,9 +1690,7 @@ impl Shell {
             return;
         }
         if let Err(back) = self.start_icon_job(IconClient::Start, px, missing) {
-            for chunk in back.chunks(START_ICON_BATCH) {
-                self.pending.push_back(ShellRequest::StartIcons { icon_px: px, ids: chunk.to_vec() });
-            }
+            self.icons_here(IconClient::Start, px, back);
         }
     }
 }
@@ -1690,27 +1744,37 @@ impl IconReader {
     /// The reader thread of one job: it writes the ids (the shell thread never writes to a pipe, so a child slow to
     /// read its input never holds a launch), closes the child's input, then decodes the frames and pushes them to the
     /// UI as they arrive: the Start menu's in batches of `START_ICON_BATCH`, the launcher's as soon as nothing more
-    /// waits in the pipe. It ends at the end of the output, at a write error or the first frame refused (each logged
-    /// once per process; dropping the pipes makes a child still at work exit at its next write), or when the shell
-    /// thread kills the child; then it logs what it delivered.
+    /// waits in the pipe. It ends at the end of the output, at a write error, a missing header or the first frame
+    /// refused (each kind logged once per process; dropping the pipes makes a child still at work exit at its next
+    /// write), or when the shell thread kills the child; then it logs what it delivered. A child that gave no header,
+    /// unless stopped, marks the job `no_header` and wakes the shell thread, which makes its ids in-process.
     fn run(self, input: std::io::PipeWriter, output: std::io::PipeReader) {
-        static WRITE_WARNED: AtomicBool = AtomicBool::new(false);
+        static HEADER_WARNED: AtomicBool = AtomicBool::new(false);
         static FRAME_WARNED: AtomicBool = AtomicBool::new(false);
-        let (first, failed) = match self.feed(input) {
-            Ok(()) => {
-                let (first, outcome) = self.read(output);
-                (first, outcome.err().map(|why| (&FRAME_WARNED, why)))
-            }
+        let (first, end) = match self.feed(input) {
+            Ok(()) => self.read(output),
             Err(e) => {
                 drop(output);
-                (None, Some((&WRITE_WARNED, format!("the ids could not be written: {e}"))))
+                (None, IconEnd::NoHeader(format!("the ids could not be written: {e}")))
             }
         };
+        let stopped = self.progress.stopped.load(SeqCst);
+        let here = icons_in_process(&end, stopped);
+        self.progress.no_header.store(here, SeqCst);
         self.progress.ended.store(true, SeqCst);
-        if let Some((warned, why)) = failed {
-            if !self.progress.stopped.load(SeqCst) && !warned.swap(true, Relaxed) {
+        let tid = thread_id();
+        if here && tid != 0 {
+            // SAFETY: PostThreadMessageW is thread-safe; if the thread no longer exists it just fails.
+            let _ = unsafe { PostThreadMessageW(tid, WM_SHELL_WAKE, WPARAM(0), LPARAM(0)) };
+        }
+        match end {
+            IconEnd::NoHeader(why) if here && !HEADER_WARNED.swap(true, Relaxed) => {
+                log!("start icons: the icons process failed ({why}), icons made in-process from now on");
+            }
+            IconEnd::Broken(why) if !stopped && !FRAME_WARNED.swap(true, Relaxed) => {
                 log!("start icons: the icons process failed ({why}); its other icons are not made");
             }
+            _ => {}
         }
         let n = self.ids.len();
         let delivered = self.progress.delivered.load(SeqCst);
@@ -1732,18 +1796,18 @@ impl IconReader {
     }
 
     /// Decodes the output and delivers the frames: when the first batch went out, and how the output ended.
-    fn read(&self, output: std::io::PipeReader) -> (Option<Duration>, Result<(), String>) {
+    fn read(&self, output: std::io::PipeReader) -> (Option<Duration>, IconEnd) {
         let n = self.ids.len();
         let mut r = std::io::BufReader::with_capacity(ICON_IO_BUF, output);
         if let Err(why) = read_icon_header(&mut r) {
-            return (None, Err(why));
+            return (None, IconEnd::NoHeader(why));
         }
         let (mut batch, mut prev, mut first) = (Vec::new(), None, None);
         let outcome = loop {
             match read_icon_frame(&mut r, n, self.px, prev) {
                 Ok(Some((i, icon))) => {
                     prev = Some(i);
-                    let Some(id) = self.ids.get(i) else { break Err(format!("frame {i} of {n}")) };
+                    let Some(id) = self.ids.get(i) else { break IconEnd::Broken(format!("frame {i} of {n}")) };
                     batch.push((id.clone(), icon));
                     let due = match self.client {
                         IconClient::Start => batch.len() >= START_ICON_BATCH,
@@ -1753,8 +1817,8 @@ impl IconReader {
                         self.deliver(&mut batch, i, &mut first);
                     }
                 }
-                Ok(None) => break Ok(()),
-                Err(why) => break Err(why),
+                Ok(None) => break IconEnd::Done,
+                Err(why) => break IconEnd::Broken(why),
             }
         };
         if let (Some(i), false) = (prev, batch.is_empty()) {
@@ -2531,8 +2595,8 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
     }
 }
 
-/// `StartIconsFor` made here, when its icons child cannot start: the icons of the launcher's rows, made at
-/// `icon_px` (clamped as the Start menu's). Start's `start_px` and `start_sent` are not touched.
+/// `StartIconsFor` made here, when its icons child cannot start or gave no header: the icons of the launcher's rows,
+/// made at `icon_px` (clamped as the Start menu's). Start's `start_px` and `start_sent` are not touched.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launcher_icons(ui: isize, icon_px: u32, ids: Vec<String>) {
     let icon_px = icon_px.clamp(8, 256);
@@ -4127,6 +4191,7 @@ mod tests {
             start_sent: HashSet::new(),
             start_job: None,
             launcher_job: None,
+            icons_child_off: false,
         }
     }
 
@@ -4191,6 +4256,84 @@ mod tests {
         assert!(sh.start_job.is_none() && ended(start_seen, 0));
     }
 
+    /// A child that gives no header (it exited at once, its COM start failed, an antivirus stopped it, its input could
+    /// not be written) made no icon: the reader marks its job for the in-process path. A child the shell thread stopped
+    /// (a late kill, a replaced job) or one whose frame is refused after the header is not marked.
+    #[test]
+    fn icon_reader_marks_a_child_without_header() {
+        let cmd = system_dir().unwrap().join("cmd.exe");
+        let refused = std::env::temp_dir().join(format!("dock_icon_refused_{}.bin", std::process::id()));
+        std::fs::write(&refused, [ICONS_HEADER, &raw_frame(5, 0, 0, 0)].concat()).unwrap();
+        let marked = |args: &[&str], stopped: bool| {
+            let mut child = crate::update::spawn_in_job(&cmd, args, true).unwrap();
+            let progress = Arc::new(IconProgress::default());
+            progress.stopped.store(stopped, SeqCst);
+            let (input, output) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+            let reader = IconReader {
+                ui: 0,
+                client: IconClient::Launcher,
+                px: 10,
+                ids: strings(&["a", "b"]).into(),
+                progress: Arc::clone(&progress),
+                started: Instant::now(),
+            };
+            reader.run(input, output);
+            let _ = child.wait();
+            assert!(progress.ended.load(SeqCst) && progress.delivered.load(SeqCst) == 0, "{args:?}");
+            progress.no_header.load(SeqCst)
+        };
+        assert!(marked(&["/c", "exit 1"], false), "no output at all");
+        assert!(marked(&["/c", "echo", "not icons"], false), "an output that is not an icons header");
+        assert!(!marked(&["/c", "exit 1"], true), "stopped by the shell thread");
+        assert!(!marked(&["/c", "type", refused.to_str().unwrap()], false), "a frame refused after the header");
+        let _ = std::fs::remove_file(&refused);
+    }
+
+    #[test]
+    fn icon_jobs_without_header_are_made_in_process() {
+        // The decision: only a child that gave no header and that the shell thread did not stop. A refused frame or a
+        // kill comes from a child at work on an icon, which in-process could crash or hang the shell thread.
+        let no_header = IconEnd::NoHeader("no output".into());
+        assert!(icons_in_process(&no_header, false));
+        assert!(!icons_in_process(&no_header, true), "a late kill or a replaced job");
+        assert!(!icons_in_process(&IconEnd::Broken("frame 5 of 2".into()), false), "a refused frame");
+        assert!(!icons_in_process(&IconEnd::Done, false));
+        // Reaped: Start's ids are queued as in-process batches and stay sent; the launcher's go as one request.
+        let mut sh = test_shell();
+        sh.start_px = 24;
+        let ten: Vec<String> = (0..10).map(|i| format!("app{i}")).collect();
+        let (start, start_seen) = fake_job(&ten.iter().map(String::as_str).collect::<Vec<_>>(), false);
+        let (launcher, launcher_seen) = fake_job(&["x", "y"], false);
+        for p in [&start.progress, &launcher.progress] {
+            p.no_header.store(true, SeqCst);
+            p.ended.store(true, SeqCst);
+        }
+        sh.start_sent = ten.iter().cloned().collect();
+        sh.start_job = Some(start);
+        sh.launcher_job = Some(launcher);
+        sh.reap_icon_jobs();
+        assert!(sh.start_job.is_none() && sh.launcher_job.is_none());
+        assert!(ended(start_seen, 10_000) && ended(launcher_seen, 10_000));
+        assert!(sh.icons_child_off);
+        assert_eq!(sh.start_sent.len(), 10);
+        let queued: Vec<(bool, u32, Vec<String>)> = sh
+            .pending
+            .drain(..)
+            .map(|r| match r {
+                ShellRequest::StartIcons { icon_px, ids } => (true, icon_px, ids),
+                ShellRequest::StartIconsFor { icon_px, ids } => (false, icon_px, ids),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let want = [(true, 24, ten[..8].to_vec()), (true, 24, ten[8..].to_vec()), (false, 24, strings(&["x", "y"]))];
+        assert_eq!(queued, want);
+        // From now on no child starts: the ids come back to be made here.
+        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, strings(&["k"])), Err(strings(&["k"])));
+        sh.start_menu_icons(strings(&["m"]));
+        assert!(sh.start_job.is_none() && sh.launcher_job.is_none());
+        assert!(matches!(sh.pending.pop_front(), Some(ShellRequest::StartIcons { icon_px: 24, ids }) if ids == ["m"]));
+    }
+
     #[test]
     fn finished_and_hung_icon_jobs_are_reaped() {
         let mut sh = test_shell();
@@ -4224,5 +4367,6 @@ mod tests {
         sh.reap_icon_jobs();
         assert!(sh.launcher_job.is_none() && ended(seen, 0));
         assert!(sh.start_sent.len() == 2, "the launcher's job touches nothing of Start's");
+        assert!(sh.pending.is_empty() && !sh.icons_child_off, "a job with a header, or killed: nothing made here");
     }
 }
