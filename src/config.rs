@@ -413,6 +413,169 @@ pub const TRAY_ICON_SIZE: SizeRange = SizeRange { min: 12, max: 24, default: 16 
 /// Scale of the system modules on the right (percent).
 pub const MODULE_SIZE: SizeRange = SizeRange { min: 75, max: 150, default: 100 };
 
+/// The providers a `launcher.providers` map may name, in the order the template lists them.
+const LAUNCHER_PROVIDERS: [&str; 10] =
+    ["apps", "windows", "files", "settings", "calc", "commands", "run", "web", "datetime", "registry"];
+
+/// The launcher's prefix defaults (SPEC-launcher 5.6).
+const LAUNCHER_PREFIXES: [(&str, &str); 8] = [
+    ("=", "calc"),
+    (">", "run"),
+    ("<", "windows"),
+    ("??", "web"),
+    ("$", "settings"),
+    (")", "datetime"),
+    (":", "registry"),
+    ("file ", "files"),
+];
+
+/// `launcher` section of the config (SPEC-launcher 5.6). Plain data: nothing here names a program, a path or a verb.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LauncherConfig {
+    pub enabled: bool,
+    /// "off", "alt+space" or "alt+shift+space".
+    pub chord: String,
+    /// "yield" or "take": what to do while another program answers the same chord.
+    pub with_powertoys: String,
+    /// "pointer", "active" or "primary".
+    pub monitor: String,
+    /// Distance of the panel from the top of the display, percent of its height (10..=50).
+    pub top_percent: u8,
+    /// Panel width in logical px (560..=880, multiples of 40).
+    pub width: u16,
+    /// Visible result rows (4..=12).
+    pub rows: u8,
+    pub animate: bool,
+    pub keep_query: bool,
+    /// "pass" or "open".
+    pub over_fullscreen: String,
+    pub learn: bool,
+    pub announce_selection: bool,
+    pub providers: BTreeMap<String, bool>,
+    pub prefixes: BTreeMap<String, String>,
+    /// "google", "bing", "duckduckgo" or "custom".
+    pub web_engine: String,
+    /// The search URL template of the "custom" engine, "" otherwise.
+    pub web_url: String,
+    /// true once the owner answered the notice about another program using the chord.
+    pub offer_done: bool,
+}
+
+pub const LAUNCHER_TOP_PERCENT: (u8, u8, u8) = (10, 50, 24);
+pub const LAUNCHER_WIDTH: (u16, u16, u16) = (560, 880, 640);
+pub const LAUNCHER_ROWS: (u8, u8, u8) = (4, 12, 8);
+
+impl Default for LauncherConfig {
+    fn default() -> Self {
+        LauncherConfig {
+            enabled: true,
+            chord: "off".into(),
+            with_powertoys: "yield".into(),
+            monitor: "pointer".into(),
+            top_percent: LAUNCHER_TOP_PERCENT.2,
+            width: LAUNCHER_WIDTH.2,
+            rows: LAUNCHER_ROWS.2,
+            animate: false,
+            keep_query: false,
+            over_fullscreen: "pass".into(),
+            learn: true,
+            announce_selection: false,
+            providers: LAUNCHER_PROVIDERS.iter().map(|p| (p.to_string(), true)).collect(),
+            prefixes: LAUNCHER_PREFIXES.iter().map(|(p, n)| (p.to_string(), n.to_string())).collect(),
+            web_engine: "google".into(),
+            web_url: String::new(),
+            offer_done: false,
+        }
+    }
+}
+
+/// Puts `v` back to `default` unless it is one of `allowed`; the message names the key.
+fn fix_choice(v: &mut String, allowed: &[&str], default: &str, key: &str, out: &mut Vec<String>) {
+    if !allowed.contains(&v.as_str()) {
+        out.push(format!("launcher.{key}: unknown value, using \"{default}\""));
+        *v = default.to_string();
+    }
+}
+
+impl LauncherConfig {
+    /// Brings every key into its closed list or range and returns one message per fix. Never runs anything.
+    pub fn sanitize(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        fix_choice(&mut self.chord, &["off", "alt+space", "alt+shift+space"], "off", "chord", &mut out);
+        fix_choice(&mut self.with_powertoys, &["yield", "take"], "yield", "with_powertoys", &mut out);
+        fix_choice(&mut self.monitor, &["pointer", "active", "primary"], "pointer", "monitor", &mut out);
+        fix_choice(&mut self.over_fullscreen, &["pass", "open"], "pass", "over_fullscreen", &mut out);
+        let (lo, hi, _) = LAUNCHER_TOP_PERCENT;
+        let v = self.top_percent.clamp(lo, hi);
+        if v != self.top_percent {
+            out.push("launcher.top_percent: out of range, clamped".into());
+            self.top_percent = v;
+        }
+        let (lo, hi, _) = LAUNCHER_ROWS;
+        let v = self.rows.clamp(lo, hi);
+        if v != self.rows {
+            out.push("launcher.rows: out of range, clamped".into());
+            self.rows = v;
+        }
+        let (lo, hi, _) = LAUNCHER_WIDTH;
+        let v = (self.width.clamp(lo, hi) + 20) / 40 * 40;
+        let v = v.clamp(lo, hi);
+        if v != self.width {
+            out.push("launcher.width: out of range or not a multiple of 40, adjusted".into());
+            self.width = v;
+        }
+        // providers: unknown names dropped, apps always on, a missing one stays at its default (on)
+        let before = self.providers.len();
+        self.providers.retain(|k, _| crate::launcher::model::ProviderId::from_name(k).is_some());
+        if self.providers.len() != before {
+            out.push("launcher.providers: unknown names dropped".into());
+        }
+        for p in LAUNCHER_PROVIDERS {
+            self.providers.entry(p.to_string()).or_insert(true);
+        }
+        if self.providers.get("apps") != Some(&true) {
+            out.push("launcher.providers.apps: always on".into());
+            self.providers.insert("apps".into(), true);
+        }
+        // prefixes: 1-5 characters, known provider, unique, a word prefix ends with a space
+        let mut seen = std::collections::BTreeSet::new();
+        let mut dropped = false;
+        self.prefixes.retain(|p, name| {
+            let chars = p.chars().count();
+            let closed = !p.chars().any(char::is_alphabetic) || p.ends_with(' ');
+            let ok = (1..=5).contains(&chars)
+                && closed
+                && crate::launcher::model::ProviderId::from_name(name).is_some()
+                && seen.insert(p.to_ascii_lowercase());
+            dropped |= !ok;
+            ok
+        });
+        if dropped {
+            out.push("launcher.prefixes: invalid entries dropped".into());
+        }
+        // web: a custom template must pass the validator, else Google
+        fix_choice(&mut self.web_engine, &["google", "bing", "duckduckgo", "custom"], "google", "web_engine", &mut out);
+        if self.web_engine == "custom" {
+            if let Err(why) = crate::launcher::web::validate_template(&self.web_url) {
+                out.push(format!("launcher.web_url: {why}, using google"));
+                self.web_engine = "google".into();
+                self.web_url.clear();
+            }
+        }
+        out
+    }
+
+    /// The chord to hook; None when the launcher is disabled or the chord is "off".
+    #[allow(dead_code)] // the hook is armed from it by the chord flow (L1a-15)
+    pub fn chord_spec(&self) -> Option<crate::launcher::model::ChordSpec> {
+        if !self.enabled {
+            return None;
+        }
+        crate::launcher::model::ChordSpec::parse(&self.chord)
+    }
+}
+
 /// Default opacity of the bar background (percent).
 pub const DEFAULT_BAR_OPACITY: u8 = 95;
 
@@ -559,6 +722,8 @@ pub struct Config {
     pub last_update_check: String,
     /// Internal: tag of the newest release found by the last check, "" = none.
     pub update_available: String,
+    /// The launcher (Alt+Space style search box); off until a chord is set.
+    pub launcher: LauncherConfig,
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -631,6 +796,7 @@ impl Default for Config {
             update_auto_install: false,
             last_update_check: String::new(),
             update_available: String::new(),
+            launcher: LauncherConfig::default(),
         }
     }
 }
@@ -738,6 +904,9 @@ fn parse(text: &str) -> Result<Config, String> {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut c = serde_json::from_str::<Config>(&strip_comments(t)).map_err(|e| e.to_string())?;
     migrate_bar_size(&mut c);
+    for msg in c.launcher.sanitize() {
+        crate::log!("config error: {msg}");
+    }
     Ok(c)
 }
 
@@ -997,6 +1166,44 @@ fn render(c: &Config) -> String {
   "last_update_check": {last_update_check},
   "update_available": {update_available},
 
+  // Launcher: a search box over the desktop (apps, open windows, settings, commands, calculator).
+  // It stays off until "chord" is set. Unknown or out-of-range values fall back to the default.
+  "launcher": {{
+    // false = the launcher is never started, whatever the chord says.
+    "enabled": {l_enabled},
+    // The key chord that opens it: "off", "alt+space" or "alt+shift+space".
+    "chord": {l_chord},
+    // When another program answers the same chord: "yield" (leave it) or "take" (the dock opens it).
+    "with_powertoys": {l_with_powertoys},
+    // Display the box opens on: "pointer", "active" or "primary".
+    "monitor": {l_monitor},
+    // Distance of the box from the top of the display, percent of its height (10-50).
+    "top_percent": {l_top_percent},
+    // Width in px, 560 to 880 in steps of 40.
+    "width": {l_width},
+    // Result rows shown at once (4-12).
+    "rows": {l_rows},
+    // Reserved: animation of the box.
+    "animate": {l_animate},
+    // true = the box reopens with the last text selected.
+    "keep_query": {l_keep_query},
+    // Over a fullscreen window: "pass" (the chord goes through) or "open".
+    "over_fullscreen": {l_over_fullscreen},
+    // true = results you pick often move up.
+    "learn": {l_learn},
+    // Reserved: spoken announcement of the selected row.
+    "announce_selection": {l_announce},
+    // Sources of results: apps (always on), windows, files, settings, calc, commands, run, web, datetime, registry.
+    "providers": {l_providers},
+    // Text that starts a query for one source, 1-5 characters (a word ends with a space), e.g. "= 2+2".
+    "prefixes": {l_prefixes},
+    // Web search: "google", "bing", "duckduckgo" or "custom" (then "web_url" is an https:// address with {{q}}).
+    "web_engine": {l_web_engine},
+    "web_url": {l_web_url},
+    // Internal: set once the notice about another program using the chord was answered.
+    "offer_done": {l_offer_done}
+  }},
+
   // Internal: set once the notification-access prompt has been shown. Leave as is.
   "notif_prompted": {notif}
 }}
@@ -1045,6 +1252,23 @@ fn render(c: &Config) -> String {
         update_auto_install = c.update_auto_install,
         last_update_check = js(&c.last_update_check),
         update_available = js(&c.update_available),
+        l_enabled = c.launcher.enabled,
+        l_chord = js(&c.launcher.chord),
+        l_with_powertoys = js(&c.launcher.with_powertoys),
+        l_monitor = js(&c.launcher.monitor),
+        l_top_percent = c.launcher.top_percent,
+        l_width = c.launcher.width,
+        l_rows = c.launcher.rows,
+        l_animate = c.launcher.animate,
+        l_keep_query = c.launcher.keep_query,
+        l_over_fullscreen = js(&c.launcher.over_fullscreen),
+        l_learn = c.launcher.learn,
+        l_announce = c.launcher.announce_selection,
+        l_providers = js_block(&c.launcher.providers).replace("\n", "\n  "),
+        l_prefixes = js_block(&c.launcher.prefixes).replace("\n", "\n  "),
+        l_web_engine = js(&c.launcher.web_engine),
+        l_web_url = js(&c.launcher.web_url),
+        l_offer_done = c.launcher.offer_done,
     )
 }
 
@@ -1572,6 +1796,104 @@ mod fixtures;
 #[allow(clippy::items_after_test_module)] // clippy: kept as is; moving the items below the tests is churn in a file other streams own
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_defaults_when_missing() {
+        let c = parse("{}").unwrap();
+        assert_eq!(c.launcher.chord, "off");
+        assert!(!c.launcher.offer_done && c.launcher.enabled);
+        assert_eq!(c.launcher.chord_spec(), None);
+        assert_eq!(c.launcher, LauncherConfig::default());
+        let mut d = LauncherConfig::default();
+        assert!(d.sanitize().is_empty(), "the defaults need no fix");
+        assert_eq!(d, LauncherConfig::default());
+        // the template with the defaults reads back as the defaults
+        let r = render(&Config::default());
+        assert_eq!(parse(&r).unwrap().launcher, LauncherConfig::default());
+    }
+
+    fn sane(f: impl FnOnce(&mut LauncherConfig)) -> (LauncherConfig, Vec<String>) {
+        let mut l = LauncherConfig::default();
+        f(&mut l);
+        let msgs = l.sanitize();
+        (l, msgs)
+    }
+
+    #[test]
+    fn launcher_sanitize_vectors() {
+        let (l, m) = sane(|l| l.chord = "ctrl+alt+space".into());
+        assert_eq!((l.chord.as_str(), m.len()), ("off", 1));
+        let (l, _) = sane(|l| l.chord = "alt+shift+space".into());
+        assert!(l.chord_spec().is_some());
+        let (l, _) = sane(|l| {
+            l.chord = "alt+space".into();
+            l.enabled = false;
+        });
+        assert_eq!(l.chord_spec(), None);
+        let (l, _) = sane(|l| {
+            l.with_powertoys = "x".into();
+            l.monitor = "x".into();
+            l.over_fullscreen = "x".into();
+        });
+        assert_eq!((&l.with_powertoys[..], &l.monitor[..], &l.over_fullscreen[..]), ("yield", "pointer", "pass"));
+        let (l, _) = sane(|l| {
+            l.top_percent = 3;
+            l.rows = 99;
+            l.width = 1000;
+        });
+        assert_eq!((l.top_percent, l.rows, l.width), (10, 12, 880));
+        let (l, _) = sane(|l| l.width = 100);
+        assert_eq!(l.width, 560);
+        let (l, _) = sane(|l| l.width = 661);
+        assert_eq!(l.width, 680);
+        let (l, _) = sane(|l| l.width = 659);
+        assert_eq!(l.width, 640);
+        let (l, _) = sane(|l| {
+            l.providers.insert("apps".into(), false);
+            l.providers.insert("bogus".into(), true);
+            l.providers.insert("calc".into(), false);
+        });
+        assert_eq!(l.providers.get("apps"), Some(&true));
+        assert_eq!(l.providers.get("calc"), Some(&false));
+        assert!(!l.providers.contains_key("bogus"));
+        let (l, _) = sane(|l| {
+            l.prefixes.clear();
+            for (p, n) in [("x", "calc"), ("file", "files"), ("f ", "files"), ("toolong", "web"), ("", "web"), ("=", "calc"), ("%", "nope")] {
+                l.prefixes.insert(p.into(), n.into());
+            }
+        });
+        let keys: Vec<&str> = l.prefixes.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["=", "f "]);
+    }
+
+    #[test]
+    fn launcher_web_url_rules() {
+        let (l, _) = sane(|l| {
+            l.web_engine = "custom".into();
+            l.web_url = "https://example.com/?q={q}".into();
+        });
+        assert_eq!(l.web_engine, "custom");
+        for bad in ["https://user:pw@example.com/?q={q}", "http://example.com/?q={q}", "", "javascript:alert(1)"] {
+            let (l, m) = sane(|l| {
+                l.web_engine = "custom".into();
+                l.web_url = bad.into();
+            });
+            assert_eq!((l.web_engine.as_str(), l.web_url.as_str()), ("google", ""), "{bad:?}");
+            assert_eq!(m.len(), 1);
+        }
+        let (l, _) = sane(|l| l.web_engine = "yahoo".into());
+        assert_eq!(l.web_engine, "google");
+    }
+
+    #[test]
+    fn launcher_section_roundtrips_and_parse_sanitizes() {
+        let c = parse(r#"{"launcher": {"chord": "alt+space", "rows": 20, "prefixes": {"file ": "files"}}}"#).unwrap();
+        assert_eq!(c.launcher.rows, 12);
+        assert_eq!(c.launcher.chord_spec().map(|s| s.vk), Some(0x20));
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(render(&parse(&r).unwrap()), r);
+    }
 
     #[test]
     fn parse_partial_uses_defaults() {
