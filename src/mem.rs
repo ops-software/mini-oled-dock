@@ -8,6 +8,7 @@ use crate::log;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use windows::Win32::Foundation::{HANDLE, HMODULE};
+use windows::Win32::System::Com::{CoFreeUnusedLibraries, CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
 use windows::Win32::System::ProcessStatus::{
     EmptyWorkingSet, EnumProcessModules, GetModuleBaseNameW, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -210,6 +211,27 @@ pub fn released_data() {
     }
 }
 
+/// Unloads the in-proc COM servers with no object left: here on the calling (UI, STA) thread, and from a short MTA thread.
+/// The MTA call only marks candidates the first time and unloads them when called again 10 or more minutes later (COM's
+/// own protection for free-threaded DLLs), so it is made at every trim and never with a delay of 0.
+fn free_com_libraries() {
+    // SAFETY: plain call; on a thread without COM it does nothing.
+    unsafe { CoFreeUnusedLibraries() };
+    let spawned = std::thread::Builder::new().name("com-free".into()).stack_size(64 * 1024).spawn(|| {
+        // SAFETY: COM for this thread only, paired with CoUninitialize when the init succeeded.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        // SAFETY: as above.
+        unsafe { CoFreeUnusedLibraries() };
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+    });
+    if let Err(e) = spawned {
+        log!("trim: cannot start the com-free thread: {e}");
+    }
+}
+
 /// Compacts every process heap (decommits coalesced free blocks) and empties the working set.
 /// Call only while the dock is idle: the next show takes a few soft page faults.
 pub fn trim(reason: &str) {
@@ -220,6 +242,7 @@ pub fn trim(reason: &str) {
     if n == 0 {
         log!("GetProcessHeaps returned no heaps: {}", windows::core::Error::from_thread());
     }
+    free_com_libraries();
     for h in heaps.iter().take(n.min(MAX_HEAPS)) {
         // SAFETY: handle returned by GetProcessHeaps for this process; compaction is thread-safe
         // on serialized heaps and merely returns 0 on failure.

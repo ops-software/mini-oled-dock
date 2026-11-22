@@ -35,9 +35,9 @@ use windows::Win32::Graphics::Gdi::HGDIOBJ;
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WIN32_FIND_DATAW};
 use windows::Win32::System::Com::{
-    CoAllowSetForegroundWindow, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IDispatch,
-    IPersistFile, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
-    STGM_READ,
+    CoAllowSetForegroundWindow, CoCreateInstance, CoFreeUnusedLibraries, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    IBindCtx, IDispatch, IPersistFile, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
+    COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4};
@@ -701,6 +701,10 @@ impl Shell {
             ShellRequest::StartRelease => {
                 start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending);
                 crate::start_search::release_app_index();
+                // The icon pipeline and the AppsFolder catalog are done: this STA's COM servers with no object left are
+                // unloaded at once (M1 F4). Nothing kept points into them: icons and strings were copied.
+                // SAFETY: plain call on a COM-initialised thread.
+                unsafe { CoFreeUnusedLibraries() };
             }
             ShellRequest::StartIcons { icon_px, ids } => {
                 // A batch queued for a previous size: its ids were forgotten with that size.

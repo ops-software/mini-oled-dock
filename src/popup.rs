@@ -69,7 +69,10 @@ use crate::audio::{OutputDevice, VolumeState};
 use crate::launcher::field::KeyEvent;
 use crate::launcher::model::Mods;
 use crate::log;
-use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
+use crate::msg::{
+    TIMER_POPUP_ANIM, TIMER_POPUP_COM_FREE, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK,
+    WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE,
+};
 use crate::render::Metrics;
 use crate::surface::Surface;
 
@@ -767,6 +770,7 @@ pub fn shutdown() {
     for h in with(|st| [st.hwnd, st.launcher_hwnd]).unwrap_or_default().into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: our window.
         let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
+        let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_COM_FREE) };
     }
     if let Some(h) = crate::launcher_sys::timer_window() {
         for id in LAUNCHER_TIMERS {
@@ -1084,6 +1088,7 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     if kind == PopupKind::StartMenu {
         // SAFETY: our window; fails harmlessly if the timer is not armed.
         let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
+        let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_COM_FREE) };
     }
     let metrics = Metrics { dpi: anchor.dpi.max(96) };
     let surf = match Surface::new(metrics) {
@@ -1554,6 +1559,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 (TimerOwner::Host, TIMER_POPUP_TICK) => on_tick(hwnd),
                 (TimerOwner::Host, TIMER_POPUP_FOCUS) => on_focus_retry(hwnd),
                 (TimerOwner::Host, TIMER_POPUP_START_RELEASE) => on_start_release(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_COM_FREE) => on_com_free(hwnd),
                 (TimerOwner::Host, _) => {}
             }
             LRESULT(0)
@@ -1878,6 +1884,10 @@ pub(crate) fn tick_soon(ms: u32) {
 /// Delay after a Start menu close before its catalog and icons are released (`TIMER_POPUP_START_RELEASE`).
 const START_RELEASE_MS: u32 = 60_000;
 
+/// Delay after the Start data release before the trim is re-armed for COM's second `CoFreeUnusedLibraries` call: more
+/// than COM's 10 minute default delay for free-threaded DLLs (`TIMER_POPUP_COM_FREE`).
+const COM_FREE_MS: u32 = 660_000;
+
 /// Whether the release timer may free the Start data: not while a Start menu is open.
 fn start_release_due(open: Option<PopupKind>) -> bool {
     open != Some(PopupKind::StartMenu)
@@ -1904,11 +1914,22 @@ fn on_start_release(hwnd: HWND) {
         // The shell thread's COM libraries are freed with the release; the catalog and icons freed here are trimmed in
         // the next hidden period (M1 F3), and the free-threaded ones are unloaded by a second pass 11 minutes on (F4).
         crate::mem::rearm();
+        // SAFETY: our window; the callback is in its wnd_proc.
+        if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_COM_FREE, COM_FREE_MS, None) } == 0 {
+            log!("popup: SetTimer(com free) failed");
+        }
         // With the launcher on its release also trims at once while the bar is hidden.
         if popup_launcher::is_on() {
             crate::mem::released_data();
         }
     }
+}
+
+/// `TIMER_POPUP_COM_FREE`: one-shot; the idle trim runs again, and its MTA pass unloads what the first one marked.
+fn on_com_free(hwnd: HWND) {
+    // SAFETY: timer of our window.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_COM_FREE) };
+    crate::mem::rearm();
 }
 
 /// What follows a foreground attempt of `on_focus_retry`.
@@ -2296,7 +2317,9 @@ mod tests {
         for id in 34..=39 {
             assert_eq!(timer_owner(id), TimerOwner::Launcher, "timer {id}");
         }
-        for id in [TIMER_POPUP_ANIM, TIMER_POPUP_TICK, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE] {
+        for id in
+            [TIMER_POPUP_ANIM, TIMER_POPUP_TICK, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_COM_FREE]
+        {
             assert_eq!(timer_owner(id), TimerOwner::Host, "timer {id}");
         }
         assert_eq!((TIMER_POPUP_ANIM, TIMER_POPUP_START_RELEASE), (30, 33));

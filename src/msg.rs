@@ -173,6 +173,10 @@ pub const TIMER_POPUP_FOCUS: usize = 32;
 /// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
 /// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
 pub const TIMER_POPUP_START_RELEASE: usize = 33;
+/// 11 min one-shot (on the popup window) armed when the Start data is released, killed when a Start menu opens: it
+/// re-arms the idle trim so the next hidden trim makes COM's second, MTA `CoFreeUnusedLibraries` call (M1 F4).
+/// 34 is the launcher's, 40 to 42 belong to the dock window, so 43.
+pub const TIMER_POPUP_COM_FREE: usize = 43;
 // The launcher's one-shots, on the DOCK window (a popup window can be destroyed, and its timers with it):
 // `ui::on_timer` forwards 34-39 to `popup_launcher::on_timer`, which kills each before acting; `popup::shutdown` kills
 // them all. None is armed while the chord is off.
