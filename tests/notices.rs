@@ -31,16 +31,9 @@ fn notices_list_every_crate_in_the_exe() {
         ])
         .output()
         .expect("run cargo tree");
-    assert!(
-        out.status.success(),
-        "cargo tree failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "cargo tree failed: {}", String::from_utf8_lossy(&out.stderr));
     let notices = String::from_utf8(read("THIRD_PARTY_NOTICES.md")).expect("notices are UTF-8");
-    let used: Vec<&str> = notices
-        .lines()
-        .filter_map(|l| l.strip_prefix("Used by: "))
-        .collect();
+    let used: Vec<&str> = notices.lines().filter_map(|l| l.strip_prefix("Used by: ")).collect();
     let text = String::from_utf8_lossy(&out.stdout);
     let mut seen = 0;
     let mut missing = Vec::new();
@@ -54,18 +47,13 @@ fn notices_list_every_crate_in_the_exe() {
         };
         seen += 1;
         let want = format!("{name} {ver}");
-        let found = used
-            .iter()
-            .any(|l| l.split(", ").any(|item| item == want));
+        let found = used.iter().any(|l| l.split(", ").any(|item| item == want));
         if !found && !missing.contains(&want) {
             missing.push(want);
         }
     }
     assert!(seen > 0, "cargo tree listed no dependency");
-    assert!(
-        missing.is_empty(),
-        "THIRD_PARTY_NOTICES.md lacks {missing:?}: run pwsh tools/gen-notices.ps1"
-    );
+    assert!(missing.is_empty(), "THIRD_PARTY_NOTICES.md lacks {missing:?}: run pwsh tools/gen-notices.ps1");
 }
 
 #[test]
@@ -77,19 +65,12 @@ fn eartrumpet_licence_is_verbatim() {
         "THIRD_PARTY_NOTICES.md does not contain tools/notices/EarTrumpet-LICENSE.txt verbatim"
     );
     let s = String::from_utf8(lic).expect("licence is UTF-8");
-    for who in [
-        "Yellow Elephant Productions",
-        "Tidal Media Inc.",
-        "Articent Group LLC",
-    ] {
+    for who in ["Yellow Elephant Productions", "Tidal Media Inc.", "Articent Group LLC"] {
         assert!(s.contains(who), "licence file does not name {who}");
     }
 }
 
 #[test]
 fn notices_have_lf_only() {
-    assert!(
-        !read("THIRD_PARTY_NOTICES.md").contains(&13),
-        "THIRD_PARTY_NOTICES.md contains CR"
-    );
+    assert!(!read("THIRD_PARTY_NOTICES.md").contains(&13), "THIRD_PARTY_NOTICES.md contains CR");
 }
