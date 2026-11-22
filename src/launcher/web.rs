@@ -3,6 +3,9 @@
 
 pub const MAX_TEMPLATE_CHARS: usize = 512;
 
+/// The longest web address the launcher offers and `OpenUrl` passes on.
+pub const MAX_URL_BYTES: usize = 8 * 1024;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine {
     Google,
@@ -121,27 +124,51 @@ pub fn url_for(t: &Template, query: &str) -> String {
     t.text.replacen(HOLE, &enc, 1)
 }
 
+/// The part of a web address between "://" and the first "/", "?" or "#" as `OpenUrl` accepts it (the shell thread's
+/// `rebuild_url` checks it again with this, so a typed URL row never ends in a refusal): no user name or password before
+/// the host ("https://bank.it@evil.example" reads as one host and is another); a host of letters, digits and hyphens in
+/// dot-separated labels, none empty (so no IP literal in brackets); an optional numeric port up to 65535.
+pub fn check_authority(authority: &str) -> Result<(), &'static str> {
+    if authority.contains('@') {
+        return Err("a user name before the host");
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let label_ok = |l: &str| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-');
+    if !host.split('.').all(label_ok) {
+        return Err("not a host name");
+    }
+    if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err()) {
+        return Err("not a port");
+    }
+    Ok(())
+}
+
 /// A typed address: "http://" or "https://" as typed (the scheme in lowercase), or "www." which gets "https://".
-/// No whitespace, no control character, something after the scheme.
+/// No whitespace, no control character, something after the scheme, a host `check_authority` accepts, at most
+/// `MAX_URL_BYTES`: what `OpenUrl` would refuse is never offered.
 pub fn parse_typed_url(text: &str) -> Option<String> {
     let text = text.trim();
-    if text.is_empty() || super::history::has_marker(text) {
+    if text.is_empty() || text.len() > MAX_URL_BYTES || super::history::has_marker(text) {
         return None;
     }
     if text.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let lower = |n: usize| text.get(..n).map(str::to_ascii_lowercase);
-    for scheme in ["https://", "http://"] {
-        if lower(scheme.len()).as_deref() == Some(scheme) {
-            let rest = text.get(scheme.len()..)?;
-            return (!rest.is_empty()).then(|| format!("{scheme}{rest}"));
-        }
+    let (scheme, rest) = match ["https://", "http://"].into_iter().find(|s| lower(s.len()).as_deref() == Some(*s)) {
+        Some(scheme) => (scheme, text.get(scheme.len()..)?),
+        None if lower(4).as_deref() == Some("www.") && text.len() > 4 => ("https://", text),
+        None => return None,
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest.is_empty() || check_authority(rest.get(..end)?).is_err() {
+        return None;
     }
-    if lower(4).as_deref() == Some("www.") && text.len() > 4 {
-        return Some(format!("https://{text}"));
-    }
-    None
+    let url = format!("{scheme}{rest}");
+    (url.len() <= MAX_URL_BYTES).then_some(url)
 }
 
 #[cfg(test)]
@@ -239,8 +266,28 @@ mod tests {
             "http://a\u{7}b",
             "http://exa\u{202E}mple.com",
             "www.exa\u{200F}mple.com",
+            // What OpenUrl refuses is never offered: a user name, an IP literal, a bad label or port.
+            "https://user@host",
+            "https://user:pw@a.it/x",
+            "www.a.it@evil.example",
+            "https://[::1]/",
+            "https://my_host/",
+            "https://a.it./",
+            "www.a..it",
+            "https:///x",
+            "https://a.it:65536/",
+            "https://a.it:/",
+            "https://a.it:8a",
+            "https://a.it\\@evil.example",
         ] {
             assert_eq!(parse_typed_url(bad), None, "{bad:?}");
         }
+        assert_eq!(parse_typed_url("http://a.it:8080/p#top").as_deref(), Some("http://a.it:8080/p#top"));
+        assert_eq!(parse_typed_url("https://a.it:65535").as_deref(), Some("https://a.it:65535"));
+        let long = format!("https://a.it/{}", "x".repeat(MAX_URL_BYTES));
+        assert_eq!(parse_typed_url(&long), None, "longer than OpenUrl passes on");
+        let www = format!("www.a.it/{}", "x".repeat(MAX_URL_BYTES - "https://www.a.it/".len()));
+        assert_eq!(parse_typed_url(&www).map(|u| u.len()), Some(MAX_URL_BYTES));
+        assert_eq!(parse_typed_url(&format!("{www}x")), None, "the added https:// counts");
     }
 }

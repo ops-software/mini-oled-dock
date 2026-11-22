@@ -67,6 +67,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
 use crate::launcher::gesture::{is_marker, is_network_file, Gesture};
+use crate::launcher::web::{check_authority, MAX_URL_BYTES};
 use crate::log;
 use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
 
@@ -2087,16 +2088,14 @@ fn reveal_path_with(path: &str, windows: &Path, exec: Exec) -> Result<(), Fail> 
     exec(&explorer.to_string_lossy(), Some(&format!("/select,\"{path}\"")), None, Verb::Open).map_err(Fail::Shell)
 }
 
-/// The longest web address `OpenUrl` passes on.
-const MAX_URL_BYTES: usize = 8 * 1024;
-
 /// `OpenUrl`'s check on the shell thread, whatever the launcher checked: an http or https address
-/// rebuilt from its parts, so only what was checked reaches the shell. The scheme in lowercase; a host
-/// of letters, digits, hyphens and dots (no empty label) with an optional numeric port; no user name
-/// or password before the host (refused: "https://bank.it@evil.example" reads as one host and is
-/// another); then the path, query and fragment with every character that is not URL-safe ASCII
-/// percent-encoded as UTF-8, so a quote or a bracket can never end the address inside a browser's
-/// command line. Whitespace and control characters are refused.
+/// rebuilt from its parts, so only what was checked reaches the shell. The scheme in lowercase; the
+/// host part as `web::check_authority` accepts it (the launcher offers a typed URL only after the same
+/// check): letters, digits, hyphens and dots (no empty label), an optional numeric port, no user name
+/// or password before the host ("https://bank.it@evil.example" reads as one host and is another);
+/// then the path, query and fragment with every character that is not URL-safe ASCII percent-encoded
+/// as UTF-8, so a quote or a bracket can never end the address inside a browser's command line.
+/// Whitespace and control characters are refused.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn rebuild_url(url: &str) -> Result<String, &'static str> {
     const KEEP: &str = "-._~:/?#[]@!$&'()*+,;=%";
@@ -2115,20 +2114,7 @@ fn rebuild_url(url: &str) -> Result<String, &'static str> {
     let (Some(authority), Some(tail)) = (rest.get(..end), rest.get(end..)) else {
         return Err("no host");
     };
-    if authority.contains('@') {
-        return Err("a user name before the host");
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, Some(p)),
-        None => (authority, None),
-    };
-    let label_ok = |l: &str| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-');
-    if !host.split('.').all(label_ok) {
-        return Err("not a host name");
-    }
-    if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err()) {
-        return Err("not a port");
-    }
+    check_authority(authority)?;
     let mut out = String::with_capacity(url.len() + 16);
     out.push_str(&scheme);
     out.push_str("://");
@@ -2814,6 +2800,46 @@ mod tests {
         assert!(open_url_with("HTTPS://a.it/\"", &mut recorder(&mut calls, true)).is_ok());
         assert!(open_url_with("ftp://a.it", &mut recorder(&mut calls, true)).is_err());
         assert_eq!(calls, [("https://a.it/%22".to_string(), None, None, Verb::Open)]);
+    }
+
+    #[test]
+    fn typed_urls_pass_open_url() {
+        // Every address the launcher offers as a typed URL is one OpenUrl passes on: no row ends in a refusal.
+        let prefixes = ["https://", "http://", "HTTPS://", "www.", "WWW."];
+        let hosts = [
+            "a.it",
+            "user@host",
+            "u:p@a.it",
+            "[::1]",
+            "my_host",
+            "a.it.",
+            "a..it",
+            "",
+            ".a.it",
+            "a.it:",
+            "a.it:8080",
+            "a.it:65535",
+            "a.it:65536",
+            "a.it:8a",
+            "citt\u{e0}.it",
+            "a-b.it",
+            "a.it\\x",
+            "a.it%40b",
+        ];
+        let tails = ["", "/", "/x?q=1#f", "?q", "#f", "/\"<>|", "/@x", "/a:b"];
+        let mut offered = 0;
+        for p in prefixes {
+            for h in hosts {
+                for t in tails {
+                    let typed = format!("{p}{h}{t}");
+                    if let Some(url) = crate::launcher::web::parse_typed_url(&typed) {
+                        offered += 1;
+                        assert!(rebuild_url(&url).is_ok(), "{typed:?} -> {url:?}: {:?}", rebuild_url(&url));
+                    }
+                }
+            }
+        }
+        assert!(offered > 50, "{offered}");
     }
 
     #[test]
