@@ -1034,21 +1034,23 @@ fn run_action(a: Action) {
             log!("settings: launcher history forgotten");
         }
         // `config.json` is the one file the interactive user may write; the shell thread opens it as that user.
-        Action::EditConfig => {
-            if let Some(p) = crate::datadir::config_path() {
+        Action::EditConfig => match (crate::datadir::config_path(), notepad_path()) {
+            (Some(p), Some(notepad)) => {
                 shell_thread::request(ShellRequest::Launch {
-                    target: notepad_path(),
+                    target: notepad,
                     args: Some(format!("\"{}\"", p.display())),
                 });
             }
-        }
+            (_, None) => log!("settings: no system directory (GetSystemDirectoryW failed), config.json not opened"),
+            (None, _) => {}
+        },
     }
 }
 
-/// `<SystemRoot>\System32\notepad.exe`, never found through the search path.
-fn notepad_path() -> String {
-    let root = std::env::var_os("SystemRoot").map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from);
-    root.join("System32").join("notepad.exe").display().to_string()
+/// `<System32>\notepad.exe`, the folder from `GetSystemDirectoryW` (never from the environment, whose
+/// %SystemRoot% is the user's to set), never found through the search path. None when the API fails.
+fn notepad_path() -> Option<String> {
+    Some(shell_thread::system_dir()?.join("notepad.exe").display().to_string())
 }
 
 // ------------------------------------------------------------------ messages
@@ -1343,6 +1345,14 @@ mod tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_TAB, VK_UP};
     const FRAME: RECT = RECT { left: -8, top: -31, right: 8, bottom: 8 };
+
+    #[test]
+    fn notepad_comes_from_the_system_directory() {
+        // GetSystemDirectoryW, never %SystemRoot%: the elevated dock stats this path before the shell launch.
+        let p = notepad_path().expect("GetSystemDirectoryW");
+        assert_eq!(p, shell_thread::system_dir().unwrap().join("notepad.exe").display().to_string());
+        assert!(std::path::Path::new(&p).is_absolute(), "{p}");
+    }
 
     #[test]
     fn initial_rect_centres_and_clamps() {
