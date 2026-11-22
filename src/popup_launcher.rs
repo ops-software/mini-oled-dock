@@ -348,6 +348,8 @@ impl Launcher {
             return view;
         }
         self.taken = true;
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::focused();
         let mut buf = [KeyRec::default(); RING_CAP];
         let n = hook.take(self.open_seq, &mut buf);
         let keys = replay_keys(buf.get(..n).unwrap_or(&[]), sys);
@@ -487,6 +489,8 @@ impl Launcher {
     fn finish(&mut self, hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
         hook.shown(false);
         hook.end(self.open_seq);
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::closed();
         if self.restore && self.fg_at_open != 0 {
             sys.restore(self.fg_at_open);
         }
@@ -1226,6 +1230,8 @@ fn gesture_for(ev: &KeyEvent, hook: &mut dyn HookPort, sys: &dyn SysPort) -> Opt
         return None;
     }
     let hook_time = hook.gesture_time();
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::gesture(hook_time, sys.msg_time());
     Gesture::from_key(ev, hook_time, sys.msg_time(), sys.msg_extra(), hook::INJECT_TAG, sys.now())
 }
 
@@ -1449,6 +1455,8 @@ pub(crate) fn on_config() {
         }
         (_, true) => {
             with_ctrl(|c| c.configure(&cfg.launcher));
+            // The flags of the window in front now, not at its next change.
+            foreground_flow(&mut RealHook, &RealSys);
             if !was {
                 log!("launcher: chord on");
                 if !REGISTERED.with(|r| r.replace(true)) {
@@ -1460,10 +1468,23 @@ pub(crate) fn on_config() {
 }
 
 /// `EVENT_SYSTEM_FOREGROUND` (`ui::on_foreground_changed`, first thing): the hook's pass flags for the new foreground.
-pub(crate) fn on_foreground(_fg: HWND) {
-    if ON.with(Cell::get) {
-        foreground_flow(&mut RealHook, &RealSys);
+#[cfg_attr(not(feature = "owner-probe"), allow(unused_variables))]
+pub(crate) fn on_foreground(fg: HWND) {
+    if !ON.with(Cell::get) {
+        return;
     }
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::foreground(fg);
+    foreground_flow(&mut RealHook, &RealSys);
+}
+
+/// `WM_DOCK_LAUNCHER_YIELDED`: the chord pressed at `kb_time` passed under YIELD (another launcher answers it). In
+/// L1a only the probe watches it; the answer check comes with PowerToys detection (L1b-5).
+#[cfg_attr(not(feature = "owner-probe"), allow(unused_variables))]
+pub(crate) fn on_yielded(kb_time: u32) {
+    let on = ON.with(Cell::get);
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::yielded(on.then_some(kb_time));
 }
 
 /// The pass flags of the window now in front, to the hook (a chord's FULLSCREEN is recomputed here).
@@ -1471,8 +1492,12 @@ fn foreground_flow(hook: &mut dyn HookPort, sys: &dyn SysPort) {
     let over_pass = with_ctrl(|c| c.over_fullscreen_pass).unwrap_or(true);
     let d3d = sys.d3d_fullscreen();
     let fs = !d3d && over_pass && sys.fullscreen_foreground();
-    // REMOTE and YIELD come with their detection (L1b-6, L1b-5).
-    let flags = pass_flags(d3d, fs, over_pass, false, false);
+    // REMOTE and YIELD come with their detection (L1b-6, L1b-5); the owner probe can force YIELD (S-PT).
+    #[cfg(feature = "owner-probe")]
+    let yield_ = crate::launcher_probe::force_yield();
+    #[cfg(not(feature = "owner-probe"))]
+    let yield_ = false;
+    let flags = pass_flags(d3d, fs, over_pass, false, yield_);
     with_ctrl(|c| c.flags = flags);
     hook.pass(flags);
 }
@@ -1540,6 +1565,11 @@ pub(crate) fn on_chord(seq: u32, sent_time: u32) {
 /// first, so the next key reaches the window behind and the keys already kept are never replayed by a later chord.
 fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn SysPort) -> OpenPlan {
     hook.ack(seq);
+    #[cfg(feature = "owner-probe")]
+    if crate::launcher_probe::drop_post() {
+        hook.end(seq);
+        return OpenPlan::Nothing;
+    }
     let (newest, failopen) = hook.seqs();
     let action = hook::post_verdict(seq, sent_time, sys.now(), newest, failopen, sys.launcher_open());
     let defaults = (MonitorPick::Pointer, crate::config::LAUNCHER_TOP_PERCENT.2, true);
@@ -1581,7 +1611,11 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
                 c.num = num;
             });
             hook.shown(true);
+            #[cfg(feature = "owner-probe")]
+            crate::launcher_probe::opened(sent_time);
             if !sys.open(pick, top_percent) {
+                #[cfg(feature = "owner-probe")]
+                crate::launcher_probe::open_failed();
                 hook.shown(false);
                 hook.end(seq);
                 // The window menu opens as Windows would have opened it.

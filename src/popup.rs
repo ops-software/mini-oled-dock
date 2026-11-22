@@ -1120,6 +1120,8 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
         close_inner("initial render failed");
         return false;
     }
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::presented(kind == PopupKind::Launcher);
     log!("popup: opening {kind:?}");
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
     // SHOWNA: activated only by `force_foreground`. Active before its AttachThreadInput, the popup would get
@@ -1374,6 +1376,8 @@ fn utf16_char(held: &mut u16, unit: u32) -> Option<char> {
 
 /// A `WM_CHAR` (or routed `WM_SYSCHAR`) for the open content.
 fn on_char_unit(unit: u32) {
+    #[cfg(feature = "owner-probe")]
+    let work = crate::launcher_probe::work_start();
     let c = HIGH.with(|h| {
         let mut held = h.get();
         let c = utf16_char(&mut held, unit);
@@ -1385,6 +1389,8 @@ fn on_char_unit(unit: u32) {
     if let Some(r) = reply {
         apply(r);
     }
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::work_end(work);
 }
 
 /// true if the open content takes the system keys. A busy state (re-entry) reads as false: the usual arms.
@@ -1401,7 +1407,14 @@ fn sys_key_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> 
     }
     match route(msg, wp.0, open_wants_sys_keys()) {
         Route::Default => None,
-        Route::ToContent => Some(on_key_ex(hwnd, msg, wp, lp)),
+        Route::ToContent => {
+            #[cfg(feature = "owner-probe")]
+            let work = crate::launcher_probe::work_start();
+            let r = on_key_ex(hwnd, msg, wp, lp);
+            #[cfg(feature = "owner-probe")]
+            crate::launcher_probe::work_end(work);
+            Some(r)
+        }
         Route::Char => {
             on_char_unit(wp.0 as u32);
             Some(LRESULT(0))

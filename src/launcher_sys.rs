@@ -199,9 +199,12 @@ fn clipboard_text() -> Option<String> {
 fn arm_once(id: usize, ms: u32) {
     let Some(hwnd) = popup::last_hwnd() else { return };
     // SAFETY: our popup window (same thread); its wnd_proc forwards the launcher's ids to popup_launcher::on_timer.
-    if unsafe { SetTimer(Some(hwnd), id, ms, None) } == 0 {
+    let armed = unsafe { SetTimer(Some(hwnd), id, ms, None) } != 0;
+    if !armed {
         log!("launcher: SetTimer failed");
     }
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::timer_armed(id, ms, armed);
 }
 
 /// The dock window receives `WM_WTSSESSION_CHANGE` for this session (once, when a chord is first set).

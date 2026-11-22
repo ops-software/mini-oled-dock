@@ -498,6 +498,11 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             popup::popup_launcher::on_chord(wp.0 as u32, lp.0 as u32);
             Some(LRESULT(0))
         }
+        // The chord passed under YIELD (posted only while a chord is set): lParam = kb.time.
+        crate::msg::WM_DOCK_LAUNCHER_YIELDED => {
+            popup::popup_launcher::on_yielded(lp.0 as u32);
+            Some(LRESULT(0))
+        }
         // Registered only once a chord is set (`launcher_sys::watch_sessions`): lock and disconnects.
         windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
             popup::popup_launcher::on_session_change(wp.0 as u32);
