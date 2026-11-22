@@ -251,6 +251,7 @@ fn every_g7_budget_has_a_row() {
         "start.first_frame_files",
         "files.list_10k",
         "tasks.cpu_1s",
+        "bench.launcher_query_ratio",
     ];
     let rows = rows();
     for id in IDS {

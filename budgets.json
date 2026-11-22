@@ -272,6 +272,15 @@
       "gate": "max",
       "value": 0.5,
       "note": "of one core at 1 s refresh, sampling only while visible"
+    },
+    {
+      "id": "bench.launcher_query_ratio",
+      "where": "CI",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 0,
+      "note": "launcher_ns / reference_ns x 100, windows-latest, release, same process; calibrated in LC-3"
     }
   ]
 }

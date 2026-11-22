@@ -153,6 +153,26 @@ jobs:
           path: target/release/dock.exe
           retention-days: 7
 
+  # Launcher query cost (LC-3): the operation-count tests run in the test job; this one times the release build against a
+  # reference workload in the same process. The gate is a pending budgets.json row until the owner approves the calibration.
+  bench:
+    runs-on: windows-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      - name: Launcher bench
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-bench
+        run: cargo test --release --locked launcher::providers::bench -- --ignored --nocapture
+
   regen-golden:
     runs-on: windows-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.regen }}
