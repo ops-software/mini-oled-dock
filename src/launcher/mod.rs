@@ -3,6 +3,7 @@
 // The session that uses these modules arrives in L1a-8 to L1a-15; until then only the tests reach them.
 #![allow(dead_code)]
 
+pub mod calc;
 pub mod field;
 pub mod keywords;
 pub mod model;
