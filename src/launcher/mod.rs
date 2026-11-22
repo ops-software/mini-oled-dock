@@ -21,6 +21,7 @@ pub mod runline;
 pub mod session;
 pub mod strings;
 pub mod style;
+pub mod units;
 pub mod verbs;
 pub mod web;
 

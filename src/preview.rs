@@ -1091,6 +1091,7 @@ pub fn run(dir: &str) -> i32 {
             ("launcher_running", 0),
             ("launcher_calc", 0),
             ("launcher_time", 0),
+            ("launcher_units", 0),
             ("launcher_run", 0),
             ("launcher_run_review", 0),
             ("launcher_windows", 0),

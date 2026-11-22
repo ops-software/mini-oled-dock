@@ -162,8 +162,9 @@ impl TopK {
 
 /// The synchronous providers in the order of 5.4.1. In Mixed mode the open windows are merged into the apps; `Windows`
 /// runs only in its own mode ("<").
-pub const ORDER: [ProviderId; 9] = [
+pub const ORDER: [ProviderId; 10] = [
     ProviderId::Calc,
+    ProviderId::Units,
     ProviderId::DateTime,
     ProviderId::Apps,
     ProviderId::Windows,
@@ -246,7 +247,10 @@ fn runs(id: ProviderId, q: &Query, mask: ProviderMask) -> bool {
     }
     match q.mode {
         Mode::Mixed => id != ProviderId::Windows,
-        Mode::Only(p) => p == id || (id == ProviderId::Apps && q.apps_also),
+        // Units answers in the "=" mode too: it shares Calc's mask bit but not its mode.
+        Mode::Only(p) => {
+            p == id || (id == ProviderId::Apps && q.apps_also) || (id == ProviderId::Units && p == ProviderId::Calc)
+        }
     }
 }
 
@@ -398,7 +402,11 @@ fn run_one(id: ProviderId, q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK,
             datetime(q, cx, top);
             0
         }
-        ProviderId::Units | ProviderId::Files => 0,
+        ProviderId::Units => {
+            units(q, top);
+            0
+        }
+        ProviderId::Files => 0,
     }
 }
 
@@ -464,6 +472,26 @@ fn calc(q: &Query, top: &mut TopK) {
         score: PINNED,
         verbs: verbs(Kind::Answer, false, None),
         payload: Payload::Value { shown: a.shown.into(), raw: a.raw.into() },
+        destructive: false,
+    });
+}
+
+// ---- unit conversion
+
+/// The conversion row under the calculator's answer (rank 1): "10 km in mi" in Mixed and "=" mode. A text that does not
+/// start like a number returns at once.
+fn units(q: &Query, top: &mut TopK) {
+    let Some(c) = super::units::convert(q.text, q.num) else { return };
+    top.push(Item {
+        key: ItemKey::of(ProviderId::Units, "answer"),
+        from: ProviderId::Units,
+        kind: Kind::Answer,
+        title: c.shown.as_str().into(),
+        detail: Some(c.detail.into()),
+        icon: IconRef::Glyph(GlyphId::Equals),
+        score: Score { rank: 1, ..PINNED },
+        verbs: verbs(Kind::Answer, false, None),
+        payload: Payload::Value { shown: c.shown.into(), raw: c.raw.into() },
         destructive: false,
     });
 }
@@ -1759,16 +1787,46 @@ pub(crate) mod tests {
     #[test]
     fn query_all_order_is_5_4_1() {
         use ProviderId::*;
-        assert_eq!(ORDER, [Calc, DateTime, Apps, Windows, Commands, Settings, Run, Web, Registry]);
+        assert_eq!(ORDER, [Calc, Units, DateTime, Apps, Windows, Commands, Settings, Run, Web, Registry]);
         let fx = Fx::new();
-        assert_eq!(fx.query("x").1, [Calc, DateTime, Apps, Commands, Settings, Run, Web, Registry]);
+        assert_eq!(fx.query("x").1, [Calc, Units, DateTime, Apps, Commands, Settings, Run, Web, Registry]);
         assert_eq!(fx.query(")").1, [DateTime]);
         assert_eq!(fx.query("<x").1, [Windows]);
-        assert_eq!(fx.query("=1").1, [Calc]);
+        assert_eq!(fx.query("=1").1, [Calc, Units], "Units answers in the calculator's mode");
         assert_eq!(fx.query(">ping").1, [Run]);
         assert_eq!(fx.query("file explorer").1, [Apps], "a word prefix keeps the apps");
         // Rows of the same tier and kind keep the order of the providers: the answer of an expression comes first.
         assert_eq!(fx.rows("2+3")[0].kind, Kind::Answer);
+    }
+
+    #[test]
+    fn units_answer_in_mixed_and_calc_mode() {
+        let mut fx = Fx::new();
+        let own = |fx: &Fx, raw: &str| fx.rows(raw).into_iter().find(|r| r.from == ProviderId::Units);
+        let row = own(&fx, "10 km in mi").unwrap();
+        assert_eq!(&*row.title, "6,21371192237334 mi");
+        assert_eq!(row.kind, Kind::Answer);
+        assert!(
+            matches!(&row.payload, Payload::Value { raw, .. } if &**raw == "6,21371192237334"),
+            "copies the number only"
+        );
+        assert!(own(&fx, "=10 km in mi").is_some(), "the calculator's mode");
+        assert!(
+            own(&fx, "<10 km in mi").is_none()
+                && own(&fx, "$10 km in mi").is_none()
+                && own(&fx, ">10 km in mi").is_none()
+        );
+        assert!(own(&fx, "10 km in kg").is_none() && own(&fx, "calc").is_none());
+        // It sits under the calculator's answer (rank 1) and above the ranked rows.
+        assert_eq!(row.score, Score { rank: 1, ..PINNED });
+        let mut res = Results::default();
+        fx.sync(&mut res, "10 km in mi", 1);
+        assert_eq!(res.rows()[0].from, ProviderId::Units, "above the ranked rows");
+        assert_eq!(res.selected().unwrap().from, ProviderId::Units);
+        // It rides Calc's mask bit.
+        fx.opts.mask = ProviderMask::all().with(ProviderId::Calc, false);
+        assert!(own(&fx, "10 km in mi").is_none() && own(&fx, "=10 km in mi").is_none());
+        assert!(!fx.query("10 km in mi").1.contains(&ProviderId::Units));
     }
 
     #[test]
@@ -2178,7 +2236,7 @@ mod bench {
             })
             .collect();
         // The date and time provider: its prefix lists every row, a keyword answers one (DT-1).
-        qs.extend([")".to_string(), "ora".to_string()]);
+        qs.extend([")", "ora", "10 km in mi", "72 f in c", "1,5 GiB to MB"].map(String::from));
         qs
     }
 

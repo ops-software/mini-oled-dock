@@ -3235,6 +3235,8 @@ pub(crate) enum PreviewScene {
     Calc,
     /// The date and time rows (")").
     Time,
+    /// A unit conversion answer ("10 km in mi").
+    Units,
     Run,
     RunReview,
     Windows,
@@ -3259,6 +3261,7 @@ impl PreviewScene {
             "running" => PreviewScene::Running,
             "calc" => PreviewScene::Calc,
             "time" => PreviewScene::Time,
+            "units" => PreviewScene::Units,
             "run" => PreviewScene::Run,
             "run_review" => PreviewScene::RunReview,
             "windows" => PreviewScene::Windows,
@@ -3377,6 +3380,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::Apps => "calc",
         PreviewScene::Calc => tr("=2.5*4", "=2,5*4"),
         PreviewScene::Time => ")",
+        PreviewScene::Units => "10 km in mi",
         PreviewScene::Run => "> ping 1.1.1.1",
         PreviewScene::RunReview => long_line,
         PreviewScene::Windows => "<",
@@ -5519,6 +5523,7 @@ mod tests {
             "launcher_running",
             "launcher_calc",
             "launcher_time",
+            "launcher_units",
             "launcher_run",
             "launcher_run_review",
             "launcher_windows",

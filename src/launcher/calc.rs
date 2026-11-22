@@ -122,7 +122,7 @@ struct Lexed {
 
 /// A number literal made of digits and the two marks. Returns its value and whether a lone group mark was read as
 /// thousands.
-fn number(run: &str, num: NumberStyle) -> Option<(f64, bool)> {
+pub(super) fn number(run: &str, num: NumberStyle) -> Option<(f64, bool)> {
     let is_mark = |c: char| c == num.decimal || c == num.group;
     let marks: Vec<char> = run.chars().filter(|c| is_mark(*c)).collect();
     let segs: Vec<&str> = run.split(is_mark).collect();
@@ -549,7 +549,7 @@ fn finite(v: f64) -> Option<f64> {
 
 /// At most 15 significant digits, trailing zeros trimmed, the locale's decimal mark, scientific notation outside
 /// 1e-9..=1e15. No group marks.
-fn format_plain(v: f64, num: NumberStyle) -> String {
+pub(super) fn format_plain(v: f64, num: NumberStyle) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
