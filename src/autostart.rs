@@ -741,6 +741,21 @@ fn remove_install(dir: &Path, report: &mut UninstallReport) {
     }
 }
 
+/// After the restore of `--uninstall --remove`: a taskbar state file that is still there means the restore was
+/// not delivered (Explorer did not answer). Removing the exe, or the data folder, now would leave nothing that can
+/// finish the restore, so the removal stops.
+fn removal_after_restore(state_left: bool) -> Result<(), InstallError> {
+    if state_left {
+        Err(InstallError::Failed(
+            "the Windows taskbar was not restored (Explorer did not answer) and its saved state is kept. \
+             Run dock.exe --restore, then uninstall again."
+                .into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// `--uninstall`: removes the logon task and the Add/Remove Programs entry. With `remove` it first
 /// stops the dock (the same wait as `--install`), restores the taskbar, then deletes the installed
 /// files and the update staging folders. Returns the exit code.
@@ -760,6 +775,12 @@ pub fn run_uninstall_cli(remove: bool) -> i32 {
             return report.exit_code();
         }
         crate::taskbar::restore_force_waiting(Duration::from_secs(5));
+        if let Err(e) = removal_after_restore(crate::taskbar::state_file_exists()) {
+            log!("autostart: --uninstall --remove failed: {e}");
+            say(&format!("Removal failed: {e}"));
+            report.stop = Some(e);
+            return report.exit_code();
+        }
     }
     report.failures.extend(disable().err());
     report.failures.extend(crate::arp::delete().err());
@@ -875,6 +896,14 @@ mod tests {
         assert!(!is_old_copy_name("dock.exe.old-12x"));
         assert!(!is_old_copy_name("other.exe.old-12"));
         assert!(!is_old_copy_name("dock.exe.old-12.dll"));
+    }
+
+    #[test]
+    fn removal_stops_while_the_taskbar_state_is_kept() {
+        assert!(removal_after_restore(false).is_ok());
+        let e = removal_after_restore(true).unwrap_err();
+        assert!(matches!(e, InstallError::Failed(_)));
+        assert_ne!(UninstallReport { stop: Some(e), ..Default::default() }.exit_code(), EXIT_OK);
     }
 
     #[test]
