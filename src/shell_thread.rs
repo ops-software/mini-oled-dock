@@ -1851,11 +1851,9 @@ mod tests {
     fn admin_tools_launch_by_absolute_path_or_aumid() {
         let sys = std::path::Path::new(r"C:\Windows\System32");
         assert_eq!(AdminTool::Terminal.target(sys), r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App");
-        for tool in [AdminTool::Terminal] {
-            let s = tool.target(sys);
-            assert!(s.contains('\\'), "never a bare executable name: {s}");
-            assert!(!s.eq_ignore_ascii_case("wt.exe") && !s.eq_ignore_ascii_case("powershell.exe"));
-        }
+        let s = AdminTool::Terminal.target(sys);
+        assert!(s.contains('\\'), "never a bare executable name: {s}");
+        assert!(!s.eq_ignore_ascii_case("wt.exe") && !s.eq_ignore_ascii_case("powershell.exe"));
     }
 
     #[test]

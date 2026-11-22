@@ -1565,6 +1565,11 @@ pub fn toggle_start_pin(id: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/config_tests.rs"]
+mod fixtures;
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)] // clippy: kept as is; moving the items below the tests is churn in a file other streams own
 mod tests {
     use super::*;
 
@@ -1713,10 +1718,12 @@ mod tests {
 
     #[test]
     fn order_fields_roundtrip() {
-        let mut c = Config::default();
-        c.app_order = vec!["a".into(), "b".into()];
-        c.tray_order = vec!["x#1".into()];
-        c.modules_order = vec!["power".into(), "clock".into()];
+        let c = Config {
+            app_order: vec!["a".into(), "b".into()],
+            tray_order: vec!["x#1".into()],
+            modules_order: vec!["power".into(), "clock".into()],
+            ..Config::default()
+        };
         let r = render(&c);
         assert!(r.contains("\"modules_order\""));
         assert_eq!(parse(&r).unwrap(), c);
@@ -1830,8 +1837,7 @@ mod tests {
         assert_eq!(Config::default().start_style, StartStyle::Compact);
         let r = render(&Config::default());
         assert!(r.contains("\"start_style\": \"compact\""));
-        let mut c = Config::default();
-        c.start_style = StartStyle::Windows11;
+        let c = Config { start_style: StartStyle::Windows11, ..Config::default() };
         let r = render(&c);
         assert!(r.contains("\"start_style\": \"windows11\""));
         assert_eq!(parse(&r).unwrap(), c);
@@ -1905,8 +1911,7 @@ mod tests {
         assert_eq!(AudioLayout::parse("MOSX"), d);
         assert_eq!(std::mem::size_of::<AudioLayout>(), 6);
         // Collapsed and hidden sections round-trip through the template.
-        let mut c = Config::default();
-        c.audio_layout = AudioLayout::parse("M-oXS");
+        let c = Config { audio_layout: AudioLayout::parse("M-oXS"), ..Config::default() };
         assert_eq!(c.audio_layout.encode(), "M-oXS");
         assert!(c.audio_layout.is_hidden(AUDIO_OUTPUT) && !c.audio_layout.is_open(AUDIO_OUTPUT));
         let r = render(&c);

@@ -136,6 +136,8 @@ pub fn set_popup_open(open: bool) {
 }
 
 /// Which sections of the open popup show their data (ignored while the popup is closed).
+// clippy: kept as is, no runtime change in 1.4.3 (ROADMAP 3.6); rewrite is a follow-up of the stream that owns this file
+#[allow(clippy::precedence)]
 pub fn set_popup_wants(outputs: bool, spatial: bool, sessions: bool) {
     let bits = u8::from(outputs) * WANT_OUTPUTS | u8::from(spatial) * WANT_SPATIAL | u8::from(sessions) * WANT_SESSIONS;
     // Only the UI thread writes this byte: a plain load + store is enough.
@@ -347,6 +349,8 @@ mod mf {
 
     impl Probe {
         /// Loads `mfplat.dll` from System32 and starts Media Foundation. `None` (logged) on failure.
+        // clippy: kept as is, no runtime change in 1.4.3 (ROADMAP 3.6); rewrite is a follow-up of the stream that owns this file
+        #[allow(clippy::missing_transmute_annotations)]
         pub fn load() -> Option<Probe> {
             // SAFETY: static wide literal; System32 only (no DLL planting).
             let lib = match unsafe { LoadLibraryExW(w!("mfplat.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) } {

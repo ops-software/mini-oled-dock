@@ -52,6 +52,118 @@ fn no_style(_: &mut Config) {}
 /// Rendered DPIs and file suffix (120 is the "main" file).
 const DPIS: [(u32, &str); 2] = [(120, ""), (96, "_96")];
 
+/// What `run` renders, read once from the environment (see `Plan::try_from_vars`). Without any variable it is
+/// the legacy run that writes the README images; with `DOCK_PREVIEW_DPI` it is one cell of the golden matrix.
+struct Plan {
+    /// Matrix mode: one DPI, no legacy extras, versions pinned to 0.0.0.
+    matrix: bool,
+    dpi: u32,
+    /// Matrix mode: every image in Italian.
+    italian: bool,
+    /// Matrix mode: GDI text is not drawn (layout unchanged).
+    no_text: bool,
+}
+
+impl Plan {
+    /// The legacy run: nothing set.
+    const LEGACY: Plan = Plan { matrix: false, dpi: 0, italian: false, no_text: false };
+
+    /// Parses `DOCK_PREVIEW_DPI` (72..=384), `DOCK_PREVIEW_LANG` (`en` or `it`) and `DOCK_PREVIEW_NOTEXT`
+    /// (`1`). A value that does not parse is an error, so a typo never silently gives the legacy run; LANG and
+    /// NOTEXT without DPI are errors too.
+    fn try_from_vars(dpi: Option<&str>, lang: Option<&str>, notext: Option<&str>) -> Result<Plan, String> {
+        let Some(dpi) = dpi else {
+            if lang.is_some() || notext.is_some() {
+                return Err("DOCK_PREVIEW_LANG and DOCK_PREVIEW_NOTEXT need DOCK_PREVIEW_DPI".to_string());
+            }
+            return Ok(Plan::LEGACY);
+        };
+        let dpi = match dpi.trim().parse::<u32>() {
+            Ok(n) if (72..=384).contains(&n) => n,
+            _ => return Err(format!("DOCK_PREVIEW_DPI={dpi:?} is not a number from 72 to 384")),
+        };
+        let italian = match lang {
+            None | Some("en") => false,
+            Some("it") => true,
+            Some(other) => return Err(format!("DOCK_PREVIEW_LANG={other:?} is not en or it")),
+        };
+        let no_text = match notext {
+            None => false,
+            Some("1") => true,
+            Some(other) => return Err(format!("DOCK_PREVIEW_NOTEXT={other:?} is not 1")),
+        };
+        Ok(Plan { matrix: true, dpi, italian, no_text })
+    }
+
+    /// Rendered DPIs of the bar and the popups, with the file suffix.
+    fn dpis(&self) -> Vec<(u32, &'static str)> {
+        if self.matrix {
+            vec![(self.dpi, "")]
+        } else {
+            DPIS.to_vec()
+        }
+    }
+
+    /// Rendered DPIs of the Settings pages, with the file suffix.
+    fn settings_dpis(&self) -> Vec<(u32, &'static str)> {
+        if self.matrix {
+            vec![(self.dpi, "")]
+        } else {
+            SETTINGS_DPIS.to_vec()
+        }
+    }
+
+    /// The config every image starts from: defaults, in Italian for an Italian cell.
+    fn base_config(&self) -> Config {
+        let language = if self.italian { crate::config::Language::It } else { crate::config::Language::Auto };
+        Config { language, ..Config::default() }
+    }
+}
+
+/// The plan of this process, or the error message when the variables are wrong.
+fn plan_result() -> &'static Result<Plan, String> {
+    static PLAN: std::sync::OnceLock<Result<Plan, String>> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        Plan::try_from_vars(
+            var("DOCK_PREVIEW_DPI").as_deref(),
+            var("DOCK_PREVIEW_LANG").as_deref(),
+            var("DOCK_PREVIEW_NOTEXT").as_deref(),
+        )
+    })
+}
+
+/// The plan of this process; the legacy one when the variables are wrong (`run` has already refused to start).
+fn plan() -> &'static Plan {
+    match plan_result() {
+        Ok(p) => p,
+        Err(_) => &Plan::LEGACY,
+    }
+}
+
+/// True while `run` renders a matrix cell (false in every other mode and in unit tests).
+static MATRIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The installed version of the mock Updates status (0.0.0 in matrix mode, like `version_text`).
+fn installed_version() -> crate::update_release::Version {
+    use crate::update_release::Version;
+    if MATRIX.load(std::sync::atomic::Ordering::Relaxed) {
+        Version::default()
+    } else {
+        Version::current()
+    }
+}
+
+/// The version the About row and the mock Updates status show: pinned to 0.0.0 in matrix mode so a release
+/// bump does not change a golden image.
+pub(crate) fn version_text() -> &'static str {
+    if MATRIX.load(std::sync::atomic::Ordering::Relaxed) {
+        "0.0.0"
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
 // ------------------------------------------------------------------ mock icons
 
 /// 5x7 glyph (rows of 5 bits, MSB on the left) for the letters used by the mock icons.
@@ -365,7 +477,7 @@ fn render_bar(
 ) -> Option<(i32, i32, Vec<u32>, Option<RECT>)> {
     // The renderer reads the display mode from the global config snapshot (in memory only, never saved).
     // The metrics module (off by default) is switched on so the preview shows every module.
-    let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
+    let mut cfg = Config { display_mode: mode, show_metrics: true, ..plan().base_config() };
     STYLE.with(|s| s.get())(&mut cfg);
     let sizes = BarSizes::from_config(&cfg);
     let battery = BATTERY.with(|b| b.get());
@@ -549,7 +661,7 @@ fn settings_mock(m: Metrics) -> SettingsMock {
         screens: vec![d("\\\\.\\DISPLAY1", "1", true), d("\\\\.\\DISPLAY2", "2", false)],
         tray,
         update: UpdateStatus {
-            installed: Version::current(),
+            installed: installed_version(),
             phase: Phase::Idle,
             available: Some(Available {
                 tag: "v1.4.1".into(),
@@ -607,7 +719,7 @@ fn settings_png_with(
 
 /// Settings page `page` as the README shows it: default config, nothing open, nothing hovered.
 fn settings_png(dir: &Path, file: &str, m: Metrics, page: crate::settings_pages::Page) -> bool {
-    settings_png_with(dir, file, m, page, &Config::default(), (false, false), None, (860, 600))
+    settings_png_with(dir, file, m, page, &plan().base_config(), (false, false), None, (860, 600))
 }
 
 /// Popup on a background, written to `file`. `nth` = hovered control (scan index).
@@ -751,7 +863,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 start_pins: pins.iter().map(|p| p.to_string()).collect(),
                 start_folders: folders,
                 start_grid: name == "popup_startmenu_win11_grid",
-                ..Config::default()
+                ..plan().base_config()
             });
             let apps =
                 APPS.iter().map(|&(n, l, c)| (n.to_lowercase(), n.to_string(), mock_icon(l, c, m.px(32)))).collect();
@@ -802,9 +914,20 @@ pub fn run(dir: &str) -> i32 {
         return 1;
     }
     crate::calendar::set_preview(true);
+    if let Err(e) = plan_result() {
+        eprintln!("preview: {e}");
+        return 2;
+    }
+    MATRIX.store(plan().matrix, std::sync::atomic::Ordering::Relaxed);
+    if plan().italian {
+        crate::i18n::set_preview(false);
+    }
+    if plan().no_text {
+        crate::surface::NO_TEXT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let wifi = mock_net().status();
     let mut failures = 0;
-    for (dpi, suffix) in DPIS {
+    for (dpi, suffix) in plan().dpis() {
         let m = Metrics { dpi };
         // Entry App(1) = "Steam"; tray icon no. 2 (id 2) for the tray hover.
         for (name, mode) in [
@@ -931,7 +1054,7 @@ pub fn run(dir: &str) -> i32 {
             false,
             wifi,
         ));
-        crate::config::set(Config::default());
+        crate::config::set(plan().base_config());
         failures += i32::from(!picker_png(dir, &format!("popup_windows{suffix}.png"), m));
         // (name, index of the hovered control)
         for (name, nth) in [
@@ -959,7 +1082,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_tray_customize", 2),
         ] {
             // Popups read the background tone from the config: every one starts from the defaults.
-            crate::config::set(Config::default());
+            crate::config::set(plan().base_config());
             let italian = name.ends_with("_it");
             if italian {
                 crate::i18n::set_preview(false);
@@ -969,32 +1092,35 @@ pub fn run(dir: &str) -> i32 {
                 None => false,
             };
             if italian {
-                crate::i18n::set_preview(true);
+                crate::i18n::set_preview(english_preview(plan()));
             }
             failures += i32::from(!ok);
         }
     }
     // Settings window pages, then the same pages in Italian at 144 DPI.
-    for (dpi, suffix) in SETTINGS_DPIS {
+    for (dpi, suffix) in plan().settings_dpis() {
         for page in crate::settings_pages::Page::ALL {
             let file = format!("settings_{}{suffix}.png", page.slug());
             failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
         }
     }
-    // The whole Modules page, down to the Tray section (elevated-apps switch).
-    let (m, modules) = (Metrics { dpi: 144 }, crate::settings_pages::Page::Modules);
-    let c = Config::default();
-    let tall = settings_png_with(dir, "settings_modules_tray.png", m, modules, &c, (false, false), None, (860, 900));
-    failures += i32::from(!tall);
-    crate::i18n::set_preview(false);
-    for page in crate::settings_pages::Page::ALL {
-        let c = Config { language: crate::config::Language::It, ..Config::default() };
-        let file = format!("settings_{}_it.png", page.slug());
-        let m = Metrics { dpi: 144 };
-        failures += i32::from(!settings_png_with(dir, &file, m, page, &c, (false, false), None, (860, 600)));
+    if !plan().matrix {
+        // The whole Modules page, down to the Tray section (elevated-apps switch).
+        let (m, modules) = (Metrics { dpi: 144 }, crate::settings_pages::Page::Modules);
+        let c = Config::default();
+        let tall =
+            settings_png_with(dir, "settings_modules_tray.png", m, modules, &c, (false, false), None, (860, 900));
+        failures += i32::from(!tall);
+        crate::i18n::set_preview(false);
+        for page in crate::settings_pages::Page::ALL {
+            let c = Config { language: crate::config::Language::It, ..Config::default() };
+            let file = format!("settings_{}_it.png", page.slug());
+            let m = Metrics { dpi: 144 };
+            failures += i32::from(!settings_png_with(dir, &file, m, page, &c, (false, false), None, (860, 600)));
+        }
+        crate::i18n::set_preview(true);
     }
-    crate::i18n::set_preview(true);
-    crate::config::set(Config::default());
+    crate::config::set(plan().base_config());
     if failures > 0 {
         eprintln!("preview: {failures} previews not written");
         return 1;
@@ -1002,9 +1128,53 @@ pub fn run(dir: &str) -> i32 {
     0
 }
 
+/// The i18n preview bit a cell runs with: set (English) unless the cell renders Italian.
+fn english_preview(p: &Plan) -> bool {
+    !p.italian
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn italian_cell_keeps_italian_after_an_it_popup() {
+        let it = Plan::try_from_vars(Some("96"), Some("it"), None).unwrap();
+        let en = Plan::try_from_vars(Some("96"), Some("en"), None).unwrap();
+        assert!(!english_preview(&it));
+        assert!(english_preview(&en));
+        assert!(english_preview(&Plan::LEGACY));
+    }
+
+    #[test]
+    fn plan_defaults_are_the_legacy_run() {
+        let p = Plan::try_from_vars(None, None, None).unwrap();
+        assert!(!p.matrix);
+        assert_eq!(p.dpis(), vec![(120, ""), (96, "_96")]);
+        assert_eq!(p.settings_dpis(), vec![(144, ""), (96, "_96")]);
+    }
+
+    #[test]
+    fn plan_matrix_cell() {
+        let p = Plan::try_from_vars(Some("192"), Some("it"), Some("1")).unwrap();
+        assert!(p.matrix && p.italian && p.no_text);
+        assert_eq!(p.dpis(), vec![(192, "")]);
+        assert_eq!(p.settings_dpis(), vec![(192, "")]);
+        assert_eq!(p.base_config().language, crate::config::Language::It);
+    }
+
+    #[test]
+    fn plan_rejects_nonsense() {
+        // A typo must not silently produce the legacy run.
+        for bad in ["0", "7", "9999", "abc", ""] {
+            assert!(Plan::try_from_vars(Some(bad), None, None).is_err());
+        }
+        assert!(Plan::try_from_vars(Some("96"), Some("fr"), None).is_err());
+        assert!(Plan::try_from_vars(Some("96"), None, Some("0")).is_err());
+        // LANG or NOTEXT without DPI is an error.
+        assert!(Plan::try_from_vars(None, Some("it"), None).is_err());
+        assert!(Plan::try_from_vars(None, None, Some("1")).is_err());
+    }
 
     #[test]
     fn battery_mock_shows_the_module_and_the_default_does_not() {

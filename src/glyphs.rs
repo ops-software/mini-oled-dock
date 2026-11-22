@@ -779,7 +779,8 @@ mod tests {
 
     #[test]
     fn settings_glyphs_are_distinct_and_sized() {
-        let set: [(&str, fn(f32, f32) -> bool); 19] = [
+        type Shape = fn(f32, f32) -> bool;
+        let set: [(&str, Shape); 19] = [
             ("palette", palette_shape),
             ("bar", bar_shape),
             ("grid", grid_shape),

@@ -1,0 +1,8 @@
+{
+  "bar_size": "large",
+  "position": "top",
+  "autohide": false,
+  "pinned": [
+    { "key": "a.exe", "name": "A", "launch": "C:\\a\\a.exe" }
+  ]
+}

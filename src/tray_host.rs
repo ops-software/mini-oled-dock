@@ -3066,7 +3066,8 @@ mod tests {
         let good = SharedBlock { granted: 0x000F_001F, is_section: true, attrs: SEC_COMMIT, size: APPBAR_SECTION_SIZE };
         let rights = |granted: u32| SharedBlock { granted, ..good };
         // (holder, dock elevated, sender window pids, section, None = accept / Some(reason))
-        let rows: [(u32, bool, &[u32], SharedBlock, Option<&str>); 24] = [
+        type Row<'a> = (u32, bool, &'a [u32], SharedBlock, Option<&'a str>);
+        let rows: [Row; 24] = [
             (OWN, true, &[], good, Some("held by the dock itself")),
             (OWN, true, &[APP], good, Some("held by the dock itself")),
             // Unelevated developer build (DOCK_NO_MANIFEST=1): shell32 makes the dock the holder.
@@ -3151,15 +3152,16 @@ mod tests {
         let never = |_: u32| -> Result<u32, String> { panic!("the holder is not opened") };
         let dock_block = |_: u64| Ok((0x9B0, OWN));
         let text =
-            appbar_gate(&m, &[], OWN, None, sender_medium, dock_block, never, medium, |_, _| Ok((7u8, good)), |b| Ok(b));
+            appbar_gate(&m, &[], OWN, None, sender_medium, dock_block, never, medium, |_, _| Ok((7u8, good)), Ok);
         assert!(text.is_err_and(|t| t.contains("held by the dock itself")), "unknown elevation fails closed");
         let ok_resolve = |_: u64| Ok((0x9B0, APP));
         let ok_open = |p: u32| Ok(p);
         let ok_dup = |_: &u32, _: u64| Ok((7u8, good));
         let ok_map = |b: u8| Ok(b);
+        type DupFn<'a> = dyn Fn(&u32, u64) -> Result<(u8, SharedBlock), String> + 'a;
         let gate = |resolve: &dyn Fn(u64) -> Result<(u64, u32), String>,
                     open: &dyn Fn(u32) -> Result<u32, String>,
-                    dup: &dyn Fn(&u32, u64) -> Result<(u8, SharedBlock), String>,
+                    dup: &DupFn,
                     map: &dyn Fn(u8) -> Result<u8, String>| {
             appbar_gate(&m, &[], OWN, Some(true), sender_medium, resolve, open, medium, dup, map).unwrap_err()
         };

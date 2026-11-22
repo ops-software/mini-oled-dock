@@ -659,6 +659,7 @@ pub fn file_mtime(path: &Path) -> Option<SystemTime> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // clippy: kept as is; moving the items below the tests is churn in a file other streams own
 mod tests {
     use super::*;
 

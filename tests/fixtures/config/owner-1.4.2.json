@@ -1,0 +1,261 @@
+// mini-oled-dock configuration
+// Edit and save: changes are picked up within ~2 seconds, no restart needed.
+// The folder is admin-only: edit this file with Notepad (it saves in place) or an elevated editor.
+// Editors that save by writing a new file and renaming it over this one cannot write here.
+// Comments (// and /* */) are allowed. If the file has a syntax error the previous
+// settings are kept; if the dock must save a change (pin, tray icon) before you fix it,
+// your file is first copied to config.json.bak so no edit is lost.
+{
+  // Language of the dock: "auto" (follows the Windows display language), "en" or "it".
+  // Also sets the language of the clock, date and calendar names. Normally chosen in Settings.
+  "language": "auto",
+
+  // Where the bar sits on screen: "top" or "bottom".
+  "position": "top",
+
+  // Display the bar sits on: "" = the primary monitor, or a device name such as "\\\\.\\DISPLAY2".
+  // Normally chosen in Settings -> Screen (shown with two or more displays). If that display is
+  // not connected the bar uses the primary monitor, and moves back when it returns.
+  // "pointer" = the Win key shows the bar (and a double tap the Start menu) on the display under the pointer.
+  "monitor": "",
+
+  // What each entry shows: "icon_text" (icon + name), "icon" (icon only) or "text" (name only).
+  // The indicator bar under each entry adapts to the chosen mode.
+  "display_mode": "icon_text",
+
+  // Sizes, each independent (the bar height follows the tallest content):
+  //   app_icon_size   app icons, 14-32 px (default 16)
+  //   app_text_size   app names, 10-18 px (default 13)
+  //   tray_icon_size  tray icons, 12-24 px (default 16)
+  //   module_size     start button, notifications, volume, network, metrics, battery, clock, show desktop and
+  //                   power, 75-150 % (default 100)
+  // Logical pixels: the Windows display scaling is applied on top.
+  "app_icon_size": 20,
+  "app_text_size": 14,
+  "tray_icon_size": 18,
+  "module_size": 105,
+
+  // Background colour of the bar and the popups as a hex code, #RRGGBB (e.g. #000000, pure black,
+  // ideal for OLED). The Settings window offers dark presets and a colour picker.
+  "background": "#000000",
+
+  // Opacity of the bar and popup backgrounds in percent, 0-100 (0 = only text and icons are
+  // visible; they still react to the mouse). Text and icons always stay fully opaque.
+  "bar_opacity": 100,
+
+  // Size of the Settings window in logical pixels (96 DPI), [width, height]. Remembered when you
+  // resize it; at least [640, 460]; clamped to the display it opens on.
+  "settings_window_size": [860,594],
+
+  // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
+  "autohide": true,
+
+  // Resting the pointer on an app with several windows shows a live preview of each one (with its
+  // title); click a preview to switch to that window. false = no previews and no extra window.
+  "window_previews": true,
+
+  // true = the Win key opens the Start menu together with the bar and the next tap closes both
+  // (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.
+  "win_opens_start": false,
+
+  // Layout of the dock's Start menu: "compact" (a quick launcher: search, one strip of pinned icons,
+  // the list of all apps) or "windows11" (the full menu: one scrolling page with the pinned tiles
+  // and all apps, user name and folder shortcuts at the bottom). Normally chosen in Settings. The old names "vertical" and
+  // "horizontal" are still read; other values = "compact".
+  "start_style": "compact",
+
+  // "All apps" in the "windows11" layout: false = a list, true = a grid of icons. Normally chosen
+  // with the button next to "All apps" in the menu.
+  "start_grid": false,
+
+  // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
+  "hide_native_taskbar": true,
+
+  // Show the date next to the clock.
+  "show_date": true,
+
+  // Clock format (Windows time picture, uses the dock language, or your system locale with "auto").
+  //   H / HH = hour 0-23      h / hh = hour 1-12      m / mm = minutes
+  //   s / ss = seconds        t / tt = AM/PM marker
+  // Examples: "HH:mm" -> 14:05 (24h)    "h:mm tt" -> 2:05 PM (12h)
+  "time_format": "HH:mm",
+
+  // true = always show seconds (":ss" is appended if time_format has no "s").
+  // The clock then refreshes every second instead of every minute.
+  "show_seconds": true,
+
+  // Date format (Windows date picture). Empty string "" = no date.
+  //   d / dd = day of month   ddd / dddd = short / full weekday name
+  //   M / MM = month number   MMM / MMMM = short / full month name
+  //   yy / yyyy = year
+  // Examples: "ddd d MMM" -> Fri 23 Oct    "dd/MM/yyyy" -> 23/10/2026
+  "date_format": "ddd d MMM",
+
+  // Show the percentage next to the volume icon.
+  "show_volume_percent": true,
+
+  // Host other apps' tray icons inside the dock. All visible icons are shown (no limit);
+  // the bar widens and narrows dynamically.
+  "show_tray": true,
+
+  // System modules on the right of the bar: true = shown, false = removed from the bar.
+  // A hidden module costs nothing (no timer, no polling, no system library loaded).
+  // The power button is always shown (it holds the dock's own menu).
+  "show_notifications": true,
+  "show_volume": true,
+
+  // Network: Wi-Fi signal bars or ethernet glyph, with a small globe when the internet is reachable
+  // and a small x when it is not. Click for the connection details. Refreshed every ~6 s while
+  // the bar is visible.
+  "show_network": false,
+
+  // CPU and RAM usage in percent (two small lines). Refreshed every 2 s while the bar is visible.
+  // Click to open Task Manager.
+  "show_metrics": false,
+
+  // Battery: an Apple-style icon filled in proportion to the charge, with a bolt while charging.
+  // Click for the details. Refreshed every 30 s while the bar is visible, and at once when the
+  // charger is plugged or unplugged.
+  //   show_battery            "auto" (only on a laptop) | true (always; an icon with a slash when there
+  //                           is no battery) | false
+  //   battery_percent         show the number
+  //   battery_percent_inside  put the number inside the battery body (Apple style) instead of beside it
+  "show_battery": "auto",
+  "battery_percent": true,
+  "battery_percent_inside": false,
+
+  "show_clock": true,
+  "show_desktop_button": true,
+
+  // Windows logo button at the left end of the bar: left click opens Start, right click the Win+X menu.
+  "show_start_button": false,
+
+  // Tray icons you chose to keep out of the bar (they stay in the tray popup).
+  // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces)
+  // or "<exe name lowercase>#<icon id>", e.g. "discord.exe#1".
+  "tray_hidden": [
+    "alpha.exe#197480"
+  ],
+
+  // Order of the tray icons in the bar (same keys as "tray_hidden"). Normally managed by
+  // dragging an icon in the bar; icons not listed go last, in the order they registered.
+  "tray_order": [
+    "11111111-2222-4333-8444-555555555551",
+    "bravo.exe#3",
+    "charlie.exe#1",
+    "delta.exe#1",
+    "11111111-2222-4333-8444-555555555552",
+    "echo.exe#1000",
+    "11111111-2222-4333-8444-555555555553",
+    "foxtrot.exe#1",
+    "alpha.exe#132114",
+    "11111111-2222-3333-8444-555555555554",
+    "golf.exe#0",
+    "hotel.exe#1",
+    "india.exe#2",
+    "11111111-2222-c333-8444-555555555555",
+    "alpha.exe#197562",
+    "11111111-2222-d333-8444-555555555556"
+  ],
+
+  // System tray icons the dock never shows (volume, network, power, location, microphone).
+  "tray_hidden_guids": [
+    "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae77-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae82-23e3-4229-82c1-e41cb67d5b9c"
+  ],
+
+  // Pinned apps, in order. Normally managed with Pin/Unpin in the app menu. Fields:
+  //   "key"    grouping key: the AUMID, or the lowercase exe path
+  //   "name"   fallback label, refreshed automatically from the app itself; use the "names"
+  //            map to set a fixed label
+  //   "launch" exe path, or "shell:AppsFolder\\<AUMID>" for Store/packaged apps
+  //   "icon"   optional custom icon: plain PNG file name inside %ProgramData%\mini-oled-dock\icons\
+  //            (e.g. "discord.png"; paths, "..", drive letters and UNC paths are rejected)
+  // List the AUMIDs of installed apps with:  Get-StartApps   (PowerShell)
+  "pinned": [
+    {
+      "key": "c:\\windows\\explorer.exe",
+      "name": "Esplora risorse",
+      "launch": "C:\\Windows\\explorer.exe"
+    },
+    {
+      "key": "A1B2C3D4E5F60789",
+      "name": "Example Browser",
+      "launch": "C:\\Program Files\\Example Browser\\browser.exe"
+    },
+    {
+      "key": "c:\\users\\user\\appdata\\local\\examplechat\\app-*\\examplechat.exe",
+      "name": "Example Chat",
+      "launch": "C:\\Users\\user\\AppData\\Local\\ExampleChat\\app-1.2.3456\\ExampleChat.exe"
+    },
+    {
+      "key": "12345ABC.ExampleMessenger_abcdefgh12345!App",
+      "name": "Example Messenger",
+      "launch": "shell:AppsFolder\\12345ABC.ExampleMessenger_abcdefgh12345!App"
+    },
+    {
+      "key": "c:\\users\\user\\appdata\\local\\programs\\exampleplayer\\exampleplayer.exe",
+      "name": "Example Player",
+      "launch": "C:\\Users\\user\\AppData\\Local\\Programs\\ExamplePlayer\\exampleplayer.exe"
+    }
+  ],
+
+  // Apps pinned at the top of the Start menu that a double tap of the Win key opens (separate from
+  // the bar pins above). Normally managed with a right click on an app in that menu. Each entry is
+  // the app's id inside shell:AppsFolder (an AUMID for Store apps); see:  Get-StartApps  (PowerShell)
+  "start_pins": [],
+
+  // Folders of those pins: each one shows some of the pinned apps under a single tile, placed where
+  // its first app is. Normally managed by dragging a pinned app onto another one in the menu.
+  // Example: [{ "name": "Games", "apps": ["<id>", "<id>"] }]
+  "start_folders": [],
+
+  // Order of the open apps that are NOT pinned (their keys). Pinned apps follow the "pinned" order
+  // above. Normally managed by dragging an entry in the bar; apps not listed go last, in the order
+  // they were first seen. At most 64 keys are kept.
+  "app_order": [],
+
+  // Order of the system buttons on the right of the bar. Normally managed by dragging them.
+  // Names: "metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power".
+  // Missing names go back next to their default neighbour, unknown names are ignored.
+  // Hiding a module (the show_* switches above) keeps its place in this list.
+  "modules_order": [
+    "volume",
+    "clock",
+    "notifications",
+    "show_desktop",
+    "power"
+  ],
+
+  // Volume panel layout. Normally changed in the panel itself: click a section title to expand or
+  // collapse it, or use the pencil button at the bottom (Customize) to drag sections into a new
+  // order and to hide them. One letter per section, in display order: M = master volume,
+  // O = output devices, S = spatial sound, X = volume mixer. Upper case = expanded, lower case =
+  // collapsed, a leading "-" hides the section. Missing sections come back at the end.
+  // Example: "M-OsX". Default: "MOSX".
+  // A collapsed or hidden section reads nothing from Windows.
+  "audio_layout": "Mo-S-X",
+
+  // Display-name overrides. Key = exe file name lowercase (e.g. "code.exe") or AUMID;
+  // value = the name to show. Example: { "code.exe": "VS Code" }
+  "names": {},
+
+  // Updates. Once a day the dock asks GitHub (api.github.com) whether a newer release exists and
+  // shows a badge on Settings; nothing is downloaded until you choose "Update now" in Settings ->
+  // Updates. false = never ask by itself ("Check now" still works).
+  "update_check": true,
+
+  // true = also download, verify (SHA-256 + version) and install a new release by itself, the next
+  // time no popup or Settings window is open and no fullscreen app is in front.
+  "update_auto_install": true,
+
+  // Internal: time of the last successful check (UTC) and the newest release found. Leave as is.
+  "last_update_check": "2026-11-21T17:45:49Z",
+  "update_available": "v1.4.2",
+
+  // Internal: set once the notification-access prompt has been shown. Leave as is.
+  "notif_prompted": false
+}

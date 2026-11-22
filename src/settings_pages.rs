@@ -777,7 +777,7 @@ fn about(ctx: &Ctx<'_>) -> Vec<Row> {
         header(tr("Dock", "Dock"), None),
         row(
             glyphs::info_shape,
-            &format!("mini-oled-dock {}", env!("CARGO_PKG_VERSION")),
+            &format!("mini-oled-dock {}", crate::preview::version_text()),
             Some(tr("Ops Software \u{b7} MIT licence", "Ops Software \u{b7} licenza MIT")),
             Control::Note,
         ),

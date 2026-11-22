@@ -1037,12 +1037,14 @@ mod tests {
         // Not read yet: one "loading" row each.
         assert_eq!(popup_height(&px, &l, false, c(2, None, None)) - base, 2 * (SEP + HEAD + ROW));
         // IDs do not collide at the maximum counts.
-        assert!(ID_HEAD + ITEMS <= ID_EYE);
-        assert!(ID_EYE + ITEMS <= ID_DEVICE);
-        assert!(ID_DEVICE + 99 < ID_SPATIAL);
-        assert!(ID_SPATIAL + 8 < ID_APP_MUTE);
-        assert!(ID_APP_MUTE + audio::MAX_SESSIONS as u32 <= ID_APP_SLIDER);
-        assert!(ID_APP_SLIDER + audio::MAX_SESSIONS as u32 <= ID_END);
+        const {
+            assert!(ID_HEAD + ITEMS <= ID_EYE);
+            assert!(ID_EYE + ITEMS <= ID_DEVICE);
+            assert!(ID_DEVICE + 99 < ID_SPATIAL);
+            assert!(ID_SPATIAL + 8 < ID_APP_MUTE);
+            assert!(ID_APP_MUTE + audio::MAX_SESSIONS as u32 <= ID_APP_SLIDER);
+            assert!(ID_APP_SLIDER + audio::MAX_SESSIONS as u32 <= ID_END);
+        }
         assert_eq!(split(ID_EYE + 3), Some((ID_EYE, 3)));
         assert_eq!(split(ID_EDIT), None);
     }
