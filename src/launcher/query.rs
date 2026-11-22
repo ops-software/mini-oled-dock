@@ -59,6 +59,16 @@ impl PrefixTable {
         PrefixTable(list)
     }
 
+    /// Whether `folded` (a folded word) is one of the prefixes, its closing space trimmed and folded: "file" for "file ".
+    /// An alias may not be one (`aliases::check_word`).
+    pub fn is_word_prefix(&self, folded: &str) -> bool {
+        self.0.iter().any(|(p, _)| {
+            let mut f = String::with_capacity(p.len());
+            rank::fold(p.trim(), &mut f);
+            f == folded
+        })
+    }
+
     /// The prefix at the start of `raw`, if any: its length in bytes, its provider and whether it is a word prefix. The longest
     /// wins; word prefixes match without regard to ASCII case.
     pub fn find(&self, raw: &str) -> Option<(usize, ProviderId, bool)> {

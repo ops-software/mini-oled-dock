@@ -22,6 +22,7 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
+use crate::launcher::aliases::AliasTable;
 use crate::launcher::arena::{self, Arena, Caps, CatalogView, Kind as ArenaKind, SettingIn};
 use crate::launcher::catalog::{self, IconCache};
 use crate::launcher::datetime::TimeStyle;
@@ -2461,9 +2462,22 @@ impl MonitorPick {
     }
 }
 
+/// `opts_from_config`, and how many entries of `launcher.aliases` the alias table ignores.
+pub(crate) fn opts_with_ignored(c: &LauncherConfig) -> (LauncherOpts, usize) {
+    let mut o = opts_from_config_without_aliases(c);
+    let (aliases, ignored) = AliasTable::build(&c.aliases, &o.prefixes);
+    o.aliases = aliases;
+    (o, ignored)
+}
+
 /// The session's options from `config.launcher` (pure). A provider the map does not name is on, and apps are always
 /// on; the web template is the engine's, or the custom one when it passes the validator (Google otherwise).
+#[cfg(test)]
 pub(crate) fn opts_from_config(c: &LauncherConfig) -> LauncherOpts {
+    opts_with_ignored(c).0
+}
+
+fn opts_from_config_without_aliases(c: &LauncherConfig) -> LauncherOpts {
     let mut mask = ProviderMask::all();
     for (name, on) in &c.providers {
         if let Some(id) = ProviderId::from_name(name) {
@@ -2481,6 +2495,7 @@ pub(crate) fn opts_from_config(c: &LauncherConfig) -> LauncherOpts {
         web: web.unwrap_or_else(Template::default),
         keep_query: c.keep_query,
         rows: c.rows.clamp(*style::ROWS_RANGE.start(), *style::ROWS_RANGE.end()),
+        aliases: Default::default(),
     }
 }
 
@@ -2681,9 +2696,14 @@ impl Ctrl {
         }
     }
 
-    /// `config.launcher` taken over (the chord is set): the next open uses it.
+    /// `config.launcher` taken over (the chord is set): the next open uses it. The alias table is built here, once per
+    /// config change, and the entries it ignores are counted in the log (never their words or targets).
     fn configure(&mut self, c: &LauncherConfig) {
-        self.opts = opts_from_config(c);
+        let (opts, ignored) = opts_with_ignored(c);
+        self.opts = opts;
+        if ignored > 0 {
+            log!("launcher.aliases: {n} entries ignored", n = ignored);
+        }
         if !self.opts.keep_query {
             self.last_query = None;
         }
@@ -4560,6 +4580,22 @@ mod tests {
         for raw in ["=1", ">ping", "<note", "??x", "$disp", ")now", ":reg", "file a", "FILE a", "plain"] {
             assert_eq!(d.prefixes.find(raw), s.prefixes.find(raw), "{raw}");
         }
+        // The aliases of live check V-12: four good, two the table ignores (a word with a space, a javascript: target).
+        let mut c = LauncherConfig::default();
+        for (w, t) in [
+            ("l2t", "https://example.com/"),
+            ("l2n", "notepad.exe"),
+            ("l2d", "C:\\Windows"),
+            ("l2c", "app:Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"),
+            ("bad word", "x"),
+            ("l2j", "javascript:x"),
+        ] {
+            c.aliases.insert(w.into(), t.into());
+        }
+        let (o, ignored) = super::opts_with_ignored(&c);
+        assert_eq!((o.aliases.len(), ignored), (4, 2));
+        assert!(o.aliases.find("l2d").is_some() && o.aliases.find("l2j").is_none());
+        assert_eq!(super::opts_from_config(&c), o);
         assert_eq!(MonitorPick::from_name("active"), MonitorPick::Active);
         assert_eq!(MonitorPick::from_name("primary"), MonitorPick::Primary);
         assert_eq!(MonitorPick::from_name("pointer"), MonitorPick::Pointer);

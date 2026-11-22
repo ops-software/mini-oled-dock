@@ -455,6 +455,10 @@ pub struct LauncherConfig {
     pub announce_selection: bool,
     pub providers: BTreeMap<String, bool>,
     pub prefixes: BTreeMap<String, String>,
+    /// Words that open something when typed alone (plan L2 D9): word to target. Kept as written, `sanitize` only caps
+    /// it; `launcher::aliases::AliasTable` ignores (and counts) the entries it refuses, so a save never deletes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
     /// "google", "bing", "duckduckgo" or "custom".
     pub web_engine: String,
     /// The search URL template of the "custom" engine, "" otherwise.
@@ -470,6 +474,9 @@ pub struct LauncherConfig {
 pub const LAUNCHER_TOP_PERCENT: (u8, u8, u8) = (10, 50, 24);
 pub const LAUNCHER_WIDTH: (u16, u16, u16) = (560, 880, 640);
 pub const LAUNCHER_ROWS: (u8, u8, u8) = (4, 12, 8);
+/// `launcher.aliases`: at most this many entries are kept, each word and target of at most `ALIAS_TEXT_CAP` characters.
+pub const ALIAS_ENTRIES_CAP: usize = 256;
+pub const ALIAS_TEXT_CAP: usize = 1_024;
 
 impl Default for LauncherConfig {
     fn default() -> Self {
@@ -494,6 +501,7 @@ impl Default for LauncherConfig {
                 m.insert(p.to_string(), n.to_string());
                 m
             }),
+            aliases: BTreeMap::new(),
             web_engine: "google".into(),
             web_url: String::new(),
             offer_done: false,
@@ -577,6 +585,17 @@ impl LauncherConfig {
         });
         if dropped {
             out.push("launcher.prefixes: invalid entries dropped".into());
+        }
+        // aliases: kept as written (the alias table ignores and counts what it refuses, plan L2 D9); only the hard caps,
+        // so a file that is far too large cannot make the table's build long. The message names no word and no target.
+        let before = self.aliases.len();
+        self.aliases.retain(|w, t| w.chars().count() <= ALIAS_TEXT_CAP && t.chars().count() <= ALIAS_TEXT_CAP);
+        if let Some(first_over) = self.aliases.keys().nth(ALIAS_ENTRIES_CAP).cloned() {
+            self.aliases.split_off(&first_over);
+        }
+        let over = before - self.aliases.len();
+        if over > 0 {
+            out.push(format!("launcher.aliases: {over} entries over a cap dropped"));
         }
         // web: a custom template must pass the validator, else Google
         fix_choice(&mut self.web_engine, &["google", "bing", "duckduckgo", "custom"], "google", "web_engine", &mut out);
@@ -1224,6 +1243,8 @@ fn render(c: &Config) -> String {
     "providers": {l_providers},
     // Text that starts a query for one source, 1-5 characters (a word ends with a space), e.g. "= 2+2".
     "prefixes": {l_prefixes},
+    // Words that open something when typed alone in Mixed mode: "word": "app:<id>", an http(s) address, "ms-settings:...", a path or a command line (at most 64).
+    "aliases": {l_aliases},
     // Web search: "google", "bing", "duckduckgo" or "custom" (then "web_url" is an https:// address with {{q}}).
     "web_engine": {l_web_engine},
     "web_url": {l_web_url},
@@ -1295,6 +1316,7 @@ fn render(c: &Config) -> String {
         l_announce = c.launcher.announce_selection,
         l_providers = js_block(&c.launcher.providers).replace("\n", "\n  "),
         l_prefixes = js_block(&c.launcher.prefixes).replace("\n", "\n  "),
+        l_aliases = js_block(&c.launcher.aliases).replace("\n", "\n  "),
         l_web_engine = js(&c.launcher.web_engine),
         l_web_url = js(&c.launcher.web_url),
         l_offer_done = c.launcher.offer_done,
@@ -1932,6 +1954,56 @@ mod tests {
         }
         let (l, _) = sane(|l| l.web_engine = "yahoo".into());
         assert_eq!(l.web_engine, "google");
+    }
+
+    #[test]
+    fn launcher_aliases_kept_as_written() {
+        // What the alias table refuses stays in the file: a custom scheme, a word with a space, a 17-character word.
+        let c = parse(
+            r#"{"launcher": {"aliases": {"game": "steam://run/1", "bad word": "x", "seventeen-chars-x": "calc",
+            "docs": "https://example.com/docs"}}}"#,
+        )
+        .unwrap();
+        let words: Vec<&str> = c.launcher.aliases.keys().map(String::as_str).collect();
+        assert_eq!(words, ["bad word", "docs", "game", "seventeen-chars-x"]);
+        assert_eq!(c.launcher.aliases.get("game").map(String::as_str), Some("steam://run/1"));
+        // Hard caps only: at most 256 entries, a word and a target of at most 1,024 characters each; one message.
+        let (l, m) = sane(|l| {
+            for i in 0..257 {
+                l.aliases.insert(format!("w{i:03}"), "calc".into());
+            }
+            l.aliases.insert("long".into(), "x".repeat(1_025));
+            l.aliases.insert("y".repeat(1_025), "calc".into());
+            l.aliases.insert("edge".into(), "x".repeat(1_024));
+        });
+        assert_eq!(l.aliases.len(), 256);
+        assert!(!l.aliases.contains_key("long") && !l.aliases.keys().any(|k| k.len() > 1_024));
+        let capped: Vec<&String> = m.iter().filter(|s| s.starts_with("launcher.aliases")).collect();
+        assert_eq!(capped, ["launcher.aliases: 4 entries over a cap dropped"], "{m:?}");
+        assert!(m.iter().all(|s| !s.contains("calc") && !s.contains('w')), "no word or target in the log: {m:?}");
+        let (l, m) = sane(|l| {
+            l.aliases.insert("gh".into(), "https://example.com/".into());
+        });
+        assert!(m.is_empty() && l.aliases.len() == 1, "{m:?}");
+    }
+
+    #[test]
+    fn aliases_survive_render() {
+        let mut c = Config::default();
+        assert!(render(&c).contains("\"aliases\": {}"), "written always, {{}} when empty");
+        for (w, t) in [
+            ("docs", "https://example.com/docs"),
+            ("game", "steam://run/1"),
+            ("bad word", "x"),
+            ("win", "C:\\Windows"),
+            ("q", "\"C:\\Program Files\\Example\\tool.exe\" --a \"b c\""),
+            ("u", "ünïcødé → ok"),
+        ] {
+            c.launcher.aliases.insert(w.into(), t.into());
+        }
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c, "every entry, those the table refuses included");
+        assert_eq!(render(&parse(&r).unwrap()), r);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! query together with the result rows) and the providers themselves, run by `query_all` in the order of 5.4.1.
 //! Nothing here reads a file, the registry or the network; time is only counted (`Budget`), never asserted.
 
+use super::aliases::AliasTable;
 use super::arena::CatalogView;
 use super::commands::{self, Command, COMMANDS};
 use super::datetime::{self, TimeStyle};
@@ -33,6 +34,8 @@ pub struct LauncherOpts {
     pub keep_query: bool,
     /// Visible rows (4-12).
     pub rows: u8,
+    /// The user's aliases (plan L2 D9), built once per config change.
+    pub aliases: AliasTable,
 }
 
 impl Default for LauncherOpts {
@@ -44,6 +47,7 @@ impl Default for LauncherOpts {
             web: Template::default(),
             keep_query: false,
             rows: style::ROWS_DEFAULT,
+            aliases: AliasTable::default(),
         }
     }
 }

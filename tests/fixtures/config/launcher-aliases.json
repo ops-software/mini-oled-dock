@@ -1,0 +1,21 @@
+// mini-oled-dock configuration
+// Launcher aliases (plan L2 D9): invented words. Every entry stays in the snapshot, those the alias table ignores
+// included (a custom scheme, a word with a space, a 17-character word, a javascript: target).
+{
+  "language": "en",
+  "launcher": {
+    "chord": "alt+space",
+    "aliases": {
+      "docs": "https://example.com/docs",
+      "calc2": "app:Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+      "win": "C:\\Windows",
+      "np": "notepad.exe",
+      "disp": "ms-settings:display",
+      "tool": "\"C:\\Program Files\\Example\\tool.exe\" --quiet",
+      "game": "steam://run/1",
+      "bad word": "x",
+      "seventeen-chars-x": "calc",
+      "js": "javascript:alert(1)"
+    }
+  }
+}
