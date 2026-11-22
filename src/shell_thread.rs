@@ -1783,12 +1783,11 @@ impl IconReader {
 }
 
 /// `--start-icons <px>`, in the child a job starts: all of stdin is read first (`read_icon_ids`; the dock's writer and
-/// this reader never wait on each other), then the header and one frame per id in input order, each written and flushed
-/// at once, the pixels from `start_icon`, so identical to the ones the dock made in-process. It touches no data folder,
-/// logger, mutex or console and writes nothing but stdout. Exit 0 = every frame written; 1 = COM failed, or a write
-/// failed (the dock went away or stopped the job): it exits at once.
+/// this reader never wait on each other), then `write_icon_frames` with the pixels of `start_icon`, so identical to the
+/// ones the dock made in-process. It touches no data folder, logger, mutex or console and writes nothing but stdout.
+/// Exit 0 = every frame written; 1 = COM failed, or a write failed (the dock went away or stopped the job): it exits at
+/// once.
 pub fn run_icons_child(px: u32) -> i32 {
-    use std::io::Write;
     let ids = read_icon_ids(&mut std::io::stdin().lock());
     // SAFETY: the first COM call of this thread (the child's main thread); paired with CoUninitialize below.
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -1796,18 +1795,35 @@ pub fn run_icons_child(px: u32) -> i32 {
         return 1;
     }
     let mut out = std::io::BufWriter::with_capacity(ICON_IO_BUF, std::io::stdout().lock());
+    let code = write_icon_frames(&ids, px, &mut out, start_icon);
+    if code == 0 {
+        // SAFETY: paired with the successful CoInitializeEx above; every icon released its COM objects.
+        unsafe { CoUninitialize() };
+    }
+    code
+}
+
+/// What an icons child given `ids` at `px` writes to `out`: the header, then one frame per id in input order, each
+/// written and flushed at once. A frame carries `make`'s bitmap only when it is exactly `px` x `px`; otherwise, and
+/// for a line the child could not read (`None`, never given to `make`), it is the 0 x 0 frame. 0 = every frame
+/// written; 1 at the first write or flush that fails, after which nothing more is made or written.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn write_icon_frames(
+    ids: &[Option<String>],
+    px: u32,
+    out: &mut impl std::io::Write,
+    mut make: impl FnMut(&str, u32) -> Option<IconBitmap>,
+) -> i32 {
     if out.write_all(ICONS_HEADER).and_then(|()| out.flush()).is_err() {
         return 1;
     }
     for (i, id) in ids.iter().enumerate() {
-        let icon = id.as_deref().and_then(|id| start_icon(id, px)).filter(|b| b.width == px && b.height == px);
+        let icon = id.as_deref().and_then(|id| make(id, px)).filter(|b| b.width == px && b.height == px);
         let frame = encode_icon_frame(u32::try_from(i).unwrap_or(u32::MAX), icon.as_ref());
         if out.write_all(&frame).and_then(|()| out.flush()).is_err() {
             return 1;
         }
     }
-    // SAFETY: paired with the successful CoInitializeEx above; every icon released its COM objects.
-    unsafe { CoUninitialize() };
     0
 }
 
@@ -3925,6 +3941,112 @@ mod tests {
         let mut big = b"first\n".to_vec();
         big.resize(3 * 1024 * 1024, b'q');
         assert_eq!(read(&big), [Some("first".to_string())]);
+    }
+
+    /// A sink that takes `cap` bytes, then fails; it keeps what it took, the length at each flush and the calls made
+    /// after its first failure.
+    struct CutWriter {
+        cap: usize,
+        got: Vec<u8>,
+        flushed: Vec<usize>,
+        failed: bool,
+        after: usize,
+    }
+
+    impl CutWriter {
+        fn new(cap: usize) -> Self {
+            CutWriter { cap, got: Vec::new(), flushed: Vec::new(), failed: false, after: 0 }
+        }
+    }
+
+    impl std::io::Write for CutWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.failed {
+                self.after += 1;
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let k = buf.len().min(self.cap - self.got.len());
+            if k == 0 && !buf.is_empty() {
+                self.failed = true;
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.got.extend_from_slice(&buf[..k]);
+            Ok(k)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.failed {
+                self.after += 1;
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.flushed.push(self.got.len());
+            Ok(())
+        }
+    }
+
+    /// The icon a fake extraction makes at `px`: "a" a `px` x `px` bitmap, "c" one of the wrong size, others none.
+    fn fake_icon(id: &str, px: u32) -> Option<IconBitmap> {
+        let side = match id {
+            "a" => px,
+            "c" => px + 1,
+            _ => return None,
+        };
+        Some(IconBitmap { width: side, height: side, pixels: (0..side * side).map(|i| 0xFF00_0000 | i).collect() })
+    }
+
+    #[test]
+    fn icons_child_writes_what_the_dock_reads() {
+        let px = 9u32;
+        let ids = [Some("a".to_string()), None, Some("b".into()), Some("c".into())];
+        let mut made = Vec::new();
+        let mut w = CutWriter::new(usize::MAX);
+        let code = write_icon_frames(&ids, px, &mut w, |id, size| {
+            made.push(id.to_string());
+            fake_icon(id, size)
+        });
+        assert_eq!(code, 0);
+        assert_eq!(made, ["a", "b", "c"], "no extraction for a line the child could not read");
+        // The header, then one frame per id in input order: a wrong size goes as no icon.
+        let frames = [
+            encode_icon_frame(0, fake_icon("a", px).as_ref()),
+            encode_icon_frame(1, None),
+            encode_icon_frame(2, None),
+            encode_icon_frame(3, None),
+        ];
+        let whole = [&[ICONS_HEADER.to_vec()][..], &frames[..]].concat().concat();
+        assert_eq!(w.got, whole);
+        // Flushed after the header and after every frame.
+        let mut ends = vec![ICONS_HEADER.len()];
+        for f in &frames {
+            ends.push(ends[ends.len() - 1] + f.len());
+        }
+        assert_eq!(w.flushed, ends);
+        // The dock's reader takes it back to the same frames.
+        let mut r = &w.got[..];
+        read_icon_header(&mut r).unwrap();
+        let mut back = Vec::new();
+        let mut prev = None;
+        while let Some((i, icon)) = read_icon_frame(&mut r, ids.len(), px, prev).unwrap() {
+            prev = Some(i);
+            back.push((i, icon));
+        }
+        assert_eq!(back, [(0, fake_icon("a", px)), (1, None), (2, None), (3, None)]);
+        // A write that fails at byte k: exit 1 at once, nothing made or written after it.
+        let starts = &ends[..ends.len() - 1];
+        let k_frame0 = ends[0] + ICON_FRAME_HEAD + 5;
+        for k in [0, 1, ICONS_HEADER.len() - 1, ends[0], k_frame0, ends[1], ends[2] + 3, whole.len() - 1] {
+            let mut w = CutWriter::new(k);
+            let mut calls = 0;
+            let code = write_icon_frames(&ids, px, &mut w, |id, size| {
+                calls += 1;
+                fake_icon(id, size)
+            });
+            assert_eq!(code, 1, "cut at {k}");
+            assert_eq!(w.got, whole[..k], "cut at {k}");
+            assert_eq!(w.after, 0, "cut at {k}: a write after the error");
+            let begun = starts.iter().zip(&ids).filter(|(s, id)| **s <= k && id.is_some()).count();
+            assert_eq!(calls, begun, "cut at {k}: an extraction after the error");
+        }
     }
 
     /// A job's reader feeds the ids to a real child, decodes its output from the pipe and delivers Start's icons in
