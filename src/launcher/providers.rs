@@ -15,7 +15,7 @@ use super::rank::{self, Cand, Indexed};
 use super::runline::{self, Known, Source};
 use super::strings;
 use super::style;
-use super::verbs::verbs_for;
+use super::verbs::{verbs_for, verbs_for_file};
 use super::web::{self, Template};
 use crate::start_search::Keys;
 use core::cmp::{Ordering, Reverse};
@@ -310,6 +310,11 @@ fn chars_u16(s: &str) -> u16 {
 
 fn verbs(kind: Kind, running: bool, class: Option<FileClass>) -> VerbSet {
     verbs_for(kind, running, class, MOTW_PROMPT_CONFIRMED, GESTURE_TIME_MATCHES)
+}
+
+/// A file row's verbs: Run as administrator only where the session can run its path elevated.
+fn file_verbs(path: &str, class: FileClass) -> VerbSet {
+    verbs_for_file(path, class, MOTW_PROMPT_CONFIRMED, GESTURE_TIME_MATCHES)
 }
 
 // ---- calculator
@@ -680,7 +685,7 @@ fn run(q: &Query, cx: &Context, top: &mut TopK) {
                 detail: None,
                 icon: IconRef::Glyph(glyph),
                 score,
-                verbs: verbs(kind, false, Some(class)),
+                verbs: if dir { verbs(kind, false, Some(class)) } else { file_verbs(text, class) },
                 payload: Payload::Path { path: text.into(), dir, class },
                 destructive: false,
             });
@@ -1012,6 +1017,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn file_row(name: &str, class: FileClass) -> Item {
+        let path = format!("c:\\x\\{name}");
         Item {
             key: ItemKey::of(ProviderId::Files, name),
             from: ProviderId::Files,
@@ -1020,8 +1026,8 @@ pub(crate) mod tests {
             detail: None,
             icon: IconRef::Glyph(GlyphId::Document),
             score: PINNED,
-            verbs: verbs(Kind::File, false, Some(class)),
-            payload: Payload::Path { path: format!("c:\\x\\{name}").into(), dir: false, class },
+            verbs: file_verbs(&path, class),
+            payload: Payload::Path { path: path.into(), dir: false, class },
             destructive: false,
         }
     }

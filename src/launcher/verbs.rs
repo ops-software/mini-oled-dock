@@ -1,5 +1,6 @@
 //! The eight verbs (5.2.8), their chords and the table of which verbs a row offers.
 
+use super::gesture;
 use super::model::{FileClass, GlyphId, KeyChord, Kind, Mods, Tag, Verb, VerbSet, VerbSpec};
 use super::strings;
 
@@ -127,6 +128,18 @@ pub fn verbs_for(kind: Kind, running: bool, class: Option<FileClass>, motw_ok: b
     s
 }
 
+/// The verbs of a file row at `path`: `verbs_for`'s, with Run as administrator only on a path the session can run
+/// elevated (`gesture::elevated_file_line`: exe, msi, bat and cmd, 5.2.8), so the offer, the review and the action use
+/// one filter.
+pub fn verbs_for_file(path: &str, class: FileClass, motw_ok: bool, admin_ok: bool) -> VerbSet {
+    let s = verbs_for(Kind::File, false, Some(class), motw_ok, admin_ok);
+    if s.has(Verb::RunAsAdmin) && gesture::elevated_file_line(path).is_none() {
+        s.without(Verb::RunAsAdmin)
+    } else {
+        s
+    }
+}
+
 /// What Enter does on a row.
 pub fn primary(kind: Kind, running: bool) -> Verb {
     match kind {
@@ -198,6 +211,19 @@ mod tests {
         assert_eq!(v(Kind::File, false, exe, true, true), set(&[Open, Reveal, Copy, RunAsAdmin]));
         assert_eq!(v(Kind::File, false, exe, true, false), set(&[Open, Reveal, Copy]));
         assert_eq!(v(Kind::File, false, exe, false, true), set(&[Reveal, Copy]));
+        // A file row at a path: Run as administrator only on exe, msi, bat and cmd with no quote in the path.
+        let at = |p: &str| verbs_for_file(p, FileClass::Executable, true, true);
+        for p in ["c:\\x\\a.exe", "c:\\x\\a.MSI", "c:\\x\\a.bat", "c:\\x\\a.cmd", "\\\\srv\\s\\a.exe"] {
+            assert_eq!(at(p), set(&[Open, Reveal, Copy, RunAsAdmin]), "{p}");
+        }
+        for p in ["c:\\x\\a.ps1", "c:\\x\\a.vbs", "c:\\x\\a.js", "c:\\x\\a.scr", "c:\\x\\a.lnk", "c:\\x\\a.url"] {
+            assert_eq!(at(p), set(&[Open, Reveal, Copy]), "{p}");
+        }
+        for p in ["c:\\x\\a.com", "c:\\x\\a.appref-ms", "c:\\x\\a\".exe", "c:\\x\\exe"] {
+            assert_eq!(at(p), set(&[Open, Reveal, Copy]), "{p}");
+        }
+        assert_eq!(verbs_for_file("c:\\x\\a.exe", FileClass::Executable, false, true), set(&[Reveal, Copy]));
+        assert_eq!(verbs_for_file("c:\\x\\a.exe", FileClass::Executable, true, false), set(&[Open, Reveal, Copy]));
         // File document, folder, web, notice.
         assert_eq!(v(Kind::File, false, Some(FileClass::Document), false, true), set(&[Open, Reveal, Copy]));
         assert_eq!(v(Kind::Folder, false, None, false, true), set(&[Open, Reveal, Copy]));

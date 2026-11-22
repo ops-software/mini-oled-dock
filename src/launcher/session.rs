@@ -722,7 +722,7 @@ impl Session {
                 }
                 _ => Vec::new(),
             },
-            (Kind::File, Payload::Path { path, .. }) => match (gesture, elevated_file_line(path)) {
+            (Kind::File, Payload::Path { path, .. }) => match (gesture, gesture::elevated_file_line(path)) {
                 (Some(gesture), Some(line)) if self.review_of(item) == Some(Ok(())) => {
                     launch(LaunchReq::RunAsTyped { line, gesture })
                 }
@@ -791,33 +791,21 @@ impl Session {
     }
 }
 
-/// The text a row shows whole before Run as administrator (5.3 review detail): a typed run line, or an executable
-/// file's path, and only on a row that offers the verb.
+/// The text a row shows whole before Run as administrator (5.3 review detail): a typed run line, or the path of a file
+/// that `run_as_admin` would run (`gesture::elevated_file_line`), and only on a row that offers the verb.
 fn review_text(item: &Item) -> Option<&str> {
     if !item.verbs.has(Verb::RunAsAdmin) {
         return None;
     }
     match (&item.kind, &item.payload) {
         (Kind::RunLine, Payload::RunLine(r)) => Some(&r.line),
-        (Kind::File, Payload::Path { path, dir: false, class: FileClass::Executable }) => Some(path),
+        (Kind::File, Payload::Path { path, dir: false, class: FileClass::Executable })
+            if gesture::elevated_file_line(path).is_some() =>
+        {
+            Some(path)
+        }
         _ => None,
     }
-}
-
-/// The line that runs a file as administrator: its path quoted, the file part inside the quotes. Only exe, msi, bat
-/// and cmd files (5.4.9 file rows), never a path with a quote in it.
-fn elevated_file_line(path: &str) -> Option<RunLine> {
-    const ELEVATABLE: [&str; 4] = ["exe", "msi", "bat", "cmd"];
-    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    let (_, ext) = name.rsplit_once('.')?;
-    if !ELEVATABLE.iter().any(|e| e.eq_ignore_ascii_case(ext)) || path.contains('"') {
-        return None;
-    }
-    let mut quoted = String::with_capacity(path.len() + 2);
-    quoted.push('"');
-    quoted.push_str(path);
-    quoted.push('"');
-    runline::classify(&quoted).filter(|r| r.line.get(r.file.clone()) == Some(path))
 }
 
 /// What a command row runs: power commands after the hide, the window menu after the restore.
@@ -1315,7 +1303,7 @@ mod tests {
         let exe = |path: &str| {
             let mut it = crate::launcher::providers::tests::file_row("setup.exe", FileClass::Executable);
             it.key = ItemKey::of(ProviderId::Files, path);
-            it.verbs = verbs::verbs_for(Kind::File, false, Some(FileClass::Executable), true, true);
+            it.verbs = verbs::verbs_for_file(path, FileClass::Executable, true, true);
             it.payload = Payload::Path { path: path.into(), dir: false, class: FileClass::Executable };
             it
         };
@@ -1343,8 +1331,15 @@ mod tests {
             assert_eq!(s.admin_refusal(), Some(Refusal::Unc), "{p}");
             assert!(cse(&mut s, Some(Gesture::for_test(10))).is_empty(), "{p}");
         }
+        // A script is not offered at all: nothing to review, nothing refused, nothing run.
         pick(&mut s, paths[3]);
-        assert!(cse(&mut s, Some(Gesture::for_test(11))).is_empty(), "only exe, msi, bat and cmd");
+        assert!(!s.selected().unwrap().verbs.has(Verb::RunAsAdmin), "only exe, msi, bat and cmd");
+        assert_eq!((s.review_text(), s.admin_refusal()), (None, None));
+        assert!(cse(&mut s, Some(Gesture::for_test(11))).is_empty());
+        // The review uses the action's filter, even on a row that claims the verb.
+        let mut forced = exe(paths[3]);
+        forced.verbs = verbs::verbs_for(Kind::File, false, Some(FileClass::Executable), true, true);
+        assert_eq!(review_text(&forced), None);
     }
 
     #[test]

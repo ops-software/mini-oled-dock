@@ -4,7 +4,8 @@
 //! conditions (`review_ok`) on the typed line or the file path before it asks for the elevated launch.
 
 use super::field::KeyEvent;
-use super::model::Mods;
+use super::model::{Mods, RunLine};
+use super::runline;
 use super::strings;
 
 const VK_RETURN: u16 = 0x0D;
@@ -95,6 +96,23 @@ pub fn review_ok(text: &str, lines_needed: u8) -> Result<(), Refusal> {
         return Err(Refusal::TooLong);
     }
     Ok(())
+}
+
+/// The line that runs a file as administrator: its path quoted, the file part inside the quotes. Only exe, msi, bat
+/// and cmd files (5.2.8, 5.4.9 file rows), never a path with a quote in it. The one filter of file rows: a row offers
+/// Run as administrator (`verbs::verbs_for_file`), shows its review and runs elevated only where this is Some.
+pub fn elevated_file_line(path: &str) -> Option<RunLine> {
+    const ELEVATABLE: [&str; 4] = ["exe", "msi", "bat", "cmd"];
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let (_, ext) = name.rsplit_once('.')?;
+    if !ELEVATABLE.iter().any(|e| e.eq_ignore_ascii_case(ext)) || path.contains('"') {
+        return None;
+    }
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    quoted.push_str(path);
+    quoted.push('"');
+    runline::classify(&quoted).filter(|r| r.line.get(r.file.clone()) == Some(path))
 }
 
 #[cfg(test)]
