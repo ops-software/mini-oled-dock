@@ -639,6 +639,187 @@ fn launcher_timers_live_on_the_dock_window() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- lint 10: the host's own closes spare the launcher -------------------------------------------------------------
+
+/// The closes ui.rs applies when the bar hides or moves: each goes through `close_unless_launcher` (SPEC 5.2.1).
+const HOST_CLOSES: [&str; 3] = ["bar moved to the pointer display", "bar hidden (with Start)", "dock hidden"];
+
+fn host_close_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != "src/ui.rs" {
+        return v;
+    }
+    let code = text.get(..test_start(text)).unwrap_or(text);
+    for reason in HOST_CLOSES {
+        let spared = format!("close_unless_launcher(\"{reason}\")");
+        let plain = format!("close(\"{reason}\")");
+        let mut found = false;
+        for (i, l) in code.lines().enumerate().filter(|(_, l)| !l.trim_start().starts_with("//")) {
+            found |= l.contains(&spared);
+            if l.contains(&plain) {
+                v.push(format!("{path}:{}: {plain} closes the launcher too", i + 1));
+            }
+        }
+        if !found {
+            v.push(format!("{path}: no {spared}"));
+        }
+    }
+    v
+}
+
+#[test]
+fn host_closes_spare_the_launcher() {
+    let p = "src/ui.rs";
+    let good = "fn a() {\n    popup::close_unless_launcher(\"bar moved to the pointer display\");\n}\n\
+                fn b() {\n    popup::close_unless_launcher(\"bar hidden (with Start)\");\n}\n\
+                fn c() {\n    crate::popup::close_unless_launcher(\"dock hidden\");\n}\n";
+    assert!(host_close_violations(p, good).is_empty());
+    // 1.4.3's call: the bar's hide would close the launcher.
+    let reverted = good.replace("popup::close_unless_launcher(\"dock hidden\")", "popup::close(\"dock hidden\")");
+    assert_eq!(
+        host_close_violations(p, &reverted),
+        [
+            "src/ui.rs:8: close(\"dock hidden\") closes the launcher too",
+            "src/ui.rs: no close_unless_launcher(\"dock hidden\")"
+        ]
+    );
+    let extra = format!("{good}fn d() {{\n    popup::close(\"bar hidden (with Start)\");\n}}\n");
+    assert_eq!(
+        host_close_violations(p, &extra),
+        ["src/ui.rs:11: close(\"bar hidden (with Start)\") closes the launcher too"]
+    );
+    let commented =
+        good.replace("    popup::close_unless_launcher(\"bar moved", "    // popup::close_unless_launcher(\"bar moved");
+    assert_eq!(host_close_violations(p, &commented).len(), 1, "a comment does not count");
+    let in_tests =
+        format!("{good}#[cfg(test)]\nmod t {{\n    fn f() {{\n        popup::close(\"dock hidden\");\n    }}\n}}\n");
+    assert!(host_close_violations(p, &in_tests).is_empty(), "test code is not the host");
+    assert_eq!(host_close_violations(p, "fn f() {}").len(), 3, "a ui.rs without them fails");
+    assert!(host_close_violations("src/popup.rs", &reverted).is_empty());
+    let all = scan_tree(host_close_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+// ---- lint 11: the launcher opens at full alpha ---------------------------------------------------------------------
+
+/// Inside `fn open(` of src/popup.rs: the opening alpha and the fade timer follow `initial_alpha` (the launcher's field
+/// is there at once, every other kind fades in).
+const OPEN_ALPHA: [&str; 2] =
+    ["alpha: initial_alpha(kind),", "initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM,"];
+const FADE_TIMER: &str = "SetTimer(Some(hwnd), TIMER_POPUP_ANIM,";
+
+fn open_alpha_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != "src/popup.rs" {
+        return v;
+    }
+    let Some((s, e)) = fn_body(text, "fn open(", 0) else {
+        v.push(format!("{path}: fn open( not found"));
+        return v;
+    };
+    let body = code_of(text.get(s..e).unwrap_or(""));
+    let line = line_of(text, s);
+    for want in OPEN_ALPHA {
+        if !body.contains(want) {
+            v.push(format!("{path}:{line}: fn open without {want}"));
+        }
+    }
+    // A second, unguarded fade would start the launcher transparent.
+    if body.matches(FADE_TIMER).count() > body.matches(OPEN_ALPHA[1]).count() {
+        v.push(format!("{path}:{line}: fn open arms TIMER_POPUP_ANIM without initial_alpha(kind) < 255"));
+    }
+    v
+}
+
+#[test]
+fn the_launcher_opens_at_full_alpha() {
+    let p = "src/popup.rs";
+    let good = "fn open(kind: K) {\n    let o = Open {\n        alpha: initial_alpha(kind),\n    };\n    unsafe {\n\
+                if initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {\n\
+                log();\n        }\n    }\n}\n";
+    assert!(open_alpha_violations(p, good).is_empty());
+    // 1.4.3's open: alpha 0 and an unconditional fade.
+    let old = good.replace("alpha: initial_alpha(kind),", "alpha: 0,").replace("initial_alpha(kind) < 255 && ", "");
+    assert_eq!(
+        open_alpha_violations(p, &old),
+        [
+            "src/popup.rs:1: fn open without alpha: initial_alpha(kind),",
+            "src/popup.rs:1: fn open without initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM,",
+            "src/popup.rs:1: fn open arms TIMER_POPUP_ANIM without initial_alpha(kind) < 255",
+        ]
+    );
+    let twice = good.replace(
+        "    unsafe {\n",
+        "    unsafe {\n        SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None);\n",
+    );
+    assert_eq!(open_alpha_violations(p, &twice).len(), 1, "a second, unguarded fade");
+    let commented = good
+        .replace("        alpha: initial_alpha(kind),", "        // alpha: initial_alpha(kind),\n        alpha: 0,");
+    assert_eq!(open_alpha_violations(p, &commented).len(), 1, "a comment does not count");
+    assert_eq!(open_alpha_violations(p, "fn close() {}"), ["src/popup.rs: fn open( not found"]);
+    assert!(open_alpha_violations("src/ui.rs", &old).is_empty());
+    let all = scan_tree(open_alpha_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+// ---- lint 12: the system keys are routed in one place ------------------------------------------------------------
+
+/// The first statement of two functions of src/popup.rs: `wnd_proc` hands every message to `sys_key_msg` before its own
+/// arms, and `sys_key_msg` asks `route` (the one list of the routed messages) with no filter of its own.
+const ROUTED_FIRST: [(&str, &str); 2] = [
+    ("fn wnd_proc(", "if let Some(r) = sys_key_msg(hwnd, msg, wp, lp) {"),
+    ("fn sys_key_msg(", "match route(msg, wp.0, open_wants_sys_keys) {"),
+];
+
+fn routing_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != "src/popup.rs" {
+        return v;
+    }
+    for (sig, first) in ROUTED_FIRST {
+        let Some((s, e)) = fn_body(text, sig, 0) else {
+            v.push(format!("{path}: {sig} not found"));
+            continue;
+        };
+        let body = text.get(s..e).unwrap_or("");
+        let stmt = body.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//")).unwrap_or("");
+        if stmt != first {
+            v.push(format!("{path}:{}: {sig} must start with {first}", line_of(text, s)));
+        }
+    }
+    v
+}
+
+#[test]
+fn system_keys_are_routed_in_one_place() {
+    let p = "src/popup.rs";
+    let good = "fn sys_key_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {\n\
+                match route(msg, wp.0, open_wants_sys_keys) {\n        Route::Default => None,\n    }\n}\n\
+                extern \"system\" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {\n\
+                // the launcher first\n    if let Some(r) = sys_key_msg(hwnd, msg, wp, lp) {\n\
+                return r;\n    }\n    match msg {\n        _ => DefWindowProcW(hwnd, msg, wp, lp),\n    }\n}\n";
+    assert!(routing_violations(p, good).is_empty());
+    // A second list of the messages: dropping WM_CLOSE from it would let DefWindowProc destroy the window.
+    let filtered = good.replace(
+        "{\nmatch route(",
+        "{\n    if !matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) {\n        return None;\n    }\nmatch route(",
+    );
+    assert_eq!(
+        routing_violations(p, &filtered),
+        ["src/popup.rs:1: fn sys_key_msg( must start with match route(msg, wp.0, open_wants_sys_keys) {"]
+    );
+    // An arm ahead of the launcher's routing: WM_CLOSE would reach it first.
+    let ahead = good.replace(
+        "    if let Some(r) = sys_key_msg",
+        "    if msg == WM_CLOSE {\n        return LRESULT(0);\n    }\n    if let Some(r) = sys_key_msg",
+    );
+    assert_eq!(routing_violations(p, &ahead).len(), 1);
+    assert_eq!(routing_violations(p, "fn open() {}").len(), 2, "a popup.rs without them fails");
+    assert!(routing_violations("src/ui.rs", &ahead).is_empty());
+    let all = scan_tree(routing_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {

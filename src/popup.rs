@@ -1324,12 +1324,10 @@ enum Route {
     Default,
 }
 
-/// How `msg` is handled: `wants_sys` is the open content's `wants_sys_keys`; false gives `Default` for everything.
-fn route(msg: u32, wp: usize, wants_sys: bool) -> Route {
-    if !wants_sys {
-        return Route::Default;
-    }
-    match msg {
+/// How `msg` is handled: the one list of the routed messages (lint 12). `wants_sys` reads the open content's
+/// `wants_sys_keys`, asked only for a listed message (every other one costs no state borrow); false gives `Default`.
+fn route(msg: u32, wp: usize, wants_sys: impl FnOnce() -> bool) -> Route {
+    let r = match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN => Route::ToContent,
         WM_SYSCHAR => Route::Char,
         WM_SYSKEYUP if wp == usize::from(VK_MENU.0) => Route::Consume,
@@ -1341,6 +1339,11 @@ fn route(msg: u32, wp: usize, wants_sys: bool) -> Route {
         },
         WM_CLOSE => Route::CloseRequest,
         _ => Route::Default,
+    };
+    if r != Route::Default && wants_sys() {
+        r
+    } else {
+        Route::Default
     }
 }
 
@@ -1414,10 +1417,7 @@ fn open_wants_sys_keys() -> bool {
 
 /// The keyboard and close messages while the open content `wants_sys_keys` (`route`); None = the usual arm.
 fn sys_key_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-    if !matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN | WM_SYSCHAR | WM_SYSKEYUP | WM_SYSCOMMAND | WM_CLOSE) {
-        return None;
-    }
-    match route(msg, wp.0, open_wants_sys_keys()) {
+    match route(msg, wp.0, open_wants_sys_keys) {
         Route::Default => None,
         Route::ToContent => {
             #[cfg(feature = "owner-probe")]
@@ -2139,9 +2139,21 @@ mod tests {
             (WM_KEYUP, 0x41, Route::Default),
         ];
         for (msg, wp, want) in cases {
-            assert_eq!(route(msg, wp, true), want, "launcher: msg {msg:#x} wp {wp:#x}");
-            assert_eq!(route(msg, wp, false), Route::Default, "other kinds: msg {msg:#x} wp {wp:#x}");
+            assert_eq!(route(msg, wp, || true), want, "launcher: msg {msg:#x} wp {wp:#x}");
+            assert_eq!(route(msg, wp, || false), Route::Default, "other kinds: msg {msg:#x} wp {wp:#x}");
         }
+        // The open content is asked only for a routed message: every other one costs no state borrow.
+        let asked = Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        for (msg, wp) in [(WM_MOUSEMOVE, 0), (WM_TIMER, 30), (WM_CHAR, 0x61), (WM_KEYUP, 0x41), (WM_SYSKEYUP, 0x41)] {
+            assert_eq!(route(msg, wp, ask), Route::Default, "msg {msg:#x}");
+        }
+        assert_eq!(asked.get(), 0);
+        assert_eq!(route(WM_CLOSE, 0, ask), Route::CloseRequest);
+        assert_eq!(asked.get(), 1);
         // The KeyEvent of a key message: lParam bit 30 is the auto-repeat, WM_SYSKEYDOWN is a system key.
         let ev = key_event(WM_SYSKEYDOWN, 0x46, 1 << 30, Mods::ALT);
         assert_eq!(ev, KeyEvent { vk: 0x46, mods: Mods::ALT, repeat: true, sys: true });
@@ -2159,15 +2171,15 @@ mod tests {
 
     #[test]
     fn alt_f4_and_wm_close_are_close_requests() {
-        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, true), Route::CloseRequest);
+        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, || true), Route::CloseRequest);
         assert_eq!(
-            route(WM_SYSCOMMAND, SC_CLOSE as usize | 0x2, true),
+            route(WM_SYSCOMMAND, SC_CLOSE as usize | 0x2, || true),
             Route::CloseRequest,
             "low 4 bits are the system's"
         );
-        assert_eq!(route(WM_CLOSE, 0, true), Route::CloseRequest);
-        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, false), Route::Default, "other kinds: as today");
-        assert_eq!(route(WM_CLOSE, 0, false), Route::Default);
+        assert_eq!(route(WM_CLOSE, 0, || true), Route::CloseRequest);
+        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, || false), Route::Default, "other kinds: as today");
+        assert_eq!(route(WM_CLOSE, 0, || false), Route::Default);
         // The stub launcher closes like the final Esc (L1a-15 hands it to the session); the default is a close.
         assert_eq!(popup_launcher::new().close_request(), Reply::Close);
         assert_eq!(popup_start::new().close_request(), Reply::Close);
