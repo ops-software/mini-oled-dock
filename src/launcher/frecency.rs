@@ -5,6 +5,7 @@
 //! The file "launcher-frecency.txt": "mini-oled-dock launcher-frecency 1", then at most 1,000 lines
 //! "<ItemKey, 16 lowercase hex digits> <count 1-65535> <last pick, Unix seconds>", at most 64 KiB. The parser is
 //! strict: one bad line, a duplicate key or another version gives an empty state.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
 
@@ -62,7 +63,7 @@ impl Frecency {
     pub fn boost(&self, key: ItemKey, now: i64) -> u16 {
         let Some(&(count, last)) = self.entries.get(&key.0) else { return 0 };
         let w = weight_quarters(now.saturating_sub(last));
-        u16::try_from((u32::from(count) * w).min(u32::from(MAX_BOOST))).unwrap_or(MAX_BOOST)
+        u16::try_from(u32::from(count).saturating_mul(w).min(u32::from(MAX_BOOST))).unwrap_or(MAX_BOOST)
     }
 
     /// +1 for a pick. Ignored (false) for a destructive row. At 1,000 entries the one with the oldest last pick makes
@@ -149,7 +150,7 @@ impl Frecency {
     pub fn render(&self) -> Vec<u8> {
         let mut rows: Vec<(&u64, &(u16, i64))> = self.entries.iter().collect();
         rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
-        let mut s = String::with_capacity(HEADER.len() + 1 + rows.len() * 34);
+        let mut s = String::with_capacity(HEADER.len().saturating_add(1).saturating_add(rows.len().saturating_mul(34)));
         s.push_str(HEADER);
         s.push('\n');
         for (key, (count, last)) in rows.into_iter().take(MAX_ENTRIES) {

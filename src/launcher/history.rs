@@ -1,6 +1,7 @@
 //! The run history file (5.4.9, 5.5.2): "mini-oled-dock launcher-run 1" and at most 50 lines of at most 256 characters,
 //! at most 64 KiB. The parser is strict: one bad line, another version or a missing final newline gives an empty
 //! history. Reading and writing the file is the shell thread's job (L1a-12); this module only turns bytes into lines.
+#![deny(clippy::arithmetic_side_effects)]
 
 pub const HEADER: &str = "mini-oled-dock launcher-run 1";
 pub const MAX_LINES: usize = 50;
@@ -48,7 +49,9 @@ fn parse(bytes: &[u8]) -> Option<Vec<Box<str>>> {
 
 /// The bytes of a history file for these lines (newest first); lines that cannot be stored are skipped.
 pub fn render_run(lines: &[Box<str>]) -> Vec<u8> {
-    let mut s = String::with_capacity(HEADER.len() + 1 + lines.len().min(MAX_LINES) * 32);
+    let mut s = String::with_capacity(
+        HEADER.len().saturating_add(1).saturating_add(lines.len().min(MAX_LINES).saturating_mul(32)),
+    );
     s.push_str(HEADER);
     s.push('\n');
     for line in lines.iter().filter(|l| accept(l)).take(MAX_LINES) {

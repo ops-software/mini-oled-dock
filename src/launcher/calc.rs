@@ -3,6 +3,7 @@
 //! degrees), the literals 0x 0b 0o and 1e5, "in hex|bin|dec|oct", f64 and the locale's number rules. Arguments are
 //! separated by ";" in every locale and also by "," when the decimal mark is ".". A recursive descent over a token
 //! vector with a depth counter; nothing here runs the text as code.
+#![deny(clippy::arithmetic_side_effects)]
 
 use super::model::NumberStyle;
 use super::strings;
@@ -129,7 +130,7 @@ fn number(run: &str, num: NumberStyle) -> Option<(f64, bool)> {
         return run.parse::<f64>().ok().map(|v| (v, false));
     }
     let decimals = marks.iter().filter(|c| **c == num.decimal).count();
-    let groups = marks.len() - decimals;
+    let groups = marks.len().saturating_sub(decimals);
     let three = |s: &&str| s.len() == 3;
     let lead_ok = |s: &str| (1..=3).contains(&s.len()) && !s.starts_with('0');
     if decimals > 1 {
@@ -170,16 +171,16 @@ fn number(run: &str, num: NumberStyle) -> Option<(f64, bool)> {
 /// The digits of a 0x, 0b or 0o literal starting at `at` (the "0"), with its value; None when no digit follows the
 /// prefix (then "0x" is "0 x"), and a value of its own error when it does not fit in 64 bits.
 fn radix_literal(chars: &[char], at: usize) -> Option<Option<(f64, usize)>> {
-    let radix = match chars.get(at + 1)? {
+    let radix = match chars.get(at.saturating_add(1))? {
         'x' | 'X' => 16,
         'b' | 'B' => 2,
         'o' | 'O' => 8,
         _ => return None,
     };
-    let start = at + 2;
+    let start = at.saturating_add(2);
     let mut end = start;
     while chars.get(end).is_some_and(|d| d.is_digit(radix)) {
-        end += 1;
+        end = end.saturating_add(1);
     }
     if end == start {
         return None;
@@ -197,28 +198,28 @@ fn exponent(chars: &[char], at: usize) -> Option<(i32, usize)> {
     if !matches!(chars.get(at)?, 'e' | 'E') {
         return None;
     }
-    let mut i = at + 1;
+    let mut i = at.saturating_add(1);
     let neg = match chars.get(i) {
         Some('+') => {
-            i += 1;
+            i = i.saturating_add(1);
             false
         }
         Some('-') => {
-            i += 1;
+            i = i.saturating_add(1);
             true
         }
         _ => false,
     };
     let start = i;
     while chars.get(i).is_some_and(|d| d.is_ascii_digit()) {
-        i += 1;
+        i = i.saturating_add(1);
     }
-    if i == start || i - start > 4 || chars.get(i).is_some_and(|d| d.is_alphabetic()) {
+    if i == start || i.saturating_sub(start) > 4 || chars.get(i).is_some_and(|d| d.is_alphabetic()) {
         return None;
     }
     let digits: String = chars.get(start..i)?.iter().collect();
     let e: i32 = digits.parse().ok()?;
-    Some((if neg { -e } else { e }, i))
+    Some((if neg { e.saturating_neg() } else { e }, i))
 }
 
 /// `v` times ten to the `e`, rounded once for the powers that are exact in a double.
@@ -226,7 +227,7 @@ fn scale10(v: f64, e: i32) -> f64 {
     if (0..=22).contains(&e) {
         v * 10f64.powi(e)
     } else if (-22..0).contains(&e) {
-        v / 10f64.powi(-e)
+        v / 10f64.powi(e.saturating_neg())
     } else {
         v * 10f64.powi(e)
     }
@@ -254,15 +255,15 @@ fn lex(text: &str, num: NumberStyle) -> Option<Lexed> {
                 continue;
             }
         }
-        if c.is_ascii_digit() || (is_mark(c) && !c.is_whitespace() && digit_at(i + 1)) {
+        if c.is_ascii_digit() || (is_mark(c) && !c.is_whitespace() && digit_at(i.saturating_add(1))) {
             let start = i;
             let mut end = i;
             while let Some(&d) = chars.get(i) {
                 if d.is_ascii_digit() {
-                    i += 1;
+                    i = i.saturating_add(1);
                     end = i;
-                } else if is_mark(d) && digit_at(i + 1) {
-                    i += 1;
+                } else if is_mark(d) && digit_at(i.saturating_add(1)) {
+                    i = i.saturating_add(1);
                 } else {
                     break;
                 }
@@ -282,14 +283,14 @@ fn lex(text: &str, num: NumberStyle) -> Option<Lexed> {
         if c.is_alphabetic() {
             let start = i;
             while chars.get(i).is_some_and(|d| d.is_alphabetic()) {
-                i += 1;
+                i = i.saturating_add(1);
             }
             // "log2" is the one name with a digit.
             if chars.get(start..i).is_some_and(|w| w.iter().collect::<String>().eq_ignore_ascii_case("log"))
                 && chars.get(i) == Some(&'2')
-                && !digit_at(i + 1)
+                && !digit_at(i.saturating_add(1))
             {
-                i += 1;
+                i = i.saturating_add(1);
             }
             let word: String = chars.get(start..i)?.iter().collect::<String>().to_lowercase();
             toks.push(match word.as_str() {
@@ -305,7 +306,7 @@ fn lex(text: &str, num: NumberStyle) -> Option<Lexed> {
             });
             continue;
         }
-        i += 1;
+        i = i.saturating_add(1);
         toks.push(match c {
             c if c.is_whitespace() => {
                 continue;
@@ -347,10 +348,15 @@ impl Parser<'_> {
         self.toks.get(self.at).copied()
     }
 
+    /// Takes the next token.
+    fn bump(&mut self) {
+        self.at = self.at.saturating_add(1);
+    }
+
     fn expr(&mut self) -> Option<Val> {
         let mut acc = self.term()?;
         while let Some(op @ (Tok::Plus | Tok::Minus)) = self.peek() {
-            self.at += 1;
+            self.bump();
             let rhs = self.term()?;
             // "a + b%" and "a - b%" take b percent of a.
             let r = match rhs.pct {
@@ -370,7 +376,7 @@ impl Parser<'_> {
         while let Some(op @ (Tok::Mul | Tok::Div | Tok::Open | Tok::Pi | Tok::E | Tok::Func(_))) = self.peek() {
             let explicit = matches!(op, Tok::Mul | Tok::Div);
             if explicit {
-                self.at += 1;
+                self.bump();
             }
             let rhs = self.unary()?;
             let v = if op != Tok::Div {
@@ -389,13 +395,13 @@ impl Parser<'_> {
     fn unary(&mut self) -> Option<Val> {
         match self.peek() {
             Some(op @ (Tok::Minus | Tok::Plus)) => {
-                self.at += 1;
-                self.depth += 1;
+                self.bump();
+                self.depth = self.depth.saturating_add(1);
                 if self.depth > MAX_DEPTH {
                     return None;
                 }
                 let inner = self.unary();
-                self.depth -= 1;
+                self.depth = self.depth.saturating_sub(1);
                 let v = inner?.v;
                 Some(Val { v: if op == Tok::Minus { -v } else { v }, pct: None })
             }
@@ -406,7 +412,7 @@ impl Parser<'_> {
     fn power(&mut self) -> Option<Val> {
         let base = self.postfix()?;
         if self.peek() == Some(Tok::Pow) {
-            self.at += 1;
+            self.bump();
             let exp = self.unary()?;
             return Some(Val { v: finite(base.v.powf(exp.v))?, pct: None });
         }
@@ -416,7 +422,7 @@ impl Parser<'_> {
     fn postfix(&mut self) -> Option<Val> {
         let mut val = self.primary()?;
         while let Some(op @ (Tok::Pct | Tok::Fact | Tok::Deg)) = self.peek() {
-            self.at += 1;
+            self.bump();
             val = match op {
                 Tok::Pct => Val { v: val.v / 100.0, pct: Some(val.v) },
                 Tok::Fact => Val { v: factorial(val.v)?, pct: None },
@@ -429,44 +435,44 @@ impl Parser<'_> {
     fn primary(&mut self) -> Option<Val> {
         match self.peek()? {
             Tok::Num(v) => {
-                self.at += 1;
+                self.bump();
                 Some(Val { v, pct: None })
             }
             Tok::Pi => {
-                self.at += 1;
+                self.bump();
                 Some(Val { v: std::f64::consts::PI, pct: None })
             }
             Tok::E => {
-                self.at += 1;
+                self.bump();
                 Some(Val { v: std::f64::consts::E, pct: None })
             }
             Tok::Open => {
-                self.at += 1;
-                self.depth += 1;
+                self.bump();
+                self.depth = self.depth.saturating_add(1);
                 if self.depth > MAX_DEPTH {
                     return None;
                 }
                 let inner = self.expr();
-                self.depth -= 1;
+                self.depth = self.depth.saturating_sub(1);
                 let inner = inner?;
                 if self.peek() != Some(Tok::Close) {
                     return None;
                 }
-                self.at += 1;
+                self.bump();
                 Some(Val { v: inner.v, pct: None })
             }
             Tok::Func(f) => {
-                self.at += 1;
+                self.bump();
                 if self.peek() != Some(Tok::Open) {
                     return None;
                 }
-                self.at += 1;
-                self.depth += 1;
+                self.bump();
+                self.depth = self.depth.saturating_add(1);
                 if self.depth > MAX_DEPTH {
                     return None;
                 }
                 let v = self.call(f);
-                self.depth -= 1;
+                self.depth = self.depth.saturating_sub(1);
                 Some(Val { v: finite(v?)?, pct: None })
             }
             _ => None,
@@ -482,9 +488,9 @@ impl Parser<'_> {
                 return None;
             }
             match self.peek() {
-                Some(Tok::Semi) => self.at += 1,
+                Some(Tok::Semi) => self.bump(),
                 Some(Tok::Close) => {
-                    self.at += 1;
+                    self.bump();
                     break;
                 }
                 _ => return None,
@@ -572,10 +578,10 @@ fn format_plain(v: f64, num: NumberStyle) -> String {
         out.push('e');
         out.push_str(&exp.to_string());
     } else if exp >= 0 {
-        let int_len = exp as usize + 1;
+        let int_len = (exp as usize).saturating_add(1);
         if digits.len() <= int_len {
             out.push_str(&digits);
-            out.extend(std::iter::repeat_n('0', int_len - digits.len()));
+            out.extend(std::iter::repeat_n('0', int_len.saturating_sub(digits.len())));
         } else {
             out.push_str(digits.get(..int_len).unwrap_or(""));
             out.push(num.decimal);
@@ -584,7 +590,7 @@ fn format_plain(v: f64, num: NumberStyle) -> String {
     } else {
         out.push('0');
         out.push(num.decimal);
-        out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+        out.extend(std::iter::repeat_n('0', exp.unsigned_abs().saturating_sub(1) as usize));
         out.push_str(&digits);
     }
     out
@@ -670,9 +676,9 @@ pub fn eval(text: &str, num: NumberStyle) -> Option<Answer> {
     let mut p = Parser { toks: &lexed.toks, at: 0, depth: 0 };
     let val = p.expr()?;
     // "in hex" and its kin close the expression.
-    let base = match (p.peek(), lexed.toks.get(p.at + 1)) {
+    let base = match (p.peek(), lexed.toks.get(p.at.saturating_add(1))) {
         (Some(Tok::In), Some(Tok::Base(b))) => {
-            p.at += 2;
+            p.at = p.at.saturating_add(2);
             Some(*b)
         }
         _ => None,

@@ -1,6 +1,7 @@
 //! Run lines (5.4.9): classification by syntax only, the known-command table and the suggestions of the run mode.
 //! Nothing here reads the environment, the file system or the registry, and nothing expands %VAR%: the line goes to
 //! Explorer as typed.
+#![deny(clippy::arithmetic_side_effects)]
 
 use super::model::RunLine;
 use super::rank::fold;
@@ -128,7 +129,7 @@ pub fn classify(line: &str) -> Option<RunLine> {
         if len == 0 {
             return None;
         }
-        let file = 1..1 + len;
+        let file = 1..len.saturating_add(1);
         let console = known_for(rest.get(..len)?).is_some_and(|e| e.console);
         return Some(RunLine { line: line.into(), file, console });
     }
@@ -145,7 +146,7 @@ pub fn classify(line: &str) -> Option<RunLine> {
 
 /// "%" followed later by "%": the shape of an environment variable.
 pub fn needs_console_for_vars(line: &str) -> bool {
-    line.find('%').is_some_and(|i| line.get(i + 1..).is_some_and(|rest| rest.contains('%')))
+    line.find('%').is_some_and(|i| line.get(i.saturating_add(1)..).is_some_and(|rest| rest.contains('%')))
 }
 
 /// Whether the line runs in a console kept open: a known console program, or (only while Explorer is not known to
