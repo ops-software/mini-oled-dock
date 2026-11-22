@@ -1084,6 +1084,8 @@ pub fn run(dir: &str) -> i32 {
             ("popup_startmenu_win11_folder", 1),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
+            // Start's search control, the launcher's and the larger candidate, for the owner's Q7 choice.
+            ("launcher_field_pair", 0),
         ] {
             // Popups read the background tone from the config: every one starts from the defaults.
             crate::config::set(plan().base_config());
