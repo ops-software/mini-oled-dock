@@ -2095,8 +2095,15 @@ mod bench {
         let apps: Vec<_> = big.apps.iter().map(CatApp::cand).collect();
         let settings: Vec<_> = big.settings.iter().map(SettingRow::cand).collect();
         let (mut hidden_hits, mut fuzzy_hits) = (0usize, 0usize);
-        for (cands, view) in [(&apps, big.apps_arena.view().index()), (&settings, big.settings_arena.view().index())] {
+        let app_names: Vec<(&str, &str)> = big.apps.iter().map(|a| (&*a.name, &*a.id)).collect();
+        let setting_names: Vec<(&str, &str)> = big.settings.iter().map(|s| (&*s.name, "")).collect();
+        let (app_view, setting_view) = (big.apps_arena.view(), big.settings_arena.view());
+        for (cands, cv, names) in [(&apps, &app_view, &app_names), (&settings, &setting_view, &setting_names)] {
+            let view = cv.index();
             assert_eq!(view.entries(), cands.len());
+            for (i, want) in names.iter().enumerate() {
+                assert_eq!((cv.name(i), cv.id(i)), *want, "entry {i}");
+            }
             let (mut hits, mut near) = (Vec::new(), Vec::new());
             for raw in queries() {
                 let mut end = 0;
@@ -2120,12 +2127,30 @@ mod bench {
                         };
                         assert_eq!(found, rank::hidden_best(c, q, chars), "{part:?} entry {i}");
                         hidden_hits += usize::from(found.is_some());
+                        // What the dock runs per candidate: the arena's candidate against the in-memory one.
+                        let vc = cv.cand(i);
+                        let tier = rank::match_tiers_with(&vc, q, found);
+                        assert_eq!(tier, rank::match_tiers(c, q), "{part:?} entry {i}: tier");
+                        if let Some(t) = tier {
+                            for k in [0, 1] {
+                                assert_eq!(
+                                    rank::score_hidden(&vc, t, false, k, found),
+                                    rank::score_for(c, q, t, false, k),
+                                    "{part:?} entry {i}: score"
+                                );
+                            }
+                        }
                         if let Some((chars, m, _)) = &fz {
                             let qc = &chars[..*m];
                             let in_dict = near.binary_search(&(i as u32)).is_ok();
                             let want = rank::match_fuzzy(c, part).is_some();
                             assert_eq!(in_dict || rank::subsequence_name(c, qc), want, "{part:?} entry {i}");
                             fuzzy_hits += usize::from(want);
+                            assert_eq!(
+                                rank::subsequence_name(&cv.cand(i), qc),
+                                rank::subsequence_name(c, qc),
+                                "{part:?} entry {i}: subsequence"
+                            );
                         }
                     }
                     assert_eq!(next, hits.len(), "{part:?}: every hit belongs to an entry");
@@ -2142,8 +2167,28 @@ mod bench {
         let first: Vec<CatApp> = big.apps.iter().take(400).cloned().collect();
         let a = arena::of_apps(&first);
         println!("400 apps: {} B in one block", a.raw().len());
-        assert!(a.raw().len() <= 160 * 1024);
+        assert!(a.bytes() <= 160 * 1024);
+        assert_eq!(a.bytes(), a.raw().len(), "the block carries no growth slack");
         assert_eq!(a.len(), 400);
+    }
+
+    /// Prints the size of the bench's 1,500-setting arena by section, and what `check` costs (run by hand: `cargo test
+    /// providers::bench::settings_arena_size_printed -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "prints the size of the bench's settings arena"]
+    fn settings_arena_size_printed() {
+        let big = Big::new(1);
+        let a = &big.settings_arena;
+        print!("{}", a.layout().section_report());
+        let mut times: Vec<std::time::Duration> = (0..51)
+            .map(|_| {
+                let t = Instant::now();
+                std::hint::black_box(arena::check(a.raw(), arena::Kind::Settings, None, arena::Caps::BENCH)).unwrap();
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        println!("{} settings, total {} B, check median {:?}", big.settings.len(), a.raw().len(), times[25]);
     }
 
     /// KEY-2: no keyword line is read on the key path: the hidden tiers come from the dictionaries.

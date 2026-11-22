@@ -157,6 +157,21 @@ impl Layout {
         self.entries as usize
     }
 
+    /// The length of section `id` (0 for an id out of range), in the order STR, ENT, WORDS, CUR, CURP, XML, XMLP, FUZ, FUZP,
+    /// CHARS, TGT.
+    #[cfg(test)]
+    pub fn section_len(&self, id: usize) -> usize {
+        self.secs.get(id).map_or(0, |s| s.1 as usize)
+    }
+
+    /// One line per section: its name and length in bytes (what the size benches print).
+    #[cfg(test)]
+    pub fn section_report(&self) -> String {
+        const NAMES: [&str; SECTIONS] =
+            ["STR", "ENT", "WORDS", "CUR", "CURP", "XML", "XMLP", "FUZ", "FUZP", "CHARS", "TGT"];
+        NAMES.iter().enumerate().map(|(id, n)| format!("{n:6} {:8} B\n", self.section_len(id))).collect()
+    }
+
     #[allow(dead_code)] // read by the tests of the cache file code
     pub fn kind(&self) -> Kind {
         self.kind
@@ -448,6 +463,11 @@ impl Arena {
     /// The bytes this arena keeps resident.
     pub fn bytes(&self) -> usize {
         self.bytes.capacity()
+    }
+
+    #[cfg(test)]
+    pub fn layout(&self) -> Layout {
+        self.layout
     }
 
     #[cfg(test)]
@@ -785,7 +805,25 @@ fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps) -> Result<Vec<u8>, Ar
     );
     let secs: [&[u8]; SECTIONS] =
         [&st.bytes, &ent_sec, &word_sec, &cur, &curp, &xml, &xmlp, &fuz, &fuzp, &chars, &tgt_sec];
-    let mut out: Vec<u8> = Vec::new();
+    // The sections and their offsets are known: the buffer is sized exactly, so no growth slack stays resident.
+    let mut rel = 0usize;
+    let mut offsets = [0usize; SECTIONS];
+    for (id, s) in secs.iter().enumerate() {
+        rel = align(rel, 4).ok_or(ArenaError::TooBig)?;
+        if let Some(o) = offsets.get_mut(id) {
+            *o = rel;
+        }
+        rel = rel.checked_add(s.len()).ok_or(ArenaError::TooBig)?;
+    }
+    let head = if kind == Kind::Apps { APPS_HEADER.len() } else { SETTINGS_HEADER.len() + key.len() + 1 };
+    let data_at = align(head, 4).and_then(|h| h.checked_add(12 + SECTIONS * 8)).ok_or(ArenaError::TooBig)?;
+    let total = align(data_at.checked_add(rel).ok_or(ArenaError::TooBig)?, 8)
+        .and_then(|t| t.checked_add(8))
+        .ok_or(ArenaError::TooBig)?;
+    if total > caps.bytes {
+        return Err(ArenaError::TooBig);
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(total);
     out.extend_from_slice(if kind == Kind::Apps { APPS_HEADER } else { SETTINGS_HEADER });
     if kind == Kind::Settings {
         out.extend_from_slice(key.as_bytes());
@@ -796,16 +834,9 @@ fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps) -> Result<Vec<u8>, Ar
     put_u32(&mut out, 0);
     put_u32(&mut out, small(ents.len())?);
     put_u32(&mut out, small(SECTIONS)?);
-    let mut rel = 0usize;
-    let mut offsets = [0usize; SECTIONS];
-    for (id, s) in secs.iter().enumerate() {
-        rel = align(rel, 4).ok_or(ArenaError::TooBig)?;
-        if let Some(o) = offsets.get_mut(id) {
-            *o = rel;
-        }
-        put_u32(&mut out, small(rel)?);
+    for (off, s) in offsets.iter().zip(secs.iter()) {
+        put_u32(&mut out, small(*off)?);
         put_u32(&mut out, small(s.len())?);
-        rel = rel.checked_add(s.len()).ok_or(ArenaError::TooBig)?;
     }
     let data = out.len();
     for (s, off) in secs.iter().zip(offsets) {
@@ -817,6 +848,7 @@ fn encode(kind: Kind, key: &str, ents: &[Ent], caps: Caps) -> Result<Vec<u8>, Ar
     out.get_mut(rest_at..rest_at + 4).ok_or(ArenaError::TooBig)?.copy_from_slice(&small(rest_len)?.to_le_bytes());
     let sum = checksum(&out);
     out.extend_from_slice(&sum.to_le_bytes());
+    debug_assert_eq!(out.len(), total);
     if out.len() > caps.bytes {
         return Err(ArenaError::TooBig);
     }
@@ -951,6 +983,7 @@ mod tests {
         let (apps, a) = apps_arena();
         let v = a.view();
         assert_eq!(v.len(), apps.len());
+        assert_eq!(a.bytes(), a.raw().len(), "the block carries no growth slack");
         for (i, app) in apps.iter().enumerate() {
             let (c, want) = (v.cand(i), app.cand());
             assert_eq!((v.name(i), v.id(i), v.rank(i)), (&*app.name, &*app.id, app.rank));
@@ -966,6 +999,7 @@ mod tests {
         let (settings, s) = settings_arena();
         let v = s.view();
         assert_eq!(v.len(), settings.len());
+        assert_eq!(s.bytes(), s.raw().len(), "the block carries no growth slack");
         for (i, st) in settings.iter().enumerate() {
             let (c, want) = (v.cand(i), st.row.cand());
             assert_eq!((v.name(i), v.rank(i)), (&*st.row.name, st.row.rank));
@@ -1362,26 +1396,5 @@ mod tests {
             let short = CatalogView::new(&b[..b.len() / 2], &l);
             let _ = (short.cand(3).folded, short.index().entries());
         }
-    }
-
-    #[test]
-    #[ignore = "prints the size of the bench's settings arena"]
-    fn settings_arena_size_printed() {
-        let (_, s) = settings_arena();
-        let l = s.layout;
-        for (id, name) in
-            ["STR", "ENT", "WORDS", "CUR", "CURP", "XML", "XMLP", "FUZ", "FUZP", "CHARS", "TGT"].iter().enumerate()
-        {
-            println!("{name:6} {:8} B", l.secs[id].1);
-        }
-        let mut times: Vec<std::time::Duration> = (0..51)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                std::hint::black_box(check(s.raw(), Kind::Settings, None, Caps::BENCH)).unwrap();
-                t.elapsed()
-            })
-            .collect();
-        times.sort();
-        println!("total {} B, check median {:?}", s.raw().len(), times[25]);
     }
 }

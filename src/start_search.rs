@@ -1836,6 +1836,9 @@ mod tests {
             })
             .collect();
         times.sort();
+        if let Ok(l) = crate::launcher::arena::check(bytes, kinds, None, caps) {
+            print!("{}", l.section_report());
+        }
         println!(
             "{} settings, arena {} B (cap {}), check median {:?} over 51 runs",
             list.len(),
