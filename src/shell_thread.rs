@@ -1508,7 +1508,7 @@ struct IconProgress {
 /// One `--start-icons` child at work for a client: the process (only the shell thread waits on it or kills it; the
 /// reader thread holds its pipes), the size and ids it was given, its progress and when it started.
 struct IconJob {
-    child: std::process::Child,
+    child: crate::update::JobChild,
     px: u32,
     ids: Arc<[String]>,
     progress: Arc<IconProgress>,
@@ -1641,21 +1641,11 @@ impl Shell {
 /// both pipes. Err: why, with the ids back.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> Result<IconJob, (String, Vec<String>)> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => return Err((format!("no exe path: {e}"), ids)),
     };
-    let mut cmd = Command::new(exe);
-    cmd.arg(ICONS_FLAG)
-        .arg(px.to_string())
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = match crate::update::spawn_in_job(&mut cmd) {
+    let mut child = match crate::update::spawn_in_job(&exe, &[ICONS_FLAG, &px.to_string()], true) {
         Ok(child) => child,
         Err(e) => return Err((e.to_string(), ids)),
     };
@@ -1698,7 +1688,7 @@ impl IconReader {
     /// waits in the pipe. It ends at the end of the output, at a write error or the first frame refused (each logged
     /// once per process; dropping the pipes makes a child still at work exit at its next write), or when the shell
     /// thread kills the child; then it logs what it delivered.
-    fn run(self, input: std::process::ChildStdin, output: std::process::ChildStdout) {
+    fn run(self, input: std::io::PipeWriter, output: std::io::PipeReader) {
         static WRITE_WARNED: AtomicBool = AtomicBool::new(false);
         static FRAME_WARNED: AtomicBool = AtomicBool::new(false);
         let (first, failed) = match self.feed(input) {
@@ -1726,7 +1716,7 @@ impl IconReader {
     }
 
     /// Writes the ids, one per line, and closes the child's input.
-    fn feed(&self, mut input: std::process::ChildStdin) -> std::io::Result<()> {
+    fn feed(&self, mut input: std::io::PipeWriter) -> std::io::Result<()> {
         use std::io::Write;
         let mut text = Vec::with_capacity(self.ids.iter().map(|id| id.len() + 1).sum());
         for id in self.ids.iter() {
@@ -1737,7 +1727,7 @@ impl IconReader {
     }
 
     /// Decodes the output and delivers the frames: when the first batch went out, and how the output ended.
-    fn read(&self, output: std::process::ChildStdout) -> (Option<Duration>, Result<(), String>) {
+    fn read(&self, output: std::io::PipeReader) -> (Option<Duration>, Result<(), String>) {
         let n = self.ids.len();
         let mut r = std::io::BufReader::with_capacity(ICON_IO_BUF, output);
         if let Err(why) = read_icon_header(&mut r) {
@@ -3936,7 +3926,6 @@ mod tests {
     /// batches of 8; then the job counts every id answered, and ended.
     #[test]
     fn icon_reader_delivers_a_childs_frames() {
-        use std::process::{Command, Stdio};
         let px = 9u32;
         let ids: Vec<String> = (0..10).map(|i| format!("vendor.app{i}")).collect();
         let mut out = ICONS_HEADER.to_vec();
@@ -3947,15 +3936,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dock_icon_frames_{}.bin", std::process::id()));
         std::fs::write(&path, &out).unwrap();
         // A child that prints the frames and never reads its input, as a child stuck before its first read would.
-        let mut child = Command::new("cmd.exe")
-            .arg("/c")
-            .arg("type")
-            .arg(&path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let cmd = system_dir().unwrap().join("cmd.exe");
+        let mut child = crate::update::spawn_in_job(&cmd, &["/c", "type", path.to_str().unwrap()], true).unwrap();
         let progress = Arc::new(IconProgress::default());
         let (input, output) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         let reader = IconReader {
@@ -4024,19 +4006,9 @@ mod tests {
     /// A job whose "child" waits on its input until it is killed (`cmd /c pause` on a pipe), or exits at once.
     fn fake_job(ids: &[&str], waits: bool) -> (IconJob, HANDLE) {
         use std::os::windows::io::AsRawHandle;
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
         use windows::Win32::Foundation::DUPLICATE_SAME_ACCESS;
-        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
         let args: &[&str] = if waits { &["/c", "pause"] } else { &["/c", "exit 0"] };
-        let child = Command::new("cmd.exe")
-            .args(args)
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = crate::update::spawn_in_job(&system_dir().unwrap().join("cmd.exe"), args, true).unwrap();
         // A handle of the test's own, to see the process end after the job's handle is gone.
         let mut seen = HANDLE::default();
         // SAFETY: the child's handle is valid while `child` lives; `seen` is written once and closed by `ended`.
