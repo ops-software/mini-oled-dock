@@ -46,12 +46,22 @@ fn fn_body(text: &str, sig: &str, from: usize) -> Option<(usize, usize)> {
     let mut depth = 0usize;
     let mut in_str = false;
     let mut prev = ' ';
-    for (i, c) in text.get(open..)?.char_indices() {
+    let mut in_comment = false;
+    let mut it = text.get(open..)?.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if in_comment {
+            in_comment = c != '\n';
+            continue;
+        }
         if in_str {
             if c == '"' && prev != '\\' {
                 in_str = false;
             }
             prev = if prev == '\\' && c == '\\' { ' ' } else { c };
+            continue;
+        }
+        if c == '/' && !matches!(prev, '\'') && it.peek().is_some_and(|&(_, n)| n == '/') {
+            in_comment = true;
             continue;
         }
         match c {
@@ -243,7 +253,11 @@ fn log_violations(path: &str, text: &str) -> Vec<String> {
     if path == "src/shell_thread.rs" {
         let begin = "// launcher requests: begin";
         let end = "// launcher requests: end";
-        if let (Some(b), Some(e)) = (text.find(begin), text.find(end)) {
+        let (b, e) = (text.find(begin), text.find(end));
+        if b.is_some() != e.is_some() || b.zip(e).is_some_and(|(b, e)| e < b) {
+            v.push(format!("{path}: launcher requests markers must both be present, begin before end"));
+        }
+        if let Some((b, e)) = b.zip(e).filter(|(b, e)| b <= e) {
             let region = text.get(b..e).unwrap_or("");
             for (at, call) in log_calls(region) {
                 let ph = placeholders(call).unwrap_or_default();
@@ -288,6 +302,11 @@ fn launcher_logs_carry_no_text() {
         log_violations("src/shell_thread.rs", &st("log!(\"shell: Run ({} chars) {}\", s.chars().count(), s);")).len(),
         1
     );
+    // a missing, misspelled or swapped marker fails instead of skipping the check
+    let half = "a\n// launcher requests: begin\nlog!(\"shell: Run {}\", s);\n";
+    assert_eq!(log_violations("src/shell_thread.rs", half).len(), 1);
+    let swapped = "// launcher requests: end\n// launcher requests: begin\n";
+    assert_eq!(log_violations("src/shell_thread.rs", swapped).len(), 1);
     let all = scan_tree(log_violations);
     assert!(all.is_empty(), "{all:#?}");
 }
@@ -482,10 +501,9 @@ fn timer_violations(path: &str, text: &str) -> Vec<String> {
     let mut from = 0;
     while let Some((s, e)) = fn_body(text, "fn on_timer(", from) {
         let body = text.get(s..e).unwrap_or("");
-        let stmt =
-            body.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with("//")).collect::<Vec<_>>().join("\n");
-        let first = stmt.split(';').next().unwrap_or("");
-        if !first.contains("KillTimer(") {
+        let first = body.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//")).unwrap_or("");
+        let kills = ["KillTimer(", "let _ = KillTimer(", "unsafe { let _ = KillTimer(", "let _ = unsafe { KillTimer("];
+        if !kills.iter().any(|k| first.starts_with(k)) {
             v.push(format!("{path}:{}: fn on_timer must start with KillTimer", line_of(text, s)));
         }
         from = e;
@@ -503,6 +521,11 @@ fn launcher_timers_are_one_shot() {
     let late = "fn on_timer(h: H, id: usize) {\n    work();\n    KillTimer(h, id);\n}\n";
     assert_eq!(timer_violations("src/popup_launcher.rs", late).len(), 1);
     assert!(timer_violations("src/ui.rs", late).is_empty());
+    let cond = "fn on_timer(h: H, id: usize) {\n    if x { KillTimer(h, id); } else { work(); }\n}\n";
+    assert_eq!(timer_violations("src/popup_launcher.rs", cond).len(), 1);
+    // an odd quote in a comment does not shift the brace matching
+    let quote = "fn on_timer(h: H, id: usize) {\n    // it's \"odd\n    KillTimer(h, id);\n}\nfn on_timer(h: H) {\n    work();\n}\n";
+    assert_eq!(timer_violations("src/popup_launcher.rs", quote).len(), 1);
     assert!(timer_violations("src/popup_launcher.rs", "fn f() {}").is_empty());
     let all = scan_tree(timer_violations);
     assert!(all.is_empty(), "{all:#?}");
