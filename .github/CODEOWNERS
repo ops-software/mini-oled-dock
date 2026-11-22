@@ -1,2 +1,9 @@
 # Every change needs a review from a maintainer.
 * @ops-software/maintainers
+
+# Protected files: budgets, test floor, licences, goldens, and this file (the last matching line wins).
+/budgets.json            @ops-software/maintainers
+/tests/ratchet.txt       @ops-software/maintainers
+/deny.toml               @ops-software/maintainers
+/tests/golden/           @ops-software/maintainers
+/.github/CODEOWNERS      @ops-software/maintainers
