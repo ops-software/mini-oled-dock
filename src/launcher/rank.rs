@@ -243,8 +243,7 @@ thread_local! {
     pub(crate) static TIER_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-// The tiers, best first (5.2.5, L3 T6). 8 is `match_fuzzy`; Windows' typo rewrite shows the rows of the query it read, at
-// their own tiers.
+// The tiers, best first (5.2.5, L3 T6). 8 is `match_fuzzy`; 9 is Windows' typo rewrite.
 /// A name equals the query.
 pub(crate) const T_EXACT: u8 = 0;
 /// A name starts with the query.
@@ -263,6 +262,8 @@ pub(crate) const T_SYN_PREFIX: u8 = 6;
 pub(crate) const T_BAG_EQ: u8 = 7;
 /// Fuzzy: a subsequence or a near word prefix of a name.
 pub(crate) const T_FUZZY: u8 = 8;
+/// Windows' typo rewrite: the rows of the query it read the typed one as, after every tier of the typed query.
+pub(crate) const T_REWRITE: u8 = 9;
 
 #[cfg(test)]
 thread_local! {
@@ -904,7 +905,7 @@ mod tests {
             assert!(last.is_none_or(|l| l < *want), "the tiers are in order");
             last = Some(*want);
         }
-        assert_eq!(T_FUZZY, 8);
+        assert_eq!((T_FUZZY, T_REWRITE), (8, 9));
     }
 
     #[test]
@@ -1101,7 +1102,7 @@ mod fixtures {
         ("OneDrive", "OneDrive", "onedrive.exe", NONE),
     ];
 
-    /// English name and the XML words it carries in the fixture (tier 7).
+    /// English name and the XML words it carries in the fixture (tier 7, T_BAG_EQ).
     const XML_WORDS: &[(&str, &[&str])] = &[
         ("Photos", &["pictures"]),
         ("Camera", &["video"]),

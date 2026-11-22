@@ -47,7 +47,7 @@ pub enum Effect {
     /// Ask the files provider for this generation (L2).
     #[allow(dead_code)] // L2-2 builds it
     RequestFiles(u64),
-    /// Nothing matched: ask Windows' typo rewrite for this generation (tier 7, L1a-15d).
+    /// Nothing matched: ask Windows' typo rewrite for this generation (T_REWRITE, L1a-15d).
     RequestRewrite {
         gen: u64,
     },

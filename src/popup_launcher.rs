@@ -692,7 +692,7 @@ impl Launcher {
 
     /// `ShellEvent::LauncherConverted`: Windows read the query of `gen` as `meant`. Taken only while `gen` is the
     /// current generation and it still has no rows, so nothing can move under the selection. `meant` comes from a file
-    /// in the user's profile (untrusted, start_search.rs), so it is searched as a name and nothing else (tier 7): no
+    /// in the user's profile (untrusted, start_search.rs), so it is searched as a name and nothing else (its rows carry `rank::T_REWRITE`): no
     /// prefix, and only the catalogue's app and setting rows come in, as one late batch of that generation. A run line,
     /// a path, a URL, an answer or a command the user never typed never does (C4); the web row stays the typed query's.
     pub(crate) fn converted(&mut self, gen: u64, meant: &str, cx: &Context) -> Reply {
@@ -707,6 +707,9 @@ impl Launcher {
         });
         if items.is_empty() {
             return Reply::None;
+        }
+        for i in &mut items {
+            i.score.tier = crate::launcher::rank::T_REWRITE;
         }
         let batch = Batch { gen, from: ProviderId::Apps, items, done: true };
         if self.session.late(batch, cx) {
@@ -4475,6 +4478,10 @@ mod tests {
         // Its own generation: the rows of what Windows read the query as, as one late batch.
         assert_eq!(l.converted(gen, "calc", &fx.cx()), Reply::Relayout);
         assert!(l.session.rows().iter().any(|r| &*r.title == "Calcolatrice"), "{:?}", l.session.rows());
+        let own = |r: &&crate::launcher::model::Item| {
+            matches!((r.from, r.kind), (ProviderId::Apps, Kind::App) | (ProviderId::Settings, Kind::Setting))
+        };
+        assert!(l.session.rows().iter().filter(own).all(|r| r.score.tier == crate::launcher::rank::T_REWRITE));
         let web = l.session.rows().iter().filter(|r| r.from == ProviderId::Web).count();
         assert_eq!(web, 1, "one web row, the typed query's");
         // Rows now: a second answer moves nothing.
