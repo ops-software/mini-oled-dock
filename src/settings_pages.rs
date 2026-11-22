@@ -305,7 +305,9 @@ pub(crate) fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
         }
         Setting::DisplayMode => vec![tr("Icon + name", "Icona + nome"), tr("Icon", "Icona"), tr("Name", "Nome")],
         Setting::BatteryShow => vec![tr("Auto", "Automatica"), tr("On", "S\u{ec}"), tr("Off", "No")],
-        Setting::LauncherChord => vec!["Alt+Space", "Alt+Shift+Space", tr("Off", "No")],
+        Setting::LauncherChord => {
+            vec![tr("Alt+Space", "Alt+Spazio"), tr("Alt+Shift+Space", "Alt+Maiusc+Spazio"), tr("Off", "No")]
+        }
         Setting::LauncherPowerToys => vec![tr("Leave it", "Lascialo"), tr("Take it", "Prendilo")],
         Setting::LauncherMonitor => {
             vec![tr("Pointer", "Puntatore"), tr("Active window", "Finestra attiva"), tr("Primary", "Principale")]
