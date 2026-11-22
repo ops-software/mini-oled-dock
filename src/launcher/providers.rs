@@ -1125,9 +1125,10 @@ pub(crate) mod tests {
         let mut res = Results::default();
         fx.sync(&mut res, "st", 1);
         let titles: Vec<&str> = res.rows().iter().map(|r| &*r.title).collect();
-        assert_eq!(titles, ["Steam", "Visual Studio Code", "Restart", "Registry Editor", "Sleep"]);
+        // "standby" is a name of Sleep (L3 T5), so it starts with "st" like Steam does.
+        assert_eq!(titles, ["Steam", "Sleep", "Visual Studio Code", "Restart", "Registry Editor"]);
         assert_eq!(res.selected().unwrap().title.as_ref(), "Steam");
-        assert!(res.select_index(1), "the user moves to Visual Studio Code");
+        assert!(res.select_index(2), "the user moves to Visual Studio Code");
         let before = keys(&res);
         assert!(res.late(files(1, &["budget.ods", "studio.txt"]), 1));
         let after = keys(&res);
@@ -1250,7 +1251,7 @@ pub(crate) mod tests {
         let after = rows.iter().position(|r| r.key == last.key).unwrap();
         assert!(after < before, "{before} -> {after}");
         assert!(rows.iter().take(after).all(|r| r.score.tier <= last.score.tier), "only inside the tier");
-        assert_eq!(rows.first().map(|r| &*r.title), Some("Sign out"), "a better tier stays first");
+        assert_eq!(rows.first().map(|r| &*r.title), Some("Shut down"), "a better tier stays first");
         assert_eq!(rows[after].score.learned, Reverse(16));
         // A better tier still wins over any learned count.
         let first_tier = rows.iter().map(|r| r.score.tier).min().unwrap();
@@ -1433,8 +1434,9 @@ pub(crate) mod tests {
         let mut fx = Fx::new();
         fx.apps.push(CatApp::new("Microsoft.Windows.Explorer2", "File Explorer", Keys::default(), 1));
         let rows = fx.rows("file explorer");
-        assert_eq!(rows.len(), 1, "{rows:#?}");
-        assert_eq!(&*rows[0].title, "File Explorer");
+        // The fixture's Esplora file is File Explorer too: its other-language name is a name (L3 T5).
+        let titles: Vec<&str> = rows.iter().map(|r| &*r.title).collect();
+        assert_eq!(titles, ["File Explorer", "Esplora file"], "{rows:#?}");
         assert!(fx.rows("file xplorer").is_empty(), "nothing worse than tier 1");
     }
 

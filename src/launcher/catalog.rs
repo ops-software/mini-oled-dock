@@ -24,18 +24,27 @@ pub struct CatApp {
     pub initials: Box<str>,
     /// Windows' synonyms of the app (AppIndex).
     pub keys: Keys,
-    /// The other language's names (`keywords::BILINGUAL`), already folded.
+    /// The other names of an inbox program (`keywords::INBOX`), already folded: matched like the shown name.
     pub extra: &'static [&'static str],
     /// Microsoft's popularity rank, smaller is better.
     pub rank: u32,
 }
 
 impl CatApp {
-    /// Folds the name and looks up the hidden keywords of the id.
+    /// Folds the name and looks up the inbox entry of the id or the name: its names become `extra`, its synonyms join
+    /// the keywords with penalty 1.
     pub fn new(id: &str, name: &str, keys: Keys, rank: u32) -> CatApp {
         let x = Indexed::new(name);
-        let mut folded_id = String::with_capacity(id.len());
-        rank::fold(id, &mut folded_id);
+        let (keys, extra) = match inbox_of(id, &x.folded) {
+            Some((_, e)) => {
+                let mut k = keys;
+                for s in e.synonyms {
+                    k.push(s, 1);
+                }
+                (k.tidy(), e.names)
+            }
+            None => (keys, &[][..]),
+        };
         CatApp {
             id: id.into(),
             name: name.into(),
@@ -43,7 +52,7 @@ impl CatApp {
             words: x.words.into(),
             initials: x.initials.into(),
             keys,
-            extra: keywords::bilingual_for(&folded_id),
+            extra,
             rank,
         }
     }
@@ -58,6 +67,13 @@ impl CatApp {
             rank: self.rank,
         }
     }
+}
+
+/// The inbox entry of an app by its id (folded here) or, failing that, its folded name.
+fn inbox_of(id: &str, folded_name: &str) -> Option<(u16, &'static keywords::Inbox)> {
+    let mut folded_id = String::with_capacity(id.len());
+    rank::fold(id, &mut folded_id);
+    keywords::inbox_for(&folded_id, folded_name)
 }
 
 impl SettingRow {
@@ -99,15 +115,27 @@ fn fold_keys(k: &Keys) -> Keys {
     out.tidy()
 }
 
+/// The popularity rank of an app: its own id's, else the smallest rank of the classic programs its inbox entry lists
+/// (an inbox app has a new id and no rank of its own), else the index's default.
+fn rank_of(a: &StartApp, x: &AppIndex) -> u32 {
+    if let Some(r) = x.ranks.get(&a.id.to_lowercase()) {
+        return *r;
+    }
+    let mut folded_name = String::with_capacity(a.name.len());
+    rank::fold(&a.name, &mut folded_name);
+    let classic = inbox_of(&a.id, &folded_name)
+        .and_then(|(_, e)| e.classic.iter().filter_map(|id| x.ranks.get(*id)).min().copied());
+    classic.unwrap_or(x.default_rank)
+}
+
 /// The catalogue of one `StartApps` event: names folded, words and initials built, the keywords of the installed apps
-/// copied out of Windows' app index (which the caller drops) and the bilingual names attached; sorted by name.
+/// copied out of Windows' app index (which the caller drops) and the inbox names attached; sorted by name.
 pub fn ingest(list: &[StartApp], index: Option<&AppIndex>) -> Vec<CatApp> {
     let mut apps: Vec<CatApp> = list
         .iter()
         .map(|a| {
             let (keys, rank) = index.map_or((Keys::default(), 0), |x| {
-                let rank = x.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(x.default_rank);
-                (x.synonyms.get(&a.name.to_lowercase()).map(fold_keys).unwrap_or_default(), rank)
+                (x.synonyms.get(&a.name.to_lowercase()).map(fold_keys).unwrap_or_default(), rank_of(a, x))
             });
             CatApp::new(&a.id, &a.name, keys, rank)
         })
@@ -182,7 +210,7 @@ mod tests {
         let a = CatApp::new("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calcolatrice", Keys::default(), 3);
         assert_eq!((&*a.folded, &*a.initials, &*a.words), ("calcolatrice", "c", &[0u16][..]));
         assert!(a.extra.contains(&"calculator"));
-        assert_eq!(rank::match_tiers(&a.cand(), "calculator"), Some(1));
+        assert_eq!(rank::match_tiers(&a.cand(), "calculator"), Some(0), "the other language's name is a name");
         let s = SettingRow::new(7, "Accessibilità", Keys::default(), 1);
         assert_eq!((&*s.folded, s.index), ("accessibilita", 7));
         assert_eq!(rank::match_tiers(&s.cand(), "accessibilita"), Some(0));
@@ -243,7 +271,26 @@ mod tests {
         assert_eq!((apps[0].rank, apps[2].rank), (99, 99), "an app without a rank gets the default");
         // No index: no keywords, rank 0.
         let bare = ingest(&list, None);
-        assert!(bare.iter().all(|a| a.rank == 0 && a.keys.iter().next().is_none()));
+        assert!(bare.iter().all(|a| a.rank == 0));
+        let hidden = bare.iter().filter(|a| a.keys.iter().next().is_some()).count();
+        assert_eq!(hidden, 1, "only the inbox entry (Remote Desktop) has keywords, its own synonyms");
+    }
+
+    #[test]
+    fn inbox_rank_falls_back_to_the_classic_program() {
+        let mut index = AppIndex { default_rank: 12_813, ..AppIndex::default() };
+        index.ranks.insert("{1ac14e77-02e7-4e5d-b744-2eb1ae5198b7}\\notepad.exe".into(), 3_114);
+        index.ranks.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app".into(), 77);
+        let list = [
+            StartApp { id: "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".into(), name: "Blocco note".into() },
+            StartApp { id: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(), name: "Calcolatrice".into() },
+            StartApp { id: "Unknown.exe".into(), name: "Unknown".into() },
+        ];
+        let apps = ingest(&list, Some(&index));
+        let rank = |name: &str| apps.iter().find(|a| &*a.name == name).unwrap().rank;
+        assert_eq!(rank("Blocco note"), 3_114, "no rank of its own: the classic program's");
+        assert_eq!(rank("Calcolatrice"), 77, "its own rank is kept");
+        assert_eq!(rank("Unknown"), 12_813, "no entry: the default");
     }
 
     #[test]

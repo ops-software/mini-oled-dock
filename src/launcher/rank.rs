@@ -112,7 +112,8 @@ pub struct Cand<'a> {
     pub initials: &'a str,
     /// Windows' synonyms (start_search), already lowercase.
     pub keys: &'a Keys,
-    /// Our hidden keywords (the bilingual table, a command's words), already folded.
+    /// The other names (aliases: an inbox program's names in both languages, a command's names and words), already
+    /// folded: matched like the shown name.
     pub extra: &'a [&'static str],
     /// Microsoft's popularity rank, smaller is better.
     pub rank: u32,
@@ -206,23 +207,62 @@ pub(crate) fn hidden_best(c: &Cand, q: &str, chars: usize) -> Option<(u8, u32)> 
     best
 }
 
-/// `match_tiers` for a trimmed query that is not empty.
-fn tiers(c: &Cand, q: &str) -> Option<u8> {
-    let chars = q.chars().count();
-    if c.folded == q {
+/// The name-like tier of one name (the shown name or an alias): 0 the name equals `q`, 1 it starts with `q`, 2 a word of
+/// it starts with the first query word and every query word is contained in it. `starts` yields the byte offsets where
+/// the words of `text` start.
+fn name_like(text: &str, q: &str, mut starts: impl Iterator<Item = usize>) -> Option<u8> {
+    if text == q {
         return Some(0);
     }
-    if c.folded.starts_with(q) || c.any_keyword(|k| k == q) {
+    if text.starts_with(q) {
         return Some(1);
     }
-    let every = contains_every_word(c, q);
-    if every {
+    if q.split_whitespace().all(|w| text.contains(w)) {
         let first = q.split_whitespace().next().unwrap_or(q);
-        let word_start = c.words.iter().any(|&w| c.folded.get(usize::from(w)..).is_some_and(|t| t.starts_with(first)));
-        if word_start {
+        if starts.any(|w| text.get(w..).is_some_and(|t| t.starts_with(first))) {
             return Some(2);
         }
     }
+    None
+}
+
+/// The byte offsets where a word of an alias starts: an alphanumeric after a non-alphanumeric, or at 0.
+fn alias_starts(a: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut prev = false;
+    a.char_indices().filter_map(move |(i, ch)| {
+        let alnum = ch.is_alphanumeric();
+        let start = alnum && !prev;
+        prev = alnum;
+        start.then_some(i)
+    })
+}
+
+/// The best name-like tier (0-2) over the shown name and every alias in `c.extra`. The UI language only chooses the shown
+/// name: an alias in the other language matches the same way. Allocates nothing.
+pub fn name_tier(c: &Cand, q: &str) -> Option<u8> {
+    let mut best = name_like(c.folded, q, c.words.iter().map(|&w| usize::from(w)));
+    for a in c.extra {
+        if best == Some(0) {
+            break;
+        }
+        if let Some(t) = name_like(a, q, alias_starts(a)) {
+            best = Some(best.map_or(t, |b| b.min(t)));
+        }
+    }
+    best
+}
+
+/// `match_tiers` for a trimmed query that is not empty.
+fn tiers(c: &Cand, q: &str) -> Option<u8> {
+    if let Some(t) = name_tier(c, q) {
+        return Some(t);
+    }
+    let chars = q.chars().count();
+    // A hidden word equal to the query (L3 T6 moves it below every name).
+    if c.keys.iter().any(|(k, _)| k == q) {
+        return Some(1);
+    }
+    let every = contains_every_word(c, q);
     if chars >= 2 && !q.contains(char::is_whitespace) && c.initials.contains(q) {
         return Some(3);
     }
@@ -406,6 +446,35 @@ mod tests {
     }
 
     #[test]
+    fn aliases_match_as_names() {
+        use crate::launcher::catalog::CatApp;
+        use crate::launcher::commands::COMMANDS;
+        use crate::launcher::model::CommandId;
+        let tier_of_command = |id: CommandId, q: &str| {
+            let cmd = COMMANDS.iter().find(|c| c.id == id).unwrap();
+            let x = Indexed::new(cmd.name());
+            match_tiers(&x.cand(Keys::none(), cmd.keywords, 0), q)
+        };
+        crate::i18n::with_italian(true, || {
+            // The shown name is Italian; the English names are names too.
+            assert_eq!(tier_of_command(CommandId::ShutDown, "shut"), Some(1), "shut down");
+            assert_eq!(tier_of_command(CommandId::Restart, "rest"), Some(1), "restart");
+            assert_eq!(tier_of_command(CommandId::ShutDown, "shut down"), Some(0));
+            let notepad = CatApp::new("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", "Blocco note", Keys::default(), 1);
+            assert_eq!(match_tiers(&notepad.cand(), "notep"), Some(1), "notepad");
+            assert_eq!(match_tiers(&notepad.cand(), "blocco note"), Some(0));
+            let ps = CatApp::new(
+                "{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}\\WindowsPowerShell\\v1.0\\powershell.exe",
+                "Windows PowerShell",
+                Keys::default(),
+                1,
+            );
+            assert_eq!(match_tiers(&ps.cand(), "terminal"), None, "terminal is no name of Windows PowerShell");
+            assert_eq!(match_tiers(&ps.cand(), "powershell"), Some(0));
+        });
+    }
+
+    #[test]
     fn hidden_keys_are_classified() {
         use crate::start_search::XML_KEYWORD_PENALTY as XML;
         let keys =
@@ -469,7 +538,6 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod fixtures {
     use super::*;
-    use crate::launcher::keywords::BILINGUAL;
     use crate::launcher::model::{CommandId, GlyphId, IconRef, ItemKey, Kind, Mode, NumberStyle, ProviderId, VerbSet};
 
     /// (English name, Italian name, folded id for the bilingual table, Windows synonyms).
@@ -502,8 +570,8 @@ mod fixtures {
         ("Character Map", "Mappa caratteri", "charmap.exe", NONE),
         ("Magnifier", "Lente di ingrandimento", "magnify.exe", NONE),
         ("On-Screen Keyboard", "Tastiera su schermo", "osk.exe", NONE),
-        ("Photos", "Foto", "microsoft.windows.photos_8wekyb3d8bbwe!app", NONE),
-        ("Camera", "Fotocamera", "microsoft.windowscamera_8wekyb3d8bbwe!app", NONE),
+        ("Photos", "Foto", "microsoft.windows.photos_8wekyb3d8bbwe!app", &[("gallery", 900)]),
+        ("Camera", "Fotocamera", "microsoft.windowscamera_8wekyb3d8bbwe!app", &[("webcam", 800)]),
         ("Clock", "Orologio", "microsoft.windowsalarms_8wekyb3d8bbwe!app", NONE),
         ("Mail", "Posta", "microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.mail", NONE),
         (
@@ -512,8 +580,8 @@ mod fixtures {
             "microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.calendar",
             NONE,
         ),
-        ("Maps", "Mappe", "microsoft.windowsmaps_8wekyb3d8bbwe!app", NONE),
-        ("Weather", "Meteo", "microsoft.bingweather_8wekyb3d8bbwe!app", NONE),
+        ("Maps", "Mappe", "microsoft.windowsmaps_8wekyb3d8bbwe!app", &[("navigation", 700)]),
+        ("Weather", "Meteo", "microsoft.bingweather_8wekyb3d8bbwe!app", &[("forecast", 600)]),
         ("Media Player", "Lettore multimediale", "microsoft.zunemusic_8wekyb3d8bbwe!microsoft.zunemusic", NONE),
         ("Sound Recorder", "Registratore di suoni", "microsoft.windowssoundrecorder_8wekyb3d8bbwe!app", NONE),
         ("Sticky Notes", "Note adesive", "microsoft.microsoftstickynotes_8wekyb3d8bbwe!app", NONE),
@@ -568,11 +636,18 @@ mod fixtures {
     fn pool(it: bool) -> Vec<Entry> {
         let mut v = Vec::new();
         for (i, (en, ita, id, keys)) in APPS.iter().enumerate() {
+            let name = Indexed::new(if it { ita } else { en });
+            // As `CatApp::new` builds it: the inbox entry's names, and its synonyms joining the keywords.
+            let inbox = keywords::inbox_for(id, &name.folded).map(|(_, e)| e);
+            let mut k = Keys::from(*keys);
+            for s in inbox.map_or(&[][..], |e| e.synonyms) {
+                k.push(s, 1);
+            }
             v.push(Entry {
                 en,
-                name: Indexed::new(if it { ita } else { en }),
-                keys: Keys::from(*keys),
-                extra: keywords::bilingual_for(id),
+                name,
+                keys: k.tidy(),
+                extra: inbox.map_or(&[][..], |e| e.names),
                 rank: i as u32,
                 kind: 0,
             });
@@ -613,6 +688,8 @@ mod fixtures {
             .map(|(i, t)| (pool[i].en, t))
     }
 
+    // L3 T5: every other-language name is a name (tiers 0-2), so the first answer of "map" and "vis" is the first of two
+    // equal tier-1 rows (the fixture's ranks are list positions).
     const ROWS: &str = "
 en|calculator|Calculator|0
 en|notepad|Notepad|0
@@ -684,7 +761,7 @@ it|sospendi|Sleep|0
 it|riavvia|Restart|0
 it|blocca|Lock|0
 it|menu finestra|Window menu|0
-en|calc|Calculator|1
+en|calc|Calculator|0
 en|task|Task Manager|1
 en|file|File Explorer|1
 en|control|Control Panel|1
@@ -706,7 +783,7 @@ en|cam|Camera|1
 en|clo|Clock|1
 en|cal|Calculator|1
 en|calen|Calendar|1
-en|map|Maps|1
+en|map|Character Map|1
 en|weat|Weather|1
 en|media|Media Player|1
 en|sound|Sound Recorder|1
@@ -716,7 +793,7 @@ en|resource|Resource Monitor|1
 en|perf|Performance Monitor|1
 en|microsoft e|Microsoft Edge|1
 en|microsoft s|Microsoft Store|1
-en|vis|Visual Studio Code|1
+en|vis|Event Viewer|1
 en|goo|Google Chrome|1
 en|fire|Firefox|1
 en|disc|Discord|1
@@ -741,82 +818,82 @@ en|task man|Task Manager|1
 en|note|Notepad|1
 en|adobe|Adobe Photoshop 2025|1
 en|rdp|Remote Desktop Connection|1
-en|mstsc|Remote Desktop Connection|1
-en|regedit|Registry Editor|1
-en|cmd|Command Prompt|1
-en|taskmgr|Task Manager|1
+en|mstsc|Remote Desktop Connection|0
+en|regedit|Registry Editor|0
+en|cmd|Command Prompt|0
+en|taskmgr|Task Manager|0
 en|defender|Windows Security|1
 en|browser|Microsoft Edge|1
-en|edge|Microsoft Edge|1
-en|explorer|File Explorer|1
-en|spegni|Shut down|1
-en|riavvia|Restart|1
-en|disconnetti|Sign out|1
-en|sospendi|Sleep|1
-en|blocca|Lock|1
-en|menu finestra|Window menu|1
-en|sposta|Window menu|1
-en|blocco note|Notepad|1
-en|esplora file|File Explorer|1
-en|calcolatrice|Calculator|1
-en|gestione attivita|Task Manager|1
-en|pannello di controllo|Control Panel|1
-en|impostazioni|Settings|1
-en|orologio|Clock|1
-en|fotocamera|Camera|1
-en|foto|Photos|1
-en|meteo|Weather|1
-en|posta|Mail|1
-en|mappe|Maps|1
-en|servizi|Services|1
-en|calendario|Calendar|1
-it|spegni|Shut down|1
-it|calc|Calculator|1
+en|edge|Microsoft Edge|2
+en|explorer|File Explorer|2
+en|spegni|Shut down|0
+en|riavvia|Restart|0
+en|disconnetti|Sign out|0
+en|sospendi|Sleep|0
+en|blocca|Lock|0
+en|menu finestra|Window menu|0
+en|sposta|Window menu|0
+en|blocco note|Notepad|0
+en|esplora file|File Explorer|0
+en|calcolatrice|Calculator|0
+en|gestione attivita|Task Manager|0
+en|pannello di controllo|Control Panel|0
+en|impostazioni|Settings|0
+en|orologio|Clock|0
+en|fotocamera|Camera|0
+en|foto|Photos|0
+en|meteo|Weather|0
+en|posta|Mail|0
+en|mappe|Maps|0
+en|servizi|Services|0
+en|calendario|Calendar|0
+it|spegni|Shut down|0
+it|calc|Calculator|0
 it|esplora|File Explorer|1
 it|blocco|Notepad|1
 it|pannello|Control Panel|1
-it|calculator|Calculator|1
-it|task manager|Task Manager|1
-it|notepad|Notepad|1
-it|settings|Settings|1
-it|file explorer|File Explorer|1
-it|command prompt|Command Prompt|1
-it|control panel|Control Panel|1
-it|shut down|Shut down|1
-it|photos|Photos|1
-it|weather|Weather|1
-it|clock|Clock|1
-it|mail|Mail|1
-it|camera|Camera|1
-it|calendar|Calendar|1
-it|maps|Maps|1
-it|remote desktop|Remote Desktop Connection|1
+it|calculator|Calculator|0
+it|task manager|Task Manager|0
+it|notepad|Notepad|0
+it|settings|Settings|0
+it|file explorer|File Explorer|0
+it|command prompt|Command Prompt|0
+it|control panel|Control Panel|0
+it|shut down|Shut down|0
+it|photos|Photos|0
+it|weather|Weather|0
+it|clock|Clock|0
+it|mail|Mail|0
+it|camera|Camera|0
+it|calendar|Calendar|0
+it|maps|Maps|0
+it|remote desktop|Remote Desktop Connection|0
 en|studio|Visual Studio Code|2
 en|studio code|Visual Studio Code|2
 en|code|Visual Studio Code|2
 en|manager|Task Manager|2
-en|monitor|Resource Monitor|2
-en|powershell|Windows PowerShell|1
-en|power|Windows PowerShell|2
+en|monitor|Resource Monitor|1
+en|powershell|Windows PowerShell|0
+en|power|Windows PowerShell|1
 en|shell|Windows PowerShell|2
 en|drive|OneDrive|2
-en|desktop|Remote Desktop Connection|2
+en|desktop|Remote Desktop Connection|1
 en|bash|Git Bash|2
 en|sched|Task Scheduler|2
 en|viewer|Event Viewer|2
 en|keyboard|On-Screen Keyboard|2
 en|recorder|Sound Recorder|2
 en|tool|Snipping Tool|2
-en|prompt|Command Prompt|2
+en|prompt|Command Prompt|1
 en|panel|Control Panel|2
 en|player|Media Player|2
 en|security|Windows Security|2
-en|store|Microsoft Store|1
+en|store|Microsoft Store|2
 en|chrome|Google Chrome|2
 en|photoshop|Adobe Photoshop 2025|2
 en|2025|Adobe Photoshop 2025|2
 en|notes|Sticky Notes|2
-en|menu|Window menu|2
+en|menu|Window menu|1
 en|desk rem|Remote Desktop Connection|2
 en|manager task|Task Manager|2
 en|explorer file|File Explorer|2
@@ -831,7 +908,7 @@ it|caratteri|Character Map|2
 it|risorse|Resource Monitor|2
 it|prestazioni|Performance Monitor|2
 it|pianificazione|Task Scheduler|2
-it|cattura|Snipping Tool|1
+it|cattura|Snipping Tool|2
 it|comandi|Command Prompt|2
 it|sicurezza|Windows Security|1
 it|remoto|Remote Desktop Connection|2
@@ -864,33 +941,39 @@ en|ntrol|Control Panel|4
 en|oto|Photos|4
 en|ager|Task Manager|4
 en|ntrol pa|Control Panel|4
-en|calcol|Calculator|5
-en|esplora|File Explorer|5
-en|blocco|Notepad|5
-en|pannello|Control Panel|5
-en|gestione|Task Manager|5
-en|impost|Settings|5
-en|fotoc|Camera|5
-en|prompt dei|Command Prompt|5
-en|strumento|Snipping Tool|5
-en|lettore|Media Player|5
+en|calcol|Calculator|1
+en|esplora|File Explorer|1
+en|blocco|Notepad|1
+en|pannello|Control Panel|1
+en|gestione|Task Manager|1
+en|impost|Settings|1
+en|fotoc|Camera|1
+en|prompt dei|Command Prompt|1
+en|strumento|Snipping Tool|1
+en|lettore|Media Player|1
 en|registratore|Sound Recorder|1
-en|registrator|Sound Recorder|5
-en|lente|Magnifier|5
-en|tastiera|On-Screen Keyboard|5
-en|mappa|Character Map|5
-en|visualizzatore|Event Viewer|5
-en|utilita|Task Scheduler|5
-en|sicurezza|Windows Security|5
-en|informazioni|System Information|5
-en|monitoraggio|Resource Monitor|5
-en|arre|Shut down|5
-en|riav|Restart|5
-en|sosp|Sleep|5
-en|discon|Sign out|5
-en|bloc|Notepad|5
-it|snipping|Snipping Tool|5
-it|sticky|Sticky Notes|5
+en|registrator|Sound Recorder|1
+en|lente|Magnifier|1
+en|tastiera|On-Screen Keyboard|1
+en|mappa|Character Map|1
+en|visualizzatore|Event Viewer|1
+en|utilita|Task Scheduler|1
+en|sicurezza|Windows Security|1
+en|informazioni|System Information|1
+en|monitoraggio|Resource Monitor|1
+en|arre|Shut down|1
+en|riav|Restart|1
+en|sosp|Sleep|1
+en|discon|Sign out|1
+en|bloc|Notepad|1
+it|snipping|Snipping Tool|1
+it|sticky|Sticky Notes|1
+en|brows|Microsoft Edge|5
+en|defen|Windows Security|5
+en|webc|Camera|5
+en|galle|Photos|5
+en|forec|Weather|5
+en|navig|Maps|5
 en|clacolatrice|Calculator|6
 en|notpead|Notepad|6
 en|calclator|Calculator|6
@@ -1012,26 +1095,6 @@ it|zzzz|-|0
         let long = "a".repeat(200);
         assert_eq!(match_fuzzy(&c, &long), None);
         assert_eq!(match_tiers(&c, &long), None);
-    }
-
-    #[test]
-    fn bilingual_table_is_folded_and_findable() {
-        assert!(BILINGUAL.len() >= 40);
-        let mut seen = std::collections::HashSet::new();
-        for &(key, words) in BILINGUAL.iter() {
-            assert_eq!(fold_str(key), key, "key {key}");
-            assert!(seen.insert(key), "duplicate {key}");
-            assert!(!words.is_empty());
-            for &w in words {
-                assert_eq!(fold_str(w), w, "keyword {w}");
-                assert_eq!(w.trim(), w);
-            }
-        }
-        assert!(keywords::bilingual_for("microsoft.windowscalculator_8wekyb3d8bbwe!app").contains(&"calcolatrice"));
-        assert!(keywords::bilingual_for("c:\\windows\\system32\\notepad.exe").contains(&"blocco note"));
-        assert!(keywords::bilingual_for("msteams_8wekyb3d8bbwe!msteams").contains(&"teams"));
-        assert!(keywords::bilingual_for("nothing.exe").is_empty());
-        assert!(keywords::bilingual_for("").is_empty());
     }
 
     // ------------------------------------------------------------ the destructive rule

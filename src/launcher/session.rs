@@ -1547,6 +1547,8 @@ mod tests {
     fn enter_after_a_late_batch_acts_on_the_selected_row() {
         let fx = Fx::new();
         let mut s = typed(&fx, "st");
+        // Steam, Sleep ("standby" is a name of it, L3 T5), Visual Studio Code.
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
         press(&mut s, &fx, VK_DOWN, Mods::NONE);
         assert_eq!(sel_title(&s), Some("Visual Studio Code"));
         let row = crate::launcher::providers::tests::file_row("studio.txt", FileClass::Other);
@@ -1784,7 +1786,7 @@ mod tests {
     fn click_on_a_row_that_just_moved_only_selects() {
         let fx = Fx::new();
         let mut s = typed(&fx, "ri");
-        assert_eq!(sel_title(&s), Some("Calcolatrice"));
+        assert_eq!(sel_title(&s), Some("Window menu"), "\"ridimensiona\" is one of its names (L3 T5)");
         s.pointer(10, 10, Some(0), 0);
         // A keystroke later the row under the resting pointer is Restart, of a new generation.
         s.chars("a", &fx.cx());
