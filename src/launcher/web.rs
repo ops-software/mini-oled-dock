@@ -64,6 +64,15 @@ impl Template {
 const SCHEME: &str = "https://";
 const HOLE: &str = "{q}";
 
+impl Default for Template {
+    /// Google, the default engine (5.6): the template `validate_template` makes of it (tested).
+    fn default() -> Self {
+        const GOOGLE: &str = "https://www.google.com/search?q={q}";
+        const HOST: &str = "www.google.com";
+        Template { text: GOOGLE.into(), host: SCHEME.len()..SCHEME.len() + HOST.len() }
+    }
+}
+
 /// https only; an ASCII host of letters, digits, hyphens and dots (an IDN host is written in its punycode form); no
 /// userinfo ("@" before the host); no port; exactly one {q}.
 pub fn validate_template(t: &str) -> Result<Template, &'static str> {
@@ -190,6 +199,8 @@ mod tests {
         assert_eq!(Engine::from_name("custom"), Some(Engine::Custom));
         assert_eq!(Engine::from_name("yahoo"), None);
         let g = validate_template(Engine::Google.template().unwrap()).unwrap();
+        assert_eq!(Template::default(), g);
+        assert_eq!(Template::default().host(), "www.google.com");
         assert_eq!(url_for(&g, "rust lang"), "https://www.google.com/search?q=rust%20lang");
     }
 

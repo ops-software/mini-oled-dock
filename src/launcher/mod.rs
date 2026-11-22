@@ -4,11 +4,13 @@
 #![allow(dead_code)]
 
 pub mod calc;
+pub mod catalog;
 pub mod commands;
 pub mod field;
 pub mod history;
 pub mod keywords;
 pub mod model;
+pub mod providers;
 pub mod query;
 pub mod rank;
 pub mod runline;
