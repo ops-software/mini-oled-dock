@@ -103,6 +103,8 @@ const FOCUS_RADIUS: i32 = 9;
 /// The panel keeps its height while keys come faster than this (`TIMER_LAUNCHER_SHRINK`, SPEC 5.3).
 const SHRINK_MS: u32 = 120;
 const VK_RETURN: u16 = 0x0D;
+/// Win+V opens Windows' clipboard history.
+const VK_V: u16 = 0x56;
 const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
 
 // ---------------------------------------------------------------- text runs and markers
@@ -623,6 +625,7 @@ impl Launcher {
                 | Effect::Copy(_)
                 | Effect::Power(_)
                 | Effect::WindowMenu
+                | Effect::ClipboardHistory
                 | Effect::OpenSettings) => {
                     self.queued.push(e);
                 }
@@ -782,6 +785,8 @@ impl Launcher {
                 }
                 Effect::Power(id) => sys.power(id),
                 Effect::WindowMenu => sys.window_menu(self.fg_at_open),
+                // Windows' own history: the dock sends the keys and reads nothing (plan L2 D8).
+                Effect::ClipboardHistory => sys.win_key(VK_V),
                 Effect::Copy(text) => sys.copy(&text),
                 Effect::OpenSettings => sys.open_settings(),
                 _ => {}
@@ -2293,6 +2298,8 @@ pub(crate) trait SysPort {
     fn close_launcher(&mut self);
     /// `SendInput` of these (vk, up) events, tagged `hook::INJECT_TAG`.
     fn inject(&mut self, keys: &[(u16, bool)]);
+    /// Win + `vk` pressed and released (`ui::send_win_key`: Win extended, every event tagged `hook::INJECT_TAG`).
+    fn win_key(&mut self, vk: u16);
     /// What a kept key types with the UI thread's keyboard layout and its recorded modifiers (`ToUnicodeEx`, keyboard
     /// state left unchanged).
     fn translate(&mut self, rec: &KeyRec) -> Typed;
@@ -3592,6 +3599,7 @@ mod tests {
         CloseLauncher,
         CloseQuiet,
         Inject(Vec<(u16, bool)>),
+        WinKey(u16),
         DeferClose(u32),
         Arm(usize, u32),
     }
@@ -3649,6 +3657,9 @@ mod tests {
         }
         fn inject(&mut self, keys: &[(u16, bool)]) {
             self.ops.push(Op::Inject(keys.to_vec()));
+        }
+        fn win_key(&mut self, vk: u16) {
+            self.ops.push(Op::WinKey(vk));
         }
         /// The fake layout: `scan` holds the character a key types (0: none, 0xFFFF: a dead key).
         fn translate(&mut self, rec: &KeyRec) -> Typed {
@@ -3867,6 +3878,9 @@ mod tests {
         }
         fn close_launcher(&mut self) {}
         fn inject(&mut self, _keys: &[(u16, bool)]) {}
+        fn win_key(&mut self, vk: u16) {
+            self.ops.push(format!("WinKey({vk:#x})"));
+        }
         fn translate(&mut self, _rec: &KeyRec) -> Typed {
             Typed::Key
         }
@@ -4276,6 +4290,26 @@ mod tests {
         key(&mut l, &fx, &mut sys, 0x41, Mods::CTRL);
         assert_ne!(key(&mut l, &fx, &mut sys, 0x43, Mods::CTRL), Reply::Close);
         assert_eq!(ops(&sys), ["Copy(calc)"]);
+    }
+
+    #[test]
+    fn clipboard_history_injects_after_restore() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // Win+V goes after the restore, so Windows' panel opens over (and pastes into) the window the user came from.
+        let mut l = typed(&fx, "clipboard");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE), Reply::Close);
+        assert!(ops(&sys).is_empty(), "nothing before the close: {:?}", sys.ops);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "Restore(0x7777)", "WinKey(0x56)"]);
+        // A chord over no window: nothing to restore, the panel still opens.
+        let mut l = typed(&fx, "cronologia appunti");
+        l.fg_at_open = 0;
+        let mut sys = EffectSys::default();
+        key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "WinKey(0x56)"]);
     }
 
     #[test]

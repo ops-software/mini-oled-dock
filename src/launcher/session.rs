@@ -34,6 +34,8 @@ pub enum Effect {
     Power(CommandId),
     /// The window menu of the window of the open, after the restore.
     WindowMenu,
+    /// Windows' clipboard history (Win+V) over the window of the open, after the restore (plan L2 D8).
+    ClipboardHistory,
     /// Settings > Launcher (L1b).
     OpenSettings,
     /// Forget a learned row (frecency, L1b).
@@ -1134,7 +1136,7 @@ fn review_text(item: &Item) -> Option<&str> {
     }
 }
 
-/// What a command row runs: power commands after the hide, the window menu after the restore.
+/// What a command row runs: power commands after the hide, the window menu and the clipboard history after the restore.
 fn command(id: CommandId) -> Vec<Effect> {
     match id {
         CommandId::Lock | CommandId::Sleep | CommandId::Restart | CommandId::ShutDown | CommandId::SignOut => {
@@ -1142,8 +1144,7 @@ fn command(id: CommandId) -> Vec<Effect> {
         }
         CommandId::Registry => launch(LaunchReq::Registry),
         CommandId::WindowMenu => vec![Effect::Hide { restore: true }, Effect::WindowMenu],
-        // L2-6.
-        CommandId::ClipboardHistory => Vec::new(),
+        CommandId::ClipboardHistory => vec![Effect::Hide { restore: true }, Effect::ClipboardHistory],
     }
 }
 
@@ -1339,6 +1340,24 @@ mod tests {
         // The window menu restores first too.
         let mut s = typed(&fx, "window menu");
         assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [Effect::Hide { restore: true }, Effect::WindowMenu]);
+    }
+
+    #[test]
+    fn clipboard_history_restores_first() {
+        // Windows' own history opens over the window the user came from: the hide with the restore, then Win+V.
+        let fx = Fx::new();
+        for q in ["clipboard", "cronologia appunti", "win+v", "clipboard history"] {
+            let mut s = typed(&fx, q);
+            let row = s.selected().unwrap();
+            assert_eq!(row.payload, Payload::Command(CommandId::ClipboardHistory), "{q}");
+            assert_eq!(row.icon, IconRef::Glyph(crate::launcher::model::GlyphId::Copy), "{q}");
+            assert!(!row.destructive, "{q}");
+            assert_eq!(
+                press(&mut s, &fx, VK_RETURN, Mods::NONE),
+                [Effect::Hide { restore: true }, Effect::ClipboardHistory],
+                "{q}"
+            );
+        }
     }
 
     #[test]

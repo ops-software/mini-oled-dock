@@ -436,12 +436,31 @@ pub fn foreground(fg: HWND) {
         WATCH.with(|w| w.set(None));
         return;
     }
+    let image = image_of(fg);
+    log!("launcher probe: foreground {image} after {ms} ms");
+}
+
+/// The exe file name of the process that owns `h` ("?" when it cannot be read); never a window title.
+fn image_of(h: HWND) -> String {
     let mut pid = 0u32;
     // SAFETY: `pid` is writable; a window that is gone leaves it 0.
-    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
     let path = if pid == 0 { None } else { crate::apps::exe_path_of_pid(pid) };
-    let image = path.as_deref().and_then(|p| p.rsplit(['\\', '/']).next()).unwrap_or("?");
-    log!("launcher probe: foreground {image} after {ms} ms");
+    path.as_deref().and_then(|p| p.rsplit(['\\', '/']).next()).unwrap_or("?").to_string()
+}
+
+/// Right before Win + `vk` is sent: for the Clipboard history command (Win+V) while the probe writes, the image of the
+/// window in front, which the restore gave the foreground back to (`win_key_sent` logs it).
+pub fn before_win_key(vk: u16) -> Option<String> {
+    // SAFETY: no preconditions.
+    (vk == 0x56 && probe_on()).then(|| image_of(unsafe { GetForegroundWindow() }))
+}
+
+/// After the Clipboard history command's Win+V (live check V-10): the image `before_win_key` read.
+pub fn win_key_sent(image: Option<String>) {
+    if let Some(image) = image {
+        log!("launcher probe: clipboard history injected, foreground {image} restored");
+    }
 }
 
 /// Ctrl+Shift+Enter: the hook's kb.time and the message's time (S-GESTURE: they must be equal).

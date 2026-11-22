@@ -389,6 +389,14 @@ impl SysPort for RealSys {
         }
     }
 
+    fn win_key(&mut self, vk: u16) {
+        #[cfg(feature = "owner-probe")]
+        let probe = crate::launcher_probe::before_win_key(vk);
+        crate::ui::send_win_key(VIRTUAL_KEY(vk));
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::win_key_sent(probe);
+    }
+
     fn translate(&mut self, rec: &KeyRec) -> Typed {
         let mut state = [0u8; 256];
         let mut down = |vks: &[VIRTUAL_KEY]| {

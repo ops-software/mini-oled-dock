@@ -2723,23 +2723,28 @@ pub fn open_notification_app(aumid: &str, app: &str) {
 
 /// Win + `vk` pressed and released with `dwExtraInfo = INJECT_TAG` (Win+N, Win+S, Win+R ...).
 pub fn send_win_key(vk: VIRTUAL_KEY) {
+    let inputs = win_key_inputs(vk);
+    // SAFETY: slice of 4 initialized INPUTs; cbSize = size_of::<INPUT>() as required.
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n != inputs.len() as u32 {
+        log!("SendInput(Win+N): {n}/{} events accepted", inputs.len());
+    }
+}
+
+/// The four events `send_win_key` sends: Win down (extended), `vk` down, `vk` up, Win up, every one tagged.
+pub(crate) fn win_key_inputs(vk: VIRTUAL_KEY) -> [INPUT; 4] {
     let ev = |vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: hook::INJECT_TAG },
         },
     };
-    let inputs = [
+    [
         ev(VK_LWIN, KEYEVENTF_EXTENDEDKEY),
         ev(vk, KEYBD_EVENT_FLAGS(0)),
         ev(vk, KEYEVENTF_KEYUP),
         ev(VK_LWIN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
-    ];
-    // SAFETY: slice of 4 initialized INPUTs; cbSize = size_of::<INPUT>() as required.
-    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if n != inputs.len() as u32 {
-        log!("SendInput(Win+N): {n}/{} events accepted", inputs.len());
-    }
+    ]
 }
 
 // ------------------------------------------------------------ context menu

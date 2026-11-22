@@ -225,7 +225,6 @@ pub enum CommandId {
     SignOut,
     Registry,
     WindowMenu,
-    #[allow(dead_code)] // L2-6: the Clipboard history command
     ClipboardHistory,
 }
 

@@ -1516,6 +1516,58 @@ mod tests {
         assert_eq!(repair_plan(true, false, false, false, LONG), ClearThenGo, "lone release lost on the secure desktop");
     }
 
+    /// L2-C1: the Clipboard history command sends Win+V through `ui::send_win_key`. Its four events, as this hook sees
+    /// them (injected, Win extended, every one tagged), pass untouched: none is swallowed, the Win-tap state that toggles
+    /// the dock or opens its Start stays unarmed, and the tracked modifiers do not change.
+    #[test]
+    fn tagged_win_v_passes_and_arms_nothing() {
+        use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT_FLAGS, LLKHF_UP};
+        // The filter is the callback's first step, so a tagged event changes no state; checked before `handle_key`
+        // runs, so a broken filter fails here and never reaches the Win branch's SendInput.
+        let src = include_str!("hook.rs");
+        let sig = "fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {";
+        let body = src.find(sig).map(|at| &src[at + sig.len()..]).unwrap();
+        let first: Vec<&str> = body.split_whitespace().take(6).collect();
+        assert_eq!(first, ["if", "!accepted(kb.flags.0,", "kb.dwExtraInfo)", "{", "return", "false;"]);
+        let state = || {
+            (
+                (WIN_DOWN.load(Relaxed), WIN_OTHER.load(Relaxed), WIN_VK.load(Relaxed), WIN_LAST_TIME.load(Relaxed)),
+                (LAST_ALONE_UP.load(Relaxed), WIN_DOUBLE.load(Relaxed)),
+                (MODS.load(Relaxed), MODS_LAST.load(Relaxed)),
+            )
+        };
+        let before = state();
+        let mut seen = Vec::new();
+        for (i, input) in crate::ui::win_key_inputs(VIRTUAL_KEY(0x56)).iter().enumerate() {
+            assert_eq!(input.r#type, INPUT_KEYBOARD);
+            // SAFETY: a keyboard input (checked above): `ki` is the union's live field.
+            let ki = unsafe { input.Anonymous.ki };
+            let up = ki.dwFlags.0 & KEYEVENTF_KEYUP.0 != 0;
+            let ext = ki.dwFlags.0 & KEYEVENTF_EXTENDEDKEY.0 != 0;
+            let mut flags = LLKHF_INJECTED.0;
+            if ext {
+                flags |= LLKHF_EXTENDED.0;
+            }
+            if up {
+                flags |= LLKHF_UP.0;
+            }
+            let kb = KBDLLHOOKSTRUCT {
+                vkCode: u32::from(ki.wVk.0),
+                scanCode: u32::from(ki.wScan),
+                flags: KBDLLHOOKSTRUCT_FLAGS(flags),
+                time: 10_000 + i as u32,
+                dwExtraInfo: ki.dwExtraInfo,
+            };
+            assert_eq!(kb.dwExtraInfo, INJECT_TAG, "event {i} is tagged");
+            assert!(!accepted(kb.flags.0, kb.dwExtraInfo), "event {i}: not a key of the user's");
+            assert!(!admitted(kb.flags.0, kb.dwExtraInfo, true), "event {i}: not even under the probe's switch");
+            assert!(!handle_key(if up { WM_KEYUP } else { WM_KEYDOWN }, &kb), "event {i} passes");
+            seen.push((kb.vkCode, up, ext));
+        }
+        assert_eq!(seen, [(0x5B, false, true), (0x56, false, false), (0x56, true, false), (0x5B, true, true)]);
+        assert_eq!(state(), before, "nothing armed, nothing tracked");
+    }
+
     // ------------------------------------------------------------------ the launcher chord
 
     use crate::launcher::field::KeyEvent;

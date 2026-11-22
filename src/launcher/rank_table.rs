@@ -137,6 +137,7 @@ const SETTINGS_IT: &[SetRow] = &[
     ("Visualizza impostazioni di sistema avanzate", &[], &["calcolatore", "computer"], 85),
     ("Mostra RAM del computer", &[], &["calcolatore", "memoria"], 88),
     ("Modifica l'aspetto e le prestazioni di Windows", &[], &["prestazioni"], 97),
+    ("Appunti", &[], &["appunti", "cronologia", "copia"], 230),
 ];
 
 /// One language's catalogues, built the way the dock builds them.
@@ -434,6 +435,8 @@ en|sosp|Sleep|y|
 en|disconnetti|Sign out|y|
 en|blocca|Lock|y|
 en|move|Window menu|y|
+en|clipboard|Clipboard history|y|W
+en|win+v|Clipboard history|y|
 en|2+2|answer 4|y|F0
 en|C:\Windows|path|y|F0
 en|ipconfig|run ipconfig|y|F0
@@ -498,6 +501,9 @@ it|lock|Blocca|y|W
 it|bloc|Blocco note|y|2:Blocca
 it|blocca|Blocca|y|
 it|menu finestra|Menu finestra|y|
+it|cronologia appunti|Cronologia degli appunti|y|
+it|clipboard|Cronologia degli appunti|y|W
+it|appunti|Cronologia degli appunti|y|8:Appunti
 it|3,5*2|answer 7|y|F0
 it|=10/4|answer 2,5|y|F0
 it|C:\Windows|path|y|F0
@@ -553,6 +559,26 @@ fn invariants() {
         crate::i18n::with_italian(ui == "it", || bad.extend(invariants_of(w, ui, raw)));
     }
     assert!(bad.is_empty(), "{} invariant failures:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// L2-C1: "appunti" names the Clipboard history command (a keyword is a name, L3 R1) and the setting "Appunti" alike:
+/// both at T_EXACT. With nothing learned the command leads by kind; once the setting is learned it leads (the learned
+/// boost comes before the kind inside a tier) and the command stays among the rows shown.
+#[test]
+fn appunti_ties_and_the_learned_row_leads() {
+    use super::model::ItemKey;
+    let mut w = World::new(true);
+    let tiers = |w: &World| -> Vec<(String, u8)> {
+        let s = crate::i18n::with_italian(true, || Shown::of(w, "appunti"));
+        s.rows.iter().filter(|r| r.from != ProviderId::Web).take(2).map(|r| (r.title.to_string(), r.score.tier)).collect()
+    };
+    let exact = rank::T_EXACT;
+    assert_eq!(tiers(&w), [("Cronologia degli appunti".to_string(), exact), ("Appunti".to_string(), exact)]);
+    let picked = w.learned.pick(ItemKey::of(ProviderId::Settings, "Appunti"), w.cx().now_unix, false);
+    assert!(picked);
+    let bad = crate::i18n::with_italian(true, || check(&w, "it", "appunti", "Appunti", "y", "8:Cronologia degli appunti"));
+    assert!(bad.is_empty(), "{bad:#?}");
+    assert_eq!(tiers(&w), [("Appunti".to_string(), exact), ("Cronologia degli appunti".to_string(), exact)]);
 }
 
 #[test]

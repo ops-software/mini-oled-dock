@@ -21,8 +21,7 @@ impl Command {
     }
 }
 
-/// L2 adds ClipboardHistory.
-pub static COMMANDS: [Command; 7] = [
+pub static COMMANDS: [Command; 8] = [
     Command {
         id: CommandId::Lock,
         en: "Lock",
@@ -79,6 +78,21 @@ pub static COMMANDS: [Command; 7] = [
         keywords: &["window menu", "menu finestra", "menu", "move", "size", "sposta", "ridimensiona", "finestra"],
         destructive: false,
     },
+    // Windows' own history (Win+V, plan L2 D8): the dock never reads it.
+    Command {
+        id: CommandId::ClipboardHistory,
+        en: "Clipboard history",
+        it: "Cronologia degli appunti",
+        keywords: &[
+            "clipboard history",
+            "cronologia degli appunti",
+            "clipboard",
+            "appunti",
+            "cronologia appunti",
+            "win+v",
+        ],
+        destructive: false,
+    },
 ];
 
 pub fn command(id: CommandId) -> Option<&'static Command> {
@@ -109,7 +123,7 @@ mod tests {
                 assert_eq!(folded(k), *k, "{:?}: keyword {k:?} is not folded", c.id);
             }
         }
-        // Every command but L2's Clipboard history is in the table once.
+        // Every command is in the table once.
         for id in [
             CommandId::Lock,
             CommandId::Sleep,
@@ -118,17 +132,29 @@ mod tests {
             CommandId::SignOut,
             CommandId::Registry,
             CommandId::WindowMenu,
+            CommandId::ClipboardHistory,
         ] {
             assert_eq!(COMMANDS.iter().filter(|c| c.id == id).count(), 1, "{id:?}");
             assert!(command(id).is_some());
         }
-        assert!(command(CommandId::ClipboardHistory).is_none());
         let wm = command(CommandId::WindowMenu).unwrap();
         for k in ["menu", "move", "size", "sposta", "ridimensiona", "finestra"] {
             assert!(wm.keywords.contains(&k), "{k}");
         }
         let reg = command(CommandId::Registry).unwrap();
         assert!(reg.keywords.contains(&"registry editor") && reg.keywords.contains(&"editor del registro"));
+    }
+
+    #[test]
+    fn clipboard_history_row() {
+        let c = command(CommandId::ClipboardHistory).unwrap();
+        assert_eq!((c.en, c.it), ("Clipboard history", "Cronologia degli appunti"));
+        for k in ["clipboard", "appunti", "cronologia appunti", "win+v"] {
+            assert!(c.keywords.contains(&k), "{k}");
+        }
+        assert!(!c.destructive, "it only opens a panel");
+        assert!(destructive_names(c.id).is_empty());
+        crate::i18n::with_italian(true, || assert_eq!(c.name(), "Cronologia degli appunti"));
     }
 
     #[test]

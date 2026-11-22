@@ -1419,14 +1419,14 @@ pub(crate) mod tests {
         fx.sync(&mut res, "st", 1);
         let titles: Vec<&str> = res.rows().iter().map(|r| &*r.title).collect();
         // "standby" is a name of Sleep (L3 T5), so it starts with "st" like Steam does.
-        assert_eq!(titles, ["Steam", "Sleep", "Visual Studio Code", "Restart", "Registry Editor"]);
+        assert_eq!(titles, ["Steam", "Sleep", "Visual Studio Code", "Restart", "Clipboard history", "Registry Editor"]);
         assert_eq!(res.selected().unwrap().title.as_ref(), "Steam");
         assert!(res.select_index(2), "the user moves to Visual Studio Code");
         let before = keys(&res);
         assert!(res.late(files(1, &["budget.ods", "studio.txt"]), 1));
         let after = keys(&res);
-        assert_eq!(after[..5], before[..], "no row at or above the selection moved");
-        assert_eq!(after.len(), 7);
+        assert_eq!(after[..6], before[..], "no row at or above the selection moved");
+        assert_eq!(after.len(), 8);
         assert_eq!(res.selected().unwrap().title.as_ref(), "Visual Studio Code", "Enter acts on the selected row");
         // Late rows go above the web row...
         fx.sync(&mut res, "stea", 2);
