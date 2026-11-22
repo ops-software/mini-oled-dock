@@ -480,6 +480,9 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             if wp.0 == windows::Win32::UI::WindowsAndMessaging::PBT_APMSUSPEND as usize {
                 popup::popup_launcher::on_suspend();
             }
+            if wp.0 == windows::Win32::UI::WindowsAndMessaging::PBT_APMRESUMEAUTOMATIC as usize {
+                popup::popup_launcher::on_resume();
+            }
             // TRUE grants the event.
             Some(LRESULT(1))
         }
@@ -513,6 +516,12 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         // the open's sequence.
         crate::msg::WM_DOCK_LAUNCHER_CLOSE => {
             popup::popup_launcher::on_deferred_close(wp.0 as u32);
+            Some(LRESULT(0))
+        }
+        // PowerToys (posted only while the chord is Alt+Space): wParam 0 a watched chord owner exited, 1-4 the notice's
+        // answer.
+        crate::msg::WM_DOCK_LAUNCHER_PT => {
+            popup::popup_launcher::on_pt_message(wp.0);
             Some(LRESULT(0))
         }
         // Registered only once a chord is set (`launcher_sys::watch_sessions`): lock and disconnects.

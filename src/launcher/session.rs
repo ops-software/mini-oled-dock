@@ -7,7 +7,7 @@
 use super::field::{Edit, FieldOut, KeyEvent, Motion, TextField};
 use super::gesture::{self, Gesture, Refusal};
 use super::model::{
-    Batch, CommandId, FileClass, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId, RunLine, Verb,
+    Batch, Choice, CommandId, FileClass, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId, RunLine, Verb,
 };
 use super::providers::{self, Budget, Context, LauncherOpts, Results};
 use super::query;
@@ -41,6 +41,8 @@ pub enum Effect {
     Forget(ItemKey),
     /// "Don't show again" on a notice row: the row has left the list; the host remembers the choice (L1b-5).
     DismissNotice(ItemKey),
+    /// A notice's choice (5.7): the row has left the list; the host acts on it.
+    Choose(Choice),
     /// Forget a run-history line.
     ForgetRun(Box<str>),
     /// Ask the files provider for this generation (L2).
@@ -184,10 +186,11 @@ pub struct Session {
     actions: Option<ActionList>,
 }
 
-/// One entry of the action list: a verb of the row, or the notice's own "Don't show again".
+/// One entry of the action list: a verb of the row, a notice's choice, or the notice's own "Don't show again".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
     Verb(Verb),
+    Choice(Choice),
     DontShowAgain,
 }
 
@@ -228,8 +231,13 @@ impl ActionList {
     }
 }
 
-/// The entries of the action list of `item`: `verbs_for`'s set in `VERBS` order, then the notice's own.
+/// The entries of the action list of `item`: `verbs_for`'s set in `VERBS` order, then the notice's own. A notice with
+/// choices lists them in place of its verb.
 fn action_entries(item: &Item) -> Vec<ActEntry> {
+    let entry = |act| ActEntry { act, enabled: true, danger: false, new_window: false };
+    if let (Kind::Notice, Payload::Choices(choices)) = (item.kind, &item.payload) {
+        return choices.iter().map(|c| entry(Act::Choice(*c))).chain([entry(Act::DontShowAgain)]).collect();
+    }
     let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
     let primary = verbs::primary(item.kind, running);
     let mut out: Vec<ActEntry> = verbs::VERBS
@@ -243,7 +251,7 @@ fn action_entries(item: &Item) -> Vec<ActEntry> {
         })
         .collect();
     if item.kind == Kind::Notice && item.verbs.has(Verb::Open) {
-        out.push(ActEntry { act: Act::DontShowAgain, enabled: true, danger: false, new_window: false });
+        out.push(entry(Act::DontShowAgain));
     }
     out
 }
@@ -757,6 +765,7 @@ impl Session {
         // The list opens on what Enter would do, so Ctrl+K and Enter repeat it.
         let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
         let primary = Act::Verb(verbs::primary(item.kind, running));
+        // A notice's choices: its first one (0).
         let sel = items.iter().position(|e| e.act == primary && e.enabled).unwrap_or(0);
         self.actions = Some(ActionList { row: item.key, items, sel, ring });
         vec![Effect::Relayout]
@@ -858,6 +867,7 @@ impl Session {
         let Some(item) = self.selected().filter(|i| i.key == row).cloned() else { return vec![Effect::Relayout] };
         let mut fx = match entry.act {
             Act::Verb(v) => self.run_verb(&item, v, cx),
+            Act::Choice(c) => self.choose(&item, c),
             Act::DontShowAgain => {
                 self.results.remove(item.key);
                 vec![Effect::DismissNotice(item.key)]
@@ -893,8 +903,8 @@ impl Session {
     /// Enter and its modifiers on the selected row (table 5.2.8).
     fn enter(&mut self, m: Mods, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
         let Some(item) = self.selected().cloned() else { return Vec::new() };
-        if self.replaying && item.destructive {
-            // Typed blind before the launcher showed: it stays selected for a real Enter.
+        if self.replaying && (item.destructive || item.kind == Kind::Notice) {
+            // Typed blind before the launcher showed: it stays selected for a real Enter (a notice's choice included).
             return Vec::new();
         }
         match m {
@@ -948,8 +958,15 @@ impl Session {
             Payload::RunLine(r) => launch(run_line(r)),
             Payload::Url(u) => launch(LaunchReq::Url(u.clone())),
             Payload::Path { path, .. } => launch(LaunchReq::OpenPath(path.clone())),
+            Payload::Choices(choices) => choices.first().map_or_else(Vec::new, |c| self.choose(item, *c)),
             Payload::None => Vec::new(),
         }
+    }
+
+    /// A notice's choice: the row leaves the list for the rest of this open, and the host acts on the choice.
+    fn choose(&mut self, item: &Item, c: Choice) -> Vec<Effect> {
+        self.results.remove(item.key);
+        vec![Effect::Choose(c), Effect::Relayout]
     }
 
     /// Shift+Enter: a new instance of an app, the raw value of an answer, a line in a console kept open.
@@ -2031,5 +2048,90 @@ mod tests {
         let b = Batch { gen: s.gen(), from: ProviderId::Files, items: Vec::new(), done: true };
         s.late(b, &fx.cx());
         assert!(s.action_list().is_none());
+    }
+
+    /// The PowerToys notice (5.7): Enter takes the chord, the list offers the three choices and Don't show again.
+    fn choices_notice() -> Item {
+        let mut n = notice(VerbSet::empty().with(Verb::Open));
+        n.payload = Payload::Choices(&[Choice::TakeChord, Choice::LeaveChord, Choice::UseAltShiftSpace]);
+        n
+    }
+
+    #[test]
+    fn a_notice_with_choices_runs_them_and_stays_gone() {
+        let fx = Fx::new();
+        // On the empty field the notice is the default: Enter takes the chord, and the row leaves for this open.
+        let mut s = open(&fx);
+        let n = choices_notice();
+        let key = n.key;
+        s.set_notices(vec![n.clone()]);
+        let _ = s.refresh(&fx.cx());
+        assert_eq!(sel_title(&s), Some("A notice"));
+        assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [Effect::Choose(Choice::TakeChord), Effect::Relayout]);
+        assert!(s.rows().iter().all(|r| r.key != key));
+        s.chars("z", &fx.cx());
+        assert!(s.rows().iter().all(|r| r.key != key), "a keystroke does not bring it back");
+        // The action list: the choices in order, then Don't show again; each runs once.
+        for (i, want) in [Choice::TakeChord, Choice::LeaveChord, Choice::UseAltShiftSpace].into_iter().enumerate() {
+            let mut s = open(&fx);
+            s.set_notices(vec![n.clone()]);
+            let _ = s.refresh(&fx.cx());
+            open_list(&mut s, &fx);
+            assert_eq!(
+                acts(&s),
+                [
+                    Act::Choice(Choice::TakeChord),
+                    Act::Choice(Choice::LeaveChord),
+                    Act::Choice(Choice::UseAltShiftSpace),
+                    Act::DontShowAgain
+                ]
+            );
+            assert_eq!(s.action_list().map(ActionList::sel), Some(0), "the list opens on what Enter does");
+            for _ in 0..i {
+                press(&mut s, &fx, VK_DOWN, Mods::NONE);
+            }
+            assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [Effect::Choose(want), Effect::Relayout]);
+            assert!(s.rows().iter().all(|r| r.key != key) && s.action_list().is_none());
+        }
+        // Don't show again: dismissed, and gone for the next keystrokes too.
+        let mut s = open(&fx);
+        s.set_notices(vec![n.clone()]);
+        let _ = s.refresh(&fx.cx());
+        open_list(&mut s, &fx);
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [Effect::DismissNotice(key), Effect::Relayout]);
+        s.chars("z", &fx.cx());
+        assert!(s.rows().iter().all(|r| r.key != key));
+    }
+
+    #[test]
+    fn a_notice_with_choices_never_takes_a_typed_enter() {
+        let fx = Fx::new();
+        // Typed text: the notice stays on top but the first match is the default, so Enter runs what was typed for.
+        let mut s = open(&fx);
+        s.set_notices(vec![choices_notice()]);
+        for c in "calcolatrice".chars() {
+            let mut b = [0u8; 4];
+            s.chars(c.encode_utf8(&mut b), &fx.cx());
+        }
+        assert_eq!(s.rows().first().map(|r| r.kind), Some(Kind::Notice));
+        assert_eq!(sel_title(&s), Some("Calcolatrice"));
+        let out = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert!(out.iter().any(|e| matches!(e, Effect::Launch(LaunchReq::App(_)))), "{out:?}");
+        // Picked by hand it still runs.
+        let mut s = open(&fx);
+        s.set_notices(vec![choices_notice()]);
+        s.chars("calcolatrice", &fx.cx());
+        press(&mut s, &fx, VK_UP, Mods::NONE);
+        assert_eq!(sel_title(&s), Some("A notice"));
+        assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), [Effect::Choose(Choice::TakeChord), Effect::Relayout]);
+        // An Enter typed blind before the launcher showed never chooses.
+        let mut s = open(&fx);
+        s.set_notices(vec![choices_notice()]);
+        let _ = s.refresh(&fx.cx());
+        assert_eq!(sel_title(&s), Some("A notice"));
+        let out = s.replay(&[ReplayKey::Key(k(VK_RETURN, Mods::NONE))], &fx.cx());
+        assert!(!out.iter().any(|e| matches!(e, Effect::Choose(_))), "{out:?}");
+        assert_eq!(sel_title(&s), Some("A notice"), "it stays for a real Enter");
     }
 }

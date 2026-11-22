@@ -85,6 +85,10 @@ pub const WM_DOCK_LAUNCHER_CLOSE: u32 = WM_APP + 26;
 /// the note was handled, a lost one included), then computes the pass flags again: a window can leave fullscreen
 /// without a foreground change.
 pub const WM_DOCK_LAUNCHER_PASSED: u32 = WM_APP + 27;
+/// PowerToys (SPEC-launcher 5.7), only while the chord is Alt+Space. wParam 0: a chord owner the launcher waits on exited
+/// (posted by the thread-pool wait of `launcher_sys`); 1-4: the answer to the PowerToys notice (posted by the launcher, so
+/// the config is written outside the popup's content). lParam = 0.
+pub const WM_DOCK_LAUNCHER_PT: u32 = WM_APP + 28;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
@@ -179,7 +183,8 @@ pub const TIMER_LAUNCHER_SAVE: usize = 36;
 pub const TIMER_LAUNCHER_RELEASE: usize = 37;
 /// 60 s one-shot after a launcher close: the files worker ends (L2).
 pub const TIMER_LAUNCHER_FILES_END: usize = 38;
-/// 60 s one-shot after the dock starts: PowerToys detection (L1b).
+/// 60 s one-shot after the chord becomes Alt+Space (the dock's start): PowerToys detection again; `ANSWER_MS`
+/// (`launcher::powertoys`) after a chord passed under YIELD: the end of its answer window (L1b-5).
 pub const TIMER_LAUNCHER_PT: usize = 39;
 
 // SETTINGS window timers (`DockSettings` hwnd; handled only by `settings_window`). Timer ids are per

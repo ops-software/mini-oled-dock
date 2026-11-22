@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK,
+    KillTimer, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use super::{center_y, Button, Content, HitMap, PopupKind, Reply};
@@ -26,13 +26,14 @@ use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::history;
 use crate::launcher::model::{
-    Batch, CommandId, GlyphId, IconRef, Item, ItemKey, KeyChord, Kind, Mode, Mods, NumberStyle, Payload, ProviderId,
-    ProviderMask, SettingRow, Verb, WindowRow,
+    Batch, Choice, CommandId, GlyphId, IconRef, Item, ItemKey, KeyChord, Kind, Mode, Mods, NumberStyle, Payload,
+    ProviderId, ProviderMask, SettingRow, Verb, WindowRow,
 };
+use crate::launcher::powertoys::{self, Pt, PtEvent, PtNotice, PtState};
 use crate::launcher::providers::{self, Budget, Context, LauncherOpts};
 use crate::launcher::query::{self, PrefixTable};
 use crate::launcher::runline;
-use crate::launcher::session::{Act, Effect, ReplayKey, Session};
+use crate::launcher::session::{Act, ActEntry, Effect, ReplayKey, Session};
 use crate::launcher::strings;
 use crate::launcher::style;
 use crate::launcher::verbs;
@@ -453,7 +454,11 @@ impl Launcher {
                 }
                 // Shift+Delete on an app, a setting or a command: its learned rank goes (`forget_runs`).
                 Effect::Forget(key) => self.unlearn.push(key),
-                // The notices' choice (L1b-5) and files (L2).
+                // The PowerToys notice's answer is applied on the dock window, outside this content (`on_pt_message`):
+                // the config is written there and the controller follows it.
+                Effect::Choose(c) => sys.pt_answer(answer_code(Some(c))),
+                Effect::DismissNotice(key) if key == pt_notice_key() => sys.pt_answer(answer_code(None)),
+                // Files (L2).
                 Effect::DismissNotice(_) | Effect::RequestFiles(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::Copy(_)
@@ -821,7 +826,17 @@ impl Launcher {
             let pad = m.px(ACTION_PAD);
             let item_h = m.px(style::ROW_COMPACT);
             let n = i32::try_from(list.items().len()).unwrap_or(0);
-            let (ow, oh) = (m.px(ACTION_W), 2 * pad + n * item_h);
+            // A notice's choices are long sentences: the list widens to show them whole, within the panel.
+            let longest = list
+                .items()
+                .iter()
+                .filter(|e| matches!(e.act, Act::Choice(_)))
+                .map(|e| s.text_width(act_face(e).0, Font::Normal) + m.px(ACTION_LABEL_X + ACTION_GLYPH_X) + 2 * pad)
+                .max()
+                .unwrap_or(0);
+            let room = w - m.px(style::HINT_RIGHT_INSET) - m.px(style::FIELD_X);
+            let ow = m.px(ACTION_W).max(longest.min(room));
+            let oh = 2 * pad + n * item_h;
             let (row_top, row_bottom) =
                 shown.iter().find(|r| Some(r.idx) == sel).map_or((top, top), |r| (r.rect.top, r.rect.bottom));
             let at =
@@ -1084,16 +1099,7 @@ impl Launcher {
             } else if lit {
                 s.plate(*rc, m.px(style::R_S), style::FILL_HOVER);
             }
-            let (label, glyph, chord) = match e.act {
-                Act::Verb(v) => {
-                    let spec = verbs::spec(v);
-                    let label = if e.new_window { strings::verb_new_window() } else { (spec.label)() };
-                    let chord =
-                        if e.new_window { Some(KeyChord { vk: VK_RETURN, mods: Mods::SHIFT }) } else { spec.chord };
-                    (label, spec.glyph, chord)
-                }
-                Act::DontShowAgain => (strings::verb_dont_show_again(), GlyphId::Info, None),
-            };
+            let (label, glyph, chord) = act_face(e);
             let name_alpha = if !e.enabled {
                 style::FG_DISABLED
             } else if lit {
@@ -1167,6 +1173,25 @@ fn overlay_top(row_top: i32, row_bottom: i32, h: i32, room: i32, min_top: i32, g
     (room - h).max(min_top)
 }
 
+/// The label, glyph and key name of an entry of the action list.
+fn act_face(e: &ActEntry) -> (&'static str, GlyphId, Option<KeyChord>) {
+    match e.act {
+        Act::Verb(v) => {
+            let spec = verbs::spec(v);
+            let label = if e.new_window { strings::verb_new_window() } else { (spec.label)() };
+            let chord = if e.new_window { Some(KeyChord { vk: VK_RETURN, mods: Mods::SHIFT }) } else { spec.chord };
+            (label, spec.glyph, chord)
+        }
+        // Enter runs a notice's first choice, Take Alt+Space (5.7).
+        Act::Choice(c @ Choice::TakeChord) => {
+            (strings::choice_label(c), GlyphId::Magnifier, Some(KeyChord { vk: VK_RETURN, mods: Mods::NONE }))
+        }
+        Act::Choice(c @ Choice::LeaveChord) => (strings::choice_label(c), GlyphId::Exit, None),
+        Act::Choice(c @ Choice::UseAltShiftSpace) => (strings::choice_label(c), GlyphId::Gear, None),
+        Act::DontShowAgain => (strings::verb_dont_show_again(), GlyphId::Info, None),
+    }
+}
+
 /// The right edge of the hint and of the names (physical px): the panel's width less HINT_RIGHT_INSET.
 fn hint_right(m: Metrics, width: i32) -> i32 {
     m.px(width) - m.px(style::HINT_RIGHT_INSET)
@@ -1193,6 +1218,13 @@ fn review_text(item: &Item) -> Option<&str> {
 
 /// The hint of the selected row: what Enter does (5.3).
 fn hint_for(item: &Item) -> Option<&'static str> {
+    if let (Kind::Notice, Payload::Choices(choices)) = (item.kind, &item.payload) {
+        return match choices.first() {
+            Some(Choice::TakeChord) => Some(strings::hint_pt_take()),
+            Some(_) => Some(strings::hint_open()),
+            None => None,
+        };
+    }
     let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
     let verb = verbs::primary(item.kind, running);
     if !item.verbs.has(verb) {
@@ -1435,6 +1467,7 @@ impl Content for Launcher {
     fn after_close(&mut self) {
         self.finish(&mut RealHook, &mut RealSys);
         self.housekeeping(&mut RealSys);
+        pt_closed(&mut RealHook, &mut RealSys);
     }
 
     fn launcher(&mut self) -> Option<&mut Launcher> {
@@ -1462,15 +1495,58 @@ fn new_launcher() -> Launcher {
         l
     });
     let mut l = made.unwrap_or_else(|| Launcher::with_session(Session::open(&LauncherOpts::default(), None)));
-    // The error of a launch refused while the launcher was away shows once, at this open.
-    if with_ctrl(|c| c.notice.take()).flatten().is_some() {
-        l.session.set_notices(vec![failure_row()]);
+    // The error of a launch refused while the launcher was away, and the PowerToys notice, show once, at this open.
+    let (failed, pt) = with_ctrl(|c| (c.notice.take(), c.pt.take_notice())).unwrap_or_default();
+    let notices: Vec<Item> = failed.map(|_| failure_row()).into_iter().chain(pt.map(pt_notice_row)).collect();
+    let noticed = !notices.is_empty();
+    if noticed {
+        l.session.set_notices(notices);
     }
-    if !l.session.query_text().is_empty() {
-        // The kept query's rows.
+    if noticed || !l.session.query_text().is_empty() {
+        // The kept query's rows, and the notices (on an empty field too).
         let _ = ctx(|cx| l.session.refresh(cx));
     }
     l
+}
+
+/// The key of the PowerToys notice (one row, whichever text it shows).
+fn pt_notice_key() -> ItemKey {
+    ItemKey::of(ProviderId::Apps, "powertoys")
+}
+
+/// The PowerToys notice rows (5.7): Command Palette also uses Alt+Space (Enter takes it, the action list holds the other
+/// choices), or it did not answer and the launcher took the chord (information only).
+fn pt_notice_row(n: PtNotice) -> Item {
+    let mut row = match n {
+        PtNotice::Shared => notice_row("powertoys", strings::pt_shared(), Some(strings::pt_turn_off())),
+        PtNotice::TookOver => notice_row("powertoys", strings::pt_took_over(), None),
+    };
+    if n == PtNotice::Shared {
+        row.verbs = crate::launcher::model::VerbSet::empty().with(Verb::Open);
+        row.payload = Payload::Choices(&[Choice::TakeChord, Choice::LeaveChord, Choice::UseAltShiftSpace]);
+    }
+    row
+}
+
+/// The wParam of `WM_DOCK_LAUNCHER_PT` for the notice's answer (None: Don't show again); 0 is a chord owner's exit.
+fn answer_code(a: Option<Choice>) -> usize {
+    match a {
+        Some(Choice::TakeChord) => 1,
+        Some(Choice::LeaveChord) => 2,
+        Some(Choice::UseAltShiftSpace) => 3,
+        None => 4,
+    }
+}
+
+/// The answer of a `WM_DOCK_LAUNCHER_PT` wParam; None for an exit (0) or an unknown value.
+fn answer_of(code: usize) -> Option<Option<Choice>> {
+    Some(match code {
+        1 => Some(Choice::TakeChord),
+        2 => Some(Choice::LeaveChord),
+        3 => Some(Choice::UseAltShiftSpace),
+        4 => None,
+        _ => return None,
+    })
 }
 
 /// Once, at the end of `popup::init`: the config's chord and options.
@@ -1483,6 +1559,7 @@ pub(crate) fn shutdown() {
     if REGISTERED.with(Cell::get) {
         crate::launcher_sys::unwatch_sessions();
     }
+    crate::launcher_sys::release_owner_waits();
 }
 
 /// One of the launcher's one-shot timers (`TIMER_LAUNCHER_*`) fired on the dock window (`launcher_sys::timer_window`):
@@ -1504,6 +1581,11 @@ pub(crate) fn on_timer(hwnd: HWND, id: usize) {
         }
         crate::msg::TIMER_LAUNCHER_SAVE => save_state(),
         crate::msg::TIMER_LAUNCHER_RELEASE => release_resident(),
+        crate::msg::TIMER_LAUNCHER_PT => {
+            if is_on() {
+                pt_timer(&mut RealHook, &mut RealSys);
+            }
+        }
         _ => {}
     }
 }
@@ -1875,6 +1957,16 @@ pub(crate) trait SysPort {
     /// Posts the close of the open of `seq` (`WM_DOCK_LAUNCHER_CLOSE`), to run outside the message being handled; false
     /// when the post failed.
     fn defer_close(&mut self, seq: u32) -> bool;
+    /// PowerToys (L1b-5): whether a chord owner runs now; the real port also waits on each one's exit.
+    fn chord_owners(&mut self) -> bool {
+        false
+    }
+    /// The window `h` belongs to a chord owner (the answer check).
+    fn owner_window(&self, _h: isize) -> bool {
+        false
+    }
+    /// Posts the PowerToys notice's answer to the dock window (`WM_DOCK_LAUNCHER_PT`, `answer_code`).
+    fn pt_answer(&mut self, _code: usize) {}
 }
 
 /// The proof of a person's Ctrl+Shift+Enter (SPEC 5.4.9), built only for that key: the hook's evidence is consumed by
@@ -2059,6 +2151,13 @@ struct Ctrl {
     failed_query: Option<String>,
     /// A refused launch that could not reopen the launcher: its notice row shows at the next open.
     notice: Option<LaunchKind>,
+    /// PowerToys (L1b-5, 5.7): the chord is Alt+Space, so Command Palette and PowerToys Run are looked for; the policy;
+    /// the one-shot 60 s check after the start has run.
+    pt_on: bool,
+    pt: Pt,
+    pt_late: bool,
+    /// The tick of the last look at the process list (0: none yet).
+    pt_scanned_ms: u64,
 }
 
 /// A catalogue older than this is listed again after a close.
@@ -2071,6 +2170,11 @@ const RELEASE_MS: u32 = 600_000;
 const SAVE_MS: u32 = 2_000;
 /// The first listing, this long after the dock starts or the chord is first set (`TIMER_LAUNCHER_WARM`).
 const WARM_MS: u32 = 10_000;
+/// PowerToys is checked again this long after the chord becomes Alt+Space (`TIMER_LAUNCHER_PT`, 5.7).
+const PT_LATE_MS: u32 = 60_000;
+/// While no chord owner runs, a close looks at the process list again at most this often (a look costs about 3 ms on
+/// the UI thread: one image query per process).
+const PT_RESCAN_MS: u64 = 30_000;
 
 /// The catalogue's listing: no icons (the rows ask for theirs), and what Start was sent is left alone.
 fn list_request() -> ShellRequest {
@@ -2123,6 +2227,10 @@ impl Ctrl {
             hidden_at_ms: 0,
             failed_query: None,
             notice: None,
+            pt_on: false,
+            pt: Pt::new(),
+            pt_late: false,
+            pt_scanned_ms: 0,
         }
     }
 
@@ -2136,6 +2244,13 @@ impl Ctrl {
         self.top_percent = c.top_percent;
         self.over_fullscreen_pass = c.over_fullscreen != "open";
         self.width = i32::from(c.width);
+        // Command Palette and PowerToys Run hold Alt+Space only: with another chord nothing of PowerToys is looked for.
+        self.pt_on = c.chord == "alt+space";
+        if !self.pt_on {
+            self.pt = Pt::new();
+            self.pt_late = false;
+        }
+        self.pt.configure(c.with_powertoys == "take", c.powertoys_done);
         if self.learn != c.learn {
             // Off: what was learned is forgotten and the files are deleted at the next open; on: they are read again.
             self.learn = c.learn;
@@ -2210,6 +2325,7 @@ pub(crate) fn on_config() {
                 super::close("launcher chord off");
             }
             let save = with_ctrl(Ctrl::chord_off).flatten();
+            crate::launcher_sys::release_owner_waits();
             start_search::release_settings_for(Holder::Launcher);
             if let Some(h) = crate::launcher_sys::timer_window() {
                 for id in crate::msg::TIMER_LAUNCHER_SHRINK..=crate::msg::TIMER_LAUNCHER_PT {
@@ -2224,7 +2340,27 @@ pub(crate) fn on_config() {
             log!("launcher: chord off");
         }
         (_, true) => {
-            with_ctrl(|c| c.configure(&cfg.launcher));
+            let pt = with_ctrl(|c| {
+                let was = c.pt_on;
+                c.configure(&cfg.launcher);
+                (was, c.pt_on)
+            });
+            match pt {
+                // Alt+Space: PowerToys is looked for now (the dock's start), and again 60 s later (it may start later
+                // at logon).
+                Some((false, true)) => {
+                    pt_check(&mut RealHook, &mut RealSys);
+                    crate::launcher_sys::arm_once(crate::msg::TIMER_LAUNCHER_PT, PT_LATE_MS);
+                }
+                Some((true, false)) => {
+                    crate::launcher_sys::release_owner_waits();
+                    if let Some(h) = crate::launcher_sys::timer_window() {
+                        // SAFETY: a timer of the dock window (same thread); killing one that is not armed fails harmlessly.
+                        let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_PT) };
+                    }
+                }
+                _ => {}
+            }
             // The flags of the window in front now, not at its next change.
             foreground_flow(&mut RealHook, &RealSys);
             if !was {
@@ -2247,16 +2383,154 @@ pub(crate) fn on_foreground(fg: HWND) {
     }
     #[cfg(feature = "owner-probe")]
     crate::launcher_probe::foreground(fg);
+    pt_foreground(fg.0 as isize, &RealSys);
     foreground_flow(&mut RealHook, &RealSys);
 }
 
-/// `WM_DOCK_LAUNCHER_YIELDED`: the chord pressed at `kb_time` passed under YIELD (another launcher answers it). In
-/// L1a only the probe watches it; the answer check comes with PowerToys detection (L1b-5).
+/// `WM_DOCK_LAUNCHER_YIELDED`: the chord pressed at `kb_time` passed under YIELD (Command Palette answers it): PowerToys
+/// is checked again and the chord's answer window opens (5.7).
 #[cfg_attr(not(feature = "owner-probe"), allow(unused_variables))]
 pub(crate) fn on_yielded(kb_time: u32) {
     let on = ON.with(Cell::get);
     #[cfg(feature = "owner-probe")]
     crate::launcher_probe::yielded(on.then_some(kb_time));
+    if on {
+        pt_passed(&mut RealHook, &mut RealSys);
+    }
+}
+
+/// `WM_DOCK_LAUNCHER_PT`: a chord owner the launcher waits on exited (0), or the PowerToys notice was answered (1-4).
+pub(crate) fn on_pt_message(code: usize) {
+    if !ON.with(Cell::get) {
+        return;
+    }
+    match answer_of(code) {
+        Some(answer) => apply_pt_answer(answer),
+        None => pt_check(&mut RealHook, &mut RealSys),
+    }
+}
+
+/// The PowerToys notice's answer, outside the content that showed it: the config keeps it (`powertoys_done` for every
+/// answer), and the controller follows the config at once.
+fn apply_pt_answer(answer: Option<Choice>) {
+    let saved = crate::config::modify(|cfg| {
+        let l = &mut cfg.launcher;
+        l.powertoys_done = true;
+        match answer {
+            Some(Choice::TakeChord) => l.with_powertoys = "take".into(),
+            Some(Choice::LeaveChord) => l.with_powertoys = "yield".into(),
+            Some(Choice::UseAltShiftSpace) => l.chord = "alt+shift+space".into(),
+            None => {}
+        }
+    });
+    match saved {
+        Ok(()) => {
+            log!("launcher: the PowerToys notice was answered ({kind:?})", kind = answer);
+            on_config();
+        }
+        Err(e) => log!("launcher: cannot save the PowerToys answer: {e}"),
+    }
+}
+
+/// A PowerToys check (5.7): at the start, 60 s later, after each close, at unlock and resume, at each passed chord and
+/// when a chord owner exits; only with the chord Alt+Space. The hook's flags follow the state (YIELD while it yields).
+fn pt_check(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+    if with_ctrl(|c| c.pt_on) != Some(true) {
+        return;
+    }
+    let running = sys.chord_owners();
+    let now = sys.now_ms();
+    let Some((before, after)) = with_ctrl(|c| {
+        c.pt_scanned_ms = now.max(1);
+        let before = c.pt.state();
+        c.pt.on(if running { PtEvent::Found } else { PtEvent::Gone });
+        (before, c.pt.state())
+    }) else {
+        return;
+    };
+    if before == PtState::Absent && after != PtState::Absent {
+        log!("launcher: PowerToys Command Palette runs ({kind:?})", kind = after);
+    } else if before != PtState::Absent && after == PtState::Absent {
+        log!("launcher: PowerToys Command Palette is gone, the chord is the launcher's");
+    }
+    if before != after || after != PtState::Absent {
+        foreground_flow(hook, sys);
+    }
+}
+
+/// After a close (the launcher hidden, off the open's path): with a chord owner running the hook may pass the chord
+/// again; with none, PowerToys may have started since the last look (at most every `PT_RESCAN_MS`).
+fn pt_closed(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+    let now = sys.now_ms();
+    let plan = with_ctrl(|c| {
+        let absent = c.pt.state() == PtState::Absent;
+        (c.pt_on, absent, now.saturating_sub(c.pt_scanned_ms) >= PT_RESCAN_MS)
+    });
+    match plan {
+        Some((true, true, true)) => pt_check(hook, sys),
+        Some((true, false, _)) => foreground_flow(hook, sys),
+        _ => {}
+    }
+}
+
+/// A chord passed under YIELD: its answer window opens for `ANSWER_MS` (`TIMER_LAUNCHER_PT`). Command Palette already
+/// in front counts as the answer (the chord closes it). The process list is looked at again first, unless it was looked
+/// at less than `PT_RESCAN_MS` ago (the owner's exit is waited on anyway): presses in a row cost no scan each.
+fn pt_passed(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+    let now = sys.now_ms();
+    if with_ctrl(|c| now.saturating_sub(c.pt_scanned_ms) >= PT_RESCAN_MS) == Some(true) {
+        pt_check(hook, sys);
+    }
+    let in_front = sys.owner_window(sys.foreground());
+    let watching = with_ctrl(|c| {
+        if !c.pt.yields() {
+            return false;
+        }
+        c.pt.on(PtEvent::PassedChord);
+        if in_front {
+            c.pt.on(PtEvent::OwnerAnswered);
+        }
+        c.pt.watching()
+    });
+    if watching == Some(true) {
+        sys.arm(crate::msg::TIMER_LAUNCHER_PT, powertoys::ANSWER_MS);
+    }
+}
+
+/// A foreground change while a passed chord waits for its answer: a chord owner's window is the answer.
+fn pt_foreground(fg: isize, sys: &dyn SysPort) {
+    if with_ctrl(|c| c.pt.watching()) == Some(true) && sys.owner_window(fg) {
+        with_ctrl(|c| c.pt.on(PtEvent::OwnerAnswered));
+    }
+}
+
+/// `TIMER_LAUNCHER_PT`: the end of an answer window (no answer came), and the one-shot check 60 s after the start (or at
+/// the end of the first answer window, which takes its timer).
+fn pt_timer(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+    let Some((unanswered, took, late_done)) = with_ctrl(|c| {
+        let watching = c.pt.watching();
+        if watching {
+            c.pt.on(PtEvent::NoAnswerIn400ms);
+        }
+        let n = match c.pt.state() {
+            PtState::Yield { unanswered } => u32::from(unanswered),
+            _ => u32::from(powertoys::MAX_UNANSWERED),
+        };
+        (watching.then_some(n), watching && c.pt.state() == PtState::Take, std::mem::replace(&mut c.pt_late, true))
+    }) else {
+        return;
+    };
+    if let Some(n) = unanswered {
+        let ms = powertoys::ANSWER_MS;
+        log!("launcher: Command Palette did not answer a passed chord in {ms} ms ({n} in a row)");
+    }
+    if took {
+        log!("launcher: Command Palette did not answer twice, the launcher takes the chord");
+        foreground_flow(hook, sys);
+    }
+    if !late_done {
+        pt_check(hook, sys);
+    }
 }
 
 /// `WM_DOCK_LAUNCHER_PASSED` (wParam the newest sequence the hook issued): the hook passed a chord under FULLSCREEN or
@@ -2285,11 +2559,13 @@ fn foreground_flow(hook: &mut dyn HookPort, sys: &dyn SysPort) {
     let over_pass = with_ctrl(|c| c.over_fullscreen_pass).unwrap_or(true);
     let d3d = sys.d3d_fullscreen();
     let fs = !d3d && over_pass && sys.fullscreen_foreground();
-    // REMOTE and YIELD come with their detection (L1b-6, L1b-5); the owner probe can force YIELD (S-PT).
+    // YIELD while Command Palette answers the chord (L1b-5), never while the launcher is open: its chord closes it.
+    let pt_yield = with_ctrl(|c| c.pt_on && c.pt.yields()).unwrap_or(false) && !sys.launcher_open();
+    // REMOTE comes with its detection (L1b-6); the owner probe can force YIELD (S-PT).
     #[cfg(feature = "owner-probe")]
-    let yield_ = crate::launcher_probe::force_yield();
+    let yield_ = pt_yield || crate::launcher_probe::force_yield();
     #[cfg(not(feature = "owner-probe"))]
-    let yield_ = false;
+    let yield_ = pt_yield;
     let flags = pass_flags(d3d, fs, over_pass, false, yield_);
     with_ctrl(|c| c.flags = flags);
     hook.pass(flags);
@@ -2299,6 +2575,16 @@ fn foreground_flow(hook: &mut dyn HookPort, sys: &dyn SysPort) {
 pub(crate) fn on_session_change(code: u32) {
     if ON.with(Cell::get) && matches!(code, WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT) {
         session_end(&mut RealHook, &mut RealSys);
+    }
+    if ON.with(Cell::get) && code == WTS_SESSION_UNLOCK {
+        pt_check(&mut RealHook, &mut RealSys);
+    }
+}
+
+/// `PBT_APMRESUMEAUTOMATIC`: PowerToys is checked again (it may have started or ended meanwhile).
+pub(crate) fn on_resume() {
+    if ON.with(Cell::get) {
+        pt_check(&mut RealHook, &mut RealSys);
     }
 }
 
@@ -2410,6 +2696,10 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
                 c.fg_at_open = fg;
                 c.window_ok = window_ok;
                 c.num = num;
+                // The first chord the dock sees while Command Palette runs opens with its notice (5.7).
+                if c.pt_on {
+                    c.pt.on(PtEvent::FirstChord);
+                }
             });
             sys.prepare_open();
             hook.shown(true);
@@ -2448,6 +2738,8 @@ pub(crate) enum PreviewScene {
     FieldPair,
     /// The action list open over a running app's row (opened by Ctrl+K, so the focus ring shows).
     Actions,
+    /// The PowerToys notice's action list: its three choices and Don't show again (5.7).
+    NoticeActions,
 }
 
 impl PreviewScene {
@@ -2466,6 +2758,7 @@ impl PreviewScene {
             "error" => PreviewScene::Error,
             "field_pair" => PreviewScene::FieldPair,
             "actions" => PreviewScene::Actions,
+            "notice_actions" => PreviewScene::NoticeActions,
             _ => return None,
         })
     }
@@ -2483,11 +2776,10 @@ pub(crate) fn preview_new(scene: PreviewScene) -> Box<dyn Content> {
 fn scene_launcher(scene: PreviewScene) -> Launcher {
     use crate::i18n::tr;
     use crate::launcher::catalog::CatApp;
-    use crate::launcher::model::{ItemKey, NumberStyle, Score, SettingRow, VerbSet, WindowRow};
+    use crate::launcher::model::{NumberStyle, SettingRow, WindowRow};
     use crate::launcher::providers::Context;
     use crate::launcher::rank;
     use crate::start_search::Keys;
-    use std::cmp::Reverse;
 
     let notepad = tr("Notepad", "Blocco note");
     let calc = tr("Calculator", "Calcolatrice");
@@ -2565,7 +2857,8 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::Run => "> ping 1.1.1.1",
         PreviewScene::RunReview => long_line,
         PreviewScene::Windows => "<",
-        PreviewScene::Notice => "zz",
+        // The PowerToys notice comes with the first chord: the field is still empty.
+        PreviewScene::Notice | PreviewScene::NoticeActions => "",
         PreviewScene::Error => "calc",
         PreviewScene::FieldPair => "",
     };
@@ -2576,27 +2869,14 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         let ctrl_k = KeyEvent { vk: 0x4B, mods: Mods::CTRL, repeat: false, sys: false };
         let _ = session.key(ctrl_k, None, &cx);
     }
-    if scene == PreviewScene::Notice {
-        let notice = Item {
-            key: ItemKey::of(ProviderId::Apps, "notice"),
-            from: ProviderId::Apps,
-            kind: Kind::Notice,
-            title: tr("PowerToys Command Palette also answers Alt+Space", "PowerToys Command Palette risponde anche ad Alt+Spazio").into(),
-            detail: Some(
-                tr(
-                    "Both launchers would open at once. Turn its Alt+Space shortcut off in PowerToys, or keep this launcher on Alt+Shift+Space.",
-                    "I due launcher si aprirebbero insieme. Disattiva la sua scorciatoia Alt+Spazio in PowerToys, oppure lascia questo launcher su Alt+Maiusc+Spazio.",
-                )
-                .into(),
-            ),
-            icon: IconRef::Glyph(GlyphId::Info),
-            score: Score { tier: 0, learned: Reverse(0), idle: true, kind: 0, rank: 0, len: 0 },
-            verbs: VerbSet::empty(),
-            payload: Payload::None,
-            destructive: false,
-        };
-        session.set_notices(vec![notice]);
-        session.chars("z", &cx);
+    if matches!(scene, PreviewScene::Notice | PreviewScene::NoticeActions) {
+        // The first chord the dock sees while Command Palette runs (5.7).
+        session.set_notices(vec![pt_notice_row(PtNotice::Shared)]);
+        let _ = session.refresh(&cx);
+    }
+    if scene == PreviewScene::NoticeActions {
+        let ctrl_k = KeyEvent { vk: 0x4B, mods: Mods::CTRL, repeat: false, sys: false };
+        let _ = session.key(ctrl_k, None, &cx);
     }
     if scene == PreviewScene::Error {
         // A refused launch that reopened the launcher over the same query (`reopen_with_error`).
@@ -2777,6 +3057,7 @@ mod tests {
         CloseQuiet,
         Inject(Vec<(u16, bool)>),
         DeferClose(u32),
+        Arm(usize, u32),
     }
 
     #[derive(Default)]
@@ -2788,6 +3069,10 @@ mod tests {
         is_open: bool,
         /// The window in front can take the window menu.
         menu_ok: bool,
+        /// A chord owner runs (the PowerToys check), and the window asked about is one of its; the looks so far.
+        owners: bool,
+        owner_fg: bool,
+        scans: u32,
         ops: Vec<Op>,
     }
 
@@ -2839,7 +3124,9 @@ mod tests {
         fn shell(&mut self, _r: ShellRequest) {}
         fn power(&mut self, _id: CommandId) {}
         fn open_settings(&mut self) {}
-        fn arm(&mut self, _id: usize, _ms: u32) {}
+        fn arm(&mut self, id: usize, ms: u32) {
+            self.ops.push(Op::Arm(id, ms));
+        }
         fn msg_time(&self) -> u32 {
             0
         }
@@ -2858,6 +3145,13 @@ mod tests {
         fn defer_close(&mut self, seq: u32) -> bool {
             self.ops.push(Op::DeferClose(seq));
             true
+        }
+        fn chord_owners(&mut self) -> bool {
+            self.scans += 1;
+            self.owners
+        }
+        fn owner_window(&self, _h: isize) -> bool {
+            self.owner_fg
         }
     }
 
@@ -3065,6 +3359,9 @@ mod tests {
         fn defer_close(&mut self, seq: u32) -> bool {
             self.ops.push(format!("DeferClose({seq})"));
             true
+        }
+        fn pt_answer(&mut self, code: usize) {
+            self.ops.push(format!("PtAnswer({code})"));
         }
     }
 
@@ -4171,6 +4468,7 @@ mod tests {
             "launcher_run_review",
             "launcher_windows",
             "launcher_notice",
+            "launcher_notice_actions",
             "launcher_error",
             "launcher_field_pair",
         ];
@@ -4219,5 +4517,140 @@ mod tests {
             }
         }
         crate::glyphs::set_scale(16);
+    }
+
+    // ---- L1b-5: PowerToys
+
+    /// The controller with the chord on Alt+Space and a chord owner in `state` (the notice not answered for Detected).
+    fn pt_ctrl(state: PtState) {
+        with_ctrl(|c| {
+            c.pt_on = true;
+            c.pt = Pt::new();
+            match state {
+                PtState::Absent | PtState::Detected => {}
+                PtState::Yield { .. } => c.pt.configure(false, true),
+                PtState::Take => c.pt.configure(true, true),
+            }
+            if state != PtState::Absent {
+                c.pt.on(PtEvent::Found);
+            }
+        });
+    }
+
+    fn pt_state() -> PtState {
+        with_ctrl(|c| c.pt.state()).unwrap()
+    }
+
+    fn yields(hook: &FakeHook) -> bool {
+        hook.passes.last().is_some_and(|f| f.has(PassFlags::YIELD))
+    }
+
+    #[test]
+    fn the_first_chord_over_command_palette_opens_the_notice_once() {
+        // Another chord: Command Palette is never looked for, and nothing changes.
+        with_ctrl(|c| c.pt.on(PtEvent::Found));
+        let (plan, _, _) = post(1, 1_000, 1, fresh());
+        assert_eq!(plan, OpenPlan::TryOpen);
+        assert_eq!(with_ctrl(|c| c.pt.take_notice()).unwrap(), None);
+        pt_ctrl(PtState::Detected);
+        // Detected: the hook still swallows the chord, so the dock sees the first one.
+        let mut hook = FakeHook::default();
+        foreground_flow(&mut hook, &fresh());
+        assert!(!yields(&hook));
+        let (plan, _, _) = post(2, 1_000, 2, fresh());
+        assert_eq!(plan, OpenPlan::TryOpen);
+        assert_eq!(pt_state(), PtState::Yield { unanswered: 0 });
+        // That open shows the notice first, selected on the empty field, with what Enter does.
+        let l = new_launcher();
+        let first = l.session.rows().first().unwrap();
+        assert_eq!(&*first.title, strings::pt_shared());
+        assert_eq!(first.detail.as_deref(), Some(strings::pt_turn_off()));
+        assert_eq!(l.session.selected().map(|i| i.key), Some(first.key));
+        assert_eq!(hint_for(first), Some(strings::hint_pt_take()));
+        // Once.
+        assert!(new_launcher().session.rows().is_empty());
+        // From now on the hook passes the chord, but never while the launcher is open (its chord closes it).
+        foreground_flow(&mut hook, &FakeSys { is_open: true, ..fresh() });
+        assert!(!yields(&hook));
+        foreground_flow(&mut hook, &fresh());
+        assert!(yields(&hook));
+    }
+
+    #[test]
+    fn passed_chords_are_watched_and_two_unanswered_take_the_chord() {
+        use crate::msg::TIMER_LAUNCHER_PT;
+        pt_ctrl(PtState::Yield { unanswered: 0 });
+        let mut hook = FakeHook::default();
+        let mut sys = FakeSys { owners: true, ..fresh() };
+        // A pass that Command Palette answers by coming to the front; the process list was looked at just now.
+        with_ctrl(|c| c.pt_scanned_ms = 1);
+        pt_passed(&mut hook, &mut sys);
+        assert_eq!(sys.ops, [Op::Arm(TIMER_LAUNCHER_PT, powertoys::ANSWER_MS)]);
+        assert_eq!(sys.scans, 0, "a press soon after a look costs no scan");
+        assert!(with_ctrl(|c| c.pt.watching()).unwrap());
+        pt_foreground(0x5005, &FakeSys { owner_fg: true, ..fresh() });
+        assert_eq!(pt_state(), PtState::Yield { unanswered: 0 });
+        pt_timer(&mut hook, &mut sys);
+        assert_eq!(pt_state(), PtState::Yield { unanswered: 0 }, "the window ends after the answer: nothing changes");
+        // Another program's window is no answer.
+        pt_passed(&mut hook, &mut sys);
+        pt_foreground(0x5005, &sys);
+        pt_timer(&mut hook, &mut sys);
+        assert_eq!(pt_state(), PtState::Yield { unanswered: 1 });
+        // Command Palette already in front when the chord passed (the chord closes it): answered.
+        pt_passed(&mut hook, &mut FakeSys { owners: true, owner_fg: true, ..fresh() });
+        assert_eq!(pt_state(), PtState::Yield { unanswered: 0 });
+        assert!(!with_ctrl(|c| c.pt.watching()).unwrap());
+        // Two unanswered in a row: the launcher takes the chord and says so at its next open.
+        for _ in 0..powertoys::MAX_UNANSWERED {
+            pt_passed(&mut hook, &mut sys);
+            pt_timer(&mut hook, &mut sys);
+        }
+        assert_eq!(pt_state(), PtState::Take);
+        assert!(!yields(&hook));
+        let l = new_launcher();
+        assert_eq!(l.session.rows().first().map(|r| &*r.title), Some(strings::pt_took_over()));
+        assert_eq!(l.session.selected(), None, "a notice without a choice is never the default");
+        // It exits: the chord is the launcher's.
+        pt_check(&mut hook, &mut FakeSys { owners: false, ..fresh() });
+        assert_eq!(pt_state(), PtState::Absent);
+        assert!(!yields(&hook));
+        // After a close: with nothing found, a look at most every PT_RESCAN_MS; with Command Palette running, only the
+        // hook's flags (its exit is waited on).
+        let mut sys = FakeSys { now: 20_000, ..fresh() };
+        pt_check(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 1);
+        sys.now += 1_000;
+        pt_closed(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 1, "too soon");
+        sys.now += PT_RESCAN_MS as u32;
+        sys.owners = true;
+        pt_closed(&mut hook, &mut sys);
+        assert_eq!((sys.scans, pt_state()), (2, PtState::Yield { unanswered: 0 }), "answered before: no notice");
+        let passes = hook.passes.len();
+        pt_closed(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 2);
+        assert!(hook.passes.len() > passes && yields(&hook), "the hook passes the chord again after the close");
+        // Off the Alt+Space chord no check runs.
+        with_ctrl(|c| c.pt_on = false);
+        pt_check(&mut hook, &mut sys);
+        pt_closed(&mut hook, &mut sys);
+        assert_eq!(sys.scans, 2);
+    }
+
+    #[test]
+    fn the_notice_answers_are_posted_to_the_dock_window() {
+        let fx = crate::launcher::providers::tests::Fx::new();
+        let mut l = typed(&fx, "");
+        let mut sys = EffectSys::default();
+        l.run(vec![Effect::Choose(Choice::TakeChord)], &fx.cx(), &mut sys);
+        l.run(vec![Effect::DismissNotice(pt_notice_key())], &fx.cx(), &mut sys);
+        l.run(vec![Effect::DismissNotice(ItemKey::of(ProviderId::Apps, "another"))], &fx.cx(), &mut sys);
+        assert_eq!(ops(&sys), ["PtAnswer(1)", "PtAnswer(4)"]);
+        for a in [Some(Choice::TakeChord), Some(Choice::LeaveChord), Some(Choice::UseAltShiftSpace), None] {
+            assert_eq!(answer_of(answer_code(a)), Some(a));
+        }
+        assert_eq!(answer_of(0), None, "0 is an exit");
+        assert_eq!(answer_of(5), None);
     }
 }

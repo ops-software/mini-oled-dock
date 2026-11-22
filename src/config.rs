@@ -436,7 +436,8 @@ pub struct LauncherConfig {
     pub enabled: bool,
     /// "off", "alt+space" or "alt+shift+space".
     pub chord: String,
-    /// "yield" or "take": what to do while another program answers the same chord.
+    /// "yield" or "take": what the chord does while PowerToys Command Palette or PowerToys Run runs (SPEC-launcher 5.7,
+    /// `launcher::powertoys`). Only with the chord "alt+space".
     pub with_powertoys: String,
     /// "pointer", "active" or "primary".
     pub monitor: String,
@@ -461,6 +462,9 @@ pub struct LauncherConfig {
     /// true once the one-time launcher offer in the Start menu (SPEC-launcher 5.2.1) was answered: a chord taken from
     /// it or "Don't show again". The offer is shown only while this is false and the chord is "off".
     pub offer_done: bool,
+    /// true once the launcher's PowerToys notice (SPEC-launcher 5.7) was answered: any choice, or "Don't show again". A
+    /// chord owner found later is then yielded to (or taken, with "take") without asking again.
+    pub powertoys_done: bool,
 }
 
 pub const LAUNCHER_TOP_PERCENT: (u8, u8, u8) = (10, 50, 24);
@@ -487,6 +491,7 @@ impl Default for LauncherConfig {
             web_engine: "google".into(),
             web_url: String::new(),
             offer_done: false,
+            powertoys_done: false,
         }
     }
 }
@@ -1177,7 +1182,10 @@ fn render(c: &Config) -> String {
     "enabled": {l_enabled},
     // The key chord that opens it: "off", "alt+space" or "alt+shift+space".
     "chord": {l_chord},
-    // When another program answers the same chord: "yield" (leave it) or "take" (the dock opens it).
+    // While PowerToys Command Palette or PowerToys Run runs and "chord" is "alt+space": "yield" lets Alt+Space reach
+    // it as long as it answers (after two presses in a row with no answer the launcher keeps the chord until it exits
+    // or the dock restarts); "take" keeps Alt+Space for the launcher (turn its shortcut off in PowerToys, or it may
+    // still open on some presses). The first Alt+Space the dock sees after finding it asks once.
     "with_powertoys": {l_with_powertoys},
     // Display the box opens on: "pointer", "active" or "primary".
     "monitor": {l_monitor},
@@ -1205,7 +1213,9 @@ fn render(c: &Config) -> String {
     "web_engine": {l_web_engine},
     "web_url": {l_web_url},
     // Internal: set once the launcher offer in Start was answered (a chord taken, or Don't show again). Leave as is.
-    "offer_done": {l_offer_done}
+    "offer_done": {l_offer_done},
+    // Internal: set once that PowerToys question was answered (any choice, or Don't show again). Leave as is.
+    "powertoys_done": {l_powertoys_done}
   }},
 
   // Internal: set once the notification-access prompt has been shown. Leave as is.
@@ -1273,6 +1283,7 @@ fn render(c: &Config) -> String {
         l_web_engine = js(&c.launcher.web_engine),
         l_web_url = js(&c.launcher.web_url),
         l_offer_done = c.launcher.offer_done,
+        l_powertoys_done = c.launcher.powertoys_done,
     )
 }
 
@@ -1806,6 +1817,7 @@ mod tests {
         let c = parse("{}").unwrap();
         assert_eq!(c.launcher.chord, "off");
         assert!(!c.launcher.offer_done && c.launcher.enabled);
+        assert!(!c.launcher.powertoys_done && c.launcher.with_powertoys == "yield");
         assert_eq!(c.launcher.chord_spec(), None);
         assert_eq!(c.launcher, LauncherConfig::default());
         let mut d = LauncherConfig::default();
@@ -1814,6 +1826,11 @@ mod tests {
         // the template with the defaults reads back as the defaults
         let r = render(&Config::default());
         assert_eq!(parse(&r).unwrap().launcher, LauncherConfig::default());
+        // the PowerToys answer (SPEC-launcher 5.7) is kept through the template
+        let mut c = Config::default();
+        c.launcher.with_powertoys = "take".into();
+        c.launcher.powertoys_done = true;
+        assert_eq!(parse(&render(&c)).unwrap().launcher, c.launcher);
     }
 
     fn sane(f: impl FnOnce(&mut LauncherConfig)) -> (LauncherConfig, Vec<String>) {

@@ -6,10 +6,13 @@
 //! here and nowhere else (lint 1).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+use std::cell::RefCell;
 use std::sync::atomic::Ordering::Relaxed;
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, POINT, WPARAM};
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_SDECIMAL, LOCALE_STHOUSAND};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
@@ -20,10 +23,16 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, RegisterWaitForSingleObject, UnregisterWaitEx,
+    WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WT_EXECUTEONLYONCE,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, GetKeyboardLayout, RegisterHotKey, SendInput, ToUnicodeEx, UnregisterHotKey, INPUT, INPUT_0,
@@ -33,12 +42,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime,
-    GetShellWindow, InternalGetWindowText, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW, SetTimer,
-    SC_KEYMENU, WM_CLOSE, WM_SYSCOMMAND,
+    GetShellWindow, GetWindowThreadProcessId, InternalGetWindowText, IsHungAppWindow, IsWindow, IsWindowVisible,
+    PostMessageW, SetTimer, SC_KEYMENU, WM_CLOSE, WM_SYSCOMMAND,
 };
 
 use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
 use crate::launcher::model::{CommandId, Mods, NumberStyle, WindowRow};
+use crate::launcher::powertoys;
 use crate::launcher::rank;
 use crate::launcher::session::LaunchReq;
 use crate::log;
@@ -481,6 +491,172 @@ impl SysPort for RealSys {
         }
         r.is_ok()
     }
+
+    fn chord_owners(&mut self) -> bool {
+        let pids = chord_owner_pids();
+        sync_owner_waits(&pids);
+        !pids.is_empty()
+    }
+
+    fn owner_window(&self, h: isize) -> bool {
+        is_owner_window(h)
+    }
+
+    fn pt_answer(&mut self, code: usize) {
+        // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
+        let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_LAUNCHER_PT, WPARAM(code), LPARAM(0)) };
+        if let Err(e) = r {
+            log!("launcher: posting the PowerToys answer failed: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- PowerToys (L1b-5, SPEC 5.7)
+
+/// A chord owner the dock waits on: its process, opened for SYNCHRONIZE, and the thread-pool wait that posts its exit.
+struct OwnerWait {
+    pid: u32,
+    process: HANDLE,
+    wait: HANDLE,
+}
+
+thread_local! {
+    /// UI thread only; empty while no chord owner runs (and always with a chord other than Alt+Space).
+    static OWNER_WAITS: RefCell<Vec<OwnerWait>> = const { RefCell::new(Vec::new()) };
+}
+
+/// At most this many chord owners are waited on (Command Palette and PowerToys Run, each perhaps twice in a restart).
+const MAX_OWNER_WAITS: usize = 4;
+
+/// The image of process `pid` is a chord owner (`powertoys::is_chord_owner`). Read-only: the process is opened with
+/// PROCESS_QUERY_LIMITED_INFORMATION and closed at once; its path is read into the stack (a path over 512 characters is
+/// not a PowerToys install and is skipped).
+fn image_is_owner(pid: u32) -> bool {
+    // SAFETY: OpenProcess has no preconditions; the handle is closed below.
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return false };
+    let mut buf = [0u16; 512];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` has `len` writable elements; `len` is in (capacity) and out (length written, no NUL).
+    let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) };
+    // SAFETY: the handle opened above, closed once.
+    let _ = unsafe { CloseHandle(process) };
+    ok.is_ok() && buf.get(..len as usize).is_some_and(powertoys::is_chord_owner)
+}
+
+/// The process ids of the running chord owners (5.7: by image name; PowerToys.exe alone never counts). One
+/// `EnumProcesses` and one image query per process; nothing of PowerToys is read.
+fn chord_owner_pids() -> Vec<u32> {
+    let mut pids = vec![0u32; 1024];
+    let mut bytes = 0u32;
+    loop {
+        let cap = u32::try_from(pids.len() * std::mem::size_of::<u32>()).unwrap_or(u32::MAX);
+        // SAFETY: `pids` has `cap` writable bytes; `bytes` receives the number of bytes written.
+        if unsafe { EnumProcesses(pids.as_mut_ptr(), cap, &mut bytes) }.is_err() {
+            log!("launcher: EnumProcesses failed");
+            return Vec::new();
+        }
+        if bytes < cap || pids.len() >= 1 << 16 {
+            break;
+        }
+        // Full: the list may be cut, so grow and ask again.
+        pids.resize(pids.len() * 2, 0);
+    }
+    pids.truncate(bytes as usize / std::mem::size_of::<u32>());
+    // SAFETY: no preconditions.
+    let me = unsafe { GetCurrentProcessId() };
+    pids.retain(|&pid| pid > 4 && pid != me && image_is_owner(pid));
+    pids.truncate(MAX_OWNER_WAITS);
+    pids
+}
+
+/// Thread-pool callback of a chord owner's exit: one post to the dock window, nothing else.
+unsafe extern "system" fn owner_exited(_context: *mut core::ffi::c_void, _timed_out: bool) {
+    let h = crate::hwnd();
+    if !h.0.is_null() {
+        // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
+        let _ = unsafe { PostMessageW(Some(h), crate::msg::WM_DOCK_LAUNCHER_PT, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// Ends one wait: the thread-pool wait first (blocking until a running callback, a single post, has returned), then the
+/// process handle it waited on.
+fn end_wait(w: OwnerWait) {
+    // SAFETY: `w.wait` came from RegisterWaitForSingleObject and is unregistered once; INVALID_HANDLE_VALUE waits for a
+    // callback in progress, so the process handle is no longer in use when it is closed.
+    if let Err(e) = unsafe { UnregisterWaitEx(w.wait, Some(INVALID_HANDLE_VALUE)) } {
+        log!("launcher: UnregisterWaitEx failed: {e}");
+    }
+    // SAFETY: the process handle opened by `sync_owner_waits`, closed once.
+    let _ = unsafe { CloseHandle(w.process) };
+}
+
+/// The waits follow `pids`: a wait whose process has ended (its pid may have been reused) or is no longer listed ends;
+/// a listed pid without a wait gets one (RegisterWaitForSingleObject: no poll, one post at the exit).
+fn sync_owner_waits(pids: &[u32]) {
+    OWNER_WAITS.with(|cell| {
+        let Ok(mut waits) = cell.try_borrow_mut() else { return };
+        let mut i = 0;
+        while let Some(w) = waits.get(i) {
+            // SAFETY: a process handle this list owns; a zero timeout only reads its state.
+            let ended = unsafe { WaitForSingleObject(w.process, 0) } == WAIT_OBJECT_0;
+            if ended || !pids.contains(&w.pid) {
+                end_wait(waits.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        for &pid in pids {
+            if waits.len() >= MAX_OWNER_WAITS || waits.iter().any(|w| w.pid == pid) {
+                continue;
+            }
+            // SAFETY: OpenProcess has no preconditions; the handle is owned by the wait below or closed.
+            let Ok(process) =
+                (unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+            else {
+                continue;
+            };
+            let mut wait = HANDLE::default();
+            // SAFETY: `wait` is writable; `process` stays open until the wait is unregistered (`end_wait`); the callback
+            // only posts a message.
+            let r = unsafe {
+                RegisterWaitForSingleObject(&mut wait, process, Some(owner_exited), None, INFINITE, WT_EXECUTEONLYONCE)
+            };
+            match r {
+                Ok(()) => waits.push(OwnerWait { pid, process, wait }),
+                Err(e) => {
+                    log!("launcher: RegisterWaitForSingleObject failed: {e}");
+                    // SAFETY: opened above, closed once.
+                    let _ = unsafe { CloseHandle(process) };
+                }
+            }
+        }
+    });
+}
+
+/// Every wait ends (the chord is off or not Alt+Space, or the dock exits): nothing of it stays.
+pub(crate) fn release_owner_waits() {
+    OWNER_WAITS.with(|cell| {
+        if let Ok(mut waits) = cell.try_borrow_mut() {
+            for w in std::mem::take(&mut *waits) {
+                end_wait(w);
+            }
+        }
+    });
+}
+
+/// The window `h` belongs to a chord owner: a process the dock waits on, or one whose image is an owner's.
+fn is_owner_window(h: isize) -> bool {
+    if h == 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale window only yields 0.
+    unsafe { GetWindowThreadProcessId(hw(h), Some(&mut pid)) };
+    if pid == 0 {
+        return false;
+    }
+    let waited = OWNER_WAITS.with(|cell| cell.try_borrow().is_ok_and(|w| w.iter().any(|w| w.pid == pid)));
+    waited || image_is_owner(pid)
 }
 
 /// The id of the probe's hotkey (the launcher's, "LA").

@@ -1,7 +1,7 @@
 //! Every user-visible string of the launcher: one function each, English and Italian through `i18n::tr`.
 //! Later tasks append theirs.
 
-use super::model::{KeyChord, Mods, ProviderId};
+use super::model::{Choice, KeyChord, Mods, ProviderId};
 use crate::i18n::tr;
 
 pub fn placeholder() -> &'static str {
@@ -153,6 +153,44 @@ pub fn offer_both_held() -> &'static str {
     tr("Another app holds Alt+Space and Alt+Shift+Space", "Un'altra app usa Alt+Spazio e Alt+Maiusc+Spazio")
 }
 
+// ---- PowerToys (5.7)
+/// The notice of the first chord the dock sees while Command Palette runs.
+pub fn pt_shared() -> &'static str {
+    tr(
+        "PowerToys Command Palette is running and also uses Alt+Space.",
+        "PowerToys Command Palette è attivo e usa anche Alt+Spazio.",
+    )
+}
+/// Its detail: what taking the chord leaves to do.
+pub fn pt_turn_off() -> &'static str {
+    tr(
+        "Turn its shortcut off in PowerToys > Command Palette, or Command Palette may still open on some presses",
+        "Disattiva la sua scorciatoia in PowerToys > Command Palette, o Command Palette potrebbe ancora aprirsi a volte",
+    )
+}
+/// The hint of that notice: Enter takes the chord.
+pub fn hint_pt_take() -> &'static str {
+    tr("Take Alt+Space · Enter", "Prendi Alt+Spazio · Invio")
+}
+/// The notice's choices in its action list.
+pub fn choice_label(c: Choice) -> &'static str {
+    match c {
+        Choice::TakeChord => tr("Take Alt+Space", "Prendi Alt+Spazio"),
+        Choice::LeaveChord => tr(
+            "Leave it to Command Palette until I turn its shortcut off",
+            "Lascialo a Command Palette finché non disattivo la sua scorciatoia",
+        ),
+        Choice::UseAltShiftSpace => tr("Use Alt+Shift+Space instead", "Usa invece Alt+Maiusc+Spazio"),
+    }
+}
+/// The notice after two passed chords that Command Palette did not answer.
+pub fn pt_took_over() -> &'static str {
+    tr(
+        "Command Palette is running but did not answer Alt+Space, so the launcher has it now",
+        "Command Palette è attivo ma non ha risposto ad Alt+Spazio, quindi ora lo usa il launcher",
+    )
+}
+
 // ---- refused launches (5.5.3)
 /// The error row of a launch that did not reach the desktop shell.
 pub fn launch_failed() -> &'static str {
@@ -201,5 +239,16 @@ mod tests {
         );
         assert_eq!(key_name(KeyChord { vk: 0x20, mods: Mods::ALT }), "Alt+Space");
         assert!(verb_new_window().len() > 3 && verb_dont_show_again().len() > 3);
+    }
+
+    #[test]
+    fn powertoys_strings_follow_the_spec() {
+        assert_eq!(pt_shared(), "PowerToys Command Palette is running and also uses Alt+Space.");
+        assert_eq!(choice_label(Choice::TakeChord), "Take Alt+Space");
+        assert_eq!(choice_label(Choice::LeaveChord), "Leave it to Command Palette until I turn its shortcut off");
+        assert_eq!(choice_label(Choice::UseAltShiftSpace), "Use Alt+Shift+Space instead");
+        assert!(pt_turn_off().starts_with("Turn its shortcut off in PowerToys > Command Palette"));
+        assert!(pt_took_over().ends_with("so the launcher has it now"));
+        assert_eq!(hint_pt_take(), "Take Alt+Space · Enter");
     }
 }

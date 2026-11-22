@@ -826,6 +826,8 @@ pub struct Results {
     late_len: usize,
     /// The query was in Mixed mode, where an executable file row is never the default.
     mixed: bool,
+    /// The field holds text: a notice's choice is never the default then, so Enter runs what was typed for.
+    typed: bool,
     notices: Vec<Item>,
 }
 
@@ -891,6 +893,7 @@ impl Results {
         self.rows.extend(web);
         self.gen = q.gen;
         self.mixed = q.mode == Mode::Mixed;
+        self.typed = !q.raw.is_empty();
         self.sel = keep.filter(|k| self.rows.iter().any(|r| r.key == *k)).or_else(|| self.default_key(q));
     }
 
@@ -901,7 +904,7 @@ impl Results {
     }
 
     fn may_default(&self, r: &Item) -> bool {
-        let blocked = self.mixed && is_executable_file(r);
+        let blocked = (self.mixed && is_executable_file(r)) || (self.typed && r.kind == Kind::Notice);
         !r.verbs.is_empty() && !blocked
     }
 
@@ -946,10 +949,11 @@ impl Results {
         true
     }
 
-    /// Takes a row out (a closed window, a forgotten line). The selection moves to the row that takes its place only
-    /// when that row may be the default and is not destructive (5.2.7): nobody chose it, and Enter runs what is
-    /// selected. Otherwise nothing is selected.
+    /// Takes a row out (a closed window, a forgotten line, an answered notice, which stays out for the rest of the open).
+    /// The selection moves to the row that takes its place only when that row may be the default and is not
+    /// destructive (5.2.7): nobody chose it, and Enter runs what is selected. Otherwise nothing is selected.
     pub fn remove(&mut self, key: ItemKey) -> Option<Item> {
+        self.notices.retain(|n| n.key != key);
         let i = self.rows.iter().position(|r| r.key == key)?;
         let item = self.rows.remove(i);
         if i < self.sync_len {

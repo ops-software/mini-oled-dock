@@ -250,6 +250,18 @@ pub enum FileClass {
     Other,
 }
 
+/// What a notice row with choices offers (5.7): Enter runs the first, the action list lists them all and then "Don't
+/// show again". The host acts on the choice (`Effect::Choose`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Choice {
+    /// "Take Alt+Space": `with_powertoys` "take".
+    TakeChord,
+    /// "Leave it to Command Palette until I turn its shortcut off": "yield", with the answer check.
+    LeaveChord,
+    /// "Use Alt+Shift+Space instead".
+    UseAltShiftSpace,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Payload {
     AppId(Box<str>),
@@ -270,6 +282,8 @@ pub enum Payload {
         dir: bool,
         class: FileClass,
     },
+    /// A notice's choices, the first one Enter's.
+    Choices(&'static [Choice]),
     None,
 }
 

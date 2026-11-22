@@ -108,6 +108,7 @@
     },
     "web_engine": "google",
     "web_url": "",
-    "offer_done": false
+    "offer_done": false,
+    "powertoys_done": false
   }
 }

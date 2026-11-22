@@ -10,6 +10,7 @@ pub mod gesture;
 pub mod history;
 pub mod keywords;
 pub mod model;
+pub mod powertoys;
 pub mod providers;
 pub mod query;
 pub mod rank;
