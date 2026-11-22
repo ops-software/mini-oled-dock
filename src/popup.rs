@@ -28,7 +28,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{MonitorFromRect, ScreenToClient, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -46,9 +46,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+// The launcher's additions (L1a-13), a group of their own.
+use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+
 // Child module via #[path]: this way main.rs does not need to declare it.
 #[path = "popup_app.rs"]
 pub(crate) mod popup_app;
+#[path = "popup_launcher.rs"]
+pub(crate) mod popup_launcher;
 #[path = "popup_start.rs"]
 pub(crate) mod popup_start;
 #[path = "popup_startmenu.rs"]
@@ -93,6 +98,8 @@ pub enum PopupKind {
     StartMenu = 10,
     /// Battery details of the BATTERY module (`popup_battery`).
     Battery = 11,
+    /// The launcher (`popup_launcher`, SPEC-launcher), opened by its chord.
+    Launcher = 12,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -787,6 +794,16 @@ fn make_content(
         PopupKind::Battery => crate::popup_battery::new(battery, crate::battery::power_mode()),
         PopupKind::Start => popup_start::new(),
         PopupKind::StartMenu => popup_startmenu::new(),
+        PopupKind::Launcher => popup_launcher::new(),
+    }
+}
+
+/// Name of the popup window while `kind` is shown: screen readers get the launcher's static name (SPEC 5.6), every
+/// other kind keeps the shared window's name.
+fn window_name_for(kind: PopupKind) -> &'static str {
+    match kind {
+        PopupKind::Launcher => crate::launcher::strings::window_name(),
+        _ => "Dock popup",
     }
 }
 
@@ -928,6 +945,12 @@ fn open(kind: PopupKind, anchor: Anchor) {
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
     // SHOWNA: activated only by `force_foreground`. Active before its AttachThreadInput, the popup would get
     // WA_INACTIVE from the merged input queues and close at once (first click lost when another app was in front).
+    if kind == PopupKind::Launcher {
+        // SAFETY: `hwnd` is our popup window (same thread); no state borrow is held.
+        if let Err(e) = unsafe { SetWindowTextW(hwnd, &HSTRING::from(window_name_for(kind))) } {
+            log!("popup: SetWindowTextW failed: {e}");
+        }
+    }
     // SAFETY: `hwnd` is our popup window.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
     store_rect(&ITEM_RECT, &anchor.item);
@@ -988,6 +1011,11 @@ fn close_inner(reason: &str) {
     if !hwnd.0.is_null() {
         // SAFETY: `hwnd` is our window; the state is not borrowed.
         let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        if o.kind == PopupKind::Launcher {
+            // The shared window gets its own name back once hidden.
+            // SAFETY: `hwnd` is our window; the state is not borrowed.
+            let _ = unsafe { SetWindowTextW(hwnd, w!("Dock popup")) };
+        }
     }
     o.content.after_close();
     let kind = o.kind;
@@ -1595,6 +1623,24 @@ mod tests {
             "20 - 32 < 0: never zero or negative"
         );
         assert_eq!(fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 10, bottom: 10 }, 16), (1, 1), "never zero");
+    }
+
+    #[test]
+    fn launcher_kind_makes_a_launcher_content() {
+        let c = make_content(
+            PopupKind::Launcher,
+            VolumeState::default(),
+            crate::net::NetInfo::default(),
+            crate::battery::BatteryStatus::NONE,
+        );
+        assert_eq!(c.kind(), PopupKind::Launcher);
+    }
+
+    #[test]
+    fn launcher_window_name() {
+        assert_eq!(window_name_for(PopupKind::Launcher), "Launcher");
+        assert_eq!(window_name_for(PopupKind::StartMenu), "Dock popup");
+        assert_eq!(window_name_for(PopupKind::Audio), "Dock popup");
     }
 
     #[test]

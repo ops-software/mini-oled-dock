@@ -932,7 +932,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Network => Some(ItemId::Network),
         PopupKind::Battery => Some(ItemId::Battery),
         PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
-        PopupKind::AppMenu => None,
+        PopupKind::AppMenu | PopupKind::Launcher => None,
     }
 }
 
