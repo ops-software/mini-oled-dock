@@ -458,7 +458,8 @@ pub struct LauncherConfig {
     pub web_engine: String,
     /// The search URL template of the "custom" engine, "" otherwise.
     pub web_url: String,
-    /// true once the owner answered the notice about another program using the chord.
+    /// true once the one-time launcher offer in the Start menu (SPEC-launcher 5.2.1) was answered: a chord taken from
+    /// it or "Don't show again". The offer is shown only while this is false and the chord is "off".
     pub offer_done: bool,
 }
 
@@ -1203,7 +1204,7 @@ fn render(c: &Config) -> String {
     // Web search: "google", "bing", "duckduckgo" or "custom" (then "web_url" is an https:// address with {{q}}).
     "web_engine": {l_web_engine},
     "web_url": {l_web_url},
-    // Internal: set once the notice about another program using the chord was answered.
+    // Internal: set once the launcher offer in Start was answered (a chord taken, or Don't show again). Leave as is.
     "offer_done": {l_offer_done}
   }},
 
