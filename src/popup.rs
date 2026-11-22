@@ -539,6 +539,18 @@ pub fn close(reason: &str) {
     close_inner(reason);
 }
 
+/// Whether a close the host applies (the bar hides or moves) reaches the open popup: the launcher is exempt (SPEC 5.2.1).
+fn host_close_applies(open: Option<PopupKind>) -> bool {
+    open != Some(PopupKind::Launcher)
+}
+
+/// `close` for the host's own closes (the bar hides or moves): a no-op while the launcher is open.
+pub fn close_unless_launcher(reason: &str) {
+    if host_close_applies(current()) {
+        close_inner(reason);
+    }
+}
+
 /// Opens popup `kind` centred on `c.work` (the launcher), first closing any other popup: the open path of `toggle`
 /// with the placement of `Centred`. false when nothing is shown (no popups, no surface, or the first render failed).
 // The launcher's chord flow (L1a-15) calls it; until then nothing does.
@@ -726,6 +738,10 @@ pub fn shutdown() {
     if let Some(h) = with(|st| st.hwnd).filter(|h| !h.0.is_null()) {
         // SAFETY: our window.
         let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
+        for id in LAUNCHER_TIMERS {
+            // SAFETY: our window; an id that is not armed fails harmlessly.
+            let _ = unsafe { KillTimer(Some(h), id) };
+        }
     }
     let Some((hwnd, registered)) = with(|st| {
         let r = (st.hwnd, st.registered);
@@ -1419,12 +1435,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_TIMER => {
-            match wp.0 {
-                TIMER_POPUP_ANIM => on_anim(hwnd),
-                TIMER_POPUP_TICK => on_tick(hwnd),
-                TIMER_POPUP_FOCUS => on_focus_retry(hwnd),
-                TIMER_POPUP_START_RELEASE => on_start_release(hwnd),
-                _ => {}
+            match (timer_owner(wp.0), wp.0) {
+                (TimerOwner::Launcher, id) => popup_launcher::on_timer(hwnd, id),
+                (TimerOwner::Host, TIMER_POPUP_ANIM) => on_anim(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_TICK) => on_tick(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_FOCUS) => on_focus_retry(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_START_RELEASE) => on_start_release(hwnd),
+                (TimerOwner::Host, _) => {}
             }
             LRESULT(0)
         }
@@ -1669,6 +1686,40 @@ fn on_anim(hwnd: HWND) {
 /// The popup window (0 = none), readable while the state is borrowed.
 static POPUP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// The launcher's one-shot timers on the popup window (msg.rs 34-39).
+const LAUNCHER_TIMERS: [usize; 6] = [
+    crate::msg::TIMER_LAUNCHER_SHRINK,
+    crate::msg::TIMER_LAUNCHER_WARM,
+    crate::msg::TIMER_LAUNCHER_SAVE,
+    crate::msg::TIMER_LAUNCHER_RELEASE,
+    crate::msg::TIMER_LAUNCHER_FILES_END,
+    crate::msg::TIMER_LAUNCHER_PT,
+];
+
+/// Who handles a `WM_TIMER` of the popup window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerOwner {
+    /// This module (fade, tick, focus retries, Start release); an unknown id is ignored here.
+    Host,
+    /// `popup_launcher::on_timer`.
+    Launcher,
+}
+
+fn timer_owner(id: usize) -> TimerOwner {
+    if LAUNCHER_TIMERS.contains(&id) {
+        TimerOwner::Launcher
+    } else {
+        TimerOwner::Host
+    }
+}
+
+/// The window the launcher's one-shots are armed on, created if needed, so they can be armed before the first open.
+// The launcher's timers (L1a-15, L1a-16) arm through it; until then nothing does.
+#[allow(dead_code)]
+pub(crate) fn popup_hwnd() -> Option<HWND> {
+    ensure_window()
+}
+
 /// Fires the content's `tick` once after about `ms` (re-arms the 1 s tick timer, which `close_inner`
 /// kills, so nothing outlives the popup). Only meaningful while a popup is open.
 pub(crate) fn tick_soon(ms: u32) {
@@ -1899,6 +1950,10 @@ pub(crate) fn tick_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::msg::{
+        TIMER_LAUNCHER_FILES_END, TIMER_LAUNCHER_PT, TIMER_LAUNCHER_RELEASE, TIMER_LAUNCHER_SAVE,
+        TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM,
+    };
     use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
 
     #[test]
@@ -2036,6 +2091,38 @@ mod tests {
         assert_eq!(retry_outcome(0, false, false), Retry::Stop, "another kind stays (the tick safety net remains)");
         assert!(popup_launcher::new().focus_lost_closes());
         assert!(!popup_start::new().focus_lost_closes());
+    }
+
+    #[test]
+    fn close_unless_launcher_keeps_the_launcher() {
+        assert!(!host_close_applies(Some(PopupKind::Launcher)), "the bar hides or moves: the launcher stays");
+        assert!(host_close_applies(Some(PopupKind::StartMenu)));
+        assert!(host_close_applies(Some(PopupKind::Audio)));
+        assert!(host_close_applies(None));
+    }
+
+    #[test]
+    fn launcher_timer_ids_forwarded() {
+        assert_eq!(
+            LAUNCHER_TIMERS,
+            [
+                TIMER_LAUNCHER_SHRINK,
+                TIMER_LAUNCHER_WARM,
+                TIMER_LAUNCHER_SAVE,
+                TIMER_LAUNCHER_RELEASE,
+                TIMER_LAUNCHER_FILES_END,
+                TIMER_LAUNCHER_PT
+            ]
+        );
+        for id in 34..=39 {
+            assert_eq!(timer_owner(id), TimerOwner::Launcher, "timer {id}");
+        }
+        for id in [TIMER_POPUP_ANIM, TIMER_POPUP_TICK, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE] {
+            assert_eq!(timer_owner(id), TimerOwner::Host, "timer {id}");
+        }
+        assert_eq!((TIMER_POPUP_ANIM, TIMER_POPUP_START_RELEASE), (30, 33));
+        assert_eq!(timer_owner(40), TimerOwner::Host);
+        assert_eq!(timer_owner(29), TimerOwner::Host);
     }
 
     #[test]

@@ -158,6 +158,20 @@ pub const TIMER_POPUP_FOCUS: usize = 32;
 /// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
 /// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
 pub const TIMER_POPUP_START_RELEASE: usize = 33;
+// The launcher's one-shots, also on the POPUP window: `popup::wnd_proc` forwards 34-39 to `popup_launcher::on_timer`,
+// which kills each before acting; `popup::shutdown` kills them all. None is armed while the chord is off.
+/// 120 ms one-shot while the launcher is open: the panel shrinks once no key came for that long.
+pub const TIMER_LAUNCHER_SHRINK: usize = 34;
+/// 10 s one-shot after the dock starts: the launcher's catalogue is listed.
+pub const TIMER_LAUNCHER_WARM: usize = 35;
+/// 2 s one-shot after a launcher close: its state files are saved.
+pub const TIMER_LAUNCHER_SAVE: usize = 36;
+/// 10 min one-shot after a launcher close: its settings rows are released.
+pub const TIMER_LAUNCHER_RELEASE: usize = 37;
+/// 60 s one-shot after a launcher close: the files worker ends (L2).
+pub const TIMER_LAUNCHER_FILES_END: usize = 38;
+/// 60 s one-shot after the dock starts: PowerToys detection (L1b).
+pub const TIMER_LAUNCHER_PT: usize = 39;
 
 // SETTINGS window timers (`DockSettings` hwnd; handled only by `settings_window`). Timer ids are per
 // HWND, so they could not clash with the dock window's private ones (`ui.rs`: 40, 41, 42), but 50 to

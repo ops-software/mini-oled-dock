@@ -58,8 +58,6 @@ pub(crate) fn new() -> Box<dyn Content> {
 pub(crate) fn init() {}
 
 /// One of the launcher's one-shot timers (`TIMER_LAUNCHER_*`) fired on the popup window: killed first.
-// `popup::wnd_proc` forwards the launcher's timer ids here from L1a-13f on.
-#[allow(dead_code)]
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
     // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
     let _ = unsafe { KillTimer(Some(hwnd), id) };

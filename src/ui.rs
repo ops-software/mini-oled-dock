@@ -735,7 +735,7 @@ fn follow_pointer() -> bool {
         return false;
     }
     // A popup or the picker anchored to the old position would be left behind.
-    popup::close("bar moved to the pointer display");
+    popup::close_unless_launcher("bar moved to the pointer display");
     picker_cancel("bar moved to the pointer display");
     if VISIBLE.load(Relaxed) {
         hide("bar moved to the pointer display", true);
@@ -1245,7 +1245,7 @@ fn on_vis_tick(h: HWND) {
         if a.to <= 0.0 {
             // A popup linked to the hide (Win with the Start menu open) goes away on the same frame.
             if popup::is_linked() {
-                popup::close("bar hidden (with Start)");
+                popup::close_unless_launcher("bar hidden (with Start)");
             }
             // Deferred by `hide` while the linked popup held the foreground; before the bar hides, which
             // could hand the foreground to a third window.
@@ -3040,7 +3040,7 @@ fn hide(reason: &str, now: bool) {
     let linked = !instant && crate::popup::is_linked();
     let prev = if linked { 0 } else { PREV_FG.swap(0, Relaxed) };
     if !linked {
-        crate::popup::close("dock hidden");
+        crate::popup::close_unless_launcher("dock hidden");
     }
     picker_cancel("dock hidden");
     if instant {
