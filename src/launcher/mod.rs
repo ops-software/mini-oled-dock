@@ -5,6 +5,8 @@
 
 pub mod field;
 pub mod model;
+pub mod query;
+pub mod rank;
 pub mod strings;
 pub mod style;
 pub mod verbs;
