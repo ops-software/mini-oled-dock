@@ -198,6 +198,9 @@ pub struct Args {
     /// `--start-apps`: the AppsFolder catalogue listed in a child of the dock, its arena on stdout
     /// (`shell_thread::run_apps_child`); combines with nothing.
     pub start_apps: bool,
+    /// `--start-settings`: the settings catalogue built in a child of the dock, its arena on stdout
+    /// (`start_search::run_settings_child`); combines with nothing.
+    pub start_settings: bool,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -249,6 +252,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--update-check" => a.update_check = true,
             "--update-fetch" => a.update_fetch = true,
             "--start-apps" => a.start_apps = true,
+            "--start-settings" => a.start_settings = true,
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
@@ -260,6 +264,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     if a.start_apps && flags > 1 {
         return Err("--start-apps cannot be combined with other arguments".into());
+    }
+    if a.start_settings && flags > 1 {
+        return Err("--start-settings cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
@@ -1082,6 +1089,11 @@ fn main() -> std::process::ExitCode {
     if args.start_apps {
         return std::process::ExitCode::from(shell_thread::run_apps_child().clamp(0, 255) as u8);
     }
+    // --start-settings: the settings catalogue built in a child of the dock (`start_search::ensure_settings_cache` and
+    // Start's load); stdout only, no data folder, logger, mutex or console.
+    if args.start_settings {
+        return std::process::ExitCode::from(start_search::run_settings_child().clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1295,11 +1307,14 @@ mod tests {
         let s = p(&[shell_thread::APPS_FLAG]).unwrap(); // the flag of the apps child (L3 T17)
         assert!(s.start_apps && !s.settings && !s.autostart && !s.update_fetch);
         assert!(!p(&["--autostart"]).unwrap().start_apps);
+        let s = p(&[start_search::SETTINGS_FLAG]).unwrap(); // the flag of the settings child (L3 T18)
+        assert!(s.start_settings && !s.start_apps && !s.settings && !s.autostart);
+        assert!(!p(&["--settings"]).unwrap().start_settings);
     }
 
     #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 16] = [
+        let bad: [&[&str]; 20] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1316,6 +1331,10 @@ mod tests {
             &["--settings", "--start-apps"],
             &["--start-apps", "--update-fetch"],
             &["--start-apps", "--start-apps"],
+            &["--start-settings", "--autostart"],
+            &["--settings", "--start-settings"],
+            &["--start-settings", "--start-apps"],
+            &["--start-settings", "--start-settings"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");

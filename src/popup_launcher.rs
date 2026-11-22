@@ -21,8 +21,8 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
-use crate::launcher::arena::{self, Arena, Caps, Kind as ArenaKind, SettingIn};
-use crate::launcher::catalog::{self, FoldedSettings, IconCache};
+use crate::launcher::arena::{self, Arena, Caps, CatalogView, Kind as ArenaKind, SettingIn};
+use crate::launcher::catalog::{self, IconCache};
 use crate::launcher::field::KeyEvent;
 use crate::launcher::frecency::Frecency;
 use crate::launcher::gesture::{self, Gesture};
@@ -44,7 +44,7 @@ use crate::launcher_sys::{RealHook, RealSys};
 use crate::log;
 use crate::render::Metrics;
 use crate::shell_thread::{IconPlan, LaunchKind, ShellRequest};
-use crate::start_search::{self, Holder, Setting};
+use crate::start_search;
 use crate::surface::{rect_wh, Font, Surface, WHITE};
 
 /// Height of the empty panel, the field alone (logical px, SPEC 5.2.3).
@@ -752,12 +752,9 @@ impl Launcher {
             sys.restore(self.fg_at_open);
         }
         let mut elevated = false;
-        // A setting's target comes from the list the controller holds next to the rows.
-        let held = with_ctrl(|c| c.setting_list.clone()).unwrap_or_default();
-        let setting = |i: u32| {
-            let s = held.get(usize::try_from(i).ok()?)?;
-            Some((s.target.to_string(), s.args.clone()))
-        };
+        // A setting's target and arguments come from the settings arena this open searched (its rows carry the entry
+        // index): it is still held here, and never replaced while the launcher is open.
+        let setting = |i: u32| with_ctrl(|c| setting_target(c.settings.as_ref()?, i)).flatten();
         if let Some(key) = self.learn.take() {
             with_ctrl(|c| c.learn_pick(key));
         }
@@ -1805,6 +1802,11 @@ pub(crate) fn on_timer(hwnd: HWND, id: usize) {
                 if with_ctrl(|c| c.warm_due()) == Some(true) {
                     ask_catalogue();
                 }
+                // The settings cache made sure of (built by a child when missing or stale), so the first open finds the
+                // rows at its first keystroke; only with the Settings provider on.
+                if with_ctrl(|c| warm_settings_due(&c.opts)) == Some(true) {
+                    start_search::ensure_settings_cache(false);
+                }
                 warm_window();
             }
         }
@@ -1940,7 +1942,6 @@ fn warm_window_due(popup_open: bool, opened: bool) -> bool {
 
 /// The warm timer makes sure of the settings cache only with the Settings provider on: otherwise the settings child would
 /// run after every start for nothing.
-#[allow(dead_code)] // the warm timer's settings-cache call (`start_search::ensure_settings_cache(false)`, L3 T18)
 fn warm_settings_due(opts: &LauncherOpts) -> bool {
     opts.mask.has(ProviderId::Settings)
 }
@@ -2035,25 +2036,44 @@ pub(crate) fn on_catalog(apps: Arc<Arena>) {
     }
 }
 
-/// `ShellEvent::StartSettings`: the settings list is built (or the launcher's rows of it); when the launcher holds it,
-/// they are taken now.
+/// `ShellEvent::StartSettings`: the settings cache file is good again (or Start's list came). An open launcher that holds
+/// no settings takes them now (new rows appear at the next keystroke, under the stability rule); one that holds them
+/// keeps what it has until it closes, so an Enter never meets an entry index of another file.
 pub(crate) fn on_settings_ready() {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::SettingsReady);
-    if is_on() && start_search::holds_settings(Holder::Launcher) {
-        fold_held_settings();
+    if !is_on() || super::current() != Some(PopupKind::Launcher) {
+        return;
+    }
+    if with_ctrl(|c| c.opts.mask.has(ProviderId::Settings) && c.settings.is_none()) == Some(true) {
+        take_settings();
     }
 }
 
-/// Takes the held settings list with the rows and keyword dictionary made of it on a settings thread (once per load:
-/// names and keywords are folded there, never here on the UI thread, L3 KEY-11). Not made yet: they come with a later
-/// `StartSettings` event.
-fn fold_held_settings() {
-    let Some((list, folded)) = start_search::launcher_settings() else { return };
-    with_ctrl(|c| {
-        c.settings = folded;
-        c.setting_list = list;
-    });
+/// The launcher's settings (L3 T18): the version 2 cache file, checked whole against the key the settings thread computed
+/// (the names, keywords and dictionaries were folded and indexed in the `--start-settings` child: nothing is built here on
+/// the UI thread, KEY-11). A missing file, or one that fails, is not used: the settings thread is asked to make it (rebuilt
+/// when there was one) at most once per open, so a file that keeps failing cannot loop children, and the rows join when
+/// `StartSettings` comes (5.4.7).
+fn take_settings() {
+    match crate::launcher_sys::read_settings() {
+        Ok(a) => {
+            with_ctrl(|c| c.settings = Some(a));
+        }
+        Err(miss) => {
+            let first = with_ctrl(|c| !std::mem::replace(&mut c.rebuild_asked, true)) == Some(true);
+            if let (true, Some(rebuild)) = (first, miss.rebuild()) {
+                start_search::ensure_settings_cache(rebuild);
+            }
+        }
+    }
+}
+
+/// The launch target and arguments of entry `i` of the held settings.
+fn setting_target(settings: &Arena, i: u32) -> Option<(String, Option<String>)> {
+    let i = usize::try_from(i).ok().filter(|&i| i < settings.len())?;
+    let (target, args) = settings.view().target(i);
+    (!target.is_empty()).then(|| (target.to_string(), args.map(str::to_string)))
 }
 
 /// `ShellEvent::LauncherIcons`: kept in the cache (at the size of the rows) and shown at once when the launcher is open.
@@ -2171,18 +2191,17 @@ fn release_resident() {
         return;
     }
     let _ = with_ctrl(|c| {
-        c.settings = Arc::default();
-        c.setting_list = Arc::default();
+        c.settings = None;
         c.windows = Vec::new();
         c.failed_query = None;
     });
-    start_search::release_settings_for(Holder::Launcher);
     crate::mem::released_data();
     log!("launcher: settings released");
 }
 
-/// What an open needs before its window shows (`SysPort::prepare_open`): the settings held (and folded when they are
-/// already loaded), the windows listed, the history asked for the first time, the catalogue listed when it has not been.
+/// What an open needs before its window shows (`SysPort::prepare_open`): the settings read from the cache file (with the
+/// Settings provider on), the windows listed, the history asked for the first time, the catalogue listed when it has not
+/// been.
 pub(crate) fn prepare_open() {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::PrepareOpen);
@@ -2191,9 +2210,12 @@ pub(crate) fn prepare_open() {
         // SAFETY: a timer of the dock window (same thread); killing an id that is not armed fails harmlessly.
         let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
     }
-    start_search::hold_settings(Holder::Launcher);
-    if with_ctrl(|c| c.settings.arena.is_empty()) == Some(true) {
-        fold_held_settings();
+    let settings = with_ctrl(|c| {
+        c.rebuild_asked = false;
+        c.opts.mask.has(ProviderId::Settings)
+    });
+    if settings == Some(true) {
+        take_settings();
     }
     let windows = crate::launcher_sys::window_rows();
     let (state, listed) = with_ctrl(|c| {
@@ -2472,14 +2494,13 @@ struct Ctrl {
     num: NumberStyle,
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
     apps: Arc<Arena>,
-    /// The settings arena, shared with `start_search`'s settings thread that made it.
-    settings: Arc<FoldedSettings>,
+    /// The settings arena of the cache file (`take_settings`), while the Settings provider is on.
+    settings: Option<Arena>,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
     /// What was picked (L1b-3): read by every keystroke, written 2 s after a close that changed it.
     frecency: Frecency,
-    /// The settings list the rows were folded from (the launch targets), and the icons kept between opens.
-    setting_list: Arc<Vec<Setting>>,
+    /// The icons kept between opens.
     icons: IconCache,
     /// The pixel size of the icons in `icons`: the size of the last open's rows.
     icon_px: u32,
@@ -2498,6 +2519,8 @@ struct Ctrl {
     /// only, at most until the next open or the release).
     hidden_at_ms: u64,
     failed_query: Option<String>,
+    /// This open asked the settings thread for the cache file already (at most once per open).
+    rebuild_asked: bool,
     /// A refused launch that could not reopen the launcher: its notice row shows at the next open.
     notice: Option<LaunchKind>,
     /// The PowerToys notice chose Alt+Shift+Space, another app holds it, and no launcher was open to say so: its notice
@@ -2569,11 +2592,10 @@ impl Ctrl {
             opts: LauncherOpts::default(),
             num: NumberStyle { decimal: '.', group: ',' },
             apps: Arc::default(),
-            settings: Arc::default(),
+            settings: None,
             windows: Vec::new(),
             history: Vec::new(),
             frecency: Frecency::new(),
-            setting_list: Arc::default(),
             icons: IconCache::default(),
             icon_px: style::ICON_M as u32,
             listed_at_ms: 0,
@@ -2585,6 +2607,7 @@ impl Ctrl {
             frec_dirty: false,
             hidden_at_ms: 0,
             failed_query: None,
+            rebuild_asked: false,
             notice: None,
             chord_held: false,
             pt_on: false,
@@ -2650,7 +2673,10 @@ impl Ctrl {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
         Context {
             apps: self.apps.view(),
-            settings: self.settings.arena.view(),
+            settings: match &self.settings {
+                Some(s) if self.opts.mask.has(ProviderId::Settings) => s.view(),
+                _ => CatalogView::default(),
+            },
             windows: &self.windows,
             history: &self.history,
             opts: &self.opts,
@@ -2689,7 +2715,6 @@ pub(crate) fn on_config() {
             }
             let save = with_ctrl(Ctrl::chord_off).flatten();
             crate::launcher_sys::release_owner_waits();
-            start_search::release_settings_for(Holder::Launcher);
             if let Some(h) = crate::launcher_sys::timer_window() {
                 for id in crate::msg::TIMER_LAUNCHER_SHRINK..=crate::msg::TIMER_LAUNCHER_PT {
                     // SAFETY: timers of the dock window (same thread); killing an id that is not armed fails harmlessly.
@@ -4463,8 +4488,7 @@ mod tests {
                 &[],
                 1,
             )]));
-            c.settings =
-                Arc::new(FoldedSettings { arena: crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]) });
+            c.settings = Some(crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]));
             c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
             c.history = vec!["ping 1.1.1.1".into()];
             c.last_query = Some("calc".into());
@@ -4475,11 +4499,10 @@ mod tests {
         };
         let empty = |c: &Ctrl| {
             c.apps.is_empty()
-                && c.settings.arena.is_empty()
+                && c.settings.is_none()
                 && c.windows.is_empty()
                 && c.icons.len() == 0
                 && c.history.is_empty()
-                && c.setting_list.is_empty()
                 && c.last_query.is_none()
                 && c.listed_at_ms == 0
                 && !c.dirty

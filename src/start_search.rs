@@ -4,9 +4,11 @@
 //! MEMORY: nothing here stays loaded longer than it is used. The app index is read for each
 //! catalog by the `--start-apps` child (the shell thread only when the child failed), whose arena
 //! carries only the few keywords of the installed apps (`take_app_index`, L3 T17). The typo
-//! rewrites (1.4 MB) are read from disk only for a query that finds nothing (`converted`). The settings catalog is kept packed (`Keys`, a shared target: its ~1500
-//! entries cost under 1 MB) while a Start menu is in use and freed with the rest of its data
-//! (`release_settings`, a minute after the last one closed).
+//! rewrites (1.4 MB) are read from disk only for a query that finds nothing (`converted`). The
+//! settings catalog is built by the `--start-settings` child into `cache\settings-catalog.bin` (one
+//! checked arena, L3 T18); Start keeps its list of it (`Keys`, a shared target: its ~1500 entries
+//! cost under 1 MB) while a Start menu is in use and frees it with the rest of its data
+//! (`release_settings`, a minute after the last one closed); the launcher maps the file at each open.
 //!
 //! APPS (`AppIndex`, read with each catalog in the `--start-apps` child):
 //!  * `appssynonyms.txt`: `*|<app name>\t*|<query>[:wux:...]\t<penalty>`, e.g. "rdp" for Remote
@@ -19,7 +21,7 @@
 //! exist only as the copy Windows Search unpacks in the user's profile: read as untrusted input
 //! (`datadir::read_file`: no reparse points, capped) and used only to rewrite the typed text.
 //!
-//! SETTINGS (`settings`, built by a background thread, see `load_settings`): the
+//! SETTINGS (`settings`, built by a child of the dock, see `load_settings` and `serve`): the
 //! catalog of the Settings app and of the Control Panel, `<Windows>\ImmersiveControlPanel\Settings\
 //! AllSystemSettings_*.xml`. Names and keywords are resource references, resolved in the Windows
 //! display language (`SHLoadIndirectString`). A setting opens through its page name
@@ -34,9 +36,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::HSTRING;
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -45,12 +47,11 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 use windows::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
 };
-use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
-};
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath, SHLoadIndirectString, KF_FLAG_DEFAULT};
 
-use crate::launcher::catalog::FoldedSettings;
+use crate::launcher::arena::{self, Caps, CatalogView, Kind as ArenaKind, Layout};
+use crate::launcher::catalog::encode_setting_list;
 use crate::log;
 
 /// Largest index file read.
@@ -476,204 +477,162 @@ pub(crate) struct Setting {
     pub args: Option<String>,
 }
 
-/// The settings catalog and, while the launcher holds it, the launcher's rows and keyword dictionary of it.
-#[derive(Default)]
-struct Held {
-    list: Option<Arc<Vec<Setting>>>,
-    /// Made from `list` off the UI thread (L3 KEY-11): by the thread that built the list when the launcher held it, else
-    /// by one `fold_for_launcher` thread. Dropped with the list and when the launcher lets the catalog go.
-    folded: Option<Arc<FoldedSettings>>,
-    /// A `fold_for_launcher` thread is running.
-    folding: bool,
+/// What one short-lived "start-settings" thread shares with the two callers it serves (L3 T18): Start (`load_settings`,
+/// `release_settings`) and the launcher (`ensure_settings_cache`). Each caller sets its flags, then starts the thread when
+/// none runs; the thread takes the flags at the start of each run and runs again while one is set when it ends, so a
+/// request that arrives during another caller's run is never lost. One static in the dock, one per test.
+struct Shared {
+    /// Start's list, decoded from the settings arena while Start holds the catalogue (`settings`).
+    list: Mutex<Option<Arc<Vec<Setting>>>>,
+    /// Start holds the catalogue (from `load_settings` to `release_settings`).
+    held: AtomicBool,
+    /// Asked of the thread: Start's list; the cache file made sure of; the cache file rebuilt whatever it holds.
+    start: AtomicBool,
+    ensure: AtomicBool,
+    rebuild: AtomicBool,
+    /// A settings thread runs (or is being started).
+    thread: AtomicBool,
 }
 
-static SETTINGS: Mutex<Held> = Mutex::new(Held { list: None, folded: None, folding: false });
-static SETTINGS_STARTED: AtomicBool = AtomicBool::new(false);
-
-fn held() -> std::sync::MutexGuard<'static, Held> {
-    SETTINGS.lock().unwrap_or_else(|p| p.into_inner())
+/// What one run of the settings thread serves: the flags it took.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Asked {
+    start: bool,
+    ensure: bool,
+    rebuild: bool,
 }
 
-/// The settings catalog; empty until `load_settings` has finished (and after `release_settings`).
+impl Shared {
+    const fn new() -> Shared {
+        Shared {
+            list: Mutex::new(None),
+            held: AtomicBool::new(false),
+            start: AtomicBool::new(false),
+            ensure: AtomicBool::new(false),
+            rebuild: AtomicBool::new(false),
+            thread: AtomicBool::new(false),
+        }
+    }
+
+    fn list(&self) -> std::sync::MutexGuard<'_, Option<Arc<Vec<Setting>>>> {
+        self.list.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A caller's request: its flags set first, then true when the caller must start the thread (none runs).
+    fn ask(&self, a: Asked) -> bool {
+        for (wanted, flag) in [(a.start, &self.start), (a.ensure, &self.ensure), (a.rebuild, &self.rebuild)] {
+            if wanted {
+                flag.store(true, SeqCst);
+            }
+        }
+        !self.thread.swap(true, SeqCst)
+    }
+
+    /// The start of a run: what it serves.
+    fn take(&self) -> Asked {
+        Asked {
+            start: self.start.swap(false, SeqCst),
+            ensure: self.ensure.swap(false, SeqCst),
+            rebuild: self.rebuild.swap(false, SeqCst),
+        }
+    }
+
+    /// The end of a run: true when the thread may exit. When something was asked meanwhile the thread takes itself back
+    /// and runs again (false); if a caller started a new thread in between, that one serves it and this one exits.
+    fn done(&self) -> bool {
+        self.thread.store(false, SeqCst);
+        let pending = self.start.load(SeqCst) || self.ensure.load(SeqCst) || self.rebuild.load(SeqCst);
+        !(pending && self.thread.compare_exchange(false, true, SeqCst, SeqCst).is_ok())
+    }
+
+    /// Start holds the catalogue: true when its list is not there yet (the thread is asked for it).
+    fn hold(&self) -> bool {
+        self.held.store(true, SeqCst);
+        self.list().is_none()
+    }
+
+    /// Start lets the catalogue go: its list is dropped (after the lock).
+    fn release(&self) {
+        self.held.store(false, SeqCst);
+        let old = self.list().take();
+        drop(old);
+    }
+
+    /// Start's list goes in only while Start holds the catalogue, decided under the lock `release_settings` clears it with
+    /// (a release during the decode keeps nothing). What is not kept is dropped by the caller, after the lock.
+    fn store_start(&self, list: &mut Option<Vec<Setting>>) -> bool {
+        let mut slot = self.list();
+        if !self.held.load(SeqCst) {
+            return false;
+        }
+        *slot = list.take().map(Arc::new);
+        true
+    }
+}
+
+static SHARED: Shared = Shared::new();
+
+/// The settings catalog; empty until the settings thread has decoded it for Start (and after `release_settings`).
 pub(crate) fn settings() -> Arc<Vec<Setting>> {
-    held().list.clone().unwrap_or_default()
+    SHARED.list().clone().unwrap_or_default()
 }
 
-/// A built list goes in (taken), with the launcher's rows of it when they were made and the launcher still holds the
-/// catalog (`launcher`); nothing when the catalog was released meanwhile (`started` false). What is not taken is
-/// dropped by the caller, after the lock. True when the list was kept.
-fn store_built(
-    h: &mut Held,
-    list: &mut Option<Arc<Vec<Setting>>>,
-    folded: &mut Option<Arc<FoldedSettings>>,
-    started: bool,
-    launcher: bool,
-) -> bool {
-    if !started {
-        return false;
-    }
-    h.list = list.take();
-    h.folded = if launcher { folded.take() } else { None };
-    true
-}
-
-/// What the launcher's ask finds: the list with its rows, a list to fold (this ask starts the one fold), or nothing yet.
-enum LauncherAsk {
-    Ready(Arc<Vec<Setting>>, Arc<FoldedSettings>),
-    Fold(Arc<Vec<Setting>>),
-    Wait,
-}
-
-fn launcher_ask(h: &mut Held) -> LauncherAsk {
-    match (&h.list, &h.folded) {
-        (Some(l), Some(f)) => LauncherAsk::Ready(l.clone(), f.clone()),
-        (Some(l), None) if !h.folding => {
-            h.folding = true;
-            LauncherAsk::Fold(l.clone())
-        }
-        _ => LauncherAsk::Wait,
-    }
-}
-
-/// What a launcher fold does when it ends: its rows were kept (the launcher is told), it folds the list that replaced its
-/// own next, or it ends with nothing kept.
-enum FoldNext {
-    Posted,
-    Again(Arc<Vec<Setting>>),
-    Done,
-}
-
-/// A launcher fold of `list` ended: its rows are kept (taken) when `list` is still the held one, the launcher still
-/// holds it (`launcher`) and no rows came meanwhile; when another list without rows replaced it, that one is folded
-/// next. Rows not taken are dropped by the caller, after the lock.
-fn fold_done(
-    h: &mut Held,
-    list: &Arc<Vec<Setting>>,
-    folded: &mut Option<Arc<FoldedSettings>>,
-    launcher: bool,
-) -> FoldNext {
-    if launcher && h.folded.is_none() {
-        match &h.list {
-            Some(l) if Arc::ptr_eq(l, list) => {
-                h.folded = folded.take();
-                h.folding = false;
-                return FoldNext::Posted;
-            }
-            Some(l) => return FoldNext::Again(l.clone()),
-            None => {}
-        }
-    }
-    h.folding = false;
-    FoldNext::Done
-}
-
-/// `who` let the catalog go and `left` holders remain: with none left the list goes; the launcher's rows go with the
-/// launcher's hold.
-fn release_step(h: &mut Held, who: Holder, left: u8) {
-    if left == 0 {
-        h.list = None;
-    }
-    if left == 0 || who == Holder::Launcher {
-        h.folded = None;
-    }
-}
-
-/// The launcher's settings: the held list with the rows and keyword dictionary made of it. When the list is there
-/// without them, one short-lived thread makes them and posts `StartSettingsReady`: the UI thread never folds.
-pub(crate) fn launcher_settings() -> Option<(Arc<Vec<Setting>>, Arc<FoldedSettings>)> {
-    let ask = launcher_ask(&mut held());
-    match ask {
-        LauncherAsk::Ready(list, folded) => Some((list, folded)),
-        LauncherAsk::Fold(list) => {
-            fold_for_launcher(list);
-            None
-        }
-        LauncherAsk::Wait => None,
-    }
-}
-
-/// The launcher's settings arena of `list`; one that cannot be made (a name past the arena's limits, say) is logged and the
-/// launcher searches no settings, as before the list was there.
-fn fold_or_empty(list: &[Setting]) -> Arc<FoldedSettings> {
-    Arc::new(FoldedSettings::new(list).unwrap_or_else(|e| {
-        log!("start search: the launcher's settings catalogue was not built: {e}");
-        FoldedSettings::default()
-    }))
-}
-
-/// Folds `list` for the launcher on a short-lived thread (normal priority: the launcher waits for these rows, and pages a
-/// background thread touches get a low memory priority).
-fn fold_for_launcher(list: Arc<Vec<Setting>>) {
-    let spawned = std::thread::Builder::new().name("start-settings".into()).spawn(move || {
-        let mut list = list;
-        loop {
-            let mut folded = Some(fold_or_empty(&list));
-            let next = {
-                let mut h = held();
-                fold_done(&mut h, &list, &mut folded, holds_settings(Holder::Launcher))
-            };
-            drop(folded);
-            match next {
-                FoldNext::Posted => {
-                    crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);
-                    return;
-                }
-                FoldNext::Again(l) => list = l,
-                FoldNext::Done => return,
-            }
-        }
-    });
-    if let Err(e) = spawned {
-        held().folding = false;
-        log!("start search: cannot start the launcher's settings fold: {e}");
-    }
-}
-
-/// Builds the settings catalog on a background thread, unless it is there or being built. It takes
-/// about a second (thousands of resource lookups), so it is never done on the UI or shell thread;
-/// the menu uses the catalog from the first search after it is ready.
-// The build is kept on disk (see `load_or_build_settings`): only the first run after a Windows
-// update or a language change pays the second of resource lookups.
+/// Start's settings list: held from now on and decoded from the cache file (built first by a child when the file is
+/// missing or stale) on the settings thread, unless it is there. The menu uses it from the first search after
+/// `StartSettingsReady`; nothing of it is done on the UI or shell thread.
 pub(crate) fn load_settings() {
-    if SETTINGS_STARTED.swap(true, Relaxed) {
-        return;
+    if SHARED.hold() {
+        request(Asked { start: true, ..Asked::default() });
     }
+}
+
+/// The launcher (L3 T18, T19): makes sure the cache file is there and matches this Windows, its language, its settings
+/// files and this dock, for the next mapping (`rebuild`: rebuilt whatever the file holds, after one the launcher could not
+/// map or check). The launcher never holds a list of its own: it maps the file at each open. When the file is good at
+/// the end of the run, `StartSettingsReady` is posted (an open launcher maps it then).
+pub(crate) fn ensure_settings_cache(rebuild: bool) {
+    request(Asked { ensure: true, rebuild, ..Asked::default() });
+}
+
+fn request(a: Asked) {
+    if SHARED.ask(a) {
+        spawn_settings_thread();
+    }
+}
+
+/// Who keeps the settings catalog loaded: Start alone (the launcher maps the cache file at each open instead, L3 T19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Holder {
+    Start,
+}
+
+/// `h` needs the settings catalog: marks it and decodes the catalog unless it is there.
+pub(crate) fn hold_settings(h: Holder) {
+    match h {
+        Holder::Start => load_settings(),
+    }
+}
+
+/// Frees Start's settings list (the Start menu data was released): the next Start menu decodes it again.
+pub(crate) fn release_settings() {
+    SHARED.release();
+}
+
+/// The one settings thread: COM (MTA) and background priority for the in-process fallback, then runs until nothing is
+/// asked. It waits on the `--start-settings` child (up to 60 s): never the UI or the shell thread.
+fn spawn_settings_thread() {
     let spawned = std::thread::Builder::new().name("start-settings".into()).spawn(|| {
         // SAFETY: COM for this thread only, paired with CoUninitialize below; background priority
         // is a hint that fails harmlessly.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         // SAFETY: pseudo-handle of the current thread.
         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
-        let t = Instant::now();
-        let (list, cached) = load_or_build_settings();
-        log!(
-            "start search: {} settings in {} ms{}",
-            list.len(),
-            t.elapsed().as_millis(),
-            if cached { " (disk cache)" } else { "" }
-        );
-        let list = Arc::new(list);
-        // The launcher holds the catalog: its rows and keyword dictionary are made here too, never on the UI thread, at
-        // normal priority (they are read by every keystroke, and a background thread's pages get a low memory priority).
-        let mut folded = holds_settings(Holder::Launcher).then(|| {
-            // SAFETY: pseudo-handle of the current thread; ends the background mode begun above, harmless if it fails.
-            let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
-            fold_or_empty(&list)
-        });
-        // Released while it was being built: not kept (decided under the lock a release clears it with; what is not
-        // kept is dropped after it).
-        let mut list = Some(list);
-        let kept = {
-            let mut h = held();
-            let started = SETTINGS_STARTED.load(Relaxed);
-            store_built(&mut h, &mut list, &mut folded, started, holds_settings(Holder::Launcher))
-        };
-        drop((list, folded));
-        // The build left megabytes of freed blocks that the heap keeps committed: the next hidden period trims again.
-        crate::mem::rearm();
-        if kept {
-            // An open menu searches again: what is typed may match a setting; the launcher takes its rows.
-            crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);
+        loop {
+            let asked = SHARED.take();
+            serve(&SHARED, asked, &mut RealIo);
+            if SHARED.done() {
+                break;
+            }
         }
         if hr.is_ok() {
             // SAFETY: paired with the successful CoInitializeEx above.
@@ -681,54 +640,317 @@ pub(crate) fn load_settings() {
         }
     });
     if let Err(e) = spawned {
-        SETTINGS_STARTED.store(false, Relaxed);
+        SHARED.thread.store(false, SeqCst);
         log!("start search: cannot start the settings thread: {e}");
     }
 }
 
-/// Who keeps the settings catalog loaded: the Start menu and the launcher share one copy, freed when the last of them
-/// lets go.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Holder {
-    Start = 1,
-    Launcher = 2,
+/// What a run of the settings thread does with the world: `RealIo` in the dock, a recorder in the tests.
+trait SettingsIo {
+    /// The cache file's key now (`catalog_key`), stored for the launcher (`expected_settings_key`).
+    fn key(&mut self) -> Option<String>;
+    /// The cache file whole (checked opener: one link, no reparse point; at most `CACHE_MAX`), if it can be read.
+    fn read_cache(&mut self) -> Option<Vec<u8>>;
+    /// A new cache file can be written (an elevated dock with its verified data folder).
+    fn can_cache(&mut self) -> bool;
+    /// What one `--start-settings` child printed, with its exit code.
+    fn child(&mut self) -> Result<(i32, Vec<u8>), String>;
+    /// The catalogue built and encoded in this process under `key` (the fallback when the child fails).
+    fn build_here(&mut self, key: &str) -> Result<Vec<u8>, String>;
+    fn write_cache(&mut self, bytes: &[u8]) -> Result<(), String>;
+    /// `StartSettingsReady` to the UI: an open Start searches again, an open launcher maps the file.
+    fn ready(&mut self);
 }
 
-static HOLDERS: AtomicU8 = AtomicU8::new(0);
+/// A checked settings arena of this run, and whether the cache file holds exactly these bytes.
+struct Made {
+    bytes: Vec<u8>,
+    layout: Layout,
+    cached: bool,
+}
 
-/// `holders` with the bit of `h` set or cleared; the bits left.
-fn holders_step(holders: &AtomicU8, h: Holder, hold: bool) -> u8 {
-    let bit = h as u8;
-    if hold {
-        holders.fetch_or(bit, Relaxed) | bit
-    } else {
-        holders.fetch_and(!bit, Relaxed) & !bit
+/// One run of the settings thread, for what it took: the cache file used when it passes the whole check under the key
+/// computed now (unless a rebuild was asked), else a new arena made (`make`); Start's list decoded from it when Start
+/// still wants one; `StartSettingsReady` when the file is good for the launcher or Start's list came. Then the bytes go
+/// (one block, back to the OS at once). A launcher-only run never fills Start's list.
+fn serve(sh: &Shared, asked: Asked, io: &mut dyn SettingsIo) {
+    let start = asked.start && sh.held.load(SeqCst) && sh.list().is_none();
+    if !start && !asked.ensure {
+        return;
+    }
+    let t = Instant::now();
+    let key = io.key();
+    let mut got = None;
+    if let (false, Some(k)) = (asked.rebuild, key.as_deref()) {
+        got = io.read_cache().and_then(|bytes| match cache_use(&bytes, k) {
+            CacheUse::Use(layout) => Some(Made { bytes, layout, cached: true }),
+            CacheUse::Rebuild => None,
+        });
+    }
+    // Without a key (Windows' build or its settings files unreadable), or where no file can be written (unelevated), a
+    // new arena serves Start alone: the launcher's request makes none, so it never costs a child per open.
+    if got.is_none() && (start || (key.is_some() && io.can_cache())) {
+        got = make(io, key);
+    }
+    let Some(made) = got else { return };
+    let mut stored = false;
+    if start {
+        let view = CatalogView::new(&made.bytes, &made.layout);
+        let mut list = Some(start_rows(view));
+        stored = sh.store_start(&mut list);
+        if stored && made.cached {
+            log!("start search: {} settings from the cache in {} ms", view.len(), t.elapsed().as_millis());
+        }
+        drop(list);
+    }
+    if stored || (asked.ensure && made.cached) {
+        io.ready();
     }
 }
 
-/// `h` needs the settings catalog: marks it and builds the catalog unless it is there.
-pub(crate) fn hold_settings(h: Holder) {
-    holders_step(&HOLDERS, h, true);
-    load_settings();
-}
-
-/// `h` lets the settings catalog go; it is freed only when no holder is left. The launcher's rows go with its hold.
-pub(crate) fn release_settings_for(h: Holder) {
-    let left = holders_step(&HOLDERS, h, false);
-    if left == 0 {
-        SETTINGS_STARTED.store(false, Relaxed);
+/// A new settings arena: printed by an `--start-settings` child, whose key line must be the key computed right after it
+/// exited (a settings file that changed while it ran: the child runs once more; a second mismatch is logged and the
+/// bytes serve Start alone, never the in-process build, which would load the shell's resource code into the dock). A
+/// child that cannot start, fails, or prints anything `arena::check` refuses: logged once, built in this process with the
+/// same encoder. The arena is written to the cache when it carries the current key; a failed write (a sharing
+/// violation, a full disk) leaves it to this run, and the launcher asks again at its next open.
+fn make(io: &mut dyn SettingsIo, key: Option<String>) -> Option<Made> {
+    static CHANGED: AtomicBool = AtomicBool::new(false);
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    let t = Instant::now();
+    let mut key_now = key;
+    let mut verdict = ChildVerdict::Refused(String::new());
+    for _ in 0..2 {
+        let out = io.child();
+        key_now = io.key();
+        verdict = child_verdict(out, key_now.as_deref());
+        if !matches!(verdict, ChildVerdict::Mismatch(..)) {
+            break;
+        }
     }
-    release_step(&mut held(), h, left);
+    let mut made = match verdict {
+        ChildVerdict::Use(bytes, layout) => {
+            log!("start search: {} settings in {} ms (child)", layout.entries(), t.elapsed().as_millis());
+            Made { bytes, layout, cached: false }
+        }
+        ChildVerdict::Mismatch(bytes, layout) => {
+            if !CHANGED.swap(true, SeqCst) {
+                log!("start search: the settings files changed while the catalogue was built (twice): not cached this time");
+            }
+            return Some(Made { bytes, layout, cached: false });
+        }
+        ChildVerdict::Refused(why) => {
+            if !FAILED.swap(true, SeqCst) {
+                log!("start search: the settings process failed ({why}), building in-process");
+            }
+            let k = key_now.clone().unwrap_or_else(unkeyed_key);
+            let built = io.build_here(&k).and_then(|bytes| {
+                let layout =
+                    arena::check(&bytes, ArenaKind::Settings, Some(&k), Caps::SETTINGS).map_err(|e| e.to_string())?;
+                Ok(Made { bytes, layout, cached: false })
+            });
+            match built {
+                Ok(m) => {
+                    log!("start search: {} settings in {} ms", m.layout.entries(), t.elapsed().as_millis());
+                    m
+                }
+                Err(e) => {
+                    log!("start search: the settings catalogue was not built: {e}");
+                    return None;
+                }
+            }
+        }
+    };
+    // The child's and the fallback's garbage (or the read buffer of the pipe) is freed: the next hidden period trims.
+    crate::mem::rearm();
+    if key_now.is_some() {
+        match io.write_cache(&made.bytes) {
+            Ok(()) => made.cached = true,
+            Err(e) => log!("start search: cannot write the settings cache: {e}"),
+        }
+    }
+    Some(made)
 }
 
-/// `h` still holds the catalog.
-pub(crate) fn holds_settings(h: Holder) -> bool {
-    HOLDERS.load(Relaxed) & h as u8 != 0
+/// What the dock makes of one child's output.
+enum ChildVerdict {
+    /// Checked, and keyed as the dock computes the key now (or no key is computed: the child's own line).
+    Use(Vec<u8>, Layout),
+    /// Checked, but its key line is not the key computed right after it exited.
+    Mismatch(Vec<u8>, Layout),
+    /// Not started, failed, or refused by `arena::check`: the reason.
+    Refused(String),
 }
 
-/// Frees the settings catalog (the Start menu data was released): the next Start menu builds it again.
-pub(crate) fn release_settings() {
-    release_settings_for(Holder::Start);
+/// The verdict on what an `--start-settings` child printed: exit code 0 and the whole output a settings arena under the
+/// settings caps (header, sizes, every reference and order, the checksum); nothing is read from the untrusted bytes
+/// before that check. Then its key line against `key_now`.
+fn child_verdict(out: Result<(i32, Vec<u8>), String>, key_now: Option<&str>) -> ChildVerdict {
+    let (code, bytes) = match out {
+        Ok(o) => o,
+        Err(e) => return ChildVerdict::Refused(e),
+    };
+    if code != 0 {
+        return ChildVerdict::Refused(format!("exit code {code}"));
+    }
+    let layout = match arena::check(&bytes, ArenaKind::Settings, None, Caps::SETTINGS) {
+        Ok(l) => l,
+        Err(e) => return ChildVerdict::Refused(format!("{} bytes refused: {e}", bytes.len())),
+    };
+    match key_now {
+        Some(k) if arena::key_line(&bytes) != Some(k) => ChildVerdict::Mismatch(bytes, layout),
+        _ => ChildVerdict::Use(bytes, layout),
+    }
+}
+
+/// What the settings thread does with the cache file's bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum CacheUse {
+    Use(Layout),
+    Rebuild,
+}
+
+/// The cache file is used only when the whole of it passes `arena::check` under the expected key (the header, the key line,
+/// every section and reference, the checksum): nothing is decided from the header and the key line alone, so a damaged
+/// body or a file of another build, format or language is rebuilt.
+fn cache_use(bytes: &[u8], expected: &str) -> CacheUse {
+    match arena::check(bytes, ArenaKind::Settings, Some(expected), Caps::SETTINGS) {
+        Ok(layout) => CacheUse::Use(layout),
+        Err(_) => CacheUse::Rebuild,
+    }
+}
+
+/// Start's rows of a checked settings arena, as `build_settings` makes them: the name and its lowercase, Start's keywords,
+/// the rank, the launch target (the Settings app's is the shared constant) and the arguments.
+fn start_rows(v: CatalogView<'_>) -> Vec<Setting> {
+    (0..v.len())
+        .map(|i| {
+            let name = v.name(i);
+            let (target, args) = v.target(i);
+            Setting {
+                name: name.to_string(),
+                lower: name.to_lowercase(),
+                keys: Keys::from_packed(v.start_keys(i)),
+                rank: v.start_rank(i),
+                target: if target == SETTINGS_APP {
+                    Cow::Borrowed(SETTINGS_APP)
+                } else {
+                    Cow::Owned(target.to_string())
+                },
+                args: args.map(str::to_string),
+            }
+        })
+        .collect()
+}
+
+/// The dock's side of a run.
+struct RealIo;
+
+impl SettingsIo for RealIo {
+    fn key(&mut self) -> Option<String> {
+        let key = current_key();
+        store_key(key.as_deref());
+        key
+    }
+
+    fn read_cache(&mut self) -> Option<Vec<u8>> {
+        crate::datadir::read_file(&settings_cache_path()?, CACHE_MAX, true).ok()
+    }
+
+    fn can_cache(&mut self) -> bool {
+        crate::datadir::writable() && settings_cache_path().is_some()
+    }
+
+    fn child(&mut self) -> Result<(i32, Vec<u8>), String> {
+        let exe = std::env::current_exe().map_err(|e| format!("no exe path: {e}"))?;
+        crate::update::run_capture(&exe, &[SETTINGS_FLAG], SETTINGS_CHILD_TIMEOUT, CACHE_MAX)
+    }
+
+    fn build_here(&mut self, key: &str) -> Result<Vec<u8>, String> {
+        encode_setting_list(key, &build_settings()).map_err(|e| e.to_string())
+    }
+
+    fn write_cache(&mut self, bytes: &[u8]) -> Result<(), String> {
+        // Unelevated, the data folder is read-only: reading the cache is fine, writing it is not tried.
+        if !crate::datadir::writable() {
+            return Err("the data folder is read-only".into());
+        }
+        let path = settings_cache_path().ok_or("no cache folder")?;
+        crate::datadir::write_atomic(&path, bytes, crate::datadir::FileAcl::Inherit)
+    }
+
+    fn ready(&mut self) {
+        crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);
+    }
+}
+
+/// The key the settings thread computed last (`None` before its first run, or when no key could be computed).
+static EXPECTED_KEY: Mutex<Option<Arc<str>>> = Mutex::new(None);
+
+fn expected_key_slot() -> std::sync::MutexGuard<'static, Option<Arc<str>>> {
+    EXPECTED_KEY.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Each run of the settings thread stores the key it computed, so a settings file that changed during a session is seen
+/// at the thread's next run, never turned into a permanent mismatch.
+fn store_key(key: Option<&str>) {
+    let mut slot = expected_key_slot();
+    if slot.as_deref() != key {
+        *slot = key.map(Arc::from);
+    }
+}
+
+/// The key the launcher checks the mapped cache file against (L3 T19): the one the settings thread stored, or computed
+/// here (well under 1 ms: a folder listing, two registry values, the exe's size and time) and stored when none is.
+/// `None` when Windows' build or the settings files cannot be read: then no file is ever written.
+pub(crate) fn expected_settings_key() -> Option<Arc<str>> {
+    if let Some(k) = expected_key_slot().clone() {
+        return Some(k);
+    }
+    let key: Arc<str> = current_key()?.into();
+    *expected_key_slot() = Some(key.clone());
+    Some(key)
+}
+
+/// `<root>\cache\settings-catalog.bin` (admin-only, as the rest of the cache folder).
+pub(crate) fn settings_cache_path() -> Option<PathBuf> {
+    crate::datadir::cache_dir().map(|d| d.join(CACHE_NAME))
+}
+
+/// The flag of the child mode that builds the settings catalogue (`run_settings_child`); not combinable.
+pub(crate) const SETTINGS_FLAG: &str = "--start-settings";
+/// How long the settings thread waits for the child (it takes about a second; this thread waits, nobody else).
+const SETTINGS_CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `--start-settings`, in the child the settings thread starts: the settings catalogue built (thousands of resource
+/// lookups, which load the shell's resource code into this short-lived process instead of the dock), folded and indexed
+/// by the entry builder, and written to stdout as one settings arena under the key the child computes itself, before the
+/// build (a settings file that changes during the build then makes a key the dock no longer computes, never a stale
+/// catalogue under a new key). It touches no data folder, logger, mutex or console, reads no input and writes nothing but
+/// stdout. Exit 0 = an arena written; 1 = COM, the encoder or stdout failed.
+pub fn run_settings_child() -> i32 {
+    use std::io::Write;
+    // SAFETY: the first COM call of this thread (the child's main thread); paired with CoUninitialize below.
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if hr.is_err() {
+        return 1;
+    }
+    // SAFETY: pseudo-handle of the current thread; a hint that fails harmlessly.
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+    let key = current_key().unwrap_or_else(unkeyed_key);
+    let code = match encode_setting_list(&key, &build_settings()) {
+        Ok(bytes) => {
+            let mut stdout = std::io::stdout().lock();
+            match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            }
+        }
+        Err(_) => 1,
+    };
+    // SAFETY: paired with the successful CoInitializeEx above.
+    unsafe { CoUninitialize() };
+    code
 }
 
 /// `@dll,-id` / `@{package?ms-resource://...}` resolved in the display language; plain text as it is.
@@ -818,12 +1040,11 @@ fn is_catalog_xml(name: &str) -> bool {
     n.starts_with("allsystemsettings_") && n.ends_with(".xml")
 }
 
-// ------------------------------------------------------------------ disk cache of the catalog
+// ------------------------------------------------------------------ the cache file of the catalog
 
-/// First line of `<root>\cache\settings-catalog.bin`; the digit is the format version.
-const CACHE_HEADER: &str = "mini-oled-dock settings-catalog 1\n";
-/// Largest cache file read or written.
-const CACHE_MAX: u64 = 2 << 20;
+/// The largest cache file read, mapped or written, and the most read back from the settings child (version 2: one settings
+/// arena, `arena::check` under `Caps::SETTINGS`).
+pub(crate) const CACHE_MAX: u64 = Caps::SETTINGS.bytes as u64;
 const CACHE_NAME: &str = "settings-catalog.bin";
 const NT_KEY: windows::core::PCWSTR = windows::core::w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
 
@@ -873,20 +1094,37 @@ fn windows_build() -> String {
 
 /// What the cache depends on, one line: the dock's own identity (version, size and modification
 /// time of its exe: a new build rebuilds the catalog once), the Windows build, the UI language, and name, size and
-/// modification time of each `AllSystemSettings_*.xml`. `None` when the build is unknown or no XML
-/// file is there (nothing to key on: nothing cached).
+/// modification time of each `AllSystemSettings_*.xml`, then the arena's format (`|fmt <ARENA_FORMAT>`: a cache of another
+/// layout is rebuilt once). Printable ASCII only, at most an arena key line long. `None` when the build is unknown or no
+/// XML file is there (nothing to key on: nothing cached), or when the line would be too long.
 fn catalog_key_of(dock: &str, build: &str, lang: u16, files: &[(String, u64, u64)]) -> Option<String> {
     if build.is_empty() || files.is_empty() {
         return None;
     }
+    let printable = |c: &char| c.is_ascii_graphic() && *c != '|';
     // "l3s1": the settings keywords carry `XML_KEYWORD_PENALTY` since L3; a file written with the old penalty is rebuilt once.
-    let mut key = format!("{dock}|{build}|{lang:04x}|l3s1");
+    let mut key: String = dock.chars().filter(printable).collect();
+    key.push('|');
+    key.extend(build.chars().filter(printable));
+    key.push_str(&format!("|{lang:04x}|l3s1"));
     for (name, len, mtime) in files {
         key.push('|');
-        key.extend(name.chars().filter(|c| !c.is_control() && *c != '|'));
+        key.extend(name.chars().filter(printable));
         key.push_str(&format!(":{len}:{mtime}"));
     }
-    Some(key)
+    key.push_str(&format!("|fmt {}", arena::ARENA_FORMAT));
+    (key.len() <= arena::KEY_MAX).then_some(key)
+}
+
+/// The key line of an arena built without a key (Windows' build or its settings files unreadable): it serves Start for
+/// one run and is never written to the cache.
+fn unkeyed_key() -> String {
+    format!("unkeyed|fmt {}", arena::ARENA_FORMAT)
+}
+
+/// The cache key of this Windows, its language, its settings files and this dock, now.
+fn current_key() -> Option<String> {
+    catalog_key(&windows_dir()?.join(r"ImmersiveControlPanel\Settings"))
 }
 
 fn catalog_key(dir: &Path) -> Option<String> {
@@ -918,135 +1156,6 @@ fn dock_identity() -> String {
         })
         .unwrap_or((0, 0));
     format!("{}:{len}:{mtime}", env!("CARGO_PKG_VERSION"))
-}
-
-fn fnv64(b: &[u8]) -> u64 {
-    b.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| (h ^ u64::from(c)).wrapping_mul(0x0100_0000_01b3))
-}
-
-fn put(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-/// The cache file: header, key line, entry count, the entries (name, keys, rank, target, args: each
-/// string length-prefixed, a missing `args` is the length `u32::MAX`), a 64-bit checksum of all
-/// of it. `None` if it would pass `CACHE_MAX`.
-fn encode_catalog(key: &str, list: &[Setting]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(list.len() * 96 + 256);
-    out.extend_from_slice(CACHE_HEADER.as_bytes());
-    out.extend_from_slice(key.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(&(list.len() as u32).to_le_bytes());
-    for s in list {
-        put(&mut out, &s.name);
-        put(&mut out, &s.keys.0);
-        out.extend_from_slice(&s.rank.to_le_bytes());
-        put(&mut out, &s.target);
-        match &s.args {
-            Some(a) => put(&mut out, a),
-            None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
-        }
-    }
-    let sum = fnv64(&out);
-    out.extend_from_slice(&sum.to_le_bytes());
-    (out.len() as u64 <= CACHE_MAX).then_some(out)
-}
-
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn u32(&mut self) -> Option<u32> {
-        let (h, rest) = self.0.split_first_chunk::<4>()?;
-        self.0 = rest;
-        Some(u32::from_le_bytes(*h))
-    }
-    fn str(&mut self, len: u32) -> Option<&'a str> {
-        let len = len as usize;
-        if len > self.0.len() {
-            return None;
-        }
-        let (s, rest) = self.0.split_at(len);
-        self.0 = rest;
-        std::str::from_utf8(s).ok()
-    }
-    fn string(&mut self) -> Option<&'a str> {
-        let n = self.u32()?;
-        self.str(n)
-    }
-}
-
-/// The catalog of `bytes`, or `None` for anything that is not exactly what `encode_catalog` wrote
-/// for `key`: wrong header, key, checksum, count or lengths, bad UTF-8, trailing bytes. Every
-/// length is checked against what is left before it allocates. Entries are rebuilt as
-/// `build_settings` makes them (exact-size strings; the Settings app target is the shared constant).
-fn decode_catalog(bytes: &[u8], key: &str) -> Option<Vec<Setting>> {
-    let head = CACHE_HEADER.as_bytes();
-    let body_len = bytes.len().checked_sub(8)?;
-    let (body, sum) = bytes.split_at(body_len);
-    if fnv64(body).to_le_bytes() != sum || !body.starts_with(head) {
-        return None;
-    }
-    let rest = &body[head.len()..];
-    let nl = rest.iter().position(|&c| c == b'\n')?;
-    if &rest[..nl] != key.as_bytes() {
-        return None;
-    }
-    let mut r = Reader(&rest[nl + 1..]);
-    let count = r.u32()? as usize;
-    // An entry is at least 20 bytes (four lengths and the rank): a larger count cannot be true.
-    if count > r.0.len() / 20 {
-        return None;
-    }
-    let mut list = Vec::with_capacity(count);
-    for _ in 0..count {
-        let name = r.string()?;
-        let keys = r.string()?;
-        let rank = r.u32()?;
-        let target = r.string()?;
-        let args = match r.u32()? {
-            u32::MAX => None,
-            n => Some(r.str(n)?.to_string()),
-        };
-        let target: Cow<'static, str> =
-            if target == SETTINGS_APP { Cow::Borrowed(SETTINGS_APP) } else { Cow::Owned(target.to_string()) };
-        list.push(Setting {
-            name: name.to_string(),
-            lower: name.to_lowercase(),
-            keys: Keys(keys.to_string()),
-            rank,
-            target,
-            args,
-        });
-    }
-    r.0.is_empty().then_some(list)
-}
-
-/// The catalog: from the cache file when it matches this Windows build, language and XML files,
-/// else built (and the cache rewritten). The bool is true when it came from the cache. A cache that
-/// cannot be read, parsed or written only costs the build, as before.
-fn load_or_build_settings() -> (Vec<Setting>, bool) {
-    let Some(windir) = windows_dir() else { return (Vec::new(), false) };
-    let key = catalog_key(&windir.join(r"ImmersiveControlPanel\Settings"));
-    let path = crate::datadir::cache_dir().map(|d| d.join(CACHE_NAME));
-    if let (Some(key), Some(path)) = (&key, &path) {
-        if let Some(list) = crate::datadir::read_file(path, CACHE_MAX, true).ok().and_then(|b| decode_catalog(&b, key))
-        {
-            return (list, true);
-        }
-    }
-    let list = build_settings();
-    if let (Some(key), Some(path)) = (&key, &path) {
-        // Unelevated, the data folder is read-only: reading the cache is fine, writing it is not tried.
-        if !list.is_empty() && crate::datadir::writable() {
-            if let Some(bytes) = encode_catalog(key, &list) {
-                if let Err(e) = crate::datadir::write_atomic(path, &bytes, crate::datadir::FileAcl::Inherit) {
-                    log!("start search: cannot write the settings cache: {e}");
-                }
-            }
-        }
-    }
-    (list, false)
 }
 
 #[cfg(test)]
@@ -1224,28 +1333,50 @@ mod tests {
             .collect()
     }
 
-    const KEY: &str = "26100.1742|0409|allsystemsettings_x.xml:100:5";
+    /// The key of the sample cache (the dock's identity first, the arena's format last).
+    fn key() -> String {
+        catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_x.xml".to_string(), 100, 5)]).unwrap()
+    }
+
+    /// The same, after the settings file changed.
+    fn key2() -> String {
+        catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_x.xml".to_string(), 100, 6)]).unwrap()
+    }
+
+    /// The version 2 cache file (one settings arena) of `list` under `key`, as the child prints it.
+    fn arena_of(key: &str, list: &[Setting]) -> Vec<u8> {
+        encode_setting_list(key, list).unwrap()
+    }
+
+    fn child_out(key: &str, n: usize) -> Result<(i32, Vec<u8>), String> {
+        Ok((0, arena_of(key, &sample(n))))
+    }
+
+    fn rows_of(bytes: &[u8], key: &str) -> Vec<Setting> {
+        let CacheUse::Use(layout) = cache_use(bytes, key) else { panic!("the arena checks") };
+        start_rows(CatalogView::new(bytes, &layout))
+    }
 
     #[test]
     fn round_trip() {
         let list = sample(300);
-        let bytes = encode_catalog(KEY, &list).unwrap();
-        assert!(bytes.starts_with(b"mini-oled-dock settings-catalog 1\n"));
-        let back = decode_catalog(&bytes, KEY).unwrap();
+        let bytes = arena_of(&key(), &list);
+        assert!(bytes.starts_with(b"mini-oled-dock settings-catalog 2\n"));
+        let back = rows_of(&bytes, &key());
         assert_eq!(back, list);
         assert!(
             back.iter().filter(|s| matches!(s.target, Cow::Borrowed(_))).count() > 100,
             "the shared target stays shared"
         );
-        assert_eq!(decode_catalog(&encode_catalog(KEY, &[]).unwrap(), KEY).unwrap(), Vec::new());
+        assert_eq!(rows_of(&arena_of(&key(), &[]), &key()), Vec::new());
     }
 
     #[test]
     fn invalidated_by_build_or_language() {
         let files = vec![("allsystemsettings_a.xml".to_string(), 10u64, 20u64)];
         let k = catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &files).unwrap();
-        let bytes = encode_catalog(&k, &sample(5)).unwrap();
-        assert!(decode_catalog(&bytes, &k).is_some());
+        let bytes = arena_of(&k, &sample(5));
+        assert!(matches!(cache_use(&bytes, &k), CacheUse::Use(_)));
         for other in [
             catalog_key_of("1.5.1:9:9", "26100.1742", 0x409, &files),
             catalog_key_of("1.5.0:10:9", "26100.1742", 0x409, &files),
@@ -1259,48 +1390,83 @@ mod tests {
         ] {
             let other = other.unwrap();
             assert_ne!(other, k);
-            assert!(decode_catalog(&bytes, &other).is_none(), "{other}");
+            assert_eq!(cache_use(&bytes, &other), CacheUse::Rebuild, "{other}");
         }
         // A key written before the XML sentinel (no salt) does not match.
         let old = k.replace("|l3s1", "");
         assert_ne!(old, k);
-        assert!(decode_catalog(&bytes, &old).is_none(), "a pre-L3 cache is rebuilt once");
+        assert_eq!(cache_use(&arena_of(&old, &sample(5)), &k), CacheUse::Rebuild, "a pre-L3 cache is rebuilt once");
         assert!(catalog_key_of("1.5.0:9:9", "", 0x409, &files).is_none(), "unknown build: no cache");
         assert!(catalog_key_of("1.5.0:9:9", "26100.1", 0x409, &[]).is_none(), "no XML: no cache");
+        // The line is printable ASCII whatever a file is called, and one past an arena's key line gives no key at all.
+        let odd = catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_é|\nx.xml".into(), 1, 2)]);
+        assert!(odd.as_deref().is_some_and(|o| o.contains("|allsystemsettings_x.xml:1:2|") && o.is_ascii()), "{odd:?}");
+        let many: Vec<(String, u64, u64)> =
+            (0..40).map(|i| (format!("allsystemsettings_{}{i}.xml", "x".repeat(40)), 1, 2)).collect();
+        assert!(catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &many).is_none());
+    }
+
+    /// L3 T18: the key ends with the arena's format, so a cache file of another layout is rebuilt once.
+    #[test]
+    fn settings_key_has_the_arena_format() {
+        let k = key();
+        let fmt = format!("|fmt {}", arena::ARENA_FORMAT);
+        assert!(k.ends_with(&fmt) && k.starts_with("1.5.0:9:9|26100.1742|0409|l3s1|"), "{k}");
+        let other = k.replace(&fmt, &format!("|fmt {}", arena::ARENA_FORMAT + 1));
+        assert_eq!(cache_use(&arena_of(&other, &sample(3)), &k), CacheUse::Rebuild);
+        assert!(matches!(cache_use(&arena_of(&k, &sample(3)), &k), CacheUse::Use(_)));
+        assert!(unkeyed_key().ends_with(&fmt));
+        assert_ne!(unkeyed_key(), k);
+    }
+
+    /// L3 T18: the cache file is used only when the whole of it passes `arena::check` under the expected key.
+    #[test]
+    fn cache_decision() {
+        let k = key();
+        let good = arena_of(&k, &sample(40));
+        assert!(matches!(cache_use(&good, &k), CacheUse::Use(l) if l.entries() == 40));
+        // L1b-8's version 1 file.
+        let mut v1 = b"mini-oled-dock settings-catalog 1\n".to_vec();
+        v1.extend_from_slice(k.as_bytes());
+        v1.push(b'\n');
+        v1.extend_from_slice(&[0; 12]);
+        for (bad, why) in [
+            (v1, "version 1"),
+            (arena_of(&key2(), &sample(40)), "another key"),
+            (good[..20].to_vec(), "a truncated header"),
+            (Vec::new(), "an empty file"),
+            (good[..good.len() - 1].to_vec(), "a truncated body"),
+        ] {
+            assert_eq!(cache_use(&bad, &k), CacheUse::Rebuild, "{why}");
+        }
+        // Header and key line as expected, a byte of a launch target damaged: nothing is decided from the head alone.
+        let at = good.windows(6).position(|w| w == b"t0.exe").unwrap();
+        let mut body = good.clone();
+        body[at] ^= 0x01;
+        assert!(body.starts_with(b"mini-oled-dock settings-catalog 2\n") && arena::key_line(&body) == Some(k.as_str()));
+        assert_eq!(cache_use(&body, &k), CacheUse::Rebuild);
     }
 
     #[test]
     fn corrupt_ignored() {
-        let bytes = encode_catalog(KEY, &sample(40)).unwrap();
-        assert!(decode_catalog(&[], KEY).is_none());
-        assert!(decode_catalog(&bytes[..bytes.len() - 1], KEY).is_none());
+        let k = key();
+        let bytes = arena_of(&k, &sample(40));
+        assert_eq!(cache_use(&[], &k), CacheUse::Rebuild);
+        assert_eq!(cache_use(&bytes[..bytes.len() - 1], &k), CacheUse::Rebuild);
         let mut trailing = bytes.clone();
         trailing.push(0);
-        assert!(decode_catalog(&trailing, KEY).is_none());
+        assert_eq!(cache_use(&trailing, &k), CacheUse::Rebuild);
         for i in (0..bytes.len()).step_by(7) {
             let mut b = bytes.clone();
             b[i] ^= 0x55;
-            assert!(decode_catalog(&b, KEY).is_none(), "byte {i}");
+            assert_eq!(cache_use(&b, &k), CacheUse::Rebuild, "byte {i}");
         }
-        // A forged file with a valid checksum but lies inside: an absurd count and a length past the end.
-        let forge = |tail: &[u8]| {
-            let mut b = CACHE_HEADER.as_bytes().to_vec();
-            b.extend_from_slice(KEY.as_bytes());
-            b.push(b'\n');
-            b.extend_from_slice(tail);
-            let sum = fnv64(&b);
-            b.extend_from_slice(&sum.to_le_bytes());
-            b
-        };
-        assert!(decode_catalog(&forge(&u32::MAX.to_le_bytes()), KEY).is_none());
-        assert!(decode_catalog(&forge(&[1, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f]), KEY).is_none());
-        assert!(decode_catalog(&forge(&[1, 0, 0, 0, 2, 0, 0, 0, 0xc3, 0x28]), KEY).is_none(), "bad UTF-8");
-        assert!(decode_catalog(&forge(&0u32.to_le_bytes()), KEY).is_some());
     }
 
     #[test]
     fn corrupt_ignored_seeded_100000() {
-        let good = encode_catalog(KEY, &sample(12)).unwrap();
+        let k = key();
+        let good = arena_of(&k, &sample(12));
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
             state ^= state << 13;
@@ -1321,17 +1487,281 @@ mod tests {
                 2 => (0..(next() % 64)).for_each(|_| b.push(next() as u8)),
                 _ => b = (0..(next() % 200)).map(|_| next() as u8).collect(),
             }
-            // Half the runs get a fresh checksum, so the mutated body reaches the parser itself.
-            if next() % 2 == 0 && b.len() >= 8 {
-                b.truncate(b.len() - 8);
-                let sum = fnv64(&b);
-                b.extend_from_slice(&sum.to_le_bytes());
-            }
-            // Must never panic; anything it accepts is exactly what the encoder would write.
-            if let Some(list) = decode_catalog(&b, KEY) {
-                assert_eq!(encode_catalog(KEY, &list), Some(b));
+            // Must never panic; anything it accepts is exactly what the encoder wrote, and decodes.
+            if let CacheUse::Use(layout) = cache_use(&b, &k) {
+                assert_eq!(b, good);
+                assert_eq!(start_rows(CatalogView::new(&b, &layout)).len(), 12);
             }
         }
+    }
+
+    /// L3 T18: Start's rows of the arena are the ones `build_settings` made: names, Start's keywords as written, ranks, the
+    /// shared Settings-app target as `Cow::Borrowed`, a Control Panel entry with arguments, one without.
+    #[test]
+    fn start_rows_from_the_arena() {
+        let mut access = Keys::default();
+        access.push("Contrasto elevato", 3);
+        access.push("ipovedenti", XML_KEYWORD_PENALTY);
+        let list = vec![
+            Setting {
+                name: "Accessibilità".into(),
+                lower: "accessibilità".into(),
+                keys: access.tidy(),
+                rank: 2,
+                target: Cow::Borrowed(SETTINGS_APP),
+                args: Some("page=SettingsPageEaseOfAccess".into()),
+            },
+            Setting {
+                name: "Mouse".into(),
+                lower: "mouse".into(),
+                keys: Keys::default(),
+                rank: 9,
+                target: Cow::Owned(r"C:\Windows\System32\control.exe".into()),
+                args: Some("/name Microsoft.Mouse".into()),
+            },
+            Setting {
+                name: "Schermo".into(),
+                lower: "schermo".into(),
+                keys: Keys::default(),
+                rank: 1,
+                target: Cow::Borrowed(SETTINGS_APP),
+                args: None,
+            },
+        ];
+        let rows = rows_of(&arena_of(&key(), &list), &key());
+        assert_eq!(rows, list);
+        assert!(matches!(rows[0].target, Cow::Borrowed(t) if t == SETTINGS_APP), "the shared constant, not a copy");
+        assert!(matches!(&rows[1].target, Cow::Owned(t) if t.ends_with("control.exe")));
+        assert_eq!((rows[1].args.as_deref(), rows[2].args.as_deref()), (Some("/name Microsoft.Mouse"), None));
+        let keys: Vec<(&str, u32)> = rows[0].keys.iter().collect();
+        assert_eq!(keys, [("contrasto elevato", 3), ("ipovedenti", XML_KEYWORD_PENALTY)], "as Start searches them");
+    }
+
+    /// A recorder of a settings thread run's world: the keys `key` answers in turn (the last one stays), a cache file,
+    /// the children's outputs, what was built, written and posted, and a caller acting while a child runs or the file is
+    /// read.
+    #[derive(Default)]
+    struct FakeIo<'a> {
+        keys: Vec<Option<String>>,
+        file: Option<Vec<u8>>,
+        children: std::collections::VecDeque<Result<(i32, Vec<u8>), String>>,
+        here: Vec<Setting>,
+        write_fails: bool,
+        /// No cache file can be written here (an unelevated dock).
+        read_only: bool,
+        calls: Vec<String>,
+        /// Start asks (as `load_settings` does) while the first child runs.
+        start_during_child: Option<&'a Shared>,
+        /// Start lets go (as `release_settings` does) while the file is read.
+        release_on_read: Option<&'a Shared>,
+    }
+
+    impl SettingsIo for FakeIo<'_> {
+        fn key(&mut self) -> Option<String> {
+            self.calls.push("key".into());
+            let k = self.keys.first().cloned().flatten();
+            if self.keys.len() > 1 {
+                self.keys.remove(0);
+            }
+            k
+        }
+        fn read_cache(&mut self) -> Option<Vec<u8>> {
+            self.calls.push("read".into());
+            if let Some(sh) = self.release_on_read.take() {
+                sh.release();
+            }
+            self.file.clone()
+        }
+        fn can_cache(&mut self) -> bool {
+            !self.read_only
+        }
+        fn child(&mut self) -> Result<(i32, Vec<u8>), String> {
+            self.calls.push("child".into());
+            if let Some(sh) = self.start_during_child.take() {
+                assert!(sh.hold());
+                assert!(!sh.ask(Asked { start: true, ..Asked::default() }), "a thread runs: no second one");
+            }
+            self.children.pop_front().unwrap_or_else(|| Err("no child".into()))
+        }
+        fn build_here(&mut self, k: &str) -> Result<Vec<u8>, String> {
+            self.calls.push(format!("build {}", k == key()));
+            encode_setting_list(k, &self.here).map_err(|e| e.to_string())
+        }
+        fn write_cache(&mut self, bytes: &[u8]) -> Result<(), String> {
+            self.calls.push("write".into());
+            if self.write_fails || self.read_only {
+                return Err("sharing violation".into());
+            }
+            self.file = Some(bytes.to_vec());
+            Ok(())
+        }
+        fn ready(&mut self) {
+            self.calls.push("ready".into());
+        }
+    }
+
+    const ENSURE: Asked = Asked { start: false, ensure: true, rebuild: false };
+    const START: Asked = Asked { start: true, ensure: false, rebuild: false };
+
+    /// L3 T18: one thread serves both callers; a Start request that arrives while a launcher-only run works is served by
+    /// the same thread right after it, from the file that run wrote, and a launcher-only run never fills Start's list.
+    #[test]
+    fn start_request_during_a_launcher_ensure_is_served() {
+        let sh = Shared::new();
+        assert!(sh.ask(ENSURE), "the launcher asks: the thread starts");
+        let mut io = FakeIo {
+            keys: vec![Some(key())],
+            children: [child_out(&key(), 30)].into(),
+            start_during_child: Some(&sh),
+            ..FakeIo::default()
+        };
+        let asked = sh.take();
+        assert_eq!(asked, ENSURE);
+        serve(&sh, asked, &mut io);
+        assert_eq!(io.calls, ["key", "read", "child", "key", "write", "ready"], "no file: one child, written, told");
+        assert!(sh.list().is_none(), "a launcher-only run never fills Start's list");
+        assert!(!sh.done(), "Start asked meanwhile: the thread runs again");
+        let asked = sh.take();
+        assert_eq!(asked, START);
+        io.calls.clear();
+        serve(&sh, asked, &mut io);
+        assert_eq!(io.calls, ["key", "read", "ready"], "from the file just written, once, no child");
+        assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(30));
+        assert!(sh.done(), "nothing left: it exits");
+        // A valid file serves an ensure without a child; a rebuild never reads it.
+        io.calls.clear();
+        serve(&sh, ENSURE, &mut io);
+        assert_eq!(io.calls, ["key", "read", "ready"]);
+        io.calls.clear();
+        io.children.push_back(child_out(&key(), 31));
+        serve(&sh, Asked { rebuild: true, ..ENSURE }, &mut io);
+        assert_eq!(io.calls, ["key", "child", "key", "write", "ready"]);
+        assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(30), "Start keeps the list it has");
+        assert!(sh.ask(ENSURE), "after the exit, the next request starts a thread");
+    }
+
+    /// L3 T18: Start lets go while its list is being decoded: nothing is kept; held again, the next run keeps it; with the
+    /// list there, nothing is asked or read.
+    #[test]
+    fn start_release_during_a_decode_keeps_nothing() {
+        let sh = Shared::new();
+        assert!(sh.hold());
+        assert!(sh.ask(START));
+        let mut io = FakeIo {
+            keys: vec![Some(key())],
+            file: Some(arena_of(&key(), &sample(20))),
+            release_on_read: Some(&sh),
+            ..FakeIo::default()
+        };
+        serve(&sh, sh.take(), &mut io);
+        assert!(sh.list().is_none(), "released during the decode: not kept");
+        assert_eq!(io.calls, ["key", "read"], "nothing to tell");
+        assert!(sh.done());
+        assert!(sh.hold());
+        assert!(sh.ask(START));
+        serve(&sh, sh.take(), &mut io);
+        assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(20));
+        assert!(sh.done());
+        assert!(!sh.hold(), "the list is there: nothing to ask");
+        io.calls.clear();
+        serve(&sh, START, &mut io);
+        assert!(io.calls.is_empty(), "a late Start request reads nothing: {:?}", io.calls);
+        sh.release();
+        assert!(sh.list().is_none());
+    }
+
+    /// L3 T18: what the dock does after a child: a key line that is not the key computed right after it runs the child once
+    /// more, and a second mismatch never leads to the in-process build; a failed child does; a failed write keeps the run's
+    /// bytes for Start only; without a key nothing is cached.
+    #[test]
+    fn key_mismatch_retries_the_child_once() {
+        let (k1, k2) = (key(), key2());
+        assert!(matches!(child_verdict(child_out(&k1, 3), Some(&k1)), ChildVerdict::Use(..)));
+        assert!(matches!(child_verdict(child_out(&k1, 3), Some(&k2)), ChildVerdict::Mismatch(..)));
+        assert!(
+            matches!(child_verdict(child_out(&k1, 3), None), ChildVerdict::Use(..)),
+            "no key: the child's own line"
+        );
+        let refused = |out| matches!(child_verdict(out, Some(&k1)), ChildVerdict::Refused(_));
+        assert!(
+            matches!(child_verdict(Ok((1, arena_of(&k1, &sample(3)))), Some(&k1)), ChildVerdict::Refused(e) if e == "exit code 1")
+        );
+        assert!(refused(Ok((0, Vec::new()))));
+        assert!(refused(Ok((0, b"mini-oled-dock settings-catalog 2\nk\n".to_vec()))));
+        assert!(refused(Ok((0, crate::launcher::arena::test_apps(&[("a.exe", "A", &[], 1)]).raw().to_vec()))));
+        let mut flipped = arena_of(&k1, &sample(3));
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0x10;
+        assert!(refused(Ok((0, flipped))));
+        assert!(matches!(child_verdict(Err("timeout".into()), Some(&k1)), ChildVerdict::Refused(e) if e == "timeout"));
+        let sh = Shared::new();
+        // The settings files changed while the first child ran: once more, then cached under the new key.
+        let mut io = FakeIo {
+            keys: vec![Some(k1.clone()), Some(k2.clone())],
+            children: [child_out(&k1, 3), child_out(&k2, 4)].into(),
+            ..FakeIo::default()
+        };
+        serve(&sh, ENSURE, &mut io);
+        assert_eq!(io.calls, ["key", "read", "child", "key", "child", "key", "write", "ready"]);
+        let file = io.file.unwrap();
+        assert_eq!((arena::key_line(&file), rows_of(&file, &k2).len()), (Some(k2.as_str()), 4));
+        // Twice: no file and never the in-process build; Start still gets this run's list.
+        let k3 = k2.replace(":100:6", ":100:7");
+        let mut io = FakeIo {
+            keys: vec![Some(k1.clone()), Some(k2.clone()), Some(k3)],
+            children: [child_out(&k1, 3), child_out(&k2, 4)].into(),
+            here: sample(9),
+            ..FakeIo::default()
+        };
+        assert!(sh.hold());
+        serve(&sh, Asked { start: true, ensure: true, rebuild: false }, &mut io);
+        assert_eq!(io.calls, ["key", "read", "child", "key", "child", "key", "ready"]);
+        assert!(io.file.is_none());
+        assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(4));
+        sh.release();
+        // A child that fails: built in this process under the current key, and written.
+        let mut io = FakeIo {
+            keys: vec![Some(k1.clone())],
+            children: [Ok((0, b"garbage".to_vec()))].into(),
+            here: sample(5),
+            ..FakeIo::default()
+        };
+        serve(&sh, ENSURE, &mut io);
+        assert_eq!(io.calls, ["key", "read", "child", "key", "build true", "write", "ready"]);
+        assert_eq!(rows_of(&io.file.unwrap(), &k1).len(), 5);
+        // A failed write: the launcher is not told (it asks again at its next open).
+        let mut io = FakeIo {
+            keys: vec![Some(k1.clone())],
+            children: [child_out(&k1, 3)].into(),
+            write_fails: true,
+            ..FakeIo::default()
+        };
+        serve(&sh, ENSURE, &mut io);
+        assert_eq!(io.calls, ["key", "read", "child", "key", "write"]);
+        // Unelevated (no file can be written): the launcher's request makes nothing, so no child per open; Start's does.
+        let mut io = FakeIo {
+            keys: vec![Some(k1.clone())],
+            children: [child_out(&k1, 6)].into(),
+            read_only: true,
+            ..FakeIo::default()
+        };
+        serve(&sh, ENSURE, &mut io);
+        assert_eq!(io.calls, ["key", "read"]);
+        assert!(sh.hold());
+        serve(&sh, START, &mut io);
+        assert_eq!(&io.calls[2..], ["key", "read", "child", "key", "write", "ready"]);
+        assert!(io.file.is_none());
+        assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(6));
+        sh.release();
+        // No key: nothing at all for the launcher; Start's list from the child's own line, never written.
+        let mut io = FakeIo { keys: vec![None], children: [child_out(&unkeyed_key(), 2)].into(), ..FakeIo::default() };
+        serve(&sh, ENSURE, &mut io);
+        assert_eq!(io.calls, ["key"]);
+        assert!(sh.hold());
+        serve(&sh, START, &mut io);
+        assert_eq!(io.calls, ["key", "key", "child", "key", "ready"]);
+        assert!(io.file.is_none());
+        assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(2));
     }
 
     #[test]
@@ -1340,114 +1770,6 @@ mod tests {
         let b = windows_build();
         println!("build {b}");
         assert!(b.contains('.') && b.chars().next().is_some_and(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn settings_freed_only_when_both_released() {
-        let bits = AtomicU8::new(0);
-        assert_eq!(holders_step(&bits, Holder::Start, true), 1);
-        assert_eq!(holders_step(&bits, Holder::Launcher, true), 3);
-        assert_eq!(holders_step(&bits, Holder::Start, false), 2, "the launcher still holds it");
-        assert_eq!(holders_step(&bits, Holder::Start, false), 2, "releasing twice changes nothing");
-        assert_eq!(holders_step(&bits, Holder::Launcher, false), 0, "the last one frees it");
-        assert_eq!(holders_step(&bits, Holder::Launcher, true), 2);
-        assert_eq!(holders_step(&bits, Holder::Start, true), 3);
-        assert_eq!(holders_step(&bits, Holder::Launcher, false), 1);
-    }
-
-    fn held_list(n: usize) -> (Arc<Vec<Setting>>, Arc<FoldedSettings>) {
-        let list = Arc::new(sample(n));
-        let folded = Arc::new(FoldedSettings::new(&list).unwrap());
-        (list, folded)
-    }
-
-    fn ready_with(ask: LauncherAsk, list: &Arc<Vec<Setting>>) -> bool {
-        matches!(ask, LauncherAsk::Ready(l, f) if Arc::ptr_eq(&l, list) && f.arena.len() == list.len() && f.arena.bytes() > 0)
-    }
-
-    #[test]
-    fn launcher_rows_come_with_the_list_or_from_one_fold() {
-        let mut h = Held::default();
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Wait), "no list yet: the build brings it");
-        // Built while the launcher held the catalog: the rows came with it, nothing is folded later.
-        let (list, folded) = held_list(40);
-        assert!(store_built(&mut h, &mut Some(list.clone()), &mut Some(folded), true, true));
-        assert!(ready_with(launcher_ask(&mut h), &list));
-        assert!(!h.folding);
-        // Built for Start alone: the launcher's first ask starts one fold, later asks wait for it.
-        let mut h = Held::default();
-        let (list, folded) = held_list(40);
-        assert!(store_built(&mut h, &mut Some(list.clone()), &mut None, true, false));
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(l) if Arc::ptr_eq(&l, &list)));
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Wait), "one fold at a time");
-        assert!(matches!(fold_done(&mut h, &list, &mut Some(folded), true), FoldNext::Posted));
-        assert!(!h.folding);
-        assert!(ready_with(launcher_ask(&mut h), &list));
-    }
-
-    #[test]
-    fn launcher_rows_never_outlive_the_list_or_the_hold() {
-        // Made while the launcher held the catalog, released before the store: the list stays, the rows do not.
-        let mut h = Held::default();
-        let (list, folded) = held_list(10);
-        assert!(store_built(&mut h, &mut Some(list.clone()), &mut Some(folded), true, false));
-        assert!(h.list.is_some() && h.folded.is_none());
-        // Released while it was being built: nothing is kept.
-        let mut h = Held::default();
-        let (list, folded) = held_list(10);
-        assert!(!store_built(&mut h, &mut Some(list), &mut Some(folded), false, true));
-        assert!(h.list.is_none() && h.folded.is_none());
-        // The launcher lets go and Start still holds: the list stays, the rows go; the last holder frees both.
-        let (list, folded) = held_list(10);
-        store_built(&mut h, &mut Some(list), &mut Some(folded), true, true);
-        release_step(&mut h, Holder::Launcher, Holder::Start as u8);
-        assert!(h.list.is_some() && h.folded.is_none());
-        let (list, folded) = held_list(10);
-        store_built(&mut h, &mut Some(list), &mut Some(folded), true, true);
-        release_step(&mut h, Holder::Start, Holder::Launcher as u8);
-        assert!(h.list.is_some() && h.folded.is_some(), "Start let go, the launcher still holds both");
-        release_step(&mut h, Holder::Launcher, 0);
-        assert!(h.list.is_none() && h.folded.is_none());
-    }
-
-    #[test]
-    fn a_fold_of_a_list_that_went_is_not_kept() {
-        // The list was freed during the fold.
-        let mut h = Held::default();
-        let (list, folded) = held_list(10);
-        store_built(&mut h, &mut Some(list.clone()), &mut None, true, true);
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
-        release_step(&mut h, Holder::Launcher, 0);
-        assert!(matches!(fold_done(&mut h, &list, &mut Some(folded), true), FoldNext::Done));
-        assert!(h.folded.is_none() && !h.folding);
-        // The launcher let go during the fold.
-        let (list, folded) = held_list(10);
-        store_built(&mut h, &mut Some(list.clone()), &mut None, true, true);
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
-        assert!(matches!(fold_done(&mut h, &list, &mut Some(folded), false), FoldNext::Done));
-        assert!(h.folded.is_none() && !h.folding);
-        // Another list replaced it, without rows: that one is folded next, and kept.
-        let (old, old_folded) = held_list(10);
-        let mut h = Held::default();
-        store_built(&mut h, &mut Some(old.clone()), &mut None, true, true);
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
-        let (new, new_folded) = held_list(12);
-        store_built(&mut h, &mut Some(new.clone()), &mut None, true, true);
-        assert!(
-            matches!(fold_done(&mut h, &old, &mut Some(old_folded), true), FoldNext::Again(l) if Arc::ptr_eq(&l, &new))
-        );
-        assert!(h.folding && h.folded.is_none());
-        assert!(matches!(fold_done(&mut h, &new, &mut Some(new_folded), true), FoldNext::Posted));
-        assert!(ready_with(launcher_ask(&mut h), &new));
-        // Another list replaced it with its own rows: the fold is dropped.
-        let mut h = Held::default();
-        let (old, old_folded) = held_list(10);
-        store_built(&mut h, &mut Some(old.clone()), &mut None, true, true);
-        assert!(matches!(launcher_ask(&mut h), LauncherAsk::Fold(_)));
-        let (new, new_folded) = held_list(12);
-        store_built(&mut h, &mut Some(new.clone()), &mut Some(new_folded), true, true);
-        assert!(matches!(fold_done(&mut h, &old, &mut Some(old_folded), true), FoldNext::Done));
-        assert!(ready_with(launcher_ask(&mut h), &new) && !h.folding);
     }
 
     /// Builds the REAL settings catalog and app index of this machine (run by hand:
@@ -1500,8 +1822,8 @@ mod tests {
         // SAFETY: COM for this test thread, paired with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let list = build_settings();
-        let folded = FoldedSettings::new(&list).expect("the settings of this machine fit the arena");
-        let bytes = folded.arena.raw();
+        let encoded = encode_setting_list(&unkeyed_key(), &list).expect("the settings of this machine fit the arena");
+        let bytes = encoded.as_slice();
         let kinds = crate::launcher::arena::Kind::Settings;
         let caps = crate::launcher::arena::Caps::SETTINGS;
         let mut times: Vec<std::time::Duration> = (0..51)

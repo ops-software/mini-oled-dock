@@ -15,6 +15,9 @@ use super::rank::{Cand, KeysRef, Words};
 
 const APPS_HEADER: &[u8] = b"mini-oled-dock apps-catalog 1\n";
 const SETTINGS_HEADER: &[u8] = b"mini-oled-dock settings-catalog 2\n";
+/// The version of C.1's layout and C.2's checks: the settings key line ends with `|fmt <ARENA_FORMAT>` (L3 T18), so a cache
+/// file of another layout never matches and is rebuilt once. Bump it with every change of the layout or of `check`.
+pub const ARENA_FORMAT: u32 = 1;
 
 /// Sections, in file order (C.1's ids).
 const STR: usize = 0;
@@ -39,7 +42,7 @@ const CUR_POST: usize = 8;
 const POST: usize = 4;
 const TGT_REC: usize = 8;
 /// The key line of a settings buffer, at most.
-const KEY_MAX: usize = 2048;
+pub const KEY_MAX: usize = 2048;
 /// A string, at most; the words of a name, at most.
 pub const STR_MAX: usize = 64 * 1024;
 const WORDS_MAX: usize = 64;
@@ -154,10 +157,24 @@ impl Layout {
         self.entries as usize
     }
 
-    #[allow(dead_code)] // read by the cache file code of T18 and T19
+    #[allow(dead_code)] // read by the tests of the cache file code
     pub fn kind(&self) -> Kind {
         self.kind
     }
+}
+
+/// The key line of a settings buffer (what it says it was built from), without its newline; `None` for a buffer that does
+/// not start with the settings header and a line of printable ASCII of at most 2 KiB. Read after `check` accepted the buffer
+/// with no expected key, to compare the line with a key computed later (L3 T18).
+pub fn key_line(bytes: &[u8]) -> Option<&str> {
+    let rest = bytes.strip_prefix(SETTINGS_HEADER)?;
+    let window = rest.get(..rest.len().min(KEY_MAX + 1))?;
+    let nl = window.iter().position(|&b| b == b'\n')?;
+    let line = window.get(..nl)?;
+    if line.is_empty() || !line.iter().all(|b| (0x20..=0x7E).contains(b)) {
+        return None;
+    }
+    std::str::from_utf8(line).ok()
 }
 
 /// The strings of STR as a checked reader.
@@ -456,7 +473,7 @@ impl Default for CatalogView<'static> {
 }
 
 impl<'a> CatalogView<'a> {
-    #[allow(dead_code)] // T19 lends the mapped file's bytes with the layout `check` made of them
+    /// The view of `bytes` with the layout `check` made of them (a mapped cache file, L3 T19).
     pub fn new(bytes: &'a [u8], layout: &'a Layout) -> CatalogView<'a> {
         CatalogView { bytes, layout }
     }
@@ -521,7 +538,6 @@ impl<'a> CatalogView<'a> {
     }
 
     /// The launch target and the arguments of a setting.
-    #[allow(dead_code)] // T18 launches from the arena instead of the held list
     pub fn target(&self, i: usize) -> (&'a str, Option<&'a str>) {
         if self.layout.kind != Kind::Settings {
             return ("", None);

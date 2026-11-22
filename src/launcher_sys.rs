@@ -7,7 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::cell::RefCell;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -756,6 +756,62 @@ pub(crate) fn fill_titles(rows: &mut [WindowRow]) {
         let title = String::from_utf16_lossy(buf.get(..n.min(buf.len())).unwrap_or(&[]));
         r.title = (!title.trim().is_empty()).then(|| title.into());
     }
+}
+
+/// Why the launcher holds no settings at an open (L3 T18, T19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SettingsMiss {
+    /// No key (Windows' build or its settings files cannot be read) or no cache folder: no file is ever written, so the
+    /// settings thread is not asked.
+    NoKey,
+    /// No cache file yet: the settings thread is asked to make it.
+    NoFile,
+    /// A file that could not be read, or failed the check: the settings thread rebuilds it.
+    Refused,
+}
+
+impl SettingsMiss {
+    /// What to ask the settings thread (`start_search::ensure_settings_cache`'s `rebuild`), if anything.
+    pub(crate) fn rebuild(self) -> Option<bool> {
+        match self {
+            SettingsMiss::NoKey => None,
+            SettingsMiss::NoFile => Some(false),
+            SettingsMiss::Refused => Some(true),
+        }
+    }
+}
+
+/// The settings cache file (`<root>\cache\settings-catalog.bin`, version 2) read through the checked opener (one link, no
+/// reparse point, at most 4 MiB) and checked whole (`arena::check` under the key the settings thread computed: header,
+/// key line, every section and reference, the checksum) before anything of it is used. The bytes are untrusted.
+pub(crate) fn read_settings() -> Result<crate::launcher::arena::Arena, SettingsMiss> {
+    use crate::launcher::arena::{Arena, Caps, Kind};
+    static NO_KEY: AtomicBool = AtomicBool::new(false);
+    static REFUSED: AtomicBool = AtomicBool::new(false);
+    let Some((key, path)) =
+        crate::start_search::expected_settings_key().zip(crate::start_search::settings_cache_path())
+    else {
+        if !NO_KEY.swap(true, Relaxed) {
+            log!("launcher: no settings cache can be keyed or kept here: the launcher shows no settings");
+        }
+        return Err(SettingsMiss::NoKey);
+    };
+    let bytes = match crate::datadir::read_file(&path, crate::start_search::CACHE_MAX, true) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SettingsMiss::NoFile),
+        Err(e) => {
+            if !REFUSED.swap(true, Relaxed) {
+                log!("launcher: the settings cache cannot be read: {e}");
+            }
+            return Err(SettingsMiss::Refused);
+        }
+    };
+    Arena::new(bytes, Kind::Settings, Some(&key), Caps::SETTINGS).map_err(|e| {
+        if !REFUSED.swap(true, Relaxed) {
+            log!("launcher: the settings cache was refused: {e}");
+        }
+        SettingsMiss::Refused
+    })
 }
 
 /// The shell request of one launch. `setting` gives the target and arguments of a held setting

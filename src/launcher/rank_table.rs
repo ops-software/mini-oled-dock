@@ -1,5 +1,5 @@
 //! The ranking table of plan L3 (Appendix B): two synthetic catalogues, English and Italian, built through the code
-//! the dock uses (`catalog::ingest`, `catalog::fold_settings`), and one query per row through `parse_query`,
+//! the dock uses (`catalog::ingest`, `catalog::setting_entries`), and one query per row through `parse_query`,
 //! `query_all` and `Results::sync`, as the session does. No name from any real machine: Windows' own programs and
 //! invented names only. A failing run prints every failing row.
 
@@ -183,7 +183,7 @@ impl World {
                 }
             })
             .collect();
-        let settings = catalog::FoldedSettings::new(&held).unwrap().arena;
+        let settings = catalog::build_settings_arena(catalog::IN_PROCESS_KEY, &held).unwrap();
         World {
             apps,
             settings,

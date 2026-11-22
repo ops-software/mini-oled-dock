@@ -177,15 +177,6 @@ pub fn ingest(list: &[StartApp], index: Option<&AppIndex>) -> Vec<CatApp> {
     apps
 }
 
-/// The settings catalogue folded once, when it arrives: `index` is the position in `list`, the held list the launch
-/// targets come from.
-pub fn fold_settings(list: &[Setting]) -> Vec<SettingRow> {
-    list.iter()
-        .enumerate()
-        .map(|(i, s)| SettingRow::new(u32::try_from(i).unwrap_or(u32::MAX), &s.name, fold_keys(&s.keys), s.rank))
-        .collect()
-}
-
 /// The apps catalogue of one listing as the bytes of its arena: what the `--start-apps` child writes (L3 T17).
 pub fn encode_app_list(list: &[StartApp], index: Option<&AppIndex>) -> Result<Vec<u8>, ArenaError> {
     arena::encode_apps(&ingest(list, index), Caps::APPS)
@@ -212,29 +203,40 @@ pub fn index_settings(rows: &[SettingRow]) -> IndexBuf {
     IndexBuf::build(rows.iter().enumerate().map(|(i, r)| (u32::try_from(i).unwrap_or(u32::MAX), r.cand())))
 }
 
-/// The launcher's settings as one arena: made from the held list off the UI thread (`start_search` builds it on a settings
-/// thread, L3 KEY-11) and shared with the list it indexes (the entry at position i is the setting at index i).
-#[derive(Default, Debug)]
-pub struct FoldedSettings {
-    pub arena: Arena,
+/// The settings entries of `list` as the encoder takes them (L3 T18), each folded once: the row (names, words, initials and
+/// keywords folded; the position among the entries is its index), the launch target and arguments, and Start's packed
+/// keywords as `build_settings` made them (cut after a whole line when longer than an arena string). A setting no arena can
+/// hold (a name, target or argument over 4 KiB; never seen) is left out instead of failing the whole catalogue.
+pub fn setting_entries(list: &[Setting]) -> Vec<SettingIn> {
+    let fits = |s: &&Setting| {
+        !s.name.is_empty()
+            && s.name.len() <= NAME_MAX
+            && s.target.len() <= NAME_MAX
+            && s.args.as_ref().is_none_or(|a| a.len() <= NAME_MAX)
+    };
+    list.iter()
+        .filter(fits)
+        .enumerate()
+        .map(|(i, s)| SettingIn {
+            row: SettingRow::new(u32::try_from(i).unwrap_or(u32::MAX), &s.name, fold_keys(&s.keys), s.rank),
+            target: s.target.to_string(),
+            args: s.args.clone(),
+            start_keys: start_copy(&s.keys).packed().to_string(),
+        })
+        .collect()
 }
 
-impl FoldedSettings {
-    /// `fold_settings` of `list`, encoded and checked.
-    pub fn new(list: &[Setting]) -> Result<FoldedSettings, ArenaError> {
-        let ins: Vec<SettingIn> = fold_settings(list)
-            .into_iter()
-            .zip(list)
-            .map(|(row, s)| SettingIn {
-                row,
-                target: s.target.to_string(),
-                args: s.args.as_ref().map(|a| a.to_string()),
-                start_keys: String::new(),
-            })
-            .collect();
-        let bytes = arena::encode_settings(IN_PROCESS_KEY, &ins, Caps::SETTINGS)?;
-        Ok(FoldedSettings { arena: Arena::new(bytes, Kind::Settings, Some(IN_PROCESS_KEY), Caps::SETTINGS)? })
-    }
+/// The settings catalogue of `list` as the bytes of its arena under `key` (the line that names what it was built from):
+/// what the `--start-settings` child writes, and what the dock encodes itself when the child fails (L3 T18).
+pub fn encode_setting_list(key: &str, list: &[Setting]) -> Result<Vec<u8>, ArenaError> {
+    arena::encode_settings(key, &setting_entries(list), Caps::SETTINGS)
+}
+
+/// The settings catalogue of `list` as a checked arena under `key` (the tests' and the ranking table's way to the real
+/// entry builder and encoder).
+#[cfg(test)]
+pub fn build_settings_arena(key: &str, list: &[Setting]) -> Result<Arena, ArenaError> {
+    Arena::new(encode_setting_list(key, list)?, Kind::Settings, Some(key), Caps::SETTINGS)
 }
 
 /// Icons kept between opens (at most `ICON_CACHE_CAP`), the least recently used dropped first.
@@ -317,7 +319,7 @@ mod tests {
             setting("Schermo", &[], 1),
             setting("Rete e Internet", &[("Wi-Fi", 4)], 7),
         ];
-        let rows = fold_settings(&list);
+        let rows: Vec<SettingRow> = setting_entries(&list).into_iter().map(|e| e.row).collect();
         assert_eq!(rows.len(), 3);
         assert_eq!((&*rows[0].folded, rows[0].index, rows[2].index), ("accessibilita", 0, 2));
         let keys: Vec<(&str, u32)> = rows[0].keys.iter().collect();
@@ -332,6 +334,47 @@ mod tests {
             found
         });
         assert_eq!((hit, allocs), (10, 0));
+    }
+
+    /// L3 T18: the settings entry builder keeps what Start searches with and what a setting opens, and leaves out what no
+    /// arena can hold instead of failing the whole catalogue; the positions are the indexes the launcher launches by.
+    #[test]
+    fn setting_entries_keep_starts_copy_and_the_targets() {
+        let mut huge = Keys::default();
+        for i in 0..8_000 {
+            huge.push(&format!("parola{i:05}"), i);
+        }
+        assert!(huge.packed().len() > arena::STR_MAX);
+        let mut panel = setting("Pannello di controllo", &[("Control Panel", 2)], 4);
+        panel.target = std::borrow::Cow::Owned(r"C:\Windows\System32\control.exe".into());
+        panel.args = Some("/name Microsoft.Mouse".into());
+        let list = [
+            setting("Accessibilità", &[("Contrasto più", 5)], 2),
+            setting(&"x".repeat(5_000), &[], 1),
+            panel,
+            setting("", &[], 1),
+            setting("Molte parole", &[], 9),
+        ];
+        let mut many = list;
+        many[4].keys = huge;
+        let ins = setting_entries(&many);
+        let names: Vec<&str> = ins.iter().map(|e| &*e.row.name).collect();
+        assert_eq!(names, ["Accessibilità", "Pannello di controllo", "Molte parole"]);
+        assert_eq!(ins.iter().map(|e| e.row.index).collect::<Vec<_>>(), [0, 1, 2], "the position is the index");
+        assert_eq!(ins[0].start_keys, "contrasto più\t5\n", "Start's keywords as Start searches them, unfolded");
+        assert_eq!(ins[0].row.keys.iter().collect::<Vec<_>>(), [("contrasto piu", 5)], "the launcher's folded");
+        assert_eq!(
+            (ins[1].target.as_str(), ins[1].args.as_deref()),
+            (r"C:\Windows\System32\control.exe", Some("/name Microsoft.Mouse"))
+        );
+        assert!(ins[2].start_keys.len() <= arena::STR_MAX && ins[2].start_keys.ends_with('\n'));
+        let a = build_settings_arena("k|fmt 1", &many).unwrap();
+        let v = a.view();
+        assert_eq!(
+            (v.len(), v.name(1), v.target(1)),
+            (3, "Pannello di controllo", (ins[1].target.as_str(), ins[1].args.as_deref()))
+        );
+        assert_eq!((v.start_keys(0), v.rank(2)), ("contrasto più\t5\n", 9));
     }
 
     #[test]
