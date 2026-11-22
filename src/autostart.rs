@@ -864,8 +864,11 @@ mod tests {
     fn an_old_watchdog_is_seen_by_its_image_not_by_a_mutex() {
         // A 1.3.0 watchdog is just a process running the installed exe; any running exe stands in for it.
         let ping = crate::shell_thread::system_dir().expect("system dir").join("ping.exe");
+        // No console of its own: a console child of a console-less test run opens a visible window.
         let mut child = std::process::Command::new(&ping)
+            .creation_flags(CREATE_NO_WINDOW.0)
             .args(["-n", "8", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn ping.exe");

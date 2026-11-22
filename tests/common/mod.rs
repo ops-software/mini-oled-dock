@@ -4,7 +4,11 @@ pub mod compare;
 pub mod wic;
 
 use std::ffi::OsString;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+
+/// `CREATE_NO_WINDOW` (winbase.h): every process a test starts carries it (lint `every_spawned_process_has_no_window`).
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The whole argument vector the golden tests give to the dock exe. A test must never be able to start
 /// the real dock: `--preview <dir>` is handled by main.rs before any window, hook or taskbar code.
@@ -18,7 +22,9 @@ pub fn run_preview(out: &Path, lang: &str, dpi: u32, no_text: bool) {
     let _ = std::fs::remove_dir_all(out);
     std::fs::create_dir_all(out).unwrap();
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_dock"));
-    c.args(preview_args(out))
+    // CREATE_NO_WINDOW: no test child may ever open a console or a window on the desktop.
+    c.creation_flags(CREATE_NO_WINDOW)
+        .args(preview_args(out))
         .env("DOCK_PREVIEW_DPI", dpi.to_string())
         .env("DOCK_PREVIEW_LANG", lang)
         .env_remove("DOCK_PREVIEW_NOTEXT");

@@ -937,6 +937,68 @@ fn release_strings_hold_no_probe_name() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- no process without CREATE_NO_WINDOW ---------------------------------------------------------------------------
+
+/// Lines around a spawn that may hold its flags.
+const SPAWN_WINDOW: usize = 12;
+/// The Win32 starters (called with an opening parenthesis).
+const CREATE_CALLS: [&str; 4] = ["CreateProcessW(", "CreateProcessAsUserW(", "CreateProcessWithTokenW(", "CreateProcessWithLogonW("];
+
+/// A process started from src/ or tests/ without CREATE_NO_WINDOW: a console-subsystem child (ping, cmd, schtasks) started
+/// from a process that has no console gets a new visible one, which takes the foreground from the person at the PC. The
+/// flag must stand within a few lines of every `Command::new(` (as `.creation_flags(CREATE_NO_WINDOW...)`) and of every
+/// CreateProcess call. Test code counts as much as production code.
+fn spawn_violations(path: &str, text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut v = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") || code.starts_with("use ") {
+            continue;
+        }
+        let starts_std = code.contains("Command::new(");
+        let starts_win = CREATE_CALLS.iter().any(|c| code.contains(c));
+        if !starts_std && !starts_win {
+            continue;
+        }
+        let from = if starts_win { n.saturating_sub(SPAWN_WINDOW) } else { n };
+        let to = (n + SPAWN_WINDOW + 1).min(lines.len());
+        let near = lines.get(from..to).unwrap_or(&[]).join("\n");
+        let ok = near.contains("CREATE_NO_WINDOW") && (starts_win || near.contains("creation_flags("));
+        if !ok {
+            v.push(format!("{path}:{}: a process is started without CREATE_NO_WINDOW", n + 1));
+        }
+    }
+    v
+}
+
+#[test]
+fn every_spawned_process_has_no_window() {
+    let good = "let c = Command::new(exe)\n    .creation_flags(CREATE_NO_WINDOW.0)\n    .spawn();";
+    assert!(spawn_violations("src/a.rs", good).is_empty());
+    let bad = "let c = std::process::Command::new(&ping)\n    .args([\"-n\", \"8\"])\n    .spawn();";
+    assert_eq!(spawn_violations("src/a.rs", bad).len(), 1);
+    let flags_only = "let c = Command::new(exe).creation_flags(0).spawn();";
+    assert_eq!(spawn_violations("src/a.rs", flags_only).len(), 1, "creation_flags without the flag");
+    let win_good = "let flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;\nunsafe { CreateProcessW(app, line) };";
+    assert!(spawn_violations("src/a.rs", win_good).is_empty());
+    assert_eq!(spawn_violations("tests/a.rs", "unsafe { CreateProcessW(app, line) };").len(), 1);
+    assert!(spawn_violations("src/a.rs", "/// CreateProcessW(x)\n// Command::new(x)\nuse std::process::Command;").is_empty());
+    let far = format!("Command::new(x)\n{}\n.creation_flags(CREATE_NO_WINDOW.0)", "\n".repeat(20));
+    assert_eq!(spawn_violations("src/a.rs", &far).len(), 1, "the flag must stand next to the spawn");
+    let mut all = scan_tree(spawn_violations);
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = Vec::new();
+    collect(&tests, &mut files);
+    assert!(files.iter().any(|f| f.ends_with("common/mod.rs")), "the tests folder is walked");
+    for f in files {
+        let rel = f.strip_prefix(&tests).unwrap_or(&f).to_string_lossy().replace('\\', "/");
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        all.extend(spawn_violations(&format!("tests/{}", rel.trim_start_matches('/')), &text));
+    }
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
