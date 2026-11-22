@@ -6,6 +6,7 @@
 //! in the tests).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -107,46 +108,133 @@ const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
 /// A piece of text drawn in one style: plain, or a marker (SPEC 5.3: a control or bidi character shown visibly).
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Run {
-    text: String,
+    /// A marker's text is static; plain text is owned (a wrapped detail line).
+    text: Cow<'static, str>,
     marker: bool,
 }
 
-/// The width of each character of `text` as it is drawn (a marker by its display text).
-fn char_widths(s: &Surface, text: &str) -> Vec<i32> {
-    text.chars().map(|c| s.text_width(&unit(c).text, Font::Query)).collect()
+/// The width up to and including each character of `text` as it is drawn, into `out` (a marker counts by its display
+/// text): one measurement of the whole text, character by character only when the text holds a marker.
+fn query_extents(s: &Surface, text: &str, out: &mut Vec<i32>) {
+    if text.chars().any(gesture::is_marker) {
+        out.clear();
+        let mut total = 0;
+        for c in text.chars() {
+            let mut buf = [0u8; 4];
+            total += s.text_width(marker_text(c).unwrap_or_else(|| c.encode_utf8(&mut buf)), Font::Query);
+            out.push(total);
+        }
+    } else {
+        s.char_extents(text, Font::Query, out);
+    }
 }
 
-/// The width of the characters of `text` before the byte offset `at`.
-fn prefix_width(widths: &[i32], text: &str, at: usize) -> i32 {
+/// The width of the characters of `text` before the byte offset `at`, from the cumulative widths of `query_extents`.
+fn prefix_width(extents: &[i32], text: &str, at: usize) -> i32 {
     let n = text.get(..at).map_or(0, |t| t.chars().count());
-    widths.iter().take(n).sum()
+    n.checked_sub(1).map_or(0, |i| extents.get(i).or(extents.last()).copied().unwrap_or(0))
 }
 
 /// How a marker character is drawn: control pictures for C0 and DEL, "<U+XXXX>" for the rest.
-fn marker_text(c: char) -> Option<String> {
+fn marker_text(c: char) -> Option<&'static str> {
     if !gesture::is_marker(c) {
         return None;
     }
-    let u = u32::from(c);
-    Some(match u {
-        0..=0x1F => char::from_u32(0x2400 + u).map_or_else(|| format!("<U+{u:04X}>"), String::from),
-        0x7F => String::from('\u{2421}'),
-        _ => format!("<U+{u:04X}>"),
+    // The marked set is closed (Cc and the bidi marks), so every text is a literal and nothing is formatted per key.
+    Some(match u32::from(c) {
+        0x00 => "\u{2400}",
+        0x01 => "\u{2401}",
+        0x02 => "\u{2402}",
+        0x03 => "\u{2403}",
+        0x04 => "\u{2404}",
+        0x05 => "\u{2405}",
+        0x06 => "\u{2406}",
+        0x07 => "\u{2407}",
+        0x08 => "\u{2408}",
+        0x09 => "\u{2409}",
+        0x0A => "\u{240A}",
+        0x0B => "\u{240B}",
+        0x0C => "\u{240C}",
+        0x0D => "\u{240D}",
+        0x0E => "\u{240E}",
+        0x0F => "\u{240F}",
+        0x10 => "\u{2410}",
+        0x11 => "\u{2411}",
+        0x12 => "\u{2412}",
+        0x13 => "\u{2413}",
+        0x14 => "\u{2414}",
+        0x15 => "\u{2415}",
+        0x16 => "\u{2416}",
+        0x17 => "\u{2417}",
+        0x18 => "\u{2418}",
+        0x19 => "\u{2419}",
+        0x1A => "\u{241A}",
+        0x1B => "\u{241B}",
+        0x1C => "\u{241C}",
+        0x1D => "\u{241D}",
+        0x1E => "\u{241E}",
+        0x1F => "\u{241F}",
+        0x7F => "\u{2421}",
+        0x0080 => "<U+0080>",
+        0x0081 => "<U+0081>",
+        0x0082 => "<U+0082>",
+        0x0083 => "<U+0083>",
+        0x0084 => "<U+0084>",
+        0x0085 => "<U+0085>",
+        0x0086 => "<U+0086>",
+        0x0087 => "<U+0087>",
+        0x0088 => "<U+0088>",
+        0x0089 => "<U+0089>",
+        0x008A => "<U+008A>",
+        0x008B => "<U+008B>",
+        0x008C => "<U+008C>",
+        0x008D => "<U+008D>",
+        0x008E => "<U+008E>",
+        0x008F => "<U+008F>",
+        0x0090 => "<U+0090>",
+        0x0091 => "<U+0091>",
+        0x0092 => "<U+0092>",
+        0x0093 => "<U+0093>",
+        0x0094 => "<U+0094>",
+        0x0095 => "<U+0095>",
+        0x0096 => "<U+0096>",
+        0x0097 => "<U+0097>",
+        0x0098 => "<U+0098>",
+        0x0099 => "<U+0099>",
+        0x009A => "<U+009A>",
+        0x009B => "<U+009B>",
+        0x009C => "<U+009C>",
+        0x009D => "<U+009D>",
+        0x009E => "<U+009E>",
+        0x009F => "<U+009F>",
+        0x061C => "<U+061C>",
+        0x200E => "<U+200E>",
+        0x200F => "<U+200F>",
+        0x202A => "<U+202A>",
+        0x202B => "<U+202B>",
+        0x202C => "<U+202C>",
+        0x202D => "<U+202D>",
+        0x202E => "<U+202E>",
+        0x2066 => "<U+2066>",
+        0x2067 => "<U+2067>",
+        0x2068 => "<U+2068>",
+        0x2069 => "<U+2069>",
+        _ => "\u{FFFD}",
     })
 }
 
 /// One character as a run of its own.
 fn unit(c: char) -> Run {
     match marker_text(c) {
-        Some(text) => Run { text, marker: true },
-        None => Run { text: c.to_string(), marker: false },
+        Some(text) => Run { text: Cow::Borrowed(text), marker: true },
+        None => Run { text: Cow::Owned(c.to_string()), marker: false },
     }
 }
 
 /// Appends a run, merging it into the last one of the same kind.
 fn push_run(runs: &mut Vec<Run>, r: Run) {
     match runs.last_mut() {
-        Some(last) if last.marker == r.marker => last.text.push_str(&r.text),
+        Some(last) if last.marker == r.marker => last.text.to_mut().push_str(&r.text),
         _ => runs.push(r),
     }
 }
@@ -163,20 +251,43 @@ fn runs_of(text: &str) -> Vec<Run> {
 /// Draws the runs from `x` and returns the x after the last. Markers are FG_SECONDARY with a 2 px ACCENT_ATTENTION
 /// underline.
 fn draw_runs(s: &mut Surface, runs: &[Run], mut x: i32, y: i32, font: Font, alpha: u32) -> i32 {
-    let m = s.metrics();
-    let lh = s.line_height(font);
     for r in runs {
-        let w = s.text_width(&r.text, font);
-        if r.marker {
-            s.text(&r.text, x, y, font, WHITE, style::FG_SECONDARY);
-            let bar = m.px(2).max(1);
-            s.fill_rr(rect_wh(x, y + lh - bar, w, bar), 0, style::ACCENT_ATTENTION, 255);
-        } else {
-            s.text(&r.text, x, y, font, WHITE, alpha);
-        }
-        x += w;
+        x = draw_run(s, &r.text, r.marker, x, y, font, alpha);
     }
     x
+}
+
+/// Draws one run at `x` and returns the x after it.
+fn draw_run(s: &mut Surface, text: &str, marker: bool, x: i32, y: i32, font: Font, alpha: u32) -> i32 {
+    let m = s.metrics();
+    let lh = s.line_height(font);
+    let w = s.text_width(text, font);
+    if marker {
+        s.text(text, x, y, font, WHITE, style::FG_SECONDARY);
+        let bar = m.px(2).max(1);
+        s.fill_rr(rect_wh(x, y + lh - bar, w, bar), 0, style::ACCENT_ATTENTION, 255);
+    } else {
+        s.text(text, x, y, font, WHITE, alpha);
+    }
+    x + w
+}
+
+/// Draws `text` as runs (markers apart from the rest) from `x` and returns the x after it: the runs are slices of
+/// `text` and the markers' own static texts, so nothing is allocated.
+fn draw_text_runs(s: &mut Surface, text: &str, mut x: i32, y: i32, font: Font, alpha: u32) -> i32 {
+    let mut plain = 0;
+    for (i, c) in text.char_indices() {
+        let Some(shown) = marker_text(c) else { continue };
+        if let Some(run) = text.get(plain..i).filter(|r| !r.is_empty()) {
+            x = draw_run(s, run, false, x, y, font, alpha);
+        }
+        x = draw_run(s, shown, true, x, y, font, alpha);
+        plain = i + c.len_utf8();
+    }
+    match text.get(plain..).filter(|r| !r.is_empty()) {
+        Some(run) => draw_run(s, run, false, x, y, font, alpha),
+        None => x,
+    }
 }
 
 /// Draws `text` on one line in `max_w` px: ellipsized at the end, or clipped when it holds markers.
@@ -184,7 +295,7 @@ fn draw_line(s: &mut Surface, text: &str, x: i32, y: i32, max_w: i32, font: Font
     if text.chars().any(gesture::is_marker) {
         let lh = s.line_height(font);
         s.set_clip(Some(rect_wh(x, y, max_w.max(0), lh)));
-        draw_runs(s, &runs_of(text), x, y, font, alpha);
+        draw_text_runs(s, text, x, y, font, alpha);
         s.set_clip(None);
     } else {
         let shown = s.ellipsize(text, font, max_w);
@@ -262,6 +373,12 @@ fn wrap(s: &Surface, text: &str, font: Font, first_w: i32, max_w: i32, max_lines
 
 // ---------------------------------------------------------------- the view
 
+// Number of `Launcher::layout` calls on this thread (the one-layout-per-key gate).
+#[cfg(test)]
+thread_local! {
+    static LAYOUTS: Cell<u32> = const { Cell::new(0) };
+}
+
 /// What the last layout decided: rectangles in client px, for painting and for the hit test.
 #[derive(Clone, Default)]
 struct Geo {
@@ -316,6 +433,10 @@ pub(crate) struct Launcher {
     /// Visible rows of the last layout, for the wheel.
     count: Cell<usize>,
     geo: RefCell<Geo>,
+    /// `geo` was laid out by `size` and not yet painted: the paint that follows reads it instead of laying out again.
+    fresh: Cell<bool>,
+    /// The cumulative widths of the query's characters (`query_extents`), measured by the layout and read by the paint.
+    extents: RefCell<Vec<i32>>,
     /// The height last given to the host, and whether a shrink waits (120 ms without a keystroke).
     shown_h: i32,
     hold_shrink: bool,
@@ -361,6 +482,8 @@ impl Launcher {
             scroll: Cell::new(0),
             count: Cell::new(0),
             geo: RefCell::new(Geo::default()),
+            fresh: Cell::new(false),
+            extents: RefCell::new(Vec::new()),
             shown_h: 0,
             hold_shrink: false,
             bar_ticks: Cell::new(0),
@@ -723,7 +846,7 @@ impl Launcher {
             if lines.len() > MAX_LINES {
                 lines.truncate(MAX_LINES);
                 if let Some(last) = lines.last_mut() {
-                    push_run(last, Run { text: "\u{2026}".to_string(), marker: false });
+                    push_run(last, Run { text: Cow::Borrowed("\u{2026}"), marker: false });
                 }
             }
             return lines;
@@ -769,6 +892,8 @@ impl Launcher {
 
     /// Places everything for the surface's metrics and the session as it is now.
     fn layout(&self, s: &Surface) -> Geo {
+        #[cfg(test)]
+        LAYOUTS.with(|c| c.set(c.get() + 1));
         let m = s.metrics();
         let w = m.px(self.width);
         let inset = m.px(style::S_4);
@@ -873,9 +998,11 @@ impl Launcher {
         let m = s.metrics();
         let (_, room) = self.query_room(s, field);
         let text = self.session.query_text();
-        let widths = char_widths(s, text);
-        let caret_x = prefix_width(&widths, text, self.session.field().caret());
-        let whole: i32 = widths.iter().sum();
+        let mut extents = self.extents.borrow_mut();
+        query_extents(s, text, &mut extents);
+        let caret_x = prefix_width(&extents, text, self.session.field().caret());
+        let whole = extents.last().copied().unwrap_or(0);
+        drop(extents);
         let mut scroll = self.scroll.get();
         let slack = m.px(2);
         if caret_x - scroll > room - slack {
@@ -940,6 +1067,7 @@ impl Launcher {
         let cy = f.top + (f.bottom - f.top - ch) / 2;
         let scroll = self.scroll.get();
         let text = self.session.query_text();
+        let mut extents = self.extents.borrow_mut();
         s.set_clip(Some(rect_wh(tx, f.top, room.max(0), f.bottom - f.top)));
         if text.is_empty() {
             if self.session.chip().is_none() {
@@ -947,28 +1075,34 @@ impl Launcher {
             }
         } else {
             let field = self.session.field();
-            let widths = char_widths(s, text);
+            // The layout of this paint measured the text; a text of another length is measured again.
+            if extents.len() != text.chars().count() {
+                query_extents(s, text, &mut extents);
+            }
             if let Some(sel) = field.selection() {
-                let before = prefix_width(&widths, text, sel.start);
-                let upto = prefix_width(&widths, text, sel.end);
+                let before = prefix_width(&extents, text, sel.start);
+                let upto = prefix_width(&extents, text, sel.end);
                 let rc = rect_wh(tx + before - scroll, cy, upto - before, ch);
                 s.fill_rr(rc, 0, WHITE, style::FILL_TEXT_SELECTION);
             }
             // Only the characters in the room are drawn: a long query is wider than the text scratch.
-            let mut runs: Vec<Run> = Vec::new();
-            let (mut at, mut start_x) = (0, None);
-            for (ch_, w) in text.chars().zip(&widths) {
+            let (mut at, mut seen) = (0, None::<(usize, usize, i32)>);
+            for ((b, ch_), edge) in text.char_indices().zip(extents.iter()) {
+                let w = edge - at;
                 if at + w > scroll && at < scroll + room {
-                    start_x.get_or_insert(at);
-                    push_run(&mut runs, unit(ch_));
+                    let first = seen.map_or((b, at), |(from, _, x0)| (from, x0));
+                    seen = Some((first.0, b + ch_.len_utf8(), first.1));
                 }
-                at += w;
+                at = *edge;
             }
-            draw_runs(s, &runs, tx + start_x.unwrap_or(0) - scroll, ty, Font::Query, text_alpha);
+            if let Some((from, to, start_x)) = seen {
+                if let Some(visible) = text.get(from..to) {
+                    draw_text_runs(s, visible, tx + start_x - scroll, ty, Font::Query, text_alpha);
+                }
+            }
         }
         if lit {
-            let widths = char_widths(s, text);
-            let x = tx + prefix_width(&widths, text, self.session.field().caret()) - scroll + m.px(1);
+            let x = tx + prefix_width(&extents, text, self.session.field().caret()) - scroll + m.px(1);
             s.fill_rr(rect_wh(x, cy, m.px(1).max(1), ch), 0, WHITE, style::FG_HOT);
         }
         s.set_clip(None);
@@ -1078,7 +1212,13 @@ impl Launcher {
     /// `Content::paint` on a port: the rows on screen ask for the icons they lack.
     fn paint_on(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>, sys: &mut dyn SysPort) {
         s.panel();
-        let g = self.layout(s);
+        // After `size` (the render of a key) the layout is the one it stored; any other render lays out again.
+        let stored = if self.fresh.replace(false) {
+            self.geo.try_borrow_mut().ok().map(|mut slot| std::mem::take(&mut *slot))
+        } else {
+            None
+        };
+        let g = stored.unwrap_or_else(|| self.layout(s));
         self.paint_field(s, &g, hot == Some(ID_FIELD));
         let sel = self.session.selected_index();
         for rg in &g.rows {
@@ -1296,11 +1436,12 @@ impl Content for Launcher {
                 }
             });
         }
-        let g = self.layout(s);
-        // The review of the selected row is measured with the real font, for the session's conditions.
+        // The review of the selected row is measured with the real font, for the session's conditions, before the one
+        // layout of this key: the layout painted is the layout whose height is returned.
         if let (Some(lines), Some(key)) = (self.review_lines(s), self.session.selected().map(|i| i.key)) {
             self.session.set_review_lines(key, lines);
         }
+        let g = self.layout(s);
         let mut h = g.h;
         if self.hold_shrink && h < self.shown_h {
             h = self.shown_h;
@@ -1308,6 +1449,7 @@ impl Content for Launcher {
         self.shown_h = h;
         let w = g.w;
         *self.geo.borrow_mut() = g;
+        self.fresh.set(true);
         (w, h)
     }
 
@@ -4645,6 +4787,100 @@ mod tests {
         assert_eq!(row.lines, [runs_of("Line too long to review")], "the detail says why");
     }
 
+    /// A launcher with the query typed one character at a time, painted after each key the way `popup::render(true)` does.
+    fn type_and_paint(text: &str, mut each: impl FnMut(&mut Launcher, &mut Surface)) {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut s = surface(96);
+        let mut l = typed(&fx, "");
+        l.foreground = true;
+        for ch in text.chars() {
+            l.session.chars(&ch.to_string(), &fx.cx());
+            each(&mut l, &mut s);
+        }
+    }
+
+    #[test]
+    fn one_layout_per_key() {
+        let mut keys = 0;
+        type_and_paint("calcolatrice", |l, s| {
+            LAYOUTS.with(|c| c.set(0));
+            l.size(s);
+            l.paint_on(s, None, None, &mut EffectSys::default());
+            assert_eq!(LAYOUTS.with(|c| c.get()), 1, "one layout for the key");
+            keys += 1;
+        });
+        assert_eq!(keys, 12);
+        // A render that is not a key (hover, a scrollbar tick) lays out once, as before.
+        let l = scene_launcher(PreviewScene::Apps);
+        let mut s = surface(96);
+        LAYOUTS.with(|c| c.set(0));
+        l.paint_on(&mut s, None, None, &mut EffectSys::default());
+        assert_eq!(LAYOUTS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn field_measured_once_per_key() {
+        type_and_paint("calcolatrice", |l, s| {
+            let before = crate::surface::EXTENT_CALLS.with(|c| c.get());
+            l.size(s);
+            l.paint_on(s, None, None, &mut EffectSys::default());
+            let calls = crate::surface::EXTENT_CALLS.with(|c| c.get()) - before;
+            assert!((1..=2).contains(&calls), "{calls} measurements of the field for one key");
+        });
+    }
+
+    #[test]
+    fn text_paths_allocate_nothing() {
+        let mut s = surface(96);
+        let mut l = scene_launcher(PreviewScene::Empty);
+        l.foreground = true;
+        l.session_mut().chars("calcolatrice 12345678", &scene_context_free());
+        l.size(&s);
+        let g = l.geo.borrow().clone();
+        l.paint_field(&mut s, &g, false);
+        let ((), n) = crate::launcher::testkit::allocations_during(|| l.paint_field(&mut s, &g, false));
+        assert_eq!(n, 0, "painting the field allocates nothing after the first paint");
+        // With a marker in the text too.
+        l.session_mut().chars("\u{202E}x", &scene_context_free());
+        l.size(&s);
+        let g = l.geo.borrow().clone();
+        l.paint_field(&mut s, &g, false);
+        let ((), n) = crate::launcher::testkit::allocations_during(|| l.paint_field(&mut s, &g, false));
+        assert_eq!(n, 0, "nor with a marker in it");
+    }
+
+    /// What `size` and `paint_on` did before: lay out, set the review lines, store that layout, paint with a second one.
+    fn size_and_paint_two_layouts(l: &mut Launcher, s: &mut Surface) {
+        let g = l.layout(s);
+        if let (Some(lines), Some(key)) = (l.review_lines(s), l.session.selected().map(|i| i.key)) {
+            l.session.set_review_lines(key, lines);
+        }
+        *l.geo.borrow_mut() = g;
+        l.fresh.set(false);
+        l.paint_on(s, None, None, &mut EffectSys::default());
+    }
+
+    #[test]
+    fn review_change_paints_like_two_layouts() {
+        for line in
+            [format!("> {}", "WWWWWWW ".repeat(40)), format!("> {}", "alpha beta ".repeat(14)), "> calc".to_string()]
+        {
+            let make = || {
+                let mut l = scene_launcher(PreviewScene::Empty);
+                l.foreground = true;
+                l.session_mut().chars(&line, &scene_context_free());
+                l
+            };
+            let (mut a, mut b) = (make(), make());
+            let (mut sa, mut sb) = (surface(96), surface(96));
+            a.size(&sa);
+            a.paint_on(&mut sa, None, None, &mut EffectSys::default());
+            size_and_paint_two_layouts(&mut b, &mut sb);
+            assert!(sa.snapshot_pixels() == sb.snapshot_pixels(), "pixels differ for {line:.20}");
+        }
+    }
+
     #[test]
     fn caret_stays_in_view() {
         let s = surface(96);
@@ -4655,8 +4891,9 @@ mod tests {
         assert!(l.scroll.get() > 0, "a query wider than the field scrolls");
         let g = l.geo.borrow().clone();
         let (_, room) = l.query_room(&s, &g.field);
-        let widths = char_widths(&s, l.session.query_text());
-        let caret = prefix_width(&widths, l.session.query_text(), l.session.field().caret());
+        let mut extents = Vec::new();
+        query_extents(&s, l.session.query_text(), &mut extents);
+        let caret = prefix_width(&extents, l.session.query_text(), l.session.field().caret());
         assert!(caret - l.scroll.get() <= room, "the caret is inside the room");
         // A short text does not scroll.
         let mut short = scene_launcher(PreviewScene::Apps);
@@ -4666,11 +4903,17 @@ mod tests {
 
     #[test]
     fn markers_are_visible_and_split_from_plain_text() {
-        assert_eq!(marker_text('\u{7}').as_deref(), Some("\u{2407}"));
-        assert_eq!(marker_text('\u{0}').as_deref(), Some("\u{2400}"));
-        assert_eq!(marker_text('\u{7f}').as_deref(), Some("\u{2421}"));
-        assert_eq!(marker_text('\u{202E}').as_deref(), Some("<U+202E>"));
-        assert_eq!(marker_text('\u{85}').as_deref(), Some("<U+0085>"));
+        assert_eq!(marker_text('\u{7}'), Some("\u{2407}"));
+        assert_eq!(marker_text('\u{0}'), Some("\u{2400}"));
+        assert_eq!(marker_text('\u{7f}'), Some("\u{2421}"));
+        assert_eq!(marker_text('\u{202E}'), Some("<U+202E>"));
+        assert_eq!(marker_text('\u{85}'), Some("<U+0085>"));
+        // Every marked character has a text of its own (the table is the closed set of `gesture::is_marker`).
+        for u in 0..=0x2FFFu32 {
+            if let Some(c) = char::from_u32(u).filter(|c| gesture::is_marker(*c)) {
+                assert_ne!(marker_text(c), Some("\u{FFFD}"), "U+{u:04X}");
+            }
+        }
         assert_eq!(marker_text('a'), None);
         let runs = runs_of("ab\u{202E}cd");
         assert_eq!(runs.len(), 3);
@@ -4689,7 +4932,7 @@ mod tests {
             let line_w: i32 = l.iter().map(|r| s.text_width(&r.text, Font::Caption)).sum();
             assert!(line_w <= w + 4, "a line is within the width: {line_w} > {w}");
         }
-        let joined: String = lines.iter().flatten().map(|r| r.text.as_str()).collect();
+        let joined: String = lines.iter().flatten().map(|r| &*r.text).collect();
         assert_eq!(joined, text, "nothing is lost or ellipsized");
         let cut = wrap(&s, text, Font::Caption, w, w, 2);
         assert_eq!(cut.len(), 3, "one line past the limit tells the caller it does not fit");
@@ -4708,7 +4951,7 @@ mod tests {
         let width = |l: &[Run]| l.iter().map(|r| s.text_width(&r.text, Font::Caption)).sum::<i32>();
         assert!(width(&lines[0]) <= first, "the first line stops at its own width");
         assert!(lines.iter().skip(1).any(|l| width(l) > first), "the others use the whole width");
-        let joined: String = lines.iter().flatten().map(|r| r.text.as_str()).collect();
+        let joined: String = lines.iter().flatten().map(|r| &*r.text).collect();
         assert_eq!(joined, text);
     }
 

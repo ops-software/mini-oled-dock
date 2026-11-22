@@ -12,16 +12,17 @@
 //!
 //! THREADING: UI thread only (GDI objects of the thread).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
-    GetDC, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, HBITMAP, HDC, HFONT,
-    HGDIOBJ, LOGFONTW, SRCCOPY, TEXTMETRICW, TRANSPARENT,
+    GetDC, GetTextExtentExPointW, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, HBITMAP,
+    HDC, HFONT, HGDIOBJ, LOGFONTW, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
@@ -240,6 +241,8 @@ pub(crate) struct Gdi {
     dc_txt: HDC,
     main: Option<Dib>,
     txt: Option<Dib>,
+    /// The UTF-16 of the text being measured or drawn: one buffer, its capacity kept, freed with the Gdi.
+    wide: RefCell<Vec<u16>>,
 }
 
 impl Gdi {
@@ -270,7 +273,7 @@ impl Gdi {
             SetBkMode(dc_txt, TRANSPARENT);
             SetTextColor(dc_txt, COLORREF(0x00FF_FFFF));
         }
-        Ok(Gdi { dc_main, dc_txt, main: None, txt: None })
+        Ok(Gdi { dc_main, dc_txt, main: None, txt: None, wide: RefCell::new(Vec::new()) })
     }
 
     /// DC holding the main DIB (source for `present_layered` / `BitBlt`).
@@ -330,7 +333,9 @@ impl Gdi {
         if s.is_empty() {
             return 0;
         }
-        let wide: Vec<u16> = s.encode_utf16().collect();
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
         let mut sz = SIZE::default();
         // SAFETY: `dc_txt` is valid; `wide` and `sz` outlive the call; the font is restored.
         let ok = unsafe {
@@ -344,6 +349,54 @@ impl Gdi {
         } else {
             wide.len() as i32 * per_char
         }
+    }
+
+    /// The width of the text up to and including each character of `s` (`out[i]` for the character `i`, so the last
+    /// is the whole width), from one `GetTextExtentExPointW` call. If GDI fails, `per_char` px per UTF-16 unit.
+    pub(crate) fn char_extents(&self, s: &str, font: HFONT, per_char: i32, out: &mut Vec<i32>) {
+        out.clear();
+        if s.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        EXTENT_CALLS.with(|c| c.set(c.get() + 1));
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
+        let units = wide.len();
+        out.resize(units, 0);
+        let mut sz = SIZE::default();
+        // SAFETY: `dc_txt` is valid; `wide` holds `units` units and `out` has `units` writable entries, both alive for
+        // the call; `lpnFit` is null, so `nMaxExtent` is ignored and every partial extent is written; the font is restored.
+        let ok = unsafe {
+            let old = SelectObject(self.dc_txt, HGDIOBJ(font.0));
+            let ok = GetTextExtentExPointW(
+                self.dc_txt,
+                PCWSTR(wide.as_ptr()),
+                units as i32,
+                0,
+                None,
+                Some(out.as_mut_ptr()),
+                &mut sz,
+            );
+            SelectObject(self.dc_txt, old);
+            ok
+        };
+        if !ok.as_bool() {
+            for (i, e) in out.iter_mut().enumerate() {
+                *e = (i as i32 + 1) * per_char;
+            }
+        }
+        // One entry per UTF-16 unit became one per character: the extent after its last unit (forward, in place).
+        let mut end = 0usize;
+        for (j, ch) in s.chars().enumerate() {
+            end += ch.len_utf16();
+            let v = out.get(end.saturating_sub(1)).copied().unwrap_or(0);
+            if let Some(slot) = out.get_mut(j) {
+                *slot = v;
+            }
+        }
+        out.truncate(s.chars().count());
     }
 
     /// Single-line text `s` with the top-left corner at `(x, y)` onto `cv` (a canvas of this
@@ -380,7 +433,9 @@ impl Gdi {
             let start = row * txt.w as usize;
             tbuf[start..start + w as usize].fill(0);
         }
-        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
         let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
         // SAFETY: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the call;
         // the font is restored right away. GdiFlush guarantees GDI has written before the read.
@@ -390,6 +445,7 @@ impl Gdi {
             SelectObject(self.dc_txt, old);
             let _ = GdiFlush();
         }
+        drop(wide);
         for row in 0..h {
             for col in 0..w {
                 let cov = (tbuf[(row * txt.w + col) as usize] >> 8) & 0xFF; // coverage = G channel
@@ -419,7 +475,9 @@ impl Gdi {
             let start = row * txt.w as usize;
             tbuf[start..start + w as usize].fill(0);
         }
-        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
         let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
         // SAFETY: as in `text`: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the
         // call; the font is restored right away; GdiFlush makes GDI write before the read.
@@ -730,6 +788,12 @@ impl Surface {
         }
         delete_font(font);
         w
+    }
+
+    /// The width of each prefix of `s` in `font`: `out[i]` is the width up to and including the character `i`, from one
+    /// GDI call (a character's own width is the difference of two neighbours). `out` keeps its capacity.
+    pub(crate) fn char_extents(&self, s: &str, font: Font, out: &mut Vec<i32>) {
+        self.gdi.char_extents(s, self.face(font).0, self.metrics.px(7), out);
     }
 
     /// Width in physical px of `s` with `font`.
@@ -1246,6 +1310,12 @@ pub(crate) fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -
     let dx = (x as f32 + 0.5) - cx as f32;
     let dy = (y as f32 + 0.5) - cy as f32;
     (rad as f32 + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
+}
+
+// Number of `GetTextExtentExPointW` calls on this thread (the measurement gate of the launcher's field).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXTENT_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 // Number of `rr_cov` calls on this thread (the evaluation-count gates).
