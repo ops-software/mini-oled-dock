@@ -456,16 +456,21 @@ impl Launcher {
         }
     }
 
-    /// `ShellEvent::LauncherConverted`: Windows read the query of `gen` as `meant`. Taken only while `gen` is the current
-    /// generation and it still has no rows, so nothing can move under the selection: the rows of `meant` come in as one
-    /// late batch of that generation (the web row stays the typed query's).
+    /// `ShellEvent::LauncherConverted`: Windows read the query of `gen` as `meant`. Taken only while `gen` is the
+    /// current generation and it still has no rows, so nothing can move under the selection. `meant` comes from a file
+    /// in the user's profile (untrusted, start_search.rs), so it is searched as a name and nothing else (tier 7): no
+    /// prefix, and only the catalogue's app and setting rows come in, as one late batch of that generation. A run line,
+    /// a path, a URL, an answer or a command the user never typed never does (C4); the web row stays the typed query's.
     pub(crate) fn converted(&mut self, gen: u64, meant: &str, cx: &Context) -> Reply {
         if gen != self.session.gen() || self.session.has_matches() {
             return Reply::None;
         }
-        let q = query::parse_query(meant, &cx.opts.prefixes, cx.num, gen);
+        let no_prefixes = PrefixTable::from_pairs(&std::collections::BTreeMap::new());
+        let q = query::parse_query(meant, &no_prefixes, cx.num, gen);
         let mut items = providers::query_all(&q, cx, &mut Budget::default()).into_sorted();
-        items.retain(|i| i.from != ProviderId::Web);
+        items.retain(|i| {
+            matches!((i.from, i.kind), (ProviderId::Apps, Kind::App) | (ProviderId::Settings, Kind::Setting))
+        });
         if items.is_empty() {
             return Reply::None;
         }
@@ -3060,6 +3065,23 @@ mod tests {
         let old = l.session.gen();
         l.session.chars("w", &fx.cx());
         assert_eq!(l.converted(old, "calc", &fx.cx()), Reply::None);
+    }
+
+    #[test]
+    fn rewrite_never_adds_run_open_or_url_rows() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // The rewrite comes from a file in the user's profile: it is searched as a name only, so a line, a prefix, a
+        // path, a URL, an expression or a command never comes in as a row the user did not type.
+        let meant = ["cmd /c whoami", "> x", "C:\\x.exe", "\\\\h\\s\\x.exe", "https://x.org", "=1+1", "shut down"];
+        for m in meant {
+            let mut l = typed(&fx, "zzqx");
+            assert!(!l.session.has_matches(), "the fixture has nothing for zzqx");
+            let gen = l.session.gen();
+            assert_eq!(l.converted(gen, m, &fx.cx()), Reply::None, "{m}");
+            assert!(!l.session.has_matches(), "{m}: {:?}", l.session.rows());
+            assert!(l.session.rows().iter().all(|r| r.kind == Kind::Web), "{m}: {:?}", l.session.rows());
+        }
     }
 
     #[test]
