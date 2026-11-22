@@ -80,6 +80,11 @@ fn fn_body(text: &str, sig: &str, from: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// `body` without its comment lines: a comment never satisfies a lint.
+fn code_of(body: &str) -> String {
+    body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+}
+
 // ---- lint 1: who may build a run-as request --------------------------------------------------------------------------
 
 fn runas_violations(path: &str, text: &str) -> Vec<String> {
@@ -582,6 +587,55 @@ fn no_mouse_hook_for_the_launcher() {
     assert_eq!(mouse_hook_violations(p, "fn close() {}").len(), 1);
     assert!(mouse_hook_violations("src/ui.rs", bare).is_empty());
     let all = scan_tree(mouse_hook_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+// ---- lint 9: launcher timers live on the dock window --------------------------------------------------------------
+
+/// The launcher's one-shots are armed on the dock window, never destroyed while the dock runs (the shared popup window
+/// can be: Alt+F4 on another kind's popup reaches DefWindowProc, and its timers go with it), and the dock window hands
+/// them to the launcher: (file, function, what its code holds).
+const DOCK_TIMER_WIRING: [(&str, &str, &str); 3] = [
+    ("src/launcher_sys.rs", "fn arm_once(", "timer_window()"),
+    ("src/launcher_sys.rs", "fn timer_window(", "crate::hwnd()"),
+    ("src/ui.rs", "fn on_timer(", "popup::on_launcher_timer(h, id)"),
+];
+
+fn dock_timer_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for (file, sig, want) in DOCK_TIMER_WIRING {
+        if path != file {
+            continue;
+        }
+        match fn_body(text, sig, 0) {
+            Some((s, e)) if code_of(text.get(s..e).unwrap_or("")).contains(want) => {}
+            Some((s, _)) => v.push(format!("{path}:{}: {sig} without {want}", line_of(text, s))),
+            None => v.push(format!("{path}: {sig} not found")),
+        }
+    }
+    v
+}
+
+#[test]
+fn launcher_timers_live_on_the_dock_window() {
+    let p = "src/launcher_sys.rs";
+    let sys = "fn timer_window() -> Option<HWND> {\n    let h = crate::hwnd();\n    (!h.0.is_null()).then_some(h)\n}\n\
+               fn arm_once(id: usize, ms: u32) {\n    let Some(hwnd) = timer_window() else { return };\n}\n";
+    assert!(dock_timer_violations(p, sys).is_empty());
+    // The popup window: Alt+F4 on Start destroys it, and the launcher's timers with it.
+    let popup = sys.replace("timer_window() else", "popup::popup_hwnd() else");
+    assert_eq!(dock_timer_violations(p, &popup), ["src/launcher_sys.rs:5: fn arm_once( without timer_window()"]);
+    let commented =
+        sys.replace("    let Some(hwnd) = timer_window()", "    // timer_window()\n    let Some(hwnd) = popup_hwnd()");
+    assert_eq!(dock_timer_violations(p, &commented).len(), 1, "a comment does not count");
+    assert_eq!(dock_timer_violations(p, "fn arm_once() {}").len(), 2, "a missing fn fails");
+    let ui = "fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {\n    match id {\n        _ => {\n\
+              if !popup::on_launcher_timer(h, id) {\n                return None;\n            }\n\
+              }\n    }\n}\n";
+    assert!(dock_timer_violations("src/ui.rs", ui).is_empty());
+    assert_eq!(dock_timer_violations("src/ui.rs", "fn on_timer(h: HWND, id: usize) {\n    return None;\n}\n").len(), 1);
+    assert!(dock_timer_violations("src/popup.rs", &popup).is_empty());
+    let all = scan_tree(dock_timer_violations);
     assert!(all.is_empty(), "{all:#?}");
 }
 

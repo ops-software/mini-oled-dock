@@ -1223,9 +1223,10 @@ pub(crate) fn shutdown() {
     }
 }
 
-/// One of the launcher's one-shot timers (`TIMER_LAUNCHER_*`) fired on the popup window: killed first.
+/// One of the launcher's one-shot timers (`TIMER_LAUNCHER_*`) fired on the dock window (`launcher_sys::timer_window`):
+/// killed first.
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
-    // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
+    // SAFETY: a timer of one of our windows (same thread); killing an id that is not armed fails harmlessly.
     let _ = unsafe { KillTimer(Some(hwnd), id) };
     match id {
         crate::msg::TIMER_LAUNCHER_SHRINK => {
@@ -1479,8 +1480,8 @@ fn release_resident() {
 /// What an open needs before its window shows (`SysPort::prepare_open`): the settings held (and folded when they are
 /// already loaded), the windows listed, the history asked for the first time, the catalogue listed when it has not been.
 pub(crate) fn prepare_open() {
-    if let Some(h) = super::last_hwnd() {
-        // SAFETY: a timer of our popup window; killing an id that is not armed fails harmlessly.
+    if let Some(h) = crate::launcher_sys::timer_window() {
+        // SAFETY: a timer of the dock window (same thread); killing an id that is not armed fails harmlessly.
         let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
     }
     start_search::hold_settings(Holder::Launcher);

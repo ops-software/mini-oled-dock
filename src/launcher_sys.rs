@@ -196,12 +196,19 @@ fn clipboard_text() -> Option<String> {
     }
 }
 
-/// The only `SetTimer` of the launcher (lint 7): a one-shot on the popup window; `popup_launcher::on_timer` kills it
-/// before it acts.
+/// The window the launcher's one-shots live on (lint 9): the dock window, never destroyed while the dock runs. The
+/// shared popup window can be (Alt+F4 on another kind's popup reaches DefWindowProc), and its timers go with it. None
+/// before the dock window exists and after it is gone.
+pub(crate) fn timer_window() -> Option<HWND> {
+    let h = crate::hwnd();
+    (!h.0.is_null()).then_some(h)
+}
+
+/// The only `SetTimer` of the launcher (lint 7): a one-shot on the dock window (`timer_window`); `ui::on_timer` hands
+/// it to `popup_launcher::on_timer`, which kills it before it acts.
 pub(crate) fn arm_once(id: usize, ms: u32) {
-    // Before the first open the popup window may not exist yet: it is created so the warm timer can be armed at start.
-    let Some(hwnd) = popup::last_hwnd().or_else(popup::popup_hwnd) else { return };
-    // SAFETY: our popup window (same thread); its wnd_proc forwards the launcher's ids to popup_launcher::on_timer.
+    let Some(hwnd) = timer_window() else { return };
+    // SAFETY: the dock window (same thread); ui::on_timer forwards the launcher's ids to popup_launcher::on_timer.
     let armed = unsafe { SetTimer(Some(hwnd), id, ms, None) } != 0;
     if !armed {
         log!("launcher: SetTimer failed");

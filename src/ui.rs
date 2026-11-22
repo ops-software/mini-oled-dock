@@ -623,7 +623,12 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
                 kill_timer(h, TIMER_CLOCK);
             }
         }
-        _ => return None,
+        _ => {
+            // The launcher's one-shots (`launcher_sys::arm_once`): on this window, never destroyed while the dock runs.
+            if !popup::on_launcher_timer(h, id) {
+                return None;
+            }
+        }
     }
     Some(LRESULT(0))
 }

@@ -767,8 +767,10 @@ pub fn shutdown() {
     for h in with(|st| [st.hwnd, st.launcher_hwnd]).unwrap_or_default().into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: our window.
         let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
+    }
+    if let Some(h) = crate::launcher_sys::timer_window() {
         for id in LAUNCHER_TIMERS {
-            // SAFETY: our window; an id that is not armed fails harmlessly.
+            // SAFETY: the dock window (same thread), still alive here; an id that is not armed fails harmlessly.
             let _ = unsafe { KillTimer(Some(h), id) };
         }
     }
@@ -952,6 +954,11 @@ fn ensure_window_for(kind: PopupKind) -> Option<HWND> {
     // SAFETY: IsWindow accepts any handle, even null.
     if !existing.0.is_null() && unsafe { IsWindow(Some(existing)) }.as_bool() {
         return Some(existing);
+    }
+    // It existed and was destroyed (Alt+F4 on a kind that does not take the system keys reaches DefWindowProc): the
+    // timers armed on it are gone. Logged only with the launcher on, so the log without a chord stays 1.4.3's.
+    if !existing.0.is_null() && popup_launcher::is_on() {
+        log!("popup: {slot:?} window was destroyed, recreated (its timers are gone)");
     }
     // SAFETY: no preconditions.
     let module = match unsafe { GetModuleHandleW(PCWSTR::null()) } {
@@ -1778,7 +1785,8 @@ fn on_anim(hwnd: HWND) {
 /// The popup window (0 = none), readable while the state is borrowed.
 static POPUP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-/// The launcher's one-shot timers on the popup window (msg.rs 34-39).
+/// The launcher's one-shot timers (msg.rs 34-39), armed on the dock window (`launcher_sys::timer_window`), which hands
+/// them over through `on_launcher_timer`. None is armed on a popup window: the shared one can be destroyed.
 const LAUNCHER_TIMERS: [usize; 6] = [
     crate::msg::TIMER_LAUNCHER_SHRINK,
     crate::msg::TIMER_LAUNCHER_WARM,
@@ -1805,14 +1813,17 @@ fn timer_owner(id: usize) -> TimerOwner {
     }
 }
 
-/// The window of the open popup (or of the last one), read without the popup state: the launcher arms its one-shots on
-/// it from inside its own key handling, while the state is borrowed.
-pub(crate) fn last_hwnd() -> Option<HWND> {
-    let h = POPUP_HWND.load(std::sync::atomic::Ordering::Relaxed);
-    (h != 0).then_some(HWND(h as *mut _))
+/// A `WM_TIMER` of the dock window that `ui::on_timer` does not know: true when it was one of the launcher's one-shots,
+/// now handled.
+pub(crate) fn on_launcher_timer(h: HWND, id: usize) -> bool {
+    let ours = timer_owner(id) == TimerOwner::Launcher;
+    if ours {
+        popup_launcher::on_timer(h, id);
+    }
+    ours
 }
 
-/// The window the launcher's one-shots are armed on, created if needed, so they can be armed before the first open.
+/// The launcher's popup window, created if needed (`launcher_sys::chord_is_free` registers its probe on it).
 pub(crate) fn popup_hwnd() -> Option<HWND> {
     ensure_window_for(PopupKind::Launcher)
 }

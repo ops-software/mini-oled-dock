@@ -158,8 +158,9 @@ pub const TIMER_POPUP_FOCUS: usize = 32;
 /// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
 /// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
 pub const TIMER_POPUP_START_RELEASE: usize = 33;
-// The launcher's one-shots, also on the POPUP window: `popup::wnd_proc` forwards 34-39 to `popup_launcher::on_timer`,
-// which kills each before acting; `popup::shutdown` kills them all. None is armed while the chord is off.
+// The launcher's one-shots, on the DOCK window (a popup window can be destroyed, and its timers with it):
+// `ui::on_timer` forwards 34-39 to `popup_launcher::on_timer`, which kills each before acting; `popup::shutdown` kills
+// them all. None is armed while the chord is off.
 /// 120 ms one-shot while the launcher is open: the panel shrinks once no key came for that long.
 pub const TIMER_LAUNCHER_SHRINK: usize = 34;
 /// 10 s one-shot after the dock starts: the launcher's catalogue is listed.
