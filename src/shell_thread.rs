@@ -242,7 +242,6 @@ pub enum ShellRequest {
     /// A query that found nothing: Windows' typo rewrite of it (`start_search::converted`, a 1.4 MB
     /// read kept off the UI thread) -> `ShellEvent::LauncherConverted`. A newer one replaces the
     /// pending one.
-    #[allow(dead_code)] // sent by the launcher (L1a-15)
     LauncherConvert { gen: u64, query: String },
     /// The launcher's first open of a session: the shell user's SID and history files ->
     /// `ShellEvent::LauncherState`, read on this thread from that user's `cache\<SID>` only.
@@ -300,7 +299,6 @@ pub enum ShellEvent {
     LauncherIcons { icon_px: u32, icons: Vec<(String, Option<IconBitmap>)> },
     /// What Windows Search reads the query of generation `gen` as (reply to `LauncherConvert`);
     /// `None` = no rewrite.
-    #[allow(dead_code)] // read by the launcher (L1a-15)
     LauncherConverted { gen: u64, meant: Option<String> },
     /// The shell user's SID and the launcher's history files (reply to `LauncherStateLoad`); `None`
     /// for what could not be found or read.

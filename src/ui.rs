@@ -477,6 +477,9 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize {
                 battery_tick();
             }
+            if wp.0 == windows::Win32::UI::WindowsAndMessaging::PBT_APMSUSPEND as usize {
+                popup::popup_launcher::on_suspend();
+            }
             // TRUE grants the event.
             Some(LRESULT(1))
         }
@@ -493,6 +496,11 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         // The launcher's chord (posted by the hook only while a chord is set): wParam = sequence, lParam = kb.time.
         crate::msg::WM_DOCK_LAUNCHER => {
             popup::popup_launcher::on_chord(wp.0 as u32, lp.0 as u32);
+            Some(LRESULT(0))
+        }
+        // Registered only once a chord is set (`launcher_sys::watch_sessions`): lock and disconnects.
+        windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
+            popup::popup_launcher::on_session_change(wp.0 as u32);
             Some(LRESULT(0))
         }
         WM_DOCK_APPS_DIRTY => {
@@ -799,6 +807,8 @@ pub fn on_config_changed() {
     if let Some(a) = popup::current().and_then(item_for_popup).and_then(anchor_for) {
         popup::reanchor(a);
     }
+    // The launcher's chord and options.
+    popup::popup_launcher::on_config();
     // Last: the Settings window shows the values the bar now uses.
     crate::settings_window::on_config_changed();
 }
@@ -1565,11 +1575,15 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::on_audio_sessions(list);
             return false;
         }
-        // The launcher's replies: it handles them from L1a-15; nothing asks for them yet.
-        ShellEvent::LaunchFailed { .. }
-        | ShellEvent::LauncherIcons { .. }
-        | ShellEvent::LauncherConverted { .. }
-        | ShellEvent::LauncherState { .. } => return false,
+        // The launcher's replies.
+        ShellEvent::LauncherConverted { gen, meant } => {
+            popup::popup_launcher::on_converted(gen, meant);
+            return false;
+        }
+        // Nothing asks for them yet (L1a-16, L1a-17).
+        ShellEvent::LaunchFailed { .. } | ShellEvent::LauncherIcons { .. } | ShellEvent::LauncherState { .. } => {
+            return false
+        }
         other => other,
     };
     UI.with(|u| {
@@ -3405,6 +3419,7 @@ pub fn foreground_is_fullscreen() -> bool {
 /// the dock hides immediately. A fullscreen app taking the foreground while the dock is
 /// visible hides it too.
 fn on_foreground_changed(fg: HWND) {
+    popup::popup_launcher::on_foreground(fg);
     if !VISIBLE.load(Relaxed) || fg.0.is_null() || is_own_window(fg) || tray_host::foreign_menu_active() {
         return;
     }

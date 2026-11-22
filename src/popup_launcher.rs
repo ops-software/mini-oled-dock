@@ -10,9 +10,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+use windows::Win32::UI::WindowsAndMessaging::{
+    KillTimer, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK,
+};
 
 use super::{center_y, Content, HitMap, PopupKind, Reply};
+use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
@@ -20,14 +23,17 @@ use crate::launcher::catalog::CatApp;
 use crate::launcher::field::KeyEvent;
 use crate::launcher::gesture::{self, Gesture};
 use crate::launcher::model::{
-    CommandId, GlyphId, IconRef, Item, Kind, Mods, NumberStyle, Payload, ProviderId, SettingRow, Verb, WindowRow,
+    Batch, CommandId, GlyphId, IconRef, Item, Kind, Mods, NumberStyle, Payload, ProviderId, ProviderMask, SettingRow,
+    Verb, WindowRow,
 };
-use crate::launcher::providers::{Context, LauncherOpts};
+use crate::launcher::providers::{self, Budget, Context, LauncherOpts};
+use crate::launcher::query::{self, PrefixTable};
 use crate::launcher::runline;
 use crate::launcher::session::{Effect, ReplayKey, Session};
 use crate::launcher::strings;
 use crate::launcher::style;
 use crate::launcher::verbs;
+use crate::launcher::web::{self, Engine, Template};
 use crate::launcher_sys::{RealHook, RealSys};
 use crate::log;
 use crate::render::Metrics;
@@ -379,8 +385,13 @@ impl Launcher {
                     sys.shell(ShellRequest::StartIconsFor { icon_px: self.icon_px, ids });
                 }
                 Effect::ForgetRun(line) => self.forgotten.push(line),
-                // Tier 7 (L1a-15d), learned ranks (L1b) and files (L2).
-                Effect::RequestRewrite { .. } | Effect::Forget(_) | Effect::RequestFiles(_) => {}
+                // Nothing matched: Windows' typo rewrite is read on the shell thread (a 1.4 MB file) and comes back as a
+                // late batch of this generation (`converted`).
+                Effect::RequestRewrite { gen } => {
+                    sys.shell(ShellRequest::LauncherConvert { gen, query: self.session.last_query() });
+                }
+                // Learned ranks (L1b) and files (L2).
+                Effect::Forget(_) | Effect::RequestFiles(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::Copy(_)
                 | Effect::Power(_)
@@ -434,6 +445,27 @@ impl Launcher {
         }
     }
 
+    /// `ShellEvent::LauncherConverted`: Windows read the query of `gen` as `meant`. Taken only while `gen` is the current
+    /// generation and it still has no rows, so nothing can move under the selection: the rows of `meant` come in as one
+    /// late batch of that generation (the web row stays the typed query's).
+    pub(crate) fn converted(&mut self, gen: u64, meant: &str, cx: &Context) -> Reply {
+        if gen != self.session.gen() || self.session.has_matches() {
+            return Reply::None;
+        }
+        let q = query::parse_query(meant, &cx.opts.prefixes, cx.num, gen);
+        let mut items = providers::query_all(&q, cx, &mut Budget::default()).into_sorted();
+        items.retain(|i| i.from != ProviderId::Web);
+        if items.is_empty() {
+            return Reply::None;
+        }
+        let batch = Batch { gen, from: ProviderId::Apps, items, done: true };
+        if self.session.late(batch, cx) {
+            Reply::Relayout
+        } else {
+            Reply::None
+        }
+    }
+
     /// The forgotten run lines leave the controller's history (outside the context's borrow).
     fn forget_runs(&mut self) {
         if self.forgotten.is_empty() {
@@ -458,10 +490,12 @@ impl Launcher {
         if self.restore && self.fg_at_open != 0 {
             sys.restore(self.fg_at_open);
         }
+        let mut elevated = false;
         for e in std::mem::take(&mut self.queued) {
             match e {
                 Effect::Launch(r) => {
                     let elevates = r.elevates();
+                    elevated |= elevates;
                     // A setting's target comes with the settings rows the controller holds (L1a-16).
                     if let Some(req) = crate::launcher_sys::to_request(r, &|_| None) {
                         sys.shell(req);
@@ -478,6 +512,11 @@ impl Launcher {
                 _ => {}
             }
         }
+        // keep_query: the query as typed, in memory only, for the next open; never after an admin launch.
+        let session = &self.session;
+        with_ctrl(|c| {
+            c.last_query = (c.opts.keep_query && !elevated).then(|| session.last_query()).filter(|q| !q.is_empty());
+        });
     }
 
     /// The session the keys and the late batches go to (L1a-15).
@@ -488,8 +527,6 @@ impl Launcher {
     }
 
     /// Panel width in logical px and the visible rows (the settings of L1a-11).
-    // L1a-15 hands the config's values over at open.
-    #[allow(dead_code)]
     pub(crate) fn set_shape(&mut self, width: i32, rows: u8) {
         self.width = width.clamp(*style::WIDTH_RANGE.start(), *style::WIDTH_RANGE.end());
         self.max_rows =
@@ -1059,18 +1096,38 @@ impl Content for Launcher {
 
 /// The content of a new launcher popup (`popup::make_content`), for the post the controller is opening.
 pub(crate) fn new() -> Box<dyn Content> {
-    let mut l = Launcher::with_session(Session::open(&LauncherOpts::default(), None));
-    if let Some((seq, fg)) = with_ctrl(|c| (c.open_seq, c.fg_at_open)) {
-        l.open_seq = seq;
-        l.fg_at_open = fg;
-    }
-    Box::new(l)
+    Box::new(new_launcher())
 }
 
-/// Once, at the end of `popup::init` (wired by L1a-15): nothing to set up yet.
-// The chord flow of L1a-15 calls it; until then nothing does.
-#[allow(dead_code)]
-pub(crate) fn init() {}
+/// A launcher for the post being opened, with the config's options, shape and the kept query (fully selected, so
+/// typing replaces it).
+fn new_launcher() -> Launcher {
+    let made = with_ctrl(|c| {
+        let mut l = Launcher::with_session(Session::open(&c.opts, c.last_query.as_deref()));
+        l.open_seq = c.open_seq;
+        l.fg_at_open = c.fg_at_open;
+        l.set_shape(c.width, c.opts.rows);
+        l
+    });
+    let mut l = made.unwrap_or_else(|| Launcher::with_session(Session::open(&LauncherOpts::default(), None)));
+    if !l.session.query_text().is_empty() {
+        // The kept query's rows.
+        let _ = ctx(|cx| l.session.refresh(cx));
+    }
+    l
+}
+
+/// Once, at the end of `popup::init`: the config's chord and options.
+pub(crate) fn init() {
+    on_config();
+}
+
+/// At the end of `popup::shutdown`, while the dock window still exists.
+pub(crate) fn shutdown() {
+    if REGISTERED.with(Cell::get) {
+        crate::launcher_sys::unwatch_sessions();
+    }
+}
 
 /// One of the launcher's one-shot timers (`TIMER_LAUNCHER_*`) fired on the popup window: killed first.
 pub(crate) fn on_timer(hwnd: HWND, id: usize) {
@@ -1156,6 +1213,10 @@ pub(crate) trait SysPort {
     fn msg_extra(&self) -> usize;
     /// `GetTickCount64` (the pointer's and the click's clock).
     fn now_ms(&self) -> u64;
+    /// The user locale's decimal and thousands marks (`GetLocaleInfoEx`), read at each open.
+    fn number_style(&self) -> NumberStyle;
+    /// Closes the launcher without the session's Hide (no restore).
+    fn close_quiet(&mut self);
 }
 
 /// The proof of a person's Ctrl+Shift+Enter (SPEC 5.4.9), built only for that key: the hook's evidence is consumed by
@@ -1210,13 +1271,63 @@ fn replay_keys(recs: &[KeyRec], sys: &mut dyn SysPort) -> Vec<ReplayKey> {
 
 /// Which monitor the launcher opens on (`launcher.monitor`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // on_config reads launcher.monitor (L1a-15d)
 pub(crate) enum MonitorPick {
     /// The one under the pointer.
     Pointer,
     /// The one of the foreground window.
     Active,
     Primary,
+}
+
+impl MonitorPick {
+    /// "pointer", "active", "primary" (the config sanitizes the value; anything else is the pointer's).
+    fn from_name(name: &str) -> MonitorPick {
+        match name {
+            "active" => MonitorPick::Active,
+            "primary" => MonitorPick::Primary,
+            _ => MonitorPick::Pointer,
+        }
+    }
+}
+
+/// The session's options from `config.launcher` (pure). A provider the map does not name is on, and apps are always
+/// on; the web template is the engine's, or the custom one when it passes the validator (Google otherwise).
+pub(crate) fn opts_from_config(c: &LauncherConfig) -> LauncherOpts {
+    let mut mask = ProviderMask::all();
+    for (name, on) in &c.providers {
+        if let Some(id) = ProviderId::from_name(name) {
+            mask = mask.with(id, *on);
+        }
+    }
+    let web = match Engine::from_name(&c.web_engine) {
+        Some(Engine::Custom) => web::validate_template(&c.web_url).ok(),
+        Some(e) => e.template().and_then(|t| web::validate_template(t).ok()),
+        None => None,
+    };
+    LauncherOpts {
+        prefixes: PrefixTable::from_pairs(&c.prefixes),
+        mask,
+        web: web.unwrap_or_else(Template::default),
+        keep_query: c.keep_query,
+        rows: c.rows.clamp(*style::ROWS_RANGE.start(), *style::ROWS_RANGE.end()),
+    }
+}
+
+/// Why the chord passes (the hook's pass flags), pure: FULLSCREEN over exclusive D3D always and over a fullscreen window
+/// with `over_fullscreen` "pass"; REMOTE for a remote or VM client in front (L1b-6); YIELD while another launcher answers
+/// the chord (L1b-5).
+fn pass_flags(quns_d3d: bool, fs: bool, over_fullscreen_pass: bool, remote: bool, yield_: bool) -> PassFlags {
+    let mut f = PassFlags::default();
+    if quns_d3d || (fs && over_fullscreen_pass) {
+        f = f.with(PassFlags::FULLSCREEN);
+    }
+    if remote {
+        f = f.with(PassFlags::REMOTE);
+    }
+    if yield_ {
+        f = f.with(PassFlags::YIELD);
+    }
+    f
 }
 
 /// What a chord post leads to (spec rule 8 and 5.2.12).
@@ -1252,6 +1363,10 @@ struct Ctrl {
     over_fullscreen_pass: bool,
     /// The pass flags the hook was last given.
     flags: PassFlags,
+    /// keep_query: the last query, in memory only (never written anywhere).
+    last_query: Option<String>,
+    /// `launcher.width` (logical px).
+    width: i32,
     /// The session's view of the config and the locale's number marks.
     opts: LauncherOpts,
     num: NumberStyle,
@@ -1271,6 +1386,8 @@ impl Ctrl {
             top_percent: crate::config::LAUNCHER_TOP_PERCENT.2,
             over_fullscreen_pass: true,
             flags: PassFlags::default(),
+            last_query: None,
+            width: style::LAUNCHER_W,
             opts: LauncherOpts::default(),
             num: NumberStyle { decimal: '.', group: ',' },
             apps: Vec::new(),
@@ -1278,6 +1395,18 @@ impl Ctrl {
             windows: Vec::new(),
             history: Vec::new(),
         }
+    }
+
+    /// `config.launcher` taken over (the chord is set): the next open uses it.
+    fn configure(&mut self, c: &LauncherConfig) {
+        self.opts = opts_from_config(c);
+        if !self.opts.keep_query {
+            self.last_query = None;
+        }
+        self.pick = MonitorPick::from_name(&c.monitor);
+        self.top_percent = c.top_percent;
+        self.over_fullscreen_pass = c.over_fullscreen != "open";
+        self.width = i32::from(c.width);
     }
 
     /// The providers' context of one keystroke: borrowed, nothing copied.
@@ -1299,6 +1428,85 @@ impl Ctrl {
 thread_local! {
     /// Touched only while a chord is set: the paths that exist without the launcher never reach it.
     static CTRL: RefCell<Ctrl> = RefCell::new(Ctrl::new());
+    /// A chord is set: the foreground, session and power events concern the launcher.
+    static ON: Cell<bool> = const { Cell::new(false) };
+    /// The dock window receives the session notifications (registered once, at the first chord).
+    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The config changed (and once at start): the hook's chord, and with a chord the options the next open uses. With no
+/// chord (every config that predates the launcher) nothing else happens: no state, no timer, no log line.
+pub(crate) fn on_config() {
+    let cfg = crate::config::get();
+    let chord = cfg.launcher.chord_spec();
+    hook::set_launcher_chord(chord);
+    let was = ON.with(|on| on.replace(chord.is_some()));
+    match (was, chord.is_some()) {
+        (false, false) => {}
+        (true, false) => {
+            with_ctrl(|c| c.last_query = None);
+            log!("launcher: chord off");
+        }
+        (_, true) => {
+            with_ctrl(|c| c.configure(&cfg.launcher));
+            if !was {
+                log!("launcher: chord on");
+                if !REGISTERED.with(|r| r.replace(true)) {
+                    crate::launcher_sys::watch_sessions();
+                }
+            }
+        }
+    }
+}
+
+/// `EVENT_SYSTEM_FOREGROUND` (`ui::on_foreground_changed`, first thing): the hook's pass flags for the new foreground.
+pub(crate) fn on_foreground(_fg: HWND) {
+    if ON.with(Cell::get) {
+        foreground_flow(&mut RealHook, &RealSys);
+    }
+}
+
+/// The pass flags of the window now in front, to the hook (a chord's FULLSCREEN is recomputed here).
+fn foreground_flow(hook: &mut dyn HookPort, sys: &dyn SysPort) {
+    let over_pass = with_ctrl(|c| c.over_fullscreen_pass).unwrap_or(true);
+    let d3d = sys.d3d_fullscreen();
+    let fs = !d3d && over_pass && sys.fullscreen_foreground();
+    // REMOTE and YIELD come with their detection (L1b-6, L1b-5).
+    let flags = pass_flags(d3d, fs, over_pass, false, false);
+    with_ctrl(|c| c.flags = flags);
+    hook.pass(flags);
+}
+
+/// `WM_WTSSESSION_CHANGE`: a lock, a console or a remote disconnect ends the session (`session_end`).
+pub(crate) fn on_session_change(code: u32) {
+    if ON.with(Cell::get) && matches!(code, WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT) {
+        session_end(&mut RealHook, &mut RealSys);
+    }
+}
+
+/// `PBT_APMSUSPEND` (`WM_POWERBROADCAST`).
+pub(crate) fn on_suspend() {
+    if ON.with(Cell::get) {
+        session_end(&mut RealHook, &mut RealSys);
+    }
+}
+
+/// Lock, disconnect, suspend: the launcher closes without restoring, the kept query goes and the hook forgets its
+/// tracked modifiers (the secure desktop can swallow their releases).
+fn session_end(hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+    if sys.launcher_open() {
+        sys.close_quiet();
+    }
+    with_ctrl(|c| c.last_query = None);
+    hook.reset_mods();
+}
+
+/// `ShellEvent::LauncherConverted` (the reply to `LauncherConvert`).
+pub(crate) fn on_converted(gen: u64, meant: Option<String>) {
+    let Some(meant) = meant else { return };
+    if ON.with(Cell::get) {
+        super::with_launcher(|l| ctx(|cx| l.converted(gen, &meant, cx)).unwrap_or(Reply::None));
+    }
 }
 
 /// Runs `f` on the controller's state; None (logged) on a re-entry, never a panic.
@@ -1366,9 +1574,11 @@ fn chord_flow(seq: u32, sent_time: u32, hook: &mut dyn HookPort, sys: &mut dyn S
         }
         OpenPlan::TryOpen => {
             let fg = sys.foreground();
+            let num = sys.number_style();
             with_ctrl(|c| {
                 c.open_seq = seq;
                 c.fg_at_open = fg;
+                c.num = num;
             });
             hook.shown(true);
             if !sys.open(pick, top_percent) {
@@ -1713,6 +1923,7 @@ mod tests {
     enum Op {
         Open,
         CloseLauncher,
+        CloseQuiet,
         Inject(Vec<(u16, bool)>),
     }
 
@@ -1780,6 +1991,12 @@ mod tests {
         }
         fn now_ms(&self) -> u64 {
             u64::from(self.now)
+        }
+        fn number_style(&self) -> NumberStyle {
+            NumberStyle { decimal: '.', group: ',' }
+        }
+        fn close_quiet(&mut self) {
+            self.ops.push(Op::CloseQuiet);
         }
     }
 
@@ -1964,6 +2181,12 @@ mod tests {
         }
         fn now_ms(&self) -> u64 {
             u64::from(self.now)
+        }
+        fn number_style(&self) -> NumberStyle {
+            NumberStyle { decimal: ',', group: '.' }
+        }
+        fn close_quiet(&mut self) {
+            self.ops.push("CloseQuiet".into());
         }
     }
 
@@ -2161,6 +2384,136 @@ mod tests {
         // Nothing on the clipboard: nothing changes.
         let mut sys = EffectSys::default();
         assert_eq!(key(&mut l, &fx, &mut sys, 0x2D, Mods::SHIFT), Reply::None);
+    }
+
+    // ---- 15d: config, pass flags, session events, the typo rewrite
+
+    #[test]
+    fn opts_from_config() {
+        use crate::config::LauncherConfig;
+        let mut c = LauncherConfig::default();
+        c.prefixes.insert("#".into(), "windows".into());
+        c.providers.insert("settings".into(), false);
+        c.providers.insert("apps".into(), false);
+        c.keep_query = true;
+        c.rows = 6;
+        let o = super::opts_from_config(&c);
+        assert_eq!(o.prefixes.find("#note").map(|(n, id, _)| (n, id)), Some((1, ProviderId::Windows)));
+        assert_eq!(o.prefixes.find("=1").map(|(_, id, _)| id), Some(ProviderId::Calc), "the defaults stay");
+        assert!(!o.mask.has(ProviderId::Settings));
+        assert!(o.mask.has(ProviderId::Apps), "apps are always on");
+        assert!(o.mask.has(ProviderId::Calc) && o.mask.has(ProviderId::Web), "a provider not switched off is on");
+        assert_eq!((o.keep_query, o.rows), (true, 6));
+        assert_eq!(o.web.host(), "www.google.com");
+        for (engine, host) in [("bing", "www.bing.com"), ("duckduckgo", "duckduckgo.com"), ("nope", "www.google.com")] {
+            c.web_engine = engine.into();
+            assert_eq!(super::opts_from_config(&c).web.host(), host, "{engine}");
+        }
+        c.web_engine = "custom".into();
+        c.web_url = "https://search.example.org/?q={q}".into();
+        assert_eq!(super::opts_from_config(&c).web.host(), "search.example.org");
+        c.web_url = "https://user@search.example.org/?q={q}".into();
+        assert_eq!(super::opts_from_config(&c).web.host(), "www.google.com", "userinfo: Google");
+        // The defaults of the config are the session's defaults (the prefix table in another order).
+        let (d, s) = (super::opts_from_config(&LauncherConfig::default()), LauncherOpts::default());
+        assert_eq!((d.mask, &d.web, d.keep_query, d.rows), (s.mask, &s.web, s.keep_query, s.rows));
+        for raw in ["=1", ">ping", "<note", "??x", "$disp", ")now", ":reg", "file a", "FILE a", "plain"] {
+            assert_eq!(d.prefixes.find(raw), s.prefixes.find(raw), "{raw}");
+        }
+        assert_eq!(MonitorPick::from_name("active"), MonitorPick::Active);
+        assert_eq!(MonitorPick::from_name("primary"), MonitorPick::Primary);
+        assert_eq!(MonitorPick::from_name("pointer"), MonitorPick::Pointer);
+    }
+
+    #[test]
+    fn keep_query_kept_only_when_set_and_cleared_on_lock() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let close = |l: &mut Launcher| host_close(l, &mut FakeHook::default(), &mut EffectSys::default());
+        let kept = || with_ctrl(|c| c.last_query.clone()).flatten();
+        with_ctrl(|c| {
+            c.opts.keep_query = true;
+            c.last_query = None;
+        });
+        let mut l = typed(&fx, "calc");
+        close(&mut l);
+        assert_eq!(kept().as_deref(), Some("calc"), "in memory only");
+        let next = new_launcher();
+        assert_eq!((next.session.query_text(), next.session.field().selection()), ("calc", Some(0..4)), "selected");
+        // A lock, a disconnect or a suspend: the launcher closes without restoring and the query goes.
+        let mut hook = FakeHook::default();
+        let mut sys = FakeSys { is_open: true, ..FakeSys::default() };
+        session_end(&mut hook, &mut sys);
+        assert_eq!(sys.ops, [Op::CloseQuiet], "no restore");
+        assert_eq!(hook.resets, 1, "the hook forgets its modifiers");
+        assert_eq!(kept(), None);
+        assert_eq!(new_launcher().session.query_text(), "");
+        // An admin launch clears it too.
+        let mut l = typed(&fx, "calcolatrice");
+        key(&mut l, &fx, &mut EffectSys::default(), VK_RETURN, CTRL_SHIFT);
+        close(&mut l);
+        assert_eq!(kept(), None);
+        // keep_query off: nothing is kept.
+        with_ctrl(|c| c.opts.keep_query = false);
+        let mut l = typed(&fx, "calc");
+        close(&mut l);
+        assert_eq!(kept(), None);
+        with_ctrl(|c| c.opts = LauncherOpts::default());
+    }
+
+    #[test]
+    fn rewrite_applies_only_to_its_generation() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "zzq");
+        let mut sys = EffectSys::default();
+        let effects = l.session.chars("x", &fx.cx());
+        l.run(effects, &fx.cx(), &mut sys);
+        assert!(!l.session.has_matches(), "the fixture has nothing for zzqx");
+        let gen = l.session.gen();
+        assert_eq!(ops(&sys), [format!("Shell(LauncherConvert {{ gen: {gen}, query: \"zzqx\" }})")]);
+        // Another generation is dropped.
+        assert_eq!(l.converted(gen - 1, "calc", &fx.cx()), Reply::None);
+        assert!(!l.session.has_matches());
+        // Its own generation: the rows of what Windows read the query as, as one late batch.
+        assert_eq!(l.converted(gen, "calc", &fx.cx()), Reply::Relayout);
+        assert!(l.session.rows().iter().any(|r| &*r.title == "Calcolatrice"), "{:?}", l.session.rows());
+        let web = l.session.rows().iter().filter(|r| r.from == ProviderId::Web).count();
+        assert_eq!(web, 1, "one web row, the typed query's");
+        // Rows now: a second answer moves nothing.
+        assert_eq!(l.converted(gen, "blocco", &fx.cx()), Reply::None);
+        // A newer keystroke: the answer for the old one is dropped.
+        let mut l = typed(&fx, "zzqx");
+        let old = l.session.gen();
+        l.session.chars("w", &fx.cx());
+        assert_eq!(l.converted(old, "calc", &fx.cx()), Reply::None);
+    }
+
+    #[test]
+    fn pass_flags_table() {
+        for bits in 0u8..32 {
+            let [d3d, fs, pass, remote, yld] = [0, 1, 2, 3, 4].map(|i| bits & (1 << i) != 0);
+            let f = pass_flags(d3d, fs, pass, remote, yld);
+            assert_eq!(f.has(PassFlags::FULLSCREEN), d3d || (fs && pass), "{bits:05b}");
+            assert_eq!(f.has(PassFlags::REMOTE), remote, "{bits:05b}");
+            assert_eq!(f.has(PassFlags::YIELD), yld, "{bits:05b}");
+        }
+        // On a foreground change the hook gets the new flags, and a chord's FULLSCREEN is recomputed.
+        with_ctrl(|c| {
+            c.over_fullscreen_pass = true;
+            c.flags = PassFlags::FULLSCREEN;
+        });
+        let mut hook = FakeHook::default();
+        foreground_flow(&mut hook, &FakeSys::default());
+        assert_eq!(hook.passes, [PassFlags::default()], "the game is gone: the chord opens again");
+        foreground_flow(&mut hook, &FakeSys { fs: true, ..FakeSys::default() });
+        assert_eq!(hook.passes.last(), Some(&PassFlags::FULLSCREEN));
+        with_ctrl(|c| c.over_fullscreen_pass = false);
+        foreground_flow(&mut hook, &FakeSys { fs: true, ..FakeSys::default() });
+        assert_eq!(hook.passes.last(), Some(&PassFlags::default()), "over_fullscreen \"open\"");
+        foreground_flow(&mut hook, &FakeSys { d3d: true, ..FakeSys::default() });
+        assert_eq!(hook.passes.last(), Some(&PassFlags::FULLSCREEN), "exclusive D3D passes anyway");
+        with_ctrl(|c| c.over_fullscreen_pass = true);
     }
 
     #[test]

@@ -567,7 +567,6 @@ impl LauncherConfig {
     }
 
     /// The chord to hook; None when the launcher is disabled or the chord is "off".
-    #[allow(dead_code)] // the hook is armed from it by the chord flow (L1a-15)
     pub fn chord_spec(&self) -> Option<crate::launcher::model::ChordSpec> {
         if !self.enabled {
             return None;

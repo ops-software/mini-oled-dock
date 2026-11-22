@@ -8,7 +8,9 @@
 
 use std::sync::atomic::Ordering::Relaxed;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_SDECIMAL, LOCALE_STHOUSAND};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
@@ -18,6 +20,9 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -32,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
-use crate::launcher::model::{CommandId, Mods};
+use crate::launcher::model::{CommandId, Mods, NumberStyle};
 use crate::launcher::session::LaunchReq;
 use crate::log;
 use crate::popup::popup_launcher::{typed_of, HookPort, Launcher, MonitorPick, SysPort, Typed};
@@ -197,6 +202,29 @@ fn arm_once(id: usize, ms: u32) {
     if unsafe { SetTimer(Some(hwnd), id, ms, None) } == 0 {
         log!("launcher: SetTimer failed");
     }
+}
+
+/// The dock window receives `WM_WTSSESSION_CHANGE` for this session (once, when a chord is first set).
+pub(crate) fn watch_sessions() {
+    // SAFETY: the dock window exists (popup::init runs after ui::attach) and belongs to this thread.
+    if let Err(e) = unsafe { WTSRegisterSessionNotification(crate::hwnd(), NOTIFY_FOR_THIS_SESSION) } {
+        log!("launcher: WTSRegisterSessionNotification failed: {e}");
+    }
+}
+
+/// Undoes `watch_sessions` before the dock window is destroyed.
+pub(crate) fn unwatch_sessions() {
+    // SAFETY: as above; unregistering a window that is not registered fails harmlessly.
+    let _ = unsafe { WTSUnRegisterSessionNotification(crate::hwnd()) };
+}
+
+/// One mark of the user locale (`LOCALE_SDECIMAL`, `LOCALE_STHOUSAND`): its first character.
+fn locale_mark(lctype: u32) -> Option<char> {
+    let mut buf = [0u16; 8];
+    // SAFETY: `buf` is writable and its length is passed; a null name is LOCALE_NAME_USER_DEFAULT.
+    let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), lctype, Some(&mut buf)) };
+    let len = usize::try_from(n).ok()?.saturating_sub(1);
+    String::from_utf16_lossy(buf.get(..len)?).chars().next()
 }
 
 /// The power action of a command row.
@@ -391,12 +419,22 @@ impl SysPort for RealSys {
         // SAFETY: no preconditions.
         unsafe { GetTickCount64() }
     }
+
+    fn number_style(&self) -> NumberStyle {
+        let decimal = locale_mark(LOCALE_SDECIMAL).unwrap_or('.');
+        let fallback = if decimal == ',' { '.' } else { ',' };
+        let group = locale_mark(LOCALE_STHOUSAND).filter(|g| *g != decimal).unwrap_or(fallback);
+        NumberStyle { decimal, group }
+    }
+
+    fn close_quiet(&mut self) {
+        popup::close("session end");
+    }
 }
 
 /// The shell request of one launch. `setting` gives the target and arguments of a held setting
 /// (`LaunchReq::Setting` carries only its index; the controller holds the list). `None`: no such setting,
 /// or no Windows folder for the registry row; nothing is launched.
-#[allow(dead_code)] // the chord flow's port calls it (L1a-15)
 pub(crate) fn to_request(
     r: LaunchReq,
     setting: &dyn Fn(u32) -> Option<(String, Option<String>)>,

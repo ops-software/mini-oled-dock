@@ -499,6 +499,7 @@ pub fn init() -> Result<(), String> {
         st.available = true;
     });
     log!("popup::init: DockPopup class registered");
+    popup_launcher::init();
     Ok(())
 }
 
@@ -757,6 +758,7 @@ pub fn on_start_settings() {
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {
     close_inner("shutdown");
+    popup_launcher::shutdown();
     for h in with(|st| [st.hwnd, st.launcher_hwnd]).unwrap_or_default().into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: our window.
         let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };

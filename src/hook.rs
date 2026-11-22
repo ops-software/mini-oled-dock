@@ -534,7 +534,6 @@ const NOTE_LAUNCHER_FAIL_OPEN: usize = 16;
 /// A post may stay unacknowledged this long before the chord fails open (the name and value of WS-C 17.1).
 pub const ACK_TIMEOUT_MS: u32 = 1500;
 /// The UI opens nothing for a post older than this (`post_verdict`).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub const STALE_POST_MS: u32 = 300;
 /// The type-ahead window after the post of a chord that will open the launcher.
 pub const TYPEAHEAD_MS: u32 = 500;
@@ -548,9 +547,7 @@ pub const RING_CAP: usize = 32;
 const MASK_KEY_DEFAULT: u32 = 0xE8;
 
 const VK_RETURN_: u32 = 0x0D;
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 const VK_SPACE_: u16 = 0x20;
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 const VK_MENU_: u16 = 0x12;
 const CTRL_SHIFT: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
 /// `LAUNCHER_CHORD`: bits 0-7 the vk, 8-11 the modifiers, bit 12 set.
@@ -623,7 +620,6 @@ const SIDES: [(u8, u32, Mods); 6] = [
     (16, 0xA0, Mods::SHIFT),
     (32, 0xA1, Mods::SHIFT),
 ];
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 const ALT_BITS: u8 = 1 | 2;
 
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -647,7 +643,6 @@ impl ModTrack {
         }
     }
 
-    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
     fn alt_down(&self) -> bool {
         self.down & ALT_BITS != 0
     }
@@ -854,7 +849,6 @@ impl Ring {
     }
 
     /// UI: ends the open window of `seq`; its length, or None when there is no such window (or it already ended).
-    #[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
     pub(crate) fn end(&self, seq: u32) -> Option<usize> {
         let mut cur = self.ctl.load(Acquire);
         loop {
@@ -1119,7 +1113,6 @@ fn chord_step(s: &mut ChordState, ring: &Ring, ev: KeyEv) -> (Option<bool>, Act)
 }
 
 /// What the UI does with a WM_DOCK_LAUNCHER post (spec rule 8).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PostAction {
     Open,
@@ -1223,7 +1216,6 @@ static RING: Ring = Ring::new();
 /// `pack_gesture_time(kb.time)`, stored by the hook, consumed by the UI with one swap.
 static GESTURE_TIME: AtomicU64 = AtomicU64::new(0);
 
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 fn pack_chord(chord: Option<ChordSpec>) -> u32 {
     chord.map_or(0, |c| u32::from(c.vk & 0xFF) | (u32::from(c.mods.0 & 0xF) << 8) | CHORD_SET)
 }
@@ -1233,7 +1225,6 @@ fn unpack_chord(v: u32) -> Option<ChordSpec> {
 }
 
 /// UI: the launcher's chord (None: off, and the hook leaves every key to the Win branch).
-#[allow(dead_code)] // the UI side of the chord arrives with the chord flow (L1a-15)
 pub fn set_launcher_chord(chord: Option<ChordSpec>) {
     LAUNCHER_CHORD.store(pack_chord(chord), Relaxed);
 }

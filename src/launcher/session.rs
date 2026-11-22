@@ -263,6 +263,11 @@ impl Session {
         self.gen
     }
 
+    /// Some row matched the query (notices and the web row do not count).
+    pub fn has_matches(&self) -> bool {
+        self.results.has_matches()
+    }
+
     /// The text the view shows whole under the selected row (the review detail of 5.3) before Run as administrator can
     /// act on it: the typed run line, or the path of a file row that offers Run as administrator.
     pub fn review_text(&self) -> Option<&str> {
