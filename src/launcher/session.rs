@@ -5,8 +5,10 @@
 //! the restore so the text lands where the user came from.
 
 use super::field::{Edit, FieldOut, KeyEvent, Motion, TextField};
-use super::gesture::Gesture;
-use super::model::{Batch, CommandId, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId, RunLine, Verb};
+use super::gesture::{self, Gesture, Refusal};
+use super::model::{
+    Batch, CommandId, FileClass, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId, RunLine, Verb,
+};
 use super::providers::{self, Budget, Context, LauncherOpts, Results};
 use super::query;
 use super::rank;
@@ -97,6 +99,15 @@ const POINTER_TRAVEL_PX: i64 = 8;
 /// A destructive row runs on a click only after this long under the pointer, unchanged (5.2.7).
 const DESTRUCTIVE_HOVER_MS: u64 = 300;
 
+/// The view's measure of the review detail of a row (5.3): its key, the generation it was measured in and the CAPTION
+/// lines its whole text needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Review {
+    key: ItemKey,
+    gen: u64,
+    lines: u8,
+}
+
 /// The mode chip: a recognised prefix taken out of the field.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Chip {
@@ -152,6 +163,8 @@ pub struct Session {
     pointer_from: Option<(i32, i32)>,
     pointer_live: bool,
     hover: Option<Hover>,
+    /// Run as administrator acts only on a text the view has measured, for this row and this generation.
+    review: Option<Review>,
 }
 
 fn mru_window(cx: &Context, group: &str) -> Option<isize> {
@@ -210,6 +223,7 @@ impl Session {
             pointer_from: None,
             pointer_live: false,
             hover: None,
+            review: None,
         }
     }
 
@@ -240,6 +254,33 @@ impl Session {
 
     pub fn gen(&self) -> u64 {
         self.gen
+    }
+
+    /// The text the view shows whole under the selected row (the review detail of 5.3) before Run as administrator can
+    /// act on it: the typed run line, or the path of a file row that offers Run as administrator.
+    pub fn review_text(&self) -> Option<&str> {
+        self.selected().and_then(review_text)
+    }
+
+    /// The view measured the review detail of the row `key` (`review_text`) with the real CAPTION font over the review
+    /// width: its whole text needs `lines` lines. The measure holds for this generation only.
+    pub fn set_review_lines(&mut self, key: ItemKey, lines: u8) {
+        self.review = Some(Review { key, gen: self.gen, lines });
+    }
+
+    /// Why Ctrl+Shift+Enter on the selected row would be refused now; the view shows `Refusal::detail` in place of the
+    /// review. None when the row has nothing to review or the review passes.
+    pub fn admin_refusal(&self) -> Option<Refusal> {
+        self.selected().and_then(|item| self.review_of(item)).and_then(Result::err)
+    }
+
+    /// The review conditions (5.4.9 conditions 3 and 4) of a row that offers Run as administrator on a typed text, with
+    /// the view's measure of this row in this generation (none: not measured, refused). None: nothing to review.
+    fn review_of(&self, item: &Item) -> Option<Result<(), Refusal>> {
+        let text = review_text(item)?;
+        let gen = self.gen;
+        let lines = self.review.filter(|r| r.key == item.key && r.gen == gen).map_or(0, |r| r.lines);
+        Some(gesture::review_ok(text, lines))
     }
 
     /// The query as typed, prefix included: what keep_query brings back at the next open.
@@ -646,10 +687,10 @@ impl Session {
     }
 
     /// Ctrl+Shift+Enter. An app asks UAC through Explorer (no gesture needed: the app is the catalogue's); a run
-    /// suggestion only goes into the field, where it becomes typed text. The typed line needs the gesture and the
-    /// review conditions (L1a-9): until then it does nothing.
+    /// suggestion only goes into the field, where it becomes typed text. The typed line and an executable file need the
+    /// hook-proven gesture and the review conditions (5.4.9); a file needs an exe, msi, bat or cmd path that is not on
+    /// the network. The view resets the hook's tracked modifiers after the launch.
     fn run_as_admin(&mut self, item: &Item, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
-        let _ = gesture;
         match (&item.kind, &item.payload) {
             (Kind::App, _) if item.verbs.has(Verb::RunAsAdmin) => {
                 app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::AppAdmin(id.into())))
@@ -658,6 +699,18 @@ impl Session {
                 let line = r.line.clone();
                 self.set_field(&line, cx)
             }
+            (Kind::RunLine, Payload::RunLine(r)) => match gesture {
+                Some(gesture) if self.review_of(item) == Some(Ok(())) => {
+                    launch(LaunchReq::RunAsTyped { line: r.clone(), gesture })
+                }
+                _ => Vec::new(),
+            },
+            (Kind::File, Payload::Path { path, .. }) => match (gesture, elevated_file_line(path)) {
+                (Some(gesture), Some(line)) if self.review_of(item) == Some(Ok(())) => {
+                    launch(LaunchReq::RunAsTyped { line, gesture })
+                }
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -721,6 +774,35 @@ impl Session {
     }
 }
 
+/// The text a row shows whole before Run as administrator (5.3 review detail): a typed run line, or an executable
+/// file's path, and only on a row that offers the verb.
+fn review_text(item: &Item) -> Option<&str> {
+    if !item.verbs.has(Verb::RunAsAdmin) {
+        return None;
+    }
+    match (&item.kind, &item.payload) {
+        (Kind::RunLine, Payload::RunLine(r)) => Some(&r.line),
+        (Kind::File, Payload::Path { path, dir: false, class: FileClass::Executable }) => Some(path),
+        _ => None,
+    }
+}
+
+/// The line that runs a file as administrator: its path quoted, the file part inside the quotes. Only exe, msi, bat
+/// and cmd files (5.4.9 file rows), never a path with a quote in it.
+fn elevated_file_line(path: &str) -> Option<RunLine> {
+    const ELEVATABLE: [&str; 4] = ["exe", "msi", "bat", "cmd"];
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let (_, ext) = name.rsplit_once('.')?;
+    if !ELEVATABLE.iter().any(|e| e.eq_ignore_ascii_case(ext)) || path.contains('"') {
+        return None;
+    }
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    quoted.push_str(path);
+    quoted.push('"');
+    runline::classify(&quoted).filter(|r| r.line.get(r.file.clone()) == Some(path))
+}
+
 /// What a command row runs: power commands after the hide, the window menu after the restore.
 fn command(id: CommandId) -> Vec<Effect> {
     match id {
@@ -738,7 +820,7 @@ fn command(id: CommandId) -> Vec<Effect> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::launcher::model::FileClass;
+    use crate::launcher::model::VerbSet;
     use crate::launcher::providers::tests::{Fx, NOTEPAD_KEY};
 
     const NOTEPAD_ID: &str = "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App";
@@ -1089,7 +1171,7 @@ mod tests {
         assert_eq!(s.selected().unwrap().kind, Kind::RunLine, "the typed line first");
         assert_eq!(press(&mut s, &fx, VK_TAB, Mods::NONE), [Effect::Relayout]);
         assert_eq!((s.chip(), s.query_text()), (Some(ProviderId::Run), "ping 1.1.1.1"));
-        // Ctrl+Shift+Enter on a suggestion only puts it in the field; on the typed line it waits for L1a-9.
+        // Ctrl+Shift+Enter on a suggestion only puts it in the field; the typed line needs the view's measure first.
         let mut s = typed(&fx, ">no");
         press(&mut s, &fx, VK_DOWN, Mods::NONE);
         assert_eq!(s.selected().unwrap().kind, Kind::RunSuggestion);
@@ -1117,6 +1199,100 @@ mod tests {
         press(&mut s, &fx, VK_TAB, Mods::NONE);
         assert_eq!(s.query_text(), "Calcolatrice");
         let _ = NOTEPAD_KEY;
+    }
+
+    #[test]
+    fn runas_conditions() {
+        let fx = Fx::new();
+        let cse = |s: &mut Session, g: Option<Gesture>| s.key(k(VK_RETURN, CTRL_SHIFT), g, &fx.cx());
+        let hide = Effect::Hide { restore: false };
+        // A suggestion only goes into the field, where it becomes the typed line.
+        let mut s = typed(&fx, ">no");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert_eq!(s.selected().unwrap().kind, Kind::RunSuggestion);
+        assert_eq!((s.review_text(), s.admin_refusal()), (None, None));
+        assert_eq!(cse(&mut s, Some(Gesture::for_test(1))), [Effect::Relayout]);
+        let line = s.selected().unwrap().clone();
+        let Payload::RunLine(run) = &line.payload else { panic!("{line:?}") };
+        assert_eq!(line.kind, Kind::RunLine);
+        assert_eq!(s.review_text(), Some("notepad c:\\temp\\a.txt"));
+        // The typed line: the view's measure and the gesture, both.
+        assert_eq!(s.admin_refusal(), Some(Refusal::TooLong), "not measured yet");
+        assert!(cse(&mut s, Some(Gesture::for_test(2))).is_empty());
+        s.set_review_lines(line.key, 1);
+        assert_eq!(s.admin_refusal(), None);
+        assert!(cse(&mut s, None).is_empty(), "no gesture");
+        let runas = |g: u32| Effect::Launch(LaunchReq::RunAsTyped { line: run.clone(), gesture: Gesture::for_test(g) });
+        assert_eq!(cse(&mut s, Some(Gesture::for_test(3))), [hide.clone(), runas(3)]);
+        // A line that needs 4 lines is disabled, with its detail line; 3 lines pass.
+        s.set_review_lines(line.key, 4);
+        assert_eq!(s.admin_refusal(), Some(Refusal::TooLong));
+        assert_eq!(s.admin_refusal().and_then(Refusal::detail), Some("Line too long to review"));
+        assert!(cse(&mut s, Some(Gesture::for_test(4))).is_empty());
+        s.set_review_lines(line.key, 3);
+        assert_eq!(cse(&mut s, Some(Gesture::for_test(5))), [hide.clone(), runas(5)]);
+        // A measure holds for its row and its generation only.
+        s.set_review_lines(ItemKey(1), 1);
+        assert_eq!(s.admin_refusal(), Some(Refusal::TooLong), "another row's measure");
+        s.set_review_lines(line.key, 1);
+        s.chars(" ", &fx.cx());
+        assert_eq!(s.selected().unwrap().key, line.key, "the same line");
+        assert_eq!(s.admin_refusal(), Some(Refusal::TooLong), "a new generation needs a new measure");
+        assert!(cse(&mut s, Some(Gesture::for_test(6))).is_empty());
+        // A replayed Ctrl+Shift+Enter has no gesture.
+        s.set_review_lines(line.key, 1);
+        assert!(s.replay(&[ReplayKey::Key(k(VK_RETURN, CTRL_SHIFT))], &fx.cx()).is_empty());
+        // A bidi override disables it, measured or not.
+        let mut s = typed(&fx, ">notepad a\u{202E}txt.exe");
+        let key = s.selected().unwrap().key;
+        s.set_review_lines(key, 1);
+        assert_eq!(s.admin_refusal(), Some(Refusal::Markers));
+        assert!(cse(&mut s, Some(Gesture::for_test(7))).is_empty());
+        // Executable rows offer only Reveal and Copy while MOTW_PROMPT_CONFIRMED is false: nothing to review or run.
+        const { assert!(!providers::MOTW_PROMPT_CONFIRMED) };
+        let mut s = typed(&fx, "c:\\tools\\setup.exe");
+        let i = s.rows().iter().position(|r| r.kind == Kind::File).unwrap();
+        s.results.select_index(i);
+        let row = s.selected().unwrap().clone();
+        assert_eq!(row.verbs, VerbSet::empty().with(Verb::Reveal).with(Verb::Copy));
+        assert_eq!(s.review_text(), None);
+        s.set_review_lines(row.key, 1);
+        assert!(cse(&mut s, Some(Gesture::for_test(8))).is_empty());
+        assert!(press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty());
+        // Once live check 6 passes: a local exe runs reviewed and quoted; a UNC path and a script are refused.
+        let exe = |path: &str| {
+            let mut it = crate::launcher::providers::tests::file_row("setup.exe", FileClass::Executable);
+            it.key = ItemKey::of(ProviderId::Files, path);
+            it.verbs = verbs::verbs_for(Kind::File, false, Some(FileClass::Executable), true, true);
+            it.payload = Payload::Path { path: path.into(), dir: false, class: FileClass::Executable };
+            it
+        };
+        let paths =
+            ["c:\\a b\\setup.exe", "\\\\server\\share\\setup.exe", "//server/share/setup.exe", "c:\\x\\run.ps1"];
+        let mut s = typed(&fx, "setup");
+        let batch =
+            Batch { gen: s.gen(), from: ProviderId::Files, items: paths.iter().map(|p| exe(p)).collect(), done: true };
+        assert!(s.late(batch, &fx.cx()));
+        let pick = |s: &mut Session, p: &str| {
+            let i = s.rows().iter().position(|r| r.key == ItemKey::of(ProviderId::Files, p)).unwrap();
+            s.results.select_index(i);
+            s.set_review_lines(ItemKey::of(ProviderId::Files, p), 1);
+        };
+        pick(&mut s, paths[0]);
+        assert_eq!(s.review_text(), Some(paths[0]), "the full path is reviewed");
+        let quoted = RunLine { line: "\"c:\\a b\\setup.exe\"".into(), file: 1..17, console: false };
+        assert_eq!(
+            cse(&mut s, Some(Gesture::for_test(9))),
+            [hide.clone(), Effect::Launch(LaunchReq::RunAsTyped { line: quoted, gesture: Gesture::for_test(9) })]
+        );
+        assert!(cse(&mut s, None).is_empty(), "no gesture");
+        for p in &paths[1..3] {
+            pick(&mut s, p);
+            assert_eq!(s.admin_refusal(), Some(Refusal::Unc), "{p}");
+            assert!(cse(&mut s, Some(Gesture::for_test(10))).is_empty(), "{p}");
+        }
+        pick(&mut s, paths[3]);
+        assert!(cse(&mut s, Some(Gesture::for_test(11))).is_empty(), "only exe, msi, bat and cmd");
     }
 
     #[test]
