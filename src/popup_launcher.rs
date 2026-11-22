@@ -1738,7 +1738,10 @@ pub(crate) fn on_timer(hwnd: HWND, id: usize) {
         }
         crate::msg::TIMER_LAUNCHER_WARM => {
             if is_on() {
-                ask_catalogue();
+                // B7: an open or Start may have listed the catalogue already; the warm timer lists nothing twice.
+                if with_ctrl(|c| c.warm_due()) == Some(true) {
+                    ask_catalogue();
+                }
                 warm_window();
             }
         }
@@ -2485,6 +2488,12 @@ fn run_line_of(r: &crate::launcher::session::LaunchReq) -> Option<&str> {
 }
 
 impl Ctrl {
+    /// The warm timer still has a listing to ask for: nothing was ever stored (`on_catalog` sets `listed_at_ms` to at
+    /// least 1, and `chord_off` resets it).
+    fn warm_due(&self) -> bool {
+        self.listed_at_ms == 0
+    }
+
     /// The catalogue was listed more than 10 minutes ago and no listing is waiting for its answer.
     fn catalogue_stale(&self, now: u64) -> bool {
         let waiting = self.listing_since.is_some_and(|t| now.saturating_sub(t) < LISTING_RETRY_MS);
@@ -5371,6 +5380,16 @@ mod tests {
         held_flow(&mut |_| false);
         assert_eq!(notice_titles(&new_launcher()), [strings::pt_alt_shift_space_held()]);
         with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    // ---- L3 T2: the warm timer lists once
+
+    #[test]
+    fn warm_timer_never_lists_a_listed_catalogue() {
+        let mut c = Ctrl::new();
+        assert!(c.warm_due(), "nothing listed yet");
+        c.listed_at_ms = 8_046; // the first open's listing came back (on_catalog)
+        assert!(!c.warm_due(), "B7: the warm timer at 10 s lists nothing");
     }
 
     // ---- L3 T22: the warm timer
