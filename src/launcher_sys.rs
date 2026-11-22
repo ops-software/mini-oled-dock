@@ -452,7 +452,14 @@ impl SysPort for RealSys {
 
     fn open_settings(&mut self) {
         // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
-        let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_OPEN_SETTINGS, WPARAM(0), LPARAM(0)) };
+        let r = unsafe {
+            PostMessageW(
+                Some(crate::hwnd()),
+                crate::msg::WM_DOCK_OPEN_SETTINGS,
+                WPARAM(crate::msg::SETTINGS_PAGE_LAUNCHER),
+                LPARAM(0),
+            )
+        };
         if let Err(e) = r {
             log!("launcher: PostMessageW(WM_DOCK_OPEN_SETTINGS) failed: {e}");
         }

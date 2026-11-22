@@ -35,7 +35,6 @@ pub enum Effect {
     /// The window menu of the window of the open, after the restore.
     WindowMenu,
     /// Settings > Launcher (L1b).
-    #[allow(dead_code)] // L1b-7 builds it
     OpenSettings,
     /// Forget a learned row (frecency, L1b).
     Forget(ItemKey),
@@ -146,6 +145,7 @@ const VK_A: u16 = 0x41;
 const VK_C: u16 = 0x43;
 const VK_E: u16 = 0x45;
 const VK_K: u16 = 0x4B;
+const VK_OEM_COMMA: u16 = 0xBC;
 const VK_V: u16 = 0x56;
 const VK_W: u16 = 0x57;
 const VK_X: u16 = 0x58;
@@ -506,6 +506,9 @@ impl Session {
             VK_K if m == Mods::CTRL && !ev.repeat => self.open_actions(true),
             VK_F10 if m == Mods::SHIFT && !ev.repeat => self.open_actions(true),
             VK_APPS if plain && !ev.repeat => self.open_actions(true),
+            VK_OEM_COMMA if m == Mods::CTRL && !ev.repeat => {
+                vec![Effect::Hide { restore: false }, Effect::OpenSettings]
+            }
             VK_X if m == Mods::CTRL => self.edit(Edit::Cut, cx),
             VK_ESCAPE if plain => self.escape(cx),
             VK_RETURN if ev.repeat => Vec::new(),
@@ -1817,6 +1820,21 @@ mod tests {
 
     fn acts(s: &Session) -> Vec<Act> {
         s.action_list().map(|l| l.items().iter().map(|e| e.act).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn ctrl_comma_opens_settings_after_the_hide() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "blocco");
+        assert_eq!(
+            press(&mut s, &fx, VK_OEM_COMMA, Mods::CTRL),
+            [Effect::Hide { restore: false }, Effect::OpenSettings]
+        );
+        // A bare comma is text; a held Ctrl+, does not repeat; the action list takes the key first.
+        let mut s = typed(&fx, "a");
+        assert!(!press(&mut s, &fx, VK_OEM_COMMA, Mods::NONE).contains(&Effect::OpenSettings));
+        let held = KeyEvent { repeat: true, ..k(VK_OEM_COMMA, Mods::CTRL) };
+        assert!(s.key(held, None, &fx.cx()).is_empty());
     }
 
     #[test]

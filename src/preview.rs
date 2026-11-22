@@ -702,6 +702,7 @@ fn settings_png_with(
         data_dir: Some("C:\\ProgramData\\mini-oled-dock"),
         log_path: Some("C:\\ProgramData\\mini-oled-dock\\dock.log"),
         trust_elevated: false,
+        powertoys: false,
     };
     // The mini bar is drawn by the bar renderer, which reads the global config.
     crate::config::set(c.clone());
@@ -1127,6 +1128,10 @@ pub fn run(dir: &str) -> i32 {
         let tall =
             settings_png_with(dir, "settings_modules_tray.png", m, modules, &c, (false, false), None, (860, 900));
         failures += i32::from(!tall);
+        // The whole Launcher page, down to the config file row.
+        let launcher = crate::settings_pages::Page::Launcher;
+        let file = "settings_launcher_full.png";
+        failures += i32::from(!settings_png_with(dir, file, m, launcher, &c, (false, false), None, (860, 1560)));
         crate::i18n::set_preview(false);
         for page in crate::settings_pages::Page::ALL {
             let c = Config { language: crate::config::Language::It, ..Config::default() };

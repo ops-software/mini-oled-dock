@@ -460,6 +460,7 @@ impl Win {
             data_dir: self.data_dir.as_deref(),
             log_path: self.log_path.as_deref(),
             trust_elevated: self.trust_elevated,
+            powertoys: crate::popup::popup_launcher::pt_detected(),
         }
     }
 
@@ -716,6 +717,16 @@ pub fn open() {
     if let Err(e) = create() {
         log!("settings: cannot open the window: {e}");
     }
+}
+
+/// Opens the window (or the open one) on `page`.
+pub fn open_at(page: Page) {
+    open();
+    with_win(|w| {
+        if w.page != page {
+            w.goto(page);
+        }
+    });
 }
 
 fn create() -> Result<(), String> {
@@ -996,7 +1007,26 @@ fn run_action(a: Action) {
             close("exit");
             crate::power::run(crate::power::PowerAction::ExitDock);
         }
+        Action::ForgetHistory => {
+            crate::popup::popup_launcher::forget_history();
+            log!("settings: launcher history forgotten");
+        }
+        // `config.json` is the one file the interactive user may write; the shell thread opens it as that user.
+        Action::EditConfig => {
+            if let Some(p) = crate::datadir::config_path() {
+                shell_thread::request(ShellRequest::Launch {
+                    target: notepad_path(),
+                    args: Some(format!("\"{}\"", p.display())),
+                });
+            }
+        }
     }
+}
+
+/// `<SystemRoot>\System32\notepad.exe`, never found through the search path.
+fn notepad_path() -> String {
+    let root = std::env::var_os("SystemRoot").map_or_else(|| "C:\\Windows".into(), std::path::PathBuf::from);
+    root.join("System32").join("notepad.exe").display().to_string()
 }
 
 // ------------------------------------------------------------------ messages

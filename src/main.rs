@@ -484,7 +484,11 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_DOCK_OPEN_SETTINGS => {
-            settings_window::open();
+            if wp.0 == msg::SETTINGS_PAGE_LAUNCHER {
+                settings_window::open_at(settings_pages::Page::Launcher);
+            } else {
+                settings_window::open();
+            }
             LRESULT(0)
         }
         WM_DOCK_UPDATE => {

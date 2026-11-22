@@ -66,8 +66,11 @@ pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
 /// INSTEAD of the second `WM_DOCK_TOGGLE`. `main` calls `ui::open_start_menu()`.
 pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
 /// Popups, the quick-links menu and `--settings` -> dock window: open the Settings window (or bring
-/// the open one to the front). wParam = lParam = 0. `main` calls `settings_window::open()`.
+/// the open one to the front). wParam = 0 (`SETTINGS_PAGE_LAUNCHER` from the launcher's Ctrl+,), lParam = 0. `main` calls
+/// `settings_window::open()`, or `open_at(Page::Launcher)` for the launcher's value.
 pub const WM_DOCK_OPEN_SETTINGS: u32 = WM_APP + 40;
+/// wParam of `WM_DOCK_OPEN_SETTINGS`: open on the Launcher page.
+pub const SETTINGS_PAGE_LAUNCHER: usize = 1;
 /// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
 /// Consecutive posts may be coalesced: re-read `update::status()`.
 pub const WM_DOCK_UPDATE: u32 = WM_APP + 17;

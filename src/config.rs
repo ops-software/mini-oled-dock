@@ -414,11 +414,11 @@ pub const TRAY_ICON_SIZE: SizeRange = SizeRange { min: 12, max: 24, default: 16 
 pub const MODULE_SIZE: SizeRange = SizeRange { min: 75, max: 150, default: 100 };
 
 /// The providers a `launcher.providers` map may name, in the order the template lists them.
-const LAUNCHER_PROVIDERS: [&str; 10] =
+pub(crate) const LAUNCHER_PROVIDERS: [&str; 10] =
     ["apps", "windows", "files", "settings", "calc", "commands", "run", "web", "datetime", "registry"];
 
 /// The launcher's prefix defaults (SPEC-launcher 5.6).
-const LAUNCHER_PREFIXES: [(&str, &str); 8] = [
+pub(crate) const LAUNCHER_PREFIXES: [(&str, &str); 8] = [
     ("=", "calc"),
     (">", "run"),
     ("<", "windows"),

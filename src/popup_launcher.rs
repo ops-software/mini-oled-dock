@@ -1791,8 +1791,12 @@ pub(crate) fn on_state(frecency: Option<Vec<u8>>, run: Option<Vec<u8>>) {
     });
 }
 
+/// A PowerToys chord owner is running (Settings > Launcher shows its row only then).
+pub(crate) fn pt_detected() -> bool {
+    with_ctrl(|c| c.pt.state() != PtState::Absent).unwrap_or(false)
+}
+
 /// "Forget history" (Settings > Launcher, L1b-7): the run history and every learned rank leave the memory and the files.
-#[allow(dead_code)] // L1b-7 builds the button
 pub(crate) fn forget_history() {
     let cleared = with_ctrl(|c| {
         c.history.clear();
@@ -3675,6 +3679,17 @@ mod tests {
             assert_eq!(plan, OpenPlan::TryOpen);
             assert_eq!(with_ctrl(|c| c.context().window_target), Some(ok));
         }
+    }
+
+    #[test]
+    fn ctrl_comma_hides_then_opens_the_settings_page() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "calc");
+        let mut sys = EffectSys::default();
+        assert_eq!(key(&mut l, &fx, &mut sys, 0xBC, Mods::CTRL), Reply::Close);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(ops(&sys), ["Hide", "OpenSettings"], "no restore: the Settings window takes the foreground");
     }
 
     #[test]

@@ -140,7 +140,7 @@ pub(crate) fn hit_id(h: Hit) -> u32 {
 
 pub(crate) fn decode(id: u32) -> Option<Hit> {
     match id {
-        1..=7 => Some(Hit::Nav(Page::ALL[(id - 1) as usize])),
+        1..=8 => Some(Hit::Nav(Page::ALL[(id - 1) as usize])),
         1000.. => {
             let k = id - 1000;
             let part = k % 16;
@@ -1102,6 +1102,7 @@ mod tests {
             data_dir: None,
             log_path: None,
             trust_elevated: false,
+            powertoys: false,
         }
     }
 
@@ -1122,7 +1123,7 @@ mod tests {
         let st = idle_status();
         let rows = settings_pages::rows(Page::Appearance, &Config::default(), &test_ctx(&st));
         let g = layout(&s, (860, 600), &frame(Page::Appearance, &rows), 0);
-        assert_eq!(g.nav.len(), 7);
+        assert_eq!(g.nav.len(), 8);
         let about = g.nav.iter().find(|(p, _)| *p == Page::About).unwrap().1;
         assert_eq!(about.bottom, 600 - 8);
         assert!(g.nav.iter().all(|(_, r)| r.right <= NAV_W));
