@@ -7,8 +7,8 @@ use super::catalog::CatApp;
 use super::commands::{self, Command, COMMANDS};
 use super::gesture::GESTURE_TIME_MATCHES;
 use super::model::{
-    CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, NumberStyle, Payload, ProviderId, ProviderMask,
-    Query, Score, SettingRow, Verb, VerbSet, WindowRow,
+    Batch, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, NumberStyle, Payload, ProviderId,
+    ProviderMask, Query, Score, SettingRow, Verb, VerbSet, WindowRow,
 };
 use super::query::{self, Implicit, PrefixTable};
 use super::rank::{self, Cand, Indexed};
@@ -731,6 +731,166 @@ fn web(q: &Query, cx: &Context, top: &mut TopK) {
     }
 }
 
+// ---------------------------------------------------------------- results
+
+fn is_executable_file(r: &Item) -> bool {
+    matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. })
+}
+
+/// The rows of the current query in the merge order of 5.2.6 (notices, the answer, the ranked rows, late rows, the
+/// web row) and the selection, kept by `ItemKey`. Late rows are only ever added below the synchronous rows and never
+/// move a row at or above the selection; every row belongs to the generation of the last `sync`.
+#[derive(Debug, Default)]
+pub struct Results {
+    rows: Vec<Item>,
+    sel: Option<ItemKey>,
+    gen: u64,
+    /// Notices, the answer and the ranked rows: the rows of the keystroke's own frame.
+    sync_len: usize,
+    /// Late rows right after them, above the web row.
+    late_len: usize,
+    /// The query was in Mixed mode, where an executable file row is never the default.
+    mixed: bool,
+    notices: Vec<Item>,
+}
+
+impl Results {
+    /// The notice rows (5.5.2, 5.7), shown first from the next `sync`.
+    pub fn set_notices(&mut self, notices: Vec<Item>) {
+        self.notices = notices;
+    }
+
+    pub fn rows(&self) -> &[Item] {
+        &self.rows
+    }
+
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+
+    pub fn selected(&self) -> Option<&Item> {
+        let key = self.sel?;
+        self.rows.iter().find(|r| r.key == key)
+    }
+
+    pub fn selected_index(&self) -> Option<usize> {
+        let key = self.sel?;
+        self.rows.iter().position(|r| r.key == key)
+    }
+
+    /// Selects the row at `i` (arrows, pointer); false when there is none.
+    pub fn select_index(&mut self, i: usize) -> bool {
+        match self.rows.get(i) {
+            Some(r) => {
+                self.sel = Some(r.key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether anything but notices and the web row answered: when nothing did, tier 7 is worth asking.
+    pub fn has_matches(&self) -> bool {
+        self.rows.iter().any(|r| r.kind != Kind::Notice && r.key != web_search_key())
+    }
+
+    /// The synchronous rows of a keystroke. A new generation drops every older row and takes the default selection; the
+    /// same generation again (a refresh) keeps its late rows and the selected key when it is still there.
+    pub fn sync(&mut self, q: &Query, top: TopK) {
+        let same = q.gen == self.gen;
+        let keep = if same { self.sel } else { None };
+        let late = if same { self.take_late() } else { Vec::new() };
+        self.rows.clear();
+        self.rows.extend(self.notices.iter().cloned());
+        let mut web = None;
+        let mut ranked = Vec::with_capacity(top.len());
+        for item in top.into_sorted() {
+            if item.key == web_search_key() {
+                web = Some(item);
+            } else if item.kind == Kind::Answer {
+                self.rows.push(item);
+            } else {
+                ranked.push(item);
+            }
+        }
+        self.rows.append(&mut ranked);
+        self.sync_len = self.rows.len();
+        self.late_len = late.len();
+        self.rows.extend(late);
+        self.rows.extend(web);
+        self.gen = q.gen;
+        self.mixed = q.mode == Mode::Mixed;
+        self.sel = keep.filter(|k| self.rows.iter().any(|r| r.key == *k)).or_else(|| self.default_key(q));
+    }
+
+    /// The rows added after the last `sync` (they sit after the synchronous rows, around the web row).
+    fn take_late(&mut self) -> Vec<Item> {
+        let start = self.sync_len.min(self.rows.len());
+        self.rows.drain(start..).filter(|r| r.key != web_search_key()).collect()
+    }
+
+    fn may_default(&self, r: &Item) -> bool {
+        let blocked = self.mixed && is_executable_file(r);
+        !r.verbs.is_empty() && !blocked
+    }
+
+    /// The first row that may be the default (destructive rows by the rule of 5.2.7, executable files in Mixed mode and
+    /// rows with no action skipped); the web row only when nothing else answered.
+    fn default_key(&self, q: &Query) -> Option<ItemKey> {
+        let web = web_search_key();
+        let first =
+            self.rows.iter().filter(|r| r.key != web).find(|r| self.may_default(r) && rank::default_allowed(r, q));
+        if let Some(r) = first {
+            return Some(r.key);
+        }
+        let alone = self.rows.iter().all(|r| r.key == web || r.kind == Kind::Notice);
+        self.rows.iter().find(|r| alone && r.key == web && !r.verbs.is_empty()).map(|r| r.key)
+    }
+
+    /// A late batch (files, tier 7). False, and nothing changes, unless it is of the current generation. Its rows go
+    /// below the synchronous and earlier late rows, above the web row, unless the web row is selected: then below it.
+    /// A row already shown is not added twice. With nothing selected, the first late row that may be the default is.
+    pub fn late(&mut self, b: Batch, current_gen: u64) -> bool {
+        if b.gen != current_gen || b.gen != self.gen {
+            return false;
+        }
+        let first_late = self.sync_len + self.late_len;
+        let below_web = self.selected_index().is_some_and(|i| i >= first_late);
+        let mut at = if below_web { self.rows.len() } else { first_late };
+        let from = at;
+        for item in b.items {
+            if self.rows.iter().any(|r| r.key == item.key) {
+                continue;
+            }
+            self.rows.insert(at, item);
+            at += 1;
+            if !below_web {
+                self.late_len += 1;
+            }
+        }
+        if self.sel.is_none() {
+            let added = self.rows.get(from..at).unwrap_or(&[]);
+            self.sel = added.iter().find(|r| !r.destructive && self.may_default(r)).map(|r| r.key);
+        }
+        true
+    }
+
+    /// Takes a row out (a closed window, a forgotten line); the selection moves to the row that takes its place.
+    pub fn remove(&mut self, key: ItemKey) -> Option<Item> {
+        let i = self.rows.iter().position(|r| r.key == key)?;
+        let item = self.rows.remove(i);
+        if i < self.sync_len {
+            self.sync_len -= 1;
+        } else if i < self.sync_len + self.late_len {
+            self.late_len -= 1;
+        }
+        if self.sel == Some(key) {
+            self.sel = self.rows.get(i).or_else(|| self.rows.last()).map(|r| r.key);
+        }
+        Some(item)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub(crate) mod tests {
@@ -836,6 +996,156 @@ pub(crate) mod tests {
 
     fn titled<'a>(rows: &'a [Item], title: &str) -> Vec<&'a Item> {
         rows.iter().filter(|r| &*r.title == title).collect()
+    }
+
+    // ---- results
+
+    impl Fx {
+        /// The results of a query of generation `gen`.
+        pub(crate) fn sync(&self, res: &mut Results, raw: &str, gen: u64) {
+            let q = query::parse_query(raw, &self.opts.prefixes, NUM_IT, gen);
+            res.sync(&q, query_all(&q, &self.cx(), &mut Budget::default()));
+        }
+    }
+
+    pub(crate) fn file_row(name: &str, class: FileClass) -> Item {
+        Item {
+            key: ItemKey::of(ProviderId::Files, name),
+            from: ProviderId::Files,
+            kind: Kind::File,
+            title: name.into(),
+            detail: None,
+            icon: IconRef::Glyph(GlyphId::Document),
+            score: PINNED,
+            verbs: verbs(Kind::File, false, Some(class)),
+            payload: Payload::Path { path: format!("c:\\x\\{name}").into(), dir: false, class },
+            destructive: false,
+        }
+    }
+
+    fn keys(res: &Results) -> Vec<ItemKey> {
+        res.rows().iter().map(|r| r.key).collect()
+    }
+
+    fn files(gen: u64, names: &[&str]) -> Batch {
+        let items = names.iter().map(|n| file_row(n, FileClass::Other)).collect();
+        Batch { gen, from: ProviderId::Files, items, done: true }
+    }
+
+    #[test]
+    fn stability_merge_with_a_late_provider() {
+        let fx = Fx::new();
+        let mut res = Results::default();
+        fx.sync(&mut res, "st", 1);
+        let titles: Vec<&str> = res.rows().iter().map(|r| &*r.title).collect();
+        assert_eq!(titles, ["Steam", "Visual Studio Code", "Restart", "Registry Editor", "Sleep"]);
+        assert_eq!(res.selected().unwrap().title.as_ref(), "Steam");
+        assert!(res.select_index(1), "the user moves to Visual Studio Code");
+        let before = keys(&res);
+        assert!(res.late(files(1, &["budget.ods", "studio.txt"]), 1));
+        let after = keys(&res);
+        assert_eq!(after[..5], before[..], "no row at or above the selection moved");
+        assert_eq!(after.len(), 7);
+        assert_eq!(res.selected().unwrap().title.as_ref(), "Visual Studio Code", "Enter acts on the selected row");
+        // Late rows go above the web row...
+        fx.sync(&mut res, "stea", 2);
+        assert_eq!(res.rows().last().unwrap().key, web_search_key());
+        assert!(res.late(files(2, &["steam.log"]), 2));
+        assert_eq!(res.rows().last().unwrap().key, web_search_key());
+        assert_eq!(res.rows()[res.rows().len() - 2].title.as_ref(), "steam.log");
+        // ... unless the web row is selected: then below it, and it stays where it was.
+        fx.sync(&mut res, "zzqq", 3);
+        assert_eq!(res.selected().unwrap().key, web_search_key());
+        assert!(res.late(files(3, &["zzqq.txt"]), 3));
+        assert_eq!(res.rows()[0].key, web_search_key());
+        assert_eq!(res.selected().unwrap().key, web_search_key());
+        // A row already there is not added twice.
+        assert!(res.late(files(3, &["zzqq.txt"]), 3));
+        assert_eq!(res.rows().len(), 2);
+    }
+
+    #[test]
+    fn stale_generation_dropped() {
+        let fx = Fx::new();
+        let mut res = Results::default();
+        fx.sync(&mut res, "st", 4);
+        let before = keys(&res);
+        assert!(!res.late(files(3, &["old.txt"]), 4), "an older batch");
+        assert!(!res.late(files(4, &["old.txt"]), 5), "the session moved on");
+        assert_eq!(keys(&res), before);
+        assert!(res.late(files(4, &["kept.txt"]), 4));
+        fx.sync(&mut res, "ste", 5);
+        assert!(res.rows().iter().all(|r| r.from != ProviderId::Files), "older rows are gone at the next keystroke");
+        // A refresh of the same generation keeps its late rows and the selected key.
+        assert!(res.late(files(5, &["steam.cfg"]), 5));
+        res.select_index(res.rows().iter().position(|r| &*r.title == "steam.cfg").unwrap());
+        fx.sync(&mut res, "ste", 5);
+        assert_eq!(res.selected().unwrap().title.as_ref(), "steam.cfg");
+        assert_eq!(res.rows().last().unwrap().key, web_search_key());
+    }
+
+    #[test]
+    fn web_row_from_3_chars_selected_only_alone() {
+        let fx = Fx::new();
+        let mut res = Results::default();
+        fx.sync(&mut res, "zz", 1);
+        assert!(res.rows().is_empty() && res.selected().is_none());
+        fx.sync(&mut res, "zzq", 2);
+        assert_eq!(keys(&res), [web_search_key()]);
+        assert_eq!(res.selected().unwrap().key, web_search_key());
+        assert!(!res.has_matches());
+        fx.sync(&mut res, "ste", 3);
+        assert_eq!(res.rows().last().unwrap().key, web_search_key());
+        assert_eq!(res.selected().unwrap().title.as_ref(), "Steam");
+        assert!(res.has_matches());
+        // A destructive row that may not be the default does not let the web row take it.
+        fx.sync(&mut res, "sle", 4);
+        assert!(res.rows().iter().any(|r| r.payload == Payload::Command(CommandId::Sleep)));
+        assert_eq!(res.selected(), None);
+    }
+
+    #[test]
+    fn default_skips_destructive_and_executables() {
+        let fx = Fx::new();
+        let mut res = Results::default();
+        fx.sync(&mut res, "sl", 1);
+        assert_eq!(res.rows().len(), 1);
+        assert_eq!(res.rows()[0].payload, Payload::Command(CommandId::Sleep));
+        assert_eq!(res.selected(), None, "\"sl\" never selects Sleep");
+        fx.sync(&mut res, "sleep", 2);
+        assert_eq!(res.selected().unwrap().payload, Payload::Command(CommandId::Sleep));
+        fx.sync(&mut res, "C:\\tools\\setup.exe", 3);
+        assert!(is_executable_file(&res.rows()[0]));
+        assert_eq!(res.selected(), None, "an executable file row is never the default in Mixed mode");
+        fx.sync(&mut res, "C:\\tools\\readme.txt", 4);
+        assert_eq!(res.selected().unwrap().kind, Kind::File);
+        // A late executable row is not taken as the default either; a document is.
+        fx.sync(&mut res, "zz", 5);
+        let batch = |items| Batch { gen: 5, from: ProviderId::Files, items, done: false };
+        assert!(res.late(batch(vec![file_row("setup.exe", FileClass::Executable)]), 5));
+        assert_eq!(res.selected(), None);
+        assert!(res.late(batch(vec![file_row("zz.txt", FileClass::Other)]), 5));
+        assert_eq!(res.selected().unwrap().title.as_ref(), "zz.txt");
+    }
+
+    #[test]
+    fn merge_order_notices_answer_ranked_web() {
+        let fx = Fx::new();
+        let mut res = Results::default();
+        let mut notice = file_row("notice", FileClass::Other);
+        notice.kind = Kind::Notice;
+        notice.verbs = VerbSet::empty();
+        res.set_notices(vec![notice]);
+        fx.sync(&mut res, "3*12", 1);
+        let kinds: Vec<Kind> = res.rows().iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, [Kind::Notice, Kind::Answer, Kind::Web]);
+        assert_eq!(res.rows()[1].title.as_ref(), "36");
+        assert_eq!(res.selected().unwrap().kind, Kind::Answer, "a notice without an action is not the default");
+        // Removing the selected row selects the one that takes its place.
+        let answer = res.rows()[1].key;
+        assert_eq!(res.remove(answer).unwrap().kind, Kind::Answer);
+        assert_eq!(res.selected().unwrap().key, web_search_key());
+        assert!(res.remove(answer).is_none());
     }
 
     #[test]
