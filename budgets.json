@@ -1,0 +1,277 @@
+{
+  "schema": 1,
+  "protocol": "ROADMAP 6.2, SPEC-platform 5.7.4. Bytes (MiB = 1048576). Memory gates absolute; time gates +15 % over the S15 baseline unless a value is given. provisional:true rows still gate; only an owner-approved change may alter a value. pending rows are declared, not yet gated: where says what measures them.",
+  "rows": [
+    {
+      "id": "exe_size.dock",
+      "where": "CI",
+      "status": "active",
+      "unit": "bytes",
+      "gate": "ledger",
+      "base_bytes": 1400320,
+      "target": "1.4.3",
+      "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test.",
+      "ledger_kib_cumulative": {
+        "1.4.2": 0,
+        "1.4.3": 80,
+        "1.4.4": 120,
+        "1.5.0": 180,
+        "1.6.0": 330,
+        "1.7.0": 780,
+        "1.8.0": 1030,
+        "1.9.0": 1280
+      }
+    },
+    {
+      "id": "golden.bytes",
+      "where": "CI",
+      "status": "active",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 33554432,
+      "note": "committed set tests/golden/base only; lowered at 2.7 to the measured size + 25 %"
+    },
+    {
+      "id": "tests.floor",
+      "where": "CI",
+      "status": "active",
+      "unit": "count",
+      "gate": "file",
+      "file": "tests/ratchet.txt"
+    },
+    {
+      "id": "private.dock_hidden",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 12582912,
+      "note": "default config, one bar, hidden, 150 %"
+    },
+    {
+      "id": "wakeups.dock_hidden",
+      "where": "VM",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0.25
+    },
+    {
+      "id": "timers.dock_hidden",
+      "where": "VM",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 0
+    },
+    {
+      "id": "wakeups.kit_static",
+      "where": "VM",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0,
+      "note": "a static kit window, debug counter"
+    },
+    {
+      "id": "private.kit_empty",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 4194304,
+      "provisional": true
+    },
+    {
+      "id": "private.tasks_640x560",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 15728640,
+      "provisional": true,
+      "note": "300 processes"
+    },
+    {
+      "id": "private.tasks_3840x2160",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 15728640,
+      "provisional": true,
+      "note": "300 processes"
+    },
+    {
+      "id": "private.files_1100x720",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 20971520,
+      "provisional": true,
+      "note": "100,000 entries"
+    },
+    {
+      "id": "private.files_3840x2160",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 20971520,
+      "provisional": true,
+      "note": "100,000 entries"
+    },
+    {
+      "id": "private.tasks_admin",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 4194304,
+      "provisional": true
+    },
+    {
+      "id": "private.uia_client_delta",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 2097152,
+      "provisional": true,
+      "note": "a UIA client attached adds at most +2 MiB, own row"
+    },
+    {
+      "id": "leak.open_close_20",
+      "where": "VM",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 1048576,
+      "note": "open and close each surface 20 times, growth strictly below 1 MiB (AG2 section 3.4)"
+    },
+    {
+      "id": "exe_size.tasks",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 1887437,
+      "provisional": true
+    },
+    {
+      "id": "exe_size.files",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 2621440,
+      "provisional": true
+    },
+    {
+      "id": "exe_size.tasks_admin",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 629146,
+      "provisional": true
+    },
+    {
+      "id": "frame.bar_150",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "baseline_plus_15pct",
+      "baseline": null
+    },
+    {
+      "id": "frame.table_hover",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 0.5,
+      "note": "offscreen bench median at 150 %"
+    },
+    {
+      "id": "frame.table_text_40x4",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 1.5,
+      "note": "40 rows x 4 cells of text"
+    },
+    {
+      "id": "frame.scroll_strip",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 2
+    },
+    {
+      "id": "frame.table_4k_full",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 8
+    },
+    {
+      "id": "frame.screen_p95_4k",
+      "where": "VM",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 8,
+      "note": "p95 while scrolling at 4K, S-BAND rig; DWM redirection surface not charged to private bytes"
+    },
+    {
+      "id": "frame.tears_per_100",
+      "where": "VM",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 1,
+      "note": "strictly below 1 tear per 100 frames at 60, 144 and 240 Hz"
+    },
+    {
+      "id": "start.first_frame_tasks",
+      "where": "VM",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 100,
+      "note": "warm, QPC log"
+    },
+    {
+      "id": "start.first_frame_files",
+      "where": "VM",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 100,
+      "note": "warm, QPC log"
+    },
+    {
+      "id": "files.list_10k",
+      "where": "VM",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 50,
+      "note": "10,000 entries listed"
+    },
+    {
+      "id": "tasks.cpu_1s",
+      "where": "VM",
+      "status": "pending",
+      "unit": "percent_core",
+      "gate": "max",
+      "value": 0.5,
+      "note": "of one core at 1 s refresh, sampling only while visible"
+    }
+  ]
+}
