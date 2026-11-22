@@ -73,9 +73,28 @@ pub struct TopK {
 
 /// Result order: the `Score` (5.2.5), then alphabetical (case-insensitive).
 fn order(a: &Item, b: &Item) -> Ordering {
-    a.score
-        .cmp(&b.score)
-        .then_with(|| a.title.chars().flat_map(char::to_lowercase).cmp(b.title.chars().flat_map(char::to_lowercase)))
+    by_rank((&a.score, &a.title), (&b.score, &b.title))
+}
+
+/// `order` on a score and a title, before any row is built.
+fn by_rank(a: (&Score, &str), b: (&Score, &str)) -> Ordering {
+    a.0.cmp(b.0).then_with(|| a.1.chars().flat_map(char::to_lowercase).cmp(b.1.chars().flat_map(char::to_lowercase)))
+}
+
+/// One provider's best `cap` candidates as (score, title, what builds the row), in `TopK`'s order and with its ties
+/// (after their equals; at capacity only a better one enters). A row is built only for the candidates kept here, so a
+/// bigger catalogue never builds more rows (LC-3); `best` is allocated once with room for `cap`.
+fn keep_best<'a, T>(best: &mut Vec<(Score, &'a str, T)>, cap: usize, score: Score, title: &'a str, what: T) {
+    if best.len() >= cap {
+        match best.last() {
+            Some(worst) if by_rank((&score, title), (&worst.0, worst.1)) == Ordering::Less => {
+                best.pop();
+            }
+            _ => return,
+        }
+    }
+    let at = best.partition_point(|x| by_rank((&x.0, x.1), (&score, title)) != Ordering::Greater);
+    best.insert(at, (score, title, what));
 }
 
 impl TopK {
@@ -397,7 +416,8 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         _ => (&q.folded, u8::MAX),
     };
     let mut hits = 0;
-    for app in cx.apps {
+    let mut best = Vec::with_capacity(top.cap);
+    for (i, app) in cx.apps.iter().enumerate() {
         let c = app.cand();
         let Some(tier) = tier_of(&c, text, fuzzy).filter(|t| *t <= max_tier) else { continue };
         hits += 1;
@@ -405,16 +425,22 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         if !top.accepts(&c.score(tier, true, KIND_APP)) {
             continue;
         }
-        let win = cx.windows.iter().find(|w| same_program(app, w));
+        let win = cx.windows.iter().position(|w| same_program(app, w));
         let score = c.score(tier, win.is_some(), KIND_APP);
         if top.accepts(&score) {
-            top.push(app_item(app, win, score));
+            keep_best(&mut best, top.cap, score, &app.name, (i, win));
+        }
+    }
+    for (score, _, (i, win)) in best {
+        if let Some(app) = cx.apps.get(i) {
+            top.push(app_item(app, win.and_then(|w| cx.windows.get(w)), score));
         }
     }
     if !cx.opts.mask.has(ProviderId::Windows) {
         return hits;
     }
     let no_keys = Keys::default();
+    let mut best = Vec::with_capacity(top.cap);
     for (i, w) in cx.windows.iter().enumerate().take(MAX_WINDOW_ROWS) {
         let seen = cx.windows.get(..i).is_some_and(|before| before.iter().any(|o| o.group_key == w.group_key));
         if seen {
@@ -428,6 +454,9 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         if !top.accepts(&score) || cx.apps.iter().any(|a| same_program(a, w)) {
             continue;
         }
+        keep_best(&mut best, top.cap, score, &w.name, w);
+    }
+    for (score, _, w) in best {
         top.push(Item {
             key: ItemKey::of(ProviderId::Windows, &w.group_key),
             from: ProviderId::Windows,
@@ -586,25 +615,29 @@ fn registry(q: &Query, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -> usize {
 /// The settings catalogue, already folded and split at load: nothing is folded per candidate.
 fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK) -> usize {
     let mut hits = 0;
+    let mut best = Vec::with_capacity(top.cap);
     for row in cx.settings {
         let c = row.cand();
         let Some(tier) = tier_of(&c, &q.folded, fuzzy) else { continue };
         hits += 1;
         let score = c.score(tier, false, KIND_SETTING);
         if top.accepts(&score) {
-            top.push(Item {
-                key: ItemKey::of(ProviderId::Settings, &row.name),
-                from: ProviderId::Settings,
-                kind: Kind::Setting,
-                title: row.name.clone(),
-                detail: None,
-                icon: IconRef::Glyph(GlyphId::Gear),
-                score,
-                verbs: verbs(Kind::Setting, false, None),
-                payload: Payload::Setting(row.index),
-                destructive: false,
-            });
+            keep_best(&mut best, top.cap, score, &row.name, row);
         }
+    }
+    for (score, _, row) in best {
+        top.push(Item {
+            key: ItemKey::of(ProviderId::Settings, &row.name),
+            from: ProviderId::Settings,
+            kind: Kind::Setting,
+            title: row.name.clone(),
+            detail: None,
+            icon: IconRef::Glyph(GlyphId::Gear),
+            score,
+            verbs: verbs(Kind::Setting, false, None),
+            payload: Payload::Setting(row.index),
+            destructive: false,
+        });
     }
     hits
 }
@@ -1415,5 +1448,261 @@ pub(crate) mod tests {
         }
         let titles: Vec<String> = top.into_sorted().iter().map(|i| i.title.to_string()).collect();
         assert_eq!(titles, ["running", "app", "short", "alpha", "Beta", "window"]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod bench {
+    //! LC-3: what one keystroke costs over a big catalogue. Two counts that run with every test run (allocations and
+    //! tier checks per query: they count, they never time) and, in the CI bench job only (release, `--ignored`), the
+    //! time of the same queries against a reference workload of the same process.
+    use super::*;
+    use crate::launcher::rank::TIER_CHECKS;
+    use crate::launcher::testkit::{allocations_during, XorShift};
+    use std::time::Instant;
+
+    /// The names of the fixture: 150 English and 150 Italian words (accents included, for the folding).
+    const WORDS: &str =
+        "app audio backup battery bluetooth browser calculator calendar camera capture chat clock cloud code \
+        color command connect contacts control copy data date defender desktop device display disk document \
+        download drive editor email explorer family feedback file finder firewall folder font game graphics \
+        group health help history home image input insider install keyboard language launcher library light \
+        link local lock mail manager maps media memory message microsoft mixer mobile monitor mouse movie \
+        music network news note notepad office online options paint panel password pen phone photo picture \
+        player policy power preview print privacy profile project quick radio record recovery region remote \
+        reader report screen search security server service settings setup share shell show snip sound \
+        speech spell start steam sticky storage store studio sync system task terminal text theme time timer \
+        tips tool touch tracker update usb user video view viewer virtual voice volume wallet weather web \
+        widget window wireless word accesso account aggiornamento aiuto alimentazione amministratore \
+        anteprima appunti archivio attività avvio barra batteria blocco calcolatrice calendario cartella \
+        cattura chiave colore comandi condivisione configurazione connessione console contatti controllo \
+        copia cronologia dati dispositivo disco documenti energia esplora filmati finestra foto gestione \
+        giochi grafica gruppo immagini impostazioni informazioni ingresso installazione lettore lingua lista \
+        mappe memoria messaggi microfono musica notifiche nuovo opzioni ora orologio pannello percorso posta \
+        processi profilo programma progetto protezione rapido registro rete ricerca risorse schermo \
+        scrivania servizi sicurezza sistema sincronizzazione sfondo stampa stampante strumenti suono \
+        supporto tastiera tema terminale testo unità utente visualizzatore voce zona accessibilità aspetto \
+        avanzate area bloccare caratteri cestino chiamate cuffie data disattiva elenco esegui fotocamera \
+        famiglia guida indirizzo lavoro luminosità modalità mostra nascondi notte orario pagina personalizza \
+        posizione predefinite preferiti puntatore riproduzione salva scarica schede segnale sensore sorgente \
+        spazio stato sveglia tempo trasferimento ultimo vista volume wireless attivazione bilanciamento \
+        collegamento cancella diagnostica estensioni lavagna navigazione privata ripristino";
+
+    fn words() -> Vec<&'static str> {
+        let w: Vec<&str> = WORDS.split_whitespace().collect();
+        assert_eq!(w.len(), 300);
+        w
+    }
+
+    const NUM: NumberStyle = NumberStyle { decimal: ',', group: '.' };
+    /// Queries per run, and the bound of 5.5.7 for one query on the runner (the providers' share of a keystroke).
+    const QUERIES: usize = 1_000;
+    /// What one query may allocate whatever the size of the catalogue: the TopK, one list of the best per big provider
+    /// (apps, their unmatched windows, settings), the rows of at most `cap` (24) candidates each (three strings for an
+    /// app or a window row, one for a setting), the commands and the fixed rows (answer, run, web). 118 measured at
+    /// 2,000 apps and 126 at 4,000; 64 (LC-3's figure) is below what 24 app rows alone need (72).
+    const MAX_ALLOCATIONS: u64 = 160;
+    const PER_QUERY_BUDGET_US: f64 = 4_000.0;
+
+    /// The catalogue of one test: apps, settings, windows and run history, with the default options.
+    struct Big {
+        apps: Vec<CatApp>,
+        settings: Vec<SettingRow>,
+        windows: Vec<WindowRow>,
+        history: Vec<Box<str>>,
+        opts: LauncherOpts,
+    }
+
+    impl Big {
+        /// `scale` 1: 2,000 apps, 1,500 settings, 60 windows, 50 history lines; 2 doubles each. Every kind has its own
+        /// generator (seed 0xB0B and the kind), so the first half of scale 2 is scale 1.
+        fn new(scale: usize) -> Big {
+            let words = words();
+            let name = |r: &mut XorShift| {
+                let n = 1 + (r.next_u64() % 3) as usize;
+                let words: Vec<&str> = (0..n).map(|_| *r.pick(&words)).collect();
+                let mut s = words.join(" ");
+                if let Some(c) = s.get_mut(..1) {
+                    c.make_ascii_uppercase();
+                }
+                s
+            };
+            let mut r = XorShift::new(0xB0B);
+            let apps = (0..2_000 * scale)
+                .map(|i| {
+                    let n = name(&mut r);
+                    CatApp::new(&format!("Vendor.App{i}!App"), &n, Keys::default(), (r.next_u64() % 1_000) as u32)
+                })
+                .collect();
+            let mut r = XorShift::new(0xB0B + 1);
+            let settings = (0..1_500 * scale)
+                .map(|i| {
+                    let n = name(&mut r);
+                    let keys = [(*r.pick(&words), 0), (*r.pick(&words), 1)];
+                    SettingRow::new(i as u32, &n, Keys::from(&keys[..]), (r.next_u64() % 1_000) as u32)
+                })
+                .collect();
+            let mut r = XorShift::new(0xB0B + 2);
+            let windows = (0..60 * scale)
+                .map(|i| {
+                    let n = name(&mut r);
+                    let mut folded = String::new();
+                    rank::fold(&n, &mut folded);
+                    WindowRow {
+                        hwnd: 0x1000 + i as isize,
+                        group_key: format!("c:\\program files\\tool{i}\\tool{i}.exe").into(),
+                        aumid: None,
+                        name: n.into(),
+                        name_folded: folded.into(),
+                        title: None,
+                        hung: false,
+                    }
+                })
+                .collect();
+            let mut r = XorShift::new(0xB0B + 3);
+            let history = (0..50 * scale).map(|_| format!("ping {}", r.pick(&words)).into()).collect();
+            Big { apps, settings, windows, history, opts: LauncherOpts::default() }
+        }
+
+        fn cx(&self) -> Context<'_> {
+            Context {
+                apps: &self.apps,
+                settings: &self.settings,
+                windows: &self.windows,
+                history: &self.history,
+                opts: &self.opts,
+                num: NUM,
+                now_unix: 1_790_000_000,
+                window_target: true,
+            }
+        }
+
+        /// The candidates one query ranks by tiers: every app, setting and window, and the commands.
+        fn candidates(&self) -> u64 {
+            (self.apps.len() + self.settings.len() + self.windows.len() + COMMANDS.len()) as u64
+        }
+    }
+
+    /// `QUERIES` queries of 1 to 12 characters: most a cut of one or two words, some random letters (the misses that
+    /// reach tier 6).
+    fn queries() -> Vec<String> {
+        let words = words();
+        let mut r = XorShift::new(0xB0B + 4);
+        (0..QUERIES)
+            .map(|_| {
+                let len = 1 + (r.next_u64() % 12) as usize;
+                let text: String = if r.next_u64() % 10 < 7 {
+                    let two = format!("{} {}", r.pick(&words), r.pick(&words));
+                    two.chars().take(len).collect()
+                } else {
+                    (0..len).map(|_| char::from(b'a' + (r.next_u64() % 26) as u8)).collect()
+                };
+                if text.trim().is_empty() {
+                    "a".into()
+                } else {
+                    text
+                }
+            })
+            .collect()
+    }
+
+    /// The most allocations one query of `qs` made inside `query_all`.
+    fn worst_allocations(big: &Big, qs: &[String]) -> u64 {
+        let cx = big.cx();
+        let mut worst = 0;
+        for raw in qs {
+            let q = query::parse_query(raw, &big.opts.prefixes, NUM, 1);
+            let (_, n) = allocations_during(|| query_all(&q, &cx, &mut Budget::default()));
+            worst = worst.max(n);
+        }
+        worst
+    }
+
+    #[test]
+    fn no_allocation_per_candidate() {
+        let qs = queries();
+        let one = worst_allocations(&Big::new(1), &qs);
+        let two = worst_allocations(&Big::new(2), &qs);
+        assert!(one <= MAX_ALLOCATIONS, "a query made {one} allocations: rows built for candidates that cannot stay");
+        assert!(two <= MAX_ALLOCATIONS, "twice the candidates took a query to {two} allocations (from {one})");
+    }
+
+    #[test]
+    fn comparisons_are_linear() {
+        let big = Big::new(1);
+        let cx = big.cx();
+        let candidates = big.candidates();
+        for raw in &queries() {
+            let q = query::parse_query(raw, &big.opts.prefixes, NUM, 1);
+            let before = TIER_CHECKS.with(std::cell::Cell::get);
+            let _ = query_all(&q, &cx, &mut Budget::default());
+            let checks = TIER_CHECKS.with(std::cell::Cell::get) - before;
+            assert!(checks <= 6 * candidates, "{raw:?}: {checks} tier checks for {candidates} candidates");
+        }
+    }
+
+    /// The shortest of five runs of `f`, in ns.
+    fn min_of_five(mut f: impl FnMut()) -> u128 {
+        (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                f();
+                t.elapsed().as_nanos()
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[ignore = "release bench (CI job bench): cargo test --release launcher::providers::bench -- --ignored --nocapture"]
+    fn ratio_to_reference() {
+        let big = Big::new(1);
+        let cx = big.cx();
+        let qs = queries();
+        let launcher_ns = min_of_five(|| {
+            for raw in &qs {
+                let q = query::parse_query(raw, &big.opts.prefixes, NUM, 1);
+                std::hint::black_box(query_all(&q, &cx, &mut Budget::default()));
+            }
+        });
+        // The reference: folding and sorting the same 4,000 names, 10 times.
+        let names: Vec<&str> = big
+            .apps
+            .iter()
+            .map(|a| &*a.name)
+            .chain(big.settings.iter().map(|s| &*s.name))
+            .chain(big.windows.iter().map(|w| &*w.name))
+            .cycle()
+            .take(4_000)
+            .collect();
+        let reference_ns = min_of_five(|| {
+            for _ in 0..10 {
+                let mut folded: Vec<String> = names
+                    .iter()
+                    .map(|n| {
+                        let mut f = String::new();
+                        rank::fold(n, &mut f);
+                        f
+                    })
+                    .collect();
+                folded.sort();
+                std::hint::black_box(folded);
+            }
+        });
+        let ratio = launcher_ns as f64 / reference_ns.max(1) as f64;
+        let per_query_us = launcher_ns as f64 / QUERIES as f64 / 1_000.0;
+        println!("bench: launcher {launcher_ns} ns, reference {reference_ns} ns, ratio {ratio:.3}, per query {per_query_us:.1} us");
+        if per_query_us > PER_QUERY_BUDGET_US {
+            println!("bench: over the {PER_QUERY_BUDGET_US} us of one query (5.5.7): stop and report, no calibration");
+        }
+        // The gate: budgets.json's row, once the owner approved its calibration (pending: printed, not gated).
+        let budgets: serde_json::Value =
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/budgets.json"))).unwrap();
+        let row = budgets["rows"].as_array().unwrap().iter().find(|r| r["id"] == "bench.launcher_query_ratio").unwrap();
+        if row["status"] == "active" {
+            let value = row["value"].as_f64().unwrap();
+            assert!(ratio * 100.0 <= value, "ratio x 100 = {:.1}, over the calibrated {value}", ratio * 100.0);
+        }
     }
 }

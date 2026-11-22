@@ -143,6 +143,22 @@ pub fn match_tiers(c: &Cand, q: &str) -> Option<u8> {
     if q.is_empty() {
         return None;
     }
+    let tier = tiers(c, q);
+    // The tiers tried: up to the one that matched, all six when none did (the bench's linear bound, LC-3).
+    #[cfg(test)]
+    TIER_CHECKS.with(|n| n.set(n.get() + tier.map_or(6, |t| u64::from(t) + 1)));
+    tier
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tier checks `match_tiers` made on this thread. Per thread, like the allocation counter of the test kit, so
+    /// the tests running beside a measurement never add to it.
+    pub(crate) static TIER_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `match_tiers` for a trimmed query that is not empty.
+fn tiers(c: &Cand, q: &str) -> Option<u8> {
     let chars = q.chars().count();
     if c.folded == q {
         return Some(0);

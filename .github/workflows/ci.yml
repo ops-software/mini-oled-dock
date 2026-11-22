@@ -181,10 +181,20 @@ jobs:
           rustc -vV
 
       - name: Launcher bench
+        shell: pwsh
         env:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-bench
-        run: cargo test --release --locked launcher::providers::bench -- --ignored --nocapture
+        run: |
+          $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
+          $out = cargo test --release --locked --bin dock launcher::providers::bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          # A filter that matches no test passes silently: the job fails unless the bench ran and printed its line.
+          if ($out -match 'running 0 tests') { throw 'launcher bench: no test ran' }
+          if (-not ($out -match 'bench: launcher \d+ ns')) { throw 'launcher bench: no bench line printed' }
 
   regen-golden:
     runs-on: windows-latest
