@@ -1806,13 +1806,13 @@ fn on_anim(hwnd: HWND) {
 /// The popup window (0 = none), readable while the state is borrowed.
 static POPUP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-/// The launcher's one-shot timers (msg.rs 34-39), armed on the dock window (`launcher_sys::timer_window`), which hands
-/// them over through `on_launcher_timer`. None is armed on a popup window: the shared one can be destroyed.
-const LAUNCHER_TIMERS: [usize; 6] = [
+/// The launcher's one-shot timers (msg.rs 34-39 without 37, unused since L3 T19), armed on the dock window
+/// (`launcher_sys::timer_window`), which hands them over through `on_launcher_timer`. None is armed on a popup window:
+/// the shared one can be destroyed.
+const LAUNCHER_TIMERS: [usize; 5] = [
     crate::msg::TIMER_LAUNCHER_SHRINK,
     crate::msg::TIMER_LAUNCHER_WARM,
     crate::msg::TIMER_LAUNCHER_SAVE,
-    crate::msg::TIMER_LAUNCHER_RELEASE,
     crate::msg::TIMER_LAUNCHER_FILES_END,
     crate::msg::TIMER_LAUNCHER_PT,
 ];
@@ -2127,8 +2127,7 @@ pub(crate) fn tick_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::msg::{
-        TIMER_LAUNCHER_FILES_END, TIMER_LAUNCHER_PT, TIMER_LAUNCHER_RELEASE, TIMER_LAUNCHER_SAVE,
-        TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM,
+        TIMER_LAUNCHER_FILES_END, TIMER_LAUNCHER_PT, TIMER_LAUNCHER_SAVE, TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM,
     };
     use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
 
@@ -2307,14 +2306,14 @@ mod tests {
                 TIMER_LAUNCHER_SHRINK,
                 TIMER_LAUNCHER_WARM,
                 TIMER_LAUNCHER_SAVE,
-                TIMER_LAUNCHER_RELEASE,
                 TIMER_LAUNCHER_FILES_END,
                 TIMER_LAUNCHER_PT
             ]
         );
-        for id in 34..=39 {
+        for id in [34, 35, 36, 38, 39] {
             assert_eq!(timer_owner(id), TimerOwner::Launcher, "timer {id}");
         }
+        assert_eq!(timer_owner(37), TimerOwner::Host, "37 is unused since L3 T19 (the 10-minute release)");
         for id in
             [TIMER_POPUP_ANIM, TIMER_POPUP_TICK, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_COM_FREE]
         {

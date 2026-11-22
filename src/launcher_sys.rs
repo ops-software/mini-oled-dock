@@ -21,7 +21,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, MapViewOfFile, UnmapViewOfFile,
+    FILE_MAP_READ, GMEM_MOVEABLE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY,
+};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::RemoteDesktop::{
@@ -47,6 +50,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::hook::{self, KeyRec, PassFlags, RING_CAP};
+#[cfg(test)]
+use crate::launcher::arena::Arena;
+use crate::launcher::arena::{self, ArenaError, Caps, CatalogView, Kind as ArenaKind, Layout};
 use crate::launcher::model::{CommandId, Mods, NumberStyle, WindowRow};
 use crate::launcher::powertoys;
 use crate::launcher::rank;
@@ -469,6 +475,14 @@ impl SysPort for RealSys {
         popup::popup_launcher::prepare_open();
     }
 
+    fn settings_bytes(&mut self) -> Result<SettingsArena, SettingsMiss> {
+        settings_now()
+    }
+
+    fn ensure_settings(&mut self, rebuild: bool) {
+        crate::start_search::ensure_settings_cache(rebuild);
+    }
+
     fn fill_titles(&mut self, rows: &mut [WindowRow]) {
         fill_titles(rows);
     }
@@ -781,13 +795,128 @@ impl SettingsMiss {
     }
 }
 
-/// The settings cache file (`<root>\cache\settings-catalog.bin`, version 2) read through the checked opener (one link, no
-/// reparse point, at most 4 MiB) and checked whole (`arena::check` under the key the settings thread computed: header,
-/// key line, every section and reference, the checksum) before anything of it is used. The bytes are untrusted.
-pub(crate) fn read_settings() -> Result<crate::launcher::arena::Arena, SettingsMiss> {
-    use crate::launcher::arena::{Arena, Caps, Kind};
+/// A file mapped read-only (L3 T19): the settings cache while the launcher is open, 0 private bytes (its pages are the
+/// file's). Opened with read sharing only (`datadir::open_checked_read_only`), so while it is mapped nobody can write,
+/// truncate, rename or delete the file and a read of the view can never fault; refused when it is a reparse point, has
+/// more than one link, is empty or is larger than the cap. Dropped: the view unmapped, the mapping and the file closed.
+pub(crate) struct MappedFile {
+    _file: std::fs::File,
+    map: HANDLE,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+}
+
+/// Why a file was not mapped.
+#[derive(Debug)]
+pub(crate) enum MapError {
+    /// No such file.
+    Missing,
+    /// Not a file to read (a reparse point, a folder, another link, its size, its access): never read.
+    Refused(String),
+    /// The mapping itself failed: the file may be read instead.
+    Map(String),
+}
+
+impl MappedFile {
+    pub(crate) fn open(path: &std::path::Path, cap: u64) -> Result<MappedFile, MapError> {
+        use std::os::windows::io::AsRawHandle;
+        let file = crate::datadir::open_checked_read_only(path, true).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => MapError::Missing,
+            std::io::ErrorKind::PermissionDenied => MapError::Refused(e.to_string()),
+            _ => MapError::Map(e.to_string()),
+        })?;
+        let size = file.metadata().map_err(|e| MapError::Map(e.to_string()))?.len();
+        if size == 0 || size > cap {
+            return Err(MapError::Refused(format!("{size} bytes")));
+        }
+        let len = usize::try_from(size).map_err(|e| MapError::Refused(e.to_string()))?;
+        // SAFETY: the handle of `file`, open for reading for the whole call; no security attributes, no name; the
+        // mapping covers the file as it is (its size cannot change: nobody else may write it).
+        let map =
+            unsafe { CreateFileMappingW(HANDLE(file.as_raw_handle()), None, PAGE_READONLY, 0, 0, PCWSTR::null()) }
+                .map_err(|e| MapError::Map(e.to_string()))?;
+        // SAFETY: the mapping handle made above; the whole file, read-only.
+        let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) };
+        if view.Value.is_null() {
+            let e = windows::core::Error::from_thread();
+            // SAFETY: the mapping handle made above, closed once.
+            let _ = unsafe { CloseHandle(map) };
+            return Err(MapError::Map(e.to_string()));
+        }
+        Ok(MappedFile { _file: file, map, view, len })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: `view` maps the whole file, `len` bytes, read-only, until `drop`; the file cannot change while
+        // `_file` is open (read sharing only) and the slice lives no longer than `&self`.
+        unsafe { std::slice::from_raw_parts(self.view.Value.cast::<u8>().cast_const(), self.len) }
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        // SAFETY: the view and the mapping handle made in `open`, each released once; the file closes after, with
+        // `_file`.
+        unsafe {
+            let _ = UnmapViewOfFile(self.view);
+            let _ = CloseHandle(self.map);
+        }
+    }
+}
+
+/// The bytes of a settings arena held by the launcher.
+enum SettingsBytes {
+    Mapped(MappedFile),
+    /// Read into one block, when the mapping failed.
+    Read(Box<[u8]>),
+}
+
+impl SettingsBytes {
+    fn get(&self) -> &[u8] {
+        match self {
+            SettingsBytes::Mapped(m) => m.bytes(),
+            SettingsBytes::Read(b) => b,
+        }
+    }
+}
+
+/// The launcher's settings while it is open (L3 T19): the cache file's bytes, mapped (0 private bytes) or read, with
+/// the layout `arena::check` made of them. Never replaced during an open; dropped at the close.
+pub(crate) struct SettingsArena {
+    bytes: SettingsBytes,
+    layout: Layout,
+}
+
+impl SettingsArena {
+    fn checked(bytes: SettingsBytes, key: Option<&str>) -> Result<SettingsArena, ArenaError> {
+        let layout = arena::check(bytes.get(), ArenaKind::Settings, key, Caps::SETTINGS)?;
+        Ok(SettingsArena { bytes, layout })
+    }
+
+    pub(crate) fn view(&self) -> CatalogView<'_> {
+        CatalogView::new(self.bytes.get(), &self.layout)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.layout.entries()
+    }
+
+    /// The bytes are the file's pages, not the heap's.
+    #[cfg(test)]
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self.bytes, SettingsBytes::Mapped(_))
+    }
+
+    /// The bytes of a test arena, checked again (the fake ports' settings).
+    #[cfg(test)]
+    pub(crate) fn of(a: &Arena) -> Option<SettingsArena> {
+        SettingsArena::checked(SettingsBytes::Read(a.raw().into()), None).ok()
+    }
+}
+
+/// The launcher's settings now (`SysPort::settings_bytes`): the cache file under the key the settings thread computed.
+pub(crate) fn settings_now() -> Result<SettingsArena, SettingsMiss> {
     static NO_KEY: AtomicBool = AtomicBool::new(false);
-    static REFUSED: AtomicBool = AtomicBool::new(false);
     let Some((key, path)) =
         crate::start_search::expected_settings_key().zip(crate::start_search::settings_cache_path())
     else {
@@ -796,26 +925,43 @@ pub(crate) fn read_settings() -> Result<crate::launcher::arena::Arena, SettingsM
         }
         return Err(SettingsMiss::NoKey);
     };
-    let bytes = match crate::datadir::read_file(&path, crate::start_search::CACHE_MAX, true) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SettingsMiss::NoFile),
-        Err(e) => {
-            if !REFUSED.swap(true, Relaxed) {
-                log!("launcher: the settings cache cannot be read: {e}");
-            }
-            return Err(SettingsMiss::Refused);
-        }
-    };
-    Arena::new(bytes, Kind::Settings, Some(&key), Caps::SETTINGS).map_err(|e| {
+    // Unelevated the cache cannot be written: a file of an elevated run is still used, but nothing is asked of the thread.
+    map_settings(&path, &key).map_err(|m| if crate::datadir::writable() { m } else { SettingsMiss::NoKey })
+}
+
+/// The settings cache (`<root>\cache\settings-catalog.bin`, version 2) mapped (`MappedFile`: read sharing only, one link,
+/// no reparse point, at most 4 MiB) and checked whole before anything of it is used (`arena::check` under `key`: header, key
+/// line, every section and reference, the checksum): the bytes are untrusted. When the mapping itself fails the file is
+/// read into one block instead (logged once per process; that open may pass MEM-3).
+pub(crate) fn map_settings(path: &std::path::Path, key: &str) -> Result<SettingsArena, SettingsMiss> {
+    static READ: AtomicBool = AtomicBool::new(false);
+    static REFUSED: AtomicBool = AtomicBool::new(false);
+    let refused = |e: &dyn std::fmt::Display| {
         if !REFUSED.swap(true, Relaxed) {
             log!("launcher: the settings cache was refused: {e}");
         }
         SettingsMiss::Refused
-    })
+    };
+    let bytes = match MappedFile::open(path, crate::start_search::CACHE_MAX) {
+        Ok(m) => SettingsBytes::Mapped(m),
+        Err(MapError::Missing) => return Err(SettingsMiss::NoFile),
+        Err(MapError::Refused(e)) => return Err(refused(&e)),
+        Err(MapError::Map(e)) => {
+            if !READ.swap(true, Relaxed) {
+                log!("launcher: the settings cache cannot be mapped ({e}): read instead");
+            }
+            match crate::datadir::read_file(path, crate::start_search::CACHE_MAX, true) {
+                Ok(b) => SettingsBytes::Read(b.into_boxed_slice()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SettingsMiss::NoFile),
+                Err(e) => return Err(refused(&e)),
+            }
+        }
+    };
+    SettingsArena::checked(bytes, Some(key)).map_err(|e| refused(&e))
 }
 
 /// The shell request of one launch. `setting` gives the target and arguments of a held setting
-/// (`LaunchReq::Setting` carries only its index; the controller holds the list). `None`: no such setting,
+/// (`LaunchReq::Setting` carries only its entry index; the controller holds the settings arena). `None`: no such setting,
 /// or no Windows folder for the registry row; nothing is launched.
 pub(crate) fn to_request(
     r: LaunchReq,
@@ -946,5 +1092,56 @@ mod tests {
         assert!(!out.iter().any(shared), "{out:?}");
         // A setting the controller does not hold launches nothing.
         assert!(to_request(LaunchReq::Setting { index: 7 }, &setting).is_none());
+    }
+
+    /// L3 T19: a file is mapped whole and read-only; while it is mapped nobody can write, replace or delete it (a reader
+    /// still can); one with another hard link, an empty one, one over the cap and a folder are refused, a missing one is
+    /// missing; the settings cache is used only under its own key.
+    #[test]
+    fn mapped_file_reads_and_refuses_links() {
+        let dir = std::env::temp_dir().join(format!("dock_map_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.bin");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let m = MappedFile::open(&path, 1 << 20).unwrap();
+        assert!(m.bytes() == bytes.as_slice());
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err(), "no writer while mapped");
+        let tmp = dir.join("a.tmp");
+        std::fs::write(&tmp, b"x").unwrap();
+        assert!(std::fs::rename(&tmp, &path).is_err(), "no replacement while mapped");
+        assert!(std::fs::remove_file(&path).is_err(), "no deletion while mapped");
+        assert_eq!(crate::datadir::read_file(&path, 1 << 20, true).unwrap(), bytes, "a reader still reads it");
+        drop(m);
+        assert!(matches!(MappedFile::open(&path, 1_000), Err(MapError::Refused(_))), "over the cap");
+        let empty = dir.join("e.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(MappedFile::open(&empty, 1 << 20), Err(MapError::Refused(_))), "empty");
+        assert!(matches!(MappedFile::open(&dir.join("none.bin"), 1 << 20), Err(MapError::Missing)));
+        assert!(matches!(MappedFile::open(&dir, 1 << 20), Err(MapError::Refused(_) | MapError::Map(_))), "a folder");
+        let link = dir.join("b.bin");
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(matches!(MappedFile::open(&path, 1 << 20), Err(MapError::Refused(_))), "two links");
+        assert!(matches!(MappedFile::open(&link, 1 << 20), Err(MapError::Refused(_))));
+        // The settings cache: mapped and checked under its key; another key, a missing file and a damaged one are not used.
+        let cache = dir.join("settings-catalog.bin");
+        let arena = crate::launcher::arena::test_settings(&[("Schermo", &[], 1), ("Mouse", &[], 2)]);
+        std::fs::write(&cache, arena.raw()).unwrap();
+        let held = map_settings(&cache, "test").unwrap();
+        assert!(held.is_mapped() && held.len() == 2 && held.view().name(1) == "Mouse");
+        assert!(matches!(map_settings(&cache, "other|fmt 1"), Err(SettingsMiss::Refused)));
+        drop(held);
+        let mut damaged = arena.raw().to_vec();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 0x20;
+        std::fs::write(&cache, &damaged).unwrap();
+        assert!(matches!(map_settings(&cache, "test"), Err(SettingsMiss::Refused)));
+        assert!(matches!(map_settings(&dir.join("gone.bin"), "test"), Err(SettingsMiss::NoFile)));
+        assert_eq!(
+            [SettingsMiss::NoKey, SettingsMiss::NoFile, SettingsMiss::Refused].map(SettingsMiss::rebuild),
+            [None, Some(false), Some(true)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

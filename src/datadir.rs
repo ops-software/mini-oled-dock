@@ -68,9 +68,9 @@ use windows::Win32::Storage::FileSystem::{
     SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, VOLUME_NAME_DOS,
-    WRITE_DAC,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GETFINALPATHNAMEBYHANDLE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL,
+    SYNCHRONIZE, VOLUME_NAME_DOS, WRITE_DAC,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
@@ -521,11 +521,18 @@ pub enum FileAcl {
 /// Opens `path` for reading WITHOUT following reparse points and checks it is a regular file
 /// (single hard link if `single_link`). Errors keep `NotFound` for a missing file.
 pub(crate) fn open_checked(path: &Path, single_link: bool) -> io::Result<File> {
-    let f = OpenOptions::new()
-        .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)?;
+    open_checked_shared(path, single_link, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+}
+
+/// `open_checked` with read sharing only: while the handle is open nobody can open the file for writing, truncate,
+/// rename or delete it (a file mapped from it can never change under its reader, L3 T19).
+pub(crate) fn open_checked_read_only(path: &Path, single_link: bool) -> io::Result<File> {
+    open_checked_shared(path, single_link, FILE_SHARE_READ)
+}
+
+fn open_checked_shared(path: &Path, single_link: bool, share: FILE_SHARE_MODE) -> io::Result<File> {
+    let f =
+        OpenOptions::new().read(true).share_mode(share.0).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0).open(path)?;
     let info = file_info(&f)?;
     check_regular(info.dwFileAttributes, info.nNumberOfLinks, single_link)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;

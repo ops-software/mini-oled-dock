@@ -178,7 +178,7 @@ pub const TIMER_POPUP_START_RELEASE: usize = 33;
 /// 34 is the launcher's, 40 to 42 belong to the dock window, so 43.
 pub const TIMER_POPUP_COM_FREE: usize = 43;
 // The launcher's one-shots, on the DOCK window (a popup window can be destroyed, and its timers with it):
-// `ui::on_timer` forwards 34-39 to `popup_launcher::on_timer`, which kills each before acting; `popup::shutdown` kills
+// `ui::on_timer` forwards 34-36, 38 and 39 to `popup_launcher::on_timer`, which kills each before acting; `popup::shutdown` kills
 // them all. None is armed while the chord is off.
 /// 120 ms one-shot while the launcher is open: the panel shrinks once no key came for that long.
 pub const TIMER_LAUNCHER_SHRINK: usize = 34;
@@ -186,8 +186,8 @@ pub const TIMER_LAUNCHER_SHRINK: usize = 34;
 pub const TIMER_LAUNCHER_WARM: usize = 35;
 /// 2 s one-shot after a launcher close: its state files are saved.
 pub const TIMER_LAUNCHER_SAVE: usize = 36;
-/// 10 min one-shot after a launcher close: its settings rows are released.
-pub const TIMER_LAUNCHER_RELEASE: usize = 37;
+// 37: unused. It was the launcher's 10-minute release of its settings rows; since L3 T19 the settings are mapped at each
+// open and dropped at its close.
 /// 60 s one-shot after a launcher close: the files worker ends (L2).
 pub const TIMER_LAUNCHER_FILES_END: usize = 38;
 /// 60 s one-shot after the chord becomes Alt+Space (the dock's start): PowerToys detection again; `ANSWER_MS`

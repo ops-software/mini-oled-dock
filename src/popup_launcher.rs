@@ -40,7 +40,7 @@ use crate::launcher::strings;
 use crate::launcher::style;
 use crate::launcher::verbs;
 use crate::launcher::web::{self, Engine, Template};
-use crate::launcher_sys::{RealHook, RealSys};
+use crate::launcher_sys::{RealHook, RealSys, SettingsArena, SettingsMiss};
 use crate::log;
 use crate::render::Metrics;
 use crate::shell_thread::{IconPlan, LaunchKind, ShellRequest};
@@ -789,9 +789,10 @@ impl Launcher {
         });
     }
 
-    /// After a close, with the popup hidden (the host's `after_close`): the icons the rows used stay in the cache, the
-    /// 10-minute release of the settings is armed, a changed run history or frecency is written 2 s later, and a
-    /// catalogue older than 10 minutes is listed again.
+    /// After a close, with the popup hidden (the host's `after_close`, after `finish` took the launches' targets): the icons
+    /// the rows used stay in the cache; the settings mapping and the window rows go (L3 T19: mapped and listed again at
+    /// every open, nothing of the open kept), and the next hidden trim is re-armed for the small blocks; a changed run
+    /// history or frecency is written 2 s later, and a catalogue older than 10 minutes is listed again.
     fn housekeeping(&mut self, sys: &mut dyn SysPort) {
         let used: Vec<String> = self
             .session
@@ -811,10 +812,12 @@ impl Launcher {
             }
             c.hidden_at_ms = now;
             c.failed_query = failed_query;
-            (c.dirty || c.frec_dirty, c.catalogue_stale(now))
+            let gone = (c.settings.take(), std::mem::take(&mut c.windows));
+            (c.dirty || c.frec_dirty, c.catalogue_stale(now), gone)
         });
-        let (save, stale) = plan.unwrap_or_default();
-        sys.arm(crate::msg::TIMER_LAUNCHER_RELEASE, RELEASE_MS);
+        let (save, stale, gone) = plan.unwrap_or_default();
+        drop(gone);
+        crate::mem::rearm();
         if save {
             sys.arm(crate::msg::TIMER_LAUNCHER_SAVE, SAVE_MS);
         }
@@ -1811,7 +1814,6 @@ pub(crate) fn on_timer(hwnd: HWND, id: usize) {
             }
         }
         crate::msg::TIMER_LAUNCHER_SAVE => save_state(),
-        crate::msg::TIMER_LAUNCHER_RELEASE => release_resident(),
         crate::msg::TIMER_LAUNCHER_PT => {
             if is_on() {
                 pt_timer(&mut RealHook, &mut RealSys);
@@ -2042,35 +2044,54 @@ pub(crate) fn on_catalog(apps: Arc<Arena>) {
 pub(crate) fn on_settings_ready() {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::SettingsReady);
-    if !is_on() || super::current() != Some(PopupKind::Launcher) {
-        return;
-    }
-    if with_ctrl(|c| c.opts.mask.has(ProviderId::Settings) && c.settings.is_none()) == Some(true) {
-        take_settings();
+    if is_on() {
+        settings_ready_on(super::current() == Some(PopupKind::Launcher), &mut RealSys);
     }
 }
 
-/// The launcher's settings (L3 T18): the version 2 cache file, checked whole against the key the settings thread computed
-/// (the names, keywords and dictionaries were folded and indexed in the `--start-settings` child: nothing is built here on
-/// the UI thread, KEY-11). A missing file, or one that fails, is not used: the settings thread is asked to make it (rebuilt
-/// when there was one) at most once per open, so a file that keeps failing cannot loop children, and the rows join when
-/// `StartSettings` comes (5.4.7).
-fn take_settings() {
-    match crate::launcher_sys::read_settings() {
+/// `on_settings_ready` with the launcher open (`open`) or not: only an open launcher that holds no settings maps.
+fn settings_ready_on(open: bool, sys: &mut dyn SysPort) {
+    if open && with_ctrl(|c| c.opts.mask.has(ProviderId::Settings) && c.settings.is_none()) == Some(true) {
+        take_settings(sys);
+    }
+}
+
+/// The settings of an open (L3 T19), before its window shows: with the Settings provider on, the cache file mapped and
+/// checked; nothing with it off. Whatever an earlier open left (none: the close drops it) goes first.
+fn settings_at_open(sys: &mut dyn SysPort) {
+    let Some((on, stale)) = with_ctrl(|c| {
+        c.rebuild_asked = false;
+        (c.opts.mask.has(ProviderId::Settings), c.settings.take())
+    }) else {
+        return;
+    };
+    drop(stale);
+    if on {
+        take_settings(sys);
+    }
+}
+
+/// The launcher's settings (L3 T18, T19): the version 2 cache file mapped read-only and checked whole against the key the
+/// settings thread computed (the names, keywords and dictionaries were folded and indexed in the `--start-settings` child:
+/// nothing is built here on the UI thread, KEY-11; 0 private bytes while held). A missing file, or one that fails, is not
+/// used: the settings thread is asked to make it (rebuilt when there was one) at most once per open, so a file that keeps
+/// failing cannot loop children, and the rows join when `StartSettings` comes (5.4.7).
+fn take_settings(sys: &mut dyn SysPort) {
+    match sys.settings_bytes() {
         Ok(a) => {
             with_ctrl(|c| c.settings = Some(a));
         }
         Err(miss) => {
             let first = with_ctrl(|c| !std::mem::replace(&mut c.rebuild_asked, true)) == Some(true);
             if let (true, Some(rebuild)) = (first, miss.rebuild()) {
-                start_search::ensure_settings_cache(rebuild);
+                sys.ensure_settings(rebuild);
             }
         }
     }
 }
 
 /// The launch target and arguments of entry `i` of the held settings.
-fn setting_target(settings: &Arena, i: u32) -> Option<(String, Option<String>)> {
+fn setting_target(settings: &SettingsArena, i: u32) -> Option<(String, Option<String>)> {
     let i = usize::try_from(i).ok().filter(|&i| i < settings.len())?;
     let (target, args) = settings.view().target(i);
     (!target.is_empty()).then(|| (target.to_string(), args.map(str::to_string)))
@@ -2184,39 +2205,14 @@ fn save_state() {
     }
 }
 
-/// `TIMER_LAUNCHER_RELEASE`: 10 minutes after the last close the settings rows, their list and the window rows are freed
-/// (the catalogue and its icons stay: they are what the 0.42 MiB resident set is).
-fn release_resident() {
-    if super::current() == Some(PopupKind::Launcher) {
-        return;
-    }
-    let _ = with_ctrl(|c| {
-        c.settings = None;
-        c.windows = Vec::new();
-        c.failed_query = None;
-    });
-    crate::mem::released_data();
-    log!("launcher: settings released");
-}
-
-/// What an open needs before its window shows (`SysPort::prepare_open`): the settings read from the cache file (with the
-/// Settings provider on), the windows listed, the history asked for the first time, the catalogue listed when it has not
-/// been.
+/// What an open needs before its window shows (`SysPort::prepare_open`): the settings mapped from the cache file (with
+/// the Settings provider on), the windows listed, the history asked for the first time, the catalogue listed when it has
+/// not been.
 pub(crate) fn prepare_open() {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::PrepareOpen);
     note_open();
-    if let Some(h) = crate::launcher_sys::timer_window() {
-        // SAFETY: a timer of the dock window (same thread); killing an id that is not armed fails harmlessly.
-        let _ = unsafe { KillTimer(Some(h), crate::msg::TIMER_LAUNCHER_RELEASE) };
-    }
-    let settings = with_ctrl(|c| {
-        c.rebuild_asked = false;
-        c.opts.mask.has(ProviderId::Settings)
-    });
-    if settings == Some(true) {
-        take_settings();
-    }
+    settings_at_open(&mut RealSys);
     let windows = crate::launcher_sys::window_rows();
     let (state, listed) = with_ctrl(|c| {
         c.windows = windows;
@@ -2307,8 +2303,14 @@ pub(crate) trait SysPort {
     fn power(&mut self, id: CommandId);
     /// Settings > Launcher.
     fn open_settings(&mut self);
-    /// What an open needs before the window shows: the settings held, the open windows listed, the history asked for.
+    /// What an open needs before the window shows: the settings mapped, the open windows listed, the history asked for.
     fn prepare_open(&mut self) {}
+    /// The settings cache file mapped and checked against the key the settings thread computed (L3 T19).
+    fn settings_bytes(&mut self) -> Result<SettingsArena, SettingsMiss> {
+        Err(SettingsMiss::NoKey)
+    }
+    /// Asks the settings thread to make sure of the cache file (`start_search::ensure_settings_cache`).
+    fn ensure_settings(&mut self, _rebuild: bool) {}
     /// Reads the titles of the windows (`InternalGetWindowText`), once per open and only in the "<" mode.
     fn fill_titles(&mut self, _rows: &mut [WindowRow]) {}
     /// One of the launcher's one-shot timers on the popup window.
@@ -2494,8 +2496,8 @@ struct Ctrl {
     num: NumberStyle,
     /// What the providers' context borrows (the catalogue, the settings, the windows and the run history).
     apps: Arc<Arena>,
-    /// The settings arena of the cache file (`take_settings`), while the Settings provider is on.
-    settings: Option<Arena>,
+    /// The settings cache file mapped at the open (`take_settings`), while the Settings provider is on; dropped at the close.
+    settings: Option<SettingsArena>,
     windows: Vec<WindowRow>,
     history: Vec<Box<str>>,
     /// What was picked (L1b-3): read by every keystroke, written 2 s after a close that changed it.
@@ -2516,7 +2518,7 @@ struct Ctrl {
     dirty: bool,
     frec_dirty: bool,
     /// The last close that launched something: when it hid, and the query as typed (kept for the reopen of a refused launch
-    /// only, at most until the next open or the release).
+    /// only: `on_launch_failed` takes it, the next open clears it).
     hidden_at_ms: u64,
     failed_query: Option<String>,
     /// This open asked the settings thread for the cache file already (at most once per open).
@@ -2539,8 +2541,6 @@ struct Ctrl {
 const CATALOGUE_STALE_MS: u64 = 600_000;
 /// A listing nobody answered is asked again after this.
 const LISTING_RETRY_MS: u64 = 60_000;
-/// The settings rows are freed this long after a close (`TIMER_LAUNCHER_RELEASE`).
-const RELEASE_MS: u32 = 600_000;
 /// A changed history is written this long after the close (`TIMER_LAUNCHER_SAVE`).
 const SAVE_MS: u32 = 2_000;
 /// The first listing, this long after the dock starts or the chord is first set (`TIMER_LAUNCHER_WARM`).
@@ -3558,6 +3558,14 @@ mod tests {
         ops: Vec<Op>,
         /// Every request to the shell thread (the icons' included).
         shells: Vec<String>,
+        /// The settings the port hands out (checked again, as the real port checks the file), or why not; the mappings
+        /// asked for and the settings thread's requests (`rebuild` each).
+        settings: Option<Arena>,
+        miss: Option<SettingsMiss>,
+        /// A real cache file and its key: mapped through the dock's own code (`launcher_sys::map_settings`).
+        file: Option<(std::path::PathBuf, String)>,
+        maps: u32,
+        ensures: Vec<bool>,
     }
 
     impl SysPort for FakeSys {
@@ -3641,6 +3649,19 @@ mod tests {
         }
         fn owner_window(&self, _h: isize) -> bool {
             self.owner_fg
+        }
+        fn settings_bytes(&mut self) -> Result<SettingsArena, SettingsMiss> {
+            self.maps += 1;
+            if let Some(m) = self.miss {
+                return Err(m);
+            }
+            if let Some((path, key)) = &self.file {
+                return crate::launcher_sys::map_settings(path, key);
+            }
+            self.settings.as_ref().and_then(SettingsArena::of).ok_or(SettingsMiss::NoFile)
+        }
+        fn ensure_settings(&mut self, rebuild: bool) {
+            self.ensures.push(rebuild);
         }
     }
 
@@ -4047,7 +4068,7 @@ mod tests {
         let mut sys = EffectSys::default();
         l.housekeeping(&mut sys);
         assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_SAVE), 0, "{:?}", sys.ops);
-        assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_RELEASE), 1, "the release is armed at every close");
+        assert!(!sys.ops.iter().any(|o| o.starts_with("Arm(37,")), "no release timer (L3 T19): {:?}", sys.ops);
         // A launched run line changes the history, and only a learning launcher records it.
         for (learn, want) in [(false, false), (true, true)] {
             with_ctrl(|c| {
@@ -4488,7 +4509,8 @@ mod tests {
                 &[],
                 1,
             )]));
-            c.settings = Some(crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]));
+            c.settings = SettingsArena::of(&crate::launcher::arena::test_settings(&[("Schermo", &[], 1)]));
+            c.windows = vec![window_row(0x1001, "Blocco note")];
             c.icons.insert("microsoft.windowscalculator_8wekyb3d8bbwe!app", IconBitmap::new(24, 24));
             c.history = vec!["ping 1.1.1.1".into()];
             c.last_query = Some("calc".into());
@@ -4522,6 +4544,190 @@ mod tests {
         let mut c = filled(true, false);
         assert!(c.chord_off().is_none());
         assert!(empty(&c));
+        // A close with the chord still set: the settings mapping and the window rows go, the catalogue and the icons stay.
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        with_ctrl(|c| *c = filled(false, true));
+        typed(&fx, "x").housekeeping(&mut FakeSys::default());
+        let kept = with_ctrl(|c| (c.settings.is_none(), c.windows.is_empty(), c.apps.len(), c.icons.len())).unwrap();
+        assert_eq!(kept, (true, true, 1, 1));
+    }
+
+    fn window_row(hwnd: isize, name: &str) -> WindowRow {
+        WindowRow {
+            hwnd,
+            group_key: format!("c:\\apps\\{hwnd:x}.exe").into(),
+            aumid: None,
+            name: name.into(),
+            name_folded: name.to_lowercase().into(),
+            title: None,
+            hung: false,
+        }
+    }
+
+    fn held_names() -> Vec<String> {
+        with_ctrl(|c| {
+            let v = c.context().settings;
+            (0..v.len()).map(|i| v.name(i).to_string()).collect()
+        })
+        .unwrap()
+    }
+
+    /// L3 T19: the settings are mapped at the open (with the Settings provider on), searched by every keystroke of it,
+    /// and dropped at its close: nothing of them stays between opens and no timer is armed for them.
+    #[test]
+    fn settings_mapped_at_open_and_dropped_at_close() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut sys = FakeSys {
+            settings: Some(crate::launcher::arena::test_settings(&[("Schermo", &[("display", 0)], 1)])),
+            ..FakeSys::default()
+        };
+        settings_at_open(&mut sys);
+        assert_eq!((sys.maps, sys.ensures.len()), (1, 0));
+        assert_eq!(held_names(), ["Schermo"]);
+        with_ctrl(|c| c.windows = vec![window_row(0x1001, "Blocco note")]);
+        let mut l = typed(&fx, "schermo");
+        l.housekeeping(&mut sys);
+        assert_eq!(with_ctrl(|c| (c.settings.is_none(), c.windows.is_empty())), Some((true, true)));
+        assert!(held_names().is_empty());
+        assert!(!sys.ops.iter().any(|o| matches!(o, Op::Arm(37, _))), "{:?}", sys.ops);
+        // The next open maps again.
+        settings_at_open(&mut sys);
+        assert_eq!((sys.maps, held_names()), (2, vec!["Schermo".to_string()]));
+    }
+
+    /// L3 T19: with the Settings provider off nothing is mapped or asked, and a held arena is not searched.
+    #[test]
+    fn no_settings_when_the_provider_is_off() {
+        with_ctrl(|c| c.opts.mask = c.opts.mask.with(ProviderId::Settings, false));
+        let mut sys = FakeSys {
+            settings: Some(crate::launcher::arena::test_settings(&[("Schermo", &[], 1)])),
+            ..FakeSys::default()
+        };
+        settings_at_open(&mut sys);
+        settings_ready_on(true, &mut sys);
+        assert_eq!((sys.maps, sys.ensures.len()), (0, 0));
+        assert_eq!(with_ctrl(|c| c.settings.is_none()), Some(true));
+        with_ctrl(|c| c.settings = SettingsArena::of(&crate::launcher::arena::test_settings(&[("Schermo", &[], 1)])));
+        assert!(held_names().is_empty(), "the provider is off: the context has no settings");
+        sys.miss = Some(SettingsMiss::NoFile);
+        settings_at_open(&mut sys);
+        assert_eq!((sys.maps, sys.ensures.len(), with_ctrl(|c| c.settings.is_none())), (0, 0, Some(true)));
+    }
+
+    /// L3 T19: a mapping is never replaced while the launcher is open (an Enter never meets an entry index of another
+    /// file); an open that holds none maps when the settings are ready; a closed launcher maps nothing; a missing or
+    /// failing file asks the settings thread once per open, and nothing without a key.
+    #[test]
+    fn a_mapping_is_never_replaced_while_open() {
+        let mut sys = FakeSys {
+            settings: Some(crate::launcher::arena::test_settings(&[("Schermo", &[], 1)])),
+            ..FakeSys::default()
+        };
+        settings_at_open(&mut sys);
+        sys.settings = Some(crate::launcher::arena::test_settings(&[("Bluetooth", &[], 1), ("Schermo", &[], 2)]));
+        settings_ready_on(true, &mut sys);
+        assert_eq!((sys.maps, held_names()), (1, vec!["Schermo".to_string()]), "held: kept as it is");
+        // No file at the open: the thread is asked to make it; the rows come with the event, only while open.
+        sys.miss = Some(SettingsMiss::NoFile);
+        settings_at_open(&mut sys);
+        assert_eq!((sys.maps, sys.ensures.clone()), (2, vec![false]));
+        assert!(held_names().is_empty());
+        sys.miss = None;
+        settings_ready_on(false, &mut sys);
+        assert_eq!(sys.maps, 2, "closed: nothing mapped");
+        settings_ready_on(true, &mut sys);
+        assert_eq!((sys.maps, held_names()), (3, vec!["Bluetooth".to_string(), "Schermo".to_string()]));
+        // A file that keeps failing: one rebuild per open, however often the event comes.
+        sys.miss = Some(SettingsMiss::Refused);
+        settings_at_open(&mut sys);
+        settings_ready_on(true, &mut sys);
+        settings_ready_on(true, &mut sys);
+        assert_eq!((sys.maps, sys.ensures.clone()), (6, vec![false, true]));
+        settings_at_open(&mut sys);
+        assert_eq!(sys.ensures, [false, true, true], "the next open asks again");
+        // No key: no file is ever written, so nothing is asked.
+        sys.miss = Some(SettingsMiss::NoKey);
+        settings_at_open(&mut sys);
+        assert_eq!(sys.ensures.len(), 3);
+    }
+
+    /// L3 T19: a settings row's launch takes its target and arguments from the arena this open searched, at the close,
+    /// before the close drops it; an index the arena does not have launches nothing.
+    #[test]
+    fn setting_launch_reads_the_held_arena() {
+        use crate::launcher::model::SettingRow;
+        use crate::launcher::providers::tests::Fx;
+        use crate::launcher::session::LaunchReq;
+        use crate::start_search::Keys;
+        let fx = Fx::new();
+        let entry = |i: u32, name: &str, target: &str, args: Option<&str>| SettingIn {
+            row: SettingRow::new(i, name, Keys::default(), i),
+            target: target.into(),
+            args: args.map(str::to_string),
+            start_keys: String::new(),
+        };
+        let ins = [
+            entry(0, "Schermo", "ms-settings:display", None),
+            entry(1, "Mouse", r"C:\Windows\System32\control.exe", Some("/name Microsoft.Mouse")),
+        ];
+        let bytes = arena::encode_settings("test|fmt 1", &ins, Caps::SETTINGS).unwrap();
+        let held = Arena::new(bytes, ArenaKind::Settings, None, Caps::SETTINGS).unwrap();
+        with_ctrl(|c| c.settings = SettingsArena::of(&held));
+        let mut l = typed(&fx, "mouse");
+        l.queued.push(Effect::Launch(LaunchReq::Setting { index: 1 }));
+        l.queued.push(Effect::Launch(LaunchReq::Setting { index: 7 }));
+        let mut hook = FakeHook::default();
+        let mut sys = EffectSys::default();
+        l.finish(&mut hook, &mut sys);
+        let launches: Vec<&String> = sys.ops.iter().filter(|o| o.contains("LauncherLaunch")).collect();
+        assert_eq!(launches.len(), 1, "{:?}", sys.ops);
+        assert!(launches[0]
+            .contains(r#"target: "C:\\Windows\\System32\\control.exe", args: Some("/name Microsoft.Mouse")"#));
+        l.housekeeping(&mut sys);
+        assert_eq!(with_ctrl(|c| c.settings.is_none()), Some(true), "dropped after the launch took its target");
+    }
+
+    /// L3 T19, MEM-3: the open maps a real cache file through the dock's own code and allocates almost nothing for it on
+    /// the heap (the bytes are the file's pages); the close unmaps it (the file can be deleted again: no handle is left).
+    #[test]
+    fn prepare_open_allocates_no_settings_data() {
+        use crate::start_search::{Keys, Setting};
+        let dir = std::env::temp_dir().join(format!("dock_map_open_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings-catalog.bin");
+        let list: Vec<Setting> = (0..1_500)
+            .map(|i| {
+                let name = format!("Impostazione numero {i}");
+                let mut keys = Keys::default();
+                keys.push(&format!("parola{i}"), 3);
+                keys.push(&format!("chiave {i}"), crate::start_search::XML_KEYWORD_PENALTY);
+                Setting {
+                    lower: name.to_lowercase(),
+                    name,
+                    keys: keys.tidy(),
+                    rank: i,
+                    target: std::borrow::Cow::Borrowed("ms-settings:"),
+                    args: Some(format!("page=p{i}")),
+                }
+            })
+            .collect();
+        let key = "test|fmt 1";
+        let bytes = catalog::encode_setting_list(key, &list).unwrap();
+        assert!(bytes.len() > 100_000, "{}", bytes.len());
+        std::fs::write(&path, &bytes).unwrap();
+        let mut sys = FakeSys { file: Some((path.clone(), key.into())), ..FakeSys::default() };
+        let ((), peak) = crate::launcher::testkit::peak_bytes_during(|| settings_at_open(&mut sys));
+        assert!(peak <= 8 * 1024, "{peak} B on the heap for the settings");
+        let held = with_ctrl(|c| c.settings.as_ref().map(|s| (s.is_mapped(), s.len()))).flatten();
+        assert_eq!(held, Some((true, 1_500)));
+        assert!(std::fs::remove_file(&path).is_err(), "mapped: nobody can delete or replace the file");
+        use crate::launcher::providers::tests::Fx;
+        typed(&Fx::new(), "x").housekeeping(&mut sys);
+        std::fs::remove_file(&path).expect("unmapped at the close");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
