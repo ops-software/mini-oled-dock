@@ -3218,19 +3218,33 @@ mod tests {
         assert_eq!(58 + 8 * 44 + 12, 422);
     }
 
+    /// The DIB of the real run-review scene at 144 DPI, with the rows below the review filled to `rows` at the measured
+    /// row height: (width, height, bytes).
+    fn review_dib(width: i32, rows: u8) -> (i32, i32, i64, usize) {
+        let s = surface(144);
+        let mut l = scene_launcher(PreviewScene::RunReview);
+        l.set_shape(width, rows);
+        let (w, h) = l.size(&s);
+        let g = l.geo.borrow().clone();
+        let lines = g.rows.iter().map(|r| r.lines.len()).max().unwrap_or(0);
+        let have = i32::try_from(g.rows.len()).unwrap();
+        let row_h = s.metrics().px(44);
+        let full = h + (i32::from(rows) - have).max(0) * row_h;
+        (w, full, i64::from(w) * i64::from(full) * 4, lines)
+    }
+
     #[test]
     fn dib_at_144_dpi_within_2_6_mib() {
-        // Eight rows with a three-line notice (+32): the tallest panel the launcher makes.
-        let s = surface(144);
-        let mut l = scene_launcher(PreviewScene::Notice);
-        l.max_rows = 8;
-        let (w, h) = l.size(&s);
-        let rows = l.geo.borrow().rows.len();
-        assert!(rows >= 2, "the notice and the web row at least");
-        assert!(i64::from(w) * i64::from(h) * 4 <= 2_726_297, "{w} x {h} is more than 2.6 MiB");
-        // The worst case by arithmetic: 8 rows, 3 review lines.
-        let worst_h = (58 + 7 * 44 + 44 + 2 * 16 + 12) * 3 / 2;
-        assert!(i64::from(w) * i64::from(worst_h) * 4 <= 2_726_297, "{w} x {worst_h}");
+        // The gate covers the default shape: 640 wide, 8 rows, the selected run line reviewed on 3 lines.
+        let (w, h, bytes, lines) = review_dib(640, 8);
+        assert_eq!(lines, 3, "the scene's review wraps to three lines");
+        assert_eq!(w, 960);
+        assert!(bytes <= 2_726_297, "{w} x {h} is more than 2.6 MiB: {bytes}");
+        // Recorded, not gated at 2.6: wider or taller shapes are bigger (SPEC 5.5.6 allows about +4.5 MiB open at 150 %).
+        let (w, h, bytes, _) = review_dib(880, 8);
+        assert!(bytes <= 3_800_000, "880 wide, 8 rows: {w} x {h} = {bytes}");
+        let (w, h, bytes, _) = review_dib(640, 12);
+        assert!(bytes <= 3_700_000, "640 wide, 12 rows: {w} x {h} = {bytes}");
     }
 
     #[test]
