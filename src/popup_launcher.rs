@@ -796,7 +796,8 @@ impl Launcher {
     /// After a close, with the popup hidden (the host's `after_close`, after `finish` took the launches' targets): the icons
     /// the rows used stay in the cache; the settings mapping and the window rows go (L3 T19: mapped and listed again at
     /// every open, nothing of the open kept), and the next hidden trim is re-armed for the small blocks; a changed run
-    /// history or frecency is written 2 s later, and a catalogue older than 10 minutes is listed again.
+    /// history or frecency is written 2 s later, the query of a close that launched something is forgotten then (its
+    /// reopen window is over), and a catalogue older than 10 minutes is listed again.
     fn housekeeping(&mut self, sys: &mut dyn SysPort) {
         // The icons child of this open's rows ends with it (L3 T20): what it has not made yet is asked for again by the
         // next open that shows those rows.
@@ -814,7 +815,8 @@ impl Launcher {
             })
             .collect();
         let now = sys.now_ms();
-        let failed_query = std::mem::take(&mut self.launched).then(|| self.session.last_query());
+        let launched = std::mem::take(&mut self.launched);
+        let failed_query = launched.then(|| self.session.last_query());
         let plan = with_ctrl(|c| {
             for id in &used {
                 c.icons.touch(id);
@@ -827,7 +829,8 @@ impl Launcher {
         let (save, stale, gone) = plan.unwrap_or_default();
         drop(gone);
         crate::mem::rearm();
-        if save {
+        // The save timer also ends the reopen window of a launch (`save_state` forgets the query as typed).
+        if save || launched {
             sys.arm(crate::msg::TIMER_LAUNCHER_SAVE, SAVE_MS);
         }
         if stale {
@@ -2184,9 +2187,12 @@ pub(crate) fn forget_history() {
     crate::shell_thread::request(ShellRequest::LauncherStateSave { frecency: None, run: None, delete: true });
 }
 
-/// `TIMER_LAUNCHER_SAVE`: a changed history is written (the shell thread writes it for the shell user).
+/// `TIMER_LAUNCHER_SAVE`: the query of the last launching close is forgotten (its reopen window is over), and a changed
+/// history is written (the shell thread writes it for the shell user).
 fn save_state() {
+    let now = RealSys.now_ms();
     let waiting = with_ctrl(|c| {
+        c.reopen_over(now);
         // The files were not read yet: a write now would replace them with the picks alone. The picks stay in memory
         // and are absorbed on load.
         c.learn && (c.dirty || c.frec_dirty) && !c.state_arrived
@@ -2526,7 +2532,7 @@ struct Ctrl {
     dirty: bool,
     frec_dirty: bool,
     /// The last close that launched something: when it hid, and the query as typed (kept for the reopen of a refused launch
-    /// only: `on_launch_failed` takes it, the next open clears it).
+    /// only: `on_launch_failed` takes it, the save timer 2 s after that close forgets it, the next open clears it).
     hidden_at_ms: u64,
     failed_query: Option<String>,
     /// This open asked the settings thread for the cache file already (at most once per open).
@@ -2549,8 +2555,10 @@ struct Ctrl {
 const CATALOGUE_STALE_MS: u64 = 600_000;
 /// A listing nobody answered is asked again after this.
 const LISTING_RETRY_MS: u64 = 60_000;
-/// A changed history is written this long after the close (`TIMER_LAUNCHER_SAVE`).
+/// A changed history is written this long after the close (`TIMER_LAUNCHER_SAVE`); the reopen window of a launch is over
+/// by then.
 const SAVE_MS: u32 = 2_000;
+const _: () = assert!(SAVE_MS as u64 > REOPEN_WITHIN_MS);
 /// The first listing, this long after the dock starts or the chord is first set (`TIMER_LAUNCHER_WARM`).
 const WARM_MS: u32 = 10_000;
 /// PowerToys is checked again this long after the chord becomes Alt+Space (`TIMER_LAUNCHER_PT`, 5.7).
@@ -2579,6 +2587,13 @@ impl Ctrl {
     /// least 1, and `chord_off` resets it).
     fn warm_due(&self) -> bool {
         self.listed_at_ms == 0
+    }
+
+    /// A refused launch can no longer reopen the launcher (`after_failure`): the query as typed is not kept past that.
+    fn reopen_over(&mut self, now: u64) {
+        if now.saturating_sub(self.hidden_at_ms) > REOPEN_WITHIN_MS {
+            self.failed_query = None;
+        }
     }
 
     /// The catalogue was listed more than 10 minutes ago and no listing is waiting for its answer.
@@ -4120,7 +4135,8 @@ mod tests {
             l.finish(&mut hook, &mut sys);
             assert_eq!(with_ctrl(|c| c.dirty).unwrap(), want, "learn {learn}");
             l.housekeeping(&mut sys);
-            assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_SAVE), usize::from(want), "learn {learn}: {:?}", sys.ops);
+            // A launching close arms it in both cases: the timer also ends the reopen window of the launch.
+            assert_eq!(arms(&sys, crate::msg::TIMER_LAUNCHER_SAVE), 1, "learn {learn}: {:?}", sys.ops);
         }
         // A stale catalogue is listed again after the close, a fresh one is not.
         with_ctrl(|c| c.listed_at_ms = 1);
@@ -4782,6 +4798,45 @@ mod tests {
         with_ctrl(|c| c.state_arrived = true);
         save_state();
         assert_eq!(with_ctrl(|c| c.frec_dirty), Some(false), "written once the files were read");
+    }
+
+    #[test]
+    fn a_launching_close_forgets_its_query_at_the_save_timer() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // Not learning: nothing to write, the close still arms the timer for the query.
+        with_ctrl(|c| {
+            *c = Ctrl::new();
+            c.learn = false;
+        });
+        let mut l = typed(&fx, "ping");
+        l.queued.push(Effect::Launch(crate::launcher::session::LaunchReq::Command(
+            runline::classify("ping 1.1.1.1").unwrap(),
+        )));
+        let mut sys = EffectSys { now: 5_000, ..EffectSys::default() };
+        l.finish(&mut FakeHook::default(), &mut sys);
+        l.housekeeping(&mut sys);
+        let id = format!("Arm({},", crate::msg::TIMER_LAUNCHER_SAVE);
+        assert_eq!(sys.ops.iter().filter(|o| o.starts_with(&id)).count(), 1, "{:?}", sys.ops);
+        assert_eq!(with_ctrl(|c| c.failed_query.clone()), Some(Some("ping".into())), "kept for the reopen");
+        // Up to the end of the reopen window the query stays; past it, it goes.
+        with_ctrl(|c| c.reopen_over(5_000 + REOPEN_WITHIN_MS));
+        assert!(with_ctrl(|c| c.failed_query.is_some()).unwrap());
+        with_ctrl(|c| c.reopen_over(5_001 + REOPEN_WITHIN_MS));
+        assert_eq!(with_ctrl(|c| c.failed_query.clone()), Some(None));
+        // The timer itself, on the real clock (the hide at 0 is long past).
+        with_ctrl(|c| {
+            c.hidden_at_ms = 0;
+            c.failed_query = Some("ping".into());
+        });
+        save_state();
+        assert_eq!(with_ctrl(|c| c.failed_query.clone()), Some(None));
+        // A close that launched nothing keeps no query and arms nothing.
+        let mut l = typed(&fx, "ping");
+        let mut sys = EffectSys::default();
+        l.housekeeping(&mut sys);
+        assert!(!sys.ops.iter().any(|o| o.starts_with(&id)), "{:?}", sys.ops);
+        assert_eq!(with_ctrl(|c| c.failed_query.clone()), Some(None));
     }
 
     #[test]
