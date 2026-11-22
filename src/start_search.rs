@@ -613,14 +613,15 @@ fn windows_build() -> String {
     }
 }
 
-/// What the cache depends on, one line: the Windows build, the UI language, and name, size and
+/// What the cache depends on, one line: the dock's own identity (version, size and modification
+/// time of its exe: a new build rebuilds the catalog once), the Windows build, the UI language, and name, size and
 /// modification time of each `AllSystemSettings_*.xml`. `None` when the build is unknown or no XML
 /// file is there (nothing to key on: nothing cached).
-fn catalog_key_of(build: &str, lang: u16, files: &[(String, u64, u64)]) -> Option<String> {
+fn catalog_key_of(dock: &str, build: &str, lang: u16, files: &[(String, u64, u64)]) -> Option<String> {
     if build.is_empty() || files.is_empty() {
         return None;
     }
-    let mut key = format!("{build}|{lang:04x}");
+    let mut key = format!("{dock}|{build}|{lang:04x}");
     for (name, len, mtime) in files {
         key.push('|');
         key.extend(name.chars().filter(|c| !c.is_control() && *c != '|'));
@@ -643,7 +644,21 @@ fn catalog_key(dir: &Path) -> Option<String> {
     files.sort();
     // SAFETY: no arguments, no preconditions.
     let lang = unsafe { GetUserDefaultUILanguage() };
-    catalog_key_of(&windows_build(), lang, &files)
+    catalog_key_of(&dock_identity(), &windows_build(), lang, &files)
+}
+
+/// Version, size and modification time of the running exe: the cache never outlives a new dock.
+fn dock_identity() -> String {
+    let (len, mtime) = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .map(|m| {
+            (
+                m.len(),
+                m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()),
+            )
+        })
+        .unwrap_or((0, 0));
+    format!("{}:{len}:{mtime}", env!("CARGO_PKG_VERSION"))
 }
 
 fn fnv64(b: &[u8]) -> u64 {
@@ -754,7 +769,8 @@ fn load_or_build_settings() -> (Vec<Setting>, bool) {
     }
     let list = build_settings();
     if let (Some(key), Some(path)) = (&key, &path) {
-        if !list.is_empty() {
+        // Unelevated, the data folder is read-only: reading the cache is fine, writing it is not tried.
+        if !list.is_empty() && crate::datadir::writable() {
             if let Some(bytes) = encode_catalog(key, &list) {
                 if let Err(e) = crate::datadir::write_atomic(path, &bytes, crate::datadir::FileAcl::Inherit) {
                     log!("start search: cannot write the settings cache: {e}");
@@ -897,23 +913,26 @@ mod tests {
     #[test]
     fn invalidated_by_build_or_language() {
         let files = vec![("allsystemsettings_a.xml".to_string(), 10u64, 20u64)];
-        let k = catalog_key_of("26100.1742", 0x409, &files).unwrap();
+        let k = catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &files).unwrap();
         let bytes = encode_catalog(&k, &sample(5)).unwrap();
         assert!(decode_catalog(&bytes, &k).is_some());
         for other in [
-            catalog_key_of("26100.1743", 0x409, &files),
-            catalog_key_of("26200.1742", 0x409, &files),
-            catalog_key_of("26100.1742", 0x410, &files),
-            catalog_key_of("26100.1742", 0x409, &[("allsystemsettings_a.xml".to_string(), 11, 20)]),
-            catalog_key_of("26100.1742", 0x409, &[("allsystemsettings_a.xml".to_string(), 10, 21)]),
-            catalog_key_of("26100.1742", 0x409, &[("allsystemsettings_b.xml".to_string(), 10, 20)]),
+            catalog_key_of("1.5.1:9:9", "26100.1742", 0x409, &files),
+            catalog_key_of("1.5.0:10:9", "26100.1742", 0x409, &files),
+            catalog_key_of("1.5.0:9:10", "26100.1742", 0x409, &files),
+            catalog_key_of("1.5.0:9:9", "26100.1743", 0x409, &files),
+            catalog_key_of("1.5.0:9:9", "26200.1742", 0x409, &files),
+            catalog_key_of("1.5.0:9:9", "26100.1742", 0x410, &files),
+            catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_a.xml".to_string(), 11, 20)]),
+            catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_a.xml".to_string(), 10, 21)]),
+            catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_b.xml".to_string(), 10, 20)]),
         ] {
             let other = other.unwrap();
             assert_ne!(other, k);
             assert!(decode_catalog(&bytes, &other).is_none(), "{other}");
         }
-        assert!(catalog_key_of("", 0x409, &files).is_none(), "unknown build: no cache");
-        assert!(catalog_key_of("26100.1", 0x409, &[]).is_none(), "no XML: no cache");
+        assert!(catalog_key_of("1.5.0:9:9", "", 0x409, &files).is_none(), "unknown build: no cache");
+        assert!(catalog_key_of("1.5.0:9:9", "26100.1", 0x409, &[]).is_none(), "no XML: no cache");
     }
 
     #[test]
@@ -968,10 +987,15 @@ mod tests {
                 2 => (0..(next() % 64)).for_each(|_| b.push(next() as u8)),
                 _ => b = (0..(next() % 200)).map(|_| next() as u8).collect(),
             }
-            // Must never panic; a result is only legal for the untouched file.
+            // Half the runs get a fresh checksum, so the mutated body reaches the parser itself.
+            if next() % 2 == 0 && b.len() >= 8 {
+                b.truncate(b.len() - 8);
+                let sum = fnv64(&b);
+                b.extend_from_slice(&sum.to_le_bytes());
+            }
+            // Must never panic; anything it accepts is exactly what the encoder would write.
             if let Some(list) = decode_catalog(&b, KEY) {
-                assert_eq!(b, good);
-                assert_eq!(list.len(), 12);
+                assert_eq!(encode_catalog(KEY, &list), Some(b));
             }
         }
     }
