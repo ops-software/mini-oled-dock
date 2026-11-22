@@ -911,7 +911,8 @@ impl Launcher {
         // The magnifier is centred in the icon column the rows use.
         let gs = m.px(style::FIELD_ICON);
         let gx = m.px(style::ICON_X) + (m.px(style::ICON_M) - gs) / 2;
-        s.glyph(gx, f.top + (f.bottom - f.top - gs) / 2, gs, style::FG_SECONDARY, &super::popup_startmenu::magnifier);
+        let gy = f.top + (f.bottom - f.top - gs) / 2;
+        s.glyph_cached(GlyphId::Magnifier as u32, gx, gy, gs, style::FG_SECONDARY, glyph_shape(GlyphId::Magnifier));
         let lit = self.foreground;
         let text_alpha = if lit { style::FG_PRIMARY } else { style::FG_TERTIARY };
         if let Some(p) = self.session.chip() {
@@ -988,7 +989,7 @@ impl Launcher {
             (IconRef::Glyph(g), _) => {
                 let gs = m.px(style::ICON_S);
                 let off = (size - gs) / 2;
-                s.glyph(x + off, box_y + off, gs, alpha, glyph_shape(*g));
+                s.glyph_cached(*g as u32, x + off, box_y + off, gs, alpha, glyph_shape(*g));
             }
             _ => s.fill_rr(rect_wh(x, box_y, size, size), m.px(style::R_XS), WHITE, style::FILL_CONTROL),
         }
@@ -1122,11 +1123,11 @@ impl Launcher {
             let gx = rc.left + m.px(ACTION_GLYPH_X);
             let gy = rc.top + (rc.bottom - rc.top - gs) / 2;
             if !e.enabled {
-                s.glyph(gx, gy, gs, style::FG_DISABLED, glyph_shape(glyph));
+                s.glyph_cached(glyph as u32, gx, gy, gs, style::FG_DISABLED, glyph_shape(glyph));
             } else if e.danger {
-                s.glyph_rgb(gx, gy, gs, style::ACCENT_DANGER, style::FG_HOT, glyph_shape(glyph));
+                s.glyph_cached_rgb(glyph as u32, gx, gy, gs, style::ACCENT_DANGER, style::FG_HOT, glyph_shape(glyph));
             } else {
-                s.glyph(gx, gy, gs, style::FG_SECONDARY, glyph_shape(glyph));
+                s.glyph_cached(glyph as u32, gx, gy, gs, style::FG_SECONDARY, glyph_shape(glyph));
             }
             let mut label_right = rc.right - m.px(ACTION_GLYPH_X);
             let lx = rc.left + m.px(ACTION_LABEL_X);
@@ -3184,12 +3185,13 @@ impl Content for FieldPair {
             s.stroke_rr(rc, radius, m.px(1).max(1), style::RIM_CONTROL);
             let gs = m.px(style::ICON_S);
             let gx = rc.left + if i == 0 { m.px(12) } else { m.px(16) };
-            s.glyph(
+            s.glyph_cached(
+                GlyphId::Magnifier as u32,
                 gx,
                 rc.top + (rc.bottom - rc.top - gs) / 2,
                 gs,
                 style::FG_SECONDARY,
-                &super::popup_startmenu::magnifier,
+                glyph_shape(GlyphId::Magnifier),
             );
             if i == 0 {
                 // Start's own control (popup_startmenu.rs paint_search): the text 10 px after the glyph, a 200 caret.
@@ -4840,6 +4842,35 @@ mod tests {
         }
         assert!(PreviewScene::from_name("launcher_nope").is_none());
         assert!(PreviewScene::from_name("popup_tray").is_none());
+    }
+
+    #[test]
+    fn cached_glyph_equals_uncached() {
+        use GlyphId::*;
+        let all = [
+            Magnifier, Equals, Prompt, Window, Document, Image, Archive, Executable, Copy, Globe, Clock, Folder, Info,
+            Gear, Lock, Moon, Restart, Power, Exit,
+        ];
+        let mut s = Surface::new(Metrics { dpi: 96 }).expect("surface");
+        s.resize(64, 64).unwrap();
+        let snap = |s: &Surface| s.snapshot_pixels().expect("pixels").2;
+        for g in all {
+            for size in 12..=48 {
+                for alpha in [255, 90] {
+                    s.fill_rr(rect_wh(0, 0, 64, 64), 0, (30, 40, 50), 255);
+                    s.glyph(5, 5, size, alpha, glyph_shape(g));
+                    let plain = snap(&s);
+                    s.fill_rr(rect_wh(0, 0, 64, 64), 0, (30, 40, 50), 255);
+                    s.glyph_cached(g as u32, 5, 5, size, alpha, glyph_shape(g));
+                    assert!(plain == snap(&s), "{g:?} at {size}, alpha {alpha}, first paint");
+                    s.fill_rr(rect_wh(0, 0, 64, 64), 0, (30, 40, 50), 255);
+                    s.glyph_cached(g as u32, 5, 5, size, alpha, glyph_shape(g));
+                    assert!(plain == snap(&s), "{g:?} at {size}, alpha {alpha}, from the cache");
+                }
+            }
+            // the cache is bounded: start afresh for the next glyph
+            s.glyph_hits_clear();
+        }
     }
 
     #[test]

@@ -512,7 +512,13 @@ pub struct Surface {
     query: Cell<Option<(HFONT, i32)>>,
     /// Clipping rectangle (physical px) applied to every write; `None` = the whole DIB.
     clip: Option<RECT>,
+    /// 4 x 4 hit counts of the glyphs painted with `glyph_cached`: (key, size, counts); freed with the surface.
+    glyph_hits: Vec<(u32, i32, Box<[u8]>)>,
 }
+
+/// Largest glyph (side in physical px) and number of entries `glyph_cached` keeps.
+const GLYPH_CACHE_MAX_SIZE: i32 = 64;
+const GLYPH_CACHE_MAX_ENTRIES: usize = 32;
 
 fn delete_fonts(fonts: &[HFONT; 6]) {
     for f in fonts {
@@ -551,7 +557,7 @@ impl Surface {
         let gdi = Gdi::new()?;
         // On error `gdi` is dropped, which deletes the DCs.
         let (fonts, lhs) = build_fonts(gdi.dc_txt(), m)?;
-        Ok(Surface { metrics: m, gdi, fonts, lhs, query: Cell::new(None), clip: None })
+        Ok(Surface { metrics: m, gdi, fonts, lhs, query: Cell::new(None), clip: None, glyph_hits: Vec::new() })
     }
 
     /// Current metrics.
@@ -632,6 +638,49 @@ impl Surface {
     /// `(x, y)`, 4x4 supersampling.
     pub fn glyph(&mut self, x: i32, y: i32, size: i32, alpha: u32, shape: &dyn Fn(f32, f32) -> bool) {
         self.glyph_rgb(x, y, size, WHITE, alpha, shape);
+    }
+
+    /// Like `glyph`, but the 4 x 4 hit counts of the shape are kept per (`key`, `size`) in the surface, so a frame
+    /// after the first only blends. `key` names the shape (never a pointer: capture-less closures can share an
+    /// address). A size over 64 px, or a full cache, paints like `glyph`.
+    pub fn glyph_cached(&mut self, key: u32, x: i32, y: i32, size: i32, alpha: u32, shape: &dyn Fn(f32, f32) -> bool) {
+        self.glyph_cached_rgb(key, x, y, size, WHITE, alpha, shape);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn glyph_hits_clear(&mut self) {
+        self.glyph_hits.clear();
+    }
+
+    /// Like `glyph_cached` with color `rgb`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn glyph_cached_rgb(
+        &mut self,
+        key: u32,
+        x: i32,
+        y: i32,
+        size: i32,
+        rgb: (u32, u32, u32),
+        alpha: u32,
+        shape: &dyn Fn(f32, f32) -> bool,
+    ) {
+        if size <= 0 || size > GLYPH_CACHE_MAX_SIZE {
+            return self.glyph_rgb(x, y, size, rgb, alpha, shape);
+        }
+        let at = match self.glyph_hits.iter().position(|(k, sz, _)| *k == key && *sz == size) {
+            Some(i) => i,
+            None if self.glyph_hits.len() >= GLYPH_CACHE_MAX_ENTRIES => {
+                return self.glyph_rgb(x, y, size, rgb, alpha, shape);
+            }
+            None => {
+                self.glyph_hits.push((key, size, glyph_hit_counts(size, shape)));
+                self.glyph_hits.len() - 1
+            }
+        };
+        let Some((_, _, hits)) = self.glyph_hits.get(at) else { return };
+        if let Some(mut cv) = self.gdi.canvas(self.clip) {
+            cv.glyph_from_hits(x, y, size, rgb, alpha, hits);
+        }
     }
 
     /// Like `glyph` with color `rgb` (e.g. black on the white plate).
@@ -1084,26 +1133,47 @@ impl Canvas<'_> {
         if size <= 0 {
             return;
         }
-        crate::glyphs::set_scale(size);
-        let k = 16.0 / size as f32;
+        let hits = glyph_hit_counts(size, shape);
+        self.glyph_from_hits(x, y, size, rgb, alpha, &hits);
+    }
+
+    /// Blends a glyph from its 4 x 4 hit counts (`glyph_hit_counts`), `size` x `size` of them, row by row.
+    pub(crate) fn glyph_from_hits(&mut self, x: i32, y: i32, size: i32, rgb: (u32, u32, u32), alpha: u32, hits: &[u8]) {
+        if size <= 0 || hits.len() < (size as usize) * (size as usize) {
+            return;
+        }
         for py in 0..size {
             for px in 0..size {
-                let mut hits = 0u32;
-                for sy in 0..4 {
-                    for sx in 0..4 {
-                        let u = (px as f32 + (sx as f32 + 0.5) / 4.0) * k;
-                        let v = (py as f32 + (sy as f32 + 0.5) / 4.0) * k;
-                        if shape(u, v) {
-                            hits += 1;
-                        }
-                    }
-                }
-                if hits > 0 {
-                    self.blend(x + px, y + py, argb(alpha * hits / 16, rgb.0, rgb.1, rgb.2));
+                let n = hits.get((py * size + px) as usize).copied().unwrap_or(0) as u32;
+                if n > 0 {
+                    self.blend(x + px, y + py, argb(alpha * n / 16, rgb.0, rgb.1, rgb.2));
                 }
             }
         }
     }
+}
+
+/// How many of the 4 x 4 samples of each pixel of a `size` x `size` glyph are inside `shape` (16x16 space).
+fn glyph_hit_counts(size: i32, shape: &dyn Fn(f32, f32) -> bool) -> Box<[u8]> {
+    let mut out = Vec::with_capacity((size.max(0) as usize).pow(2));
+    crate::glyphs::set_scale(size);
+    let k = 16.0 / size as f32;
+    for py in 0..size {
+        for px in 0..size {
+            let mut hits = 0u8;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let u = (px as f32 + (sx as f32 + 0.5) / 4.0) * k;
+                    let v = (py as f32 + (sy as f32 + 0.5) / 4.0) * k;
+                    if shape(u, v) {
+                        hits += 1;
+                    }
+                }
+            }
+            out.push(hits);
+        }
+    }
+    out.into_boxed_slice()
 }
 
 // ------------------------------------------------------- pixel primitives (shared with render.rs)
@@ -1313,7 +1383,10 @@ mod tests {
                 }
             }
             let (rl, rt, rr, rb) = (rc.left, rc.top, rc.right, rc.bottom);
-            assert!(a == b, "case {case} stroke {stroke} rc ({rl},{rt},{rr},{rb}) radius {radius} bw {bw} clip {clip:?}");
+            assert!(
+                a == b,
+                "case {case} stroke {stroke} rc ({rl},{rt},{rr},{rb}) radius {radius} bw {bw} clip {clip:?}"
+            );
         }
     }
 
@@ -1341,6 +1414,35 @@ mod tests {
         panel_pixels(&mut buf, 800, 528, m.px(PANEL_RADIUS), 1.max(m.px(1)), (0, 0, 0), 255);
         let n = RR_COV_CALLS.with(|c| c.get());
         assert!(n <= 8_000, "{n} rr_cov calls");
+    }
+
+    #[test]
+    fn glyph_shape_called_once_per_surface() {
+        let mut s = Surface::new(M).expect("surface");
+        s.resize(64, 64).unwrap();
+        let calls = Cell::new(0u32);
+        let shape = |u: f32, v: f32| {
+            calls.set(calls.get() + 1);
+            u + v < 16.0
+        };
+        s.glyph_cached(7, 4, 4, 20, 255, &shape);
+        assert_eq!(calls.get(), 16 * 20 * 20);
+        s.glyph_cached(7, 30, 30, 20, 90, &shape);
+        assert_eq!(calls.get(), 16 * 20 * 20, "the second paint reads the cache");
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded() {
+        let mut s = Surface::new(M).expect("surface");
+        s.resize(200, 200).unwrap();
+        let shape = |u: f32, _v: f32| u < 8.0;
+        for key in 0..(GLYPH_CACHE_MAX_ENTRIES as u32 + 10) {
+            s.glyph_cached(key, 0, 0, 12, 255, &shape);
+        }
+        assert_eq!(s.glyph_hits.len(), GLYPH_CACHE_MAX_ENTRIES);
+        s.glyph_cached(1, 0, 0, GLYPH_CACHE_MAX_SIZE + 1, 255, &shape);
+        assert_eq!(s.glyph_hits.len(), GLYPH_CACHE_MAX_ENTRIES, "a big glyph is not kept");
+        assert!(s.glyph_hits.iter().all(|(_, size, h)| h.len() == (size * size) as usize));
     }
 
     #[test]
