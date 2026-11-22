@@ -37,6 +37,10 @@ impl Content for Launcher {
     fn click(&mut self, _id: u32) -> Reply {
         Reply::None
     }
+
+    fn wants_sys_keys(&self) -> bool {
+        true
+    }
 }
 
 /// The content of a new launcher popup (`popup::make_content`).

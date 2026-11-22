@@ -25,7 +25,7 @@
 //! State is ALWAYS taken with `try_borrow_mut` (`with`): an unexpected re-entry is a logged no-op,
 //! never a panic (panic = abort).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 
 use windows::core::{w, HSTRING, PCWSTR};
@@ -47,7 +47,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 // The launcher's additions (L1a-13), a group of their own.
-use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowTextW, SC_CLOSE, SC_KEYMENU, WM_CLOSE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+};
 
 // Child module via #[path]: this way main.rs does not need to declare it.
 #[path = "popup_app.rs"]
@@ -60,6 +65,8 @@ pub(crate) mod popup_start;
 pub(crate) mod popup_startmenu;
 
 use crate::audio::{OutputDevice, VolumeState};
+use crate::launcher::field::KeyEvent;
+use crate::launcher::model::Mods;
 use crate::log;
 use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
 use crate::render::Metrics;
@@ -306,9 +313,24 @@ pub(crate) trait Content {
     fn key(&mut self, _vk: u16) -> Option<Reply> {
         None
     }
-    /// Character typed while the popup has the focus (`WM_CHAR`).
+    /// Character typed while the popup has the focus (`WM_CHAR`; also `WM_SYSCHAR` while `wants_sys_keys`).
     fn char(&mut self, _c: char) -> Reply {
         Reply::None
+    }
+    /// Key pressed while the popup has the focus, for a content that `wants_sys_keys`: `WM_KEYDOWN` and
+    /// `WM_SYSKEYDOWN` with the modifiers held. `None` = not handled: Esc then closes the popup, an unhandled system
+    /// key is swallowed.
+    fn key_ex(&mut self, _ev: KeyEvent) -> Option<Reply> {
+        None
+    }
+    /// true: the window procedure sends the system keys (Alt held) to `key_ex` and `char` and swallows the Alt release
+    /// and the keyboard menu (the launcher only; `route`).
+    fn wants_sys_keys(&self) -> bool {
+        false
+    }
+    /// Alt+F4 (`SC_CLOSE`) or `WM_CLOSE` while `wants_sys_keys`: the content says how it closes.
+    fn close_request(&mut self) -> Reply {
+        Reply::Close
     }
     /// 1 s tick (`TIMER_POPUP_TICK`); also fired early by `popup::tick_soon`.
     fn tick(&mut self) -> Reply {
@@ -1049,6 +1071,7 @@ fn close_inner(reason: &str) {
     let Some((taken, hwnd)) = with(|st| (st.open.take(), st.hwnd)) else { return };
     let Some(mut o) = taken else { return };
     log!("popup: closing {:?} ({reason})", o.kind);
+    HIGH.with(|h| h.set(0));
     // SAFETY: GetTickCount64 has no preconditions.
     let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
     LAST_CLOSE_MS.store(tick, std::sync::atomic::Ordering::Relaxed);
@@ -1165,7 +1188,152 @@ fn hi_i16(v: isize) -> i32 {
     ((v >> 16) & 0xFFFF) as u16 as i16 as i32
 }
 
+/// What the window procedure does with a keyboard or close message while the open content `wants_sys_keys`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// A key down for the content's `key_ex`.
+    ToContent,
+    /// A system character for the content's `char`.
+    Char,
+    /// Swallowed: answered 0, never DefWindowProc (no menu mode, no beep).
+    Consume,
+    /// The content's `close_request`; answered 0, so the shared window is never destroyed.
+    CloseRequest,
+    /// The usual arm, as for every other kind.
+    Default,
+}
+
+/// How `msg` is handled: `wants_sys` is the open content's `wants_sys_keys`; false gives `Default` for everything.
+fn route(msg: u32, wp: usize, wants_sys: bool) -> Route {
+    if !wants_sys {
+        return Route::Default;
+    }
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN => Route::ToContent,
+        WM_SYSCHAR => Route::Char,
+        WM_SYSKEYUP if wp == usize::from(VK_MENU.0) => Route::Consume,
+        // The low four bits of an SC_ code are the system's own.
+        WM_SYSCOMMAND => match (wp & 0xFFF0) as u32 {
+            SC_KEYMENU => Route::Consume,
+            SC_CLOSE => Route::CloseRequest,
+            _ => Route::Default,
+        },
+        WM_CLOSE => Route::CloseRequest,
+        _ => Route::Default,
+    }
+}
+
+/// The modifiers of a key event.
+fn mods_of(ctrl: bool, shift: bool, alt: bool, win: bool) -> Mods {
+    let mut m = Mods::NONE;
+    for (down, bit) in [(ctrl, Mods::CTRL), (shift, Mods::SHIFT), (alt, Mods::ALT), (win, Mods::WIN)] {
+        if down {
+            m = m.with(bit);
+        }
+    }
+    m
+}
+
+/// The modifiers held when the key message being handled was posted.
+fn held_mods() -> Mods {
+    // SAFETY: GetKeyState has no preconditions.
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+    mods_of(down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU), down(VK_LWIN) || down(VK_RWIN))
+}
+
+/// The `KeyEvent` of a `WM_KEYDOWN` or `WM_SYSKEYDOWN`: lParam bit 30 is the auto-repeat.
+fn key_event(msg: u32, wp: usize, lp: isize, mods: Mods) -> KeyEvent {
+    KeyEvent { vk: wp as u16, mods, repeat: lp & (1 << 30) != 0, sys: msg == WM_SYSKEYDOWN }
+}
+
+thread_local! {
+    /// The high surrogate of a character outside the BMP, held until its low half arrives (0 = none).
+    static HIGH: Cell<u16> = const { Cell::new(0) };
+}
+
+/// One UTF-16 unit of a `WM_CHAR` or `WM_SYSCHAR`: a high surrogate is held in `held` until the low one completes
+/// the character; a lone surrogate is dropped.
+fn utf16_char(held: &mut u16, unit: u32) -> Option<char> {
+    let high = std::mem::take(held);
+    match unit {
+        0xD800..=0xDBFF => {
+            *held = unit as u16;
+            None
+        }
+        0xDC00..=0xDFFF if high != 0 => char::decode_utf16([high, unit as u16]).next()?.ok(),
+        _ => char::from_u32(unit),
+    }
+}
+
+/// A `WM_CHAR` (or routed `WM_SYSCHAR`) for the open content.
+fn on_char_unit(unit: u32) {
+    let c = HIGH.with(|h| {
+        let mut held = h.get();
+        let c = utf16_char(&mut held, unit);
+        h.set(held);
+        c
+    });
+    let Some(c) = c else { return };
+    let reply = with(|st| st.open.as_mut().map(|o| o.content.char(c))).flatten();
+    if let Some(r) = reply {
+        apply(r);
+    }
+}
+
+/// true if the open content takes the system keys. A busy state (re-entry) reads as false: the usual arms.
+fn open_wants_sys_keys() -> bool {
+    STATE
+        .with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.content.wants_sys_keys())))
+        .unwrap_or(false)
+}
+
+/// The keyboard and close messages while the open content `wants_sys_keys` (`route`); None = the usual arm.
+fn sys_key_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    if !matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN | WM_SYSCHAR | WM_SYSKEYUP | WM_SYSCOMMAND | WM_CLOSE) {
+        return None;
+    }
+    match route(msg, wp.0, open_wants_sys_keys()) {
+        Route::Default => None,
+        Route::ToContent => Some(on_key_ex(hwnd, msg, wp, lp)),
+        Route::Char => {
+            on_char_unit(wp.0 as u32);
+            Some(LRESULT(0))
+        }
+        Route::Consume => Some(LRESULT(0)),
+        Route::CloseRequest => {
+            let reply = with(|st| st.open.as_mut().map(|o| o.content.close_request())).flatten();
+            if let Some(r) = reply {
+                apply(r);
+            }
+            Some(LRESULT(0))
+        }
+    }
+}
+
+/// A key down for `key_ex`, with the modifiers read once.
+fn on_key_ex(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let ev = key_event(msg, wp.0, lp.0, held_mods());
+    let handled = with(|st| st.open.as_mut().and_then(|o| o.content.key_ex(ev))).flatten();
+    if let Some(reply) = handled {
+        apply(reply);
+        return LRESULT(0);
+    }
+    if msg == WM_SYSKEYDOWN {
+        // Never DefWindowProc: no menu mode, no beep, no SC_CLOSE of its own.
+        return LRESULT(0);
+    }
+    if wp.0 == VK_ESCAPE.0 as usize {
+        close_inner("Esc");
+        return LRESULT(0);
+    }
+    // SAFETY: forwarding to the default handler with the same arguments.
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(r) = sys_key_msg(hwnd, msg, wp, lp) {
+        return r;
+    }
     match msg {
         WM_ACTIVATE => {
             if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE {
@@ -1194,13 +1362,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_CHAR => {
-            // Characters outside the BMP arrive as two surrogates: not searchable, ignored.
-            if let Some(c) = char::from_u32(wp.0 as u32) {
-                let reply = with(|st| st.open.as_mut().map(|o| o.content.char(c))).flatten();
-                if let Some(r) = reply {
-                    apply(r);
-                }
-            }
+            // Characters outside the BMP arrive as two surrogates: combined by `utf16_char`.
+            on_char_unit(wp.0 as u32);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1677,6 +1840,7 @@ pub(crate) fn tick_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
 
     #[test]
     fn popup_is_clamped_to_the_work_area() {
@@ -1730,6 +1894,76 @@ mod tests {
         assert_eq!(initial_alpha(PopupKind::Launcher), 255, "no fade: the field is there at once");
         assert_eq!(initial_alpha(PopupKind::StartMenu), 0);
         assert_eq!(initial_alpha(PopupKind::Audio), 0);
+    }
+
+    #[test]
+    fn sys_key_routing() {
+        let alt = usize::from(VK_MENU.0);
+        let cases: [(u32, usize, Route); 11] = [
+            (WM_KEYDOWN, 0x41, Route::ToContent),
+            (WM_SYSKEYDOWN, 0x41, Route::ToContent),
+            (WM_SYSKEYDOWN, alt, Route::ToContent),
+            (WM_SYSCHAR, 0x61, Route::Char),
+            (WM_SYSKEYUP, alt, Route::Consume),
+            (WM_SYSKEYUP, 0x41, Route::Default),
+            (WM_SYSCOMMAND, SC_KEYMENU as usize, Route::Consume),
+            (WM_SYSCOMMAND, SC_KEYMENU as usize | 0x3, Route::Consume),
+            (WM_SYSCOMMAND, 0xF010, Route::Default),
+            (WM_CHAR, 0x61, Route::Default),
+            (WM_KEYUP, 0x41, Route::Default),
+        ];
+        for (msg, wp, want) in cases {
+            assert_eq!(route(msg, wp, true), want, "launcher: msg {msg:#x} wp {wp:#x}");
+            assert_eq!(route(msg, wp, false), Route::Default, "other kinds: msg {msg:#x} wp {wp:#x}");
+        }
+        // The KeyEvent of a key message: lParam bit 30 is the auto-repeat, WM_SYSKEYDOWN is a system key.
+        let ev = key_event(WM_SYSKEYDOWN, 0x46, 1 << 30, Mods::ALT);
+        assert_eq!(ev, KeyEvent { vk: 0x46, mods: Mods::ALT, repeat: true, sys: true });
+        assert_eq!(
+            key_event(WM_KEYDOWN, 0x0D, 1, Mods::NONE),
+            KeyEvent { vk: 0x0D, mods: Mods::NONE, repeat: false, sys: false }
+        );
+        assert_eq!(mods_of(true, true, false, false), Mods::CTRL.with(Mods::SHIFT));
+        assert_eq!(mods_of(false, false, true, true), Mods::ALT.with(Mods::WIN));
+        assert_eq!(mods_of(false, false, false, false), Mods::NONE);
+        // Only the launcher takes the system keys.
+        assert!(popup_launcher::new().wants_sys_keys());
+        assert!(!popup_start::new().wants_sys_keys());
+    }
+
+    #[test]
+    fn alt_f4_and_wm_close_are_close_requests() {
+        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, true), Route::CloseRequest);
+        assert_eq!(
+            route(WM_SYSCOMMAND, SC_CLOSE as usize | 0x2, true),
+            Route::CloseRequest,
+            "low 4 bits are the system's"
+        );
+        assert_eq!(route(WM_CLOSE, 0, true), Route::CloseRequest);
+        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, false), Route::Default, "other kinds: as today");
+        assert_eq!(route(WM_CLOSE, 0, false), Route::Default);
+        // The stub launcher closes like the final Esc (L1a-15 hands it to the session); the default is a close.
+        assert_eq!(popup_launcher::new().close_request(), Reply::Close);
+        assert_eq!(popup_start::new().close_request(), Reply::Close);
+    }
+
+    #[test]
+    fn surrogate_pairs_combine() {
+        let mut held = 0u16;
+        assert_eq!(utf16_char(&mut held, 0x61), Some('a'));
+        // U+1F600 arrives as D83D DE00.
+        assert_eq!(utf16_char(&mut held, 0xD83D), None);
+        assert_eq!(utf16_char(&mut held, 0xDE00), Some('\u{1F600}'));
+        assert_eq!(held, 0);
+        // A lone low surrogate is dropped.
+        assert_eq!(utf16_char(&mut held, 0xDE00), None);
+        // A high surrogate followed by anything but a low one is dropped; the next character passes.
+        assert_eq!(utf16_char(&mut held, 0xD83D), None);
+        assert_eq!(utf16_char(&mut held, 0x62), Some('b'));
+        assert_eq!(utf16_char(&mut held, 0xD83D), None);
+        assert_eq!(utf16_char(&mut held, 0xD83C), None, "a second high replaces the first");
+        assert_eq!(utf16_char(&mut held, 0xDF89), Some('\u{1F389}'));
+        assert_eq!(utf16_char(&mut held, 0xE9), Some('\u{E9}'));
     }
 
     #[test]
