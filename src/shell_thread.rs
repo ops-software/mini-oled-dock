@@ -4334,6 +4334,15 @@ mod tests {
     fn one_pump_drains_every_request() {
         let mut pending: VecDeque<ShellRequest> = VecDeque::new();
         let ids = |s: &str| vec![s.to_string()];
+        let resolve = ResolveApp {
+            key: "k".into(),
+            exe_path: "x.exe".into(),
+            aumid: None,
+            hwnd: 0,
+            icon_px: 24,
+            custom_icon: None,
+        };
+        enqueue(&mut pending, ShellRequest::ResolveApp(resolve));
         enqueue(&mut pending, ShellRequest::VolumeAdjust { delta_percent: 2 });
         enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
         enqueue(&mut pending, ShellRequest::Launch { target: "x.exe".into(), args: None });
@@ -4341,14 +4350,18 @@ mod tests {
         enqueue(&mut pending, ShellRequest::VolumeRefresh);
         enqueue(&mut pending, ShellRequest::StartIcons { icon_px: 48, ids: ids("s") });
         let mut taken = 0;
-        let mut seen_icons = false;
+        let (mut seen_resolve, mut seen_icons) = (false, false);
         while let Some(r) = next_request(&mut pending) {
             taken += 1;
+            let resolve = matches!(r, ShellRequest::ResolveApp(_));
             let low = matches!(r, ShellRequest::StartIcons { .. });
             assert!(!seen_icons || low, "a normal request came after a Start batch");
+            assert!(!seen_resolve || resolve || low, "a normal request came after a ResolveApp");
+            seen_resolve |= resolve;
             seen_icons |= low;
         }
-        assert_eq!(taken, 6, "every request comes out exactly once");
+        assert!(seen_resolve, "the ResolveApp came out");
+        assert_eq!(taken, 7, "every request comes out exactly once");
         // Newer ones replace older ones; the launcher's close drops a pending icon request.
         enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
         enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("b") });
