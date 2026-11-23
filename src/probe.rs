@@ -7,6 +7,11 @@
 //! environment. Off (the default), every call below is one load of a null pointer and a branch, the UI thread
 //! runs the release's own `GetMessageW` loop, and nothing is allocated, installed or started.
 //!
+//! STALL SWITCH (wsC Q7, live check L1 B9 (iii) and (iv)), only while the probe is on: the marker `wakeprobe.stall` in
+//! the data folder holds a decimal number of ms (at most `STALL_MAX_MS`; anything else is off), read once by `init`.
+//! More than 60 s after start, the first message whose beat is not due (the last beat under 1 s old) sleeps that long
+//! before its dispatch, once per process, then logs "wake probe: stalled N ms (beat age A ms)".
+//!
 //! ON, this module counts, with relaxed atomics in one heap block (about 50 KB, allocated once) and a few
 //! thread-locals, never a lock or an allocation on a counted path:
 //!  * UI thread: the release loop is replaced by `MsgWaitForMultipleObjectsEx` + `PeekMessageW(PM_REMOVE)`, so
@@ -390,6 +395,16 @@ static UI_TID: AtomicU32 = AtomicU32::new(0);
 static SHELLHOOK: AtomicU32 = AtomicU32::new(0);
 static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static REPORTER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// The stall switch: ms of the one stall still pending, 0 = off or done.
+static STALL_MS: AtomicU32 = AtomicU32::new(0);
+/// `GetTickCount64` at `init`: the stall comes only after `STALL_AFTER_MS`.
+static STARTED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Marker of the stall switch, next to `MARKER`.
+pub const STALL_MARKER: &str = "wakeprobe.stall";
+const STALL_AFTER_MS: u64 = 60_000;
+/// The longest stall the switch accepts (ms).
+const STALL_MAX_MS: u32 = 60_000;
 
 #[inline]
 fn get() -> Option<&'static Probe> {
@@ -512,6 +527,13 @@ pub fn init() {
     let p: &'static Probe = Box::leak(Probe::new_boxed());
     PROBE.store(std::ptr::from_ref(p).cast_mut(), Release);
     let switch = if env_on { "env" } else { "marker" };
+    // SAFETY: no preconditions.
+    STARTED_MS.store(unsafe { GetTickCount64() }, Relaxed);
+    let stall = data.as_deref().map_or(0, read_stall);
+    if stall != 0 {
+        STALL_MS.store(stall, Relaxed);
+        log!("wake probe: one stall of {stall} ms armed, more than {} s after start", STALL_AFTER_MS / 1000);
+    }
     let path = report.clone();
     let spawned = std::thread::Builder::new()
         .name("wake-probe".into())
@@ -522,6 +544,41 @@ pub fn init() {
         Err(e) => log!("wake probe: reporter thread not started: {e} (counters run, no report)"),
     }
     log!("wake probe ON ({switch}): a JSON line every {} s to {}", PERIOD_MS / 1000, report.display());
+}
+
+/// The stall switch's marker in `dir`, read once and bounded: 0 (off) when absent or unreadable.
+fn read_stall(dir: &Path) -> u32 {
+    use std::io::Read;
+    let mut text = String::new();
+    match std::fs::File::open(dir.join(STALL_MARKER)).and_then(|f| f.take(32).read_to_string(&mut text)) {
+        Ok(_) => stall_ms(&text),
+        Err(_) => 0,
+    }
+}
+
+/// The stall switch's value: a decimal number of ms from 1 to `STALL_MAX_MS`; anything else is off (0).
+fn stall_ms(text: &str) -> u32 {
+    text.trim().parse::<u32>().ok().filter(|&n| n <= STALL_MAX_MS).unwrap_or(0)
+}
+
+/// The UI loop's heartbeat for a message (wsC Q7), before its dispatch: as the release loop, only for messages not
+/// addressed to the dock window (those beat in `wnd_proc`, so no message beats twice). While the stall switch is pending
+/// and more than 60 s have passed since start, the one stall goes on the first message whose beat is not due (the last
+/// beat under 1 s old): it begins as close after a beat as a real stall can, the case of the 5.6 s tolerance.
+fn beat_or_stall(msg: &MSG) {
+    let beat = msg.hwnd != crate::hwnd() && crate::watchdog::beat_if_due();
+    let stall = STALL_MS.load(Relaxed);
+    // SAFETY: no preconditions.
+    if stall == 0 || beat || unsafe { GetTickCount64() }.saturating_sub(STARTED_MS.load(Relaxed)) <= STALL_AFTER_MS {
+        return;
+    }
+    let age = crate::watchdog::beat_age_ms();
+    if age >= crate::watchdog::BEAT_MIN_GAP_MS {
+        return; // a message to the dock window, whose beat `wnd_proc` gives
+    }
+    STALL_MS.store(0, Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(u64::from(stall)));
+    log!("wake probe: stalled {stall} ms (beat age {age} ms)");
 }
 
 /// Writes the last (partial) report and stops the reporter. No-op when the probe is off.
@@ -793,6 +850,7 @@ pub fn ui_loop() -> bool {
             if shellhook != 0 && msg.message == shellhook {
                 ui.bump(K_SHELLHOOK | (msg.wParam.0 as u32 & 0xFFFF), 0);
             }
+            beat_or_stall(&msg);
             let key = msg_key(&msg);
             let t = Instant::now();
             // SAFETY: `msg` was just filled by PeekMessageW.
@@ -1664,6 +1722,16 @@ mod tests {
         assert_eq!(cause_name(u32::from(CAUSE_POSTED | CAUSE_WINEVENT)), "posted+winevent");
         assert_eq!(copydata_kind(1, 1), "nim_modify");
         assert_eq!(event_name(0x800B), "OBJECT_LOCATIONCHANGE");
+    }
+
+    #[test]
+    fn the_stall_switch_reads_a_bounded_number_of_ms() {
+        assert_eq!(stall_ms("7000"), 7000);
+        assert_eq!(stall_ms(" 4500\r\n"), 4500);
+        assert_eq!(stall_ms(&STALL_MAX_MS.to_string()), STALL_MAX_MS);
+        for off in ["", "0", "-1", "7 s", "abc", "60001", "99999999999"] {
+            assert_eq!(stall_ms(off), 0, "{off:?}");
+        }
     }
 
     #[test]

@@ -3,10 +3,11 @@
 //!
 //! PROTOCOL
 //!  * Heartbeat event: name `Local\DockHeartbeat-<pid>` (auto-reset), created by the dock with
-//!    `CreateEventW`; the dock signals it every 1 s (`TIMER_SECOND` -> `heartbeat()`).
+//!    `CreateEventW`; the dock signals it at most once a second while it handles messages (`beat_if_due`, at the
+//!    start of each message), and every 3 s when idle (`TIMER_SECOND`, `HEARTBEAT_MS`).
 //!  * The watchdog opens the dock process (`SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`) and
 //!    the event, then waits (`WaitForMultipleObjects`) on the process and the event with a 3.3 s timeout
-//!    (sized for a heartbeat period of up to 3 s; with a 1 s beat each wait returns at the beat). 2 timeouts
+//!    (sized for the 3 s keepalive; while the dock handles messages each wait returns at a beat). 2 timeouts
 //!    in a row (6.6 s without a beat) are a hang; before the first beat, 10 (33 s). On a hang it runs
 //!    `taskbar::restore_force()` but stays alive as long as the dock lives (a stuck dock can recover; the
 //!    dock itself stops hiding the taskbar if it finds the state file deleted). If the process ends with
@@ -16,7 +17,7 @@
 //!  * Startup heartbeat event: `Local\DockHeartbeat-<pid>-startup` (auto-reset), signaled by
 //!    `taskbar::init` while waiting for `Shell_TrayWnd`: it resets the count but does NOT move the
 //!    watchdog from the startup tolerance (10) to the steady-state one (2), which starts at the first
-//!    real heartbeat from `TIMER_SECOND`.
+//!    real heartbeat (`heartbeat`).
 //!  * Single instance: named mutex `Local\DockInstance`, taken by `main` right after parsing the
 //!    arguments, before the data folder (`datadir::init`), the logger and anything else. The watchdog,
 //!    `--restore` and `--install` never take it; `--restore` polls it (`instance_running`) to wait
@@ -25,12 +26,12 @@
 //!    `stop-watch` thread waits on it and, if it fires, posts `WM_DOCK_QUIT_REQUEST` to the window.
 //!    `--restore` signals it with `signal_stop_to_instance()`.
 //!
-//! THREADING: `spawn`, `heartbeat`, `start_stop_watcher`, `shutdown` from the main/UI thread;
+//! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `shutdown` from the main/UI thread;
 //! `run_watchdog` is the main of the watchdog process (no window, no hook, no COM).
 
 use std::ffi::c_void;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
 use windows::core::{HSTRING, PWSTR};
@@ -39,6 +40,7 @@ use windows::Win32::Foundation::{
     WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenEventW, OpenMutexW,
     OpenProcess, ProcessMemoryPriority, ResetEvent, SetEvent, SetProcessInformation, TerminateProcess,
@@ -63,6 +65,11 @@ pub(crate) const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_s
 
 /// Timeout of each watchdog wait: 10 % above the longest heartbeat period it is sized for (3 s).
 const WAIT_MS: u32 = 3300;
+/// Period (ms) of `TIMER_SECOND`: the keepalive heartbeat of an idle dock (and the taskbar safety check).
+pub const HEARTBEAT_MS: u32 = 3000;
+/// While the dock handles messages it beats at the start of a message when the last beat is at least this old (ms),
+/// so a stall always begins at most 1 s after a beat: 5.6 s of it are tolerated, as with the old 1 s timer.
+pub(crate) const BEAT_MIN_GAP_MS: u64 = 1000;
 /// Before the FIRST heartbeat the dock may still be starting (waiting for Shell_TrayWnd, ...):
 /// a much wider tolerance (10 timeouts, 33 s).
 const MAX_MISSED_BEFORE_FIRST: u32 = 10;
@@ -74,6 +81,8 @@ static HEARTBEAT_EVENT: AtomicIsize = AtomicIsize::new(0);
 static STARTUP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SHUTDOWN_EVENT: AtomicIsize = AtomicIsize::new(0);
+/// `GetTickCount64` of the last heartbeat signalled (0 = none yet). UI thread.
+static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Name of the heartbeat event for the dock with `pid`: `Local\DockHeartbeat-<pid>`.
 pub fn heartbeat_event_name(pid: u32) -> String {
@@ -262,16 +271,43 @@ fn attempt_note(label: &str, e: &windows::core::Error, exe: &str) -> Option<Stri
     Some(format!("spawn: CreateProcessW of {exe} ({label}) failed: {e}"))
 }
 
-/// Signals the heartbeat (`SetEvent`). Does not block; no-op if `spawn` did not succeed.
-/// UI thread, `TIMER_SECOND`.
+/// Signals the heartbeat (`SetEvent`) and remembers when. Does not block; no-op if `spawn` did not succeed.
+/// UI thread: `beat_if_due` and `TIMER_SECOND`.
 pub fn heartbeat() {
     let raw = HEARTBEAT_EVENT.load(Relaxed);
     if raw == 0 {
         return;
     }
+    // SAFETY: no preconditions.
+    LAST_BEAT_MS.store(unsafe { GetTickCount64() }, Relaxed);
     // SAFETY: handle valid until `shutdown` closes it (same UI thread).
     let _ = unsafe { SetEvent(to_handle(raw)) };
     probe!(crate::probe::bump(crate::probe::C::Heartbeat));
+}
+
+/// true when a beat is due: the last one is at least `BEAT_MIN_GAP_MS` old (a clock read before it is not).
+fn beat_due(now_ms: u64, last_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) >= BEAT_MIN_GAP_MS
+}
+
+/// The heartbeat at the start of a message (UI thread: `wnd_proc`, the message loop): beats when the last beat is at
+/// least 1 s old. true when it called `heartbeat` (which stays a no-op when `spawn` did not succeed).
+pub fn beat_if_due() -> bool {
+    // SAFETY: no preconditions.
+    let now = unsafe { GetTickCount64() };
+    if beat_due(now, LAST_BEAT_MS.load(Relaxed)) {
+        heartbeat();
+        true
+    } else {
+        false
+    }
+}
+
+/// Age (ms) of the last heartbeat, for the wake probe's stall line.
+#[cfg(feature = "wake-probe")]
+pub fn beat_age_ms() -> u64 {
+    // SAFETY: no preconditions.
+    unsafe { GetTickCount64() }.saturating_sub(LAST_BEAT_MS.load(Relaxed))
 }
 
 /// Startup heartbeat (`taskbar::init`, waiting for `Shell_TrayWnd`): resets the watchdog count
@@ -605,6 +641,30 @@ mod tests {
         assert!(beat_fits(3000, WAIT_MS), "the idle keepalive of 3 s");
         assert!(beat_fits(1000, WAIT_MS), "the 1 s beat of today");
         assert!(!beat_fits(3100, WAIT_MS));
+    }
+
+    /// The stall a hang restore tolerates when it begins `beat_age_ms` after the last beat.
+    fn stall_tolerance_ms(beat_age_ms: u32) -> u32 {
+        silence_ms(true) - beat_age_ms
+    }
+
+    #[test]
+    fn a_beat_at_most_once_a_second() {
+        assert!(beat_due(1000, 0));
+        assert!(!beat_due(999, 0));
+        assert!(!beat_due(5, 10), "a clock read before the last beat");
+        assert!(beat_due(u64::MAX, 0));
+    }
+
+    #[test]
+    fn the_keepalive_fits_the_wait() {
+        assert!(beat_fits(HEARTBEAT_MS, WAIT_MS), "an idle dock's 3 s keepalive lands inside one 3.3 s wait");
+    }
+
+    #[test]
+    fn the_stall_tolerance_is_unchanged() {
+        let gap = u32::try_from(BEAT_MIN_GAP_MS).unwrap();
+        assert_eq!(stall_tolerance_ms(gap), 5600, "a stall begins at most 1 s after a beat: 5.6 s tolerated, as today");
     }
 
     #[test]

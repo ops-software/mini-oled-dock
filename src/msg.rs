@@ -127,8 +127,10 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_HOUSEKEEPING: usize = 2;
 /// 30 s: RAM log (private working set). Handled by `main`.
 pub const TIMER_RAM: usize = 3;
-/// 1 s: heartbeat to the watchdog (`watchdog::heartbeat`) + taskbar safety timer
-/// (`taskbar::on_safety_timer`). Handled by `main`.
+/// 3 s (`watchdog::HEARTBEAT_MS`): keepalive heartbeat of an idle dock + taskbar safety check
+/// (`taskbar::on_safety_timer`); while messages flow the heartbeat comes from `watchdog::beat_if_due` in `wnd_proc` (dock
+/// window, the shell hook's messages excepted) and in the loop (other windows, thread messages), at most once a second.
+/// Handled by `main`.
 pub const TIMER_SECOND: usize = 4;
 /// 5 s: window list reconciliation (`ui::on_reconcile`). Handled by `ui`.
 pub const TIMER_RECONCILE: usize = 5;

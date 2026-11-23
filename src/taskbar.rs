@@ -67,6 +67,8 @@ static EDGE_HOLDER: AtomicIsize = AtomicIsize::new(0);
 /// Taskbar state (`ABS_*`) of the last `ABM_GETSTATE` read by `hide_all`, or `STATE_UNREAD` / `STATE_UNKNOWN`:
 /// a change is logged once, so the log tells whether Explorer turned auto-hide off by itself or kept it off.
 static LAST_STATE: AtomicU32 = AtomicU32::new(STATE_UNREAD);
+/// Times this process's safety check found a visible taskbar (`on_safety_timer`, `safety_logs`).
+static SAFETY_FINDS: AtomicU32 = AtomicU32::new(0);
 /// Monotonic time reference of the process.
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -1030,8 +1032,9 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
     hide_all();
 }
 
-/// 1 s safety timer (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
-/// no longer a window (`holder_left`), redoes `hide_all()`.
+/// 3 s safety check (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
+/// no longer a window (`holder_left`), redoes `hide_all()`. A visible taskbar is logged for the first 20 times
+/// (`safety_logs`): the event path should have hidden it already.
 /// No-op if `HIDDEN` is false or if the taskbar was restored from outside (see `restored_externally`).
 pub fn on_safety_timer() {
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
@@ -1047,8 +1050,18 @@ pub fn on_safety_timer() {
         return;
     }
     if native_taskbars().into_iter().any(is_visible) {
+        let n = SAFETY_FINDS.fetch_add(1, Relaxed);
+        if safety_logs(n) {
+            log!("taskbar: safety check found a visible taskbar ({}), hiding it again", n + 1);
+        }
         hide_all();
     }
+}
+
+/// Whether the safety check's find number `count` (from 0) is logged: the first 20 per process, so a taskbar that
+/// stays visible (Explorer hung) does not log every 3 s.
+fn safety_logs(count: u32) -> bool {
+    count < 20
 }
 
 /// `TaskbarCreated` message (Explorer restarted): redoes self-heal + state saving (only if the
@@ -1362,6 +1375,14 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wsC Q7: the safety check's line is logged for the first 20 hits of a process, not every 3 s.
+    #[test]
+    fn the_safety_line_is_capped() {
+        assert!(safety_logs(0));
+        assert!(safety_logs(19));
+        assert!(!safety_logs(20));
+    }
 
     /// Only a timed-out direct send on the UI thread skips SHAppBarMessage (review of 7232226: its forward through the
     /// dock's tray host restarts its 3 s at each icon apps send the host); a refused send and other threads keep it.

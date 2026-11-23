@@ -460,9 +460,19 @@ fn auto_install_busy(popup: bool, settings: bool, fullscreen: bool) -> bool {
 
 // ------------------------------------------------------------ window proc
 
+/// Whether a message to the dock window beats (`watchdog::beat_if_due`): all but the shell hook's (`shell_msg`, 0 while
+/// no shell hook is registered).
+fn beats_for(m: u32, shell_msg: u32) -> bool {
+    shell_msg == 0 || m != shell_msg
+}
+
 /// "Core" messages handled here (exit, keyboard hook, service timers, taskbar, session);
 /// everything else goes to `ui::handle_message`, and if the UI does not handle it either, to `DefWindowProcW`.
 unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // The heartbeat at the start of every message to the dock window, posted or sent, at most once a second (wsC Q7): a
+    // stall begins inside a message, so at most 1 s after a beat. Not for the shell hook's message: its handler cannot
+    // stall, and its HSHELL_REDRAW alone would beat about once a second.
+    let beat = beats_for(m, ui::shell_hook_msg()) && watchdog::beat_if_due();
     match m {
         WM_TIMER => match wp.0 {
             TIMER_HOUSEKEEPING => {
@@ -490,7 +500,10 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 LRESULT(0)
             }
             TIMER_SECOND => {
-                watchdog::heartbeat();
+                // The idle keepalive: the line above has beaten for this tick unless a beat came less than 1 s before.
+                if !beat {
+                    watchdog::heartbeat();
+                }
                 taskbar::on_safety_timer();
                 LRESULT(0)
             }
@@ -719,6 +732,11 @@ fn message_loop() {
         if r.0 < 0 {
             log!("GetMessageW error");
             break;
+        }
+        // The dock window's messages beat in `wnd_proc`; the others (popups, Settings, thread messages) here, so no
+        // message beats twice.
+        if msg.hwnd != hwnd() {
+            watchdog::beat_if_due();
         }
         // SAFETY: `msg` was just filled by GetMessageW.
         unsafe {
@@ -1076,7 +1094,7 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     // Service timers (the UI ones are armed by `ui::attach`).
     set_timer(h, TIMER_HOUSEKEEPING, 2000);
     set_timer(h, TIMER_RAM, 30_000);
-    set_timer(h, TIMER_SECOND, 1000);
+    set_timer(h, TIMER_SECOND, watchdog::HEARTBEAT_MS);
     update::init(h);
     mem::log_memory();
 
@@ -1349,6 +1367,15 @@ mod tests {
         let n = std::cell::Cell::new(0);
         probe!(n.set(1));
         assert_eq!(n.get(), if cfg!(feature = "wake-probe") { 1 } else { 0 });
+    }
+
+    #[test]
+    fn shell_hook_messages_do_not_beat() {
+        const SHELL: u32 = 0xC123;
+        assert!(!beats_for(SHELL, SHELL), "the shell hook's message never beats");
+        assert!(beats_for(WM_TIMER, SHELL));
+        assert!(beats_for(WM_TIMER, 0));
+        assert!(beats_for(0, 0), "no shell hook registered: every message beats");
     }
 
     #[test]

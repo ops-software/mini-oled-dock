@@ -460,6 +460,11 @@ pub fn attach(h: HWND) -> Result<(), String> {
     Ok(())
 }
 
+/// Id of the registered "SHELLHOOK" window message, 0 while none is registered (`main::wnd_proc`: it does not beat).
+pub(crate) fn shell_hook_msg() -> u32 {
+    SHELLHOOK_MSG.load(Relaxed)
+}
+
 /// All window messages NOT handled directly by `main`. Returns `None` if the
 /// message is of no interest (then `main` calls `DefWindowProcW`). Messages the UI must handle:
 ///  * `WM_TIMER` for `TIMER_POLL`, `TIMER_RECONCILE`, `TIMER_APPS_DEBOUNCE`, `TIMER_ANIM`, `TIMER_CLOCK`;
