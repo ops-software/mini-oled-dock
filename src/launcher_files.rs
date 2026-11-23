@@ -816,9 +816,9 @@ mod tests {
 
     #[test]
     fn the_accepted_folders_reach_the_helper() {
-        let roots = ["D:\\".to_string(), "\\\\nas\\share docs".into()];
+        let roots = ["D:\\".to_string(), "E:\\Old docs".into()];
         let args = helper_args(None, &roots);
-        assert_eq!(args, ["--launcher-files", "--root", "D:\\", "--root", "\\\\nas\\share docs"]);
+        assert_eq!(args, ["--launcher-files", "--root", "D:\\", "--root", "E:\\Old docs"]);
         // The helper reads them back as its folders (and checks them again, with_folders in files_child.rs).
         let parsed = crate::parse_args_from(args.iter().map(|s| s.to_string())).unwrap();
         assert!(parsed.launcher_files && parsed.roots == roots);

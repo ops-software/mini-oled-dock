@@ -1458,8 +1458,8 @@ mod tests {
         assert!(stalled.is_err(), "no --stall in a release build");
         // The folders of launcher.file_folders the dock passes: only with the helper, at most 8, each bounded.
         let edge = format!("D:\\{}", "d".repeat(257));
-        let f = p(&["--launcher-files", "--root", "D:\\", "--root", "\\\\nas\\share docs", "--root", &edge]).unwrap();
-        assert_eq!((f.launcher_files, f.roots), (true, vec!["D:\\".to_string(), "\\\\nas\\share docs".into(), edge]));
+        let f = p(&["--launcher-files", "--root", "D:\\", "--root", "E:\\Old docs", "--root", &edge]).unwrap();
+        assert_eq!((f.launcher_files, f.roots), (true, vec!["D:\\".to_string(), "E:\\Old docs".into(), edge]));
         assert!(p(&["--launcher-files"]).unwrap().roots.is_empty());
         let mut eight = vec!["--launcher-files"];
         for _ in 0..8 {

@@ -12,6 +12,7 @@
 
 use crate::launcher::files::{self, under, Fences, FileHit};
 use crate::launcher::providers;
+use crate::launcher_sys::same_text;
 use std::io::{BufRead, Read, Write};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -103,7 +104,7 @@ fn row_of(raw: RawRow, roots: &[String]) -> Option<FileHit> {
     };
     let dir = matches!(&raw.kind, Cell::Text(k) if k.eq_ignore_ascii_case(DIRECTORY));
     files::check_hit(&path, &name, &folder).ok()?;
-    if !roots.iter().any(|r| under(&path, r)) {
+    if !roots.iter().any(|r| under(&path, r, same_text)) {
         return None;
     }
     Some(FileHit { path: path.into(), name: name.into(), folder: folder.into(), dir, dangerous: false })
@@ -287,7 +288,7 @@ fn search_running() -> bool {
 /// of the user can point at C:\Users or C:\, where the helper's elevated token would let the index list other accounts'
 /// files; the known folders that HKCU also holds join only as `files::root_of` accepts them (`with_folders`).
 fn roots_of(profile: String, common: String) -> Vec<String> {
-    if under(&profile, &common) {
+    if under(&profile, &common, same_text) {
         vec![profile]
     } else {
         vec![profile, common]
@@ -331,6 +332,7 @@ fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
             profiles: path(&FOLDERID_UserProfiles)?,
             profile: profile.clone(),
             accounts: crate::launcher_sys::profile_folders()?,
+            same: same_text,
         })
     };
     let fences = fences();
@@ -668,6 +670,7 @@ mod tests {
             profiles: "C:\\Users".into(),
             profile: "C:\\Users\\a".into(),
             accounts: vec!["C:\\Users\\a".into(), "C:\\Users\\b".into()],
+            same: same_text,
         }
     }
 
@@ -690,20 +693,24 @@ mod tests {
         ]);
         let want = ["C:\\Users\\a", common, "D:\\Docs", "D:\\Downloads", "E:\\Media\\Pictures", "E:\\Media\\Music"];
         assert_eq!(with_folders(roots(), &known, &[], Some(&f)), want);
-        // A known folder pointed at another account's profile, the profiles folder, a drive or share root, the
-        // Windows tree or an odd path is refused.
+        // A known folder pointed at another account's profile (in any spelling), the profiles folder, a drive root, a
+        // share, the Windows tree or an odd path is refused.
         let bad = strings(&[
             "C:\\Users\\b\\Documents",
+            "C:\\Users\\a\\..\\b\\Documents",
+            "C:\\Users\\B~1\\Documents",
             "C:\\Users",
             "D:\\",
             "C:\\",
             "C:\\Windows\\Temp",
-            "\\\\nas\\share",
+            "\\\\nas\\share\\Docs",
+            "\\\\localhost\\Users\\b\\Documents",
+            "\\\\?\\C:\\Users\\b\\Documents",
             "\\\\nas\\c$\\Users",
             "Docs",
         ]);
         assert_eq!(with_folders(roots(), &bad, &[], Some(&f)), roots());
-        // The user's own folders may be a drive or a share root; never C:\ or another profile; at most 8 are read.
+        // The user's own folders may be a drive root; never a share, C:\ or another profile; at most 8 are read.
         let extra = strings(&[
             "D:\\",
             "\\\\nas\\share",
@@ -721,7 +728,6 @@ mod tests {
             "E:\\Media\\Pictures",
             "E:\\Media\\Music",
             "D:\\",
-            "\\\\nas\\share",
             "F:\\Archive",
             "G:\\Photos",
             "H:\\Music",
@@ -735,28 +741,31 @@ mod tests {
     #[test]
     fn the_scope_binds_the_accepted_roots() {
         let known = strings(&["D:\\Docs", "C:\\Users\\b\\Documents"]);
-        let roots =
-            with_folders(roots(), &known, &strings(&["\\\\nas\\share", "E:\\O'Brien", "C:\\"]), Some(&fences()));
+        let extra = strings(&["\\\\nas\\share", "E:\\O'Brien", "C:\\", "f:/Data/./x/../Média."]);
+        let roots = with_folders(roots(), &known, &extra, Some(&fences()));
         let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+        // Each root in the text Windows reads it as: the scope and the row fence use that text.
         assert_eq!(
             files::scope_clause(&refs).unwrap(),
             "SCOPE='file:C:\\Users\\a' OR SCOPE='file:C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\' OR \
-             SCOPE='file:D:\\Docs' OR SCOPE='file:\\\\nas\\share' OR SCOPE='file:E:\\O''Brien'"
+             SCOPE='file:D:\\Docs' OR SCOPE='file:E:\\O''Brien' OR SCOPE='file:f:\\Data\\Média'"
         );
-        // The rows: only those under an accepted root pass the fence.
+        // The rows: only those under an accepted root pass the fence, in any case of its letters.
         let rows = [
             "D:\\Docs\\quokka.txt",
-            "\\\\nas\\share\\quokka.txt",
             "E:\\O'Brien\\quokka.txt",
+            "F:\\DATA\\MÉDIA\\quokka.txt",
+            "\\\\nas\\share\\quokka.txt",
             "C:\\Users\\b\\Documents\\quokka.txt",
             "D:\\Docs2\\quokka.txt",
             "D:\\quokka.txt",
             "C:\\quokka.txt",
+            "F:\\Data\\x\\quokka.txt",
         ];
         let raws: Vec<RawRow> = rows.iter().map(|p| raw(p, "quokka.txt", text("x"), "x")).collect();
         let (hits, skipped) = collect(&mut Fake(raws.into_iter()), &roots, &mut |_| false);
         let paths: Vec<&str> = hits.iter().map(|h| &*h.path).collect();
-        assert_eq!((paths, skipped), (rows[..3].to_vec(), 4));
+        assert_eq!((paths, skipped), (rows[..3].to_vec(), 6));
     }
 
     #[test]

@@ -16,7 +16,8 @@ use windows::Win32::Foundation::{
     INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Globalization::{
-    GetLocaleInfoEx, LOCALE_ITIME, LOCALE_SDECIMAL, LOCALE_SSHORTDATE, LOCALE_STHOUSAND,
+    CompareStringOrdinal, GetLocaleInfoEx, CSTR_EQUAL, LOCALE_ITIME, LOCALE_SDECIMAL, LOCALE_SSHORTDATE,
+    LOCALE_STHOUSAND,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
@@ -718,7 +719,16 @@ pub(crate) fn file_fences() -> Option<crate::launcher::files::Fences> {
         profiles: s(&FOLDERID_UserProfiles)?,
         profile: s(&FOLDERID_Profile)?,
         accounts: profile_folders()?,
+        same: same_text,
     })
+}
+
+/// Whether two names are the same to the file system: ordinal, the case folded by the system's table (CompareStringOrdinal
+/// with bIgnoreCase), never by ASCII rules alone; no file is touched. The fences' comparison (`files::Same`) in the dock
+/// and the files helper.
+pub(crate) fn same_text(a: &[u16], b: &[u16]) -> bool {
+    // SAFETY: two slices, read for their lengths only.
+    a.len() == b.len() && unsafe { CompareStringOrdinal(a, b, true) } == CSTR_EQUAL
 }
 
 /// At most this many ProfileList entries are read; a longer list counts as unreadable.
@@ -1254,6 +1264,34 @@ mod tests {
         assert!(accounts.iter().any(|a| trim(a).eq_ignore_ascii_case(&trim(&profile))), "the user's profile is listed");
         let fences = file_fences().expect("the fences read whole");
         assert!(crate::launcher::files::root_of(&format!("{profile}\\Documents"), &fences, false).is_some());
+    }
+
+    /// The system's comparison of names: the two cases of a letter of any script are one name, different letters and
+    /// lengths are not, and the fences of the files roots compare with it.
+    #[test]
+    fn names_compare_as_the_file_system_does() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        for (a, b) in [("Åsa", "åSA"), ("Ольга", "оЛЬГА"), ("Zoë", "ZOË"), ("αβγ", "ΑΒΓ"), ("abc", "ABC")]
+        {
+            assert!(same_text(&w(a), &w(b)), "{a} {b}");
+        }
+        for (a, b) in [("Asa", "Åsa"), ("ss", "ß"), ("a", "ab"), ("Ольга", "Ольгa"), ("", "a")] {
+            assert!(!same_text(&w(a), &w(b)), "{a} {b}");
+        }
+        let fences = crate::launcher::files::Fences {
+            windows: "C:\\Windows".into(),
+            program_files: vec!["C:\\Program Files".into()],
+            profiles: "C:\\Users".into(),
+            profile: "C:\\Users\\Zoë".into(),
+            accounts: vec!["C:\\Users\\zoë".into(), "D:\\Профили\\Ольга".into()],
+            same: same_text,
+        };
+        let root = |p: &str| crate::launcher::files::root_of(p, &fences, true);
+        for bad in ["d:\\профили\\ОЛЬГА\\Docs", "D:\\ПРОФИЛИ", "C:\\Users\\ZOË\\..\\Åsa"] {
+            assert_eq!(root(bad), None, "{bad:?}");
+        }
+        assert_eq!(root("c:\\users\\ZOË\\Docs").as_deref(), Some("c:\\users\\ZOË\\Docs"));
+        assert!(root("D:\\Профили\\Ольга2").is_some());
     }
 
     const CALC: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";

@@ -119,10 +119,16 @@ pub const MAX_EXTRA_ROOTS: usize = 8;
 /// A root's length in UTF-16 units: a folder deeper than MAX_PATH is no root.
 pub const ROOT_UNITS: usize = 260;
 
+/// The file system's comparison of two names (UTF-16 units, ordinal, the case folded by the system's table; no file is
+/// touched): `launcher_sys::same_text`, CompareStringOrdinal with bIgnoreCase, in the dock and the helper. Pure code
+/// cannot call Windows, so the fences carry it.
+pub type Same = fn(&[u16], &[u16]) -> bool;
+
 /// The folders no root may be, lie in or hold, read from known folders whose paths only an administrator can change
 /// (HKLM): the Windows folder, the Program Files folders and the profiles folder; the profile of every account Windows
-/// lists, wherever it lies; and the user's own profile, the one place inside the profiles folder a root may be.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// lists, wherever it lies; and the user's own profile, the one place inside the profiles folder a root may be. `same`
+/// compares them with a root.
+#[derive(Clone, Debug)]
 pub struct Fences {
     pub windows: String,
     pub program_files: Vec<String>,
@@ -131,69 +137,92 @@ pub struct Fences {
     /// Every account's profile folder (ProfileList, HKLM: `launcher_sys::profile_folders`), the user's own included,
     /// which fences nothing.
     pub accounts: Vec<String>,
+    pub same: Same,
 }
 
-/// `path` lies under `root`: the root (ASCII case-insensitive, a trailing separator ignored), a separator, then more.
-pub fn under(path: &str, root: &str) -> bool {
-    let root = root.strip_suffix('\\').unwrap_or(root).as_bytes();
-    let p = path.as_bytes();
-    !root.is_empty()
-        && p.len() > root.len() + 1
-        && p.get(..root.len()).is_some_and(|head| head.eq_ignore_ascii_case(root))
-        && p.get(root.len()) == Some(&b'\\')
+fn units(s: &str) -> Vec<u16> {
+    trim_sep(s).encode_utf16().collect()
+}
+
+/// `path` lies under `root`: the root (compared by `same`, a trailing separator ignored), a separator, then more.
+pub fn under(path: &str, root: &str, same: Same) -> bool {
+    let (p, r): (Vec<u16>, _) = (path.encode_utf16().collect(), units(root));
+    !r.is_empty()
+        && p.len() > r.len() + 1
+        && p.get(r.len()) == Some(&u16::from(b'\\'))
+        && p.get(..r.len()).is_some_and(|head| same(head, &r))
 }
 
 fn trim_sep(s: &str) -> &str {
     s.strip_suffix('\\').unwrap_or(s)
 }
 
-/// `a` is the folder `b` (ASCII case-insensitive, a trailing separator of either ignored) or lies under it.
-fn within(a: &str, b: &str) -> bool {
-    (!trim_sep(b).is_empty() && trim_sep(a).eq_ignore_ascii_case(trim_sep(b))) || under(a, b)
+/// `a` is the folder `b` (compared by `same`, a trailing separator of either ignored).
+fn same_folder(a: &str, b: &str, same: Same) -> bool {
+    !trim_sep(b).is_empty() && same(&units(a), &units(b))
 }
 
-/// `path` as a root of the files helper, in the form roots are compared and quoted in (`\` for each `/`, no trailing
-/// `\` but a drive root's), or None when it is no safe root (SPEC 5.4.6). A safe root is a drive path (`D:\...`) or a
-/// UNC path (`\\server\share\...`) of at most 260 UTF-16 units in the form the files reader accepts (no device or
-/// long-path prefix, no colon past the drive's, no segment of dots and spaces alone), with no control, bidi or format
-/// character, no empty segment, no segment ending in a dot or a space (Windows drops them, so the text would not name
-/// the folder Windows reads), none of `<>"|?*` and no administrative share (a share name ending in `$`); a drive root
-/// (`D:\`) or a share root (`\\server\share`) only when `drive_root` (the user's own list); neither the Windows folder
-/// nor a Program Files folder, nor inside or holding one; neither the profiles folder nor holding it nor holding the
-/// user's profile, and inside the profiles folder only inside the user's profile; neither inside nor holding another
-/// account's profile wherever it lies; so no root reaches another account's profile. A fence that is empty refuses every
-/// path.
+/// `a` is the folder `b` or lies under it.
+fn within(a: &str, b: &str, same: Same) -> bool {
+    same_folder(a, b, same) || under(a, b, same)
+}
+
+/// `path` as Windows' path normalization (GetFullPathNameW) reads a drive path, done on the text alone: `\` for each
+/// `/`, the `.` and `..` segments resolved (`..` stops at the drive), the trailing dots and spaces of the last segment
+/// dropped, no trailing `\` but a drive root's. None for any other path (UNC, device, long-path or relative: a network
+/// path can name a local folder under another spelling), and for a segment that is empty, holds a colon or one of
+/// `<>"|?*`, or holds a `~` followed by a digit (it may be the short 8.3 name of another folder: refused, never
+/// resolved), or one left before the last that ends in a dot or a space (Windows keeps some of those).
+fn canonical(path: &str) -> Option<String> {
+    let p = path.replace('/', "\\");
+    let rest = p.strip_prefix(|c: char| c.is_ascii_alphabetic())?.strip_prefix(":\\")?;
+    let body = rest.strip_suffix('\\').unwrap_or(rest);
+    let mut segs: Vec<&str> = Vec::new();
+    for s in body.split('\\').filter(|_| !body.is_empty()) {
+        let short = s.split('~').skip(1).any(|t| t.starts_with(|c: char| c.is_ascii_digit()));
+        if s.is_empty() || short || s.contains(['<', '>', '"', '|', '?', '*', ':']) {
+            return None;
+        }
+        match s {
+            "." => {}
+            ".." => {
+                segs.pop();
+            }
+            _ => segs.push(s),
+        }
+    }
+    if let Some(last) = segs.last_mut() {
+        *last = last.trim_end_matches(['.', ' ']);
+    }
+    let bad = |s: &&str| s.is_empty() || s.ends_with(['.', ' ']);
+    (!segs.iter().any(bad)).then(|| format!("{}{}", p.get(..3).unwrap_or_default(), segs.join("\\")))
+}
+
+/// `path` as a root of the files helper, in the form roots are compared and quoted in (`canonical`: the text Windows
+/// reads it as), or None when it is no safe root (SPEC 5.4.6). A safe root is a drive path (`D:\...`), never a network
+/// or device path, of at most 260 UTF-16 units once read as Windows reads it, with no control, bidi or format character
+/// and no segment `canonical` refuses; a drive root (`D:\`) only when `drive_root` (the user's own list); neither the
+/// Windows folder nor a Program Files folder, nor inside or holding one; neither the profiles folder nor holding it nor
+/// holding the user's profile, and inside the profiles folder only inside the user's profile; neither inside nor holding
+/// another account's profile wherever it lies; so no root reaches another account's profile. Every comparison is the
+/// file system's (`Fences::same`). A fence that is empty refuses every path.
 pub fn root_of(path: &str, f: &Fences, drive_root: bool) -> Option<String> {
-    if path.len() > 3 * ROOT_UNITS {
+    if path.len() > 3 * ROOT_UNITS || path.chars().any(is_hidden) {
         return None;
     }
-    let mut p = path.replace('/', "\\");
-    if p.len() > 3 && p.ends_with('\\') {
-        p.pop();
-    }
-    let unc = p.starts_with("\\\\");
-    let rest = p.get(if unc { 2 } else { 3 }..).unwrap_or_default();
-    let segs: Vec<&str> = rest.split('\\').filter(|_| !rest.is_empty()).collect();
-    let seg_ok = |s: &&str| {
-        !s.is_empty() && !s.ends_with('.') && !s.ends_with(' ') && !s.bytes().any(|c| b"<>\"|?*".contains(&c))
-    };
-    let form = p.encode_utf16().count() <= ROOT_UNITS
-        && !p.chars().any(is_hidden)
-        && path_form_ok(&p)
-        && segs.iter().all(seg_ok)
-        && (!unc || segs.get(1).is_some_and(|share| !share.ends_with('$')));
-    let top = segs.len() == if unc { 2 } else { 0 };
-    let apart = |fence: &str| !fence.is_empty() && !within(&p, fence) && !under(fence, &p);
-    let other = |a: &&String| !trim_sep(a).eq_ignore_ascii_case(trim_sep(&f.profile));
+    let p = canonical(path).filter(|p| p.encode_utf16().count() <= ROOT_UNITS && (drive_root || p.len() > 3))?;
+    let same = f.same;
+    let apart = |fence: &str| !fence.is_empty() && !within(&p, fence, same) && !under(fence, &p, same);
+    let other = |a: &&String| !same_folder(a, &f.profile, same);
     let fenced = f.program_files.iter().chain([&f.windows]).all(|d| apart(d))
         && !f.profile.is_empty()
         && !f.profiles.is_empty()
         && !f.accounts.is_empty()
-        && !within(&f.profiles, &p)
-        && !under(&f.profile, &p)
-        && (!under(&p, &f.profiles) || within(&p, &f.profile))
-        && f.accounts.iter().filter(other).all(|a| !within(&p, a) && !under(a, &p));
-    (form && (drive_root || !top) && fenced).then_some(p)
+        && !within(&f.profiles, &p, same)
+        && !under(&f.profile, &p, same)
+        && (!under(&p, &f.profiles, same) || within(&p, &f.profile, same))
+        && f.accounts.iter().filter(other).all(|a| !within(&p, a, same) && !under(a, &p, same));
+    fenced.then_some(p)
 }
 
 /// Adds each of `folders` that `root_of` accepts to `roots`, unless a root already holds it; the roots it holds leave.
@@ -208,9 +237,9 @@ pub fn add_roots<'a>(
     for folder in folders {
         match root_of(folder, f, drive_root) {
             None => refused += 1,
-            Some(r) if roots.iter().any(|a| within(&r, a)) => {}
+            Some(r) if roots.iter().any(|a| within(&r, a, f.same)) => {}
             Some(r) => {
-                roots.retain(|a| !under(a, &r));
+                roots.retain(|a| !under(a, &r, f.same));
                 roots.push(r);
             }
         }
@@ -1173,6 +1202,21 @@ mod tests {
         assert_eq!(scope_clause(&[&"e".repeat(1_025)]), Err(Refusal::TooLong));
     }
 
+    /// The tests' stand-in for the system's comparison of names (`launcher_sys::same_text`, CompareStringOrdinal): each
+    /// UTF-16 unit upper-cased alone.
+    fn same(a: &[u16], b: &[u16]) -> bool {
+        let up = |u: &u16| {
+            char::from_u32(u32::from(*u)).map_or(u32::from(*u), |c| {
+                let mut up = c.to_uppercase();
+                match (up.next(), up.next()) {
+                    (Some(x), None) => u32::from(x),
+                    _ => u32::from(c),
+                }
+            })
+        };
+        a.len() == b.len() && a.iter().map(up).eq(b.iter().map(up))
+    }
+
     fn fences() -> Fences {
         Fences {
             windows: "C:\\Windows".into(),
@@ -1182,19 +1226,19 @@ mod tests {
             accounts: ["C:\\Windows\\system32\\config\\systemprofile", "C:\\Users\\a", "C:\\Users\\b"]
                 .map(String::from)
                 .to_vec(),
+            same,
         }
     }
 
     #[test]
     fn a_root_is_accepted_only_when_safe() {
         let f = fences();
-        // Known folders moved to other drives or to a share are roots, in one form; so is a folder of the profile.
+        // Known folders moved to other drives are roots, in one form; so is a folder of the profile.
         for (path, root) in [
             ("D:\\Docs", "D:\\Docs"),
             ("E:\\Media\\Pictures\\", "E:\\Media\\Pictures"),
             ("d:/docs/2026", "d:\\docs\\2026"),
-            ("\\\\nas\\share\\docs", "\\\\nas\\share\\docs"),
-            ("//nas/share/docs/", "\\\\nas\\share\\docs"),
+            ("D:\\Backup~old", "D:\\Backup~old"),
             ("C:\\Users\\a\\Documents", "C:\\Users\\a\\Documents"),
             ("c:\\users\\A", "c:\\users\\A"),
             ("C:\\Data", "C:\\Data"),
@@ -1205,19 +1249,14 @@ mod tests {
             assert_eq!(root_of(path, &f, false).as_deref(), Some(root), "{path:?}");
             assert_eq!(root_of(path, &f, true).as_deref(), Some(root), "{path:?}");
         }
-        // A drive root or a share root: only in the user's own list.
-        for (top, root) in [
-            ("D:\\", "D:\\"),
-            ("e:/", "e:\\"),
-            ("\\\\nas\\share", "\\\\nas\\share"),
-            ("\\\\nas\\share\\", "\\\\nas\\share"),
-        ] {
+        // A drive root: only in the user's own list.
+        for (top, root) in [("D:\\", "D:\\"), ("e:/", "e:\\"), ("F:\\\\", "F:\\")] {
             assert_eq!(root_of(top, &f, false), None, "{top:?}");
             assert_eq!(root_of(top, &f, true).as_deref(), Some(root), "{top:?}");
         }
         // Never: the drive that holds Windows and the profiles, the system trees, the profiles folder, another
-        // account's profile, the public one, relative and odd paths, a device or long-path prefix, an administrative
-        // share, a hidden character, an over-long path.
+        // account's profile, the public one, relative and odd paths, every network or device path (a share can name a
+        // local folder under another spelling: \\localhost\Users), a hidden character, an over-long path.
         let long = format!("D:\\{}", "d".repeat(258));
         for bad in [
             "C:\\",
@@ -1238,10 +1277,6 @@ mod tests {
             "\\Docs",
             "C:",
             "C:Docs",
-            "D:\\a\\..\\b",
-            "D:\\a\\.",
-            "D:\\a.",
-            "D:\\a ",
             "D:\\a\\\\b",
             "D:\\a\\\\",
             "D:\\a:b",
@@ -1251,8 +1286,19 @@ mod tests {
             "D:\\a\"b",
             "D:\\a<b",
             "\\\\?\\D:\\Docs",
+            "\\\\?\\UNC\\nas\\share",
             "\\\\.\\D:",
+            "\\\\.\\D:\\Docs",
+            "\\??\\D:\\Docs",
+            "//?/D:/Docs",
             "\\\\nas",
+            "\\\\nas\\share",
+            "\\\\nas\\share\\",
+            "\\\\nas\\share\\docs",
+            "//nas/share/docs/",
+            "\\\\localhost\\Users",
+            "\\\\localhost\\Users\\b\\Documents",
+            "\\\\127.0.0.1\\share",
             "\\\\nas\\c$\\Users",
             "\\\\localhost\\C$",
             "\\\\nas\\share$",
@@ -1292,10 +1338,83 @@ mod tests {
             Fences { profile: String::new(), ..fences() },
             Fences { program_files: vec![String::new()], ..fences() },
             Fences { accounts: Vec::new(), ..fences() },
-            Fences::default(),
+            Fences {
+                windows: String::new(),
+                program_files: Vec::new(),
+                profiles: String::new(),
+                profile: String::new(),
+                accounts: Vec::new(),
+                same,
+            },
         ] {
             assert_eq!(root_of("D:\\Docs", &missing, true), None, "{missing:?}");
         }
+    }
+
+    /// A root is fenced and quoted in the text Windows reads it as (`canonical`), so another spelling of a fenced folder
+    /// is fenced; a segment that may be a short 8.3 name is refused, never resolved.
+    #[test]
+    fn a_root_is_read_as_windows_reads_it() {
+        let f = fences();
+        for (path, root) in [
+            ("D:\\a\\..\\b", "D:\\b"),
+            ("D:\\a\\.", "D:\\a"),
+            ("D:\\a\\.\\b\\", "D:\\a\\b"),
+            ("D:\\a.", "D:\\a"),
+            ("D:\\a. . ", "D:\\a"),
+            ("D:\\a\\b.\\..\\c", "D:\\a\\c"),
+            ("d:/a/b/../../c", "d:\\c"),
+            ("D:\\..\\..\\Docs", "D:\\Docs"),
+            ("C:\\Users\\a\\x\\..\\Documents", "C:\\Users\\a\\Documents"),
+        ] {
+            assert_eq!(root_of(path, &f, false).as_deref(), Some(root), "{path:?}");
+        }
+        assert_eq!(root_of("D:\\Docs\\..", &f, true).as_deref(), Some("D:\\"));
+        assert_eq!(root_of("D:\\Docs\\..", &f, false), None, "a drive root only in the user's own list");
+        for bad in [
+            "C:\\Users\\a\\..\\b",
+            "c:/users/a/../B/Documents",
+            "C:\\Users\\.\\b",
+            "C:\\Users\\a\\..",
+            "C:\\Users\\b.",
+            "C:\\Users\\b . ",
+            "C:\\Data\\..\\Windows\\Temp",
+            "C:\\Program Files.\\",
+            "D:\\Docs\\..\\..\\..\\C:\\Windows",
+            "D:\\a\\...",
+            "D:\\a.\\b",
+            "D:\\a \\b",
+            // A possible short name.
+            "C:\\Users\\OTHERU~1",
+            "C:\\Users\\OTHERU~1\\Documents",
+            "C:\\PROGRA~1\\Tool",
+            "D:\\DOCUME~2",
+            "D:\\a\\b~9c\\d",
+            "D:\\x~1\\..\\Docs",
+            "C:\\Users\\a\\MYDOCU~1",
+        ] {
+            assert_eq!(root_of(bad, &f, false), None, "{bad:?}");
+            assert_eq!(root_of(bad, &f, true), None, "{bad:?}");
+        }
+    }
+
+    /// The fences compare names as the file system does (`Fences::same`): another case of a non-ASCII letter names the
+    /// same folder.
+    #[test]
+    fn fences_compare_names_as_the_file_system_does() {
+        let accounts = ["C:\\Users\\Zoë", "C:\\Users\\Åsa", "D:\\Профили\\Ольга"];
+        let f = Fences { profile: "C:\\Users\\Zoë".into(), accounts: accounts.map(String::from).to_vec(), ..fences() };
+        for bad in
+            ["D:\\профили\\ОЛЬГА", "d:\\ПРОФИЛИ\\ольга\\Docs", "D:\\ПРОФИЛИ", "C:\\Users\\åSA\\Documents", "C:\\USERS"]
+        {
+            assert_eq!(root_of(bad, &f, true), None, "{bad:?}");
+        }
+        for good in ["C:\\Users\\ZOË\\Documents", "c:\\users\\zoë\\Desktop", "D:\\Профили2", "D:\\Профили\\Ольга2"]
+        {
+            assert!(root_of(good, &f, true).is_some(), "{good:?}");
+        }
+        assert!(under("D:\\ДОКИ\\x", "d:\\доки\\", same));
+        assert!(!under("D:\\Докиx\\y", "D:\\Доки", same) && !under("D:\\Доки", "D:\\Доки", same));
     }
 
     #[test]
@@ -1330,8 +1449,8 @@ mod tests {
         .map(String::from)
         .to_vec();
         let (roots, ignored) = extra_roots(&list, Some(&f));
-        assert_eq!(roots, ["D:\\", "E:\\Archive", "\\\\nas\\share", "F:\\A"]);
-        assert_eq!(ignored, 3 + 2, "three refused, two past the 8th; a folder inside another is no error");
+        assert_eq!(roots, ["D:\\", "E:\\Archive", "F:\\A"]);
+        assert_eq!(ignored, 4 + 2, "four refused (a share too), two past the 8th; a folder inside another is no error");
         assert_eq!(extra_roots(&list, None), (Vec::new(), 10));
         assert_eq!(extra_roots(&[], Some(&f)), (Vec::new(), 0));
     }

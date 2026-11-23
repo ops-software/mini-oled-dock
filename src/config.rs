@@ -2037,6 +2037,7 @@ mod tests {
             profiles: "C:\\Users".into(),
             profile: "C:\\Users\\a".into(),
             accounts: vec!["C:\\Users\\a".into()],
+            same: crate::launcher_sys::same_text,
         };
         for e in &examples {
             assert_eq!(crate::launcher::files::root_of(e, &f, true).as_deref(), Some(e.as_str()), "{e:?}");
