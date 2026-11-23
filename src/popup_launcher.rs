@@ -2978,6 +2978,11 @@ pub(crate) fn on_config() {
                 log!("launcher: chord on");
                 // The catalogue is listed 10 s from now, off the first open's path.
                 crate::launcher_sys::arm_once(crate::msg::TIMER_LAUNCHER_WARM, WARM_MS);
+                // L3 KEY-11: an open before the warm would compute the settings key and fault the cache file in on the UI
+                // thread (2.5-3.0 ms measured, against 1.1-1.2 ms for every later open): both are done now, off it.
+                if with_ctrl(|c| warm_settings_due(&c.opts)) == Some(true) {
+                    start_search::prime_launcher_settings();
+                }
                 if !REGISTERED.with(|r| r.replace(true)) {
                     crate::launcher_sys::watch_sessions();
                 }

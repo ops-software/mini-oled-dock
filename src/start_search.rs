@@ -491,6 +491,8 @@ struct Shared {
     start: AtomicBool,
     ensure: AtomicBool,
     rebuild: AtomicBool,
+    /// The key and the cache file's pages made ready for the launcher's first open (`prime_launcher_settings`).
+    prime: AtomicBool,
     /// A settings thread runs (or is being started).
     thread: AtomicBool,
 }
@@ -501,6 +503,7 @@ struct Asked {
     start: bool,
     ensure: bool,
     rebuild: bool,
+    prime: bool,
 }
 
 impl Shared {
@@ -511,6 +514,7 @@ impl Shared {
             start: AtomicBool::new(false),
             ensure: AtomicBool::new(false),
             rebuild: AtomicBool::new(false),
+            prime: AtomicBool::new(false),
             thread: AtomicBool::new(false),
         }
     }
@@ -521,7 +525,9 @@ impl Shared {
 
     /// A caller's request: its flags set first, then true when the caller must start the thread (none runs).
     fn ask(&self, a: Asked) -> bool {
-        for (wanted, flag) in [(a.start, &self.start), (a.ensure, &self.ensure), (a.rebuild, &self.rebuild)] {
+        for (wanted, flag) in
+            [(a.start, &self.start), (a.ensure, &self.ensure), (a.rebuild, &self.rebuild), (a.prime, &self.prime)]
+        {
             if wanted {
                 flag.store(true, SeqCst);
             }
@@ -535,6 +541,7 @@ impl Shared {
             start: self.start.swap(false, SeqCst),
             ensure: self.ensure.swap(false, SeqCst),
             rebuild: self.rebuild.swap(false, SeqCst),
+            prime: self.prime.swap(false, SeqCst),
         }
     }
 
@@ -542,7 +549,8 @@ impl Shared {
     /// and runs again (false); if a caller started a new thread in between, that one serves it and this one exits.
     fn done(&self) -> bool {
         self.thread.store(false, SeqCst);
-        let pending = self.start.load(SeqCst) || self.ensure.load(SeqCst) || self.rebuild.load(SeqCst);
+        let pending =
+            self.start.load(SeqCst) || self.ensure.load(SeqCst) || self.rebuild.load(SeqCst) || self.prime.load(SeqCst);
         !(pending && self.thread.compare_exchange(false, true, SeqCst, SeqCst).is_ok())
     }
 
@@ -593,6 +601,23 @@ pub(crate) fn load_settings() {
 /// the end of the run, `StartSettingsReady` is posted (an open launcher maps it then).
 pub(crate) fn ensure_settings_cache(rebuild: bool) {
     request(Asked { ensure: true, rebuild, ..Asked::default() });
+}
+
+/// The launcher (L3 KEY-11), when a chord is set (the dock's start included): what its first open would otherwise do on
+/// the UI thread is done here, on the settings thread at background priority, once: the cache key computed and stored for
+/// `expected_settings_key`, and the cache file's pages brought into the system cache (`touch_pages`: mapped read-only,
+/// one byte read per page, unmapped; no heap, no check, nothing kept). Nothing is built, written or posted.
+pub(crate) fn prime_launcher_settings() {
+    request(Asked { prime: true, ..Asked::default() });
+}
+
+/// Maps `path` read-only and reads one byte of each 4 KiB page, so the next mapping of the file finds its pages in memory
+/// (0 private bytes; the file is unmapped and closed on return). A missing or refused file is left alone.
+pub(crate) fn touch_pages(path: &Path) {
+    if let Ok(m) = crate::launcher_sys::MappedFile::open(path, CACHE_MAX) {
+        let x = m.bytes().iter().step_by(4096).fold(0u8, |a, b| a ^ b);
+        std::hint::black_box(x);
+    }
 }
 
 fn request(a: Asked) {
@@ -661,6 +686,10 @@ trait SettingsIo {
     fn write_cache(&mut self, bytes: &[u8]) -> Result<(), String>;
     /// `StartSettingsReady` to the UI: an open Start searches again, an open launcher maps the file.
     fn ready(&mut self);
+    /// `prime_launcher_settings`: the key computed and stored (`key`), and with a key the cache file's pages read in.
+    fn prime(&mut self) {
+        let _ = self.key();
+    }
 }
 
 /// A checked settings arena of this run, and whether the cache file holds exactly these bytes.
@@ -677,6 +706,10 @@ struct Made {
 fn serve(sh: &Shared, asked: Asked, io: &mut dyn SettingsIo) {
     let start = asked.start && sh.held.load(SeqCst) && sh.list().is_none();
     if !start && !asked.ensure {
+        // A prime alone; with an ensure or Start's list the run computes the key and reads the file anyway.
+        if asked.prime {
+            io.prime();
+        }
         return;
     }
     let t = Instant::now();
@@ -882,6 +915,14 @@ impl SettingsIo for RealIo {
 
     fn ready(&mut self) {
         crate::shell_thread::request(crate::shell_thread::ShellRequest::StartSettingsReady);
+    }
+
+    fn prime(&mut self) {
+        if self.key().is_some() {
+            if let Some(path) = settings_cache_path() {
+                touch_pages(&path);
+            }
+        }
     }
 }
 
@@ -1639,8 +1680,41 @@ mod tests {
         }
     }
 
-    const ENSURE: Asked = Asked { start: false, ensure: true, rebuild: false };
-    const START: Asked = Asked { start: true, ensure: false, rebuild: false };
+    const ENSURE: Asked = Asked { start: false, ensure: true, rebuild: false, prime: false };
+    const START: Asked = Asked { start: true, ensure: false, rebuild: false, prime: false };
+    const PRIME: Asked = Asked { start: false, ensure: false, rebuild: false, prime: true };
+
+    /// L3 KEY-11: a prime alone computes and stores the key and nothing else (no read, child, write or post); with an
+    /// ensure in the same run the ensure's own key and read serve it.
+    #[test]
+    fn a_prime_only_computes_the_key() {
+        let sh = Shared::new();
+        assert!(sh.ask(PRIME), "the chord was set: the thread starts");
+        let mut io = FakeIo { keys: vec![Some(key())], ..FakeIo::default() };
+        let asked = sh.take();
+        assert_eq!(asked, PRIME);
+        serve(&sh, asked, &mut io);
+        assert_eq!(io.calls, ["key"]);
+        assert!(sh.done(), "nothing else asked: the thread exits");
+        let mut io = FakeIo { keys: vec![Some(key())], ..FakeIo::default() };
+        serve(&sh, Asked { prime: true, ..ENSURE }, &mut io);
+        assert_eq!(io.calls.first().map(String::as_str), Some("key"));
+        assert!(io.calls.iter().any(|c| c == "read"), "the ensure reads the file: {:?}", io.calls);
+    }
+
+    /// L3 KEY-11: `touch_pages` reads a file through a mapping and leaves nothing open (the file can be deleted at once).
+    #[test]
+    fn touched_file_is_released() {
+        let dir = std::env::temp_dir().join(format!("dock_touch_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings-catalog.bin");
+        std::fs::write(&path, vec![7u8; 3 * 4096 + 5]).unwrap();
+        touch_pages(&path);
+        touch_pages(&dir.join("none.bin"));
+        std::fs::remove_file(&path).expect("unmapped and closed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// L3 T18: one thread serves both callers; a Start request that arrives while a launcher-only run works is served by
     /// the same thread right after it, from the file that run wrote, and a launcher-only run never fills Start's list.
@@ -1753,7 +1827,7 @@ mod tests {
             ..FakeIo::default()
         };
         assert!(sh.hold());
-        serve(&sh, Asked { start: true, ensure: true, rebuild: false }, &mut io);
+        serve(&sh, Asked { start: true, ensure: true, rebuild: false, prime: false }, &mut io);
         assert_eq!(io.calls, ["key", "read", "child", "key", "child", "key", "ready"]);
         assert!(io.file.is_none());
         assert_eq!(sh.list().as_ref().map(|l| l.len()), Some(4));
