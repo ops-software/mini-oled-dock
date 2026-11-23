@@ -36,6 +36,10 @@ pub fn hint_switch() -> &'static str {
 pub fn hint_copy() -> &'static str {
     tr("Copy · Enter", "Copia · Invio")
 }
+/// A file or folder row that has no Open (an executable while the Mark of the Web check is open): Ctrl+Enter shows it.
+pub fn hint_reveal() -> &'static str {
+    tr("Show in folder · Ctrl+Enter", "Mostra nella cartella · Ctrl+Invio")
+}
 pub fn hint_run() -> &'static str {
     tr("Run · Enter", "Esegui · Invio")
 }
@@ -367,7 +371,6 @@ pub fn files_admin_protection() -> &'static str {
 pub fn files_unavailable() -> &'static str {
     tr("File search is unavailable", "Ricerca file non disponibile")
 }
-#[allow(dead_code)] // L2-F4 draws it
 pub fn files_placeholder() -> &'static str {
     tr("Names starting with the typed words", "Nomi che iniziano con le parole scritte")
 }

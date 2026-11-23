@@ -1182,8 +1182,12 @@ impl Launcher {
         let mut extents = self.extents.borrow_mut();
         s.set_clip(Some(rect_wh(tx, f.top, room.max(0), f.bottom - f.top)));
         if text.is_empty() {
-            if self.session.chip().is_none() {
-                s.text(strings::placeholder(), tx, ty, Font::Query, WHITE, style::FG_TERTIARY);
+            match self.session.chip() {
+                None => s.text(strings::placeholder(), tx, ty, Font::Query, WHITE, style::FG_TERTIARY),
+                Some(ProviderId::Files) => {
+                    s.text(strings::files_placeholder(), tx, ty, Font::Query, WHITE, style::FG_TERTIARY)
+                }
+                Some(_) => {}
             }
         } else {
             let field = self.session.field();
@@ -1219,6 +1223,15 @@ impl Launcher {
             s.fill_rr(rect_wh(x, cy, m.px(1).max(1), ch), 0, WHITE, style::FG_HOT);
         }
         s.set_clip(None);
+        if self.session.files_busy() {
+            // The files request is taking long (FilesEvent::Slow): three dots in the right padding of the field.
+            let (d, gap) = (m.px(2).max(1), m.px(2).max(1));
+            let x0 = f.right - m.px(FIELD_PAD_R) - m.px(2);
+            let y = f.top + (f.bottom - f.top - d) / 2;
+            for i in 0..3 {
+                s.fill_rr(rect_wh(x0 + i * (d + gap), y, d, d), d / 2, WHITE, style::FG_TERTIARY);
+            }
+        }
         if lit && caret == 0 {
             // Before the first character (or the placeholder): the clip starts at `tx`, so this one is drawn outside it.
             let x = tx - m.px(1).max(1);
@@ -1506,7 +1519,9 @@ fn hint_for(item: &Item) -> Option<&'static str> {
     let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
     let verb = verbs::primary(item.kind, running);
     if !item.verbs.has(verb) {
-        return None;
+        // An executable file row has no Open (file_verbs): Ctrl+Enter shows it in its folder.
+        let is_path = matches!(item.kind, Kind::File | Kind::Folder);
+        return (is_path && item.verbs.has(Verb::Reveal)).then(strings::hint_reveal);
     }
     if item.from == ProviderId::Alias && item.kind == Kind::Command {
         // The alias prompt's row (alias rows themselves are apps, addresses, paths and lines).
@@ -3543,6 +3558,14 @@ pub(crate) enum PreviewScene {
     Alias,
     /// The alias prompt opened from Settings, "word target" typed: the "Alias" chip and the row Enter saves.
     AliasPrompt,
+    /// Mixed mode with the files' rows arrived: two apps, three file rows, the web row last (plan L2-F4).
+    Files,
+    /// The files request is taking long: the busy mark in the field, no file row yet.
+    FilesBusy,
+    /// "file " mode: eight of twenty rows shown, a glyph by class.
+    FilesMode,
+    /// "file " mode while Windows Search is off: the honest row.
+    SearchOff,
 }
 
 impl PreviewScene {
@@ -3567,6 +3590,10 @@ impl PreviewScene {
             "notice_took_over" => PreviewScene::NoticeTookOver,
             "alias" => PreviewScene::Alias,
             "alias_prompt" => PreviewScene::AliasPrompt,
+            "files" => PreviewScene::Files,
+            "files_busy" => PreviewScene::FilesBusy,
+            "files_mode" => PreviewScene::FilesMode,
+            "search_off" => PreviewScene::SearchOff,
             _ => return None,
         })
     }
@@ -3693,9 +3720,53 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::FieldPair => "",
         PreviewScene::Alias => "np",
         PreviewScene::AliasPrompt => "",
+        PreviewScene::Files | PreviewScene::FilesBusy => "notep",
+        PreviewScene::FilesMode | PreviewScene::SearchOff => "file report",
     };
     if !query.is_empty() {
         session.chars(query, &cx);
+    }
+    if matches!(scene, PreviewScene::Files | PreviewScene::FilesMode) {
+        use crate::launcher::files::{items, FileHit};
+        let hit = |name: &str, folder: &str, dir: bool| FileHit {
+            path: format!("C:\\Users\\Public\\{folder}\\{name}").into(),
+            name: name.into(),
+            folder: folder.into(),
+            dir,
+        };
+        let (words, cap, hits) = if scene == PreviewScene::Files {
+            let hits = vec![
+                hit("notepad-tips.txt", "Documents", false),
+                hit("notepad-shortcuts.pdf", "Documents", false),
+                hit("notepad-screenshot.png", "Pictures", false),
+            ];
+            (vec!["notep"], 3, hits)
+        } else {
+            let names: [(&str, &str, bool); 12] = [
+                ("report-2026.docx", "Documents", false),
+                ("report-summary.pdf", "Documents", false),
+                ("report-chart.png", "Pictures", false),
+                ("report-archive.zip", "Downloads", false),
+                ("report-tool.exe", "Downloads", false),
+                ("reports", "Documents", true),
+                ("report-draft.txt", "Desktop", false),
+                ("report-notes.md", "Desktop", false),
+                ("report-old.docx", "Archive", false),
+                ("report-photo.jpg", "Pictures", false),
+                ("report-data.csv", "Documents", false),
+                ("report-backup.7z", "Downloads", false),
+            ];
+            (vec!["report"], 20, names.iter().map(|(n, f, d)| hit(n, f, *d)).collect())
+        };
+        let batch = Batch { gen: session.gen(), from: ProviderId::Files, items: items(hits, &words, cap), done: true };
+        let _ = session.late(batch, &cx);
+    }
+    if scene == PreviewScene::FilesBusy {
+        let _ = session.files_event(crate::launcher::files::FilesEvent::Slow(session.gen()), &cx);
+    }
+    if scene == PreviewScene::SearchOff {
+        use crate::launcher::files::{FilesEvent, Why};
+        let _ = session.files_event(FilesEvent::Off(Why::SearchOff), &cx);
     }
     if scene == PreviewScene::Actions {
         let ctrl_k = KeyEvent { vk: 0x4B, mods: Mods::CTRL, repeat: false, sys: false };
@@ -6007,6 +6078,10 @@ mod tests {
             "launcher_field_pair",
             "launcher_alias",
             "launcher_alias_prompt",
+            "launcher_files",
+            "launcher_files_busy",
+            "launcher_files_mode",
+            "launcher_search_off",
         ];
         let s = surface(96);
         for n in names {
@@ -6450,6 +6525,86 @@ mod tests {
         show(&mut l, &mut sys);
         let want = format!("Shell({:?})", ShellRequest::StartIconsFor { icon_px: 24, ids: vec![NOTEPAD_ID.into()] });
         assert_eq!(asks(&sys), [want], "{:?}", sys.ops);
+    }
+
+    // ---- file rows (plan L2-F4)
+
+    fn file_batch(l: &mut Launcher, fx: &crate::launcher::providers::tests::Fx) {
+        use crate::launcher::files::{items, FileHit};
+        let hit = |name: &str, dir: bool| FileHit {
+            path: format!("C:\\x\\{name}").into(),
+            name: name.into(),
+            folder: "x".into(),
+            dir,
+        };
+        let hits =
+            vec![hit("note-a.txt", false), hit("note-b.png", false), hit("note-c.exe", false), hit("notes", true)];
+        let rows = items(hits, &["note"], 20);
+        let batch = Batch { gen: l.session.gen(), from: ProviderId::Files, items: rows, done: true };
+        assert!(l.session.late(batch, &fx.cx()));
+    }
+
+    #[test]
+    fn view_file_rows_ask_no_icons() {
+        let fx = crate::launcher::providers::tests::Fx::new();
+        let mut l = typed(&fx, "file note");
+        file_batch(&mut l, &fx);
+        let files = l.session.rows().iter().filter(|r| matches!(r.kind, Kind::File | Kind::Folder)).count();
+        assert_eq!(files, 4);
+        let mut sys = EffectSys::default();
+        let mut s = surface(96);
+        l.size(&s);
+        l.paint_on(&mut s, None, None, &mut sys);
+        let asks: Vec<&String> = sys.ops.iter().filter(|o| o.starts_with("Shell(StartIconsFor")).collect();
+        assert!(asks.is_empty(), "{:?}", sys.ops);
+        // The same rows in Mixed mode, next to the apps: the apps' ids go, no file path does.
+        let mut l = typed(&fx, "note");
+        file_batch(&mut l, &fx);
+        let mut sys = EffectSys::default();
+        l.size(&s);
+        l.paint_on(&mut s, None, None, &mut sys);
+        assert!(sys.ops.iter().all(|o| !o.contains("C:\\\\x")), "{:?}", sys.ops);
+    }
+
+    #[test]
+    fn busy_mark_only_after_slow() {
+        use crate::launcher::files::FilesEvent;
+        let fx = crate::launcher::providers::tests::Fx::new();
+        let mut l = typed(&fx, "note");
+        assert!(!l.session.files_busy());
+        let gen = l.session.gen();
+        // Another generation's Slow is not the open query's.
+        let _ = l.session.files_event(FilesEvent::Slow(gen.wrapping_sub(1)), &fx.cx());
+        assert!(!l.session.files_busy());
+        let _ = l.session.files_event(FilesEvent::Slow(gen), &fx.cx());
+        assert!(l.session.files_busy());
+        // The mark is drawn: the field differs from the same field without it.
+        let render = |l: &mut Launcher| {
+            let mut s = surface(96);
+            l.size(&s);
+            l.paint_on(&mut s, None, None, &mut EffectSys::default());
+            s.snapshot_pixels().expect("pixels").2
+        };
+        let with = render(&mut l);
+        let mut calm = typed(&fx, "note");
+        assert_ne!(with, render(&mut calm));
+        // The next keystroke ends it.
+        calm.session.chars("x", &fx.cx());
+        assert!(!calm.session.files_busy());
+    }
+
+    #[test]
+    fn executable_row_hints_show_in_folder() {
+        let fx = crate::launcher::providers::tests::Fx::new();
+        let mut l = typed(&fx, "file note");
+        file_batch(&mut l, &fx);
+        let hint = |name: &str| {
+            let item = l.session.rows().iter().find(|r| r.title.as_ref() == name).expect(name);
+            hint_for(item)
+        };
+        assert_eq!(hint("note-a.txt"), Some(strings::hint_open()));
+        assert_eq!(hint("notes"), Some(strings::hint_open()));
+        assert_eq!(hint("note-c.exe"), Some(strings::hint_reveal()));
     }
 
     #[test]
