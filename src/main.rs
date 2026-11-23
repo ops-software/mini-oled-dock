@@ -39,6 +39,7 @@ mod calendar;
 mod clock;
 mod config;
 mod datadir;
+mod files_child;
 mod glyphs;
 mod hook;
 mod i18n;
@@ -208,6 +209,11 @@ pub struct Args {
     /// `--start-icons <px>` (8-256): the icons of the AppsFolder ids on stdin made in a child of the dock at `px`, as
     /// frames on stdout (`shell_thread::run_icons_child`); combines with nothing.
     pub start_icons: Option<u32>,
+    /// `--launcher-files`: the launcher's file search in a child of the dock (`files_child::run`, plan L2-F2): request
+    /// lines on stdin, frames on stdout; combines with nothing but `--stall`.
+    pub launcher_files: bool,
+    /// `--stall <ms>` (owner-probe builds only, with `--launcher-files`): the helper sleeps before each query (V-4).
+    pub stall: Option<u32>,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -265,6 +271,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     it.next().and_then(|v| v.parse::<u32>().ok()).filter(|px| shell_thread::ICON_PX_RANGE.contains(px));
                 a.start_icons = Some(px.ok_or("--start-icons requires a pixel size from 8 to 256")?);
             }
+            "--launcher-files" => a.launcher_files = true,
+            #[cfg(feature = "owner-probe")]
+            "--stall" => a.stall = Some(it.next().and_then(|v| v.parse().ok()).ok_or("--stall requires <ms>")?),
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
@@ -282,6 +291,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     if a.start_icons.is_some() && flags > 1 {
         return Err("--start-icons cannot be combined with other arguments".into());
+    }
+    if a.stall.is_some() && !a.launcher_files {
+        return Err("--stall requires --launcher-files".into());
+    }
+    if a.launcher_files && flags > 1 + usize::from(a.stall.is_some()) {
+        return Err("--launcher-files cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
@@ -698,7 +713,7 @@ fn child_error_mode() -> THREAD_ERROR_MODE {
 
 /// Whether the arguments select a child mode of the dock; add each new child flag here (the error mode is set for them).
 fn is_child_mode(a: &Args) -> bool {
-    a.update_fetch || a.start_apps || a.start_settings || a.start_icons.is_some()
+    a.update_fetch || a.start_apps || a.start_settings || a.start_icons.is_some() || a.launcher_files
 }
 
 /// Sets `child_error_mode` for the whole process, first thing of a child mode.
@@ -1133,6 +1148,11 @@ fn main() -> std::process::ExitCode {
     if let Some(px) = args.start_icons {
         return std::process::ExitCode::from(shell_thread::run_icons_child(px).clamp(0, 255) as u8);
     }
+    // --launcher-files: the launcher's file search in a child of the dock (`files_child::run`, plan L2-F2); stdin and
+    // stdout only, no data folder, logger, mutex or console.
+    if args.launcher_files {
+        return std::process::ExitCode::from(files_child::run(args.stall.unwrap_or(0)).clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1333,7 +1353,14 @@ mod tests {
 
     #[test]
     fn the_child_modes_are_told_from_the_rest() {
-        for a in [&["--update-fetch"][..], &["--start-apps"], &["--start-settings"], &["--start-icons", "32"]] {
+        let all = [
+            &["--update-fetch"][..],
+            &["--start-apps"],
+            &["--start-settings"],
+            &["--start-icons", "32"],
+            &["--launcher-files"],
+        ];
+        for a in all {
             assert!(is_child_mode(&p(a).unwrap()), "{a:?}");
         }
         for a in [&[][..], &["--preview", "x"], &["--watchdog", "1", "ev"], &["--version"]] {
@@ -1346,7 +1373,14 @@ mod tests {
         assert_eq!(child_error_mode().0, 0x0001 | 0x0002 | 0x8000);
         let src = include_str!("main.rs");
         let call = src.find("        set_child_error_mode();").expect("the call");
-        for first in ["run_fetch_child()", "run_apps_child()", "run_settings_child()", "run_icons_child(px)"] {
+        let firsts = [
+            "run_fetch_child()",
+            "run_apps_child()",
+            "run_settings_child()",
+            "run_icons_child(px)",
+            "run(args.stall.unwrap_or(0))",
+        ];
+        for first in firsts {
             let at = src.find(&format!("::{first}.clamp")).expect(first);
             assert!(call < at, "{first} runs after the error mode is set");
         }
@@ -1379,6 +1413,28 @@ mod tests {
             assert!(p(&["--start-icons", bad]).is_err(), "{bad:?}");
         }
         assert!(p(&["--start-icons"]).is_err(), "a size is required");
+        // The files helper (plan L2-F2): alone; `--stall` only in owner-probe builds and only with it.
+        let f = p(&["--launcher-files"]).unwrap();
+        assert!(f.launcher_files && f.stall.is_none() && f.start_icons.is_none() && !f.autostart);
+        assert!(!p(&["--autostart"]).unwrap().launcher_files);
+        for bad in [
+            &["--launcher-files", "--autostart"][..],
+            &["--autostart", "--launcher-files"],
+            &["--launcher-files", "--launcher-files"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+        let stalled = p(&["--launcher-files", "--stall", "3000"]);
+        #[cfg(feature = "owner-probe")]
+        {
+            assert_eq!(stalled.unwrap().stall, Some(3000));
+            assert_eq!(p(&["--stall", "3000", "--launcher-files"]).unwrap().stall, Some(3000));
+            assert!(p(&["--stall", "3000"]).is_err(), "only with --launcher-files");
+            assert!(p(&["--launcher-files", "--stall", "x"]).is_err());
+            assert!(p(&["--launcher-files", "--stall", "1", "--autostart"]).is_err());
+        }
+        #[cfg(not(feature = "owner-probe"))]
+        assert!(stalled.is_err(), "no --stall in a release build");
     }
 
     #[test]

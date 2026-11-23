@@ -34,11 +34,11 @@ pub const MAX_ROWS: u32 = 50;
 const MAX_FRAME: usize = 256 * 1024;
 /// Column caps: bytes of UTF-8, and UTF-16 units (SPEC 5.4.6: name 260, path 1,024).
 const PATH_BYTES: (usize, usize) = (3, 3_072);
-const PATH_UNITS: usize = 1_024;
+pub const PATH_UNITS: usize = 1_024;
 const NAME_BYTES: (usize, usize) = (1, 780);
-const NAME_UNITS: usize = 260;
+pub const NAME_UNITS: usize = 260;
 const FOLDER_BYTES: (usize, usize) = (0, 780);
-const FOLDER_UNITS: usize = 260;
+pub const FOLDER_UNITS: usize = 260;
 
 const TAG_STATE: u32 = 1;
 const TAG_ROWS: u32 = 2;

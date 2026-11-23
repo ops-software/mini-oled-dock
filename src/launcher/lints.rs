@@ -9,9 +9,14 @@ const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
 const DENY: &str = "#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]";
 const OWNER_PROBE_CFG: &str = "#[cfg(feature = \"owner-probe\")]";
-/// The four launcher files that call Windows (lints 5 and 6).
-const WIN32_FILES: [&str; 4] =
-    ["src/popup_launcher.rs", "src/launcher_sys.rs", "src/launcher_files.rs", "src/launcher_probe.rs"];
+/// The launcher files that call Windows (lints 5 and 6).
+const WIN32_FILES: [&str; 5] = [
+    "src/popup_launcher.rs",
+    "src/launcher_sys.rs",
+    "src/launcher_files.rs",
+    "src/launcher_probe.rs",
+    "src/files_child.rs",
+];
 
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
@@ -1069,6 +1074,75 @@ fn every_spawned_process_has_no_window() {
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
         all.extend(spawn_violations(&format!("tests/{}", rel.trim_start_matches('/')), &text));
     }
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+// ---- lint 15: the search client stays in the files helper ---------------------------------------------------------
+
+/// The files helper child (plan L2-F2, D1): the only file that may name the search client or the service manager.
+const FILES_HELPER: &str = "src/files_child.rs";
+const SEARCH_TOKENS: [&str; 8] = [
+    "Win32::System::Search",
+    "ISearchManager",
+    "CSearchManager",
+    "IDataInitialize",
+    "IDBInitialize",
+    "ICommandText",
+    "IRowset",
+    "OpenSCManagerW",
+];
+
+/// No module the helper loads ever enters the dock (FILES-5): the search client's names appear in the helper only, and
+/// only main.rs dispatches to it. The helper writes nothing but its frames: no log line, no file, no print (its stdout is
+/// the frame channel, and the words it gets are typed text).
+fn search_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != FILES_HELPER {
+        for t in SEARCH_TOKENS {
+            for at in tokens(text, t) {
+                v.push(format!("{path}:{}: {t} outside the files helper", line_of(text, at)));
+            }
+        }
+    }
+    if path != "src/main.rs" {
+        for (at, _) in text.match_indices("files_child::") {
+            if !text.get(..at).and_then(|t| t.chars().next_back()).is_some_and(is_ident) {
+                v.push(format!("{path}:{}: the files helper is entered from main.rs only", line_of(text, at)));
+            }
+        }
+    }
+    if path == FILES_HELPER {
+        for (at, _) in log_calls(text) {
+            v.push(format!("{path}:{}: the files helper has no logger", line_of(text, at)));
+        }
+        for (at, _) in text.match_indices("std::fs") {
+            v.push(format!("{path}:{}: std::fs in the files helper", line_of(text, at)));
+        }
+        for word in ["print!", "println!", "eprint!", "eprintln!", "dbg!"] {
+            for at in tokens(text, word) {
+                v.push(format!("{path}:{}: {word} in the files helper", line_of(text, at)));
+            }
+        }
+    }
+    v
+}
+
+#[test]
+fn search_stays_in_the_files_helper() {
+    let client = "use windows::Win32::System::Search::{IRowset, ISearchManager};";
+    assert!(search_violations(FILES_HELPER, client).is_empty());
+    assert_eq!(search_violations("src/shell_thread.rs", client).len(), 3);
+    assert_eq!(search_violations("src/launcher_files.rs", "let s = unsafe { OpenSCManagerW(a, b, c) };").len(), 1);
+    assert!(search_violations("src/launcher_files.rs", "let r: IRowsetX = x; let c = CSearchManagerY;").is_empty());
+    let entry = "return files_child::run(0);";
+    assert!(search_violations("src/main.rs", entry).is_empty());
+    assert_eq!(search_violations("src/ui.rs", entry).len(), 1);
+    assert_eq!(search_violations("src/ui.rs", "crate::files_child::run(0);").len(), 1);
+    assert!(search_violations("src/ui.rs", "my_files_child::run(0); // files_child.rs").is_empty());
+    let noisy = "fn f() { log!(\"x {n}\"); let _ = std::fs::read(p); println!(\"a\"); eprintln!(\"b\"); }";
+    assert_eq!(search_violations(FILES_HELPER, noisy).len(), 4);
+    assert!(search_violations("src/ui.rs", noisy).is_empty());
+    let all = scan_tree(search_violations);
     assert!(all.is_empty(), "{all:#?}");
 }
 
