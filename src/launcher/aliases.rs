@@ -321,8 +321,16 @@ mod tests {
             let T::Command(r) = &got else { panic!("{t:?}: {got:?}") };
             assert_eq!(&*r.line, format!("\"{t}\""), "{t:?}");
         }
-        // A trailing separator or a stream hides no program either, and the command reads back as itself.
-        for t in ["C:\\Tools\\x.exe\\", "C:\\Tools\\x.exe/", "C:\\Tools\\x.exe::$DATA", "C:\\Tools\\x.exe:s"] {
+        // A trailing separator, a stream or a dot segment hides no program, and the command reads back as itself.
+        for t in [
+            "C:\\Tools\\x.exe\\",
+            "C:\\Tools\\x.exe/",
+            "C:\\Tools\\x.exe::$DATA",
+            "C:\\Tools\\x.exe:s",
+            "C:\\Tools\\x.exe\\foo\\..",
+            "C:\\Tools\\x.exe\\foo\\..\\",
+            "C:\\Tools\\a\\..\\x.exe",
+        ] {
             let got = classify(t).unwrap();
             let T::Command(r) = &got else { panic!("{t:?}: {got:?}") };
             assert_eq!((&*r.line, r.file.clone()), (&*format!("\"{t}\""), 1..t.len() + 1), "{t:?}");

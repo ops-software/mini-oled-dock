@@ -952,12 +952,14 @@ pub fn extension(path: &str) -> Option<&str> {
 
 /// The class of a path by its extension alone (5.4.6), the same for file rows, typed paths and alias targets: it picks a
 /// row's glyph, and an executable is never the default in Mixed mode. Its last name is read as Windows reads it, so no
-/// caller can forget a step: the trailing separators, dots and spaces dropped (`setup.exe\`, `setup.exe. .`), and each
+/// caller can forget a step: the trailing separators, dots and spaces dropped (`setup.exe\`, `setup.exe. .`), the dot
+/// segments resolved (`setup.exe\foo\..`; one Windows may read either way makes the path an executable), and each
 /// part between colons classed (`ext_class`), an executable part making the whole one (`tool.exe::$DATA` and
 /// `tool.exe:s` name streams of tool.exe); otherwise the first part with a class gives it.
 pub fn file_class(path: &str) -> FileClass {
+    let Some(name) = last_name(path) else { return FileClass::Executable };
     let mut class = FileClass::Other;
-    for part in last_name(path).split(':') {
+    for part in name.split(':') {
         match ext_class(part) {
             FileClass::Executable => return FileClass::Executable,
             c if class == FileClass::Other => class = c,
@@ -967,13 +969,25 @@ pub fn file_class(path: &str) -> FileClass {
     class
 }
 
-/// The last name of a path: the trailing separators, dots and spaces dropped, then the text after the last separator.
-fn last_name(path: &str) -> &str {
-    // Cut at ASCII bytes only, as `extension`.
-    let b = path.as_bytes();
-    let end = b.iter().rposition(|c| !matches!(c, b'\\' | b'/' | b'.' | b' ')).map_or(0, |i| i + 1);
-    let start = b.get(..end).and_then(|h| h.iter().rposition(|c| matches!(c, b'\\' | b'/'))).map_or(0, |i| i + 1);
-    path.get(start..end).unwrap_or_default()
+/// The last name of a path as Windows' path normalization leaves it (GetFullPathName, lexically). From the end: empty
+/// segments and `.` skipped, each `..` taking away the name before it, the trailing dots and spaces dropped from the
+/// name (`setup.exe\foo\..` and `setup.exe. .\` name setup.exe); past the root, the empty name. None when a segment of
+/// dots and spaces other than `.` and `..` decides it (`.. `, or `...` under a `..`): Windows may read it either way.
+fn last_name(path: &str) -> Option<&str> {
+    let mut up = 0usize;
+    for seg in path.rsplit(['\\', '/']) {
+        let name = seg.trim_end_matches(['.', ' ']);
+        match seg {
+            "" | "." => {}
+            ".." => up += 1,
+            // Dropped whole at the end of a path (`...`, `. `), a name under a `..`, and `.. ` may be a `..`.
+            _ if name.is_empty() && (up > 0 || seg.trim_end_matches(' ') == "..") => return None,
+            _ if name.is_empty() => {}
+            _ if up > 0 => up -= 1,
+            _ => return Some(name),
+        }
+    }
+    Some("")
 }
 
 /// The class of one name by its `extension` (the text after the last dot, in any case). Executable: the spec's twelve,
@@ -1813,6 +1827,18 @@ pub(crate) mod tests {
             ("C:\\Windows\\", Other),
             ("shell:startup", Other),
             ("ms-settings:display", Other),
+            // Dot segments, which Windows resolves before it opens the path: `setup.exe\foo\..` names setup.exe.
+            ("C:\\x\\setup.exe\\foo\\..", Executable),
+            ("C:\\x\\setup.exe\\foo\\..\\", Executable),
+            ("C:/x/setup.exe/foo/./..", Executable),
+            ("C:\\x\\a\\..\\setup.exe", Executable),
+            ("C:\\x\\notes.md\\foo\\..", Document),
+            ("C:\\x\\a\\..\\notes.md", Document),
+            ("C:\\x\\a\\b\\..", Other),
+            ("C:\\x\\setup.exe\\..\\..", Other),
+            // A segment of dots and spaces that Windows may read either way: the safe reading.
+            ("C:\\x\\setup.exe\\foo\\.. ", Executable),
+            ("C:\\x\\a\\...\\..", Executable),
         ];
         for (path, want) in cases {
             assert_eq!(file_class(path), want, "{path}");
@@ -1855,9 +1881,17 @@ pub(crate) mod tests {
         assert_eq!(res.selected(), None, "an executable file row is never the default in Mixed mode");
         // The trailing dots and spaces Windows drops hide no executable (file_class drops them).
         let guid = "C:\\tools\\invoice.pdf.{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}";
-        // Nor do a trailing separator or a stream: an executable's name wins over the folder syntax.
-        let odd =
-            ["C:\\tools\\setup.exe\\", "C:\\tools\\setup.exe/", "C:\\tools\\tool.exe::$DATA", "C:\\tools\\tool.exe:s"];
+        // Nor do a trailing separator, a stream or a dot segment (Windows resolves `foo\..` before it runs a path): an
+        // executable's name wins over the folder syntax.
+        let odd = [
+            "C:\\tools\\setup.exe\\",
+            "C:\\tools\\setup.exe/",
+            "C:\\tools\\tool.exe::$DATA",
+            "C:\\tools\\tool.exe:s",
+            "C:\\tools\\setup.exe\\foo\\..",
+            "C:\\tools\\setup.exe\\foo\\..\\",
+            "C:\\tools\\a\\..\\setup.exe",
+        ];
         for typed in
             ["C:\\tools\\setup.exe.", "C:\\tools\\setup.exe . .", "C:\\tools\\run.CMD..", guid].iter().chain(&odd)
         {
