@@ -483,6 +483,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             }
             if wp.0 == windows::Win32::UI::WindowsAndMessaging::PBT_APMRESUMEAUTOMATIC as usize {
                 popup::popup_launcher::on_resume();
+                crate::hook::note_activity();
             }
             // TRUE grants the event.
             Some(LRESULT(1))
@@ -539,6 +540,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             if wp.0 as u32 == EVENT_SYSTEM_FOREGROUND {
                 on_shell_hook(h, HSHELL_WINDOWACTIVATED, lp.0);
                 on_foreground_changed(HWND(lp.0 as *mut std::ffi::c_void));
+                crate::hook::note_activity();
             }
             if !DEBOUNCE_ARMED.with(|d| d.replace(true)) {
                 set_timer(h, TIMER_APPS_DEBOUNCE, DEBOUNCE_MS);
@@ -3193,6 +3195,7 @@ fn hide(reason: &str, now: bool) {
 /// calls nothing). Called after `VISIBLE` is stored, before any foreground call.
 fn on_visibility(visible: bool) {
     crate::notif::set_bar_visible(visible);
+    crate::hook::note_activity();
 }
 
 /// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is

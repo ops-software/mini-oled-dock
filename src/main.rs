@@ -466,12 +466,6 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
     match m {
         WM_TIMER => match wp.0 {
             TIMER_HOUSEKEEPING => {
-                // Windows may silently remove the hook after a timeout; the hook thread reinstalls it.
-                HOOK_THREAD.with(|t| {
-                    if let Some(t) = t.borrow().as_ref() {
-                        hook::request_reinstall(t);
-                    }
-                });
                 if config::poll_changed() {
                     ui::config_reloaded();
                 }

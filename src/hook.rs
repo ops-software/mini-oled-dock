@@ -45,7 +45,10 @@
 //!
 //! The hook lives in a dedicated thread (`hook`) that only runs a message loop: the callback
 //! is served by that thread, independently of rendering, timers and logging of the UI thread.
+//! A thread timer of that thread reinstalls the hook (`reinstall`) every 2 s while keys reach the callback or the UI
+//! notes activity (`note_activity`), and stops after a quiet period: with no input nothing can remove the hook.
 
+use std::cell::Cell;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -62,9 +65,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, PeekMessageW, PostMessageW, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG,
-    PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
+    PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 use crate::msg::{
@@ -92,8 +96,50 @@ const LONE_STUCK_MS: u32 = 10_000;
 /// release posts WM_DOCK_START_MENU instead of WM_DOCK_TOGGLE.
 pub const DOUBLE_TAP_MS: u32 = 300;
 
-/// Thread message (UI -> hook): run the `reinstall` watchdog.
-const WM_HOOK_REINSTALL: u32 = WM_APP + 10;
+/// Period (ms) of the hook thread's reinstall tick (`reinstall`): armed by activity, stopped after a quiet period.
+const REINSTALL_MS: u32 = 2000;
+/// `WM_HOOK_NOTE` from any thread (`note_activity`): activity the UI thread saw, which arms the reinstall tick.
+const NOTE_ACTIVITY: usize = 4;
+
+/// Thread id of the running hook thread (0 = none): `note_activity` posts to it.
+static HOOK_TID: AtomicU32 = AtomicU32::new(0);
+/// A failed SetTimer of the reinstall tick is logged once per process.
+static TICK_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    // Hook thread only: the LL callback runs on it, inside its GetMessageW, so nothing else reads or writes these.
+    static TICK: Cell<Tick> = const { Cell::new(Tick { armed: false, active: false }) };
+    /// Id of the armed reinstall tick (a thread timer of the hook thread), 0 = none.
+    static TICK_ID: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The reinstall tick: armed by the first activity (a key reaching the hook, or a note from the UI), it ticks every
+/// `REINSTALL_MS` while activity comes within each period (or a Win press is tracked) and stops after a quiet one.
+/// Windows removes a low-level hook only when its callback overran LowLevelHooksTimeout, which needs input: with no
+/// activity there is nothing to repair.
+#[derive(Clone, Copy, Default)]
+struct Tick {
+    armed: bool,
+    active: bool,
+}
+
+impl Tick {
+    /// Activity seen. true when the tick was not armed: the caller arms the timer (and clears `armed` again if
+    /// SetTimer fails, so the next activity tries again).
+    fn on_activity(&mut self) -> bool {
+        self.active = true;
+        !std::mem::replace(&mut self.armed, true)
+    }
+
+    /// A tick ran: true (keep ticking) when activity came in its period or a Win press is tracked, so `repair_plan` still
+    /// sees a press whose release was lost.
+    fn on_tick(&mut self, win_down: bool) -> bool {
+        let keep = self.active || win_down;
+        self.active = false;
+        self.armed = keep;
+        keep
+    }
+}
 
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static WIN_OTHER: AtomicBool = AtomicBool::new(false);
@@ -165,6 +211,7 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
             log!("low-level keyboard hook installed (dedicated thread)");
             // SAFETY: no preconditions.
             let tid = unsafe { GetCurrentThreadId() };
+            HOOK_TID.store(tid, Relaxed);
             let _ = ready.send(Ok(tid));
         }
         Err(e) => {
@@ -180,12 +227,22 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
             break; // WM_QUIT (0) or error (-1)
         }
         probe!(crate::probe::thread_msg(crate::probe::Th::Hook, &msg));
-        if msg.message == WM_HOOK_REINSTALL {
+        let tick_id = TICK_ID.with(Cell::get);
+        if msg.message == WM_TIMER && msg.hwnd.0.is_null() && tick_id != 0 && msg.wParam.0 == tick_id {
             reinstall();
+            let mut tick = TICK.with(Cell::get);
+            if !tick.on_tick(WIN_DOWN.load(Relaxed)) {
+                // SAFETY: the thread timer `activity` armed on this thread; fails harmlessly if it is already gone.
+                let _ = unsafe { KillTimer(None, tick_id) };
+                TICK_ID.with(|t| t.set(0));
+            }
+            TICK.with(|t| t.set(tick));
             continue;
         }
         if msg.message == WM_HOOK_NOTE {
-            if msg.wParam.0 == NOTE_LAUNCHER_FAIL_OPEN {
+            if msg.wParam.0 == NOTE_ACTIVITY {
+                activity();
+            } else if msg.wParam.0 == NOTE_LAUNCHER_FAIL_OPEN {
                 let seq = msg.lParam.0 as u32;
                 log!(
                     "hook: launcher chord failed open (seq {seq}): the UI thread did not acknowledge for {ACK_TIMEOUT_MS} ms"
@@ -197,14 +254,40 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
         // only thread messages arrive here, but forwarding is harmless).
         unsafe { DispatchMessageW(&msg) };
     }
+    HOOK_TID.store(0, Relaxed);
     uninstall();
     let _ = done.send(());
 }
 
-/// Asks the hook thread to run the watchdog (called from the UI thread 2 s timer).
-pub fn request_reinstall(t: &HookThread) {
+/// Activity the UI thread sees (a foreground change, the bar shown or hidden, resume from sleep): arms the hook thread's
+/// reinstall tick, in case the callback itself no longer runs. Any thread; a no-op while no hook thread runs, and a
+/// failed post is harmless.
+pub fn note_activity() {
+    let tid = HOOK_TID.load(Relaxed);
+    if tid == 0 {
+        return;
+    }
     // SAFETY: PostThreadMessageW is thread-safe; if the thread has already ended it merely fails.
-    let _ = unsafe { PostThreadMessageW(t.tid, WM_HOOK_REINSTALL, WPARAM(0), LPARAM(0)) };
+    let _ = unsafe { PostThreadMessageW(tid, WM_HOOK_NOTE, WPARAM(NOTE_ACTIVITY), LPARAM(0)) };
+}
+
+/// Activity on the hook thread (a key reaching the callback, or `NOTE_ACTIVITY`): marks the current tick period active
+/// and arms the tick when it is not armed (one SetTimer per activity burst, nothing per key once armed).
+fn activity() {
+    let mut tick = TICK.with(Cell::get);
+    if tick.on_activity() {
+        // SAFETY: a thread timer of the calling (hook) thread, no callback: its WM_TIMER reaches `thread_main`'s loop.
+        let id = unsafe { SetTimer(None, 0, REINSTALL_MS, None) };
+        if id == 0 {
+            tick.armed = false;
+            if !TICK_FAIL_LOGGED.swap(true, Relaxed) {
+                log!("hook: reinstall tick not armed: {}", windows::core::Error::from_thread());
+            }
+        } else {
+            TICK_ID.with(|t| t.set(id));
+        }
+    }
+    TICK.with(|t| t.set(tick));
 }
 
 /// Closes the hook thread: WM_QUIT, then waits (max 2 s) for it to remove the hook.
@@ -298,6 +381,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
     #[cfg(feature = "owner-probe")]
     let started = std::time::Instant::now();
     if code == HC_ACTION as i32 {
+        // First, before `handle_key` (which returns at once for injected keys): any key keeps the reinstall tick going.
+        activity();
         // SAFETY: for HC_ACTION in a WH_KEYBOARD_LL hook, lparam points to a
         // KBDLLHOOKSTRUCT valid for the whole duration of the callback.
         let kb = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
@@ -537,8 +622,9 @@ fn diag(msg: u32, kb: &KBDLLHOOKSTRUCT, swallowed: bool) {
 
 pub(crate) use crate::launcher::model::{ChordSpec, Mods};
 
-/// Thread message (hook thread -> itself): a note to log outside the callback. wParam = `NOTE_*`, lParam = a sequence.
-/// WS-C's name and meaning (P0-wsC 17.1 and 17.3): wParam values 1-15 belong to WS-C, 16-31 to the launcher.
+/// Thread message to the hook thread. wParam = `NOTE_*`: from the callback, a note to log outside it (lParam = a
+/// sequence); from any thread, `NOTE_ACTIVITY` (`note_activity`). wParam values 1-15 belong to WS-C, 16-31 to the
+/// launcher.
 const WM_HOOK_NOTE: u32 = WM_APP + 19;
 /// `WM_HOOK_NOTE`: the launcher chord failed open; lParam = the unacknowledged sequence.
 const NOTE_LAUNCHER_FAIL_OPEN: usize = 16;
@@ -1529,6 +1615,54 @@ mod tests {
         assert_eq!(repair_plan(true, false, false, false, STALE), Skip, "lone Win held with no auto-repeat");
         assert_eq!(repair_plan(true, false, false, false, LONE_STUCK_MS), Skip, "lone Win at the limit: still held");
         assert_eq!(repair_plan(true, false, false, false, LONG), ClearThenGo, "lone release lost on the secure desktop");
+    }
+
+    /// wsC Q6: the reinstall tick is armed by the first activity of a burst, not by every key.
+    #[test]
+    fn first_activity_arms_once() {
+        let mut t = Tick::default();
+        assert!(t.on_activity(), "the first activity arms the tick");
+        assert!(!t.on_activity(), "an armed tick is not armed again");
+    }
+
+    #[test]
+    fn ticks_stop_after_one_quiet_period() {
+        let mut t = Tick::default();
+        assert!(t.on_activity());
+        assert!(t.on_tick(false), "activity in the period: keep ticking");
+        assert!(!t.on_tick(false), "a quiet period: stop");
+        assert!(t.on_activity(), "the next activity arms it again");
+    }
+
+    #[test]
+    fn steady_typing_keeps_ticking() {
+        let mut t = Tick::default();
+        assert!(t.on_activity());
+        for _ in 0..10 {
+            assert!(!t.on_activity(), "still armed: no second timer");
+            assert!(t.on_tick(false));
+        }
+    }
+
+    #[test]
+    fn a_tracked_win_press_keeps_ticking_until_repaired() {
+        let mut t = Tick::default();
+        assert!(t.on_activity());
+        assert!(t.on_tick(false), "the activity's own period");
+        assert!(t.on_tick(true), "no activity, a Win press tracked: keep, so `repair_plan` sees it end");
+        assert!(t.on_tick(true));
+        assert!(!t.on_tick(false), "repaired (or released): stop");
+    }
+
+    /// wsC Q6: injected keys (the rig's F24 taps among them) make `handle_key` return at once, so the callback arms the
+    /// tick before it calls `handle_key`.
+    #[test]
+    fn activity_comes_before_handle_key() {
+        let src = include_str!("hook.rs");
+        let body = src.find("fn ll_keyboard_proc(").map(|at| &src[at..]).unwrap();
+        let act = body.find("activity();").unwrap();
+        let key = body.find("handle_key(").unwrap();
+        assert!(act < key, "activity() must precede handle_key in ll_keyboard_proc");
     }
 
     /// L2-C1: the Clipboard history command sends Win+V through `ui::send_win_key`. Its four events, as this hook sees

@@ -97,11 +97,11 @@ pub const WM_DOCK_LAUNCHER_PT: u32 = WM_APP + 28;
 /// one replaces it). wParam = lParam = 0. Posted only while a chord is set.
 pub const WM_DOCK_LAUNCHER_ALIAS: u32 = WM_APP + 29;
 
-// `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
-// defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
-// `WM_APP + 18` and `+ 19` are RESERVED by WS-C: the config change and `WM_HOOK_NOTE`, the hook thread's message to
-// itself (defined privately in `hook.rs`). `WM_HOOK_NOTE`'s wParam values 1-15 belong to WS-C (1 fail-open on,
-// 2 fail-open off, 3 test stall, 4 bar shown, 5 bar hidden) and 16-31 to the launcher (16 =
+// `WM_APP + 10` stays RESERVED: it was the UI -> hook thread message `WM_HOOK_REINSTALL`, retired by wsC Q6; do not
+// reuse it.
+// `WM_APP + 18` and `+ 19` are RESERVED by WS-C: the config change and `WM_HOOK_NOTE`, the hook thread's thread
+// message (defined privately in `hook.rs`). `WM_HOOK_NOTE`'s wParam values: 4 = activity (wsC Q6: foreground change,
+// bar shown or hidden, pointer motion, resume); 1-3 and 5-15 stay reserved for WS-C; 16-31 the launcher (16 =
 // `NOTE_LAUNCHER_FAIL_OPEN`). `WM_APP + 20..23` stay for shell-thread messages.
 
 // -------------------------------------- THREAD messages (PostThreadMessageW)
@@ -123,8 +123,7 @@ pub const WM_SHELL_SPATIAL_CHANGED: u32 = WM_APP + 22;
 
 /// 50 ms, always on: auto-hide, screen edge, topmost re-assertion. Handled by `ui`.
 pub const TIMER_POLL: usize = 1;
-/// 2 s: keyboard hook watchdog (`hook::request_reinstall`) + config mtime check
-/// (`config::poll_changed`). Handled by `main`.
+/// 2 s: config mtime check (`config::poll_changed`), idle trim, automatic install. Handled by `main`.
 pub const TIMER_HOUSEKEEPING: usize = 2;
 /// 30 s: RAM log (private working set). Handled by `main`.
 pub const TIMER_RAM: usize = 3;

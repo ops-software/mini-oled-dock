@@ -1203,6 +1203,10 @@ fn msg_name(th: Th, m: u32) -> String {
 fn timer_name(th: Th, id: u32, thread_timer: bool) -> String {
     use crate::msg::*;
     if thread_timer {
+        if th == Th::Hook {
+            // The hook thread's only thread timer: the reinstall tick (wsC Q6), its id changes at each arming.
+            return "REINSTALL_TICK".into();
+        }
         return format!("thread_timer#{id:X}");
     }
     let n = match (th, id as usize) {
@@ -1655,6 +1659,7 @@ mod tests {
         assert_eq!(timer_name(Th::Ui, 1, false), "TIMER_POLL");
         assert_eq!(timer_name(Th::Tray, 1, false), "TIMER_ZORDER");
         assert_eq!(timer_name(Th::Shell, 0x7FFF, true), "thread_timer#7FFF");
+        assert_eq!(timer_name(Th::Hook, 0x7FFE, true), "REINSTALL_TICK");
         assert_eq!(cause_name(0), "none");
         assert_eq!(cause_name(u32::from(CAUSE_POSTED | CAUSE_WINEVENT)), "posted+winevent");
         assert_eq!(copydata_kind(1, 1), "nim_modify");
