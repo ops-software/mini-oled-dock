@@ -348,6 +348,30 @@ pub fn label_day_of_year() -> &'static str {
     tr("Day of the year", "Giorno dell'anno")
 }
 
+// ---- files (plan L2-F1): the state rows of "file " mode and its placeholder
+pub fn files_search_off() -> &'static str {
+    tr("Windows Search is off", "Ricerca di Windows non attiva")
+}
+pub fn files_open_indexing() -> &'static str {
+    tr("Open indexing options", "Apri Opzioni di indicizzazione")
+}
+pub fn files_not_answering() -> &'static str {
+    tr("File search isn't answering", "La ricerca file non risponde")
+}
+pub fn files_admin_protection() -> &'static str {
+    tr(
+        "File search is unavailable while Administrator protection is on",
+        "Ricerca file non disponibile con la protezione amministratore attiva",
+    )
+}
+pub fn files_unavailable() -> &'static str {
+    tr("File search is unavailable", "Ricerca file non disponibile")
+}
+#[allow(dead_code)] // L2-F4 draws it
+pub fn files_placeholder() -> &'static str {
+    tr("Names starting with the typed words", "Nomi che iniziano con le parole scritte")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {

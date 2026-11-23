@@ -5,8 +5,6 @@
 use crate::start_search::Keys;
 use core::cmp::Reverse;
 use core::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 // ---------------------------------------------------------------- providers
 
@@ -136,46 +134,6 @@ pub struct Query<'a> {
     pub apps_also: bool,
 }
 
-/// A query that a worker thread owns.
-#[allow(dead_code)] // L2-2: the files worker takes it
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct OwnedQuery {
-    pub text: String,
-    pub folded: String,
-    pub mode: Mode,
-    pub gen: u64,
-    pub num: NumberStyle,
-}
-
-impl Query<'_> {
-    #[allow(dead_code)] // L2-2: the files worker is sent it
-    pub fn to_owned_query(&self) -> OwnedQuery {
-        OwnedQuery {
-            text: self.text.to_string(),
-            folded: self.folded.clone(),
-            mode: self.mode,
-            gen: self.gen,
-            num: self.num,
-        }
-    }
-}
-
-/// Checked between row fetches by an asynchronous provider.
-#[allow(dead_code)] // L2-2: the files worker checks it
-#[derive(Clone, Default, Debug)]
-pub struct CancelToken(Arc<AtomicBool>);
-
-#[allow(dead_code)] // L2-2: the files worker checks it
-impl CancelToken {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-}
-
 // ---------------------------------------------------------------- items
 
 /// A stable identity of a row: FNV-1a 64 over the provider byte and the row's stable id, so keys survive restarts.
@@ -233,6 +191,9 @@ pub enum CommandId {
     Registry,
     WindowMenu,
     ClipboardHistory,
+    /// Indexing Options (the files state row's action, plan L2-F1): not in the searchable `COMMANDS` table.
+    #[allow(dead_code)] // L2-F3 shows the state row
+    IndexingOptions,
 }
 
 /// A line typed in the run mode, split by syntax only (5.4.9).
@@ -247,11 +208,8 @@ pub struct RunLine {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileClass {
     Executable,
-    #[allow(dead_code)] // L2-1: the files provider's classes
     Document,
-    #[allow(dead_code)] // L2-1
     Image,
-    #[allow(dead_code)] // L2-1
     Archive,
     Other,
 }
@@ -353,25 +311,6 @@ pub struct Batch {
     pub from: ProviderId,
     pub items: Vec<Item>,
     pub done: bool,
-}
-
-/// An asynchronous provider (files, L2): its own worker thread, abandon-and-replace.
-#[allow(dead_code)] // L2-2: the files worker implements it
-pub trait AsyncProvider: Send {
-    fn id(&self) -> ProviderId;
-    fn wants(&self, q: &Query) -> bool;
-    fn run(&mut self, q: &OwnedQuery, cancel: &CancelToken, sink: &mut dyn FnMut(Batch));
-    fn debounce_ms(&self) -> u32 {
-        50
-    }
-    /// After this the busy mark stays, rows are still accepted.
-    fn first_batch_ms(&self) -> u32 {
-        250
-    }
-    /// Later batches are dropped.
-    fn deadline_ms(&self) -> u32 {
-        1_000
-    }
 }
 
 // ---------------------------------------------------------------- verbs and chords
@@ -592,14 +531,5 @@ mod tests {
         assert!(Score { learned: Reverse(3), ..base } < base);
         assert!(Score { idle: false, ..base } < base);
         assert!(Score { len: 3, ..base } < base);
-    }
-
-    #[test]
-    fn cancel_token_is_shared() {
-        let t = CancelToken::default();
-        let u = t.clone();
-        assert!(!u.is_cancelled());
-        t.cancel();
-        assert!(u.is_cancelled());
     }
 }

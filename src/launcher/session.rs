@@ -95,6 +95,8 @@ pub enum LaunchReq {
     },
     Url(Box<str>),
     Registry,
+    /// Indexing Options (Control Panel's srchadmin.dll), the action of the files state row "Windows Search is off".
+    IndexingOptions,
 }
 
 impl LaunchReq {
@@ -1370,6 +1372,7 @@ fn command(id: CommandId) -> Vec<Effect> {
         CommandId::Registry => launch(LaunchReq::Registry),
         CommandId::WindowMenu => vec![Effect::Hide { restore: true }, Effect::WindowMenu],
         CommandId::ClipboardHistory => vec![Effect::Hide { restore: true }, Effect::ClipboardHistory],
+        CommandId::IndexingOptions => launch(LaunchReq::IndexingOptions),
     }
 }
 
@@ -1801,6 +1804,73 @@ mod tests {
         assert_eq!(
             press(&mut s, &fx, VK_RETURN, Mods::NONE),
             [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App("Microsoft.VisualStudioCode".into()))]
+        );
+    }
+
+    fn file_hit(path: &str) -> crate::launcher::files::FileHit {
+        let name = path.rsplit('\\').next().unwrap();
+        crate::launcher::files::FileHit { path: path.into(), name: name.into(), folder: "u".into(), dir: false }
+    }
+
+    #[test]
+    fn late_file_rows_never_above_selection() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "st");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        let at = s.selected_index().unwrap();
+        let sel = s.selected().unwrap().key;
+        let above: Vec<ItemKey> = s.rows()[..=at].iter().map(|r| r.key).collect();
+        let hits = vec![file_hit("C:\\u\\steam notes.txt"), file_hit("C:\\u\\stack.zip")];
+        let rows = crate::launcher::files::items(hits, &["st"], 3);
+        assert!(s.late(Batch { gen: s.gen(), from: ProviderId::Files, items: rows, done: true }, &fx.cx()));
+        // A second late source of the same generation (settings that finish building) merges by the same rule.
+        let mut setting = crate::launcher::providers::tests::file_row("Storage", FileClass::Other);
+        (setting.from, setting.kind, setting.key) = (ProviderId::Settings, Kind::Setting, ItemKey(7));
+        assert!(s.late(Batch { gen: s.gen(), from: ProviderId::Settings, items: vec![setting], done: true }, &fx.cx()));
+        let now: Vec<ItemKey> = s.rows()[..=at].iter().map(|r| r.key).collect();
+        assert_eq!(now, above, "no row at or above the selection moved");
+        assert_eq!(s.selected().unwrap().key, sel);
+        let i = |k: ItemKey| s.rows().iter().position(|r| r.key == k).unwrap();
+        let (steam, stack) = (
+            ItemKey::of(ProviderId::Files, "C:\\u\\steam notes.txt"),
+            ItemKey::of(ProviderId::Files, "C:\\u\\stack.zip"),
+        );
+        assert!(at < i(steam) && i(steam) < i(stack) && i(stack) < i(ItemKey(7)), "below, in arrival order");
+        // A batch of an older generation is dropped.
+        let old = crate::launcher::files::items(vec![file_hit("C:\\u\\stx.txt")], &["st"], 3);
+        assert!(!s.late(Batch { gen: s.gen() - 1, from: ProviderId::Files, items: old, done: true }, &fx.cx()));
+    }
+
+    #[test]
+    fn executable_file_never_preselected_in_mixed() {
+        let fx = Fx::new();
+        let (exe, doc) = (file_hit("C:\\u\\zz-setup.exe"), file_hit("C:\\u\\zz notes.txt"));
+        let batch = |s: &Session, hits| Batch {
+            gen: s.gen(),
+            from: ProviderId::Files,
+            items: crate::launcher::files::items(hits, &["zz"], 3),
+            done: true,
+        };
+        let mut s = typed(&fx, "zz");
+        assert_eq!(s.selected(), None);
+        let b = batch(&s, vec![exe.clone(), doc]);
+        assert!(s.late(b, &fx.cx()));
+        assert_eq!(s.selected().map(|r| &*r.title), Some("zz notes.txt"), "the document, not the executable above it");
+        let mut s = typed(&fx, "zz");
+        let b = batch(&s, vec![exe]);
+        assert!(s.late(b, &fx.cx()));
+        assert_eq!(s.selected(), None, "the executable alone: nothing");
+    }
+
+    #[test]
+    fn indexing_options_is_a_launch() {
+        assert_eq!(
+            command(CommandId::IndexingOptions),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::IndexingOptions)]
+        );
+        assert!(
+            !crate::launcher::commands::COMMANDS.iter().any(|c| c.id == CommandId::IndexingOptions),
+            "not searchable"
         );
     }
 

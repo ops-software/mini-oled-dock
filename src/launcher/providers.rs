@@ -195,8 +195,8 @@ const KIND_WINDOW: u8 = 1;
 const KIND_COMMAND: u8 = 2;
 const KIND_SETTING: u8 = 3;
 const KIND_RUN: u8 = 4;
-const KIND_FOLDER: u8 = 5;
-const KIND_FILE: u8 = 6;
+pub(super) const KIND_FOLDER: u8 = 5;
+pub(super) const KIND_FILE: u8 = 6;
 
 /// Rows that the merge order places rather than the ranking (the answer, a typed address, the web row) carry the best
 /// score, so a full `TopK` never drops them.
@@ -444,12 +444,12 @@ fn chars_u16(s: &str) -> u16 {
     u16::try_from(s.chars().count()).unwrap_or(u16::MAX)
 }
 
-fn verbs(kind: Kind, running: bool, class: Option<FileClass>) -> VerbSet {
+pub(super) fn verbs(kind: Kind, running: bool, class: Option<FileClass>) -> VerbSet {
     verbs_for(kind, running, class, MOTW_PROMPT_CONFIRMED, GESTURE_TIME_MATCHES)
 }
 
 /// A file row's verbs: Run as administrator only where the session can run its path elevated.
-fn file_verbs(path: &str, class: FileClass) -> VerbSet {
+pub(super) fn file_verbs(path: &str, class: FileClass) -> VerbSet {
     verbs_for_file(path, class, MOTW_PROMPT_CONFIRMED, GESTURE_TIME_MATCHES)
 }
 
@@ -804,7 +804,7 @@ fn command_glyph(id: CommandId) -> GlyphId {
         CommandId::Restart => GlyphId::Restart,
         CommandId::ShutDown => GlyphId::Power,
         CommandId::SignOut => GlyphId::Exit,
-        CommandId::Registry => GlyphId::Gear,
+        CommandId::Registry | CommandId::IndexingOptions => GlyphId::Gear,
         CommandId::WindowMenu => GlyphId::Window,
         CommandId::ClipboardHistory => GlyphId::Copy,
     }
@@ -937,16 +937,30 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratc
 
 // ---- run lines and typed paths
 
-/// The class of a typed path by its extension alone (5.4.6); L2's files provider adds the document, image and archive
-/// classes.
+/// The class of a path by its extension alone, the text after the last dot in any case (5.4.6): it picks a row's glyph,
+/// and an executable is never the default in Mixed mode.
 pub fn file_class(path: &str) -> FileClass {
-    const EXECUTABLE: [&str; 12] =
-        ["exe", "com", "bat", "cmd", "ps1", "vbs", "js", "msi", "scr", "lnk", "url", "appref-ms"];
+    const CLASSES: [(FileClass, &[&str]); 4] = [
+        (
+            FileClass::Executable,
+            &["exe", "com", "bat", "cmd", "ps1", "vbs", "js", "msi", "scr", "lnk", "url", "appref-ms"],
+        ),
+        (
+            FileClass::Document,
+            &[
+                "txt", "md", "pdf", "doc", "docx", "rtf", "odt", "xls", "xlsx", "ods", "csv", "ppt", "pptx", "odp",
+                "log",
+            ],
+        ),
+        (FileClass::Image, &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "svg", "heic"]),
+        (FileClass::Archive, &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "cab", "iso"]),
+    ];
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    match name.rsplit_once('.') {
-        Some((_, ext)) if EXECUTABLE.iter().any(|e| e.eq_ignore_ascii_case(ext)) => FileClass::Executable,
-        _ => FileClass::Other,
-    }
+    let Some((_, ext)) = name.rsplit_once('.') else { return FileClass::Other };
+    CLASSES
+        .iter()
+        .find(|(_, exts)| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+        .map_or(FileClass::Other, |(class, _)| *class)
 }
 
 fn run_detail(line: &str) -> Box<str> {
@@ -1684,6 +1698,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn file_class_vectors() {
+        use FileClass::*;
+        let cases = [
+            ("C:\\a\\setup.EXE", Executable),
+            ("C:\\a\\run.ps1", Executable),
+            ("C:\\a\\x.appref-ms", Executable),
+            ("C:\\a\\notes.md", Document),
+            ("C:\\a\\Budget 2026.XLSX", Document),
+            ("C:\\a\\b.pdf", Document),
+            ("C:\\a\\photo.JPEG", Image),
+            ("C:\\a\\icon.svg", Image),
+            ("C:\\a\\backup.7z", Archive),
+            ("C:\\a\\b.tar.gz", Archive),
+            ("C:\\a\\disk.iso", Archive),
+            ("C:\\a\\data.bin", Other),
+            ("C:\\a\\README", Other),
+            ("C:\\a.zip\\readme", Other),
+            ("C:/a/b.png", Image),
+            ("C:\\a\\.gitignore", Other),
+            ("C:\\a\\trailing.", Other),
+        ];
+        for (path, want) in cases {
+            assert_eq!(file_class(path), want, "{path}");
+        }
+    }
+
+    #[test]
     fn default_skips_destructive_and_executables() {
         let fx = Fx::new();
         let mut res = Results::default();
@@ -2113,7 +2154,7 @@ pub(crate) mod tests {
         let path = &fx.rows("C:\\Users\\%USERNAME%\\a b.txt")[0];
         assert_eq!(path.kind, Kind::File);
         let Payload::Path { path: p, dir, class } = &path.payload else { panic!() };
-        assert_eq!((&**p, *dir, *class), ("C:\\Users\\%USERNAME%\\a b.txt", false, FileClass::Other));
+        assert_eq!((&**p, *dir, *class), ("C:\\Users\\%USERNAME%\\a b.txt", false, FileClass::Document));
         assert!(path.verbs.has(Verb::Open));
         let exe = &fx.rows("c:\\tools\\setup.EXE")[0];
         assert!(!exe.verbs.has(Verb::Open), "executables open only after live check 6");

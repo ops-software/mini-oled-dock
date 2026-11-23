@@ -357,7 +357,9 @@ fn power_action(id: CommandId) -> Option<crate::power::PowerAction> {
         CommandId::Restart => PowerAction::Restart,
         CommandId::ShutDown => PowerAction::Shutdown,
         CommandId::SignOut => PowerAction::SignOut,
-        CommandId::Registry | CommandId::WindowMenu | CommandId::ClipboardHistory => return None,
+        CommandId::Registry | CommandId::WindowMenu | CommandId::ClipboardHistory | CommandId::IndexingOptions => {
+            return None
+        }
     })
 }
 
@@ -1100,6 +1102,13 @@ pub(crate) fn to_request(
             let windows = crate::shell_thread::system_dir()?.parent()?.join("regedit.exe");
             ShellRequest::LauncherLaunch { target: windows.to_string_lossy().into_owned(), args: None }
         }
+        LaunchReq::IndexingOptions => {
+            let control = crate::shell_thread::system_dir()?.join("control.exe");
+            ShellRequest::LauncherLaunch {
+                target: control.to_string_lossy().into_owned(),
+                args: Some("srchadmin.dll".into()),
+            }
+        }
     })
 }
 
@@ -1148,6 +1157,7 @@ mod tests {
             LaunchReq::RunAsTyped { .. } => 8,
             LaunchReq::Url(_) => 9,
             LaunchReq::Registry => 10,
+            LaunchReq::IndexingOptions => 11,
         }
     }
 
@@ -1187,10 +1197,11 @@ mod tests {
             LaunchReq::RunAsTyped { line: quoted.clone(), gesture: Gesture::for_test(7) },
             LaunchReq::Url("https://a.it/x?q=1".into()),
             LaunchReq::Registry,
+            LaunchReq::IndexingOptions,
         ];
         let mut seen: Vec<u8> = rows.iter().map(variant).collect();
         seen.dedup();
-        assert_eq!(seen, (0..=10).collect::<Vec<u8>>(), "one row per variant");
+        assert_eq!(seen, (0..=11).collect::<Vec<u8>>(), "one row per variant");
         let out: Vec<ShellRequest> = rows.into_iter().map(|r| to_request(r, &setting).expect("a request")).collect();
         let mut it = out.iter();
         let mut next = || it.next().unwrap();
@@ -1209,6 +1220,9 @@ mod tests {
             if line == "\"C:\\Program Files\\x.exe\" -y" && *file == (1..23) && *gesture == Gesture::for_test(7)));
         assert!(matches!(next(), ShellRequest::OpenUrl { url } if url == "https://a.it/x?q=1"));
         assert!(matches!(next(), ShellRequest::LauncherLaunch { target, args: None } if *target == regedit));
+        let control = crate::shell_thread::system_dir().unwrap().join("control.exe").to_string_lossy().into_owned();
+        assert!(matches!(next(), ShellRequest::LauncherLaunch { target, args: Some(a) }
+            if *target == control && a == "srchadmin.dll"));
         // None of them is a request whose failure the launcher could not tell from Start's.
         let shared = |r: &ShellRequest| {
             matches!(
