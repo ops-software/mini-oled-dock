@@ -7232,11 +7232,15 @@ mod tests {
             c.windows = vec![window_row(0x1001, "Blocco note"), window_row(0x1002, "Other")];
         });
         ON.with(|o| o.set(true));
-        on_catalog(Arc::new(crate::launcher::arena::test_apps(&[("Microsoft.Notepad_8wekyb3d8bbwe!App", "Blocco note", &[], 1)])));
+        on_catalog(Arc::new(crate::launcher::arena::test_apps(&[(
+            "Microsoft.Notepad_8wekyb3d8bbwe!App",
+            "Blocco note",
+            &[],
+            1,
+        )])));
         ON.with(|o| o.set(false));
         let marked = with_ctrl(|c| c.windows.iter().map(|w| w.in_catalogue).collect::<Vec<_>>()).unwrap();
         assert_eq!(marked, [true, false]);
         with_ctrl(|c| *c = Ctrl::new());
     }
-
 }
