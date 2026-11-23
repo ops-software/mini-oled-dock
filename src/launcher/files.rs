@@ -643,9 +643,12 @@ pub enum Act {
     Write(Req),
     /// Kill the live helper now and reap it.
     Kill(KillWhy),
-    /// The live helper is done (its state was not 0, or its output ended): close its stdin, give it `CLOSE_GRACE_MS`,
-    /// kill it if it is still there and reap it.
+    /// The live helper is done (its state was not 0, or its output ended with nothing in flight): close its stdin, give
+    /// it `CLOSE_GRACE_MS`, kill it if it is still there and reap it.
     Retire,
+    /// The live helper's output ended with a request in flight (it died on it): retired as with `Retire`, its exit
+    /// code logged once per process.
+    Died,
     /// To the launcher.
     Post(FilesEvent),
     /// The open is over: the live helper is retired and the thread ends.
@@ -683,9 +686,9 @@ fn earliest(at: Option<u64>, t: u64) -> Option<u64> {
 
 /// The policy of D2 and D3 for one open, over the caller's clock (ms): one helper at a time, spawned only when a
 /// request is due; one request in flight, written only after state 0; the newest request waiting its quiet time; the
-/// kills; files off after the third counted kill, a failed start or a broken output. Anything from a helper it killed or
-/// retired is ignored. Pure: it returns acts and never waits. A list's posts come before its kill or retire, whose wait
-/// on the pump thread can last 2 s: the launcher hears of a stall at once.
+/// kills; files off after the third counted kill or death, a failed start or a broken output. Anything from a helper
+/// it killed or retired is ignored. Pure: it returns acts and never waits. A list's posts come before its kill or
+/// retire, whose wait on the pump thread can last 2 s: the launcher hears of a stall at once.
 #[derive(Debug)]
 pub struct Pump {
     limits: Limits,
@@ -745,15 +748,18 @@ impl Pump {
     }
 
     /// The live helper's output ended at a frame boundary: it exited, and the next due request starts another. A
-    /// request it had in flight is given up.
+    /// healthy helper ends only when the dock closes its stdin, which the pump never waits for, so an end with a
+    /// request in flight is a death (a crash, a line it refused): that request is given up and the end counts as a
+    /// deadline kill does. An end with nothing in flight is not counted.
     pub fn exited(&mut self, spawn: u32) -> Vec<Act> {
         let Some(h) = self.helper.take_if(|h| h.spawn == spawn) else { return Vec::new() };
-        let mut acts = Vec::new();
-        if let Some(gen) = h.flight.map(|f| f.req.gen).filter(|g| Some(*g) == self.newest) {
-            acts.push(Act::Post(FilesEvent::Stalled(gen)));
+        match h.flight {
+            Some(f) => {
+                let gen = Some(f.req.gen).filter(|g| Some(*g) == self.newest);
+                self.counted(gen, Act::Died, Vec::new())
+            }
+            None => vec![Act::Retire],
         }
-        acts.push(Act::Retire);
-        acts
     }
 
     /// The open is over.
@@ -812,16 +818,7 @@ impl Pump {
                     Due::Deadline(gen) => (KillWhy::Deadline, Some(gen).filter(|g| Some(*g) == self.newest)),
                     _ => (KillWhy::SpawnDeadline, self.newest),
                 };
-                if let Some(gen) = gen {
-                    acts.push(Act::Post(FilesEvent::Stalled(gen)));
-                }
-                self.kills = self.kills.saturating_add(1);
-                if self.kills >= MAX_KILLS {
-                    let mut acts = self.turn_off(Why::Stalled, acts);
-                    acts.push(Act::Kill(why));
-                    return acts;
-                }
-                acts.push(Act::Kill(why));
+                acts = self.counted(gen, Act::Kill(why), acts);
             }
         }
         let is_due =
@@ -874,6 +871,20 @@ impl Pump {
             at = earliest(at, since.saturating_add(u64::from(r.quiet_ms)));
         }
         at.map(|t| t.saturating_sub(now))
+    }
+
+    /// A counted end of the live helper (a deadline or spawn-deadline kill, a death): the stall of `gen` posted, files
+    /// off at the `MAX_KILLS`th, then `end`.
+    fn counted(&mut self, gen: Option<u64>, end: Act, mut acts: Vec<Act>) -> Vec<Act> {
+        if let Some(gen) = gen {
+            acts.push(Act::Post(FilesEvent::Stalled(gen)));
+        }
+        self.kills = self.kills.saturating_add(1);
+        if self.kills >= MAX_KILLS {
+            acts = self.turn_off(Why::Stalled, acts);
+        }
+        acts.push(end);
+        acts
     }
 
     fn turn_off(&mut self, why: Why, mut acts: Vec<Act>) -> Vec<Act> {
@@ -1533,11 +1544,44 @@ mod tests {
         assert!(p.frame(1, Ok(None), 302).is_empty());
         assert!(p.frame(1, rows_of(1, &["a.txt"]), 303).is_empty());
         assert!(!p.is_off());
-        // The live helper's EOF at a frame boundary is its exit: reaped, respawned at the next request, never Broken.
-        ready(&mut p, 2, 310);
-        assert_eq!(p.frame(2, Ok(None), 320), [Act::Post(FilesEvent::Stalled(2)), Act::Retire]);
+        // The live helper's EOF at a frame boundary with nothing in flight is its exit: reaped, respawned at the next
+        // request, never Broken and never counted.
+        assert_eq!(ready(&mut p, 2, 310), [Act::Write(req(2, 0))]);
+        assert_eq!(posts(&p.frame(2, rows_of(2, &[]), 311)).len(), 1);
+        for spawn in 2..=5 {
+            assert_eq!(p.frame(spawn, Ok(None), 320), [Act::Retire], "exit {spawn}");
+            let gen = u64::from(spawn) + 1;
+            assert_eq!(p.request(Some(req(gen, 0)), 400), [Act::Spawn(spawn + 1)]);
+            assert_eq!(ready(&mut p, spawn + 1, 400), [Act::Write(req(gen, 0))]);
+            assert_eq!(posts(&p.frame(spawn + 1, rows_of(gen, &[]), 401)).len(), 1);
+        }
+        assert!(!p.is_off(), "four exits with nothing in flight: files stay on");
+    }
+
+    #[test]
+    fn exits_mid_request_count_as_kills() {
+        // A helper ends only when the dock closes its stdin: an end with a request in flight is a death (a crash, a
+        // line it refused), counted as a deadline kill is, so a helper that dies on every query is not respawned for
+        // ever.
+        let mut p = written(1, 0);
+        assert_eq!(p.frame(1, Ok(None), 10), [Act::Post(FilesEvent::Stalled(1)), Act::Died]);
         assert!(!p.is_off());
-        assert_eq!(p.request(Some(req(3, 0)), 400), [Act::Spawn(3)]);
+        assert!(p.tick(20).is_empty(), "the request it died on is not sent again");
+        assert_eq!(p.request(Some(req(2, 0)), 30), [Act::Spawn(2)]);
+        assert_eq!(ready(&mut p, 2, 31), [Act::Write(req(2, 0))]);
+        // A newer request waits: the death gives up the one in flight without a stall row, and the newer one goes to
+        // a new helper.
+        assert!(p.request(Some(req(3, 0)), 40).is_empty());
+        assert_eq!(p.frame(2, Ok(None), 41), [Act::Died]);
+        assert_eq!(p.tick(41), [Act::Spawn(3)]);
+        assert_eq!(ready(&mut p, 3, 42), [Act::Write(req(3, 0))]);
+        assert_eq!(
+            p.frame(3, Ok(None), 50),
+            [Act::Post(FilesEvent::Stalled(3)), Act::Post(FilesEvent::Off(Why::Stalled)), Act::Died]
+        );
+        assert!(p.is_off());
+        assert!(p.request(Some(req(4, 0)), 60).is_empty(), "off for the rest of the open");
+        assert_eq!(p.next_wake(60), None);
     }
 
     #[test]

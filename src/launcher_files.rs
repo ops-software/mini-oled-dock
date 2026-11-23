@@ -151,6 +151,8 @@ pub(crate) trait Helper {
     fn close_stdin(&mut self);
     /// It has ended (or cannot be waited on).
     fn ended(&mut self) -> bool;
+    /// Its exit code, once it has ended.
+    fn exit_code(&mut self) -> Option<i32>;
     /// Its private bytes, for the probe's lines.
     #[cfg(feature = "owner-probe")]
     fn private_bytes(&self) -> Option<usize>;
@@ -200,6 +202,10 @@ impl Helper for RealHelper {
         !matches!(self.0.try_wait(), Ok(None))
     }
 
+    fn exit_code(&mut self) -> Option<i32> {
+        self.0.try_wait().ok().flatten()
+    }
+
     #[cfg(feature = "owner-probe")]
     fn private_bytes(&self) -> Option<usize> {
         use std::os::windows::io::AsRawHandle;
@@ -229,6 +235,7 @@ static SPAWN_FAILED: AtomicBool = AtomicBool::new(false);
 static OUTPUT_REFUSED: AtomicBool = AtomicBool::new(false);
 static ROWS_SKIPPED: AtomicBool = AtomicBool::new(false);
 static NOT_REAPED: AtomicBool = AtomicBool::new(false);
+static DIED: AtomicBool = AtomicBool::new(false);
 
 /// The pump thread's state: the policy, the live helper and the thread's clock.
 struct PumpThread<'a> {
@@ -323,22 +330,32 @@ impl PumpThread<'_> {
                 }
                 Act::Write(req) => self.write(&req),
                 Act::Kill(why) => {
-                    if let Some(l) = self.live.take() {
+                    if let Some(mut l) = self.live.take() {
                         log_kill(why, &l);
-                        let mut child = l.child;
-                        child.kill();
-                        reap(child);
+                        l.child.kill();
+                        reap(&mut *l.child);
                     }
                 }
                 Act::Retire => {
-                    if let Some(l) = self.live.take() {
-                        retire(l.child);
+                    if let Some(mut l) = self.live.take() {
+                        retire(&mut *l.child);
+                    }
+                }
+                Act::Died => {
+                    if let Some(mut l) = self.live.take() {
+                        retire(&mut *l.child);
+                        if first(&DIED) {
+                            match l.child.exit_code() {
+                                Some(n) => log!("launcher files: the helper ended during a request (exit code {n})"),
+                                None => log!("launcher files: the helper ended during a request"),
+                            }
+                        }
                     }
                 }
                 Act::Post(ev) => (self.post)(probe_verbs(ev)),
                 Act::End => {
-                    if let Some(l) = self.live.take() {
-                        retire(l.child);
+                    if let Some(mut l) = self.live.take() {
+                        retire(&mut *l.child);
                     }
                     return false;
                 }
@@ -441,7 +458,7 @@ fn log_kill(why: KillWhy, l: &Live) {
 }
 
 /// Waits up to `REAP_MS` for a killed or retiring helper to end; past that its handle goes (the dock's job ends it).
-fn reap(mut child: Box<dyn Helper>) {
+fn reap(child: &mut dyn Helper) {
     for _ in 0..REAP_MS / STEP_MS {
         if child.ended() {
             return;
@@ -454,7 +471,7 @@ fn reap(mut child: Box<dyn Helper>) {
 }
 
 /// A helper that is done: its stdin closed, `CLOSE_GRACE_MS` to end by itself, then a kill; always reaped.
-fn retire(mut child: Box<dyn Helper>) {
+fn retire(child: &mut dyn Helper) {
     child.close_stdin();
     for _ in 0..files::CLOSE_GRACE_MS / STEP_MS {
         if child.ended() {
@@ -506,13 +523,21 @@ mod tests {
     /// What the fake helpers were asked to do, in order.
     type Log = Arc<Mutex<Vec<String>>>;
 
-    /// A helper that answers its first request with one row (twice when `twice`) and then never again (a stall). Its
-    /// write returns once the reader has queued the answer in the pump's inbox, so the pump reads the answer before any
-    /// of its clocks: no test races the reader thread against a deadline.
+    /// How the fake helpers answer: the first one answers its first request with one row (`Twice`: two frames) and
+    /// then never again (a stall); with `Dies` each one's output ends at its first request.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fake {
+        Once,
+        Twice,
+        Dies,
+    }
+
+    /// A helper as `Fake` says. Its write returns once the reader has queued the answer or the end of output in the
+    /// pump's inbox, so the pump reads it before any of its clocks: no test races the reader thread against a deadline.
     struct FakeHelper {
         n: u32,
         answers: bool,
-        twice: bool,
+        fake: Fake,
         out: Option<std::io::PipeWriter>,
         log: Log,
         ended: bool,
@@ -523,7 +548,10 @@ mod tests {
         fn write_line(&mut self, line: &[u8]) -> bool {
             let text = String::from_utf8_lossy(line).trim_end().to_string();
             self.log.lock().unwrap().push(format!("{} write {text}", self.n));
-            if std::mem::take(&mut self.answers) {
+            if self.fake == Fake::Dies {
+                (self.out, self.ended) = (None, true);
+                self.queued();
+            } else if std::mem::take(&mut self.answers) {
                 let gen = text.split(' ').next().unwrap().parse().unwrap();
                 let hit = FileHit {
                     path: "C:\\u\\quokka.txt".into(),
@@ -533,15 +561,11 @@ mod tests {
                 };
                 let mut f = Vec::new();
                 encode_rows(gen, 0, 0, &[hit], &mut f);
-                if self.twice {
+                if self.fake == Fake::Twice {
                     f.extend_from_slice(&f.clone());
                 }
                 self.out.as_mut().unwrap().write_all(&f).unwrap();
-                // A guard against a hang, not a timing assertion: the inbox was empty at the write.
-                let until = Instant::now() + Duration::from_secs(20);
-                while self.inbox.q.lock().unwrap().is_empty() && Instant::now() < until {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                self.queued();
             }
             true
         }
@@ -556,9 +580,23 @@ mod tests {
         fn ended(&mut self) -> bool {
             self.ended
         }
+        fn exit_code(&mut self) -> Option<i32> {
+            self.ended.then_some(2)
+        }
         #[cfg(feature = "owner-probe")]
         fn private_bytes(&self) -> Option<usize> {
             None
+        }
+    }
+
+    impl FakeHelper {
+        /// Returns once the reader has queued what was written. A guard against a hang, not a timing assertion: the
+        /// inbox was empty at the write.
+        fn queued(&self) {
+            let until = Instant::now() + Duration::from_secs(20);
+            while self.inbox.q.lock().unwrap().is_empty() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 
@@ -566,7 +604,7 @@ mod tests {
     struct FakeSpawner {
         n: u32,
         log: Log,
-        twice: bool,
+        fake: Fake,
         inbox: Arc<Inbox>,
     }
 
@@ -581,7 +619,7 @@ mod tests {
             let helper = FakeHelper {
                 n: self.n,
                 answers: self.n == 1,
-                twice: self.twice,
+                fake: self.fake,
                 out: Some(w),
                 log: self.log.clone(),
                 ended: false,
@@ -597,14 +635,14 @@ mod tests {
 
     /// The pump thread's body over fake helpers; the events it posts, busy marks left out. The deadline is short, since
     /// it only ever ends a helper that never answers; no spawn deadline fires.
-    fn pump_thread(log: &Log, twice: bool) -> (Arc<Inbox>, Receiver<FilesEvent>, std::thread::JoinHandle<()>) {
+    fn pump_thread(log: &Log, fake: Fake) -> (Arc<Inbox>, Receiver<FilesEvent>, std::thread::JoinHandle<()>) {
         let inbox = Arc::new(Inbox::default());
         let (ev_tx, ev_rx) = mpsc::channel();
         let own = inbox.clone();
         let log = log.clone();
         let limits = Limits { slow_ms: 20, stale_kill_ms: 20, deadline_ms: 60, spawn_deadline_ms: 600_000 };
         let thread = std::thread::spawn(move || {
-            let mut spawner = FakeSpawner { n: 0, log, twice, inbox: own.clone() };
+            let mut spawner = FakeSpawner { n: 0, log, fake, inbox: own.clone() };
             let mut post = |ev| {
                 let _ = ev_tx.send(ev);
             };
@@ -626,7 +664,7 @@ mod tests {
     #[test]
     fn pump_over_a_fake_helper() {
         let log = Log::default();
-        let (tx, events, thread) = pump_thread(&log, false);
+        let (tx, events, thread) = pump_thread(&log, Fake::Once);
         tx.push(req(1));
         let FilesEvent::Batch(b) = next(&events) else { panic!("rows first") };
         assert_eq!((b.gen, b.items.len()), (1, 1));
@@ -661,9 +699,41 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_that_dies_mid_request_is_counted() {
+        let log = Log::default();
+        let (tx, events, thread) = pump_thread(&log, Fake::Dies);
+        // Each helper's output ends on its request (it died on it): the request is given up, the helper retired, and
+        // the third death turns files off for the open.
+        for gen in 1..=3 {
+            tx.push(req(gen));
+            assert_eq!(next(&events), FilesEvent::Stalled(gen));
+        }
+        assert_eq!(next(&events), FilesEvent::Off(Why::Stalled));
+        tx.push(req(4));
+        tx.push(Msg::Close);
+        thread.join().unwrap();
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            [
+                "1 spawn",
+                "1 write 1 quokka 1",
+                "1 close",
+                "2 spawn",
+                "2 write 2 quokka 2",
+                "2 close",
+                "3 spawn",
+                "3 write 3 quokka 3",
+                "3 close"
+            ],
+            "every dead helper retired; none after files went off"
+        );
+    }
+
+    #[test]
     fn close_retires_the_live_helper() {
         let log = Log::default();
-        let (tx, events, thread) = pump_thread(&log, false);
+        let (tx, events, thread) = pump_thread(&log, Fake::Once);
         tx.push(req(1));
         assert!(matches!(next(&events), FilesEvent::Batch(_)));
         tx.push(Msg::Close);
@@ -678,7 +748,7 @@ mod tests {
     #[test]
     fn a_frame_never_asked_for_ends_files() {
         let log = Log::default();
-        let (tx, events, thread) = pump_thread(&log, true);
+        let (tx, events, thread) = pump_thread(&log, Fake::Twice);
         tx.push(req(1));
         assert!(matches!(next(&events), FilesEvent::Batch(b) if b.gen == 1), "the answer to the request");
         assert_eq!(next(&events), FilesEvent::Off(Why::Broken), "the second frame was never asked for");
