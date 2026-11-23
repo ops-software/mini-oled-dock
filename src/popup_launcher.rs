@@ -3758,11 +3758,11 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     let history: Vec<Box<str>> = vec!["ping 1.1.1.1".into()];
     let mut opts = LauncherOpts::default();
     // Invented aliases (plan L2-A2): an app and a web address.
-    let aliases: std::collections::BTreeMap<String, String> =
-        [("np", "app:Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"), ("docs", "https://example.com/docs")]
-            .iter()
-            .map(|(w, t)| (w.to_string(), t.to_string()))
-            .collect();
+    // Built by insert: collect() on a BTreeMap brings in a stable sort of its own.
+    let mut aliases = std::collections::BTreeMap::new();
+    for (w, t) in [("np", "app:Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"), ("docs", "https://example.com/docs")] {
+        aliases.insert(w.to_string(), t.to_string());
+    }
     opts.aliases = AliasTable::build(&aliases, &opts.prefixes).0;
     let cx = Context {
         apps: apps_arena.view(),
