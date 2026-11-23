@@ -31,7 +31,8 @@
 //!    bar) and WM_DOCK_LAUNCHER posted with the next sequence number and kb.time. Its repeats and its release go
 //!    the way its down went. The UI opens nothing for a stale, superseded or failed-open post (`post_verdict`).
 //!  * Type-ahead: a chord that will open the launcher opens a window of TYPEAHEAD_MS in which every other key down
-//!    (modifiers, Win, keys pressed with Win and the repeats of a key Windows already holds excepted) is swallowed
+//!    (modifiers, Win, the system's keys of `never_kept`, keys pressed with Win and the repeats of a key Windows
+//!    already holds excepted) is swallowed
 //!    into a ring of RING_CAP keys tagged with the post's sequence. The UI takes the ring of the sequence it opened and replays it, or ends it when nothing
 //!    opens; the hook expires it at the first key after the deadline. An up is swallowed only when its down was.
 //!  * The ring's control word (sequence, OPEN, ENDED, length) is changed by both threads only by compare-exchange,
@@ -966,14 +967,13 @@ fn admitted(flags: u32, extra: usize, accept_injected: bool) -> bool {
     }
 }
 
+/// The keys a type-ahead window never keeps, so the system's key state stays true: the modifiers (Shift, Ctrl, Alt:
+/// 0x10-0x12, 0xA0-0xA5), Win (0x5B, 0x5C) and the system's keys, which the launcher does not own and a replay would
+/// drop (they type nothing): CapsLock, the IME keys (Esc, 0x1B, excepted), Print Screen, Sleep, NumLock, ScrollLock
+/// and the browser, volume, media and launch keys (0xA6-0xB7).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-const fn is_modifier(vk: u32) -> bool {
-    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5)
-}
-
-#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-const fn is_win(vk: u32) -> bool {
-    matches!(vk, 0x5B | 0x5C)
+const fn never_kept(vk: u32) -> bool {
+    matches!(vk, 0x10..=0x12 | 0x14..=0x1A | 0x1C..=0x1F | 0x2C | 0x5B | 0x5C | 0x5F | 0x90 | 0x91 | 0xA0..=0xB7)
 }
 
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -1086,13 +1086,13 @@ pub(crate) fn resolve_launcher(s: &ChordState, ev: KeyEv) -> Option<Verdict> {
             (SpaceState::Idle, _) => {}
         }
     }
-    // 3. Type-ahead: inside a live window every key but modifiers, Win, Win chords and the repeats of a key Windows
-    //    already holds goes to the ring; an up is swallowed only when its down was.
+    // 3. Type-ahead: inside a live window every key but modifiers, Win, the system's keys, Win chords and the repeats of
+    //    a key Windows already holds goes to the ring; an up is swallowed only when its down was.
     if s.live(ev.time) {
         if !ev.down {
             return s.buffered(ev.vk).then_some(Verdict::SwallowSilent);
         }
-        if is_modifier(ev.vk) || is_win(ev.vk) || s.win_down || ev.held {
+        if never_kept(ev.vk) || s.win_down || ev.held {
             return None;
         }
         return Some(Verdict::Buffer);
@@ -1955,6 +1955,30 @@ mod tests {
         }
         assert!(k.take(1).is_empty());
         assert!(balanced(&k.seen));
+    }
+
+    /// The system's keys the launcher does not own pass inside a type-ahead window, down and up: Windows toggles the
+    /// locks, takes the screenshot, changes the volume and switches the IME (a replay would drop them: they type
+    /// nothing). Esc, the menu key and the keys around them are still kept.
+    #[test]
+    fn system_keys_never_buffered() {
+        let system = [0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F, 0x2C, 0x5F, 0x90, 0x91];
+        let mut k = Kbd::new();
+        k.chord(10_000);
+        k.tap(KEY_A, 10_050);
+        for (i, vk) in system.into_iter().chain(0xA6..=0xB7).enumerate() {
+            let t = 10_100 + i as u32 * 10;
+            assert_eq!(k.tap(vk, t), (None, None), "{vk:#x}");
+        }
+        k.tap(KEY_C, 10_450);
+        assert_eq!(k.take(1), [KEY_A, KEY_C], "the text around them is kept, in order");
+        assert!(balanced(&k.seen));
+        for vk in [0x13, 0x1B, 0x2D, 0x5D, 0x5E, 0x8F, 0x92, 0xB8, 0xBA] {
+            let mut s = st();
+            s.ring = RingCtl::opened(1);
+            s.post_time = 10_000;
+            assert_eq!(resolve_launcher(&s, ev(vk, true, 10_100)), Some(Verdict::Buffer), "{vk:#x}");
+        }
     }
 
     #[test]
