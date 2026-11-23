@@ -31,7 +31,7 @@
 //! `attach_console`; `--console` does the same for normal runs too (log on stdout and Ctrl+C).
 #![windows_subsystem = "windows"]
 
-/// Statements of the wake probe (`--features wake-probe`, plans/P0-wsC-v2.md Q3): they compile to nothing without it.
+/// Statements of the wake probe (`--features wake-probe`, P0-wsC-v2 Q3): they compile to nothing without it.
 macro_rules! probe {
     ($($t:tt)*) => {
         #[cfg(feature = "wake-probe")]
