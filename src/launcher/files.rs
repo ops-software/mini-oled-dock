@@ -1276,12 +1276,15 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.score.rank).collect::<Vec<_>>(), (0..7).collect::<Vec<u32>>());
         assert!(rows.iter().all(|r| !r.destructive && r.from == ProviderId::Files));
         assert_eq!(items(hits, &["quokka"], 3).len(), 3);
-        // The helper's folder flag on an executable's name, a trailing separator and the trailing dots and spaces
-        // Windows drops: executable files, no Open, never the Mixed default.
+        // The helper's folder flag on an executable's name, a trailing separator, the trailing dots and spaces
+        // Windows drops and a class id for the extension (a folder so named too): executable files, no Open, never the
+        // Mixed default.
         let odd = vec![
             hit("C:\\u\\Downloads\\setup.exe", true),
             hit("C:\\u\\quokka.cmd\\", false),
             hit("C:\\u\\quokka.exe. .", false),
+            hit("C:\\u\\quokka.pdf.{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}", false),
+            hit("C:\\u\\quokka.{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\", true),
         ];
         for r in items(odd, &["quokka"], 20) {
             assert_eq!((r.kind, &r.icon), (Kind::File, &IconRef::Glyph(Executable)), "{}", r.title);

@@ -953,7 +953,8 @@ pub fn extension(path: &str) -> Option<&str> {
 /// The class of a path by its extension alone (`extension`: the text after the last dot in any case, the trailing dots
 /// and spaces Windows drops dropped here, so no caller can forget them; 5.4.6): it picks a row's glyph, and an
 /// executable is never the default in Mixed mode. Executable: the spec's twelve, then the other types that run code
-/// when Explorer opens them (the Attachment Manager's high-risk list), held back as well until live check V-7.
+/// when Explorer opens them (the Attachment Manager's high-risk list), held back as well until live check V-7, and a
+/// class id (`{...}`): Explorer hides such an extension and may hand the file to that class's handler.
 pub fn file_class(path: &str) -> FileClass {
     const CLASSES: [(FileClass, &[&str]); 5] = [
         (
@@ -977,6 +978,10 @@ pub fn file_class(path: &str) -> FileClass {
         (FileClass::Archive, &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "cab", "iso"]),
     ];
     let Some(ext) = extension(path) else { return FileClass::Other };
+    // `invoice.pdf.{3050F4D8-...}`: no ordinary document has a class id for its extension.
+    if ext.starts_with('{') {
+        return FileClass::Executable;
+    }
     CLASSES
         .iter()
         .find(|(_, exts)| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
@@ -1764,6 +1769,11 @@ pub(crate) mod tests {
             ("C:\\a\\README. .", Other),
             ("C:\\a\\...", Other),
             ("C:\\a\\setup.exe .txt", Document),
+            // A class id as the extension, which Explorer hides: never an ordinary document.
+            ("C:\\a\\invoice.pdf.{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}", Executable),
+            ("C:\\a\\invoice.pdf.{3050f4d8-98b5-11cf-bb82-00aa00bdce0b}. ", Executable),
+            ("C:\\a\\notes.{draft}.txt", Document),
+            ("C:\\a\\{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}", Other),
         ];
         for (path, want) in cases {
             assert_eq!(file_class(path), want, "{path}");
@@ -1805,7 +1815,8 @@ pub(crate) mod tests {
         assert!(is_executable_file(&res.rows()[0]));
         assert_eq!(res.selected(), None, "an executable file row is never the default in Mixed mode");
         // The trailing dots and spaces Windows drops hide no executable (file_class drops them).
-        for typed in ["C:\\tools\\setup.exe.", "C:\\tools\\setup.exe . .", "C:\\tools\\run.CMD.."] {
+        let guid = "C:\\tools\\invoice.pdf.{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}";
+        for typed in ["C:\\tools\\setup.exe.", "C:\\tools\\setup.exe . .", "C:\\tools\\run.CMD..", guid] {
             fx.sync(&mut res, typed, 3);
             assert!(is_executable_file(&res.rows()[0]), "{typed}");
             assert!(!res.rows()[0].verbs.has(Verb::Open), "{typed}");
