@@ -516,8 +516,8 @@ impl std::fmt::Display for StageError {
     }
 }
 
-/// Largest `--version` output read back from a staged exe.
-const CAPTURE_MAX_BYTES: u64 = 4096;
+/// Largest `--version` output read back from a staged (or installed) exe.
+pub(crate) const CAPTURE_MAX_BYTES: u64 = 4096;
 /// How long a staged exe may take to answer `--version`.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 

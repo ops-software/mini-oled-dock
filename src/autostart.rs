@@ -38,6 +38,7 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, CREATE_NO_WINDOW};
 use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 use crate::log;
+use crate::update_release::{parse_version_output, Version};
 
 /// Exit codes of the CLI modes (`--install`, `--uninstall`, argument errors).
 pub const EXIT_OK: i32 = 0;
@@ -357,6 +358,53 @@ fn staging_path(dest: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The replaced exe an upgrade keeps next to `dock.exe` (`copy_self`), for `--rollback` or a manual
+/// `dock.prev.exe --install`.
+pub(crate) const PREV_NAME: &str = "dock.prev.exe";
+
+/// `<dir>\dock.prev.exe` for `dest` = `<dir>\dock.exe`. Pure.
+pub(crate) fn prev_path(dest: &Path) -> PathBuf {
+    dest.with_file_name(PREV_NAME)
+}
+
+/// `<dir>\dock.prev.exe.new`: the replaced exe is copied here, then renamed over `prev_path`. Pure.
+fn prev_staging_path(dest: &Path) -> PathBuf {
+    staging_path(&prev_path(dest))
+}
+
+/// true only for an upgrade (`installed` known and older): a reinstall, a downgrade (a rollback) or an
+/// unreadable installed version leaves `dock.prev.exe` as it is. Pure.
+pub(crate) fn keeps_prev(installed: Option<Version>, installing: Version) -> bool {
+    installed.is_some_and(|v| v < installing)
+}
+
+/// The version `exe --version` prints (contract: `mini-oled-dock X.Y.Z`, nothing touched). `None` when the
+/// file is missing; a failed run or another answer is logged and is `None`. A wedged exe costs up to the
+/// 5 s timeout and is killed by `run_capture`.
+pub(crate) fn exe_version(exe: &Path) -> Option<Version> {
+    if !exe.is_file() {
+        return None;
+    }
+    let max = crate::update::CAPTURE_MAX_BYTES;
+    match crate::update::run_capture(exe, &["--version"], Duration::from_secs(5), max) {
+        Ok((0, out)) => {
+            let v = parse_version_output(&out);
+            if v.is_none() {
+                log!("autostart: {} --version printed no version", exe.display());
+            }
+            v
+        }
+        Ok((code, _)) => {
+            log!("autostart: {} --version exited with {code}", exe.display());
+            None
+        }
+        Err(e) => {
+            log!("autostart: {} --version failed: {e}", exe.display());
+            None
+        }
+    }
+}
+
 /// Renames `src` over `dest` in one step (`MoveFileExW`, same volume). `dest` is never written in
 /// place: a running image (opened without delete sharing) makes the rename fail and stays intact.
 fn replace_file(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -390,6 +438,11 @@ fn retry_copy(
 /// (`signal_stop_to_instance`; with no instance, e.g. after a crash, its watchdog may still hold the
 /// exe) and retries while `keep_waiting` says so: up to `STOP_WAIT` (35 s) while the old instance or
 /// its watchdog still runs the exe. Never relaunches: `run_install_cli` decides that.
+///
+/// An upgrade also keeps the replaced exe as `dock.prev.exe` (`keeps_prev`), renamed into place only after
+/// the new `dock.exe` is, so `dock.exe` is a complete image at every instant. To know the installed
+/// version it runs `<dest> --version` first (also in the update guard's rollback, where `dest` is the image
+/// of the dock it just ended): a wedged exe costs up to 5 s, nothing else.
 fn copy_self(dest: &Path, allow_stop: bool) -> InstallReport {
     let fail = |m: String| InstallReport::failed(InstallError::Failed(m));
     let me = match std::env::current_exe() {
@@ -412,17 +465,41 @@ fn copy_self(dest: &Path, allow_stop: bool) -> InstallReport {
         }
         _ => {}
     }
+    let installed = exe_version(dest);
+    let prev_new = prev_staging_path(dest);
+    let _ = std::fs::remove_file(&prev_new);
+    let mut keep = keeps_prev(installed, Version::current());
+    if keep {
+        if let Err(e) = std::fs::copy(dest, &prev_new) {
+            log!("autostart: previous version not kept (copy failed: {e})");
+            let _ = std::fs::remove_file(&prev_new);
+            keep = false;
+        }
+    }
     if let Err(e) = std::fs::copy(&me, &new) {
         let _ = std::fs::remove_file(&new);
+        let _ = std::fs::remove_file(&prev_new);
         return fail(format!("copy to {} failed: {e}", new.display()));
     }
-    let copied = |stop_signalled| InstallReport { copy: CopyOutcome::Copied, stop_signalled, error: None };
+    let copied = |stop_signalled| {
+        if let (true, Some(v)) = (keep, installed) {
+            match replace_file(&prev_new, &prev_path(dest)) {
+                Ok(()) => log!("autostart: previous version {v} kept as {PREV_NAME}"),
+                Err(e) => {
+                    log!("autostart: previous version not kept ({e})");
+                    let _ = std::fs::remove_file(&prev_new);
+                }
+            }
+        }
+        InstallReport { copy: CopyOutcome::Copied, stop_signalled, error: None }
+    };
     let first = match replace_file(&new, dest) {
         Ok(()) => return copied(false),
         Err(e) => e,
     };
     if !allow_stop {
         let _ = std::fs::remove_file(&new);
+        let _ = std::fs::remove_file(&prev_new);
         return fail(format!("replacing {} failed: {first}", dest.display()));
     }
     log!("autostart: replace failed ({first}), asking the running instance to exit");
@@ -441,6 +518,7 @@ fn copy_self(dest: &Path, allow_stop: bool) -> InstallReport {
         return copied(signalled);
     };
     let _ = std::fs::remove_file(&new);
+    let _ = std::fs::remove_file(&prev_new);
     let error = if old_alive {
         InstallError::CouldNotStop(format!(
             "replacing {} failed: the old instance or its watchdog did not exit within {} s: {last}",
@@ -617,8 +695,8 @@ fn stop_and_wait(exe: &Path) -> Result<(), InstallError> {
 }
 
 /// The only files `--uninstall --remove` deletes from the install folder. Pure.
-fn removal_targets(install_dir: &Path) -> [PathBuf; 3] {
-    [install_dir.join("dock.exe"), install_dir.join("dock.exe.new"), install_dir.join("autostart-task.xml")]
+fn removal_targets(install_dir: &Path) -> [PathBuf; 5] {
+    ["dock.exe", "dock.exe.new", PREV_NAME, "dock.prev.exe.new", "autostart-task.xml"].map(|n| install_dir.join(n))
 }
 
 /// Asks Windows to delete `path` (a file or an empty folder) at the next restart. Elevated only.
@@ -639,7 +717,7 @@ fn old_copy_path(path: &Path, pid: u32) -> PathBuf {
 
 /// True for a name made by `old_copy_path` from one of `removal_targets`. Pure.
 fn is_old_copy_name(name: &str) -> bool {
-    ["dock.exe", "dock.exe.new", "autostart-task.xml"].iter().any(|t| {
+    ["dock.exe", "dock.exe.new", PREV_NAME, "dock.prev.exe.new", "autostart-task.xml"].iter().any(|t| {
         name.strip_prefix(t)
             .and_then(|rest| rest.strip_prefix(".old-"))
             .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
@@ -883,7 +961,44 @@ mod tests {
     #[test]
     fn removal_targets_are_only_our_files() {
         let d = Path::new(r"C:\Program Files\mini-oled-dock");
-        assert_eq!(removal_targets(d), [d.join("dock.exe"), d.join("dock.exe.new"), d.join("autostart-task.xml")]);
+        assert_eq!(
+            removal_targets(d),
+            [
+                d.join("dock.exe"),
+                d.join("dock.exe.new"),
+                d.join("dock.prev.exe"),
+                d.join("dock.prev.exe.new"),
+                d.join("autostart-task.xml")
+            ]
+        );
+    }
+
+    #[test]
+    fn previous_exe_is_kept_only_on_an_upgrade() {
+        let v = |s| Version::parse(s).unwrap();
+        assert!(!keeps_prev(None, v("1.5.1"))); // nothing installed, or its version unreadable
+        assert!(keeps_prev(Some(v("1.5.0")), v("1.5.1")));
+        assert!(!keeps_prev(Some(v("1.5.1")), v("1.5.1"))); // a reinstall
+        assert!(!keeps_prev(Some(v("1.5.2")), v("1.5.1"))); // a downgrade: a rollback never touches it
+    }
+
+    #[test]
+    fn previous_exe_paths_sit_next_to_dock_exe() {
+        let dest = Path::new(r"C:\P\m\dock.exe");
+        assert_eq!(prev_path(dest), PathBuf::from(r"C:\P\m\dock.prev.exe"));
+        assert_eq!(prev_staging_path(dest), PathBuf::from(r"C:\P\m\dock.prev.exe.new"));
+        assert!(prev_staging_path(dest).to_string_lossy().ends_with("dock.prev.exe.new"));
+    }
+
+    #[test]
+    fn uninstall_removes_the_previous_exe_too() {
+        let d = Path::new(r"C:\Program Files\mini-oled-dock");
+        let targets = removal_targets(d);
+        assert!(targets.contains(&d.join("dock.prev.exe")) && targets.contains(&d.join("dock.prev.exe.new")));
+        assert!(is_old_copy_name("dock.prev.exe.old-12"));
+        assert!(is_old_copy_name("dock.prev.exe.new.old-7"));
+        assert!(!is_old_copy_name("dock.prev.exe.old-"));
+        assert!(!is_old_copy_name("dock.prev.exe"));
     }
 
     #[test]

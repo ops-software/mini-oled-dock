@@ -244,6 +244,13 @@ fn hex32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// The version in `dock.exe --version`'s output, `mini-oled-dock X.Y.Z` (canonical, surrounding
+/// whitespace ignored); anything else is `None`.
+pub fn parse_version_output(stdout: &[u8]) -> Option<Version> {
+    let rest = std::str::from_utf8(stdout).ok()?.trim().strip_prefix("mini-oled-dock ")?;
+    Version::parse(rest).filter(|v| v.to_string() == rest)
+}
+
 /// `dock.exe --version` prints `mini-oled-dock X.Y.Z`.
 pub fn version_output_matches(stdout: &[u8], v: Version) -> bool {
     std::str::from_utf8(stdout).is_ok_and(|s| s.trim() == format!("mini-oled-dock {v}"))
@@ -562,6 +569,22 @@ mod tests {
             assert_eq!(parse_sha256_file(bad.as_bytes()), None, "{bad}");
         }
         assert_eq!(parse_sha256_file(&[b'a'; 2000]), None);
+    }
+
+    #[test]
+    fn version_output_parses() {
+        assert_eq!(parse_version_output(b"mini-oled-dock 1.5.0\r\n"), Version::parse("1.5.0"));
+        for bad in [
+            &b"mini-oled-dock v1.5.0"[..],
+            b"mini-oled-dock 1.5",
+            b"mini-oled-dock 1.05.0",
+            b"mini-oled-dock 1.5.0 extra",
+            b"1.5.0",
+            b"",
+            b"mini-oled-dock \xff1.5.0",
+        ] {
+            assert_eq!(parse_version_output(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
