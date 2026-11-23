@@ -772,6 +772,10 @@ pub struct Config {
     pub update_available: String,
     /// The launcher (Alt+Space style search box); off until a chord is set.
     pub launcher: LauncherConfig,
+    /// Top-level keys this release does not know, kept verbatim so that an older release does not erase
+    /// a newer one's settings; never shown in Settings. Read by `parse`, written last by `render`.
+    #[serde(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -845,6 +849,7 @@ impl Default for Config {
             last_update_check: String::new(),
             update_available: String::new(),
             launcher: LauncherConfig::default(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -950,12 +955,82 @@ fn strip_comments(src: &str) -> String {
 /// Parses the config (JSONC). Tolerates a leading UTF-8 BOM (Notepad). Missing fields = defaults.
 fn parse(text: &str) -> Result<Config, String> {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut c = serde_json::from_str::<Config>(&strip_comments(t)).map_err(|e| e.to_string())?;
+    let t = strip_comments(t);
+    let mut c = serde_json::from_str::<Config>(&t).map_err(|e| e.to_string())?;
+    c.extra = unknown_keys(&t);
     migrate_bar_size(&mut c);
     for msg in c.launcher.sanitize() {
         crate::log!("config error: {msg}");
     }
     Ok(c)
+}
+
+/// The top-level keys this release knows: every key serde writes for a `Config` (what `render` writes; a
+/// test pins the list to `serde_json::to_value(Config::default())`) and the legacy `bar_size` (read by
+/// `migrate_bar_size`, never written). A list, because serializing the defaults at run time costs the exe
+/// about 8 KiB. A new top-level field goes here too, or it would be kept as unknown and written twice.
+const KNOWN_KEYS: [&str; 50] = [
+    "language",
+    "position",
+    "monitor",
+    "autohide",
+    "window_previews",
+    "win_opens_start",
+    "hide_native_taskbar",
+    "pinned",
+    "start_pins",
+    "start_folders",
+    "start_style",
+    "start_grid",
+    "names",
+    "show_date",
+    "show_volume_percent",
+    "show_tray",
+    "show_notifications",
+    "show_volume",
+    "show_network",
+    "show_metrics",
+    "show_battery",
+    "battery_percent",
+    "battery_percent_inside",
+    "show_clock",
+    "show_desktop_button",
+    "show_start_button",
+    "display_mode",
+    "bar_size",
+    "app_icon_size",
+    "app_text_size",
+    "tray_icon_size",
+    "module_size",
+    "background",
+    "bar_opacity",
+    "settings_window_size",
+    "time_format",
+    "show_seconds",
+    "date_format",
+    "tray_hidden_guids",
+    "tray_hidden",
+    "app_order",
+    "tray_order",
+    "modules_order",
+    "audio_layout",
+    "notif_prompted",
+    "update_check",
+    "update_auto_install",
+    "last_update_check",
+    "update_available",
+    "launcher",
+];
+
+/// The top-level keys of `json` that are not `KNOWN_KEYS`. Anything unexpected keeps nothing, as before.
+fn unknown_keys(json: &str) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(serde_json::Value::Object(mut all)) = serde_json::from_str(json) else {
+        return serde_json::Map::new();
+    };
+    for k in KNOWN_KEYS {
+        all.remove(k);
+    }
+    all
 }
 
 /// Converts a legacy `bar_size` (one knob scaling the whole bar: small 7/8, medium 1, large 5/4)
@@ -992,6 +1067,16 @@ fn js<T: Serialize + ?Sized>(v: &T) -> String {
 /// Pretty JSON of a collection, continuation lines indented to sit under a 2-space key.
 fn js_block<T: Serialize + ?Sized>(v: &T) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string()).replace('\n', "\n  ")
+}
+
+/// The `extra` keys as the last lines of the file, one compact line each: "" when there are none, so
+/// such a file is written as before.
+fn render_extra(extra: &serde_json::Map<String, serde_json::Value>) -> String {
+    if extra.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = extra.iter().map(|(k, v)| format!("  {}: {}", js(k), js(v))).collect();
+    format!(",\n\n  // Kept from a newer version of the dock. Leave as is.\n{}", lines.join(",\n"))
 }
 
 /// Serializes `c` as a commented JSONC file: an English guide above every field, current values
@@ -1263,7 +1348,7 @@ fn render(c: &Config) -> String {
   }},
 
   // Internal: set once the notification-access prompt has been shown. Leave as is.
-  "notif_prompted": {notif}
+  "notif_prompted": {notif}{extra}
 }}
 "#,
         monitor = js(&c.monitor),
@@ -1330,6 +1415,7 @@ fn render(c: &Config) -> String {
         l_web_url = js(&c.launcher.web_url),
         l_offer_done = c.launcher.offer_done,
         l_powertoys_done = c.launcher.powertoys_done,
+        extra = render_extra(&c.extra),
     )
 }
 
