@@ -1048,7 +1048,7 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     }
     // WinRT notifications + "Do not disturb" (`notif` thread, non-blocking).
     if config::get().show_notifications {
-        notif::start(h);
+        notif::start(h, ui::is_visible());
     }
     // Tray host: only with the native taskbar hidden. Order: Explorer already hidden and at
     // the bottom of the Z-order -> host topmost and ready -> TaskbarCreated announcement (apps re-register with us).

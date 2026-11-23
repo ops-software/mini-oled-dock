@@ -864,7 +864,7 @@ pub fn on_config_changed() {
 fn modules_sync() {
     let cfg = config::get();
     if cfg.show_notifications && !crate::notif::is_started() {
-        crate::notif::start(hwnd());
+        crate::notif::start(hwnd(), is_visible());
     } else if !cfg.show_notifications && crate::notif::is_started() {
         let hook = popup::suspend_mouse_hook();
         crate::notif::stop();
@@ -3103,6 +3103,7 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
         arm_clock(hwnd());
         sysmon_sync();
         battery_sync();
+        on_visibility(true);
     }
     if hide_after_ms >= u64::MAX / 4 {
         log!("SHOW ({reason}), autohide off");
@@ -3150,6 +3151,7 @@ pub fn hide_dock(reason: &str) {
 /// `hide_dock` without the slide+fade out (`now`), or with it unless over a fullscreen app.
 fn hide(reason: &str, now: bool) {
     // Hiding over a fullscreen app is instant; otherwise slide+fade out.
+    let was_visible = VISIBLE.load(Relaxed);
     let fs = FS_SHOWN.swap(false, Relaxed);
     let instant = now || fs;
     // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`,
@@ -3165,6 +3167,9 @@ fn hide(reason: &str, now: bool) {
         hide_window(hwnd());
     }
     VISIBLE.store(false, Relaxed);
+    if was_visible {
+        on_visibility(false);
+    }
     reset_hover();
     kill_timer(hwnd(), TIMER_CLOCK);
     sysmon_sync();
@@ -3182,6 +3187,12 @@ fn hide(reason: &str, now: bool) {
     if prev != 0 {
         restore_foreground(HWND(prev as *mut std::ffi::c_void));
     }
+}
+
+/// The one place that follows the bar's real visibility changes (once per transition: a hide of a hidden bar
+/// calls nothing). Called after `VISIBLE` is stored, before any foreground call.
+fn on_visibility(visible: bool) {
+    crate::notif::set_bar_visible(visible);
 }
 
 /// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is
