@@ -6,8 +6,8 @@
 //!    `shutdown`: UI thread ONLY (the taskbar has no WinEvent hook of its own: `apps::winevent_proc` runs on the
 //!    UI thread and hands the raw events to `on_raw_event`, which posts `WM_DOCK_TASKBAR_EVENT`).
 //!  * `restore()` and `restore_force()`: callable from ANY thread/process (panic hook,
-//!    WM_ENDSESSION, watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
-//!    thread-safe Win32 APIs and do not touch thread-local state.
+//!    watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
+//!    thread-safe Win32 APIs and do not touch thread-local state. `restore_at_session_end` (WM_ENDSESSION): UI thread.
 //!  * On-disk state: `%ProgramData%\mini-oled-dock\taskbar-state` (text: the numeric `ABS_*` value),
 //!    admin-only folder, atomic write (`datadir::write_atomic`), read without following reparse
 //!    points. Without a usable data folder the state cannot be saved and the taskbar is never hidden.
@@ -46,6 +46,9 @@ static HIDDEN: AtomicBool = AtomicBool::new(false);
 /// Set at the start of `restore`/`restore_force` and NEVER cleared: a process that has started
 /// restoring must not hide the taskbar again (panic hook / safety timer race).
 static RESTORING: AtomicBool = AtomicBool::new(false);
+/// Set by `restore_at_session_end` and never cleared: `restore_force` keeps the state file for the next sign-in.
+/// Only the dock sets it, so a watchdog restore after a crash still deletes the file.
+static SESSION_END: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "TaskbarCreated" message (0 = not registered yet).
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// true while the taskbar wants the raw WinEvents that `apps::winevent_proc` hands to `on_raw_event` (set by
@@ -600,7 +603,8 @@ fn write_state(state: u32) -> Result<(), String> {
 /// Returns true if a valid state exists on file after the call.
 /// `pre` is the state already read (and stabilized) by `init`; `None` = reads it here.
 fn ensure_state_saved(pre: Option<u32>) -> bool {
-    if read_state().is_some() {
+    if let Some(s) = read_state() {
+        log!("taskbar: original state {s} (state file)");
         return true;
     }
     let list = native_taskbars();
@@ -1151,21 +1155,67 @@ pub fn begin_exit() {
 
 /// "Normal" restore by the dock on exit (WM_DESTROY/clean exit, WM_ENDSESSION wParam != 0,
 /// panic hook). Idempotent and guarded: if this process hid nothing (`HIDDEN` false) and
-/// the state file does not exist, it does nothing. Otherwise it runs `restore_force()` and clears `HIDDEN`.
+/// the state file does not exist, it does nothing; after the session end's restore, nothing unless this process hid
+/// the taskbar again (`restore_needed`). Otherwise it runs `restore_force()` and clears `HIDDEN`.
 /// Callable from any thread.
 pub fn restore() {
     RESTORING.store(true, Relaxed);
     let was_hidden = HIDDEN.swap(false, Relaxed);
-    if !was_hidden && !state_file_exists() && read_legacy_state().is_none() {
+    // Read only when this process hid nothing, as before.
+    let state_left = !was_hidden && (state_file_exists() || read_legacy_state().is_some());
+    if !restore_needed(was_hidden, state_left, session_ending()) {
         return;
     }
     restore_force();
 }
 
+/// Whether `restore()` has anything to do: this process hid the taskbar, or (outside a session end) a state file or
+/// a legacy state is left. The session end's restore keeps the file for the next sign-in, so a later call of the same
+/// process (WM_DESTROY, `cleanup`, the end of `main`) does not restore a second time. Pure.
+fn restore_needed(was_hidden: bool, state_left: bool, session_ending: bool) -> bool {
+    was_hidden || (state_left && !session_ending)
+}
+
+/// The session-end restore (`WM_ENDSESSION` with wParam != 0, UI thread): ends the watchdog first, so it cannot
+/// restore again after the dock and delete the state file, then marks the session end (`restore_force` keeps the
+/// file for the next sign-in's `init`) and restores. A restore that is not delivered keeps the file as always.
+pub fn restore_at_session_end() {
+    crate::watchdog::end_for_session_end();
+    SESSION_END.store(true, Relaxed);
+    restore();
+}
+
+/// true once `restore_at_session_end` ran in this process.
+fn session_ending() -> bool {
+    SESSION_END.load(Relaxed)
+}
+
+/// What `restore_force` does with the state file after its `ABM_SETSTATE`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum AfterRestore {
+    /// Delivered: the file has done its job.
+    Delete,
+    /// Not delivered (Explorer hung or shutting down): kept, so the watchdog, the next run or `--restore` finish it.
+    KeepUndelivered,
+    /// Delivered at a session end: kept for the next sign-in's `init`, since Explorer may save its settings before
+    /// this restore and does not keep a restored "not auto-hide".
+    KeepForNextSignIn,
+}
+
+/// Pure decision of `restore_force` on the state file (`session_ending`: `restore_at_session_end` ran).
+fn after_restore(delivered: bool, session_ending: bool) -> AfterRestore {
+    match (delivered, session_ending) {
+        (false, _) => AfterRestore::KeepUndelivered,
+        (true, false) => AfterRestore::Delete,
+        (true, true) => AfterRestore::KeepForNextSignIn,
+    }
+}
+
 /// UNCONDITIONAL restore (watchdog, CLI `--restore`): reads the state from the file (default
 /// `ABS_ALWAYSONTOP`, NEVER autohide), `ABM_SETSTATE`, for each taskbar `RemovePropW` +
 /// `ShowWindowAsync(SW_SHOWNA)` + `SetWindowPos(HWND_TOPMOST, ... ASYNCWINDOWPOS)`, then
-/// deletes the state file and then `SendNotifyMessageW(HWND_BROADCAST, TaskbarCreated)`. Without a file and
+/// deletes the state file (kept at a session end: `after_restore`) and then
+/// `SendNotifyMessageW(HWND_BROADCAST, TaskbarCreated)`. Without a file and
 /// without the `DockHidden` mark it does nothing; without `Shell_TrayWnd` it keeps the file and does nothing.
 /// Callable from any thread and from a process other than the dock.
 pub fn restore_force() {
@@ -1211,17 +1261,22 @@ pub fn restore_force() {
     // the file gone (`restored_externally`) and does not hide the taskbar again. If however ABM_SETSTATE
     // did not reach Explorer (session shutting down, hung) the file stays: the autohide set by
     // us has already been persisted by Explorer and without a file the next run would save it as "original".
-    // This way the watchdog, the next run's self-heal or `--restore` complete the restore.
+    // This way the watchdog, the next run's self-heal or `--restore` complete the restore. At a session end the file
+    // is kept too: the next sign-in's `init` reads it as the original.
     if delivered && legacy.is_some() {
         mark_legacy_consumed();
     }
-    if !delivered {
-        log!("taskbar: ABM_SETSTATE not delivered, state file kept");
-    } else if let Some(p) = state_file_path() {
-        // Deletes the name itself (never a link target), inside the admin-only data folder.
-        if let Err(e) = std::fs::remove_file(p) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log!("taskbar: removing state file failed: {e}");
+    match after_restore(delivered, session_ending()) {
+        AfterRestore::KeepUndelivered => log!("taskbar: ABM_SETSTATE not delivered, state file kept"),
+        AfterRestore::KeepForNextSignIn => log!("taskbar: session ending, state file kept for the next sign-in"),
+        AfterRestore::Delete => {
+            if let Some(p) = state_file_path() {
+                // Deletes the name itself (never a link target), inside the admin-only data folder.
+                if let Err(e) = std::fs::remove_file(p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log!("taskbar: removing state file failed: {e}");
+                    }
+                }
             }
         }
     }
@@ -1375,6 +1430,32 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wsA A6: a delivered restore deletes the state file, except at a session end, which keeps it for the next
+    /// sign-in's `init` (Explorer may save its own setting before the restore); an undelivered one always keeps it.
+    #[test]
+    fn a_session_end_keeps_the_state_for_the_next_sign_in() {
+        use AfterRestore::*;
+        assert_eq!(after_restore(true, false), Delete);
+        assert_eq!(after_restore(true, true), KeepForNextSignIn);
+        assert_eq!(after_restore(false, false), KeepUndelivered);
+        assert_eq!(after_restore(false, true), KeepUndelivered);
+    }
+
+    /// wsA A6: after the session end's restore (file kept) a later `restore()` of the same process (WM_DESTROY, the
+    /// cleanup, the end of `main`) runs only if this process hid the taskbar again; outside a session end, as before.
+    #[test]
+    fn a_restore_after_the_session_end_restore_does_nothing() {
+        //                     hidden left   session end
+        assert!(restore_needed(true, false, false));
+        assert!(restore_needed(true, true, false));
+        assert!(restore_needed(false, true, false), "a state file or a legacy state left: restored, as before");
+        assert!(!restore_needed(false, false, false), "nothing hidden, nothing left: as before");
+        assert!(restore_needed(true, false, true), "the session end's own restore");
+        assert!(restore_needed(true, true, true));
+        assert!(!restore_needed(false, true, true), "the file kept for the next sign-in stays");
+        assert!(!restore_needed(false, false, true));
+    }
 
     /// wsC Q7: the safety check's line is logged for the first 20 hits of a process, not every 3 s.
     #[test]

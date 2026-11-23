@@ -625,10 +625,12 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(1)
         }
         WM_ENDSESSION => {
-            // End of session: the taskbar state would survive a reboot, so restore it right away.
+            // End of session: the taskbar state would survive a reboot, so restore it right away. Explorer may save
+            // its settings before this restore: the state file stays for the next sign-in, and the watchdog is ended
+            // first so it cannot restore again and delete it.
             if wp.0 != 0 {
                 taskbar::begin_exit();
-                taskbar::restore();
+                taskbar::restore_at_session_end();
             }
             LRESULT(0)
         }

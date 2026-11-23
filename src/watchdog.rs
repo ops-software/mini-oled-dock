@@ -26,11 +26,12 @@
 //!    `stop-watch` thread waits on it and, if it fires, posts `WM_DOCK_QUIT_REQUEST` to the window.
 //!    `--restore` signals it with `signal_stop_to_instance()`.
 //!
-//! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `shutdown` from the main/UI thread;
+//! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `shutdown`, `end_for_session_end` from the
+//! main/UI thread;
 //! `run_watchdog` is the main of the watchdog process (no window, no hook, no COM).
 
 use std::ffi::c_void;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
@@ -81,6 +82,9 @@ static HEARTBEAT_EVENT: AtomicIsize = AtomicIsize::new(0);
 static STARTUP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SHUTDOWN_EVENT: AtomicIsize = AtomicIsize::new(0);
+/// The watchdog process (`launch_watchdog`), kept so the dock can end it at a session end (`end_for_session_end`);
+/// closing it does not end the watchdog, which still sees exit code 0 at a normal exit.
+static WATCHDOG_PROCESS: AtomicIsize = AtomicIsize::new(0);
 /// `GetTickCount64` of the last heartbeat signalled (0 = none yet). UI thread.
 static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -122,7 +126,7 @@ fn to_handle(raw: isize) -> HANDLE {
 fn close_slot(slot: &AtomicIsize) {
     let raw = slot.swap(0, Relaxed);
     if raw != 0 {
-        // SAFETY: handle created by CreateEventW in this process; the swap guarantees a single close.
+        // SAFETY: handle opened in this process (CreateEventW, CreateProcessW); the swap guarantees a single close.
         let _ = unsafe { CloseHandle(to_handle(raw)) };
     }
 }
@@ -188,6 +192,7 @@ pub fn spawn() -> Result<(), String> {
         close_slot(&STARTUP_EVENT);
         close_slot(&STOP_EVENT);
         close_slot(&SHUTDOWN_EVENT);
+        close_slot(&WATCHDOG_PROCESS);
         return Err(e);
     }
     log!("watchdog: started (event {ev_name})");
@@ -197,8 +202,10 @@ pub fn spawn() -> Result<(), String> {
 /// `CreateProcessW` of `current_exe --watchdog <pid> <event>`, with a fallback without breakaway.
 fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    // The process handle is not needed by the dock: dropping it closes it.
-    spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}")).map(drop)
+    // The process handle is kept for `end_for_session_end`; `shutdown` closes it.
+    let process = spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}"))?;
+    WATCHDOG_PROCESS.store(process.into_raw_handle() as isize, Relaxed);
+    Ok(())
 }
 
 /// `CreateProcessW` of `"<exe>" <args>` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW`, falling
@@ -375,6 +382,25 @@ pub fn shutdown(stop_watcher: Option<JoinHandle<()>>) {
     close_slot(&STOP_EVENT);
     close_slot(&HEARTBEAT_EVENT);
     close_slot(&STARTUP_EVENT);
+    close_slot(&WATCHDOG_PROCESS);
+}
+
+/// Session end (`taskbar::restore_at_session_end`, UI thread): ends the watchdog process before the dock's own
+/// restore, so it cannot restore again after the dock exits and delete the state file kept for the next sign-in.
+/// No-op without a watchdog (never started, or already ended).
+pub(crate) fn end_for_session_end() {
+    let raw = WATCHDOG_PROCESS.swap(0, Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let h = to_handle(raw);
+    // SAFETY: the process handle CreateProcessW returned (full access), owned by the slot until the swap above.
+    match unsafe { TerminateProcess(h, 0) } {
+        Ok(()) => log!("watchdog: ended for the session end (the dock restores and keeps the state file)"),
+        Err(e) => log!("watchdog: ending it for the session end failed: {e}"),
+    }
+    // SAFETY: the same handle, closed once (the slot was emptied by the swap).
+    let _ = unsafe { CloseHandle(h) };
 }
 
 // ------------------------------------------------------ `--restore` side
