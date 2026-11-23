@@ -506,6 +506,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             if wp.0 == windows::Win32::UI::WindowsAndMessaging::PBT_APMRESUMEAUTOMATIC as usize {
                 popup::popup_launcher::on_resume();
                 crate::hook::note_activity();
+                crate::tray_host::raise_after("resume");
             }
             // TRUE grants the event.
             Some(LRESULT(1))
@@ -563,6 +564,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
                 on_shell_hook(h, HSHELL_WINDOWACTIVATED, lp.0);
                 on_foreground_changed(HWND(lp.0 as *mut std::ffi::c_void));
                 crate::hook::note_activity();
+                crate::tray_host::raise();
             }
             request_apps_refresh(h);
             Some(LRESULT(0))
@@ -621,12 +623,14 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         WM_DPICHANGED => {
             let dpi = (wp.0 & 0xFFFF) as u32;
             picker_cancel("display changed");
+            crate::tray_host::raise_after("DPI change");
             apply_dpi(if dpi >= 96 { dpi } else { dock_dpi() });
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE => {
             // Also a display plugged in or out: the bar moves to (or back to) its chosen display.
             picker_cancel("display changed");
+            crate::tray_host::raise_after("display change");
             apply_dpi(dock_dpi());
             Some(LRESULT(0))
         }
@@ -3188,6 +3192,10 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool, startup: bool) {
     if !was_visible {
         // Before the redraw, so the first present is already at alpha 0 / slid out.
         start_vis_anim(1.0, SHOW_ANIM_MS);
+        // A dead owner's icon goes before the first frame, so the slide-in does not shrink mid-animation.
+        if tray_host::sweep_dead_now() {
+            refresh_tray_state();
+        }
     }
     if !was_visible {
         // One sample just before the first frame, so the battery module is already in it.
@@ -3303,6 +3311,7 @@ fn hide(reason: &str, now: bool) {
 /// calls nothing). Called after `VISIBLE` is stored, before any foreground call.
 fn on_visibility(visible: bool) {
     crate::notif::set_bar_visible(visible);
+    crate::tray_host::set_bar_visible(visible);
     crate::hook::note_activity();
     if visible {
         GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::Shown));

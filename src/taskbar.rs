@@ -1144,6 +1144,7 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
     }
     log!("taskbar: event 0x{event:X} on visible taskbar, hiding it again");
     hide_all();
+    crate::tray_host::raise();
 }
 
 /// 3 s safety check (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
@@ -1249,7 +1250,7 @@ fn explorer_restarted(why: &str) {
     }
     // Explorer's new Shell_TrayWnd is born topmost and would sit in front of ours: it is brought back to the
     // top and, after 300 ms, announced again so apps re-register their icons with us.
-    crate::tray_host::raise();
+    crate::tray_host::raise_after("Explorer restart");
     arm_reannounce(300);
 }
 

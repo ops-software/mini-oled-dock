@@ -69,6 +69,8 @@ use crate::icons::{self, IconBitmap};
 use crate::log;
 use crate::msg::WM_DOCK_TRAY_CHANGED;
 
+mod key;
+
 /// Window property that marks OUR `Shell_TrayWnd` (also read by the watchdog process and
 /// by the `--restore` CLI through `taskbar::is_dock_tray_host`).
 pub const PROP_DOCK_TRAY_HOST: PCWSTR = w!("DockTrayHost");
@@ -84,7 +86,7 @@ pub struct TrayView {
     pub id: u64,
     /// Premultiplied bitmap ALREADY scaled to `set_icon_px` (None = conversion failed: do not draw).
     pub bitmap: Option<Arc<IconBitmap>>,
-    /// Stable key for the `tray_hidden` config (see `item_key`).
+    /// Stable key for the `tray_hidden` / `tray_order` config (see `item_keys`).
     pub key: String,
     /// Short app name (the exe's FileDescription; fallback: first tooltip line, exe name).
     pub name: String,
@@ -361,8 +363,35 @@ const WM_HOST_RESIZE: u32 = WM_APP + 1;
 const WM_HOST_RAISE: u32 = WM_APP + 2;
 const WM_HOST_RESCALE: u32 = WM_APP + 3;
 
+/// The bar was shown (wParam 1) or hidden (wParam 0): the dead-icon sweep runs only while it is shown.
+const WM_HOST_BAR: u32 = WM_APP + 6;
+
 const TIMER_ZORDER: usize = 1;
 const TIMER_DEAD: usize = 2;
+
+/// The timers of the host for a bar state: (z-order witness, dead-icon sweep). A dead icon is seen only in the
+/// shown bar; the z-order check stays on while hidden (apps register icons with the first Shell_TrayWnd).
+fn host_timers(bar_visible: bool) -> (bool, bool) {
+    (true, bar_visible)
+}
+
+/// The witness line is logged for the first 20 displacements only.
+fn witness_logs(count: u32) -> bool {
+    count < 20
+}
+
+/// A displacement found by the 1 s check is a witness when no event raise followed it (both are `now_ms` stamps;
+/// 0 = none).
+fn witness_due(displaced_ms: u64, last_raise_ms: u64) -> bool {
+    displaced_ms != 0 && last_raise_ms < displaced_ms
+}
+
+/// When the last event raise (`WM_HOST_RAISE`, `WM_HOST_BAR(1)`) ran on the host thread.
+static LAST_RAISE_MS: AtomicU64 = AtomicU64::new(0);
+/// When the 1 s check found Explorer's taskbar above the host (0 = no record) and which window it was.
+static DISPLACED_MS: AtomicU64 = AtomicU64::new(0);
+static DISPLACED_WND: AtomicIsize = AtomicIsize::new(0);
+static WITNESS_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 fn yield_msg_id() -> u32 {
     let cur = YIELD_MSG.load(Relaxed);
@@ -390,12 +419,22 @@ fn post_ui(kind: usize) {
 }
 
 fn post_host(msg: u32) {
+    post_host_wp(msg, 0);
+}
+
+fn post_host_wp(msg: u32, wp: usize) {
     let h = HOST_HWND.load(Relaxed);
     if h == 0 {
         return;
     }
     // SAFETY: PostMessageW is thread-safe; if the window is gone it merely fails.
-    let _ = unsafe { PostMessageW(Some(hwnd_of(h)), msg, WPARAM(0), LPARAM(0)) };
+    let _ = unsafe { PostMessageW(Some(hwnd_of(h)), msg, WPARAM(wp), LPARAM(0)) };
+}
+
+/// The bar was shown or hidden (called by `ui::on_visibility`): arms or kills the dead-icon sweep and, at a show,
+/// raises the host. Does not block (private message to the host thread).
+pub fn set_bar_visible(on: bool) {
+    post_host_wp(WM_HOST_BAR, on as usize);
 }
 
 // ------------------------------------------------------------------ pure NIM_* logic
@@ -638,10 +677,11 @@ fn window_pid(h: HWND) -> u32 {
 }
 
 /// Removes icon `id` (dead owner) and notifies the UI if it was visible.
-fn remove_dead(id: u64, exe: &str) {
+fn remove_dead(id: u64, owner: isize, pid: u32, exe: &str) -> bool {
     let was_visible = {
         let mut st = state();
-        match st.items.iter().position(|t| t.id == id) {
+        // Identity is re-checked under the lock: a NIM_ADD may have given the same id a live owner meanwhile.
+        match st.items.iter().position(|t| t.id == id && t.owner == owner && t.pid == pid) {
             Some(i) => {
                 let v = is_visible_item(&st.items[i]);
                 st.items.remove(i);
@@ -655,7 +695,9 @@ fn remove_dead(id: u64, exe: &str) {
         if v {
             post_ui(2);
         }
+        return v;
     }
+    false
 }
 
 fn allow_foreground(pid: u32) {
@@ -1020,16 +1062,47 @@ pub fn is_running() -> bool {
     RUNNING.load(Relaxed) && !YIELDED.load(Relaxed)
 }
 
-/// Stable key of an icon for `config.tray_hidden`: lowercase GUID without braces if present,
-/// otherwise `<lowercase exe name>#<uID>` (unknown exe = "?").
-fn item_key(t: &TrayItem) -> String {
-    match &t.guid {
-        Some(g) => guid_string(g),
-        None => {
-            let exe = if t.exe.is_empty() { "?".to_string() } else { t.exe.to_lowercase() };
-            format!("{exe}#{}", t.uid)
+/// Stable keys of `items`, in order, for `config.tray_hidden` / `tray_order` (`key::keys_of`): the lowercase GUID
+/// without braces if the icon has one, otherwise `<lowercase exe name>|<n>` (unknown exe = "?"), n its place among
+/// the exe's GUID-less icons whose owner is alive. `alive` is `owner_alive` in production: call it in the locked
+/// section that reads the items (IsWindow and GetWindowThreadProcessId send no message and cannot block), so the
+/// keys match them.
+fn item_keys(items: &[TrayItem], alive: &dyn Fn(isize, u32) -> bool) -> Vec<String> {
+    let rows: Vec<(&str, Option<String>, bool)> = items
+        .iter()
+        .map(|t| (t.exe.as_str(), t.guid.as_ref().map(guid_string), t.guid.is_none() && alive(t.owner, t.pid)))
+        .collect();
+    key::keys_of(&rows)
+}
+
+fn same_exe(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Removes `exe`'s GUID-less icons whose owner is dead; returns (id, was visible) of each. A GUID icon stays:
+/// `apply_nim` gives it its new owner in place (same id, same place).
+fn retain_alive(items: &mut Vec<TrayItem>, exe: &str, alive: &dyn Fn(isize, u32) -> bool) -> Vec<(u64, bool)> {
+    let mut gone = Vec::new();
+    let mut i = 0;
+    while let Some(t) = items.get(i) {
+        if t.guid.is_none() && same_exe(&t.exe, exe) && !alive(t.owner, t.pid) {
+            gone.push((t.id, is_visible_item(t)));
+            items.remove(i);
+        } else {
+            i += 1;
         }
     }
+    gone
+}
+
+/// The live GUID-less icons of `exe` with their places, as `item_keys` numbers them.
+fn seen_of(items: &[TrayItem], exe: &str, alive: &dyn Fn(isize, u32) -> bool) -> Vec<key::Seen> {
+    items
+        .iter()
+        .filter(|t| t.guid.is_none() && same_exe(&t.exe, exe) && alive(t.owner, t.pid))
+        .enumerate()
+        .map(|(ordinal, t)| key::Seen { exe: t.exe.clone(), uid: t.uid, ordinal })
+        .collect()
 }
 
 /// Name to show for the icon: FileDescription, then first tooltip line, then exe without extension.
@@ -1048,8 +1121,8 @@ fn display_name(t: &TrayItem) -> String {
     }
 }
 
-fn view_of(t: &TrayItem, user_hidden: bool) -> TrayView {
-    TrayView { id: t.id, bitmap: t.bitmap.clone(), key: item_key(t), name: display_name(t), user_hidden }
+fn view_of(t: &TrayItem, key: String, user_hidden: bool) -> TrayView {
+    TrayView { id: t.id, bitmap: t.bitmap.clone(), key, name: display_name(t), user_hidden }
 }
 
 fn user_hidden_in(cfg: &crate::config::Config, key: &str) -> bool {
@@ -1070,7 +1143,12 @@ pub fn any_user_hidden() -> bool {
         return false;
     }
     let st = state();
-    st.items.iter().filter(|t| is_visible_item(t) && !guid_hidden(&cfg, t)).any(|t| user_hidden_in(&cfg, &item_key(t)))
+    let keys = item_keys(&st.items, &owner_alive);
+    st.items
+        .iter()
+        .zip(&keys)
+        .filter(|(t, _)| is_visible_item(t) && !guid_hidden(&cfg, t))
+        .any(|(_, key)| user_hidden_in(&cfg, key))
 }
 
 fn guid_hidden(cfg: &crate::config::Config, t: &TrayItem) -> bool {
@@ -1084,17 +1162,20 @@ fn guid_hidden(cfg: &crate::config::Config, t: &TrayItem) -> bool {
 }
 
 /// Builds the views; with `include_hidden == false` user-hidden icons are skipped BEFORE the
-/// view is built (no bitmap Arc clone / String copies for them). No cap on the count.
+/// view is built (no bitmap Arc clone / String copies for them). No cap on the count. The keys are
+/// computed in the same locked section, so they match the items.
 fn collect(include_hidden: bool) -> Vec<TrayView> {
     let cfg = crate::config::get();
     let st = state();
+    let keys = item_keys(&st.items, &owner_alive);
     st.items
         .iter()
-        .filter(|t| is_visible_item(t))
-        .filter(|t| !guid_hidden(&cfg, t))
-        .filter_map(|t| {
-            let hidden = user_hidden_in(&cfg, &item_key(t));
-            (include_hidden || !hidden).then(|| view_of(t, hidden))
+        .zip(keys)
+        .filter(|(t, _)| is_visible_item(t))
+        .filter(|(t, _)| !guid_hidden(&cfg, t))
+        .filter_map(|(t, key)| {
+            let hidden = user_hidden_in(&cfg, &key);
+            (include_hidden || !hidden).then(|| view_of(t, key, hidden))
         })
         .collect()
 }
@@ -1142,7 +1223,7 @@ pub fn set_icon_px(px: u32) {
 pub fn click(id: u64, kind: TrayClick, anchor: POINT) {
     let Some(t) = target_of(id) else { return };
     if !owner_alive(t.owner, t.pid) {
-        remove_dead(t.id, &t.exe);
+        remove_dead(t.id, t.owner, t.pid, &t.exe);
         return;
     }
     if t.callback == 0 {
@@ -1523,6 +1604,19 @@ pub fn raise() {
     post_host(WM_HOST_RAISE);
 }
 
+/// `raise()` plus a log line, for the rare events that can reorder `Shell_TrayWnd` (resume, display change, DPI
+/// change, Explorer restart): the lines show which transitions the days of use held.
+pub fn raise_after(why: &str) {
+    raise();
+    log!("tray: host raised after {why}");
+}
+
+/// Removes the icons of dead owners on the CALLER's thread (the UI thread, before the first frame of a show, so
+/// the slide-in does not shrink mid-animation). True when a visible icon went.
+pub fn sweep_dead_now() -> bool {
+    sweep_dead()
+}
+
 /// Yields to Explorer: permanent `YIELDED` flag, `SetWindowPos(HWND_BOTTOM, SWP_ASYNCWINDOWPOS)`,
 /// no more forwarding. Idempotent, callable from ANY thread (panic hook, WM_ENDSESSION,
 /// `taskbar::restore_force`, `restored_externally`). No-op if the host does not exist in this process.
@@ -1747,7 +1841,8 @@ fn create_host() -> Result<(), String> {
         if SetTimer(Some(host), TIMER_ZORDER, 1000, None) == 0 {
             log!("tray: SetTimer(1 s) failed: {:?}", windows::core::Error::from_thread());
         }
-        if SetTimer(Some(host), TIMER_DEAD, 5000, None) == 0 {
+        // The startup show precedes `start`, so its `set_bar_visible` found no host: arm the sweep here.
+        if host_timers(crate::ui::is_visible()).1 && SetTimer(Some(host), TIMER_DEAD, 5000, None) == 0 {
             log!("tray: SetTimer(5 s) failed: {:?}", windows::core::Error::from_thread());
         }
     }
@@ -1803,8 +1898,13 @@ unsafe extern "system" fn host_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         WM_COPYDATA => on_copydata(wp, lp),
         WM_TIMER => {
             match wp.0 {
-                TIMER_ZORDER => keep_first(hwnd),
-                TIMER_DEAD => sweep_dead(),
+                TIMER_ZORDER => {
+                    judge_witness();
+                    keep_first(hwnd, true);
+                }
+                TIMER_DEAD => {
+                    sweep_dead();
+                }
                 TIMER_PLACE => place_disarm(hwnd),
                 _ => {}
             }
@@ -1833,7 +1933,25 @@ unsafe extern "system" fn host_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             resize_host(hwnd);
             LRESULT(0)
         }
+        WM_HOST_BAR => {
+            let shown = wp.0 != 0;
+            if shown {
+                LAST_RAISE_MS.store(now_ms(), Relaxed);
+                keep_first(hwnd, false);
+            }
+            if host_timers(shown).1 {
+                // SAFETY: own window and timer id, same thread.
+                if unsafe { SetTimer(Some(hwnd), TIMER_DEAD, 5000, None) } == 0 {
+                    log!("tray: SetTimer(5 s) failed: {:?}", windows::core::Error::from_thread());
+                }
+            } else {
+                // SAFETY: own window and timer id, same thread.
+                let _ = unsafe { KillTimer(Some(hwnd), TIMER_DEAD) };
+            }
+            LRESULT(0)
+        }
         WM_HOST_RAISE => {
+            LAST_RAISE_MS.store(now_ms(), Relaxed);
             if !YIELDED.load(Relaxed) {
                 copy_taskband(hwnd);
                 set_topmost(hwnd);
@@ -1887,8 +2005,29 @@ fn set_topmost(hwnd: HWND) {
     }
 }
 
-/// 1 s timer: if we are not the first `Shell_TrayWnd` (and have not yielded) climb back up.
-fn keep_first(hwnd: HWND) {
+/// Decides the witness of the previous 1 s tick: a displacement it found that no event raise followed is logged
+/// (capped); the record is then cleared.
+fn judge_witness() {
+    let displaced = DISPLACED_MS.load(Relaxed);
+    if displaced == 0 {
+        return;
+    }
+    if witness_due(displaced, LAST_RAISE_MS.load(Relaxed)) {
+        let n = WITNESS_LOGGED.fetch_add(1, Relaxed);
+        if witness_logs(n) {
+            log!(
+                "tray: Explorer's Shell_TrayWnd 0x{:X} was above the host, raised by the 1 s check (no event raised it first)",
+                DISPLACED_WND.load(Relaxed)
+            );
+        }
+    }
+    DISPLACED_MS.store(0, Relaxed);
+    DISPLACED_WND.store(0, Relaxed);
+}
+
+/// If we are not the first `Shell_TrayWnd` (and have not yielded) climb back up. Called by the 1 s timer
+/// (`from_tick`: the displacement is recorded for the witness) and by a show of the bar.
+fn keep_first(hwnd: HWND, from_tick: bool) {
     if YIELDED.load(Relaxed) {
         return;
     }
@@ -1896,6 +2035,10 @@ fn keep_first(hwnd: HWND) {
     let first = unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }.unwrap_or_default();
     if first != hwnd {
         set_topmost(hwnd);
+        if from_tick && DISPLACED_MS.load(Relaxed) == 0 {
+            DISPLACED_WND.store(first.0 as isize, Relaxed);
+            DISPLACED_MS.store(now_ms(), Relaxed);
+        }
     }
     // SAFETY: no preconditions.
     if unsafe { IsWindowVisible(hwnd) }.as_bool() {
@@ -1904,15 +2047,17 @@ fn keep_first(hwnd: HWND) {
     }
 }
 
-/// 5 s timer: removes icons whose owner is dead.
-fn sweep_dead() {
+/// 5 s timer (and a show of the bar): removes icons whose owner is dead. True when a visible icon went.
+fn sweep_dead() -> bool {
     let cands: Vec<(u64, isize, u32, String)> =
         state().items.iter().map(|t| (t.id, t.owner, t.pid, t.exe.clone())).collect();
+    let mut visible_gone = false;
     for (id, owner, pid, exe) in cands {
         if !owner_alive(owner, pid) {
-            remove_dead(id, &exe);
+            visible_gone |= remove_dead(id, owner, pid, &exe);
         }
     }
+    visible_gone
 }
 
 /// Rectangle given to the hidden `Shell_TrayWnd`. Apps that position their own flyouts from
@@ -2193,20 +2338,42 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
     } else {
         IconUpdate::Keep
     };
-    let exe_path = if msg == NIM_ADD && pid != 0 { crate::apps::exe_path_of_pid(pid).unwrap_or_default() } else { String::new() };
-    let res = {
+    let exe_path =
+        if msg == NIM_ADD && pid != 0 { crate::apps::exe_path_of_pid(pid).unwrap_or_default() } else { String::new() };
+    let exe = file_name_of(&exe_path);
+    let guid = (nid.flags & NIF_GUID != 0 && !guid_is_zero(&nid.guid)).then_some(nid.guid);
+    let (res, dropped, key) = {
         let mut st = state();
         let TrayState { items, next_id, .. } = &mut *st;
-        apply_nim(items, next_id, &d, (pid != 0).then_some(pid), icon, &exe_path)
+        // An app that adds its icon again from a new window: the old item, whose owner is gone, would keep a place
+        // (exe|1 beside the new exe|0) until the 5 s sweep, so an icon the user hid would show meanwhile. Only the
+        // exe's GUID-less items go; a GUID item gets its new owner in place in apply_nim.
+        let dropped =
+            if msg == NIM_ADD && !exe.is_empty() { retain_alive(items, &exe, &owner_alive) } else { Vec::new() };
+        let res = apply_nim(items, next_id, &d, (pid != 0).then_some(pid), icon, &exe_path);
+        let key = if msg == NIM_ADD {
+            find_item(items, owner, nid.uid, guid).and_then(|i| item_keys(items, &owner_alive).get(i).cloned())
+        } else {
+            None
+        };
+        (res, dropped, key)
     };
+    for (id, _) in &dropped {
+        log!("tray: owner of #{id} ({exe}) no longer valid, icon removed");
+    }
     if msg == NIM_ADD && res.ret && !exe_path.is_empty() {
-        // Short name for the chooser: reading version resources is disk I/O, so it stays outside
-        // the host thread (the app is still blocked in its Shell_NotifyIcon). Reply immediately.
-        let guid = (nid.flags & NIF_GUID != 0 && !guid_is_zero(&nid.guid)).then_some(nid.guid);
-        let (uid, path) = (nid.uid, exe_path.clone());
+        // The exe's keys of releases before 1.5.1 rewritten in config.json, and the short name for the chooser:
+        // the config file and the version resources are disk I/O, so they stay outside the host thread (the app
+        // is still blocked in its Shell_NotifyIcon). Reply immediately.
+        let (uid, path, exe) = (nid.uid, exe_path.clone(), exe.clone());
         if let Err(e) = std::thread::Builder::new().name("tray-name".into()).stack_size(512 * 1024).spawn(move || {
             probe!(crate::probe::bump(crate::probe::C::Spawned));
             let name = cached_file_description(&path);
+            // The exe's icons as they are now, not at this NIM_ADD: an app adds its icons back to back and the name
+            // read (from disk the first time) lets the later ones arrive, so a legacy entry finds its exact uID
+            // instead of taking the first icon's place by position.
+            let seen = seen_of(&state().items, &exe, &owner_alive);
+            migrate_keys(&exe, &seen);
             if name.is_empty() {
                 return;
             }
@@ -2228,21 +2395,50 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         }
     }
     if msg == NIM_ADD {
-        let exe = file_name_of(&exe_path);
         let guid = if nid.flags & NIF_GUID != 0 { guid_string(&nid.guid) } else { "-".into() };
         log!(
-            "tray: NIM_ADD exe={} guid={guid} hwnd=0x{:X} uid={} ret={}",
+            "tray: NIM_ADD exe={} guid={guid} hwnd=0x{:X} uid={} ret={} key={}",
             if exe.is_empty() { "?" } else { &exe },
             owner,
             nid.uid,
-            res.ret
+            res.ret,
+            key.as_deref().unwrap_or("-")
         );
     }
     enqueue_forward(wp.0, bytes);
-    if res.change != 0 {
-        post_ui(res.change);
+    let change = if dropped.iter().any(|&(_, visible)| visible) { 2 } else { res.change };
+    if change != 0 {
+        post_ui(change);
     }
     LRESULT(res.ret as isize)
+}
+
+/// Rewrites `exe`'s keys of releases before 1.5.1 in `tray_hidden` / `tray_order` (and orders its new places)
+/// when `key::needs_migration` says so, through config::modify (which reads, renders and writes the file). Runs on
+/// the NIM_ADD's `tray-name` thread, never on the host thread. A failure is logged; the exe's next NIM_ADD tries
+/// again.
+fn migrate_keys(exe: &str, seen: &[key::Seen]) {
+    if !key::needs_migration(&key::Lists::from_config(&crate::config::get()), seen) {
+        return;
+    }
+    let mut n = 0;
+    // The closure runs migrate again on config's fresh copy under its write lock: two threads cannot apply it
+    // twice. Only the two lists change; every other key, those of newer releases too, is written back.
+    let saved = crate::config::modify(|c| {
+        let mut l = key::Lists::from_config(c);
+        n = key::migrate(&mut l, seen);
+        if n > 0 {
+            l.write_back(c);
+        }
+    });
+    match saved {
+        Ok(()) if n > 0 => {
+            log!("tray: migrated keys of {exe} ({n} changed)");
+            post_ui(2);
+        }
+        Ok(()) => {}
+        Err(e) => log!("tray: key migration of {exe} not saved: {e}"),
+    }
 }
 
 fn handle_icon_rect(bytes: &[u8]) -> LRESULT {
@@ -2777,6 +2973,27 @@ fn forward_main() {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::DUPLICATE_HANDLE_OPTIONS;
+
+    #[test]
+    fn the_dead_sweep_runs_only_while_shown() {
+        assert_eq!(host_timers(true), (true, true));
+        assert_eq!(host_timers(false), (true, false));
+    }
+
+    #[test]
+    fn the_witness_line_is_capped() {
+        assert!(witness_logs(0));
+        assert!(witness_logs(19));
+        assert!(!witness_logs(20));
+    }
+
+    #[test]
+    fn a_raise_after_the_tick_is_not_a_witness() {
+        assert!(!witness_due(1000, 1500));
+        assert!(witness_due(1000, 500));
+        assert!(witness_due(1000, 0));
+        assert!(!witness_due(0, 0));
+    }
 
     #[test]
     fn stop_wakes_a_waiting_forwarder() {
@@ -3460,5 +3677,92 @@ mod tests {
     fn handle_a_32_bit_con_segno() {
         assert_eq!(ext(0xFFFF_FFFE), -2);
         assert_eq!(ext(0x1234), 0x1234);
+    }
+
+    #[test]
+    fn readd_from_a_new_window_keeps_the_key() {
+        let mut items = Vec::new();
+        let mut next = 1u64;
+        let mut first = nid(0x1, 7, NIF_ICON);
+        first.message = NIM_ADD;
+        assert!(apply_nim(&mut items, &mut next, &first, Some(10), bmp(), r"C:\a\a.exe").ret);
+        // The app re-adds its icon from a new window; the first one is gone, its item still waits for the sweep.
+        let alive = |owner: isize, _pid: u32| owner != 0x1;
+        assert_eq!(item_keys(&items, &alive), s(&["a.exe|0"]), "a dead owner alone keeps place 0");
+        assert_eq!(retain_alive(&mut items, "A.exe", &alive), vec![(1, true)]);
+        assert!(items.is_empty());
+        let mut again = nid(0x2, 8, NIF_ICON);
+        again.message = NIM_ADD;
+        assert!(apply_nim(&mut items, &mut next, &again, Some(10), bmp(), r"C:\a\a.exe").ret);
+        assert_eq!(item_keys(&items, &alive), s(&["a.exe|0"]));
+        let mut l = key::Lists { hidden: s(&["a.exe|0"]), order: Vec::new() };
+        assert_eq!(key::migrate(&mut l, &seen_of(&items, "a.exe", &alive)), 0);
+        assert_eq!(l.hidden, s(&["a.exe|0"]));
+    }
+
+    #[test]
+    fn guid_item_with_a_dead_owner_is_replaced_in_place() {
+        let mut items = Vec::new();
+        let mut next = 1u64;
+        let mut other = nid(0x5, 1, NIF_ICON);
+        other.message = NIM_ADD;
+        assert!(apply_nim(&mut items, &mut next, &other, Some(9), bmp(), r"C:\a\a.exe").ret);
+        let mut d = nid(0x10, 1, NIF_ICON | NIF_GUID);
+        d.nid.guid = GUID::from_u128(0x7820ae73_23e3_4229_82c1_e41cb67d5b9c);
+        d.message = NIM_ADD;
+        assert!(apply_nim(&mut items, &mut next, &d, Some(5), bmp(), r"C:\a\a.exe").ret);
+        let alive = |owner: isize, _pid: u32| owner != 0x10;
+        assert!(retain_alive(&mut items, "a.exe", &alive).is_empty(), "a GUID icon is not dropped");
+        let id = items[1].id;
+        d.nid.hwnd = 0x20;
+        assert!(apply_nim(&mut items, &mut next, &d, Some(6), bmp(), r"C:\a\a.exe").ret);
+        assert_eq!(items.len(), 2);
+        assert_eq!((items[1].id, items[1].owner, items[1].pid), (id, 0x20, 6), "same id, same place, new owner");
+        assert_eq!(item_keys(&items, &|_, _| true), s(&["a.exe|0", "7820ae73-23e3-4229-82c1-e41cb67d5b9c"]));
+    }
+
+    #[test]
+    fn nim_add_of_two_icons_of_one_exe_gets_two_ordinals() {
+        let mut items = Vec::new();
+        let mut next = 1u64;
+        for (hwnd, uid) in [(0x10, 1), (0x11, 2)] {
+            let mut d = nid(hwnd, uid, NIF_ICON | NIF_MESSAGE);
+            d.message = NIM_ADD;
+            assert!(apply_nim(&mut items, &mut next, &d, Some(10), bmp(), r"C:\x\X.exe").ret);
+        }
+        let alive = |_: isize, _: u32| true;
+        assert_eq!(item_keys(&items, &alive), s(&["x.exe|0", "x.exe|1"]));
+        let seen = seen_of(&items, "x.exe", &alive);
+        let want = |uid, ordinal| key::Seen { exe: "X.exe".into(), uid, ordinal };
+        assert_eq!(seen, vec![want(1, 0), want(2, 1)]);
+        let mut l = key::Lists { hidden: s(&["x.exe#1", "x.exe#2"]), order: Vec::new() };
+        assert_eq!(key::migrate(&mut l, &seen), 2);
+        assert_eq!(l.hidden, s(&["x.exe|0", "x.exe|1"]));
+        assert!(seen_of(&items, "x.exe", &|owner, _| owner != 0x10).iter().all(|s| s.uid == 2 && s.ordinal == 0));
+    }
+
+    #[test]
+    fn stable_uids_keep_the_hidden_second_icon() {
+        let mut items = Vec::new();
+        let mut next = 1u64;
+        for (hwnd, uid) in [(0x10, 1), (0x11, 2)] {
+            let mut d = nid(hwnd, uid, NIF_ICON | NIF_MESSAGE);
+            d.message = NIM_ADD;
+            assert!(apply_nim(&mut items, &mut next, &d, Some(10), bmp(), r"C:\x\x.exe").ret);
+        }
+        let alive = |_: isize, _: u32| true;
+        // A release before 1.5.1 hid only the second icon. Seen once both are in, as the tray-name thread takes it
+        // after the name read: the exact uID wins.
+        let mut l = key::Lists { hidden: s(&["x.exe#2"]), order: Vec::new() };
+        assert_eq!(key::migrate(&mut l, &seen_of(&items, "x.exe", &alive)), 1);
+        assert_eq!(l.hidden, s(&["x.exe|1"]));
+        // Seen at the first NIM_ADD alone, the entry would take the first icon's place by position.
+        let mut early = key::Lists { hidden: s(&["x.exe#2"]), order: Vec::new() };
+        assert_eq!(key::migrate(&mut early, &seen_of(&items[..1], "x.exe", &alive)), 1);
+        assert_eq!(early.hidden, s(&["x.exe|0"]));
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
     }
 }

@@ -1243,6 +1243,7 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Tray, 0x8003) => "WM_HOST_RESCALE",
         (Th::Tray, 0x8004) => "WM_HOST_PLACE_ARM",
         (Th::Tray, 0x8005) => "WM_HOST_PLACE_MOVE",
+        (Th::Tray, 0x8006) => "WM_HOST_BAR",
         _ => return None,
     })
 }
@@ -1717,6 +1718,7 @@ mod tests {
     fn names_of_messages_timers_and_causes() {
         assert_eq!(msg_name(Th::Ui, crate::msg::WM_DOCK_TOGGLE), "WM_DOCK_TOGGLE");
         assert_eq!(msg_name(Th::Tray, 0x8001), "WM_HOST_RESIZE");
+        assert_eq!(msg_name(Th::Tray, 0x8006), "WM_HOST_BAR");
         assert_eq!(msg_name(Th::Hook, 0x800A), "WM_HOOK_REINSTALL");
         assert_eq!(msg_name(Th::Shell, 0x0113), "WM_TIMER");
         assert_eq!(msg_name(Th::Ui, 0x0401), "0x0401");

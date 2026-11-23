@@ -743,8 +743,10 @@ pub struct Config {
     /// (they keep being answered and forwarded to Explorer).
     pub tray_hidden_guids: Vec<String>,
     /// Tray icons the user chose as "not in the bar" (they stay in the chevron popup).
-    /// Per-icon key (`tray_host::item_key`): lowercase GUID without braces if the icon has one,
-    /// otherwise `<lowercase exe name>#<uID>` (e.g. "discord.exe#1"). Default: empty.
+    /// Per-icon key (`tray_host::item_keys`): lowercase GUID without braces if the icon has one,
+    /// otherwise `<lowercase exe name>|<n>` (e.g. "discord.exe|0"), n = the icon's 0-based place among that
+    /// exe's icons without a GUID. The `<exe>#<uID>` keys of releases before 1.5.1 are rewritten when the exe's
+    /// icons register (`tray_host::key::migrate`). Default: empty.
     pub tray_hidden: Vec<String>,
     /// Relative order of the app entries that are NOT pinned (their keys). Pinned entries use the
     /// `pinned` array order. Apps missing from the list go last, in the order they were first seen.
@@ -1231,8 +1233,9 @@ fn render(c: &Config) -> String {
   "show_start_button": {show_start},
 
   // Tray icons you chose to keep out of the bar (they stay in the tray popup).
-  // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces)
-  // or "<exe name lowercase>#<icon id>", e.g. "discord.exe#1".
+  // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces),
+  // e.g. "7820ae73-23e3-4229-82c1-e41cb67d5b9c", or for an icon without one
+  // "<exe name lowercase>|<n>", n counting that app's icons from 0, e.g. "discord.exe|0".
   "tray_hidden": {tray_hidden},
 
   // Order of the tray icons in the bar (same keys as "tray_hidden"). Normally managed by
