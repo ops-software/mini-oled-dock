@@ -118,7 +118,10 @@ use windows::Win32::System::Diagnostics::Debug::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcess;
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{
+    AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
@@ -952,8 +955,15 @@ fn run(args: &Args) -> Result<(), String> {
     // The manifest already sets PerMonitorV2; the call is a safety net and may fail
     // with "access denied" if the context is already fixed: not an error.
     // SAFETY: must be called before creating windows; the constant is valid.
-    if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
-        log!("SetProcessDpiAwarenessContext: {e} (probably already set by the manifest)");
+    // It is skipped when the manifest already made the thread PerMonitorV2 (the normal case: no false error line).
+    let already = unsafe {
+        AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    }
+    .as_bool();
+    if !already {
+        if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+            log!("SetProcessDpiAwarenessContext: {e} (probably already set by the manifest)");
+        }
     }
     // COM STA on the UI thread too (needed by SHGetPropertyStoreForWindow in `apps`).
     // SAFETY: paired with CoUninitialize at the end of `run`.

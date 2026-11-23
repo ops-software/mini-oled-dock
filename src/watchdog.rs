@@ -35,7 +35,7 @@ use std::thread::JoinHandle;
 
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, E_ACCESSDENIED, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     WPARAM,
 };
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
@@ -202,6 +202,7 @@ pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<Owned
     let app = HSTRING::from(exe_str.as_str());
 
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut breakaway_denied = false;
     for (flags, label) in
         [(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, "breakaway"), (CREATE_NO_WINDOW, "without breakaway")]
     {
@@ -232,10 +233,17 @@ pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<Owned
                     let _ = CloseHandle(pi.hThread);
                     OwnedHandle::from_raw_handle(pi.hProcess.0)
                 };
+                if breakaway_denied {
+                    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    log!("spawn: {name} started inside this process's job (breakaway not allowed)");
+                }
                 return Ok(process);
             }
             Err(e) => {
-                log!("spawn: CreateProcessW of {exe_str} ({label}) failed: {e}");
+                match attempt_note(label, &e, &exe_str) {
+                    Some(note) => log!("{note}"),
+                    None => breakaway_denied = true,
+                }
                 if flags == CREATE_NO_WINDOW {
                     return Err(format!("CreateProcessW: {e}"));
                 }
@@ -243,6 +251,15 @@ pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<Owned
         }
     }
     Err("CreateProcessW: no attempt succeeded".into())
+}
+
+/// The log line of a failed `CreateProcessW` attempt. A denied breakaway is the normal case inside the Task
+/// Scheduler job (the plain attempt follows), so it is not an error line: `None`.
+fn attempt_note(label: &str, e: &windows::core::Error, exe: &str) -> Option<String> {
+    if label == "breakaway" && e.code() == E_ACCESSDENIED {
+        return None;
+    }
+    Some(format!("spawn: CreateProcessW of {exe} ({label}) failed: {e}"))
 }
 
 /// Signals the heartbeat (`SetEvent`). Does not block; no-op if `spawn` did not succeed.
@@ -588,6 +605,22 @@ mod tests {
         assert!(beat_fits(3000, WAIT_MS), "the idle keepalive of 3 s");
         assert!(beat_fits(1000, WAIT_MS), "the 1 s beat of today");
         assert!(!beat_fits(3100, WAIT_MS));
+    }
+
+    #[test]
+    fn breakaway_denial_is_not_an_error() {
+        use windows::Win32::Foundation::E_FAIL;
+        let denied = windows::core::Error::from(E_ACCESSDENIED);
+        let failed = windows::core::Error::from(E_FAIL);
+        assert_eq!(attempt_note("breakaway", &denied, "x.exe"), None);
+        assert_eq!(
+            attempt_note("breakaway", &failed, "x.exe"),
+            Some(format!("spawn: CreateProcessW of x.exe (breakaway) failed: {failed}"))
+        );
+        assert_eq!(
+            attempt_note("without breakaway", &denied, "x.exe"),
+            Some(format!("spawn: CreateProcessW of x.exe (without breakaway) failed: {denied}"))
+        );
     }
 
     #[test]
