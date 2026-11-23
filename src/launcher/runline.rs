@@ -1,15 +1,16 @@
 //! Run lines (5.4.9): classification by syntax only, the known-command table and the suggestions of the run mode.
 //! Nothing here reads the environment, the file system or the registry, and nothing expands %VAR%: the line goes to
-//! Explorer as typed.
+//! Explorer as typed (a line with a %VAR% is handed to cmd.exe, which expands it in the user's context: `expands_in_cmd`).
 #![deny(clippy::arithmetic_side_effects)]
 
 use super::model::RunLine;
 use super::rank::fold;
 use crate::i18n::tr;
 
-/// True once live check 4 shows that Explorer expands %VAR% in a line it is given. While it is true the console
-/// fallback below never applies; set it to false to make such lines run in a console kept open instead.
-pub const EXPLORER_EXPANDS_VARS: bool = true;
+/// Live check 4 (V-13, live session C): the desktop shell does NOT expand %VAR% in a line it is given (Notepad got the
+/// literal text), so a line with a %VAR% goes through cmd.exe, which expands it in the user's own context (see
+/// `expands_in_cmd`).
+pub const EXPLORER_EXPANDS_VARS: bool = false;
 
 /// One entry of the known-command table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,10 +150,18 @@ pub fn needs_console_for_vars(line: &str) -> bool {
     line.find('%').is_some_and(|i| line.get(i.saturating_add(1)..).is_some_and(|rest| rest.contains('%')))
 }
 
-/// Whether the line runs in a console kept open: a known console program, or (only while Explorer is not known to
-/// expand variables) a line with a %VAR%.
+/// Whether the line runs in a console kept open: a known console program (or Shift+Enter, which is its own request).
 pub fn runs_in_console(r: &RunLine) -> bool {
-    r.console || (!EXPLORER_EXPANDS_VARS && needs_console_for_vars(&r.line))
+    r.console
+}
+
+/// Whether the shell thread hands the line to `cmd.exe /s /c` so that cmd expands its %VAR% (the desktop shell does
+/// not): a line with a %VAR% that does not already run in a console kept open. The console is not kept open here: a
+/// windowed program (Notepad) must not leave an empty console on screen, and cmd closes once it has started it. The
+/// dock still expands nothing and reads nothing; the typed line, byte for byte, is the argument of a de-elevated
+/// cmd.exe that Explorer starts at medium integrity.
+pub fn expands_in_cmd(line: &str) -> bool {
+    !EXPLORER_EXPANDS_VARS && needs_console_for_vars(line)
 }
 
 /// Where a suggestion came from.
@@ -291,8 +300,14 @@ mod tests {
         assert!(needs_console_for_vars("a%b c%"));
         assert!(!needs_console_for_vars("100%"));
         assert!(!needs_console_for_vars("%"));
-        // While Explorer is assumed to expand, a variable line is not a console line.
-        assert!(!runs_in_console(&classify("%windir%\\notepad.exe").unwrap()));
+        // The desktop shell does not expand: a variable line goes through cmd /c, and is no console line (no console is
+        // kept open for a windowed program).
+        let var = classify("notepad %USERPROFILE%\\x.txt").unwrap();
+        assert!(!runs_in_console(&var));
+        assert!(!EXPLORER_EXPANDS_VARS && expands_in_cmd(&var.line));
+        assert!(expands_in_cmd("%windir%\\notepad.exe"));
+        assert!(!expands_in_cmd("notepad 100%"));
+        assert!(!expands_in_cmd("notepad a.txt"));
     }
 
     #[test]

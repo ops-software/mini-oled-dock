@@ -2869,6 +2869,18 @@ fn command_parts(
     console: bool,
     sys: &Path,
 ) -> Result<(String, Option<String>), &'static str> {
+    command_parts_with(line, file, console.then_some("/k"), sys)
+}
+
+/// `command_parts` with the switch of the cmd.exe wrapper: `/k` (a console kept open), `/c` (cmd expands the %VAR% of
+/// the line, runs it and closes), or none (the line is split as typed).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn command_parts_with(
+    line: &str,
+    file: Range<usize>,
+    wrapper: Option<&str>,
+    sys: &Path,
+) -> Result<(String, Option<String>), &'static str> {
     let part = line.get(file.clone()).ok_or("the file range does not split the line")?;
     if part.trim().is_empty() {
         return Err("an empty file");
@@ -2885,11 +2897,12 @@ fn command_parts(
         (false, _) if rest.is_empty() || rest.starts_with(char::is_whitespace) => rest,
         _ => return Err("the file does not end where its range ends"),
     };
-    if console {
+    if let Some(switch) = wrapper {
         if !sys.is_absolute() {
             return Err("no system directory");
         }
-        return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(format!("/s /k \"{}\"", line.trim()))));
+        let args = format!("/s {switch} \"{}\"", line.trim());
+        return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(args)));
     }
     let args = rest.trim();
     Ok((part.to_string(), (!args.is_empty()).then(|| args.to_string())))
@@ -2914,12 +2927,18 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
     exec(&file, args.as_deref(), None, Verb::RunAs).map_err(Fail::Shell)
 }
 
-/// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /s /k "<line>"`), one
-/// shell call with no working directory. Nothing is expanded or looked up here: the line goes to the
-/// shell as typed.
+/// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /s /k "<line>"`; a line with a
+/// %VAR%, which the desktop shell does not expand, `<sys>\cmd.exe /s /c "<line>"`: cmd expands it in the user's
+/// context and closes once it has started a windowed program), one shell call with no working directory. Nothing is
+/// expanded or looked up here: the line goes to the shell as typed.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), Fail> {
-    let (file, args) = command_parts(line, file, console, sys).map_err(Fail::Refused)?;
+    let wrapper = if console { Some("/k") } else { crate::launcher::runline::expands_in_cmd(line).then_some("/c") };
+    // cmd reads the whole line (its & | > and %): what is shown is what runs, so no control or bidi character in it.
+    if wrapper == Some("/c") && line.chars().any(is_marker) {
+        return Err(Fail::Refused("a control or bidi character"));
+    }
+    let (file, args) = command_parts_with(line, file, wrapper, sys).map_err(Fail::Refused)?;
     exec(&file, args.as_deref(), None, Verb::Open).map_err(Fail::Shell)
 }
 
@@ -3707,6 +3726,44 @@ mod tests {
         // No system directory: no console, and no guess from the environment.
         calls.clear();
         assert!(launch_command_with(&line, file, true, Path::new(""), &mut recorder(&mut calls, true)).is_err());
+        assert!(calls.is_empty());
+    }
+
+    /// Live check V-13: the desktop shell does not expand %VAR%, so such a line goes through `cmd.exe /s /c` (cmd expands
+    /// it, closes after a windowed program started, and keeps no console open); the typed line stays whole, quotes
+    /// included; a line without a variable, and Ctrl+Shift+Enter's elevated run, are not wrapped.
+    #[test]
+    fn launch_command_with_a_variable_goes_through_cmd_c() {
+        let sys = Path::new("C:\\Windows\\System32");
+        let cmd = || "C:\\Windows\\System32\\cmd.exe".to_string();
+        let mut calls = Vec::new();
+        let (line, file) = run_line("notepad %USERPROFILE%\\x.txt");
+        assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        let (line, file) = run_line("\"C:\\Program Files\\x.exe\" \"%TEMP%\\a b\"");
+        assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        // A console program with a variable keeps its console (/k), as before.
+        let (line, file) = run_line("ping %COMPUTERNAME%");
+        assert!(launch_command_with(&line, file, true, sys, &mut recorder(&mut calls, true)).is_ok());
+        // A lone percent sign is no variable.
+        let (line, file) = run_line("notepad 100%");
+        assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        assert_eq!(
+            calls,
+            [
+                (cmd(), Some("/s /c \"notepad %USERPROFILE%\\x.txt\"".to_string()), None, Verb::Open),
+                (cmd(), Some("/s /c \"\"C:\\Program Files\\x.exe\" \"%TEMP%\\a b\"\"".to_string()), None, Verb::Open),
+                (cmd(), Some("/s /k \"ping %COMPUTERNAME%\"".to_string()), None, Verb::Open),
+                ("notepad".to_string(), Some("100%".to_string()), None, Verb::Open),
+            ]
+        );
+        // A bidi or control character in a wrapped line: refused.
+        let (line, file) = run_line("notepad %X%\u{202e}a");
+        assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_err());
+        assert_eq!(calls.len(), 4);
+        // No system directory: nothing runs, and no guess from the environment.
+        calls.clear();
+        let (line, file) = run_line("notepad %X%");
+        assert!(launch_command_with(&line, file, false, Path::new(""), &mut recorder(&mut calls, true)).is_err());
         assert!(calls.is_empty());
     }
 
