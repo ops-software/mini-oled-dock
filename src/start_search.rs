@@ -617,11 +617,16 @@ pub(crate) fn prime_launcher_settings() {
 
 /// Maps `path` read-only and reads one byte of each 4 KiB page, so the next mapping of the file finds its pages in memory
 /// (0 private bytes; the file is unmapped and closed on return). A missing or refused file is left alone.
-pub(crate) fn touch_pages(path: &Path) {
-    if let Ok(m) = crate::launcher_sys::MappedFile::open(path, CACHE_MAX) {
-        let x = m.bytes().iter().step_by(4096).fold(0u8, |a, b| a ^ b);
-        std::hint::black_box(x);
-    }
+/// Returns the number of pages read (`None` for a missing or refused file).
+pub(crate) fn touch_pages(path: &Path) -> Option<usize> {
+    let m = crate::launcher_sys::MappedFile::open(path, CACHE_MAX).ok()?;
+    let mut n = 0usize;
+    let x = m.bytes().iter().step_by(4096).fold(0u8, |a, b| {
+        n += 1;
+        a ^ b
+    });
+    std::hint::black_box(x);
+    Some(n)
 }
 
 fn request(a: Asked) {
@@ -924,7 +929,7 @@ impl SettingsIo for RealIo {
     fn prime(&mut self) {
         if self.key().is_some() {
             if let Some(path) = settings_cache_path() {
-                touch_pages(&path);
+                let _ = touch_pages(&path);
             }
         }
     }
@@ -1950,6 +1955,11 @@ mod tests {
         serve(&sh, Asked { prime: true, ..ENSURE }, &mut io);
         assert_eq!(io.calls.first().map(String::as_str), Some("key"));
         assert!(io.calls.iter().any(|c| c == "read"), "the ensure reads the file: {:?}", io.calls);
+        // A prime folded into an ensure run adds no second key.
+        let mut plain = FakeIo { keys: vec![Some(key())], ..FakeIo::default() };
+        serve(&sh, ENSURE, &mut plain);
+        let keys = |io: &FakeIo| io.calls.iter().filter(|c| *c == "key").count();
+        assert_eq!(keys(&io), keys(&plain), "{:?} against {:?}", io.calls, plain.calls);
     }
 
     /// L3 KEY-11: `touch_pages` reads a file through a mapping and leaves nothing open (the file can be deleted at once).
@@ -1960,8 +1970,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings-catalog.bin");
         std::fs::write(&path, vec![7u8; 3 * 4096 + 5]).unwrap();
-        touch_pages(&path);
-        touch_pages(&dir.join("none.bin"));
+        assert_eq!(touch_pages(&path), Some(4), "one read per page");
+        assert_eq!(touch_pages(&dir.join("none.bin")), None);
         std::fs::remove_file(&path).expect("unmapped and closed");
         let _ = std::fs::remove_dir_all(&dir);
     }

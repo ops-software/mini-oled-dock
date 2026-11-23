@@ -1422,6 +1422,7 @@ fn list_apps_arena(child: bool) -> Arena {
             }
         }
     }
+    COM_WORK.store(true, SeqCst);
     let t = Instant::now();
     let list = enum_apps_folder();
     crate::start_search::load_app_index();
@@ -2358,8 +2359,9 @@ pub(crate) fn take_com_work() -> bool {
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn loads_com(req: &ShellRequest) -> bool {
     match req {
-        ShellRequest::ListStartApps { child, .. } => !child,
-        ShellRequest::ResolveApp(_)
+        // The children's requests count only when they fall back in-process (`COM_WORK` is set there).
+        ShellRequest::ListStartApps { child: false, .. }
+        | ShellRequest::ResolveApp(_)
         | ShellRequest::Launch { .. }
         | ShellRequest::LaunchAdmin(_)
         | ShellRequest::LaunchAppAdmin { .. }
@@ -2375,7 +2377,30 @@ fn loads_com(req: &ShellRequest) -> bool {
         | ShellRequest::LauncherLaunch { .. }
         | ShellRequest::LauncherAppAdmin { .. }
         | ShellRequest::LauncherRevealApp { .. } => true,
-        _ => false,
+        ShellRequest::ListStartApps { child: true, .. }
+        | ShellRequest::StartIconsFor { .. }
+        | ShellRequest::VolumeAdjust { .. }
+        | ShellRequest::VolumeToggleMute
+        | ShellRequest::VolumeRefresh
+        | ShellRequest::VolumeSet { .. }
+        | ShellRequest::ListOutputs
+        | ShellRequest::SetDefaultOutput { .. }
+        | ShellRequest::ListSpatial
+        | ShellRequest::SetSpatialFormat { .. }
+        | ShellRequest::ListSessions
+        | ShellRequest::SetSessionVolume { .. }
+        | ShellRequest::ToggleSessionMute { .. }
+        | ShellRequest::OpenStart
+        | ShellRequest::NetworkQuery
+        | ShellRequest::NetworkRelease
+        | ShellRequest::AudioRelease
+        | ShellRequest::StartRelease
+        | ShellRequest::ComFree
+        | ShellRequest::StartSettingsReady
+        | ShellRequest::LauncherClosed
+        | ShellRequest::LauncherConvert { .. }
+        | ShellRequest::LauncherStateLoad
+        | ShellRequest::LauncherStateSave { .. } => false,
     }
 }
 
@@ -2652,6 +2677,7 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
 /// made at `icon_px` (clamped as the Start menu's). Start's `start_px` and `start_sent` are not touched.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launcher_icons(ui: isize, icon_px: u32, ids: Vec<String>) {
+    COM_WORK.store(true, SeqCst);
     let icon_px = icon_px.clamp(8, 256);
     let icons = ids
         .into_iter()
@@ -3469,6 +3495,14 @@ mod tests {
             ShellRequest::OpenUrl { url: "https://example.org".into() },
             ShellRequest::ToggleDesktop,
             ShellRequest::ListStartApps { icon_px: 30, icons: IconPlan::None, child: false },
+            ShellRequest::OpenPath { path: "C:\\x.txt".into() },
+            ShellRequest::RunAsTyped { line: "x".into(), file: 0..1, gesture: Gesture::for_test(1) },
+            ShellRequest::LaunchCommand { line: "x".into(), file: 0..1, console: false },
+            ShellRequest::RevealPath { path: "C:\\x.txt".into() },
+            ShellRequest::LauncherAppAdmin { id: "x!App".into() },
+            ShellRequest::LauncherRevealApp { id: "x!App".into() },
+            ShellRequest::OpenNotifApp { aumid: "x!App".into(), name: "x".into() },
+            ShellRequest::StartIcons { icon_px: 30, ids: Vec::new() },
         ] {
             assert!(loads_com(&r), "{r:?}");
         }
@@ -3479,6 +3513,8 @@ mod tests {
             ShellRequest::LauncherStateLoad,
             ShellRequest::LauncherClosed,
             ShellRequest::StartRelease,
+            // Counted where they fall back in-process (`COM_WORK` is set there), not by the request.
+            ShellRequest::StartIconsFor { icon_px: 30, ids: Vec::new() },
             // The trim's own pass plans nothing, or every trim would plan the next one.
             ShellRequest::ComFree,
         ] {
