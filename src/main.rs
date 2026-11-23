@@ -954,13 +954,14 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
 fn run(args: &Args) -> Result<(), String> {
     // The manifest already sets PerMonitorV2; the call is a safety net and may fail
     // with "access denied" if the context is already fixed: not an error.
-    // SAFETY: must be called before creating windows; the constant is valid.
     // It is skipped when the manifest already made the thread PerMonitorV2 (the normal case: no false error line).
+    // SAFETY: GetThreadDpiAwarenessContext and AreDpiAwarenessContextsEqual have no preconditions; the constant is a valid context.
     let already = unsafe {
         AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     }
     .as_bool();
     if !already {
+        // SAFETY: must be called before creating windows; the constant is valid.
         if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
             log!("SetProcessDpiAwarenessContext: {e} (probably already set by the manifest)");
         }
