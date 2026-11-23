@@ -471,9 +471,9 @@ fn glyph_of(dir: bool, class: FileClass) -> GlyphId {
 /// The rows of a re-sorted batch, the first `cap`: a file or a folder by its path, its name and its folder, a glyph by
 /// class, the file kinds' verbs (an executable has no Open while the Mark of the Web check is open), never destructive.
 /// The class comes from the name as Windows opens it (`check_hit` holds it to the path's last component, so a trailing
-/// separator hides no extension; the trailing dots and spaces Windows drops are dropped), and the helper's folder flag
-/// is not taken for an executable's name: that row is an executable file, so nothing in the helper's output can give
-/// Open to what SPEC 5.4.6 holds back (a real folder so named keeps Open file location and Copy).
+/// separator hides no extension; `file_class` drops the trailing dots and spaces Windows drops), and the helper's
+/// folder flag is not taken for an executable's name: that row is an executable file, so nothing in the helper's output
+/// can give Open to what SPEC 5.4.6 holds back (a real folder so named keeps Open file location and Copy).
 pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
     let first = folded_words.first().copied().unwrap_or("");
     let mut out = Vec::with_capacity(hits.len().min(usize::from(cap)));
@@ -483,7 +483,7 @@ pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
             1 => rank::T_WORD,
             _ => rank::T_SUBSTR,
         };
-        let class = providers::file_class(h.name.trim_end_matches(['.', ' ']));
+        let class = providers::file_class(&h.name);
         let dir = h.dir && class != FileClass::Executable;
         let class = if dir { FileClass::Other } else { class };
         let (kind, rank_kind, verbs) = if dir {

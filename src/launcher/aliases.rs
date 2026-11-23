@@ -314,6 +314,12 @@ mod tests {
         let exe = classify("C:\\Tools\\x.exe").unwrap();
         let T::Command(r) = &exe else { panic!("{exe:?}") };
         assert_eq!((&*r.line, r.file.clone(), r.console), ("\"C:\\Tools\\x.exe\"", 1..15, false));
+        // The trailing dots and spaces Windows drops hide no program: still a command of the quoted path.
+        for t in ["C:\\Tools\\x.exe.", "C:\\Tools\\x.EXE . .", "\\\\srv\\share\\run.bat.."] {
+            let got = classify(t).unwrap();
+            let T::Command(r) = &got else { panic!("{t:?}: {got:?}") };
+            assert_eq!(&*r.line, format!("\"{t}\""), "{t:?}");
+        }
         // %VAR% stays as typed: the shell gets the line the user wrote.
         let line = "notepad %USERPROFILE%\\x.txt";
         assert_eq!(classify(line), Ok(T::Command(runline::classify(line).unwrap())));

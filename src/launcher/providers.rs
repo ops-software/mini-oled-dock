@@ -937,9 +937,18 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratc
 
 // ---- run lines and typed paths
 
-/// The class of a path by its extension alone, the text after the last dot in any case (5.4.6): it picks a row's glyph,
-/// and an executable is never the default in Mixed mode. Executable: the spec's twelve, then the other types that run
-/// code when Explorer opens them (the Attachment Manager's high-risk list), held back as well until live check V-7.
+/// The extension of a path's last part as Windows reads it: the text after its last dot once the trailing dots and
+/// spaces Windows drops from a name are dropped (`setup.exe. .` opens `setup.exe`). None without a dot, or when
+/// nothing follows it. Syntax only.
+pub fn extension(path: &str) -> Option<&str> {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(['.', ' ']);
+    name.rsplit_once('.').map(|(_, ext)| ext).filter(|ext| !ext.is_empty())
+}
+
+/// The class of a path by its extension alone (`extension`: the text after the last dot in any case, the trailing dots
+/// and spaces Windows drops dropped here, so no caller can forget them; 5.4.6): it picks a row's glyph, and an
+/// executable is never the default in Mixed mode. Executable: the spec's twelve, then the other types that run code
+/// when Explorer opens them (the Attachment Manager's high-risk list), held back as well until live check V-7.
 pub fn file_class(path: &str) -> FileClass {
     const CLASSES: [(FileClass, &[&str]); 5] = [
         (
@@ -962,8 +971,7 @@ pub fn file_class(path: &str) -> FileClass {
         (FileClass::Image, &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "svg", "heic"]),
         (FileClass::Archive, &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "cab", "iso"]),
     ];
-    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    let Some((_, ext)) = name.rsplit_once('.') else { return FileClass::Other };
+    let Some(ext) = extension(path) else { return FileClass::Other };
     CLASSES
         .iter()
         .find(|(_, exts)| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
@@ -1738,9 +1746,34 @@ pub(crate) mod tests {
             ("C:/a/b.png", Image),
             ("C:\\a\\.gitignore", Other),
             ("C:\\a\\trailing.", Other),
+            // The trailing dots and spaces Windows drops from a name are dropped here, for every caller.
+            ("C:\\a\\setup.exe.", Executable),
+            ("C:\\a\\setup.EXE . .", Executable),
+            ("C:\\a\\run.ps1   ", Executable),
+            ("C:\\a\\x.lnk..", Executable),
+            ("C:\\a\\notes.md. ", Document),
+            ("C:\\a\\b.tar.gz.", Archive),
+            ("C:\\a\\README. .", Other),
+            ("C:\\a\\...", Other),
+            ("C:\\a\\setup.exe .txt", Document),
         ];
         for (path, want) in cases {
             assert_eq!(file_class(path), want, "{path}");
+        }
+        // The extension Windows reads (the helper asks Windows about this one, files_child.rs).
+        for (path, want) in [
+            ("C:\\a\\setup.EXE", Some("EXE")),
+            ("C:\\a\\b.tar.gz", Some("gz")),
+            ("C:\\a\\setup.exe . .", Some("exe")),
+            ("C:\\a.zip\\readme", None),
+            ("C:\\a\\trailing.", None),
+            ("C:\\a\\. .", None),
+            ("C:\\a\\.gitignore", Some("gitignore")),
+            ("x.cmd\\", None),
+            ("quokka.bat", Some("bat")),
+            ("C:/a/b.png", Some("png")),
+        ] {
+            assert_eq!(extension(path), want, "{path:?}");
         }
         // The types that run code when Explorer opens them, beyond the spec's twelve (no Open until V-7).
         let more = "hta cpl msc wsf wsh jse vbe pif scf reg chm msp mst application appinstaller msix appx diagcab \
@@ -1763,6 +1796,13 @@ pub(crate) mod tests {
         fx.sync(&mut res, "C:\\tools\\setup.exe", 3);
         assert!(is_executable_file(&res.rows()[0]));
         assert_eq!(res.selected(), None, "an executable file row is never the default in Mixed mode");
+        // The trailing dots and spaces Windows drops hide no executable (file_class drops them).
+        for typed in ["C:\\tools\\setup.exe.", "C:\\tools\\setup.exe . .", "C:\\tools\\run.CMD.."] {
+            fx.sync(&mut res, typed, 3);
+            assert!(is_executable_file(&res.rows()[0]), "{typed}");
+            assert!(!res.rows()[0].verbs.has(Verb::Open), "{typed}");
+            assert_eq!(res.selected(), None, "{typed}");
+        }
         fx.sync(&mut res, "C:\\tools\\readme.txt", 4);
         assert_eq!(res.selected().unwrap().kind, Kind::File);
         // A late executable row is not taken as the default either; a document is.
