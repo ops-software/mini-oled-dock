@@ -23,6 +23,8 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      # Keep equal to ci.yml: the release exe is built by the toolchain CI tested.
+      RUST_TOOLCHAIN: 1.93.1
     steps:
       - uses: actions/checkout@v5
         with:
@@ -36,14 +38,16 @@ jobs:
 
       - name: Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
           rustc -vV
 
       - name: Tests
         env:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
+          # Anti-aliasing drift of a new runner image only warns; Size and Exact mismatches still fail.
+          GOLDEN_TEXT_ADVISORY: "1"
         run: cargo test --locked
 
       - name: Release build
@@ -71,3 +75,13 @@ jobs:
           } else {
             gh release create $env:TAG dist/dock.exe dist/dock.exe.sha256 --verify-tag --title "mini-oled-dock $env:VERSION" --notes-file dist/notes.md
           }
+
+      # GitHub's own SHA-256 of the uploaded asset, which the updater also checks, must be the built file's.
+      # `// empty`: a null digest prints nothing (a warning here), not the string "null" (a failure).
+      - name: Uploaded dock.exe matches the build
+        run: |
+          $h = (Get-FileHash dist/dock.exe -Algorithm SHA256).Hash.ToLower()
+          $d = gh api "repos/$env:GH_REPO/releases/tags/$env:TAG" --jq '.assets[] | select(.name == "dock.exe") | .digest // empty'
+          if (-not $d) { "::warning::GitHub reports no digest for dock.exe; clients check dock.exe.sha256 only"; exit 0 }
+          if ($d -ne "sha256:$h") { Write-Error "GitHub's digest $d differs from the built dock.exe (sha256:$h)"; exit 1 }
+          "dock.exe digest matches: $d"

@@ -16,7 +16,7 @@ permissions:
 
 env:
   # Pinned so a new lint cannot turn main red overnight; a bump is a one-line PR with the clippy run attached.
-  # release.yml should adopt the same version (hand-off to WS-B).
+  # release.yml pins the same version: keep the two equal.
   RUST_TOOLCHAIN: 1.93.1
 
 jobs:
