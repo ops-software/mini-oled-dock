@@ -73,7 +73,7 @@
       "unit": "wakes_per_s",
       "gate": "max",
       "value": 0.4,
-      "note": "plans/P0-wsC-v2.md 1.1; probe build"
+      "note": "P0-wsC-v2 1.1; probe build"
     },
     {
       "id": "ctxsw.ui_hidden",
@@ -82,7 +82,7 @@
       "unit": "ctxsw_per_s",
       "gate": "max",
       "value": 12,
-      "note": "plans/P0-wsC-v2.md 1.2"
+      "note": "P0-wsC-v2 1.2"
     },
     {
       "id": "ctxsw.process_hidden",
@@ -91,7 +91,7 @@
       "unit": "ctxsw_per_s",
       "gate": "max",
       "value": 20,
-      "note": "plans/P0-wsC-v2.md 1.2; 15 after Q14"
+      "note": "P0-wsC-v2 1.2; 15 after Q14"
     },
     {
       "id": "cpu.process_hidden_60s",
@@ -100,7 +100,7 @@
       "unit": "ms",
       "gate": "max",
       "value": 30,
-      "note": "plans/P0-wsC-v2.md 1.2"
+      "note": "P0-wsC-v2 1.2"
     },
     {
       "id": "ctxsw.watchdog_hidden",
@@ -109,7 +109,7 @@
       "unit": "ctxsw_per_s",
       "gate": "max",
       "value": 0.4,
-      "note": "plans/P0-wsC-v2.md 1.2"
+      "note": "P0-wsC-v2 1.2"
     },
     {
       "id": "timers.ui_hidden_periodic",
@@ -118,7 +118,7 @@
       "unit": "count",
       "gate": "max",
       "value": 1,
-      "note": "plans/P0-wsC-v2.md 1.2; TIMER_SECOND"
+      "note": "P0-wsC-v2 1.2; TIMER_SECOND"
     },
     {
       "id": "wakeups.kit_static",
