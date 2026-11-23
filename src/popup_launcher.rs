@@ -2159,7 +2159,8 @@ fn ask_catalogue() {
 
 /// `ShellEvent::StartApps` (`popup::on_start_apps`): the launcher keeps the arena the shell thread listed and checked
 /// (folded and indexed in the `--start-apps` child, nothing built here on the UI thread, L3 KEY-11), shared with
-/// nobody once Start has made its rows; swapped in at the next keystroke. Nothing happens without a chord.
+/// nobody once Start has made its rows; swapped in at the next keystroke. The open windows are marked against it once
+/// (one scan of the apps per program, `mark_in_catalogue`). Nothing happens without a chord.
 pub(crate) fn on_catalog(apps: Arc<Arena>) {
     if !is_on() {
         return;
@@ -7221,4 +7222,21 @@ mod tests {
         assert_eq!(with_ctrl(|c| c.last_query.clone()).flatten().as_deref(), Some("calc"));
         with_ctrl(|c| *c = Ctrl::new());
     }
+
+    /// The catalogue that arrives after an open marks the windows already held: a running program is its app's row,
+    /// not a second row of its own.
+    #[test]
+    fn the_catalogue_arriving_after_the_open_marks_the_windows() {
+        with_ctrl(|c| {
+            *c = Ctrl::new();
+            c.windows = vec![window_row(0x1001, "Blocco note"), window_row(0x1002, "Other")];
+        });
+        ON.with(|o| o.set(true));
+        on_catalog(Arc::new(crate::launcher::arena::test_apps(&[("Microsoft.Notepad_8wekyb3d8bbwe!App", "Blocco note", &[], 1)])));
+        ON.with(|o| o.set(false));
+        let marked = with_ctrl(|c| c.windows.iter().map(|w| w.in_catalogue).collect::<Vec<_>>()).unwrap();
+        assert_eq!(marked, [true, false]);
+        with_ctrl(|c| *c = Ctrl::new());
+    }
+
 }

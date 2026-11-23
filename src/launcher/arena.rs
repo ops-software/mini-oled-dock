@@ -534,6 +534,11 @@ impl<'a> CatalogView<'a> {
         self.short(i, 0)
     }
 
+    /// The folded name alone (a cheap read of one field, for a scan over every entry).
+    pub fn folded(&self, i: usize) -> &'a str {
+        self.short(i, 6)
+    }
+
     /// The AppsFolder id (apps).
     pub fn id(&self, i: usize) -> &'a str {
         if self.layout.kind == Kind::Apps {

@@ -651,10 +651,14 @@ thread_local! {
 }
 
 /// Sets each row's `in_catalogue` (some catalogue app is its program): once per open and again when the catalogue
-/// arrives, so a query never scans the apps for a window.
+/// arrives, so a query never scans the apps for a window. The rows of one program are consecutive (`window_rows`
+/// emits a group at a time) and share the answer, so the scan is once per program, not once per window.
 pub fn mark_in_catalogue(rows: &mut [WindowRow], apps: &CatalogView) {
-    for w in rows {
-        w.in_catalogue = (0..apps.len()).any(|i| same_program(apps, i, w));
+    for program in rows.chunk_by_mut(|a, b| a.group_key == b.group_key) {
+        let found = program.first().is_some_and(|w| (0..apps.len()).any(|i| same_program(apps, i, w)));
+        for w in program {
+            w.in_catalogue = found;
+        }
     }
 }
 
@@ -662,7 +666,7 @@ pub fn mark_in_catalogue(rows: &mut [WindowRow], apps: &CatalogView) {
 fn same_program(apps: &CatalogView, i: usize, w: &WindowRow) -> bool {
     #[cfg(test)]
     SAME_PROGRAM_CALLS.with(|n| n.set(n.get() + 1));
-    w.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(apps.id(i))) || *w.name_folded == *apps.cand(i).folded
+    w.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(apps.id(i))) || *w.name_folded == *apps.folded(i)
 }
 
 fn app_item(apps: &CatalogView, i: usize, win: Option<&WindowRow>, score: Score) -> Item {
@@ -2861,6 +2865,35 @@ mod bench {
             })
             .min()
             .unwrap_or(0)
+    }
+
+    /// Prints what `mark_in_catalogue` costs at an open (KEY-11 allows the handler 2 ms): 128 window rows none of which
+    /// is a catalogue app, against 2,000 apps, as 128 programs of one window and as 32 programs of four (no assertion).
+    #[test]
+    #[ignore = "prints the cost of mark_in_catalogue (release): cargo test --release launcher::providers::bench -- --ignored --nocapture"]
+    fn mark_in_catalogue_printed() {
+        let big = Big::new(1);
+        let view = big.apps_arena.view();
+        for per_program in [1usize, 4] {
+            let mut rows: Vec<WindowRow> = (0..128)
+                .map(|i| {
+                    let g = i / per_program;
+                    WindowRow {
+                        hwnd: 0x2000 + i as isize,
+                        group_key: format!("c:\\tools\\gone{g}.exe").into(),
+                        aumid: None,
+                        name: format!("Gone{g}").into(),
+                        name_folded: format!("gone{g}").into(),
+                        title: None,
+                        hung: false,
+                        in_catalogue: false,
+                    }
+                })
+                .collect();
+            let ns = min_of_five(|| mark_in_catalogue(std::hint::black_box(&mut rows), &view));
+            let apps = view.len();
+            println!("bench: mark_in_catalogue, 128 rows as programs of {per_program}, {apps} apps: {} us", ns / 1_000);
+        }
     }
 
     #[test]
