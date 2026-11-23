@@ -941,8 +941,13 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratc
 /// spaces Windows drops from a name are dropped (`setup.exe. .` opens `setup.exe`). None without a dot, or when
 /// nothing follows it. Syntax only.
 pub fn extension(path: &str) -> Option<&str> {
-    let name = path.rsplit(['\\', '/']).next().unwrap_or(path).trim_end_matches(['.', ' ']);
-    name.rsplit_once('.').map(|(_, ext)| ext).filter(|ext| !ext.is_empty())
+    // Cut at ASCII bytes only, so every cut falls on a character boundary.
+    let b = path.as_bytes();
+    let start = b.iter().rposition(|&c| c == b'\\' || c == b'/').map_or(0, |i| i + 1);
+    let end = b.iter().rposition(|&c| c != b'.' && c != b' ').map_or(0, |i| i + 1);
+    let name = path.get(start..end)?;
+    let dot = name.bytes().rposition(|c| c == b'.')?;
+    name.get(dot + 1..).filter(|ext| !ext.is_empty())
 }
 
 /// The class of a path by its extension alone (`extension`: the text after the last dot in any case, the trailing dots
@@ -1067,14 +1072,17 @@ fn run(q: &Query, cx: &Context, top: &mut TopK) {
 /// A typed path names a folder when it ends in a separator or its last part has no dot (`C:\Windows`, `shell:startup`).
 /// Syntax only: no file-system call (5.4.9). A settings URI is never a folder.
 pub fn names_folder(path: &str) -> bool {
-    if path.ends_with(['\\', '/']) {
+    // ASCII bytes only, as `extension`.
+    let b = path.as_bytes();
+    if matches!(b.last(), Some(b'\\' | b'/')) {
         return true;
     }
     if path.get(..12).is_some_and(|p| p.eq_ignore_ascii_case("ms-settings:")) {
         return false;
     }
-    let name = path.rsplit(['\\', '/', ':']).next().unwrap_or(path);
-    !name.is_empty() && !name.contains('.')
+    let start = b.iter().rposition(|c| matches!(c, b'\\' | b'/' | b':')).map_or(0, |i| i + 1);
+    let name = b.get(start..).unwrap_or_default();
+    !name.is_empty() && !name.contains(&b'.')
 }
 
 // ---- web
