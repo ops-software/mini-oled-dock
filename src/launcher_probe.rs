@@ -453,25 +453,6 @@ impl Drop for UiTimer {
     }
 }
 
-/// `DOCK_LAUNCHER_NO_WARM=1`: the warm timer skips the window warm (`popup_launcher::warm_window`) and nothing else, for
-/// the two series of live check L-3 (c). Read once; each skip is logged.
-pub fn no_warm() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    let on = switch(&ON, "DOCK_LAUNCHER_NO_WARM");
-    if on && probe_on() {
-        log!("launcher probe: window warm skipped (NO_WARM)");
-    }
-    on
-}
-
-/// The warm timer's window warm, started at `t0`, is done.
-pub fn warmed(t0: Instant) {
-    if probe_on() {
-        let us = u32::try_from(t0.elapsed().as_micros()).unwrap_or(u32::MAX);
-        log!("launcher probe: window warm {us} us");
-    }
-}
-
 /// `WM_DOCK_LAUNCHER_YIELDED` while a chord is set: the chord pressed at `chord_time` passed under YIELD.
 pub fn yielded(chord_time: Option<u32>) {
     let Some(chord_time) = chord_time else { return };
