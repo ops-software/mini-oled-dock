@@ -55,7 +55,8 @@
       "status": "pending",
       "unit": "ctxsw_per_s",
       "gate": "max",
-      "value": 0.25
+      "value": 0.25,
+      "note": "not reachable without dropping attention marks, the taskbar re-hide and the hang restore: P0-wsC-v2 1.3"
     },
     {
       "id": "timers.dock_hidden",
@@ -64,6 +65,60 @@
       "unit": "count",
       "gate": "max",
       "value": 0
+    },
+    {
+      "id": "wakes.ui_dock_hidden",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "wakes_per_s",
+      "gate": "max",
+      "value": 0.4,
+      "note": "plans/P0-wsC-v2.md 1.1; probe build"
+    },
+    {
+      "id": "ctxsw.ui_hidden",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 12,
+      "note": "plans/P0-wsC-v2.md 1.2"
+    },
+    {
+      "id": "ctxsw.process_hidden",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 20,
+      "note": "plans/P0-wsC-v2.md 1.2; 15 after Q14"
+    },
+    {
+      "id": "cpu.process_hidden_60s",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 30,
+      "note": "plans/P0-wsC-v2.md 1.2"
+    },
+    {
+      "id": "ctxsw.watchdog_hidden",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0.4,
+      "note": "plans/P0-wsC-v2.md 1.2"
+    },
+    {
+      "id": "timers.ui_hidden_periodic",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 1,
+      "note": "plans/P0-wsC-v2.md 1.2; TIMER_SECOND"
     },
     {
       "id": "wakeups.kit_static",
