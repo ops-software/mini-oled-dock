@@ -3052,6 +3052,18 @@ pub(crate) fn drop_alias_op() {
     ALIAS_OP.with(|s| *s.borrow_mut() = None);
 }
 
+/// Holds `op` and runs `post`; when the post fails the held change goes at once (nothing will take it) and the
+/// result is false.
+pub(crate) fn post_alias(op: AliasOp, post: impl FnOnce() -> windows::core::Result<()>) -> bool {
+    hold_alias_op(op);
+    if let Err(e) = post() {
+        crate::log!("launcher: posting the alias change failed: {e}");
+        drop_alias_op();
+        return false;
+    }
+    true
+}
+
 /// Why an alias change was not written (the notice row says which).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AliasFail {
@@ -6941,10 +6953,20 @@ mod tests {
         let notices: Vec<&Item> = l.session.rows().iter().filter(|r| r.kind == Kind::Notice).collect();
         assert_eq!(notices.len(), 1, "{:?}", l.session.rows().iter().map(|r| r.title.to_string()).collect::<Vec<_>>());
         assert_eq!(&*notices[0].title, strings::alias_not_saved());
-        // The held change is gone: a later message finds none to write.
-        hold_alias_op(AliasOp::Remove("x".into()));
+    }
+
+    /// The seam RealSys::alias uses: a failing post drops the held change and says false; a good post leaves it held.
+    #[test]
+    fn post_alias_drops_the_held_change_when_the_post_fails() {
         drop_alias_op();
+        let failed = post_alias(AliasOp::Remove("x".into()), || {
+            Err(windows::core::Error::from_hresult(windows::core::HRESULT(-1)))
+        });
+        assert!(!failed);
         assert!(ALIAS_OP.with(|s| s.borrow().is_none()));
+        assert!(post_alias(AliasOp::Remove("y".into()), || Ok(())));
+        assert!(ALIAS_OP.with(|s| s.borrow().is_some()));
+        drop_alias_op();
     }
 
     /// A paste refused as private while the alias prompt is open shows its notice under the prompt's row, and the prompt's
