@@ -61,6 +61,7 @@ use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0, INPUT_KEYBOARD,
     KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
@@ -374,6 +375,16 @@ thread_local! {
     static TRAY_HIDDEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     /// true if some items have no ResolveApp request because the shell thread was not ready yet.
     static NEED_REQUESTS: Cell<bool> = const { Cell::new(false) };
+    /// Edge watch (see "edge watch"): true while `TIMER_POLL` is armed.
+    static POLL_ON: Cell<bool> = const { Cell::new(true) };
+    /// Edge watch: true while the raw input registration is in place.
+    static RAW_ON: Cell<bool> = const { Cell::new(false) };
+    /// Edge watch: false after a failed registration, until the next show (the poll then stays on).
+    static GATE_OK: Cell<bool> = const { Cell::new(MOTION_GATE) };
+    /// Edge watch: the pointer position read by the last poll.
+    static LAST_POS: Cell<Option<POINT>> = const { Cell::new(None) };
+    /// Edge watch: `now_ms()` when the pointer was last seen to move.
+    static STILL_SINCE: Cell<u64> = const { Cell::new(0) };
     /// true if the apps debounce timer is armed.
     static DEBOUNCE_ARMED: Cell<bool> = const { Cell::new(false) };
     /// `config.names` at the last `rebuild_entries` (to redo the requests if it changes).
@@ -441,7 +452,8 @@ pub fn attach(h: HWND) -> Result<(), String> {
     refresh_tray_state();
     apps::refresh(h);
     rebuild_entries();
-    set_timer(h, TIMER_POLL, 50);
+    STILL_SINCE.set(now_ms());
+    poll_sync();
     set_timer(h, TIMER_RECONCILE, RECONCILE_MS);
     arm_clock(h);
     // SAFETY: registering a window message by name has no preconditions.
@@ -618,6 +630,17 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         WM_SETTINGCHANGE => {
             on_setting_change(lp);
             None // DefWindowProc may do its own thing
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_INPUT => {
+            // Raw input waits for the pointer's first motion (see "edge watch"). The few messages still queued after
+            // the registration was removed find RAW_ON false. None: the caller runs DefWindowProc (RIM_INPUT cleanup).
+            if RAW_ON.get() {
+                STILL_SINCE.set(now_ms());
+                poll_sync();
+                on_poll();
+                crate::hook::note_activity();
+            }
+            None
         }
         _ => None,
     }
@@ -1399,6 +1422,9 @@ pub fn shutdown() {
     kill_timer(hwnd(), TIMER_ANIM);
     kill_timer(hwnd(), TIMER_VIS);
     kill_timer(hwnd(), TIMER_ATTN);
+    if RAW_ON.get() {
+        raw_motion(false);
+    }
     if SHELLHOOK_MSG.load(Relaxed) != 0 {
         // SAFETY: `hwnd()` is our window, registered in `attach`.
         let _ = unsafe { DeregisterShellHookWindow(hwnd()) };
@@ -1604,6 +1630,7 @@ fn request_missing() {
         }
         NEED_REQUESTS.with(|n| n.set(pending));
     });
+    poll_sync();
 }
 
 /// Applies a result from the shell thread; true if something changed.
@@ -3201,6 +3228,10 @@ fn hide(reason: &str, now: bool) {
 fn on_visibility(visible: bool) {
     crate::notif::set_bar_visible(visible);
     crate::hook::note_activity();
+    if visible {
+        GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::Shown));
+    }
+    poll_sync();
 }
 
 /// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is
@@ -3781,6 +3812,141 @@ fn send_f15() -> u32 {
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
+// ------------------------------------------------------------ edge watch
+
+/// How long the pointer must be still before the poll hands over to raw input.
+const STILL_MS: u64 = 1000;
+/// The one switch: false gives the always-on 50 ms poll of 1.5.0.
+const MOTION_GATE: bool = true;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeWatch {
+    /// The 50 ms `TIMER_POLL` runs.
+    Poll,
+    /// No timer: raw input wakes the UI thread at the pointer's next motion.
+    Motion,
+}
+
+#[derive(Clone, Copy)]
+struct WatchInputs {
+    visible: bool,
+    gate_ok: bool,
+    dwell: bool,
+    requests: bool,
+    drag: bool,
+    still_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+enum GateEvent {
+    RegisterFailed,
+    Shown,
+}
+
+fn edge_watch(w: WatchInputs) -> EdgeWatch {
+    if w.visible || !w.gate_ok || w.dwell || w.requests || w.drag || w.still_ms < STILL_MS {
+        EdgeWatch::Poll
+    } else {
+        EdgeWatch::Motion
+    }
+}
+
+fn still_since(prev: Option<POINT>, cur: Option<POINT>, since: u64, now: u64) -> u64 {
+    match (prev, cur) {
+        (_, None) => since,
+        (Some(a), Some(b)) if a.x == b.x && a.y == b.y => since,
+        _ => now,
+    }
+}
+
+fn gate_after(_gate_ok: bool, ev: GateEvent) -> bool {
+    match ev {
+        GateEvent::RegisterFailed => false,
+        GateEvent::Shown => MOTION_GATE,
+    }
+}
+
+/// Registers (`on`) or removes the raw input of the pointing devices (mouse, pen, touch screen, touch pad) with
+/// RIDEV_INPUTSINK: no foreground needed, other programs' input untouched. Known limit: a pointer moved only by
+/// SetCursorPos makes no input event and does not open the gate; injected input (SendInput, remote desktop, KVM
+/// tools) does. Pen, touch screen and touch pad usages cannot be tried here: pure tests only.
+/// Invariant: only one window per process may register a raw input device class and nothing else in the dock
+/// registers raw input; a future user of raw input must share this registration.
+fn raw_motion(on: bool) -> bool {
+    let target = if on { hwnd() } else { HWND::default() };
+    let flags = if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE };
+    let dev = |page: u16, usage: u16| RAWINPUTDEVICE {
+        usUsagePage: page,
+        usUsage: usage,
+        dwFlags: flags,
+        hwndTarget: target,
+    };
+    let all = [dev(0x01, 0x02), dev(0x0D, 0x02), dev(0x0D, 0x04), dev(0x0D, 0x05)];
+    let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+    // SAFETY: the slices hold valid RAWINPUTDEVICEs; hwndTarget is our window (or null with RIDEV_REMOVE).
+    let mut res = unsafe { RegisterRawInputDevices(&all, size) };
+    if res.is_err() {
+        // SAFETY: as above, the mouse alone.
+        res = unsafe { RegisterRawInputDevices(&all[..1], size) };
+    }
+    match res {
+        Ok(()) => {
+            RAW_ON.set(on);
+            true
+        }
+        Err(e) => {
+            if on {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Relaxed) {
+                    log!("ui: raw input unavailable ({e}), the edge poll stays on until the next show");
+                }
+            } else {
+                // The registration is gone or never was: do not wait for a message that cannot come.
+                RAW_ON.set(false);
+            }
+            false
+        }
+    }
+}
+
+/// Puts the edge watch in the state `edge_watch` asks for; touches the timer and the registration only on a change.
+fn poll_sync() {
+    let h = hwnd();
+    if h.0.is_null() {
+        return;
+    }
+    let want = edge_watch(WatchInputs {
+        visible: VISIBLE.load(Relaxed),
+        gate_ok: GATE_OK.get(),
+        dwell: EDGE_SINCE.load(Relaxed) != 0,
+        requests: NEED_REQUESTS.with(|n| n.get()),
+        drag: drag_active(),
+        still_ms: now_ms().saturating_sub(STILL_SINCE.get()),
+    });
+    match want {
+        EdgeWatch::Poll => {
+            if RAW_ON.get() {
+                raw_motion(false);
+            }
+            if !POLL_ON.get() {
+                set_timer(h, TIMER_POLL, 50);
+                POLL_ON.set(true);
+            }
+        }
+        EdgeWatch::Motion => {
+            if POLL_ON.get() {
+                kill_timer(h, TIMER_POLL);
+                POLL_ON.set(false);
+            }
+            if !RAW_ON.get() && !raw_motion(true) {
+                GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::RegisterFailed));
+                set_timer(h, TIMER_POLL, 50);
+                POLL_ON.set(true);
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------ poll timer
 
 /// With several monitors: the edge `y == mon.top` (or `mon.bottom - 1`) is a real screen border
@@ -3796,18 +3962,33 @@ fn point_in(r: &RECT, p: POINT) -> bool {
     p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
 }
 
-/// 50 ms timer: auto-hide, screen edge, topmost re-assertion.
+/// 50 ms timer while the bar is shown, while a dwell or an icon request is pending and for 1 s after the pointer last
+/// moved (otherwise raw input waits for the next motion, see "edge watch"): auto-hide, screen edge, topmost
+/// re-assertion.
 /// With `!config::effective_autohide()` the bar never hides by itself; nor does it
 /// while the context menu (popup) is open.
 fn on_poll() {
+    on_poll_body();
+    if !VISIBLE.load(Relaxed) {
+        poll_sync();
+    }
+}
+
+fn on_poll_body() {
     // Esc cancels a drag (the bar has the keyboard focus only after the Win key, so the key state is polled).
     // SAFETY: GetAsyncKeyState has no preconditions; the high bit means "pressed".
     if drag_active() && unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000 != 0 {
         end_drag(true);
     }
     let Some(g) = GEOM.with(|g| g.get()) else { return };
-    let Some(p) = cursor_pos() else { return };
+    let cur = cursor_pos();
     let now = now_ms();
+    STILL_SINCE.set(still_since(LAST_POS.get(), cur, STILL_SINCE.get(), now));
+    if cur.is_some() {
+        LAST_POS.set(cur);
+    }
+    // A failed read (locked session, secure desktop, disconnected RDP) counts as stillness.
+    let Some(p) = cur else { return };
     let autohide = crate::config::effective_autohide();
     if VISIBLE.load(Relaxed) {
         let bar = RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h };
@@ -3883,6 +4064,66 @@ fn on_poll() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wi(visible: bool, still_ms: u64) -> WatchInputs {
+        WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms }
+    }
+
+    #[test]
+    fn a_shown_bar_polls() {
+        for ms in [0, 1000, 60_000] {
+            assert_eq!(edge_watch(wi(true, ms)), EdgeWatch::Poll);
+        }
+    }
+
+    #[test]
+    fn a_still_hidden_pointer_waits_for_motion() {
+        assert_eq!(edge_watch(wi(false, 1000)), EdgeWatch::Motion);
+        assert_eq!(edge_watch(wi(false, 999)), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn a_dwell_in_progress_keeps_polling() {
+        assert_eq!(edge_watch(WatchInputs { dwell: true, ..wi(false, 5000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn pending_icon_requests_keep_polling() {
+        assert_eq!(edge_watch(WatchInputs { requests: true, ..wi(false, 5000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn without_raw_input_it_polls_as_today() {
+        assert_eq!(edge_watch(WatchInputs { gate_ok: false, ..wi(false, 60_000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn a_drag_keeps_polling() {
+        assert_eq!(edge_watch(WatchInputs { drag: true, ..wi(false, 5000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn stillness_restarts_on_any_move() {
+        let a = POINT { x: 5, y: 6 };
+        let b = POINT { x: 5, y: 7 };
+        assert_eq!(still_since(None, Some(a), 10, 50), 50);
+        assert_eq!(still_since(Some(a), Some(b), 10, 50), 50);
+        assert_eq!(still_since(Some(a), Some(a), 10, 50), 10);
+    }
+
+    #[test]
+    fn an_unreadable_cursor_counts_as_still() {
+        let a = POINT { x: 5, y: 6 };
+        assert_eq!(still_since(Some(a), None, 10, 50), 10);
+        assert_eq!(still_since(None, None, 10, 50), 10);
+    }
+
+    #[test]
+    fn a_failed_registration_is_retried_at_the_next_show() {
+        let ok = gate_after(true, GateEvent::RegisterFailed);
+        assert!(!ok);
+        assert_eq!(gate_after(ok, GateEvent::Shown), MOTION_GATE);
+    }
 
     #[test]
     fn tray_sync_waits_for_explorer() {
