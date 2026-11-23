@@ -1263,6 +1263,8 @@ impl Session {
             Payload::Hwnd(h) => vec![Effect::Switch(*h), Effect::Hide { restore: false }],
             Payload::Setting(index) => launch(LaunchReq::Setting { index: *index }),
             Payload::Command(id) => command(*id),
+            // A conversion copies the number alone, as the locale writes it (plan L2-U1); Ctrl+C copies it with its unit.
+            Payload::Value { raw, .. } if item.from == ProviderId::Units => copy_after_hide(raw),
             Payload::Value { shown, .. } => copy_after_hide(shown),
             Payload::RunLine(r) => launch(run_line(r)),
             Payload::Url(u) => launch(LaunchReq::Url(u.clone())),
@@ -1658,6 +1660,29 @@ mod tests {
         // Nothing selected: nothing.
         let mut s = typed(&fx, "sl");
         assert!(press(&mut s, &fx, VK_C, Mods::CTRL).is_empty());
+    }
+
+    /// Live check V-9: Enter on a conversion copies the number without its unit, in the locale's marks (plan L2-U1);
+    /// Shift+Enter copies the same raw number; Ctrl+C copies what the row shows, the unit included.
+    #[test]
+    fn a_conversion_copies_its_number_without_the_unit() {
+        let fx = Fx::new();
+        for (q, number, shown) in [
+            ("10 km in mi", "6,21371192237334", "6,21371192237334 mi"),
+            ("1,5 GiB to MB", "1610,612736", "1610,612736 MB"),
+            ("3 piedi in metri", "0,9144", "0,9144 m"),
+        ] {
+            let mut s = typed(&fx, q);
+            assert_eq!(s.selected().unwrap().from, ProviderId::Units, "{q}");
+            let copy = |text: &str| vec![Effect::Hide { restore: true }, Effect::Copy(text.into())];
+            assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), copy(number), "{q}");
+            assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::SHIFT), copy(number), "{q}");
+            assert_eq!(press(&mut s, &fx, VK_C, Mods::CTRL), copy(shown), "{q}");
+        }
+        // The calculator and the date rows are untouched: Enter copies what they show.
+        let mut s = typed(&fx, "=3,5*2");
+        let calc = [Effect::Hide { restore: true }, Effect::Copy("7".into())];
+        assert_eq!(press(&mut s, &fx, VK_RETURN, Mods::NONE), calc);
     }
 
     #[test]

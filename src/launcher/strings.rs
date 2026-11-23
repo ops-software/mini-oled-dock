@@ -36,6 +36,10 @@ pub fn hint_switch() -> &'static str {
 pub fn hint_copy() -> &'static str {
     tr("Copy · Enter", "Copia · Invio")
 }
+/// A conversion's row: Enter copies the number without its unit.
+pub fn hint_copy_number() -> &'static str {
+    tr("Copy number · Enter", "Copia il numero · Invio")
+}
 /// A file or folder row that has no Open (an executable while the Mark of the Web check is open): Ctrl+Enter shows it.
 pub fn hint_reveal() -> &'static str {
     tr("Open file location · Ctrl+Enter", "Apri percorso file · Ctrl+Invio")

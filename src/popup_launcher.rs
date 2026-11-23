@@ -1609,6 +1609,7 @@ fn hint_for(item: &Item) -> Option<&'static str> {
             _ => strings::hint_run(),
         },
         (_, Verb::Switch) => strings::hint_switch(),
+        (Kind::Answer, Verb::Copy) if item.from == ProviderId::Units => strings::hint_copy_number(),
         (_, Verb::Copy) => strings::hint_copy(),
         _ => strings::hint_open(),
     })
@@ -6248,6 +6249,11 @@ mod tests {
         assert_eq!(hint_for(sel), Some("Switch · Enter"), "a running app switches");
         let calc = scene_launcher(PreviewScene::Calc);
         assert_eq!(hint_for(calc.session.selected().unwrap()), Some("Copy · Enter"));
+        let mut units = scene_launcher(PreviewScene::Empty);
+        units.session_mut().chars("10 km in mi", &scene_context_free());
+        let sel = units.session.selected().unwrap();
+        assert_eq!(sel.from, ProviderId::Units);
+        assert_eq!(hint_for(sel), Some("Copy number · Enter"), "Enter copies the number without its unit");
         let run = scene_launcher(PreviewScene::Run);
         assert_eq!(
             hint_for(run.session.selected().unwrap()),
