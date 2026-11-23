@@ -251,7 +251,7 @@ Run `dock.exe --list-apps` to see how each open window was named. Command-line f
 
 The dock saves the original taskbar state before hiding it, and a separate watchdog process restores it if the dock crashes or hangs.
 
-The watchdog restores the taskbar when the dock stops answering for more than about 6.6 seconds. If the dock answers again, it hides the taskbar again at its next safety check (within about 3 seconds), as long as its watchdog is still running; it does not hide it again after `--restore`, `--install`, `--uninstall` or Exit. Explorer's own saved auto-hide setting is set back to off after a restore, so a taskbar that comes back after an uninstall is not left in auto-hide. At a sign-out or shutdown the saved taskbar state is kept for the next sign-in.
+The watchdog restores the taskbar when the dock stops answering for more than about 6.6 seconds. If the dock answers again, it is meant to hide the taskbar again at its next safety check, as long as its watchdog is still running; it does not do so after `--restore`, `--install`, `--uninstall` or Exit. Explorer's own saved auto-hide setting is set back to off after a restore, so a taskbar that comes back after an uninstall is not left in auto-hide. At a sign-out or shutdown the saved taskbar state is meant to be kept for the next sign-in. <!-- r151: rewrite as measured once LIVE-1 (forced UI stall, simulated session end) has run -->
 
 If something still goes wrong:
 
@@ -295,7 +295,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
-| [1.5.1](.github/release-notes/v1.5.1.md) | unreleased | A quieter hidden dock, the updater checks GitHub's digest and puts the old version back when a new one fails, `--rollback`, the taskbar hidden again after a watchdog restore, no titles in the log |
+| [1.5.1](.github/release-notes/v1.5.1.md) | unreleased | A quieter hidden dock, the updater checks GitHub's digest and puts the old version back when a new one fails, `--rollback`, the taskbar meant to be hidden again after a watchdog restore, no titles in the log |
 | [1.5.0](.github/release-notes/v1.5.0.md) | 2026-11-23 | The launcher (off by default), no freeze on a hung foreground window, taskbar edge fixes, full third-party licence texts |
 | [1.4.3](.github/release-notes/v1.4.3.md) | 2026-11-22 | Taskbar auto-hide: checks whether another bar holds the screen edge first |
 | [1.4.2](.github/release-notes/v1.4.2.md) | 2026-11-12 | Hotfix: the self-updater can download its first update |
