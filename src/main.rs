@@ -15,6 +15,7 @@
 //!     (`tray_host`), only if the native taskbar is hidden and `config.show_tray`.
 //!  8. `notif`: COM MTA, WinRT notification list + "Do not disturb" state (`notif`).
 //!  9. `power`: Sleep/Restart/Shut down (`power`).
+//! 10. `wake-probe`: only with `DOCK_WAKE_PROBE=1` or the `wakeprobe.on` marker (`probe`, diagnostic build).
 //!
 //!  Popups (`popup`) live on the UI thread.
 //!  Plus the watchdog PROCESS (`dock.exe --watchdog <pid> <event>`).
@@ -29,6 +30,16 @@
 //! --install, --uninstall, --preview, errors) attach to the parent process console with
 //! `attach_console`; `--console` does the same for normal runs too (log on stdout and Ctrl+C).
 #![windows_subsystem = "windows"]
+
+/// Statements of the wake probe (`--features wake-probe`, plans/P0-wsC-v2.md Q3): they compile to nothing without it.
+macro_rules! probe {
+    ($($t:tt)*) => {
+        #[cfg(feature = "wake-probe")]
+        {
+            $($t)*
+        }
+    };
+}
 
 mod apps;
 mod arp;
@@ -67,6 +78,8 @@ mod popup_power;
 mod popup_tray;
 mod power;
 mod preview;
+#[cfg(feature = "wake-probe")]
+mod probe;
 mod render;
 mod settings_pages;
 mod settings_view;
@@ -697,6 +710,11 @@ fn create_window(inst: HINSTANCE, g: &ui::Geom) -> Option<HWND> {
 }
 
 fn message_loop() {
+    // Wake probe on (DOCK_WAKE_PROBE=1 or wakeprobe.on): its instrumented loop; off, the release loop below.
+    #[cfg(feature = "wake-probe")]
+    if probe::ui_loop() {
+        return;
+    }
     let mut msg = MSG::default();
     loop {
         // SAFETY: `msg` is valid and writable; filter None = all windows of the thread.
@@ -1297,7 +1315,11 @@ fn main() -> std::process::ExitCode {
     }
     install_panic_hook();
     disable_power_throttling();
+    #[cfg(feature = "wake-probe")]
+    probe::init();
     let res = run(args);
+    #[cfg(feature = "wake-probe")]
+    probe::stop();
     // Safety net: even if `run` exited early with an error, the taskbar comes back (idempotent).
     taskbar::restore();
     restore_console_mode();
@@ -1318,6 +1340,13 @@ mod tests {
 
     fn p(a: &[&str]) -> Result<Args, String> {
         parse_args_from(a.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn probe_macro_compiles_to_nothing_without_the_feature() {
+        let n = std::cell::Cell::new(0);
+        probe!(n.set(1));
+        assert_eq!(n.get(), if cfg!(feature = "wake-probe") { 1 } else { 0 });
     }
 
     #[test]

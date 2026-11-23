@@ -53,6 +53,13 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo clippy --locked --all-targets --features owner-probe -- -D warnings
 
+      # The wake-probe build (live wake measurements): its source and call sites compile only with it.
+      - name: Clippy (wake-probe)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo clippy --locked --all-targets --features wake-probe -- -D warnings
+
       - name: Cache cargo-deny
         uses: actions/cache@v4
         with:
@@ -121,6 +128,12 @@ jobs:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --features owner-probe
+
+      - name: Tests (wake-probe)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked --features wake-probe
 
       - name: Golden diffs
         if: failure()

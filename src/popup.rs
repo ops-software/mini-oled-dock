@@ -871,6 +871,7 @@ fn remove_mouse_hook() {
 unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let m = wp.0 as u32;
+        probe!(crate::probe::mouse(m));
         if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN {
             // SAFETY: for HC_ACTION in a WH_MOUSE_LL hook, lparam points to an MSLLHOOKSTRUCT valid
             // for the duration of the callback.
@@ -880,6 +881,7 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
                 let hwnd = STATE
                     .with(|s| s.try_borrow().map(|g| g.open.as_ref().map_or(g.hwnd, |o| o.hwnd)).unwrap_or_default());
                 if !hwnd.0.is_null() {
+                    probe!(crate::probe::post_by(crate::probe::Th::Ui, crate::probe::BY_MOUSE_HOOK, WM_POPUP_OUTSIDE));
                     // SAFETY: posting to our own window; failure is harmless.
                     let _ = unsafe { PostMessageW(Some(hwnd), WM_POPUP_OUTSIDE, WPARAM(0), LPARAM(0)) };
                 }

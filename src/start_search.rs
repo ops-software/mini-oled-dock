@@ -657,6 +657,7 @@ pub(crate) fn release_settings() {
 /// asked. It waits on the `--start-settings` child (up to 60 s): never the UI or the shell thread.
 fn spawn_settings_thread() {
     let spawned = std::thread::Builder::new().name("start-settings".into()).spawn(|| {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         // SAFETY: COM for this thread only, paired with CoUninitialize below; background priority
         // is a hint that fails harmlessly.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };

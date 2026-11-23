@@ -258,6 +258,7 @@ fn free_com_libraries() {
     // SAFETY: plain call; on a thread without COM it does nothing.
     unsafe { CoFreeUnusedLibraries() };
     let spawned = std::thread::Builder::new().name("com-free".into()).stack_size(64 * 1024).spawn(|| {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         // SAFETY: COM for this thread only, paired with CoUninitialize when the init succeeded.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         // SAFETY: as above.

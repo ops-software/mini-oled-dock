@@ -320,6 +320,7 @@ fn thread_main(ui: isize, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
         let timeout = if w.popup_open { POLL_OPEN } else { POLL_CLOSED };
         match rx.recv_timeout(timeout) {
             Ok(c) => {
+                probe!(crate::probe::bump(crate::probe::C::NotifCmd));
                 if !w.handle(c) {
                     break 'outer;
                 }
@@ -330,7 +331,9 @@ fn thread_main(ui: isize, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                probe!(crate::probe::bump(crate::probe::C::NotifTimeout));
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
         w.cycle();
@@ -409,6 +412,7 @@ impl Worker {
             self.access = NotifAccess::Allowed;
             let tx = tx.clone();
             let handler = TypedEventHandler::new(move |_l, _a| {
+                probe!(crate::probe::bump(crate::probe::C::NotifChanged));
                 let _ = tx.send(Cmd::Refresh);
                 Ok(())
             });
@@ -871,6 +875,7 @@ fn icons_thread(ui: isize, rx: Receiver<IconReq>) {
     if hr.is_err() {
         log!("notif-icons: CoInitializeEx failed: {hr:?}");
     }
+    probe!(crate::probe::bump(crate::probe::C::Spawned));
     loop {
         let req = match rx.recv_timeout(ICON_IDLE) {
             Ok(r) => r,
@@ -887,6 +892,7 @@ fn icons_thread(ui: isize, rx: Receiver<IconReq>) {
                 }
             }
         };
+        probe!(crate::probe::bump(crate::probe::C::IconWakes));
         if STOPPED.load(Relaxed) {
             break;
         }

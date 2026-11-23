@@ -157,6 +157,7 @@ pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
         .spawn(move || {
             let mut file = open_log_file();
             while let Ok(Some(line)) = rx.recv() {
+                probe!(crate::probe::bump(crate::probe::C::LogLines));
                 // If stdout is closed or slow we do not want a panic: errors ignored.
                 if STDOUT_ON.load(Relaxed) {
                     let mut out = std::io::stdout().lock();

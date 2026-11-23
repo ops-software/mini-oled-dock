@@ -254,6 +254,7 @@ pub fn heartbeat() {
     }
     // SAFETY: handle valid until `shutdown` closes it (same UI thread).
     let _ = unsafe { SetEvent(to_handle(raw)) };
+    probe!(crate::probe::bump(crate::probe::C::Heartbeat));
 }
 
 /// Startup heartbeat (`taskbar::init`, waiting for `Shell_TrayWnd`): resets the watchdog count
@@ -282,6 +283,7 @@ pub fn start_stop_watcher(ui_hwnd: HWND) -> Option<JoinHandle<()>> {
         let handles = [to_handle(stop), to_handle(quit)];
         // SAFETY: the handles stay open until `shutdown` has joined this thread.
         let r = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+        probe!(crate::probe::bump(crate::probe::C::StopWatch));
         if r == WAIT_OBJECT_0 {
             // SAFETY: PostMessageW is thread-safe; if the window is already gone it merely fails.
             let posted =

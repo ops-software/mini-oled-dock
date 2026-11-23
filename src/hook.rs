@@ -179,6 +179,7 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
         if r.0 <= 0 {
             break; // WM_QUIT (0) or error (-1)
         }
+        probe!(crate::probe::thread_msg(crate::probe::Th::Hook, &msg));
         if msg.message == WM_HOOK_REINSTALL {
             reinstall();
             continue;
@@ -303,6 +304,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
         #[cfg(feature = "owner-probe")]
         crate::launcher_probe::key_seen(wp.0 as u32, kb.time);
         let swallowed = handle_key(wp.0 as u32, kb);
+        probe!(crate::probe::kb(wp.0 as u32, kb.flags.0, swallowed));
         diag(wp.0 as u32, kb, swallowed);
         #[cfg(feature = "owner-probe")]
         crate::launcher_probe::record_hook_us(started.elapsed());
@@ -407,6 +409,7 @@ fn post(msg: u32, ev: usize) {
     if h.0.is_null() {
         return; // without this check PostMessageW(NULL) would post to the hook thread
     }
+    probe!(crate::probe::post_by(crate::probe::Th::Hook, crate::probe::BY_KB_HOOK, msg));
     // SAFETY: PostMessageW is thread-safe; the error is ignored (no I/O in the callback).
     let _ = unsafe { PostMessageW(Some(h), msg, WPARAM(ev), LPARAM(0)) };
 }

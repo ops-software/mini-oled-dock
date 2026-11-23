@@ -887,6 +887,7 @@ fn chord_owner_pids() -> Vec<u32> {
 
 /// Thread-pool callback of a chord owner's exit: one post to the dock window, nothing else.
 unsafe extern "system" fn owner_exited(_context: *mut core::ffi::c_void, _timed_out: bool) {
+    probe!(crate::probe::bump(crate::probe::C::OwnerExited));
     let h = crate::hwnd();
     if !h.0.is_null() {
         // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.

@@ -230,6 +230,8 @@ unsafe extern "system" fn winevent_proc(
     _thread: u32,
     _time: u32,
 ) {
+    #[cfg(feature = "wake-probe")]
+    let _probe = crate::probe::winevent(crate::probe::Src::Apps, event, hwnd);
     if hwnd.0.is_null() {
         return;
     }
@@ -255,6 +257,7 @@ unsafe extern "system" fn winevent_proc(
     if ui.0.is_null() {
         return;
     }
+    probe!(crate::probe::winevent_pass(crate::probe::Src::Apps, crate::probe::Stage::AppsDirty, event));
     // SAFETY: PostMessageW is thread-safe; if the window no longer exists it just fails.
     let _ = unsafe { PostMessageW(Some(ui), WM_DOCK_APPS_DIRTY, WPARAM(event as usize), LPARAM(hwnd.0 as isize)) };
 }

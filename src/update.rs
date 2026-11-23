@@ -422,6 +422,7 @@ fn spawn_worker(job: impl FnOnce() + Send + 'static) -> bool {
         return false;
     }
     let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         job();
         // A check or a download frees buffers the heap keeps committed: the next hidden period trims again.
         crate::mem::rearm();
@@ -550,6 +551,7 @@ pub(crate) fn run_capture(exe: &Path, args: &[&str], timeout: Duration, cap: u64
     };
     let (tx, rx) = mpsc::channel();
     let reader = std::thread::Builder::new().name("capture".into()).stack_size(64 * 1024).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         let mut out = Vec::new();
         // One byte over the cap tells "too large" from "exactly the cap".
         let read = stdout.take(cap.saturating_add(1)).read_to_end(&mut out).map(|_| out);
@@ -1228,7 +1230,10 @@ static AUTO_TRIED: Mutex<String> = Mutex::new(String::new());
 pub fn init(h: HWND) {
     let st = status_from_config(&config::get(), Version::current());
     with_state(|s| *s = st);
-    let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(cleanup_stages);
+    let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(|| {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
+        cleanup_stages()
+    });
     if let Err(e) = spawned {
         crate::log!("update: cannot start the cleanup thread: {e}");
     }

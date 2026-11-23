@@ -125,6 +125,7 @@ pub(crate) fn start() -> bool {
         return false;
     }
     let spawned = std::thread::Builder::new().name("start-import".into()).spawn(|| {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         let r = job();
         match &r {
             Ok(n) => log!("start import: {n} apps imported"),
@@ -298,7 +299,10 @@ fn job() -> Result<usize, JobError> {
         // symlink_metadata never follows a link; only existence is checked, the `.err` is never read.
         let (ready, failed) = (std::fs::symlink_metadata(&file).is_ok(), std::fs::symlink_metadata(&err).is_ok());
         match poll_step(ready, failed, t.elapsed()) {
-            Poll::Wait => std::thread::sleep(Duration::from_millis(POLL_MS)),
+            Poll::Wait => {
+                probe!(crate::probe::bump(crate::probe::C::ImportPolls));
+                std::thread::sleep(Duration::from_millis(POLL_MS));
+            }
             Poll::Ready => break,
             Poll::Failed => return Err(JobError::Failed(format!("the export failed ({} exists)", err.display()))),
             Poll::TimedOut => return Err(JobError::TimedOut),

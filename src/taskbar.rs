@@ -852,6 +852,7 @@ pub(crate) fn on_raw_event(event: u32, hwnd: HWND, id_object: i32) {
     if ui.0.is_null() {
         return;
     }
+    probe!(crate::probe::winevent_pass(crate::probe::Src::Apps, crate::probe::Stage::TaskbarEvent, event));
     // SAFETY: PostMessageW is thread-safe; if the window no longer exists it just fails.
     let _ = unsafe { PostMessageW(Some(ui), WM_DOCK_TASKBAR_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)) };
 }

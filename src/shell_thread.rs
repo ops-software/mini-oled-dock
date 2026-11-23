@@ -511,6 +511,8 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
     // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
     // WM_TIMER in the thread queue. Cancelled at the end.
     let timer = unsafe { SetTimer(None, 0, SAFETY_TIMER_MS, None) };
+    #[cfg(feature = "wake-probe")]
+    let probe_hook = crate::probe::install_send_hook(crate::probe::Th::Shell);
 
     loop {
         // SAFETY: `msg` is valid and writable; filter None = all thread messages.
@@ -518,6 +520,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         if r.0 <= 0 {
             break; // WM_QUIT or error
         }
+        probe!(crate::probe::thread_msg(crate::probe::Th::Shell, &msg));
         match msg.message {
             WM_SHELL_WAKE => {}
             WM_TIMER if msg.hwnd.0.is_null() => {}
@@ -537,6 +540,8 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         }
         shell.pump(&rx);
     }
+    #[cfg(feature = "wake-probe")]
+    crate::probe::remove_send_hook(probe_hook);
     if timer != 0 {
         // SAFETY: `timer` is the id returned by SetTimer on the same thread.
         let _ = unsafe { KillTimer(None, timer) };
@@ -1737,7 +1742,10 @@ fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> R
     let spawned = std::thread::Builder::new()
         .name("icons".into())
         .stack_size(ICON_READER_STACK)
-        .spawn(move || reader.run(input, output));
+        .spawn(move || {
+            probe!(crate::probe::bump(crate::probe::C::Spawned));
+            reader.run(input, output)
+        });
     if let Err(e) = spawned {
         let _ = child.kill();
         let _ = child.wait();

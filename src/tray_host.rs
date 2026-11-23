@@ -1358,6 +1358,8 @@ unsafe extern "system" fn place_winevent_proc(
     _time: u32,
 ) {
     use windows::Win32::UI::WindowsAndMessaging::{CHILDID_SELF, EVENT_SYSTEM_MENUPOPUPSTART, OBJID_WINDOW};
+    #[cfg(feature = "wake-probe")]
+    let _probe = crate::probe::winevent(crate::probe::Src::TrayPlace, event, hwnd);
     if hwnd.0.is_null() {
         return;
     }
@@ -1366,6 +1368,7 @@ unsafe extern "system" fn place_winevent_proc(
     }
     let h = HOST_HWND.load(Relaxed);
     if h != 0 {
+        probe!(crate::probe::winevent_pass(crate::probe::Src::TrayPlace, crate::probe::Stage::PlaceMove, event));
         // SAFETY: PostMessageW is thread-safe; if the window is gone it merely fails.
         let _ = unsafe {
             PostMessageW(Some(hwnd_of(h)), WM_HOST_PLACE_MOVE, WPARAM(hwnd.0 as usize), LPARAM(event as isize))
@@ -1606,18 +1609,23 @@ fn host_main(ready: mpsc::Sender<Result<(), String>>) {
         Ok(()) => {
             let _ = ready.send(Ok(()));
             let mut msg = MSG::default();
+            #[cfg(feature = "wake-probe")]
+            let probe_hook = crate::probe::install_send_hook(crate::probe::Th::Tray);
             loop {
                 // SAFETY: `msg` valid and writable; message loop of the thread that created the window.
                 let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
                 if r.0 <= 0 {
                     break;
                 }
+                probe!(crate::probe::thread_msg(crate::probe::Th::Tray, &msg));
                 // SAFETY: `msg` just filled by GetMessageW.
                 unsafe {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
+            #[cfg(feature = "wake-probe")]
+            crate::probe::remove_send_hook(probe_hook);
             HOST_HWND.store(0, Relaxed);
             RUNNING.store(false, Relaxed);
             // SAFETY: classes registered by `create_host` with the same instance.
@@ -2197,6 +2205,7 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         let guid = (nid.flags & NIF_GUID != 0 && !guid_is_zero(&nid.guid)).then_some(nid.guid);
         let (uid, path) = (nid.uid, exe_path.clone());
         if let Err(e) = std::thread::Builder::new().name("tray-name".into()).stack_size(512 * 1024).spawn(move || {
+            probe!(crate::probe::bump(crate::probe::C::Spawned));
             let name = cached_file_description(&path);
             if name.is_empty() {
                 return;
@@ -2737,6 +2746,7 @@ fn signal_stop<T>(q: &Mutex<VecDeque<T>>, cv: &Condvar, stop: &AtomicBool) {
 fn forward_main() {
     loop {
         let Some(item) = next_item(&FWD_QUEUE, &FWD_CV, &FWD_STOP) else { return };
+        probe!(crate::probe::bump(crate::probe::C::FwdItem));
         if !crate::taskbar::is_hidden() || YIELDED.load(Relaxed) {
             continue;
         }

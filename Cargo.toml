@@ -88,6 +88,8 @@ winresource = "0.1.19"
 default = []
 # Owner-probe builds (launcher L0 sessions): compiles in the probe switches and probe log lines, nothing else.
 owner-probe = []
+# Wake-probe builds (live wake measurements, plans/P0-wsC-v2.md): compiles in src/probe.rs and its call sites, nothing else.
+wake-probe = []
 
 [profile.release]
 opt-level = "z"
