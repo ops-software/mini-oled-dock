@@ -281,17 +281,20 @@ fn search_running() -> bool {
     }
 }
 
-/// The helper's first two roots (SPEC 5.4.6): the shell user's profile, then the common Start Menu Programs folder
-/// unless it holds the profile. Both paths come from HKLM, which only an administrator can change. The user's own
-/// Programs folder is not a root: it lies under the profile by default, and its path comes from HKCU, which any process
-/// of the user can point at C:\Users or C:\, where the helper's elevated token would let the index list other accounts'
-/// files; the known folders that HKCU also holds join only as `files::root_of` accepts them (`with_folders`).
-fn roots_of(profile: String, common: String) -> Vec<String> {
-    if under(&profile, &common, same_text) {
-        vec![profile]
-    } else {
-        vec![profile, common]
+/// The helper's first roots (SPEC 5.4.6): the shell user's profile (ProfileList, HKLM, which only an administrator can
+/// change), then the common Start Menu Programs folder only as `files::root_of` accepts it (no drive root), and with no
+/// fences the profile alone: HKLM stores that folder as `%ProgramData%\...`, which SHGetKnownFolderPath expands from the
+/// environment the helper inherits from the dock, where a user variable can shadow ProgramData and point it into another
+/// account's profile. The user's own Programs folder is not a root: it lies under the profile by default, and its path
+/// comes from HKCU, which any process of the user can point at C:\Users or C:\, where the helper's elevated token would
+/// let the index list other accounts' files; the known folders that HKCU also holds join only as `files::root_of`
+/// accepts them (`with_folders`).
+fn roots_of(profile: String, common: String, fences: Option<&Fences>) -> Vec<String> {
+    let mut roots = vec![profile];
+    if let Some(f) = fences {
+        files::add_roots(&mut roots, std::slice::from_ref(&common).iter().map(String::as_str), f, false);
     }
+    roots
 }
 
 /// The user's known folders that join the roots wherever they point (moved with Explorer's Location tab or by Folder
@@ -302,7 +305,7 @@ fn roots_of(profile: String, common: String) -> Vec<String> {
 const KNOWN: [windows::core::GUID; 6] =
     [FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Music, FOLDERID_Videos];
 
-/// `roots` (`roots_of`'s two), then each of `known` that `files::root_of` accepts (no drive root), then the first 8 of
+/// `roots` (`roots_of`'s), then each of `known` that `files::root_of` accepts (no drive root), then the first 8 of
 /// `extra`, the folders of `launcher.file_folders` the dock passed (a drive root allowed), checked again here: the
 /// helper trusts none of them. With no fences, `roots` alone. None of them holds another (`files::add_roots`).
 fn with_folders(mut roots: Vec<String>, known: &[String], extra: &[String], fences: Option<&Fences>) -> Vec<String> {
@@ -336,7 +339,8 @@ fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
     };
     let fences = fences();
     let known: Vec<String> = KNOWN.iter().filter_map(|id| known_folder(id, token, KF_FLAG_DONT_VERIFY)).collect();
-    Some(with_folders(roots_of(profile, path(&FOLDERID_CommonPrograms)?), &known, extra, fences.as_ref()))
+    let roots = roots_of(profile, path(&FOLDERID_CommonPrograms)?, fences.as_ref());
+    Some(with_folders(roots, &known, extra, fences.as_ref()))
 }
 
 /// The checks of the state frame, in order: the SIDs, the service, the roots, the index.
@@ -577,8 +581,10 @@ mod tests {
         }
     }
 
+    const COMMON: &str = "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs";
+
     fn roots() -> Vec<String> {
-        roots_of("C:\\Users\\a".into(), "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\".into())
+        roots_of("C:\\Users\\a".into(), COMMON.into(), Some(&fences()))
     }
 
     #[test]
@@ -644,7 +650,7 @@ mod tests {
         assert_eq!(roots().len(), 2, "the profile and the common Programs folder");
         // A common Programs folder that holds the profile is refused (any case, a trailing separator or none).
         for common in ["C:\\Users", "c:\\users\\", "C:\\", "C:"] {
-            assert_eq!(roots_of(profile.into(), common.into()), [profile], "{common:?}");
+            assert_eq!(roots_of(profile.into(), common.into(), Some(&fences())), [profile], "{common:?}");
         }
         let rows = || {
             vec![
@@ -652,7 +658,7 @@ mod tests {
                 raw("C:\\Users\\a\\quokka.txt", "quokka.txt", text("a"), "x"),
             ]
         };
-        let fence = roots_of(profile.into(), "C:\\Users".into());
+        let fence = roots_of(profile.into(), "C:\\Users".into(), Some(&fences()));
         let (hits, skipped) = collect(&mut Fake(rows().into_iter()), &fence, &mut |_| false);
         assert_eq!((hits.len(), &*hits[0].path, skipped), (1, "C:\\Users\\a\\quokka.txt", 1), "another account's row");
         // The user's own Start Menu Programs folder lies under the profile: its rows pass as the profile's.
@@ -660,6 +666,24 @@ mod tests {
         let one = vec![raw(start, "Tool.lnk", text("Programs"), "x")];
         let (hits, skipped) = collect(&mut Fake(one.into_iter()), &roots(), &mut |_| false);
         assert_eq!((hits.len(), skipped), (1, 0));
+    }
+
+    #[test]
+    fn the_common_folder_is_a_root_only_as_root_of_accepts_it() {
+        // HKLM stores it as %ProgramData%\..., which the known-folder lookup expands from the environment, where a user
+        // variable can shadow ProgramData: another account's profile, the profiles folder or the Windows tree is no root.
+        let (profile, f) = ("C:\\Users\\a", fences());
+        for common in [
+            "C:\\Users\\b\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs",
+            "C:\\Users\\Public\\Microsoft\\Windows\\Start Menu\\Programs",
+            "C:\\Windows\\Microsoft\\Windows\\Start Menu\\Programs",
+            "\\\\localhost\\c$\\Users\\b\\Microsoft\\Windows\\Start Menu\\Programs",
+        ] {
+            assert_eq!(roots_of(profile.into(), common.into(), Some(&f)), [profile], "{common:?}");
+        }
+        assert_eq!(roots_of(profile.into(), COMMON.into(), Some(&f)), [profile, COMMON]);
+        // With no fences, the profile alone.
+        assert_eq!(roots_of(profile.into(), COMMON.into(), None), [profile]);
     }
 
     fn fences() -> Fences {
@@ -680,7 +704,7 @@ mod tests {
     #[test]
     fn known_folders_join_the_roots_wherever_they_point() {
         let f = fences();
-        let common = "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\";
+        let common = COMMON;
         // Documents, Downloads, Pictures, Music and Videos moved to other drives; the Desktop left in the profile.
         let known = strings(&[
             "C:\\Users\\a\\Desktop",
@@ -746,7 +770,7 @@ mod tests {
         // Each root in the text Windows reads it as: the scope and the row fence use that text.
         assert_eq!(
             files::scope_clause(&refs).unwrap(),
-            "SCOPE='file:C:\\Users\\a' OR SCOPE='file:C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\' OR \
+            "SCOPE='file:C:\\Users\\a' OR SCOPE='file:C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs' OR \
              SCOPE='file:D:\\Docs' OR SCOPE='file:E:\\O''Brien' OR SCOPE='file:f:\\Data\\Média'"
         );
         // The rows: only those under an accepted root pass the fence, in any case of its letters.
