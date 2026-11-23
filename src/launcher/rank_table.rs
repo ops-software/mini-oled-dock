@@ -584,13 +584,19 @@ fn appunti_ties_and_the_learned_row_leads() {
     let mut w = World::new(true);
     let tiers = |w: &World| -> Vec<(String, u8)> {
         let s = crate::i18n::with_italian(true, || Shown::of(w, "appunti"));
-        s.rows.iter().filter(|r| r.from != ProviderId::Web).take(2).map(|r| (r.title.to_string(), r.score.tier)).collect()
+        s.rows
+            .iter()
+            .filter(|r| r.from != ProviderId::Web)
+            .take(2)
+            .map(|r| (r.title.to_string(), r.score.tier))
+            .collect()
     };
     let exact = rank::T_EXACT;
     assert_eq!(tiers(&w), [("Cronologia degli appunti".to_string(), exact), ("Appunti".to_string(), exact)]);
     let picked = w.learned.pick(ItemKey::of(ProviderId::Settings, "Appunti"), w.cx().now_unix, false);
     assert!(picked);
-    let bad = crate::i18n::with_italian(true, || check(&w, "it", "appunti", "Appunti", "y", "8:Cronologia degli appunti"));
+    let bad =
+        crate::i18n::with_italian(true, || check(&w, "it", "appunti", "Appunti", "y", "8:Cronologia degli appunti"));
     assert!(bad.is_empty(), "{bad:#?}");
     assert_eq!(tiers(&w), [("Appunti".to_string(), exact), ("Cronologia degli appunti".to_string(), exact)]);
 }

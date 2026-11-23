@@ -383,7 +383,8 @@ fn launcher_logs_carry_no_text() {
     assert_eq!(clip_violations("src/launcher_sys.rs", "fn clipboard_text() {}").len(), 2, "a renamed one fails");
     assert_eq!(clip_violations("src/ui.rs", "fn f() { GetClipboardData(13); }").len(), 1, "read nowhere else");
     assert!(clip_violations("src/ui.rs", "use x::{GetClipboardData, OpenClipboard};").is_empty(), "an import");
-    let tests = "#[cfg(test)]\nuse a::b;\nfn f() {}\n#[cfg(test)]\n#[allow(x)]\nmod tests { fn g() { GetClipboardData(13); } }";
+    let tests =
+        "#[cfg(test)]\nuse a::b;\nfn f() {}\n#[cfg(test)]\n#[allow(x)]\nmod tests { fn g() { GetClipboardData(13); } }";
     assert!(clip_violations("src/ui.rs", tests).is_empty(), "test code may read it");
     assert_eq!(clip_violations("src/ui.rs", &tests.replace("fn f() {}", "fn f() { GetClipboardData(1); }")).len(), 1);
     let all = scan_tree(clip_violations);
