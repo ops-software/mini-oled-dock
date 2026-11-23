@@ -73,10 +73,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW,
     SendMessageTimeoutW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint,
     EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GWL_STYLE, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE,
-    PBT_APMPOWERSTATUSCHANGE, SC_CLOSE, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
+    PBT_APMPOWERSTATUSCHANGE, SC_CLOSE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_POWERBROADCAST,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -3664,16 +3664,20 @@ fn still_silent(last: (u32, u64), tid: u32, now: u64) -> bool {
 }
 
 /// Whether the thread of window `h` answers now: a WM_NULL through SendMessageTimeoutW, which returns at once for a
-/// window Windows already calls hung (SMTO_ABORTIFHUNG, 5 s without pumping) and after `PING_MS` at most otherwise. A
-/// window of the dock's own thread answers; a refused or failed send (a window gone, a higher integrity) does not.
-/// UI thread.
+/// window Windows already calls hung (SMTO_ABORTIFHUNG, 5 s without pumping) and after `PING_MS` of wall-clock time at
+/// most otherwise. SMTO_BLOCK makes that bound true: without it this thread dispatches the messages other threads send
+/// its windows while it waits, and each one starts the timeout again (live check V-14: 7.45 s with another process
+/// sending the dock a message every 10 ms, the heartbeat starved). It cannot deadlock: the wait is one wait for the
+/// reply with that timeout. A thread that sends the dock a message meanwhile waits those 50 ms at most, as for any
+/// 50 ms handler; a window whose answer needs the dock's thread is taken as silent, the safe side. A window of the
+/// dock's own thread answers; a refused or failed send (a window gone, a higher integrity) does not. UI thread.
 pub(crate) fn answers(h: HWND) -> bool {
     // SAFETY: any handle; a stale one yields 0.
     if unsafe { GetWindowThreadProcessId(h, None) } == unsafe { GetCurrentThreadId() } {
         return true;
     }
     let mut res = 0usize;
-    let flags = SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT;
+    let flags = SMTO_BLOCK | SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT;
     // SAFETY: `res` is writable for the call; any handle is accepted (a stale one fails at once); WM_NULL does nothing.
     unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), flags, PING_MS, Some(&mut res)) }.0 != 0
 }
@@ -4029,6 +4033,90 @@ mod tests {
         assert!(!still_silent(last, 7, 10_000 + SILENT_MS), "asked again after SILENT_MS");
         assert!(!still_silent(last, 8, 10_100), "another thread is asked");
         assert!(!still_silent((0, 0), 0, 50), "none yet");
+    }
+
+    /// Live check V-14, run B1: while `answers` waited for a thread that had stopped pumping, the UI thread dispatched
+    /// the messages another process sent the dock's windows, and each one started the 50 ms again (7.45 s with a sender
+    /// every 10 ms; the heartbeat starved and the watchdog gave the taskbar back). Here a second thread's message-only
+    /// window never pumps, a third thread sends a message-only window of this thread a message every 5 ms, and the ping
+    /// must still end, false, well under 1 s (without SMTO_BLOCK it lasted until the silent thread ended, 4 s).
+    /// Headless: message-only windows are never shown and never take the focus.
+    #[test]
+    fn the_ping_ends_on_time_while_the_dock_is_sent_messages() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_NOREMOVE, SMTO_NORMAL, WINDOW_EX_STYLE,
+            WINDOW_STYLE,
+        };
+        let message_only = || {
+            // SAFETY: a message-only STATIC window of the calling thread, which destroys it before it ends.
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!(""),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("a message-only window")
+        };
+        // The silent thread: its window exists and it never reads its queue until the test is done (4 s at most).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done, wait_done) = std::sync::mpsc::channel::<()>();
+        let silent = std::thread::spawn(move || {
+            let h = message_only();
+            tx.send(h.0 as isize).expect("the test thread waits");
+            let _ = wait_done.recv_timeout(Duration::from_secs(4));
+            // SAFETY: the window of this thread.
+            let _ = unsafe { DestroyWindow(h) };
+        });
+        let target = HWND(rx.recv().expect("the silent thread starts") as *mut std::ffi::c_void);
+        // A window of this thread, which the sender keeps busy as another process kept DockWindow busy in V-14.
+        let mine = message_only();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicU32::new(0));
+        let sender = {
+            let (stop, sent, to) = (stop.clone(), sent.clone(), mine.0 as isize);
+            std::thread::spawn(move || {
+                while !stop.load(Relaxed) {
+                    let mut res = 0usize;
+                    let to = HWND(to as *mut std::ffi::c_void);
+                    // SAFETY: WM_NULL to a window of the test thread; `res` is writable; the timeout bounds the wait.
+                    let _ = unsafe {
+                        SendMessageTimeoutW(to, WM_NULL, WPARAM(0), LPARAM(0), SMTO_NORMAL, 200, Some(&mut res))
+                    };
+                    sent.fetch_add(1, Relaxed);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        // Serve the sender until it runs: PeekMessageW dispatches the messages sent to this thread.
+        let mut msg = MSG::default();
+        while sent.load(Relaxed) < 3 {
+            // SAFETY: `msg` is writable; PM_NOREMOVE leaves posted messages in the queue.
+            let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let t = Instant::now();
+        let ok = answers(target);
+        let waited = t.elapsed();
+        stop.store(true, Relaxed);
+        let _ = done.send(());
+        sender.join().expect("the sender ends");
+        silent.join().expect("the silent thread ends");
+        // SAFETY: the window of this thread.
+        let _ = unsafe { DestroyWindow(mine) };
+        assert!(!ok, "a thread that never reads its queue does not answer");
+        assert!(waited < Duration::from_secs(1), "the {PING_MS} ms ping took {} ms", waited.as_millis());
     }
 
     /// What the WM_NULL ping of `answers` costs (live check V-14): a pumping thread's message-only window, then the same
