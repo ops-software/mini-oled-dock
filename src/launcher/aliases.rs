@@ -52,6 +52,8 @@ pub enum AliasRefusal {
     Address,
     /// Any other scheme ("javascript:", "file:", "mailto:", a custom one) or a device path.
     Scheme,
+    /// The table holds 64 aliases already (the alias prompt).
+    Full,
 }
 
 /// A control, bidi or format character: invisible or reordering, so a target holding one could show one thing and open
@@ -172,7 +174,6 @@ pub fn check_word(word: &str, prefixes: &PrefixTable) -> Result<Box<str>, AliasR
 
 impl AliasTarget {
     /// The target as config.json holds it (`classify` gives this target back).
-    #[cfg_attr(not(test), allow(dead_code))] // L2-A2: the alias prompt saves it
     pub fn to_config(&self) -> String {
         match self {
             AliasTarget::App(id) => format!("app:{id}"),
@@ -224,17 +225,15 @@ impl AliasTable {
     }
 
     /// The alias of a folded query typed whole: one binary search, no allocation.
-    #[cfg_attr(not(test), allow(dead_code))] // L2-A2: the alias rows
     pub fn find(&self, folded: &str) -> Option<&Alias> {
         self.0.binary_search_by(|a| (*a.folded).cmp(folded)).ok().and_then(|i| self.0.get(i))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // L2-A2: the alias prompt
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // L2-A2
+    #[cfg_attr(not(test), allow(dead_code))] // clippy's len_without_is_empty
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

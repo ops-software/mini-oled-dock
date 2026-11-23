@@ -421,9 +421,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                     }
                 });
                 if config::poll_changed() {
-                    tray_host::invalidate_trust_cache();
-                    ui::on_config_changed();
-                    update::sync_timer(h);
+                    ui::config_reloaded();
                 }
                 trim_tick();
                 if update::auto_install_pending() {

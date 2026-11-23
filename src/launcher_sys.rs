@@ -647,6 +647,15 @@ impl SysPort for RealSys {
             log!("launcher: posting the PowerToys answer failed: {e}");
         }
     }
+
+    fn alias(&mut self, op: crate::popup::popup_launcher::AliasOp) {
+        crate::popup::popup_launcher::hold_alias_op(op);
+        // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
+        let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_LAUNCHER_ALIAS, WPARAM(0), LPARAM(0)) };
+        if let Err(e) = r {
+            log!("launcher: posting the alias change failed: {e}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- PowerToys (L1b-5, SPEC 5.7)

@@ -623,9 +623,14 @@ impl Launcher {
                 // the config is written there and the controller follows it.
                 Effect::Choose(c) => sys.pt_answer(answer_code(Some(c))),
                 Effect::DismissNotice(key) if key == pt_notice_key() => sys.pt_answer(answer_code(None)),
+                // An alias saved or removed: config.json is written on the dock window, outside this content and the key
+                // handler (`on_alias_message`), which then runs the query again.
+                Effect::SaveAlias { word, target } => sys.alias(AliasOp::Save { word, target }),
+                Effect::RemoveAlias(word) => sys.alias(AliasOp::Remove(word)),
                 // Files (L2).
                 Effect::DismissNotice(_) | Effect::RequestFiles(_) => {}
                 e @ (Effect::Launch(_)
+                | Effect::LaunchAlias(_)
                 | Effect::Copy(_)
                 | Effect::Power(_)
                 | Effect::WindowMenu
@@ -771,11 +776,16 @@ impl Launcher {
             with_ctrl(|c| c.learn_pick(key));
         }
         for e in std::mem::take(&mut self.queued) {
+            // An alias's launch is the same request as a row's, never recorded in the run history (plan L2-A2).
+            let (e, alias) = match e {
+                Effect::LaunchAlias(r) => (Effect::Launch(r), true),
+                e => (e, false),
+            };
             match e {
                 Effect::Launch(r) => {
                     let elevates = r.elevates();
                     elevated |= elevates;
-                    if let Some(line) = run_line_of(&r) {
+                    if let Some(line) = run_line_of(&r).filter(|_| !alias) {
                         with_ctrl(|c| c.dirty |= c.learn && history::push_front(&mut c.history, line));
                     }
                     if let Some(req) = crate::launcher_sys::to_request(r, &setting) {
@@ -1248,8 +1258,9 @@ impl Launcher {
         let font = if item.kind == Kind::Answer { Font::Bold } else { Font::Normal };
         let name_alpha = if item.kind == Kind::Answer { style::FG_HOT } else { name_alpha };
         let nlh = s.line_height(font);
-        let has_detail =
-            item.detail.is_some() && !g.lines.is_empty() || item.detail.is_some() && item.kind != Kind::App;
+        // An app row shows no detail, except an alias's (the app it opens, or "App not found").
+        let has_detail = item.detail.is_some() && !g.lines.is_empty()
+            || item.detail.is_some() && (item.kind != Kind::App || item.from == ProviderId::Alias);
         let has_review = !g.lines.is_empty();
         let ny = if has_detail || has_review { rc.top + m.px(NAME_TOP) } else { center_y(&first_line, nlh) };
         draw_line(s, &item.title, nx, ny, name_right - nx, font, name_alpha);
@@ -1427,6 +1438,8 @@ fn act_face(e: &ActEntry) -> (&'static str, GlyphId, Option<KeyChord>) {
         Act::Choice(c @ Choice::LeaveChord) => (strings::choice_label(c), GlyphId::Exit, None),
         Act::Choice(c @ Choice::UseAltShiftSpace) => (strings::choice_label(c), GlyphId::Gear, None),
         Act::DontShowAgain => (strings::verb_dont_show_again(), GlyphId::Info, None),
+        Act::AssignAlias => (strings::verb_assign_alias(), GlyphId::Prompt, None),
+        Act::RemoveAlias => (strings::verb_remove_alias(), GlyphId::Info, None),
     }
 }
 
@@ -1467,6 +1480,10 @@ fn hint_for(item: &Item) -> Option<&'static str> {
     let verb = verbs::primary(item.kind, running);
     if !item.verbs.has(verb) {
         return None;
+    }
+    if item.from == ProviderId::Alias && item.kind == Kind::Command {
+        // The alias prompt's row (alias rows themselves are apps, addresses, paths and lines).
+        return Some(strings::hint_save());
     }
     Some(match (item.kind, verb) {
         // A known console program runs in a console kept open (5.4.9), and says so.
@@ -1944,6 +1961,50 @@ fn reopen_with_error(query: &str) {
     });
 }
 
+/// Opens the launcher on the alias prompt in its "word target" form (Settings > Launcher's "Add…", L2-A3): a
+/// programmatic open like `reopen_with_error`'s, with what a chord's open reads of the window in front (the window the
+/// close gives the foreground back to: Settings), the window check and the locale styles. Only while a chord is set.
+#[allow(dead_code)] // L2-A3: Settings > Launcher calls it
+pub(crate) fn open_alias_prompt() {
+    if alias_prompt_flow(&mut RealHook, &mut RealSys) {
+        super::with_launcher(|l| {
+            ctx(|cx| {
+                let fx = l.session.alias_prompt(cx);
+                l.run(fx, cx, &mut RealSys)
+            })
+            .unwrap_or(Reply::None)
+        });
+    }
+}
+
+/// `open_alias_prompt`'s open on the ports: true when a launcher is open for the prompt.
+fn alias_prompt_flow(hook: &mut dyn HookPort, sys: &mut dyn SysPort) -> bool {
+    if !is_on() {
+        return false;
+    }
+    if sys.launcher_open() {
+        return true;
+    }
+    let Some((pick, top_percent)) = with_ctrl(|c| (c.pick, c.top_percent)) else { return false };
+    let fg = sys.foreground();
+    let (num, time_style, utc_offset_min) = (sys.number_style(), sys.time_style(), sys.utc_offset_min());
+    let window_ok = sys.window_target(fg);
+    with_ctrl(|c| {
+        c.fg_at_open = fg;
+        c.window_ok = window_ok;
+        c.num = num;
+        c.time_style = time_style;
+        c.utc_offset_min = utc_offset_min;
+    });
+    sys.prepare_open();
+    hook.shown(true);
+    if !sys.open(pick, top_percent) {
+        hook.shown(false);
+        return false;
+    }
+    true
+}
+
 /// A chord is set: the launcher's state exists.
 pub(crate) fn is_on() -> bool {
     ON.with(Cell::get)
@@ -2377,6 +2438,9 @@ pub(crate) trait SysPort {
     }
     /// Posts the PowerToys notice's answer to the dock window (`WM_DOCK_LAUNCHER_PT`, `answer_code`).
     fn pt_answer(&mut self, _code: usize) {}
+    /// Holds an alias change for the dock window (one slot, `hold_alias_op`) and posts `WM_DOCK_LAUNCHER_ALIAS` to it:
+    /// config.json is written there, never in the key handler.
+    fn alias(&mut self, _op: AliasOp) {}
 }
 
 /// The proof of a person's Ctrl+Shift+Enter (SPEC 5.4.9), built only for that key: the hook's evidence is consumed by
@@ -2906,6 +2970,133 @@ fn apply_pt_answer(answer: Option<Choice>) {
     }
 }
 
+// ---------------------------------------------------------------- aliases (plan L2-A2)
+
+/// A change of `launcher.aliases` asked by the launcher, applied on the dock window (`on_alias_message`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum AliasOp {
+    Save {
+        word: Box<str>,
+        target: Box<str>,
+    },
+    /// The word as configured.
+    Remove(Box<str>),
+}
+
+thread_local! {
+    /// The alias change `WM_DOCK_LAUNCHER_ALIAS` applies: one slot, a newer change replaces an older one. Outside
+    /// `CTRL`, which the session's effects run under (borrowed).
+    static ALIAS_OP: RefCell<Option<AliasOp>> = const { RefCell::new(None) };
+}
+
+/// `SysPort::alias` in the dock: the change waits here for its message.
+pub(crate) fn hold_alias_op(op: AliasOp) {
+    ALIAS_OP.with(|s| *s.borrow_mut() = Some(op));
+}
+
+/// `WM_DOCK_LAUNCHER_ALIAS`: the alias change the launcher posted is written to config.json (only while a chord is set).
+pub(crate) fn on_alias_message() {
+    let op = ALIAS_OP.with(|s| s.borrow_mut().take());
+    if let (Some(op), true) = (op, is_on()) {
+        apply_alias_op(&op, &mut RealAliasCfg);
+    }
+}
+
+/// What `apply_alias_op` does with the config, in its order (a recorder in the tests).
+trait AliasCfg {
+    /// `config::external_edit_pending`: a hand edit not loaded yet.
+    fn pending(&self) -> bool;
+    /// `config::poll_changed`: true when it reloaded the file.
+    fn poll(&mut self) -> bool;
+    /// What the 2 s housekeeping runs after a reload (`ui::on_config_changed` and the rest, `ui::config_reloaded`).
+    fn follow_up(&mut self);
+    /// `config::modify` with the change applied to `launcher.aliases` (`edit_aliases`).
+    fn modify(&mut self, op: &AliasOp) -> Result<(), String>;
+    /// The launcher and the Settings window take the new config (`on_config`, `settings_window::on_config_changed`).
+    fn applied(&mut self);
+    /// The open launcher runs its query again (the new table's rows), or shows that the change was not saved.
+    fn requery(&mut self, failed: bool);
+}
+
+/// Writes an alias change: a pending hand edit is loaded first (and followed up as the housekeeping would), so the
+/// write keeps it; then the change is written, the launcher and Settings follow it and the open launcher's query runs
+/// again. A failure shows a notice row and logs the reason only.
+fn apply_alias_op(op: &AliasOp, cfg: &mut dyn AliasCfg) {
+    if cfg.pending() && cfg.poll() {
+        cfg.follow_up();
+    }
+    match cfg.modify(op) {
+        Ok(()) => {
+            cfg.applied();
+            cfg.requery(false);
+        }
+        Err(e) => {
+            log!("launcher: the alias change was not saved: {e}");
+            cfg.requery(true);
+        }
+    }
+}
+
+/// The change on `launcher.aliases`. A saved word replaces any word equal to it once folded (the table would keep only
+/// the first of the two); the other entries, those the table ignores included, stay as written.
+fn edit_aliases(l: &mut LauncherConfig, op: &AliasOp) {
+    let folded = |w: &str| {
+        let mut f = String::with_capacity(w.len());
+        crate::launcher::rank::fold(w, &mut f);
+        f
+    };
+    match op {
+        AliasOp::Save { word, target } => {
+            let f = folded(word);
+            l.aliases.retain(|w, _| folded(w) != f);
+            l.aliases.insert(word.to_string(), target.to_string());
+        }
+        AliasOp::Remove(word) => {
+            l.aliases.remove(&**word);
+        }
+    }
+}
+
+/// The dock's `AliasCfg`.
+struct RealAliasCfg;
+
+impl AliasCfg for RealAliasCfg {
+    fn pending(&self) -> bool {
+        crate::config::external_edit_pending()
+    }
+    fn poll(&mut self) -> bool {
+        crate::config::poll_changed()
+    }
+    fn follow_up(&mut self) {
+        crate::ui::config_reloaded();
+    }
+    fn modify(&mut self, op: &AliasOp) -> Result<(), String> {
+        crate::config::modify(|c| edit_aliases(&mut c.launcher, op))
+    }
+    fn applied(&mut self) {
+        on_config();
+        crate::settings_window::on_config_changed();
+    }
+    fn requery(&mut self, failed: bool) {
+        super::with_launcher(|l| {
+            ctx(|cx| {
+                if failed {
+                    l.show_notices(vec![alias_failed_row()], cx, &mut RealSys)
+                } else {
+                    let fx = l.session.refresh(cx);
+                    l.run(fx, cx, &mut RealSys)
+                }
+            })
+            .unwrap_or(Reply::None)
+        });
+    }
+}
+
+/// The row of an alias change config.json did not take (no action).
+fn alias_failed_row() -> Item {
+    notice_row("alias-not-saved", strings::alias_not_saved(), None)
+}
+
 /// The notice's answer may be written: Use Alt+Shift+Space only while no other app holds that chord (`held` runs the
 /// RegisterHotKey probe, for that answer only). A held chord leaves the chord and `powertoys_done` as they were.
 fn answer_allowed(answer: Option<Choice>, held: &dyn Fn() -> bool) -> bool {
@@ -3295,6 +3486,10 @@ pub(crate) enum PreviewScene {
     NoticeActions,
     /// The notice after two passed chords Command Palette did not answer (5.7), at the narrowest launcher width.
     NoticeTookOver,
+    /// An alias typed whole: its row first and selected, the app it opens as the detail (plan L2-A2).
+    Alias,
+    /// The alias prompt opened from Settings, "word target" typed: the "Alias" chip and the row Enter saves.
+    AliasPrompt,
 }
 
 impl PreviewScene {
@@ -3317,6 +3512,8 @@ impl PreviewScene {
             "actions" => PreviewScene::Actions,
             "notice_actions" => PreviewScene::NoticeActions,
             "notice_took_over" => PreviewScene::NoticeTookOver,
+            "alias" => PreviewScene::Alias,
+            "alias_prompt" => PreviewScene::AliasPrompt,
             _ => return None,
         })
     }
@@ -3399,7 +3596,14 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         crate::preview::mock_icon('F', 0xE66000, 64),
     ));
     let history: Vec<Box<str>> = vec!["ping 1.1.1.1".into()];
-    let opts = LauncherOpts::default();
+    let mut opts = LauncherOpts::default();
+    // Invented aliases (plan L2-A2): an app and a web address.
+    let aliases: std::collections::BTreeMap<String, String> =
+        [("np", "app:Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"), ("docs", "https://example.com/docs")]
+            .iter()
+            .map(|(w, t)| (w.to_string(), t.to_string()))
+            .collect();
+    opts.aliases = AliasTable::build(&aliases, &opts.prefixes).0;
     let cx = Context {
         apps: apps_arena.view(),
         settings: settings_arena.view(),
@@ -3434,6 +3638,8 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::Notice | PreviewScene::NoticeActions | PreviewScene::NoticeTookOver => "",
         PreviewScene::Error => "calc",
         PreviewScene::FieldPair => "",
+        PreviewScene::Alias => "np",
+        PreviewScene::AliasPrompt => "",
     };
     if !query.is_empty() {
         session.chars(query, &cx);
@@ -3455,6 +3661,11 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     if scene == PreviewScene::NoticeActions {
         let ctrl_k = KeyEvent { vk: 0x4B, mods: Mods::CTRL, repeat: false, sys: false };
         let _ = session.key(ctrl_k, None, &cx);
+    }
+    if scene == PreviewScene::AliasPrompt {
+        // Settings > Launcher's "Add…" (`open_alias_prompt`), then a word and its target typed.
+        let _ = session.alias_prompt(&cx);
+        let _ = session.chars("docs https://example.com/docs", &cx);
     }
     if scene == PreviewScene::Error {
         // A refused launch that reopened the launcher over the same query (`reopen_with_error`).
@@ -3641,6 +3852,7 @@ mod tests {
         WinKey(u16),
         DeferClose(u32),
         Arm(usize, u32),
+        Alias(AliasOp),
     }
 
     #[derive(Default)]
@@ -3768,6 +3980,9 @@ mod tests {
         }
         fn ensure_settings(&mut self, rebuild: bool) {
             self.ensures.push(rebuild);
+        }
+        fn alias(&mut self, op: AliasOp) {
+            self.ops.push(Op::Alias(op));
         }
     }
 
@@ -3991,6 +4206,9 @@ mod tests {
         fn pt_answer(&mut self, code: usize) {
             self.ops.push(format!("PtAnswer({code})"));
         }
+        fn alias(&mut self, op: AliasOp) {
+            self.ops.push(format!("Alias({op:?})"));
+        }
     }
 
     const FG: isize = 0x7777;
@@ -4113,9 +4331,10 @@ mod tests {
         let a = g.actions.as_ref().unwrap();
         assert_eq!(w, w0);
         assert!(h >= h0, "the panel grows to hold the list: {h0} -> {h}");
-        // 7 entries of 34 px and 6 px of inset on each side; the right edge is 24 px from the panel's.
-        assert_eq!(a.items.len(), 7);
-        assert_eq!((a.rect.right - a.rect.left, a.rect.bottom - a.rect.top), (280, 2 * 6 + 7 * 34));
+        // 8 entries (the app's 7 verbs and "Assign alias…") of 34 px and 6 px of inset on each side; the right edge is
+        // 24 px from the panel's.
+        assert_eq!(a.items.len(), 8);
+        assert_eq!((a.rect.right - a.rect.left, a.rect.bottom - a.rect.top), (280, 2 * 6 + 8 * 34));
         assert_eq!(a.rect.right, w - 24);
         assert!(a.rect.top >= g.rows[0].rect.bottom - 1 && a.rect.bottom + 12 <= h);
         // Entries are hit by index, the rest of the panel (rows included) by the backdrop.
@@ -5658,6 +5877,8 @@ mod tests {
             "launcher_notice_took_over",
             "launcher_error",
             "launcher_field_pair",
+            "launcher_alias",
+            "launcher_alias_prompt",
         ];
         let s = surface(96);
         for n in names {
@@ -6056,5 +6277,233 @@ mod tests {
                 assert!(l.powertoys_done, "{a:?} from {start}: answered, so never asked again");
             }
         }
+    }
+    // ---- aliases (plan L2-A2)
+
+    const NOTEPAD_ID: &str = "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App";
+
+    /// The fixture with invented aliases; "np" spells the catalogue's id in lower case.
+    fn alias_fx() -> crate::launcher::providers::tests::Fx {
+        let mut fx = crate::launcher::providers::tests::Fx::new();
+        let map = [
+            ("np", "app:microsoft.windowsnotepad_8wekyb3d8bbwe!app"),
+            ("gone", "app:Example.Missing_0000000000000!App"),
+            ("gh", "https://example.com/gh"),
+            ("win", "C:\\Windows"),
+            ("disp", "ms-settings:display"),
+            ("pad", "notepad.exe"),
+            ("ip", "ipconfig /all"),
+        ]
+        .iter()
+        .map(|(w, t)| (w.to_string(), t.to_string()))
+        .collect();
+        fx.opts.aliases = AliasTable::build(&map, &fx.opts.prefixes).0;
+        fx
+    }
+
+    #[test]
+    fn missing_app_alias_asks_no_icon() {
+        let fx = alias_fx();
+        let show = |l: &mut Launcher, sys: &mut EffectSys| {
+            let mut s = surface(96);
+            l.size(&s);
+            l.paint_on(&mut s, None, None, sys);
+        };
+        let asks = |sys: &EffectSys| -> Vec<String> {
+            sys.ops.iter().filter(|o| o.starts_with("Shell(StartIconsFor")).cloned().collect()
+        };
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "gone");
+        show(&mut l, &mut sys);
+        assert!(asks(&sys).is_empty(), "{:?}", sys.ops);
+        // A found app's request carries the catalogue's own id string, never the config's spelling.
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "np");
+        show(&mut l, &mut sys);
+        let want = format!("Shell({:?})", ShellRequest::StartIconsFor { icon_px: 24, ids: vec![NOTEPAD_ID.into()] });
+        assert_eq!(asks(&sys), [want], "{:?}", sys.ops);
+    }
+
+    #[test]
+    fn alias_launches_never_elevate() {
+        use crate::launcher::session::Effect;
+        let fx = alias_fx();
+        let no_setting = |_: u32| None;
+        for (word, want) in [
+            ("np", "LauncherLaunch"),
+            ("gh", "OpenUrl"),
+            ("win", "OpenPath"),
+            ("disp", "OpenPath"),
+            ("pad", "LaunchCommand"),
+            ("ip", "LaunchCommand"),
+        ] {
+            let mut l = typed(&fx, word);
+            assert_eq!(key(&mut l, &fx, &mut EffectSys::default(), VK_RETURN, Mods::NONE), Reply::Close, "{word}");
+            let [Effect::LaunchAlias(r)] = l.queued.as_slice() else { panic!("{word}: {:?}", l.queued) };
+            assert!(!r.elevates(), "{word}");
+            let req = crate::launcher_sys::to_request(r.clone(), &no_setting).unwrap();
+            assert!(format!("{req:?}").starts_with(want), "{word}: {req:?}");
+        }
+        let mut l = typed(&fx, "ip");
+        key(&mut l, &fx, &mut EffectSys::default(), VK_RETURN, Mods::NONE);
+        let [Effect::LaunchAlias(r)] = l.queued.as_slice() else { panic!() };
+        let req = crate::launcher_sys::to_request(r.clone(), &no_setting).unwrap();
+        assert!(matches!(req, ShellRequest::LaunchCommand { console: true, .. }), "{req:?}");
+    }
+
+    #[test]
+    fn alias_launches_skip_the_run_history() {
+        let fx = alias_fx();
+        with_ctrl(|c| {
+            c.history.clear();
+            c.dirty = false;
+        });
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "pad");
+        key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert!(sys.ops.iter().any(|o| o.starts_with("Shell(LaunchCommand")), "{:?}", sys.ops);
+        assert_eq!(with_ctrl(|c| (c.history.len(), c.dirty, c.frecency.is_empty())), Some((0, false, true)));
+        // The same line typed in the run mode is recorded.
+        let mut l = typed(&fx, "> notepad.exe");
+        key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(with_ctrl(|c| c.history.len()), Some(1));
+        with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    #[test]
+    fn save_alias_writes_nothing_in_the_key_handler() {
+        let fx = alias_fx();
+        let mut l = opened(9);
+        let mut sys = EffectSys::default();
+        let out = l.session.alias_prompt(&fx.cx());
+        l.run(out, &fx.cx(), &mut sys);
+        l.session.chars("docs https://example.com/docs", &fx.cx());
+        let reply = key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        assert_ne!(reply, Reply::Close, "the launcher stays");
+        let save = AliasOp::Save { word: "docs".into(), target: "https://example.com/docs".into() };
+        assert_eq!(ops(&sys), [format!("Alias({save:?})")], "only the post to the dock window");
+        assert!(l.queued.is_empty());
+        assert_eq!(l.session.query_text(), "docs");
+        // Remove alias, the same way.
+        let mut l = typed(&fx, "gh");
+        let mut sys = EffectSys::default();
+        key(&mut l, &fx, &mut sys, 0x4B, Mods::CTRL);
+        key(&mut l, &fx, &mut sys, 0x23, Mods::NONE);
+        key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        assert_eq!(ops(&sys), [format!("Alias({:?})", AliasOp::Remove("gh".into()))]);
+    }
+
+    #[derive(Default)]
+    struct FakeCfg {
+        pending: bool,
+        reloads: bool,
+        fails: bool,
+        calls: Vec<String>,
+    }
+
+    impl AliasCfg for FakeCfg {
+        fn pending(&self) -> bool {
+            self.pending
+        }
+        fn poll(&mut self) -> bool {
+            self.calls.push("poll".into());
+            self.reloads
+        }
+        fn follow_up(&mut self) {
+            self.calls.push("follow_up".into());
+        }
+        fn modify(&mut self, op: &AliasOp) -> Result<(), String> {
+            self.calls.push(format!("modify {op:?}"));
+            if self.fails {
+                Err("no writable data folder".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn applied(&mut self) {
+            self.calls.push("applied".into());
+        }
+        fn requery(&mut self, failed: bool) {
+            self.calls.push(format!("requery {failed}"));
+        }
+    }
+
+    #[test]
+    fn alias_save_loads_a_pending_hand_edit_first() {
+        let op = AliasOp::Save { word: "gh".into(), target: "https://example.com/".into() };
+        let m = format!("modify {op:?}");
+        let run = |cfg: FakeCfg| {
+            let mut cfg = cfg;
+            apply_alias_op(&op, &mut cfg);
+            cfg.calls
+        };
+        let edit = run(FakeCfg { pending: true, reloads: true, ..FakeCfg::default() });
+        assert_eq!(edit, ["poll", "follow_up", m.as_str(), "applied", "requery false"]);
+        assert_eq!(run(FakeCfg::default()), [m.as_str(), "applied", "requery false"], "nothing pending");
+        // An edit that does not parse is not loaded: no follow-up, and the write saves it aside first (config::modify).
+        let broken = run(FakeCfg { pending: true, ..FakeCfg::default() });
+        assert_eq!(broken, ["poll", m.as_str(), "applied", "requery false"]);
+        assert_eq!(run(FakeCfg { fails: true, ..FakeCfg::default() }), [m.as_str(), "requery true"]);
+    }
+
+    #[test]
+    fn saving_replaces_a_word_equal_once_folded() {
+        let mut l = LauncherConfig::default();
+        l.aliases.insert("GH".into(), "https://example.com/old".into());
+        l.aliases.insert("game".into(), "steam://run/1".into());
+        edit_aliases(&mut l, &AliasOp::Save { word: "gh".into(), target: "https://example.com/new".into() });
+        let all: Vec<(&str, &str)> = l.aliases.iter().map(|(w, t)| (w.as_str(), t.as_str())).collect();
+        assert_eq!(all, [("game", "steam://run/1"), ("gh", "https://example.com/new")], "the ignored entry stays");
+        edit_aliases(&mut l, &AliasOp::Remove("nope".into()));
+        assert_eq!(l.aliases.len(), 2);
+        edit_aliases(&mut l, &AliasOp::Remove("gh".into()));
+        assert_eq!(l.aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["game"]);
+    }
+
+    #[test]
+    fn prompt_from_settings_restores_the_settings_window() {
+        let fx = alias_fx();
+        let mut hook = FakeHook::default();
+        let mut sys = fresh();
+        assert!(!alias_prompt_flow(&mut hook, &mut sys), "never with the chord off");
+        assert!(sys.ops.is_empty());
+        ON.with(|o| o.set(true));
+        let opened = alias_prompt_flow(&mut hook, &mut sys);
+        ON.with(|o| o.set(false));
+        assert!(opened);
+        assert_eq!((sys.ops.as_slice(), hook.shown.as_slice()), ([Op::Open].as_slice(), [true].as_slice()));
+        // The content the host makes for it: the window in front (Settings, 0x5005) is the one the close restores.
+        let mut l = new_launcher();
+        assert_eq!(l.fg_at_open, 0x5005);
+        let mut esys = EffectSys::default();
+        let out = l.session.alias_prompt(&fx.cx());
+        l.run(out, &fx.cx(), &mut esys);
+        assert_eq!(l.session.chip(), Some(ProviderId::Alias));
+        assert_eq!(key(&mut l, &fx, &mut esys, 0x1B, Mods::NONE), Reply::Relayout);
+        assert_eq!(key(&mut l, &fx, &mut esys, 0x1B, Mods::NONE), Reply::Close);
+        host_close(&mut l, &mut hook, &mut esys);
+        assert!(esys.ops.iter().any(|o| o == "Restore(0x5005)"), "{:?}", esys.ops);
+        with_ctrl(|c| *c = Ctrl::new());
+    }
+
+    #[test]
+    fn prompt_text_is_never_kept() {
+        let fx = alias_fx();
+        with_ctrl(|c| c.opts.keep_query = true);
+        let mut sys = EffectSys::default();
+        let mut l = typed(&fx, "calc");
+        let out = l.session.alias_prompt(&fx.cx());
+        l.run(out, &fx.cx(), &mut sys);
+        l.session.chars("secret https://example.com/", &fx.cx());
+        // A refused launch's reopen and keep_query both take the query from before the prompt.
+        l.launched = true;
+        l.housekeeping(&mut sys);
+        assert_eq!(with_ctrl(|c| c.failed_query.clone()).flatten().as_deref(), Some("calc"));
+        key(&mut l, &fx, &mut sys, 0xBC, Mods::CTRL);
+        host_close(&mut l, &mut FakeHook::default(), &mut sys);
+        assert_eq!(with_ctrl(|c| c.last_query.clone()).flatten().as_deref(), Some("calc"));
+        with_ctrl(|c| *c = Ctrl::new());
     }
 }

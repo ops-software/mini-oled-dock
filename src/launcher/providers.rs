@@ -3,7 +3,7 @@
 //! query together with the result rows) and the providers themselves, run by `query_all` in the order of 5.4.1.
 //! Nothing here reads a file, the registry or the network; time is only counted (`Budget`), never asserted.
 
-use super::aliases::AliasTable;
+use super::aliases::{Alias, AliasTable, AliasTarget};
 use super::arena::CatalogView;
 use super::commands::{self, Command, COMMANDS};
 use super::datetime::{self, TimeStyle};
@@ -12,7 +12,7 @@ use super::gesture::GESTURE_TIME_MATCHES;
 use super::index::{Hit, IndexView};
 use super::model::{
     Batch, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, NumberStyle, Payload, ProviderId,
-    ProviderMask, Query, Score, Verb, VerbSet, WindowRow,
+    ProviderMask, Query, Score, Verb, VerbSet, WindowRow, PROVIDER_COUNT,
 };
 use super::query::{self, Implicit, PrefixTable};
 use super::rank::{self, Cand, Indexed};
@@ -217,7 +217,7 @@ pub const BUDGET_US: u64 = 1_000;
 /// Overruns of the budget in a row, one counter per provider.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Budget {
-    over_in_row: [u8; 11],
+    over_in_row: [u8; PROVIDER_COUNT],
 }
 
 impl Budget {
@@ -268,9 +268,13 @@ pub fn query_all(q: &Query, cx: &Context, budget: &mut Budget) -> TopK {
 fn query_all_traced(q: &Query, cx: &Context, budget: &mut Budget, trace: &mut dyn FnMut(ProviderId)) -> TopK {
     let mut top = TopK::new(cx.opts.rows);
     let mut s = Scratch::default();
-    let mut spent = [0u64; 11];
-    let mut ran = [false; 11];
+    let mut spent = [0u64; PROVIDER_COUNT];
+    let mut ran = [false; PROVIDER_COUNT];
     let mut hits = 0usize;
+    // An alias typed whole (plan L2 D9): Mixed mode only, whatever the mask; one binary search per key.
+    if q.mode == Mode::Mixed && alias(q, cx, &mut top) {
+        trace(ProviderId::Alias);
+    }
     for id in ORDER {
         if !runs(id, q, cx.opts.mask) {
             continue;
@@ -306,7 +310,7 @@ fn query_all_traced(q: &Query, cx: &Context, budget: &mut Budget, trace: &mut dy
     top
 }
 
-fn spend(spent: &mut [u64; 11], ran: &mut [bool; 11], id: ProviderId, since: Instant) {
+fn spend(spent: &mut [u64; PROVIDER_COUNT], ran: &mut [bool; PROVIDER_COUNT], id: ProviderId, since: Instant) {
     let us = u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX);
     if let Some(total) = spent.get_mut(id as usize) {
         *total = total.saturating_add(us);
@@ -410,7 +414,8 @@ fn run_one(id: ProviderId, q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK,
             units(q, top);
             0
         }
-        ProviderId::Files => 0,
+        // The alias lookup runs before `ORDER` (`query_all_traced`).
+        ProviderId::Files | ProviderId::Alias => 0,
     }
 }
 
@@ -446,6 +451,88 @@ fn verbs(kind: Kind, running: bool, class: Option<FileClass>) -> VerbSet {
 /// A file row's verbs: Run as administrator only where the session can run its path elevated.
 fn file_verbs(path: &str, class: FileClass) -> VerbSet {
     verbs_for_file(path, class, MOTW_PROMPT_CONFIRMED, GESTURE_TIME_MATCHES)
+}
+
+// ---- aliases
+
+/// The alias of the whole folded query, as one row (`Results::sync` puts it right after the notices). False, and nothing
+/// allocated, without a match.
+fn alias(q: &Query, cx: &Context, top: &mut TopK) -> bool {
+    let Some(a) = cx.opts.aliases.find(&q.folded) else { return false };
+    top.push(alias_item(a, cx));
+    true
+}
+
+/// The host of a web address, for a row's detail.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
+/// What an alias row (or the alias prompt's row) shows of a target: its detail, its icon and the verbs it offers. An
+/// app is looked for in the catalogue (ASCII case-insensitive, run only for a matched alias): found, the row carries the
+/// catalogue's own id string, so no string of config.json reaches an icon request (L3 house rule 4); not found, the Info
+/// glyph, "App not found" and no verb. Never Run as administrator.
+pub fn alias_face(t: &AliasTarget, apps: &CatalogView) -> (Option<Box<str>>, IconRef, VerbSet, Payload, Kind) {
+    let open = VerbSet::empty().with(Verb::Open);
+    match t {
+        AliasTarget::App(id) => match (0..apps.len()).find(|&i| apps.id(i).eq_ignore_ascii_case(id)) {
+            Some(i) => {
+                let own: Box<str> = apps.id(i).into();
+                let icon = IconRef::App(own.clone());
+                (Some(apps.name(i).into()), icon, open.with(Verb::Reveal), Payload::AppId(own), Kind::App)
+            }
+            None => (
+                Some(strings::app_not_found().into()),
+                IconRef::Glyph(GlyphId::Info),
+                VerbSet::empty(),
+                Payload::None,
+                Kind::App,
+            ),
+        },
+        AliasTarget::Url(u) => (
+            Some(url_host(u).into()),
+            IconRef::Glyph(GlyphId::Globe),
+            open.with(Verb::Copy),
+            Payload::Url(u.clone()),
+            Kind::Web,
+        ),
+        AliasTarget::Settings(s) => {
+            let payload = Payload::Path { path: s.clone(), dir: false, class: FileClass::Other };
+            (Some(s.clone()), IconRef::Glyph(GlyphId::Gear), open.with(Verb::Copy), payload, Kind::File)
+        }
+        AliasTarget::Path { path, dir } => {
+            let (kind, glyph, class) = if *dir {
+                (Kind::Folder, GlyphId::Folder, FileClass::Other)
+            } else {
+                (Kind::File, GlyphId::Document, file_class(path))
+            };
+            let payload = Payload::Path { path: path.clone(), dir: *dir, class };
+            (Some(path.clone()), IconRef::Glyph(glyph), open.with(Verb::Reveal).with(Verb::Copy), payload, kind)
+        }
+        AliasTarget::Command(r) => {
+            let payload = Payload::RunLine(r.clone());
+            (Some(r.line.clone()), IconRef::Glyph(GlyphId::Prompt), open.with(Verb::Copy), payload, Kind::RunLine)
+        }
+    }
+}
+
+/// An alias row: the word as configured, the target in short, `PINNED` (it is placed, not ranked), never destructive and
+/// never learned (frecency learns rows by their provider).
+fn alias_item(a: &Alias, cx: &Context) -> Item {
+    let (detail, icon, verbs, payload, kind) = alias_face(&a.target, &cx.apps);
+    Item {
+        key: ItemKey::of(ProviderId::Alias, &a.folded),
+        from: ProviderId::Alias,
+        kind,
+        title: a.word.clone(),
+        detail,
+        icon,
+        score: PINNED,
+        verbs,
+        payload,
+        destructive: false,
+    }
 }
 
 // ---- calculator
@@ -1124,17 +1211,25 @@ impl Results {
         self.rows.clear();
         self.web_at = None;
         self.rows.extend(self.notices.iter().cloned());
+        let notices = self.rows.len();
         let mut web = None;
+        let mut alias = None;
         let mut ranked = Vec::with_capacity(top.len());
         for item in top.into_sorted() {
             if item.key == web_search_key() {
                 web = Some(item);
+            } else if item.from == ProviderId::Alias {
+                alias = Some(item);
             } else if item.kind == Kind::Answer && item.score.tier == PINNED.tier {
                 // Only an answer of the best tier is lifted above the ranked rows; any other stays among them.
                 self.rows.push(item);
             } else {
                 ranked.push(item);
             }
+        }
+        // An alias typed whole comes right after the notices, before the answer (plan L2 D9).
+        if let Some(a) = alias {
+            self.rows.insert(notices, a);
         }
         if q.mode == Mode::Mixed {
             // The implicit run row follows a top hit that matched by a name (tiers 0-2), else it is the first ranked row.
@@ -1157,6 +1252,20 @@ impl Results {
         self.mixed = q.mode == Mode::Mixed;
         self.typed = !q.raw.is_empty();
         self.sel = keep.filter(|k| self.rows.iter().any(|r| r.key == *k)).or_else(|| self.default_key(q));
+    }
+
+    /// The alias prompt's one row, as a new generation (plan L2-A2): every other row goes (the notices come back with the
+    /// next `sync`); it is selected when it can be saved.
+    pub fn only(&mut self, row: Item, gen: u64) {
+        self.rows.clear();
+        self.web_at = None;
+        self.late_len = 0;
+        self.gen = gen;
+        self.mixed = false;
+        self.typed = true;
+        self.sel = (!row.verbs.is_empty()).then_some(row.key);
+        self.rows.push(row);
+        self.sync_len = self.rows.len();
     }
 
     /// The rows added after the last `sync`, the web row taken out (it is placed again by the next `sync`).
@@ -1895,6 +2004,25 @@ pub(crate) mod tests {
         assert!(setting < date, "{rows:#?}");
         // A learned row of the keyword's tier stays above it too (no learned boost on the date row).
         assert_eq!(rows[date].score.learned, Reverse(0));
+    }
+
+    #[test]
+    fn alias_lookup_allocates_nothing_without_a_match() {
+        use crate::launcher::aliases::AliasTable;
+        use crate::launcher::testkit::allocations_during;
+        let mut fx = Fx::new();
+        let map = (0..64).map(|i| (format!("w{i:02}"), "https://example.com/".to_string())).collect();
+        fx.opts.aliases = AliasTable::build(&map, &fx.opts.prefixes).0;
+        let cx = fx.cx();
+        let mut top = TopK::new(8);
+        for raw in ["calc", "", "w", "w6", "w640", "x"] {
+            let q = query::parse_query(raw, &fx.opts.prefixes, NUM_IT, 1);
+            let (hit, n) = allocations_during(|| alias(&q, &cx, &mut top));
+            assert_eq!((hit, n), (false, 0), "{raw:?}");
+        }
+        assert!(top.is_empty());
+        let q = query::parse_query("W07", &fx.opts.prefixes, NUM_IT, 1);
+        assert!(alias(&q, &cx, &mut top) && top.len() == 1);
     }
 
     #[test]

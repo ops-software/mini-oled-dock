@@ -185,13 +185,11 @@ impl World {
             })
             .collect();
         let settings = catalog::build_settings_arena(catalog::IN_PROCESS_KEY, &held).unwrap();
-        World {
-            apps,
-            settings,
-            opts: LauncherOpts::default(),
-            learned: Frecency::new(),
-            num: if italian { IT_NUM } else { EN_NUM },
-        }
+        // One invented alias (plan L2-A2): "gh" typed whole.
+        let mut opts = LauncherOpts::default();
+        let aliases = [("gh".to_string(), "https://example.com/gh".to_string())].into_iter().collect();
+        opts.aliases = super::aliases::AliasTable::build(&aliases, &opts.prefixes).0;
+        World { apps, settings, opts, learned: Frecency::new(), num: if italian { IT_NUM } else { EN_NUM } }
     }
 
     fn cx(&self) -> Context<'_> {
@@ -291,6 +289,7 @@ fn check(w: &World, ui: &str, raw: &str, first: &str, sel: &str, checks: &str) -
             "R" => vis.iter().any(|r| r.kind == Kind::RunLine),
             "F0" => s.rows.iter().all(|r| r.score.tier != TIER_FUZZY),
             "S0" => s.rows.iter().all(|r| r.from != ProviderId::Settings),
+            "A0" => s.rows.iter().all(|r| r.from != ProviderId::Alias),
             "alone" => s.rows.len() == 1 && s.has_web(),
             c if c.starts_with("2:") => s.rows.get(1).is_some_and(|r| *r.title == c[2..]),
             c if c.starts_with("8:") => {
@@ -315,8 +314,9 @@ fn check(w: &World, ui: &str, raw: &str, first: &str, sel: &str, checks: &str) -
 fn split_checks(checks: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for word in checks.split_whitespace() {
-        let starts =
-            matches!(word, "W" | "R" | "F0" | "S0" | "alone") || word.starts_with("2:") || word.starts_with("8:");
+        let starts = matches!(word, "W" | "R" | "F0" | "S0" | "A0" | "alone")
+            || word.starts_with("2:")
+            || word.starts_with("8:");
         match out.last_mut() {
             Some(last) if !starts => {
                 last.push(' ');
@@ -378,6 +378,14 @@ fn invariants_of(w: &World, ui: &str, raw: &str) -> Vec<String> {
     });
     if answered && s.rows.iter().any(|r| r.score.tier == TIER_FUZZY) {
         fail("a fuzzy row beside an answer, run, path, URL or registry row");
+    }
+    // 6. An alias row only for a Mixed query equal to its word, first and selected (plan L2 D9).
+    for (i, r) in s.rows.iter().enumerate().filter(|(_, r)| r.from == ProviderId::Alias) {
+        let mut word = String::new();
+        rank::fold(&r.title, &mut word);
+        if !s.mixed || word != folded || i != 0 || s.sel != Some(0) {
+            fail("an alias row out of place");
+        }
     }
     bad
 }
@@ -442,8 +450,14 @@ en|C:\Windows|path|y|F0
 en|ipconfig|run ipconfig|y|F0
 en|> notepad|run notepad|y|
 en|?? test|web|y|
+en|gh|gh|y|
+en|GH |gh|y|
+en|g|-|-|A0
+en|ghx|-|-|A0
+en|> gh|-|-|A0
 en|how to cook pasta|web|y|alone
 en|zzqxzzqx|web|y|alone
+it|gh|gh|y|
 it|calc|Calcolatrice|y|W R S0
 it|calcolat|Calcolatrice|y|W S0
 it|calcolatrice|Calcolatrice|y|

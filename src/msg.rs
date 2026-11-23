@@ -92,6 +92,10 @@ pub const WM_DOCK_LAUNCHER_PASSED: u32 = WM_APP + 27;
 /// (posted by the thread-pool wait of `launcher_sys`); 1-4: the answer to the PowerToys notice (posted by the launcher, so
 /// the config is written outside the popup's content). lParam = 0.
 pub const WM_DOCK_LAUNCHER_PT: u32 = WM_APP + 28;
+/// launcher -> dock window: an alias was saved or removed in the launcher (plan L2-A2), posted so config.json is written
+/// outside the popup's content and the key handler. The change waits in `popup_launcher::hold_alias_op`'s slot (a newer
+/// one replaces it). wParam = lParam = 0. Posted only while a chord is set.
+pub const WM_DOCK_LAUNCHER_ALIAS: u32 = WM_APP + 29;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.

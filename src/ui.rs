@@ -524,6 +524,11 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             popup::popup_launcher::on_pt_message(wp.0);
             Some(LRESULT(0))
         }
+        // An alias saved or removed in the launcher (posted by the launcher only): config.json is written here.
+        crate::msg::WM_DOCK_LAUNCHER_ALIAS => {
+            popup::popup_launcher::on_alias_message();
+            Some(LRESULT(0))
+        }
         // Registered only once a chord is set (`launcher_sys::watch_sessions`): lock and disconnects.
         windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
             popup::popup_launcher::on_session_change(wp.0 as u32);
@@ -786,6 +791,15 @@ fn follow_pointer() -> bool {
     }
     apply_dpi(dock_dpi());
     true
+}
+
+/// What the 2 s housekeeping runs when `config::poll_changed` reloaded a hand edit (main.rs), and the launcher's alias
+/// change after it loaded one first (`popup_launcher::on_alias_message`): the tray's trust cache, every follower of the
+/// config, the update timer.
+pub fn config_reloaded() {
+    crate::tray_host::invalidate_trust_cache();
+    on_config_changed();
+    crate::update::sync_timer(hwnd());
 }
 
 /// The config changed on disk (`config::poll_changed` returned true): rebuilds the items

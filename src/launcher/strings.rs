@@ -1,6 +1,7 @@
 //! Every user-visible string of the launcher: one function each, English and Italian through `i18n::tr`.
 //! Later tasks append theirs.
 
+use super::aliases::AliasRefusal;
 use super::model::{Choice, KeyChord, Mods, ProviderId};
 use crate::i18n::tr;
 
@@ -19,6 +20,8 @@ pub fn chip(p: ProviderId) -> Option<&'static str> {
         ProviderId::DateTime => tr("Time", "Data e ora"),
         ProviderId::Registry => tr("Registry", "Registro"),
         ProviderId::Files => tr("Files", "File"),
+        // The alias prompt (plan L2-A2).
+        ProviderId::Alias => tr("Alias", "Alias"),
         ProviderId::Apps | ProviderId::Commands => return None,
     })
 }
@@ -35,6 +38,10 @@ pub fn hint_copy() -> &'static str {
 }
 pub fn hint_run() -> &'static str {
     tr("Run · Enter", "Esegui · Invio")
+}
+/// The alias prompt's row: Enter saves.
+pub fn hint_save() -> &'static str {
+    tr("Save · Enter", "Salva · Invio")
 }
 pub fn hint_run_in_console() -> &'static str {
     tr("Run in console · Enter", "Esegui nella console · Invio")
@@ -73,6 +80,57 @@ pub fn verb_new_window() -> &'static str {
 /// The notice's own entry of the action list.
 pub fn verb_dont_show_again() -> &'static str {
     tr("Don't show again", "Non mostrare più")
+}
+
+// ---- aliases (plan L2-A2)
+
+/// The action list's entry that opens the alias prompt for the selected row.
+pub fn verb_assign_alias() -> &'static str {
+    tr("Assign alias…", "Assegna alias…")
+}
+/// The action list's entry of an alias row.
+pub fn verb_remove_alias() -> &'static str {
+    tr("Remove alias", "Rimuovi alias")
+}
+/// The alias prompt's row when its word and target can be saved.
+pub fn save_alias(word: &str) -> String {
+    format!("{} “{word}”", tr("Save alias", "Salva alias"))
+}
+/// The alias prompt's row while the field is empty (a row's target given, or the "word target" form).
+pub fn alias_type_word() -> &'static str {
+    tr("Type a word for this alias", "Scrivi una parola per l'alias")
+}
+pub fn alias_type_word_target() -> &'static str {
+    tr("Type a word, a space and what it opens", "Scrivi una parola, uno spazio e cosa apre")
+}
+/// An app alias whose app is not in the catalogue.
+pub fn app_not_found() -> &'static str {
+    tr("App not found", "App non trovata")
+}
+/// The notice row of an alias that could not be written to config.json.
+pub fn alias_not_saved() -> &'static str {
+    tr("Couldn't save the alias", "Impossibile salvare l'alias")
+}
+/// Why the alias prompt cannot save.
+pub fn alias_refusal(why: AliasRefusal) -> &'static str {
+    match why {
+        AliasRefusal::Word => tr(
+            "An alias is 1-16 letters, digits or - _ . +, starting with a letter",
+            "Un alias ha da 1 a 16 lettere, cifre o - _ . +, e inizia con una lettera",
+        ),
+        AliasRefusal::Prefix => tr("This word starts a search mode", "Questa parola avvia una modalità di ricerca"),
+        AliasRefusal::NoTarget => tr("Nothing to open after the word", "Niente da aprire dopo la parola"),
+        AliasRefusal::TooLong => tr("Longer than 512 characters", "Più lungo di 512 caratteri"),
+        AliasRefusal::Hidden => {
+            tr("Holds a hidden or control character", "Contiene un carattere nascosto o di controllo")
+        }
+        AliasRefusal::Lines => tr("More than one line", "Più di una riga"),
+        AliasRefusal::Address => tr("Not an address the launcher opens", "Non è un indirizzo che il launcher apre"),
+        AliasRefusal::Scheme => {
+            tr("This kind of address can't be an alias", "Questo tipo di indirizzo non può essere un alias")
+        }
+        AliasRefusal::Full => tr("64 aliases already: remove one first", "Ci sono già 64 alias: rimuovine uno"),
+    }
 }
 
 /// The name of a key chord as the action list shows it (right-aligned, CAPTION): "Ctrl+Shift+Enter", "Shift+Del".
@@ -311,9 +369,13 @@ mod tests {
             ProviderId::DateTime,
             ProviderId::Registry,
             ProviderId::Files,
+            ProviderId::Alias,
         ] {
             assert!(chip(p).is_some_and(|c| !c.is_empty()), "{p:?}");
         }
+        assert_eq!(save_alias("gh"), "Save alias “gh”");
+        assert_eq!(verb_assign_alias(), "Assign alias…");
+        assert!(alias_refusal(AliasRefusal::Full).starts_with("64 aliases"));
         assert_eq!(window_name(), "Launcher");
     }
 

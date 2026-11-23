@@ -4,15 +4,18 @@
 //! holds the foreground and hides after; a launch hides first so Explorer gets the foreground grant; a copy hides with
 //! the restore so the text lands where the user came from.
 
+use super::aliases::{self, AliasRefusal, AliasTarget, MAX_ALIASES};
 use super::field::{Edit, FieldOut, KeyEvent, Motion, TextField};
 use super::gesture::{self, Gesture, Refusal};
 use super::model::{
-    Batch, Choice, CommandId, FileClass, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId, RunLine, Verb,
+    Batch, Choice, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId,
+    RunLine, Score, Verb, VerbSet,
 };
 use super::providers::{self, Budget, Context, LauncherOpts, Results};
 use super::query;
 use super::rank;
 use super::runline;
+use super::strings;
 use super::verbs;
 
 /// What the host does for the session, in order ("after close" effects run in `after_close`, L1a-15c).
@@ -46,6 +49,16 @@ pub enum Effect {
     Choose(Choice),
     /// Forget a run-history line.
     ForgetRun(Box<str>),
+    /// The alias prompt's Enter: write `word` -> `target` into config.json (plan L2-A2). The host does it on the dock
+    /// window, outside the key handler.
+    SaveAlias {
+        word: Box<str>,
+        target: Box<str>,
+    },
+    /// "Remove alias" on an alias row: the word as configured leaves config.json (on the dock window, as `SaveAlias`).
+    RemoveAlias(Box<str>),
+    /// An alias row's launch: run as `Launch` is, but never recorded in the run history, and never elevated.
+    LaunchAlias(LaunchReq),
     /// Ask the files provider for this generation (L2).
     #[allow(dead_code)] // L2-2 builds it
     RequestFiles(u64),
@@ -127,6 +140,18 @@ struct Chip {
     prefix: Box<str>,
 }
 
+/// The alias prompt (plan L2-A2): the field holds the word (a row's target given) or "word target" (opened from
+/// Settings). While it is open no provider runs; its one row says what Enter saves, or why it cannot.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct AliasEdit {
+    target: Option<AliasTarget>,
+    /// The query as typed before the prompt, prefix included: `last_query` gives it while the prompt is open, so
+    /// keep_query and a refused launch's reopen never keep the prompt's text; Esc puts it back.
+    before: String,
+    /// Its chip, put back with it.
+    chip: Option<Chip>,
+}
+
 const VK_BACK: u16 = 0x08;
 const VK_TAB: u16 = 0x09;
 const VK_RETURN: u16 = 0x0D;
@@ -186,6 +211,10 @@ pub struct Session {
     review: Option<Review>,
     /// The action list over the selected row (Ctrl+K, L1b-2).
     actions: Option<ActionList>,
+    /// The alias prompt, while it is open.
+    alias_edit: Option<AliasEdit>,
+    /// The last key left the alias prompt by Esc: the next Esc closes.
+    esc_closes: bool,
 }
 
 /// One entry of the action list: a verb of the row, a notice's choice, or the notice's own "Don't show again".
@@ -194,6 +223,10 @@ pub enum Act {
     Verb(Verb),
     Choice(Choice),
     DontShowAgain,
+    /// "Assign alias…": the alias prompt for this row's target (plan L2-A2).
+    AssignAlias,
+    /// "Remove alias" on an alias row.
+    RemoveAlias,
 }
 
 /// An entry with what the view needs to draw it.
@@ -255,7 +288,81 @@ fn action_entries(item: &Item) -> Vec<ActEntry> {
     if item.kind == Kind::Notice && item.verbs.has(Verb::Open) {
         out.push(entry(Act::DontShowAgain));
     }
+    if alias_target_of(item).is_some() {
+        out.push(entry(Act::AssignAlias));
+    }
+    if item.from == ProviderId::Alias {
+        out.push(entry(Act::RemoveAlias));
+    }
     out
+}
+
+/// What "Assign alias…" saves for a row (plan L2-A2), as the alias table will read it back: a catalogue app, a folder, a
+/// file that is not a program, a typed run line and the typed-URL row. Never the web search row (its URL holds the typed
+/// query), an alias row, a window, a setting, a command or an answer.
+fn alias_target_of(item: &Item) -> Option<AliasTarget> {
+    match (&item.kind, &item.payload) {
+        _ if item.from == ProviderId::Alias => None,
+        (Kind::App, _) if item.from == ProviderId::Apps => app_id(item).map(|id| AliasTarget::App(id.into())),
+        (Kind::Folder, Payload::Path { path, .. }) => aliases::classify(path).ok(),
+        (Kind::File, Payload::Path { path, class, .. }) if *class != FileClass::Executable => {
+            aliases::classify(path).ok()
+        }
+        (Kind::RunLine, Payload::RunLine(r)) if item.from == ProviderId::Run => aliases::classify(&r.line).ok(),
+        (Kind::Web, Payload::Url(u)) if item.key == ItemKey::of(ProviderId::Web, "url") => aliases::classify(u).ok(),
+        _ => None,
+    }
+}
+
+/// The alias prompt's word and target for the field's text, or why they cannot be saved. `full`: the table holds 64
+/// aliases and `word` is none of them.
+fn prompt_check(edit: &AliasEdit, text: &str, cx: &Context) -> Result<(Box<str>, AliasTarget), AliasRefusal> {
+    let text = text.trim();
+    let (word, target) = match &edit.target {
+        Some(t) => (text, Ok(t.clone())),
+        None => match text.split_once(char::is_whitespace) {
+            Some((w, rest)) => (w, aliases::classify(rest)),
+            None => (text, Err(AliasRefusal::NoTarget)),
+        },
+    };
+    let folded = aliases::check_word(word, &cx.opts.prefixes)?;
+    let target = target?;
+    if cx.opts.aliases.len() >= MAX_ALIASES && cx.opts.aliases.find(&folded).is_none() {
+        return Err(AliasRefusal::Full);
+    }
+    Ok((word.into(), target))
+}
+
+/// The alias prompt's one row: "Save alias “gh”" with the target in short, or the reason it cannot, disabled.
+fn prompt_row(edit: &AliasEdit, text: &str, cx: &Context) -> Item {
+    let empty = text.trim().is_empty();
+    let checked = prompt_check(edit, text, cx);
+    let shown = match (&checked, &edit.target) {
+        (Ok((_, t)), _) | (Err(_), Some(t)) => Some(providers::alias_face(t, &cx.apps)),
+        (Err(_), None) => None,
+    };
+    let (detail, icon) = match shown {
+        Some((detail, icon, ..)) => (detail, icon),
+        None => (None, IconRef::Glyph(GlyphId::Info)),
+    };
+    let (title, verbs) = match &checked {
+        Ok((word, _)) => (strings::save_alias(word).into(), VerbSet::empty().with(Verb::Open)),
+        Err(_) if empty && edit.target.is_some() => (strings::alias_type_word().into(), VerbSet::empty()),
+        Err(_) if empty => (strings::alias_type_word_target().into(), VerbSet::empty()),
+        Err(why) => (strings::alias_refusal(*why).into(), VerbSet::empty()),
+    };
+    Item {
+        key: ItemKey::of(ProviderId::Alias, "prompt"),
+        from: ProviderId::Alias,
+        kind: Kind::Command,
+        title,
+        detail,
+        icon,
+        score: Score { tier: 0, learned: core::cmp::Reverse(0), idle: true, kind: 0, rank: 0, len: 0 },
+        verbs,
+        payload: Payload::None,
+        destructive: false,
+    }
 }
 
 fn mru_window(cx: &Context, group: &str) -> Option<isize> {
@@ -282,6 +389,19 @@ fn launch(req: LaunchReq) -> Vec<Effect> {
 
 fn copy_after_hide(text: &str) -> Vec<Effect> {
     vec![Effect::Hide { restore: true }, Effect::Copy(text.into())]
+}
+
+/// An alias row's launch (plan L2-A2): an app by the catalogue's id, an address, a page or a path through Explorer, a
+/// command line as the run mode runs it; each one of `launcher_sys::to_request`'s de-elevated requests.
+fn alias_launch(item: &Item) -> Vec<Effect> {
+    let req = match &item.payload {
+        Payload::AppId(id) => LaunchReq::App(id.clone()),
+        Payload::Url(u) => LaunchReq::Url(u.clone()),
+        Payload::Path { path, .. } => LaunchReq::OpenPath(path.clone()),
+        Payload::RunLine(r) => run_line(r),
+        _ => return Vec::new(),
+    };
+    vec![Effect::Hide { restore: false }, Effect::LaunchAlias(req)]
 }
 
 fn run_line(r: &RunLine) -> LaunchReq {
@@ -317,6 +437,8 @@ impl Session {
             hover: None,
             review: None,
             actions: None,
+            alias_edit: None,
+            esc_closes: false,
         }
     }
 
@@ -341,8 +463,18 @@ impl Session {
         &self.field
     }
 
+    /// The mode chip; "Alias" while the alias prompt is open.
     pub fn chip(&self) -> Option<ProviderId> {
+        if self.alias_edit.is_some() {
+            return Some(ProviderId::Alias);
+        }
         self.chip.as_ref().map(|c| c.id)
+    }
+
+    /// The alias prompt is open.
+    #[cfg(test)]
+    pub fn in_alias_prompt(&self) -> bool {
+        self.alias_edit.is_some()
     }
 
     /// The mode of the last query: mixed, or one provider's ("<" is the windows).
@@ -387,8 +519,12 @@ impl Session {
         Some(gesture::review_ok(text, lines))
     }
 
-    /// The query as typed, prefix included: what keep_query brings back at the next open.
+    /// The query as typed, prefix included: what keep_query brings back at the next open. While the alias prompt is open,
+    /// the query from before it: the prompt's text is never kept.
     pub fn last_query(&self) -> String {
+        if let Some(edit) = &self.alias_edit {
+            return edit.before.clone();
+        }
         let mut raw = String::from(self.chip.as_ref().map_or("", |c| &*c.prefix));
         raw.push_str(self.field.text());
         raw
@@ -494,6 +630,7 @@ impl Session {
 
     /// One key down (WM_KEYDOWN or WM_SYSKEYDOWN). `gesture` is the hook's proof of a person's Ctrl+Shift+Enter.
     pub fn key(&mut self, ev: KeyEvent, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        let esc_closes = self.esc_closes;
         self.keyed();
         let m = ev.mods;
         let plain = m == Mods::NONE;
@@ -517,6 +654,7 @@ impl Session {
                 vec![Effect::Hide { restore: false }, Effect::OpenSettings]
             }
             VK_X if m == Mods::CTRL => self.edit(Edit::Cut, cx),
+            VK_ESCAPE if plain && esc_closes => vec![Effect::Hide { restore: true }],
             VK_ESCAPE if plain => self.escape(cx),
             VK_RETURN if ev.repeat => Vec::new(),
             VK_RETURN => self.enter(m, gesture, cx),
@@ -555,6 +693,7 @@ impl Session {
     fn keyed(&mut self) {
         self.pointer_from = None;
         self.pointer_live = false;
+        self.esc_closes = false;
     }
 
     /// Notes which row (and generation) is under the pointer and since when.
@@ -635,7 +774,8 @@ impl Session {
 
     /// A prefix just typed at the start of the field becomes the mode chip (5.2.4).
     fn take_chip(&mut self, cx: &Context) {
-        if self.chip.is_some() {
+        // The alias prompt's field is a word and a target, never a mode.
+        if self.chip.is_some() || self.alias_edit.is_some() {
             return;
         }
         let text = self.field.text();
@@ -666,6 +806,14 @@ impl Session {
         self.gen += 1;
         self.picked = false;
         self.actions = None;
+        if let Some(edit) = &self.alias_edit {
+            // The prompt runs no provider and asks nothing of the rewrite or the files: its one row.
+            let row = prompt_row(edit, self.field.text(), cx);
+            self.results.only(row, self.gen);
+            self.mode = Mode::Mixed;
+            self.folded.clear();
+            return vec![Effect::Relayout];
+        }
         let raw = self.last_query();
         let q = query::parse_query(&raw, &cx.opts.prefixes, cx.num, self.gen);
         let top = providers::query_all(&q, cx, &mut self.budget);
@@ -683,6 +831,15 @@ impl Session {
 
     /// The Esc ladder: (the action list closes first, `action_key`), then the query and the chip, then the final Esc.
     fn escape(&mut self, cx: &Context) -> Vec<Effect> {
+        if let Some(edit) = self.alias_edit.take() {
+            // The prompt goes and the query comes back as it was; the next Esc closes.
+            let skip = edit.chip.as_ref().map_or(0, |c| c.prefix.len());
+            self.field.set_text(edit.before.get(skip..).unwrap_or(""));
+            self.chip = edit.chip;
+            let fx = self.requery(cx);
+            self.esc_closes = true;
+            return fx;
+        }
         if !self.field.is_empty() || self.chip.is_some() {
             self.field.clear();
             self.chip = None;
@@ -764,7 +921,7 @@ impl Session {
     /// Opens the action list over the selected row: Ctrl+K, Shift+F10 and the Menu key (`ring`: the focus ring shows),
     /// or a right click (`context_menu`). A row with nothing to offer, a replay and a list already open do nothing.
     fn open_actions(&mut self, ring: bool) -> Vec<Effect> {
-        if self.replaying || self.actions.is_some() {
+        if self.replaying || self.actions.is_some() || self.alias_edit.is_some() {
             return Vec::new();
         }
         let Some(item) = self.selected() else { return Vec::new() };
@@ -889,6 +1046,8 @@ impl Session {
                 self.results.remove(item.key);
                 vec![Effect::DismissNotice(item.key)]
             }
+            Act::AssignAlias => alias_target_of(&item).map_or_else(Vec::new, |t| self.enter_prompt(Some(t), cx)),
+            Act::RemoveAlias => self.remove_alias(&item),
         };
         // The panel gives the list's room back, unless the launcher closes anyway.
         if !fx.iter().any(|e| matches!(e, Effect::Hide { .. } | Effect::Relayout)) {
@@ -900,6 +1059,8 @@ impl Session {
     /// One verb on the selected row, by its menu entry rather than its chord.
     fn run_verb(&mut self, item: &Item, v: Verb, cx: &Context) -> Vec<Effect> {
         match v {
+            // An alias row opens its target as Enter does (`LaunchAlias`).
+            Verb::Open if item.from == ProviderId::Alias => self.primary(item, cx),
             // A new instance for an app (also a running one); every other row opens as Enter does.
             Verb::Open if item.kind == Kind::App => {
                 let fx = app_id(item).map_or_else(Vec::new, |id| launch(LaunchReq::App(id.into())));
@@ -919,10 +1080,22 @@ impl Session {
 
     /// Enter and its modifiers on the selected row (table 5.2.8).
     fn enter(&mut self, m: Mods, gesture: Option<Gesture>, cx: &Context) -> Vec<Effect> {
+        if self.alias_edit.is_some() {
+            // The prompt's row saves on a plain Enter, never on a replayed one.
+            return if m == Mods::NONE && !self.replaying { self.prompt_enter(cx) } else { Vec::new() };
+        }
         let Some(item) = self.selected().cloned() else { return Vec::new() };
         if self.replaying && (item.destructive || item.kind == Kind::Notice) {
             // Typed blind before the launcher showed: it stays selected for a real Enter (a notice's choice included).
             return Vec::new();
+        }
+        if item.from == ProviderId::Alias {
+            // An alias opens or shows its target; it never runs as administrator, in a console or as a new instance.
+            return match m {
+                Mods::NONE => self.primary(&item, cx),
+                Mods::CTRL => self.reveal(cx),
+                _ => Vec::new(),
+            };
         }
         match m {
             Mods::NONE => self.primary(&item, cx),
@@ -953,6 +1126,10 @@ impl Session {
     }
 
     fn primary(&mut self, item: &Item, cx: &Context) -> Vec<Effect> {
+        if self.alias_edit.is_some() {
+            // A click on the prompt's row.
+            return self.prompt_enter(cx);
+        }
         let fx = self.primary_effects(item, cx);
         self.note_pick(item, fx)
     }
@@ -961,6 +1138,9 @@ impl Session {
         let running = matches!(item.payload, Payload::Group(_) | Payload::Hwnd(_));
         if !item.verbs.has(verbs::primary(item.kind, running)) {
             return Vec::new();
+        }
+        if item.from == ProviderId::Alias {
+            return alias_launch(item);
         }
         match &item.payload {
             Payload::AppId(id) => launch(LaunchReq::App(id.clone())),
@@ -1100,6 +1280,51 @@ impl Session {
         self.results.remove(key);
         self.picked = false;
         vec![Effect::CloseWindow(h), Effect::Relayout]
+    }
+
+    // ---------------------------------------------------------------- aliases (plan L2-A2)
+
+    /// Opens the alias prompt over the current query (a row's "Assign alias…"; `target` None: opened from Settings,
+    /// the field takes "word target"). Never from a replayed type-ahead.
+    fn enter_prompt(&mut self, target: Option<AliasTarget>, cx: &Context) -> Vec<Effect> {
+        if self.replaying {
+            return Vec::new();
+        }
+        match self.alias_edit.as_mut() {
+            Some(edit) => edit.target = target,
+            None => {
+                let before = self.last_query();
+                let chip = self.chip.take();
+                self.alias_edit = Some(AliasEdit { target, before, chip });
+            }
+        }
+        self.field.clear();
+        self.requery(cx)
+    }
+
+    /// The alias prompt in its "word target" form: Settings > Launcher's "Add…" (`popup_launcher::open_alias_prompt`).
+    pub fn alias_prompt(&mut self, cx: &Context) -> Vec<Effect> {
+        self.enter_prompt(None, cx)
+    }
+
+    /// Enter on the prompt's row: the alias is saved by the host, the prompt goes and its word is the query, which the
+    /// host runs again once the new table is loaded (the new alias row).
+    fn prompt_enter(&mut self, cx: &Context) -> Vec<Effect> {
+        let Some(edit) = self.alias_edit.as_ref() else { return Vec::new() };
+        let Ok((word, target)) = prompt_check(edit, self.field.text(), cx) else { return Vec::new() };
+        self.alias_edit = None;
+        self.chip = None;
+        self.field.set_text(&word);
+        let mut fx = vec![Effect::SaveAlias { word, target: target.to_config().into() }];
+        // Its rows last until the host's requery with the new table: no typo rewrite is worth asking for them.
+        fx.extend(self.requery(cx).into_iter().filter(|e| !matches!(e, Effect::RequestRewrite { .. })));
+        fx
+    }
+
+    /// "Remove alias": the row goes now, the host takes the word out of config.json.
+    fn remove_alias(&mut self, item: &Item) -> Vec<Effect> {
+        self.results.remove(item.key);
+        vec![Effect::RemoveAlias(item.title.clone()), Effect::Relayout]
     }
 
     /// Shift+Delete: a history line is forgotten and leaves the list; an app's learned rank is forgotten (L1b).
@@ -1887,7 +2112,8 @@ mod tests {
                 V(Verb::Reveal),
                 V(Verb::Copy),
                 V(Verb::CloseWindow),
-                V(Verb::Forget)
+                V(Verb::Forget),
+                Act::AssignAlias
             ]
         );
         let l = s.action_list().unwrap();
@@ -1904,7 +2130,7 @@ mod tests {
         assert_eq!(s.action_list().map(ActionList::sel), Some(2));
         assert_eq!(press(&mut s, &fx, VK_END, Mods::NONE), [Effect::Redraw]);
         assert!(press(&mut s, &fx, VK_DOWN, Mods::NONE).is_empty());
-        assert_eq!(s.action_list().map(ActionList::sel), Some(6));
+        assert_eq!(s.action_list().map(ActionList::sel), Some(7));
         press(&mut s, &fx, VK_HOME, Mods::NONE);
         assert!(press(&mut s, &fx, VK_UP, Mods::NONE).is_empty());
         assert_eq!(s.action_list().map(ActionList::sel), Some(0));
@@ -2205,5 +2431,319 @@ mod tests {
         let out = s.replay(&[ReplayKey::Key(k(VK_RETURN, Mods::NONE))], &fx.cx());
         assert!(!out.iter().any(|e| matches!(e, Effect::Choose(_))), "{out:?}");
         assert_eq!(sel_title(&s), Some("A notice"), "it stays for a real Enter");
+    }
+    // ---------------------------------------------------------------- aliases (plan L2-A2)
+
+    /// The fixture with aliases (invented words).
+    fn with_aliases(pairs: &[(&str, &str)]) -> Fx {
+        let mut fx = Fx::new();
+        let map = pairs.iter().map(|(w, t)| (w.to_string(), t.to_string())).collect();
+        fx.opts.aliases = aliases::AliasTable::build(&map, &fx.opts.prefixes).0;
+        fx
+    }
+
+    fn alias_fx() -> Fx {
+        with_aliases(&[
+            ("gh", "https://example.com/gh"),
+            ("Steam", "C:\\Windows"),
+            ("np", "app:microsoft.windowsnotepad_8wekyb3d8bbwe!app"),
+            ("gone", "app:Example.Missing_0000000000000!App"),
+            ("ip", "ipconfig /all"),
+            ("pad", "notepad.exe"),
+            ("disp", "ms-settings:display"),
+        ])
+    }
+
+    #[test]
+    fn exact_alias_first_and_selected() {
+        let fx = alias_fx();
+        let s = typed(&fx, "gh");
+        let first = &s.rows()[0];
+        assert_eq!((first.from, &*first.title, first.kind), (ProviderId::Alias, "gh", Kind::Web));
+        assert_eq!(first.detail.as_deref(), Some("example.com"));
+        assert_eq!(s.selected_index(), Some(0));
+        // After a notice, before everything else.
+        let mut s = open(&fx);
+        let notice = Item { kind: Kind::Notice, verbs: VerbSet::empty(), ..first.clone() };
+        let notice = Item { key: ItemKey::of(ProviderId::Apps, "n"), from: ProviderId::Apps, ..notice };
+        s.set_notices(vec![notice]);
+        s.chars("gh", &fx.cx());
+        assert_eq!((s.rows()[0].kind, s.rows()[1].from), (Kind::Notice, ProviderId::Alias));
+        assert_eq!(s.selected_index(), Some(1));
+    }
+
+    #[test]
+    fn alias_needs_the_whole_word() {
+        let fx = alias_fx();
+        assert!(typed(&fx, "g").rows().iter().all(|r| r.from != ProviderId::Alias));
+        assert!(typed(&fx, "ghx").rows().iter().all(|r| r.from != ProviderId::Alias));
+        let s = typed(&fx, "GH ");
+        assert_eq!((s.rows()[0].from, sel_title(&s)), (ProviderId::Alias, Some("gh")));
+    }
+
+    #[test]
+    fn alias_above_an_exact_app_name() {
+        let fx = alias_fx();
+        let s = typed(&fx, "steam");
+        let titles: Vec<(&str, ProviderId)> = s.rows().iter().take(2).map(|r| (&*r.title, r.from)).collect();
+        assert_eq!(titles, [("Steam", ProviderId::Alias), ("Steam", ProviderId::Apps)]);
+        assert_eq!(s.selected_index(), Some(0));
+        assert_eq!(s.rows()[0].kind, Kind::Folder);
+    }
+
+    #[test]
+    fn alias_only_in_mixed() {
+        let fx = alias_fx();
+        for raw in ["> gh", "?? gh", "= gh", "$gh"] {
+            assert!(typed(&fx, raw).rows().iter().all(|r| r.from != ProviderId::Alias), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn alias_lookup_runs_with_every_provider_off() {
+        use crate::launcher::model::ProviderMask;
+        let mut fx = alias_fx();
+        let mut mask = ProviderMask::all();
+        for p in super::providers::ORDER {
+            mask = mask.with(p, false);
+        }
+        fx.opts.mask = mask;
+        let s = typed(&fx, "gh");
+        assert_eq!(s.rows().iter().filter(|r| r.from == ProviderId::Alias).count(), 1);
+        assert_eq!(sel_title(&s), Some("gh"));
+    }
+
+    #[test]
+    fn missing_app_alias_is_inert() {
+        let fx = alias_fx();
+        let mut s = typed(&fx, "gone");
+        let row = s.rows()[0].clone();
+        assert_eq!((row.from, row.icon.clone()), (ProviderId::Alias, IconRef::Glyph(GlyphId::Info)));
+        assert_eq!(row.detail.as_deref(), Some(strings::app_not_found()));
+        assert!(row.verbs.is_empty() && row.payload == Payload::None);
+        assert_ne!(s.selected_index(), Some(0), "no verb: never the default");
+        s.results.select_index(0);
+        for m in [Mods::NONE, Mods::CTRL, Mods::SHIFT, CTRL_SHIFT] {
+            assert!(press(&mut s, &fx, VK_RETURN, m).is_empty(), "{m:?}");
+        }
+        // Its action list only removes it.
+        open_list(&mut s, &fx);
+        assert_eq!(acts(&s), [Act::RemoveAlias]);
+    }
+
+    /// The launch of the alias typed as `text`, by Enter.
+    fn alias_launch_of(fx: &Fx, text: &str) -> LaunchReq {
+        let mut s = typed(fx, text);
+        let fx_ = press(&mut s, fx, VK_RETURN, Mods::NONE);
+        match fx_.as_slice() {
+            [Effect::Hide { restore: false }, Effect::LaunchAlias(r)] => r.clone(),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_launches_by_target() {
+        let fx = alias_fx();
+        assert_eq!(alias_launch_of(&fx, "gh"), LaunchReq::Url("https://example.com/gh".into()));
+        assert_eq!(alias_launch_of(&fx, "steam"), LaunchReq::OpenPath("C:\\Windows".into()));
+        assert_eq!(alias_launch_of(&fx, "disp"), LaunchReq::OpenPath("ms-settings:display".into()));
+        // The catalogue's own id string, not the config's spelling.
+        assert_eq!(alias_launch_of(&fx, "np"), LaunchReq::App(NOTEPAD_ID.into()));
+        let LaunchReq::Command(r) = alias_launch_of(&fx, "pad") else { panic!() };
+        assert_eq!(&*r.line, "notepad.exe");
+        for t in ["gh", "steam", "disp", "np", "pad", "ip"] {
+            assert!(!alias_launch_of(&fx, t).elevates(), "{t}");
+        }
+    }
+
+    #[test]
+    fn alias_command_follows_run_line() {
+        let fx = alias_fx();
+        let LaunchReq::Console(r) = alias_launch_of(&fx, "ip") else { panic!("a console program runs in a console") };
+        assert_eq!(&*r.line, "ipconfig /all");
+    }
+
+    #[test]
+    fn alias_rows_never_run_as_admin() {
+        let fx = alias_fx();
+        for t in ["gh", "steam", "np", "pad", "ip", "disp"] {
+            let mut s = typed(&fx, t);
+            let key = s.selected().unwrap().key;
+            s.set_review_lines(key, 1);
+            let ev = k(VK_RETURN, CTRL_SHIFT);
+            assert!(s.key(ev, Some(Gesture::for_test(9)), &fx.cx()).is_empty(), "{t}");
+            assert!(!s.selected().unwrap().verbs.has(Verb::RunAsAdmin), "{t}");
+            // Shift+Enter neither: no console, no new instance.
+            assert!(press(&mut s, &fx, VK_RETURN, Mods::SHIFT).is_empty(), "{t}");
+        }
+    }
+
+    #[test]
+    fn alias_rows_never_learned() {
+        let fx = alias_fx();
+        for t in ["np", "gh", "pad"] {
+            let mut s = typed(&fx, t);
+            assert!(!press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty());
+            assert_eq!(s.take_learn(), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn assign_alias_from_an_app_row_saves_the_app_id() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "calcolatrice");
+        assert_eq!(sel_title(&s), Some("Calcolatrice"));
+        open_list(&mut s, &fx);
+        assert_eq!(acts(&s).last(), Some(&Act::AssignAlias));
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert!(s.in_alias_prompt() && s.query_text().is_empty());
+        assert_eq!(s.chip(), Some(ProviderId::Alias));
+        assert_eq!(s.rows().len(), 1);
+        assert_eq!(s.rows()[0].title.as_ref(), strings::alias_type_word());
+        s.chars("calc2", &fx.cx());
+        assert_eq!(s.rows()[0].title.as_ref(), "Save alias “calc2”");
+        assert_eq!(s.rows()[0].detail.as_deref(), Some("Calcolatrice"));
+        let out = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        let save = Effect::SaveAlias { word: "calc2".into(), target: format!("app:{CALC_ID}").into() };
+        assert_eq!(out.first(), Some(&save));
+        assert!(!s.in_alias_prompt() && s.query_text() == "calc2" && s.chip().is_none());
+    }
+
+    #[test]
+    fn assign_alias_only_on_the_typed_url_row() {
+        let fx = Fx::new();
+        let entries = |raw: &str, key: ItemKey| {
+            let mut s = typed(&fx, raw);
+            let i = s.rows().iter().position(|r| r.key == key).unwrap();
+            s.results.select_index(i);
+            open_list(&mut s, &fx);
+            acts(&s)
+        };
+        let url = ItemKey::of(ProviderId::Web, "url");
+        assert!(entries("https://example.com/a", url).contains(&Act::AssignAlias));
+        assert!(!entries("https://example.com/a", providers::web_search_key()).contains(&Act::AssignAlias));
+        assert!(!entries("how to cook", providers::web_search_key()).contains(&Act::AssignAlias));
+        // A folder, a document, a run line: offered; a program's path, a setting, a window: not.
+        assert!(entries("C:\\Windows", ItemKey::of(ProviderId::Run, "C:\\Windows")).contains(&Act::AssignAlias));
+        assert!(entries("C:\\x\\a.txt", ItemKey::of(ProviderId::Run, "C:\\x\\a.txt")).contains(&Act::AssignAlias));
+        assert!(entries("ping 1.1.1.1", ItemKey::of(ProviderId::Run, "ping 1.1.1.1")).contains(&Act::AssignAlias));
+        assert!(!entries("C:\\x\\a.exe", ItemKey::of(ProviderId::Run, "C:\\x\\a.exe")).contains(&Act::AssignAlias));
+        assert!(!entries("schermo", ItemKey::of(ProviderId::Settings, "Schermo")).contains(&Act::AssignAlias));
+        assert!(!entries("< foo", ItemKey::of(ProviderId::Windows, "hwnd:2002")).contains(&Act::AssignAlias));
+        // An alias row offers its removal instead.
+        let fx = alias_fx();
+        let mut s = typed(&fx, "gh");
+        open_list(&mut s, &fx);
+        assert!(acts(&s).contains(&Act::RemoveAlias) && !acts(&s).contains(&Act::AssignAlias));
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        let out = press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert_eq!(out.first(), Some(&Effect::RemoveAlias("gh".into())));
+        assert!(s.rows().iter().all(|r| r.from != ProviderId::Alias), "the row goes at once");
+    }
+
+    #[test]
+    fn prompt_refuses_with_a_reason() {
+        let fx = alias_fx();
+        let mut s = open(&fx);
+        s.alias_prompt(&fx.cx());
+        assert_eq!(s.rows()[0].title.as_ref(), strings::alias_type_word_target());
+        for (text, why) in [
+            ("gh", AliasRefusal::NoTarget),
+            ("bad! https://example.com/", AliasRefusal::Word),
+            ("file C:\\Windows", AliasRefusal::Prefix),
+            ("x javascript:alert(1)", AliasRefusal::Scheme),
+            ("x http://user@example.com/", AliasRefusal::Address),
+        ] {
+            s.field.clear();
+            s.chars(text, &fx.cx());
+            let row = &s.rows()[0];
+            assert_eq!(row.title.as_ref(), strings::alias_refusal(why), "{text:?}");
+            assert!(row.verbs.is_empty() && s.selected().is_none(), "{text:?}: disabled");
+            assert!(press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty(), "{text:?}");
+        }
+        // A full table takes no new word, but a word it holds may be saved again.
+        let many: Vec<(String, String)> = (0..64).map(|i| (format!("w{i:02}"), "calc".to_string())).collect();
+        let pairs: Vec<(&str, &str)> = many.iter().map(|(w, t)| (w.as_str(), t.as_str())).collect();
+        let fx = with_aliases(&pairs);
+        let mut s = open(&fx);
+        s.alias_prompt(&fx.cx());
+        s.chars("new calc", &fx.cx());
+        assert_eq!(s.rows()[0].title.as_ref(), strings::alias_refusal(AliasRefusal::Full));
+        s.field.clear();
+        s.chars("w01 notepad", &fx.cx());
+        assert_eq!(s.rows()[0].title.as_ref(), "Save alias “w01”");
+    }
+
+    #[test]
+    fn prompt_sends_nothing_to_files_or_rewrite() {
+        let fx = alias_fx();
+        let mut s = open(&fx);
+        let mut out = s.alias_prompt(&fx.cx());
+        for c in "gh https://example.com/".chars() {
+            let mut b = [0u8; 4];
+            out.extend(s.chars(c.encode_utf8(&mut b), &fx.cx()));
+        }
+        assert!(out.iter().all(|e| *e == Effect::Relayout), "{out:?}");
+        assert_eq!(s.rows().len(), 1, "no provider row");
+        assert_eq!(s.rows()[0].title.as_ref(), "Save alias “gh”");
+        assert_eq!(s.rows()[0].detail.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn prompt_text_is_never_kept() {
+        let mut fx = alias_fx();
+        fx.opts.keep_query = true;
+        let mut s = typed(&fx, "=2+2");
+        assert_eq!(s.last_query(), "=2+2");
+        s.alias_prompt(&fx.cx());
+        s.chars("secret https://example.com/", &fx.cx());
+        assert_eq!(s.last_query(), "=2+2", "the query from before the prompt");
+        // Esc puts it back, its chip included.
+        press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
+        assert_eq!((s.chip(), s.query_text(), s.last_query().as_str()), (Some(ProviderId::Calc), "2+2", "=2+2"));
+    }
+
+    #[test]
+    fn esc_leaves_the_prompt_then_closes() {
+        let fx = alias_fx();
+        // Opened from Settings: Esc leaves the prompt, the next Esc closes and gives the foreground back.
+        let mut s = open(&fx);
+        s.alias_prompt(&fx.cx());
+        s.chars("gh", &fx.cx());
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout]);
+        assert!(!s.in_alias_prompt() && s.query_text().is_empty());
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Hide { restore: true }]);
+        // From a row: the query comes back, and the next Esc closes too.
+        let mut s = typed(&fx, "calcolatrice");
+        open_list(&mut s, &fx);
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        press(&mut s, &fx, VK_RETURN, Mods::NONE);
+        assert!(s.in_alias_prompt());
+        press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
+        assert_eq!((s.query_text(), sel_title(&s)), ("calcolatrice", Some("Calcolatrice")));
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Hide { restore: true }]);
+        // Any other key in between: Esc is the ladder again.
+        let mut s = typed(&fx, "calcolatrice");
+        s.alias_prompt(&fx.cx());
+        press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
+        press(&mut s, &fx, VK_END, Mods::NONE);
+        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout], "the query is cleared first");
+    }
+
+    #[test]
+    fn a_replay_never_enters_the_prompt() {
+        let fx = Fx::new();
+        let mut s = open(&fx);
+        let keys: Vec<ReplayKey> = "calcolatrice"
+            .chars()
+            .map(ReplayKey::Text)
+            .chain([k(0x4B, Mods::CTRL), k(VK_END, Mods::NONE), k(VK_RETURN, Mods::NONE)].map(ReplayKey::Key))
+            .collect();
+        let out = s.replay(&keys, &fx.cx());
+        assert!(!s.in_alias_prompt(), "{out:?}");
+        assert!(s.action_list().is_none());
+        s.replaying = true;
+        assert!(s.enter_prompt(None, &fx.cx()).is_empty() && !s.in_alias_prompt());
     }
 }

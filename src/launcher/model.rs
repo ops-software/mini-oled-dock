@@ -25,7 +25,13 @@ pub enum ProviderId {
     Web,
     Files,
     Registry,
+    /// A word the user set (plan L2 D9): no mask bit and not in `providers::ORDER`, so it cannot be switched off; the
+    /// lookup runs in Mixed mode only.
+    Alias,
 }
+
+/// The number of providers: the size of the arrays indexed by `ProviderId` (the budget counters).
+pub const PROVIDER_COUNT: usize = ProviderId::Alias as usize + 1;
 
 impl ProviderId {
     /// The names a config file may use (5.6). Units answers under `calc`.
@@ -58,6 +64,7 @@ impl ProviderId {
             ProviderId::Web => "web",
             ProviderId::Files => "files",
             ProviderId::Registry => "registry",
+            ProviderId::Alias => "alias",
         }
     }
 }
@@ -538,6 +545,15 @@ mod tests {
         assert_eq!(ProviderId::from_name("units"), None);
         assert_eq!(ProviderId::from_name("Apps"), None);
         assert_eq!(ProviderId::Units.name(), "calc");
+    }
+
+    #[test]
+    fn alias_has_no_mask_bit_and_no_name() {
+        assert_eq!(ProviderMask::all(), ProviderMask(0x7FF), "bits 0-10, Registry the last");
+        assert!(!ProviderMask::all().has(ProviderId::Alias));
+        assert_eq!(ProviderId::from_name("alias"), None, "a config cannot switch it off");
+        assert_eq!(PROVIDER_COUNT, 12);
+        assert_ne!(ItemKey::of(ProviderId::Alias, "gh"), ItemKey::of(ProviderId::Web, "gh"));
     }
 
     #[test]
