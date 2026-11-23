@@ -7,7 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, WM_KEYDOWN, WM_SYSKEYDOWN,
+    GetForegroundWindow, GetMessageTime, GetWindowThreadProcessId, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 use crate::log;
@@ -242,15 +242,55 @@ pub fn won_foreground(hwnd: HWND) {
 
 /// The entry of a `WM_KEYDOWN` or `WM_CHAR` handling: its start and its wait in the queue, while a launcher is open.
 /// The wait is read in microseconds from two QueryPerformanceCounter stamps (the tick clock moves in 15.6 ms steps, which
-/// cannot judge KEY-1's 4 ms): the keyboard hook's (`key_seen`) and this one.
+/// cannot judge KEY-1's 4 ms): the keyboard hook's stamp of this message's own key (`key_seen`), found by the message's
+/// time however many keys wait behind it, and this one. No key-down of that time in the ring: no sample.
 pub fn work_start() -> Option<(Instant, u32)> {
     with_open(|_| ())?;
-    let queued = queue_us(qpc(), LAST_KEY.load(Relaxed), qpc_freq());
+    // SAFETY: no preconditions; the time of the message being handled, on the clock of the hook's `kb.time`.
+    let time = unsafe { GetMessageTime() } as u32;
+    let queued = queue_us(qpc(), KEYS.stamp_of(time), qpc_freq());
     Some((Instant::now(), queued))
 }
 
-/// The newest key-down the keyboard hook saw, in QueryPerformanceCounter ticks (0 = none).
-static LAST_KEY: AtomicI64 = AtomicI64::new(0);
+/// The key-downs `KeyStamps` keeps: the keys the UI may still have queued behind a stall.
+const KEY_SLOTS: usize = 32;
+
+/// The keyboard hook's last key-downs, each slot `kb.time << 32 | the counter's low 32 bits` (0 = empty). The handling of
+/// a key message finds its own key by the message's time (S-GESTURE: the `GetMessageTime` of a key message, and of the
+/// WM_CHAR its WM_KEYDOWN posted, equals the hook's `kb.time`). One atomic per slot, so a slot is always read whole: never
+/// one key's time with another key's stamp. Written by the hook thread only, read by the UI thread: no lock, no
+/// allocation, no wait.
+struct KeyStamps {
+    slots: [AtomicU64; KEY_SLOTS],
+    /// The key-downs recorded (wrapping): the next one goes in slot `next % KEY_SLOTS`.
+    next: AtomicU32,
+}
+
+impl KeyStamps {
+    const fn new() -> KeyStamps {
+        KeyStamps { slots: [const { AtomicU64::new(0) }; KEY_SLOTS], next: AtomicU32::new(0) }
+    }
+
+    /// The hook saw the key-down of `time` at counter `stamp`.
+    fn record(&self, time: u32, stamp: i64) {
+        let n = self.next.fetch_add(1, Relaxed);
+        if let Some(slot) = self.slots.get(n as usize % KEY_SLOTS) {
+            slot.store((u64::from(time) << 32) | u64::from(stamp as u32), Release);
+        }
+    }
+
+    /// The counter's low 32 bits at the newest key-down of `time`; None when no slot holds one.
+    fn stamp_of(&self, time: u32) -> Option<u32> {
+        let n = self.next.load(Relaxed);
+        (1..=KEY_SLOTS as u32)
+            .filter_map(|back| self.slots.get(n.wrapping_sub(back) as usize % KEY_SLOTS))
+            .map(|slot| slot.load(Acquire))
+            .find(|&v| v != 0 && (v >> 32) as u32 == time)
+            .map(|v| v as u32)
+    }
+}
+
+static KEYS: KeyStamps = KeyStamps::new();
 
 fn qpc() -> i64 {
     let mut t = 0i64;
@@ -270,12 +310,11 @@ fn qpc_freq() -> i64 {
     })
 }
 
-/// The wait in microseconds between the key stamp and `now` (0 when no key was stamped yet, 0 for a bad frequency).
-fn queue_us(now: i64, stamp: i64, freq: i64) -> u32 {
-    if stamp <= 0 {
-        return 0;
-    }
-    ticks_to_us(now.wrapping_sub(stamp), freq)
+/// The wait in microseconds from the key's stamp (the counter's low 32 bits) to `now` (0 when no stamp matched, 0 for a
+/// bad frequency). The low bits wrap after 2^32 ticks: over 5 minutes at the 10 MHz counter of Windows 11.
+fn queue_us(now: i64, stamp: Option<u32>, freq: i64) -> u32 {
+    let Some(stamp) = stamp else { return 0 };
+    ticks_to_us(i64::from((now as u32).wrapping_sub(stamp)), freq)
 }
 
 /// `ticks` of the counter in microseconds (0 for a bad frequency or a negative count).
@@ -286,10 +325,10 @@ fn ticks_to_us(ticks: i64, freq: i64) -> u32 {
     u32::try_from(i128::from(ticks) * 1_000_000 / i128::from(freq)).unwrap_or(u32::MAX)
 }
 
-/// The keyboard hook sees event `msg`: a key-down gives the first stamp of the queue measure.
-pub fn key_seen(msg: u32) {
+/// The keyboard hook sees event `msg` of `time` (`kb.time`): a key-down gives the first stamp of the queue measure.
+pub fn key_seen(msg: u32, time: u32) {
     if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-        LAST_KEY.store(qpc(), Relaxed);
+        KEYS.record(time, qpc());
     }
 }
 
@@ -301,7 +340,7 @@ pub fn work_end(start: Option<(Instant, u32)>) {
         p.keys += 1;
         p.work.push(us);
         if queued > 0 {
-            p.queue.push(queued); // 0 = no stamp (the hook has not seen a key yet): no sample
+            p.queue.push(queued); // 0 = no stamp of this key (none matched its message time): no sample
         }
     });
 }
@@ -567,9 +606,28 @@ mod tests {
 
     #[test]
     fn an_unset_key_stamp_gives_no_wait() {
-        assert_eq!(queue_us(9_000_000_000, 0, 10_000_000), 0, "never the whole uptime");
-        assert_eq!(queue_us(1_002_500, 1_000_000, 10_000_000), 250);
-        assert_eq!(queue_us(5, 0, 10_000_000), 0);
+        assert_eq!(queue_us(9_000_000_000, None, 10_000_000), 0, "never the whole uptime");
+        assert_eq!(queue_us(1_002_500, Some(1_000_000), 10_000_000), 250);
+        assert_eq!(queue_us(0x1_0000_0100, Some(0xFFFF_FF00), 10_000_000), 51, "the low 32 bits wrap");
+        assert_eq!(KeyStamps::new().stamp_of(0), None, "an empty slot is no key of time 0");
+    }
+
+    #[test]
+    fn a_key_message_reads_its_own_key_stamp() {
+        let keys = KeyStamps::new();
+        keys.record(1_000, 10_000_000); // the first key, at 1 s on a 10 MHz counter
+        keys.record(1_060, 10_600_000); // the next one, 60 ms later, while the first still waits
+        assert_eq!(keys.stamp_of(1_000), Some(10_000_000), "the first key's message reads its own stamp");
+        assert_eq!(queue_us(11_210_000, keys.stamp_of(1_000), 10_000_000), 121_000, "the whole 121 ms wait");
+        assert_eq!(queue_us(11_210_000, keys.stamp_of(1_060), 10_000_000), 61_000);
+        assert_eq!(keys.stamp_of(2_000), None, "a time no key-down had: no sample");
+        keys.record(1_060, 10_700_000);
+        assert_eq!(keys.stamp_of(1_060), Some(10_700_000), "the newest key-down of that time");
+        for k in 0..KEY_SLOTS as u32 {
+            keys.record(5_000 + k, 20_000_000 + i64::from(k));
+        }
+        assert_eq!(keys.stamp_of(1_000), None, "overwritten: no sample rather than another key's stamp");
+        assert_eq!(keys.stamp_of(5_000), Some(20_000_000), "the oldest key still kept");
     }
 
     #[test]
