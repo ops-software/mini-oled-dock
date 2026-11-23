@@ -1538,6 +1538,7 @@ unsafe extern "system" fn on_folder_change(_context: *mut core::ffi::c_void, _ti
     use windows::Win32::Storage::FileSystem::FindNextChangeNotification;
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+    probe!(crate::probe::bump(crate::probe::C::ConfigWatch));
     let change = WATCH_CHANGE.load(SeqCst);
     let ui = HWND(WATCH_UI.load(SeqCst) as *mut core::ffi::c_void);
     if change == 0 || ui.0.is_null() {

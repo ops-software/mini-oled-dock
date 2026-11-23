@@ -26,8 +26,8 @@
 //!    messages each one posts to the UI.
 //!  * hook, shell and tray-host threads: every `GetMessageW` return by message; shell and tray host also get the
 //!    sent-message hook; the tray host's `WM_COPYDATA` calls by kind (NIM op, AppBar, icon rect) and sender
-//!    image name. tray-fwd, notif, notif-icons, log, stop-watch, audio callbacks, transient workers: counted where
-//!    they wait.
+//!    image name. tray-fwd, notif, notif-icons, log, stop-watch, audio callbacks, the config watch callback,
+//!    transient workers: counted where they wait.
 //!  * A `wake-probe` thread waits 30 s on an event, then reads every thread of the process from the system
 //!    (`NtQuerySystemInformation(SystemProcessInformation)`: context switches, CPU, state) and appends one
 //!    compact JSON line to `wakeprobe.jsonl` next to dock.log (rotated to `wakeprobe.1.jsonl` at 16 MiB), with
@@ -38,7 +38,8 @@
 //! once; per counted event 1-3 uncontended atomic adds; per WinEvent and tray call a `GetWindowThreadProcessId`
 //! (the owner's image name is resolved with OpenProcess/QueryFullProcessImageNameW once per pid per 30 s); per UI
 //! wake one more `PeekMessageW` (the final empty one) and a few `Instant::now` reads; one `WH_CALLWNDPROC` call
-//! per message sent to the UI, shell or tray-host thread. None of it posts a message or arms a timer.
+//! per message sent to the UI, shell or tray-host thread; one config watch callback per JSON line (wakeprobe.jsonl
+//! sits in the data folder the watch observes). None of it posts a message or arms a timer.
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
@@ -132,6 +133,7 @@ counters! {
     Spawned = "transient_threads_started",
     ImportPolls = "start_import.poll_wakes",
     OwnerExited = "launcher.owner_exited_waits",
+    ConfigWatch = "config.watch_callbacks",
     Reports = "probe.reports",
 }
 
