@@ -1672,6 +1672,58 @@ fn scan_tree(lint: fn(&str, &str) -> Vec<String>) -> Vec<String> {
     out
 }
 
+// ---- lint: dock.log carries no tooltip or window title (wsD D4) ----------------------------------------------------
+
+/// A `log!` call that names a tooltip (`.tip`), reads a window title (`window_title(`) or passes an argument called
+/// `title` writes personal text to a file every local account can read. Reported as "path:line".
+fn log_title_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path == "src/launcher/lints.rs" || path == "src/launcher/testkit.rs" {
+        return v;
+    }
+    for (at, call) in log_calls(text) {
+        // The arguments start after the format literal (its end is the first unescaped quote after the opening one).
+        let args = call
+            .find('"')
+            .and_then(|o| {
+                let mut esc = false;
+                call.get(o + 1..).and_then(|r| {
+                    r.char_indices().find_map(|(k, c)| {
+                        let hit = !esc && c == '"';
+                        esc = !esc && c == '\\';
+                        hit.then_some(o + 1 + k + 1)
+                    })
+                })
+            })
+            .and_then(|e| call.get(e..))
+            .unwrap_or("");
+        let title_arg = args.match_indices("title").any(|(i, _)| {
+            let before = args.get(..i).and_then(|t| t.chars().next_back());
+            let after = args.get(i + 5..).and_then(|t| t.chars().next());
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        });
+        if call.contains(".tip") || call.contains("window_title(") || title_arg || call.contains("{title") {
+            v.push(format!("{path}:{}: a log line carries a tooltip or a window title", line_of(text, at)));
+        }
+    }
+    v
+}
+
+#[test]
+fn logs_carry_no_tooltip_or_window_title() {
+    assert!(log_title_violations("src/a.rs", r#"log!("tray: NIM_ADD exe={} ret={}", exe, ret);"#).is_empty());
+    assert!(log_title_violations("src/a.rs", r#"log!("class \"{}\"", window_class(h));"#).is_empty());
+    assert!(log_title_violations("src/a.rs", r#"log!("a title word", n);"#).is_empty());
+    assert_eq!(log_title_violations("src/a.rs", r#"log!("x tip=\"{}\"", utf16_until_nul(&nid.tip));"#).len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", r#"log!("w \"{}\"", window_title(h));"#).len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", "log!(\"fg={}\", title);").len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", "log!(\"fg={}\",\n    title\n);").len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", r#"log!("fg={title}");"#).len(), 1);
+    assert!(log_title_violations("src/launcher/testkit.rs", r#"log!("{}", window_title(h));"#).is_empty());
+    let found = scan_tree(log_title_violations);
+    assert!(found.is_empty(), "tooltips or window titles in dock.log: {found:?}");
+}
+
 #[test]
 fn tree_walk_finds_the_sources() {
     let mut files = Vec::new();

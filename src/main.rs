@@ -123,7 +123,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
     KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
     UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MSGFLT_ALLOW, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
     WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -531,12 +531,9 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             }
             let w = wp.0;
             let fg = HWND(lp.0 as *mut c_void);
-            let mut buf = [0u16; 64];
-            // SAFETY: `buf` is writable; InternalGetWindowText does not send messages to the window.
-            let n = unsafe { InternalGetWindowText(fg, &mut buf) }.max(0) as usize;
-            let title = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+            let class = crate::ui::window_class(fg);
             log!(
-                "  [diag] WIN {}{} inj={} lowil={} swallowed={} ourtag={} ext={} rwin={} scan=0x{:X} latency={}ms fg=\"{}\"",
+                "  [diag] WIN {}{} inj={} lowil={} swallowed={} ourtag={} ext={} rwin={} scan=0x{:X} latency={}ms fg_class=\"{}\"",
                 if w & 1 != 0 { "DOWN" } else { "" },
                 if w & 2 != 0 { "UP" } else { "" },
                 (w >> 2) & 1,
@@ -547,7 +544,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 (w >> 7) & 1,
                 (w >> 8) & 0xFFFF,
                 (w >> 24) & 0xFFFF,
-                title
+                class
             );
             LRESULT(0)
         }

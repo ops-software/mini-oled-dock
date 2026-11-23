@@ -2231,9 +2231,8 @@ fn handle_nim(wp: WPARAM, lp: LPARAM, bytes: &[u8]) -> LRESULT {
         let exe = file_name_of(&exe_path);
         let guid = if nid.flags & NIF_GUID != 0 { guid_string(&nid.guid) } else { "-".into() };
         log!(
-            "tray: NIM_ADD exe={} guid={guid} tip=\"{}\" hwnd=0x{:X} uid={} ret={}",
+            "tray: NIM_ADD exe={} guid={guid} hwnd=0x{:X} uid={} ret={}",
             if exe.is_empty() { "?" } else { &exe },
-            utf16_until_nul(&nid.tip),
             owner,
             nid.uid,
             res.ret

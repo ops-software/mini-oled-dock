@@ -69,7 +69,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW,
     SendMessageTimeoutW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint,
     EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GWL_STYLE, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE,
@@ -3119,9 +3119,9 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
         FS_RETAKES.store(0, Relaxed);
         CLICK_DOWN.store(mouse_buttons_down(), Relaxed);
         if let Some(h) = fs {
-            log!("  fullscreen foreground window: \"{}\"", window_title(h));
+            log!("  fullscreen foreground window: class \"{}\"", window_class(h));
         } else if takes && !other_fg.0.is_null() {
-            log!("  previous foreground window: \"{}\"", window_title(other_fg));
+            log!("  previous foreground window: class \"{}\"", window_class(other_fg));
         }
     }
     if takes {
@@ -3421,12 +3421,12 @@ fn mouse_buttons_tapped() -> bool {
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 | GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16) & 0x1 != 0 }
 }
 
-fn window_title(h: HWND) -> String {
-    let mut buf = [0u16; 64];
-    // SAFETY: `buf` is a writable buffer. InternalGetWindowText reads the title
-    // without sending WM_GETTEXT to the window (a hung app does not stall the hook).
-    let n = unsafe { InternalGetWindowText(h, &mut buf) }.max(0) as usize;
-    String::from_utf16_lossy(&buf[..n.min(buf.len())])
+/// Window class name of `h` (what dock.log may say about a foreign window; never its title).
+pub(crate) fn window_class(h: HWND) -> String {
+    let mut cls = [0u16; 64];
+    // SAFETY: `cls` is a writable buffer.
+    let n = unsafe { GetClassNameW(h, &mut cls) }.max(0) as usize;
+    String::from_utf16_lossy(&cls[..n.min(cls.len())])
 }
 
 /// Foreground window covering the whole monitor `mon` (exclusive fullscreen or borderless),
@@ -3442,10 +3442,7 @@ fn fullscreen_window(mon: &RECT) -> Option<HWND> {
     if !unsafe { IsWindowVisible(fg) }.as_bool() || unsafe { IsIconic(fg) }.as_bool() {
         return None;
     }
-    let mut cls = [0u16; 64];
-    // SAFETY: `cls` is a writable buffer.
-    let n = unsafe { GetClassNameW(fg, &mut cls) }.max(0) as usize;
-    let class = String::from_utf16_lossy(&cls[..n.min(cls.len())]);
+    let class = window_class(fg);
     if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
         return None;
     }
