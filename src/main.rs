@@ -689,15 +689,16 @@ fn set_timer(h: HWND, id: usize, ms: u32) {
 
 // --------------------------------------------------------- console / process
 
-/// Attaches the parent process console (if any) so that stdout/stderr are visible again in a
-/// terminal despite the `windows` subsystem. Failures are ignored (started from Explorer/task:
-/// no parent with a console; elevated dock launched from a non-elevated terminal: access denied).
-/// If the standard handles are not valid it points them at `CONOUT$`. Returns true if attached.
 /// The error mode of a child mode (`--update-fetch`, `--start-apps`, `--start-settings`, `--start-icons`): a crash in a
 /// third-party shell or icon handler, or a failed file open, ends the child silently instead of showing the user a
 /// dialog; the dock sees the failed exit and takes its fallback.
 fn child_error_mode() -> THREAD_ERROR_MODE {
     SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+}
+
+/// Whether the arguments select a child mode of the dock; add each new child flag here (the error mode is set for them).
+fn is_child_mode(a: &Args) -> bool {
+    a.update_fetch || a.start_apps || a.start_settings || a.start_icons.is_some()
 }
 
 /// Sets `child_error_mode` for the whole process, first thing of a child mode.
@@ -706,6 +707,10 @@ fn set_child_error_mode() {
     unsafe { SetErrorMode(child_error_mode()) };
 }
 
+/// Attaches the parent process console (if any) so that stdout/stderr are visible again in a
+/// terminal despite the `windows` subsystem. Failures are ignored (started from Explorer/task:
+/// no parent with a console; elevated dock launched from a non-elevated terminal: access denied).
+/// If the standard handles are not valid it points them at `CONOUT$`. Returns true if attached.
 fn attach_console() -> bool {
     // SAFETY: no preconditions; fails harmlessly if the parent has no console.
     if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
@@ -1105,7 +1110,7 @@ fn main() -> std::process::ExitCode {
         println!("{}", version_line());
         return std::process::ExitCode::SUCCESS;
     }
-    if args.update_fetch || args.start_apps || args.start_settings || args.start_icons.is_some() {
+    if is_child_mode(args) {
         set_child_error_mode();
     }
     // --update-fetch: the update check's GET in a child of the dock (`update::fetch_latest`); stdout only,
@@ -1324,6 +1329,16 @@ mod tests {
         assert!(a.settings && !a.install);
         assert!(!p(&[]).unwrap().settings);
         assert!(p(&["--setings"]).is_err());
+    }
+
+    #[test]
+    fn the_child_modes_are_told_from_the_rest() {
+        for a in [&["--update-fetch"][..], &["--start-apps"], &["--start-settings"], &["--start-icons", "32"]] {
+            assert!(is_child_mode(&p(a).unwrap()), "{a:?}");
+        }
+        for a in [&[][..], &["--preview", "x"], &["--watchdog", "1", "ev"], &["--version"]] {
+            assert!(!is_child_mode(&p(a).unwrap()), "{a:?}");
+        }
     }
 
     #[test]
