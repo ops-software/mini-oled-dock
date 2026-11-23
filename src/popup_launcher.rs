@@ -3524,8 +3524,22 @@ fn ctx<R>(f: impl FnOnce(&Context) -> R) -> Option<R> {
     })
 }
 
+/// Whether a `WM_DOCK_LAUNCHER` post is handled: only while a chord is set (`on`). With none the launcher has no state,
+/// and a post must not create it.
+fn chord_post_handled(on: bool) -> bool {
+    on
+}
+
 /// `WM_DOCK_LAUNCHER`: the hook swallowed the chord and posted `seq` with the key's `kb.time`.
 pub(crate) fn on_chord(seq: u32, sent_time: u32) {
+    if !chord_post_handled(is_on()) {
+        // Only the hook posts it, and only while a chord is set; a post that outlives the chord (or any other sender)
+        // finds no launcher: nothing is created or loaded.
+        hook::ack_launcher(seq);
+        hook::end_typeahead(seq);
+        log!("launcher: open request ignored, chord off");
+        return;
+    }
     chord_flow(seq, sent_time, &mut RealHook, &mut RealSys);
 }
 
@@ -4704,6 +4718,25 @@ mod tests {
             // The first look at the state builds it (the prefix table, the web template): so nothing above did.
             let (_, built) = crate::launcher::testkit::allocations_during(|| with_ctrl(|_| ()));
             assert!(built > 0, "the Settings page's calls built the launcher state with the chord off");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// WM_DOCK_LAUNCHER with no chord set (live session C, run A: a post opened the launcher): the decision is pure and
+    /// the message creates and loads nothing.
+    #[test]
+    fn a_launcher_post_with_the_chord_off_creates_nothing() {
+        assert!(!chord_post_handled(false));
+        assert!(chord_post_handled(true));
+        std::thread::spawn(|| {
+            assert!(!ON.with(Cell::get));
+            on_chord(7, 0);
+            on_chord(8, 0);
+            assert!(super::super::current() != Some(PopupKind::Launcher));
+            // The state was never built: the first look at it does (the prefix table, the web template).
+            let (_, built) = crate::launcher::testkit::allocations_during(|| with_ctrl(|_| ()));
+            assert!(built > 0, "the post built the launcher state with the chord off");
         })
         .join()
         .unwrap();
