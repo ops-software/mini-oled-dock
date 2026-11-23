@@ -301,9 +301,10 @@ fn log_violations(path: &str, text: &str) -> Vec<String> {
 
 /// The functions of launcher_sys.rs that hold what the user copies (plan L2 CLIP-1): their log lines name an error at
 /// most (no text, no length), and they are the only callers of the clipboard reader in the dock.
-const CLIP_FNS: [&str; 3] = ["fn clipboard_text(", "fn clipboard_marks(", "fn set_clipboard_text("];
-/// The ones of `CLIP_FNS` that read the clipboard, at the user's paste only.
-const CLIP_READERS: [&str; 2] = ["fn clipboard_text(", "fn clipboard_marks("];
+const CLIP_FNS: [&str; 4] =
+    ["fn clipboard_text(", "fn clipboard_read(", "fn clipboard_marks(", "fn set_clipboard_text("];
+/// The ones of `CLIP_FNS` that read the clipboard, at the user's paste only, on its reader thread (lint 18).
+const CLIP_READERS: [&str; 2] = ["fn clipboard_read(", "fn clipboard_marks("];
 
 fn clip_violations(path: &str, text: &str) -> Vec<String> {
     let mut v = Vec::new();
@@ -375,15 +376,18 @@ fn launcher_logs_carry_no_text() {
     // the clipboard functions (CLIP-1): an error at most, and the clipboard is read nowhere else
     let sys = |marks_log: &str, text_log: &str| {
         format!(
-            "fn clipboard_marks() {{ {marks_log} GetClipboardData(1); }}\nfn clipboard_text() {{ {text_log} \
-             GetClipboardData(13); }}\nfn set_clipboard_text(t: &str) {{ log!(\"launcher: failed {{e}}\"); }}\n"
+            "fn clipboard_marks() {{ {marks_log} GetClipboardData(1); }}\nfn clipboard_text() {{ {text_log} }}\n\
+             fn clipboard_read() {{ GetClipboardData(13); }}\n\
+             fn set_clipboard_text(t: &str) {{ log!(\"launcher: failed {{e}}\"); }}\n"
         )
     };
     assert!(clip_violations("src/launcher_sys.rs", &sys("", "log!(\"launcher: failed {e}\");")).is_empty());
     let len = sys("", "log!(\"launcher: {n} units\", n);");
     assert_eq!(clip_violations("src/launcher_sys.rs", &len).len(), 1, "not even a length");
     assert_eq!(clip_violations("src/launcher_sys.rs", &sys("log!(\"{}\", s);", "")).len(), 1);
-    assert_eq!(clip_violations("src/launcher_sys.rs", "fn clipboard_text() {}").len(), 2, "a renamed one fails");
+    assert_eq!(clip_violations("src/launcher_sys.rs", "fn clipboard_text() {}").len(), 3, "a renamed one fails");
+    let read = sys("", "GetClipboardData(13);");
+    assert_eq!(clip_violations("src/launcher_sys.rs", &read).len(), 1, "the paste reads on its reader thread only");
     assert_eq!(clip_violations("src/ui.rs", "fn f() { GetClipboardData(13); }").len(), 1, "read nowhere else");
     assert!(clip_violations("src/ui.rs", "use x::{GetClipboardData, OpenClipboard};").is_empty(), "an import");
     let tests =
@@ -1350,11 +1354,14 @@ fn calls_that_wait_for_a_window_live_in_one_guarded_place() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
-// ---- lint 18: a paste asks the clipboard's owner first --------------------------------------------------------------
+// ---- lint 18: a paste asks the clipboard's owner, then reads on its own thread with a bounded wait -----------------
 
 /// A delay-rendered clipboard format is rendered by its owner when it is read (WM_RENDERFORMAT, a send that waits for the
-/// owner's thread, without bound when it hangs): `clipboard_text`, the paste, which reads the marks too, asks the owner
-/// with `ui::answers` before its first read.
+/// owner's thread without bound, also when the owner answered a ping and then blocks in its render): `clipboard_text`,
+/// the paste, asks the owner with `ui::answers`, starts `clipboard_read` on its own thread, waits for that thread with
+/// a bound (WaitForSingleObject, never INFINITE) and only then joins it; it reads nothing itself. `clipboard_read` is
+/// named nowhere else (its definition and that spawn) and `clipboard_marks` is called by it only, so GetClipboardData,
+/// which `clip_violations` keeps in those two, runs on the reader thread only.
 fn paste_owner_violations(path: &str, text: &str) -> Vec<String> {
     let mut v = Vec::new();
     if path != "src/launcher_sys.rs" {
@@ -1365,10 +1372,22 @@ fn paste_owner_violations(path: &str, text: &str) -> Vec<String> {
         return v;
     };
     let code = code_of(text.get(b..e).unwrap_or(""));
-    let ask = code.find("ui::answers(");
-    let read = ["clipboard_marks(", "GetClipboardData("].iter().filter_map(|r| code.find(r)).min();
-    if read.is_some_and(|r| ask.is_none_or(|a| r < a)) {
-        v.push(format!("{path}:{}: fn clipboard_text(..) reads before it asks the owner", line_of(text, b)));
+    let steps = ["ui::answers(", ".spawn(clipboard_read)", "WaitForSingleObject(", ".join()"].map(|s| code.find(s));
+    let ordered = steps.windows(2).all(|w| matches!(w, [Some(a), Some(b)] if a < b));
+    let direct =
+        ["GetClipboardData(", "OpenClipboard(", "clipboard_marks(", "INFINITE"].iter().any(|r| code.contains(r));
+    if !ordered || direct {
+        let at = line_of(text, b);
+        v.push(format!("{path}:{at}: fn clipboard_text(..) must ask the owner, then wait for its reader with a bound"));
+    }
+    let all = code_of(text.get(..test_start(text)).unwrap_or(text));
+    let reader = fn_body(text, "fn clipboard_read(", 0).map(|(b, e)| code_of(text.get(b..e).unwrap_or("")));
+    let marks_in_reader = reader.map_or(0, |r| r.matches("clipboard_marks(").count());
+    if all.matches("clipboard_read").count() != 2
+        || all.matches("clipboard_marks(").count() != 2
+        || marks_in_reader != 1
+    {
+        v.push(format!("{path}: the clipboard is read off the paste's reader thread"));
     }
     v
 }
@@ -1376,21 +1395,38 @@ fn paste_owner_violations(path: &str, text: &str) -> Vec<String> {
 #[test]
 fn a_paste_asks_the_clipboards_owner_first() {
     let p = "src/launcher_sys.rs";
-    let good = "fn clipboard_text() -> Pasted {\n    // the owner renders delayed formats\n\
-                \x20   let silent = GetClipboardOwner().is_ok_and(|o| !crate::ui::answers(o));\n\
-                \x20   if silent { Pasted::Empty } else if paste_refused(clipboard_marks()) { Pasted::Private } else {\n\
-                \x20       GetClipboardData(13);\n    }\n}\n";
-    assert!(paste_owner_violations(p, good).is_empty());
-    // 1.5.0's paste: the marks and the text read with no question to the owner.
+    let reader =
+        "fn clipboard_read() -> Pasted {\n    if paste_refused(clipboard_marks()) {}\n    GetClipboardData(13);\n}\n\
+                  fn clipboard_marks() -> ClipMarks {\n    GetClipboardData(1);\n}\n";
+    let good = format!(
+        "fn clipboard_text() -> Pasted {{\n    // the owner renders delayed formats\n\
+         \x20   if GetClipboardOwner().is_ok_and(|o| !crate::ui::answers(o)) {{\n        return Pasted::Empty;\n    }}\n\
+         \x20   let r = Builder::new().spawn(clipboard_read)?;\n\
+         \x20   if WaitForSingleObject(h(&r), PASTE_WAIT_MS) != WAIT_OBJECT_0 {{\n        return Pasted::Empty;\n    }}\n\
+         \x20   r.join().unwrap_or(Pasted::Empty)\n}}\n{reader}"
+    );
+    assert!(paste_owner_violations(p, &good).is_empty());
+    let order = format!("{p}:1: fn clipboard_text(..) must ask the owner, then wait for its reader with a bound");
+    let off = format!("{p}: the clipboard is read off the paste's reader thread");
+    let (order, off) = (order.as_str(), off.as_str());
+    // 1.5.0's paste, and e7c4e4f's, which asked first: the marks and the text read on the UI thread.
     let unasked =
         "fn clipboard_text() -> Pasted {\n    if paste_refused(clipboard_marks()) {}\n    GetClipboardData(13);\n}\n";
-    let line = "src/launcher_sys.rs:1: fn clipboard_text(..) reads before it asks the owner";
-    assert_eq!(paste_owner_violations(p, unasked), [line]);
-    let late = "fn clipboard_text() {\n    GetClipboardData(13);\n    crate::ui::answers(o);\n}\n";
-    assert_eq!(paste_owner_violations(p, late).len(), 1);
-    // A comment is not the question.
-    let comment = "fn clipboard_text() {\n    // crate::ui::answers(o)\n    GetClipboardData(13);\n}\n";
-    assert_eq!(paste_owner_violations(p, comment).len(), 1);
+    assert_eq!(paste_owner_violations(p, &format!("{unasked}{reader}")), [order, off]);
+    let asked = unasked.replace("    if paste", "    if !crate::ui::answers(o) {}\n    if paste");
+    assert_eq!(paste_owner_violations(p, &format!("{asked}{reader}")), [order, off]);
+    // An unbounded wait, a join with no wait, the question after the read, and a comment are no guard.
+    assert_eq!(paste_owner_violations(p, &good.replace("PASTE_WAIT_MS", "INFINITE")), [order]);
+    assert_eq!(paste_owner_violations(p, &good.replace("WaitForSingleObject(", "WaitFor(")), [order]);
+    let late =
+        good.replace("!crate::ui::answers(o)", "false").replace("r.join()", "crate::ui::answers(o);\n    r.join()");
+    assert_eq!(paste_owner_violations(p, &late), [order]);
+    let comment =
+        good.replace("// the owner", "// crate::ui::answers(o), the owner").replace("!crate::ui::answers(o)", "false");
+    assert_eq!(paste_owner_violations(p, &comment), [order]);
+    // The reader or the marks reached from anywhere else.
+    assert_eq!(paste_owner_violations(p, &format!("{good}fn paste() {{\n    clipboard_read();\n}}\n")), [off]);
+    assert_eq!(paste_owner_violations(p, &format!("{good}fn peek() {{\n    clipboard_marks();\n}}\n")), [off]);
     assert_eq!(paste_owner_violations(p, "fn paste() {}"), ["src/launcher_sys.rs: fn clipboard_text(..) is missing"]);
     assert!(paste_owner_violations("src/ui.rs", unasked).is_empty());
     let all = scan_tree(paste_owner_violations);

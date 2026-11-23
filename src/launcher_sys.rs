@@ -7,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::cell::RefCell;
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use windows::core::{w, PCWSTR, PWSTR};
@@ -207,23 +208,48 @@ fn set_clipboard_text(text: &str) {
     }
 }
 
-/// The clipboard's `CF_UNICODETEXT` for a paste, at most 64 KiB of it (up to its first NUL); `Private` when the app
-/// that copied it marked it private (`clipboard_marks`), and then the text is never read. Nothing is read from an owner
-/// that does not answer (`ui::answers`, lint 18): it renders a delay-rendered format when it is read (WM_RENDERFORMAT),
-/// and the read waits for its thread.
+/// How long a paste waits for its reader thread, in ms (`clipboard_text`).
+const PASTE_WAIT_MS: u32 = 250;
+
+/// The paste: the clipboard's text as `clipboard_read` gives it, read on a one-shot thread that the UI thread waits
+/// for at most `PASTE_WAIT_MS` (lint 18). A delay-rendered format is rendered by its owner when it is read
+/// (WM_RENDERFORMAT, a send that waits for the owner's thread without bound), and an owner that answers a ping may still
+/// block in its render (a stalled remote or VM clipboard channel). An owner that does not answer `ui::answers` is not
+/// read at all. A late reader closes the clipboard when the owner returns and its text is dropped; while it waits it
+/// holds the clipboard open, so the next reader's OpenClipboard fails at once and at most one is ever left waiting.
 fn clipboard_text() -> Pasted {
+    // SAFETY: no preconditions; it names the owner's window, or fails when there is none.
+    if unsafe { GetClipboardOwner() }.is_ok_and(|o| !crate::ui::answers(o)) {
+        log!("launcher: the clipboard's owner does not answer, the paste reads nothing");
+        return Pasted::Empty;
+    }
+    let reader = match std::thread::Builder::new().name("paste".into()).stack_size(256 * 1024).spawn(clipboard_read) {
+        Ok(r) => r,
+        Err(e) => {
+            log!("launcher: the paste reader did not start: {e}");
+            return Pasted::Empty;
+        }
+    };
+    // SAFETY: the reader's thread handle, open while `reader` lives; dropping `reader` detaches the thread.
+    if unsafe { WaitForSingleObject(HANDLE(reader.as_raw_handle()), PASTE_WAIT_MS) } != WAIT_OBJECT_0 {
+        log!("launcher: the clipboard was not read within 250 ms (its owner is rendering it), the paste reads nothing");
+        return Pasted::Empty;
+    }
+    reader.join().unwrap_or(Pasted::Empty)
+}
+
+/// The paste's read, on its own thread (`clipboard_text`, lint 18): the clipboard's `CF_UNICODETEXT`, at most 64 KiB
+/// of it (up to its first NUL); `Private` when the app that copied it marked it private (`clipboard_marks`), and then
+/// the text is never read.
+fn clipboard_read() -> Pasted {
     const MAX_UNITS: usize = 32 * 1024;
     // SAFETY: the clipboard is opened and closed here, on this thread; the block the clipboard owns is read only while
     // locked, within GlobalSize, and never freed here.
     unsafe {
-        if OpenClipboard(Some(crate::hwnd())).is_err() {
+        if OpenClipboard(None).is_err() {
             return Pasted::Empty;
         }
-        // The owner cannot change while the clipboard is open here.
-        let text = if GetClipboardOwner().is_ok_and(|o| !crate::ui::answers(o)) {
-            log!("launcher: the clipboard's owner does not answer, the paste reads nothing");
-            Pasted::Empty
-        } else if paste_refused(clipboard_marks()) {
+        let text = if paste_refused(clipboard_marks()) {
             Pasted::Private
         } else {
             (|| {
@@ -247,7 +273,7 @@ fn clipboard_text() -> Pasted {
     }
 }
 
-/// The privacy marks on the clipboard `clipboard_text` holds open (plan L2 D8): which mark formats are there, and the
+/// The privacy marks on the clipboard `clipboard_read` holds open (plan L2 D8): which mark formats are there, and the
 /// 4 bytes of `CanIncludeInClipboardHistory`; nothing else of the clipboard is read. A format that cannot be registered
 /// counts as present and a flag that cannot be read whole as 0: what cannot be checked is refused.
 fn clipboard_marks() -> ClipMarks {
