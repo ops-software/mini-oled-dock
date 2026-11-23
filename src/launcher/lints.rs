@@ -1192,14 +1192,21 @@ fn the_files_helper_asks_windows() {
 
 // ---- lint 17: the calls that wait for another thread's window live in one guarded place ------------------------------
 
-/// The calls that wait for another thread's window, each only in its one function of src/ui.rs, after the guard that
-/// keeps them from a window that does not answer: the join of the input queues (`ui::variant1_attempt`, after the
-/// WM_NULL ping of `variant1(`) and the raise in place (`ui::raise`, for the dock's own thread only; another thread's
-/// window is raised with SWP_ASYNCWINDOWPOS). Joined to a thread that stopped pumping, or raising its window in place,
-/// the dock's UI thread waits for as long as that window hangs (live check V-14, 28.5 s): (call, function, guard).
-const GUARDED_CALLS: [(&str, &str, &str); 2] = [
-    ("AttachThreadInput", "fn variant1_attempt(", "variant1("),
-    ("BringWindowToTop", "fn raise(", "GetCurrentThreadId()"),
+/// The calls that wait for another thread's window, each only in its one function of src/ui.rs, after the guards that
+/// keep them from a window that does not answer: the join of the input queues (`ui::variant1_attempt`, after the
+/// WM_NULL pings of the foreground window and of the other threads its queue names, the closures handed to `variant1`,
+/// and only inside `if v == Variant1::Joined`) and the raise in place (`ui::raise`, for the dock's own thread only;
+/// another thread's window is raised with SWP_ASYNCWINDOWPOS). Joined to a thread that stopped pumping, or raising its
+/// window in place, the dock's UI thread waits for as long as that window hangs (live check V-14, 28.5 s): (call,
+/// function, guards, the `if` each call sits in or "").
+const GUARDED_CALLS: [(&str, &str, &[&str], &str); 2] = [
+    (
+        "AttachThreadInput",
+        "fn variant1_attempt(",
+        &["|| front_answers(", "|| queue_answers("],
+        "if v == Variant1::Joined {",
+    ),
+    ("BringWindowToTop", "fn raise(", &["GetCurrentThreadId()"], ""),
 ];
 
 /// Byte ranges of the `use` statements of `text`, from `use` to its `;`.
@@ -1217,13 +1224,29 @@ fn use_ranges(text: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether every `call` in `code` sits inside the block of an `if` whose head is `head` (whitespace aside).
+fn calls_inside(code: &str, call: &str, head: &str) -> bool {
+    let flat: String = code.split_whitespace().collect();
+    let head: String = head.split_whitespace().collect();
+    flat.match_indices(call).all(|(at, _)| {
+        let before = flat.get(..at).unwrap_or("");
+        before.rfind(&head).is_some_and(|h| {
+            let mut depth = 1i32;
+            before.get(h + head.len()..).unwrap_or("").chars().all(|c| {
+                depth += i32::from(c == '{') - i32::from(c == '}');
+                depth > 0
+            })
+        })
+    })
+}
+
 /// Each call of `GUARDED_CALLS` outside comments only in src/ui.rs: in a `use` statement without a rename, and in the
-/// body of its function, whose first call comes after the guard.
+/// body of its function, whose first call comes after each guard and where each call sits in its `if`.
 fn guarded_call_violations(path: &str, text: &str) -> Vec<String> {
     let mut v = Vec::new();
     let ui = path == "src/ui.rs";
     let imports = use_ranges(text);
-    for (token, sig, guard) in GUARDED_CALLS {
+    for (token, sig, guards, head) in GUARDED_CALLS {
         let body = if ui { fn_body(text, sig, 0) } else { None };
         if ui && body.is_none() {
             v.push(format!("{path}: {sig}..) is missing"));
@@ -1240,8 +1263,13 @@ fn guarded_call_violations(path: &str, text: &str) -> Vec<String> {
         }
         if let Some((b, e)) = body {
             let code = code_of(text.get(b..e).unwrap_or(""));
-            if code.find(&format!("{token}(")).is_some_and(|c| code.find(guard).is_none_or(|g| c < g)) {
-                v.push(format!("{path}:{}: {sig}..) calls {token} before its {guard} guard", line_of(text, b)));
+            let call = format!("{token}(");
+            let first = code.find(&call);
+            if let Some(g) = guards.iter().find(|g| first.is_some_and(|c| code.find(**g).is_none_or(|p| c < p))) {
+                v.push(format!("{path}:{}: {sig}..) calls {token} before its {g} guard", line_of(text, b)));
+            }
+            if !head.is_empty() && !calls_inside(&code, &call, head) {
+                v.push(format!("{path}:{}: {sig}..) calls {token} outside `{head}`", line_of(text, b)));
             }
         }
     }
@@ -1254,21 +1282,38 @@ fn calls_that_wait_for_a_window_live_in_one_guarded_place() {
     let good = "use windows::Win32::System::Threading::AttachThreadInput;\n\
                 use windows::Win32::UI::WindowsAndMessaging::{\n    BringWindowToTop, SetWindowPos,\n};\n\
                 /// Variant 1: AttachThreadInput to the foreground thread.\n\
-                fn variant1_attempt(h: HWND) -> Option<bool> {\n    let v = variant1(f, m, || answers(fg));\n\
-                \x20   let _ = unsafe { AttachThreadInput(m, f, true) };\n\
+                fn variant1_attempt(h: HWND) -> Option<bool> {\n\
+                \x20   let v = variant1(f, m, || front_answers(fg, f), || queue_answers(f, m));\n\
+                \x20   if v == Variant1::Joined {\n        let _ = unsafe { AttachThreadInput(m, f, true) };\n    }\n\
                 \x20   log!(\"variant 1 (AttachThreadInput, fg null={n})\");\n}\n\
                 fn raise(h: HWND) {\n    if GetWindowThreadProcessId(h, None) == GetCurrentThreadId() {\n\
                 \x20       let _ = BringWindowToTop(h);\n    }\n}\n\
                 fn force_foreground(h: HWND) {\n    // the ping guards AttachThreadInput\n    variant1_attempt(h);\n}\n";
     assert!(guarded_call_violations(p, good).is_empty(), "{:?}", guarded_call_violations(p, good));
     // 1.4.3's force_foreground: the join with no ping before it.
-    let unguarded = good.replace("    let v = variant1(f, m, || answers(fg));\n", "");
+    let pings = "    let v = variant1(f, m, || front_answers(fg, f), || queue_answers(f, m));\n";
+    let unguarded = good.replace(pings, "");
+    let no_front = ["src/ui.rs:6: fn variant1_attempt(..) calls AttachThreadInput before its || front_answers( guard"];
+    assert_eq!(guarded_call_violations(p, &unguarded), no_front);
+    let late = unguarded.replace("log!(", &format!("{pings}log!("));
+    assert_eq!(guarded_call_violations(p, &late).len(), 1, "the guards after the call");
+    // A ping bypassed: the front window, or the other threads of its queue, taken as answering.
+    assert_eq!(guarded_call_violations(p, &good.replace("|| front_answers(fg, f)", "|| true")), no_front);
     assert_eq!(
-        guarded_call_violations(p, &unguarded),
-        ["src/ui.rs:6: fn variant1_attempt(..) calls AttachThreadInput before its variant1( guard"]
+        guarded_call_violations(p, &good.replace("|| queue_answers(f, m)", "|| true")),
+        ["src/ui.rs:6: fn variant1_attempt(..) calls AttachThreadInput before its || queue_answers( guard"]
     );
-    let late = unguarded.replace("log!(", "variant1(f);\nlog!(");
-    assert_eq!(guarded_call_violations(p, &late).len(), 1, "the guard after the call");
+    // A join on any other outcome than Joined, or out of its block.
+    let not_joined =
+        ["src/ui.rs:6: fn variant1_attempt(..) calls AttachThreadInput outside `if v == Variant1::Joined {`"];
+    let alone = good.replace("if v == Variant1::Joined {", "if v != Variant1::Alone {");
+    assert_eq!(guarded_call_violations(p, &alone), not_joined);
+    let flag =
+        good.replace("    if v == Variant1::Joined {", "    let joined = v != Variant1::Alone;\n    if joined {");
+    assert_eq!(guarded_call_violations(p, &flag), not_joined);
+    let block = "{\n        let _ = unsafe { AttachThreadInput(m, f, true) };\n    }";
+    let after = good.replace(block, "{}\n    let _ = unsafe { AttachThreadInput(m, f, true) };");
+    assert_eq!(guarded_call_violations(p, &after), not_joined);
     // A raise in place without the thread check.
     let any = good.replace("if GetWindowThreadProcessId(h, None) == GetCurrentThreadId() {", "{");
     assert_eq!(guarded_call_violations(p, &any).len(), 1);
@@ -1276,7 +1321,7 @@ fn calls_that_wait_for_a_window_live_in_one_guarded_place() {
     let outside = format!("{good}fn other() {{\n    let _ = unsafe {{ AttachThreadInput(m, f, true) }};\n}}\n");
     assert_eq!(
         guarded_call_violations(p, &outside),
-        ["src/ui.rs:21: AttachThreadInput outside fn variant1_attempt(..)"]
+        ["src/ui.rs:23: AttachThreadInput outside fn variant1_attempt(..)"]
     );
     let renamed = good.replace("AttachThreadInput;", "AttachThreadInput as Join;");
     assert_eq!(guarded_call_violations(p, &renamed).len(), 1);

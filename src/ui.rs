@@ -3710,15 +3710,14 @@ fn variant1_attempt(h: HWND, fg: HWND) -> Option<bool> {
         log!("  foreground variant 1 skipped: another thread's window in the foreground input queue does not answer");
         return None;
     }
-    let joined = v == Variant1::Joined;
-    if joined {
+    if v == Variant1::Joined {
         // SAFETY: valid thread ids; the attach is always undone below.
         let _ = unsafe { AttachThreadInput(my_tid, fg_tid, true) };
     }
     raise(h);
     // SAFETY: `h` is a window handle; SetForegroundWindow accepts any.
     let ok = unsafe { SetForegroundWindow(h) }.as_bool();
-    if joined {
+    if v == Variant1::Joined {
         // SAFETY: undoes the attach done above.
         let _ = unsafe { AttachThreadInput(my_tid, fg_tid, false) };
     }
