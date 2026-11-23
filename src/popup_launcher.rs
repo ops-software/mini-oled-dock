@@ -485,6 +485,9 @@ pub(crate) struct Launcher {
     open_no: u32,
     /// The first activation took the type-ahead ring (once per open).
     taken: bool,
+    /// The files request of the kept query's rows (`new_launcher`), sent at the first activation: a pump starts only
+    /// for a launcher that opened, whose close ends it. A later requery's request replaces it.
+    pending_files: Option<crate::launcher::files::Req>,
     /// The session's effects that run after the close, in order.
     queued: Vec<Effect>,
     /// The window in front when the chord came: the restore and the window menu act on it.
@@ -531,6 +534,7 @@ impl Launcher {
             open_seq: 0,
             open_no: 0,
             taken: false,
+            pending_files: None,
             queued: Vec::new(),
             fg_at_open: 0,
             restore: false,
@@ -567,6 +571,9 @@ impl Launcher {
             return view;
         }
         self.taken = true;
+        if let Some(r) = self.pending_files.take() {
+            sys.files(self.open_no, Some(r));
+        }
         #[cfg(feature = "owner-probe")]
         crate::launcher_probe::focused();
         let mut buf = [KeyRec::default(); RING_CAP];
@@ -632,7 +639,10 @@ impl Launcher {
                 Effect::SaveAlias { word, target } => sys.alias(AliasOp::Save { word, target }),
                 Effect::RemoveAlias(word) => sys.alias(AliasOp::Remove(word)),
                 // Files (plan L2-F3): one channel send to the pump, never a wait.
-                Effect::RequestFiles(r) => sys.files(self.open_no, r),
+                Effect::RequestFiles(r) => {
+                    self.pending_files = None;
+                    sys.files(self.open_no, r);
+                }
                 Effect::DismissNotice(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::LaunchAlias(_)
@@ -1820,8 +1830,10 @@ fn new_launcher() -> Launcher {
         l.session.set_notices(notices);
     }
     if noticed || !l.session.query_text().is_empty() {
-        // The kept query's rows, and the notices (on an empty field too).
-        let _ = ctx(|cx| l.session.refresh(cx));
+        // The kept query's rows, and the notices (on an empty field too). Its files request waits for the first
+        // activation (`on_focus`): the open may still fail, and then no close would end a pump.
+        let fx = ctx(|cx| l.session.refresh(cx)).unwrap_or_default();
+        l.pending_files = fx.into_iter().find_map(|e| if let Effect::RequestFiles(r) = e { r } else { None });
     }
     l
 }
@@ -5103,6 +5115,36 @@ mod tests {
         assert_eq!((&*row.title, &row.icon), ("zzq.txt", &crate::launcher::model::IconRef::Glyph(GlyphId::Document)));
         assert_eq!(l.files_event(open, FilesEvent::Slow(gen - 1), &fx.cx()), Reply::None);
         assert_eq!(l.files_event(open, FilesEvent::Slow(gen), &fx.cx()), Reply::Redraw);
+    }
+
+    #[test]
+    fn kept_file_query_reaches_the_pump_at_the_first_activation() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        with_ctrl(|c| {
+            c.opts.keep_query = true;
+            c.last_query = Some("file quokka".into());
+        });
+        let mut l = new_launcher();
+        let gen = l.session.gen();
+        assert_eq!(l.session.query_text(), "file quokka");
+        // Nothing went out while the content was made: the open could still fail.
+        let mut sys = EffectSys::default();
+        let mut hook = FakeHook::default();
+        l.on_focus(true, &fx.cx(), &mut hook, &mut sys);
+        assert_eq!((&sys.files, &sys.files_opens), (&vec![Some(gen)], &vec![l.open_no]), "the open's generation");
+        l.on_focus(true, &fx.cx(), &mut hook, &mut sys);
+        assert_eq!(sys.files.len(), 1, "once");
+        // A requery before the activation (a reopen's typed query) replaces it.
+        let mut l = new_launcher();
+        let effects = l.session.chars("file quokkas", &fx.cx());
+        l.run(effects, &fx.cx(), &mut sys);
+        l.on_focus(true, &fx.cx(), &mut hook, &mut sys);
+        assert_eq!(sys.files[1..], [Some(l.session.gen())], "only the newer request");
+        with_ctrl(|c| {
+            c.opts = LauncherOpts::default();
+            c.last_query = None;
+        });
     }
 
     #[test]
