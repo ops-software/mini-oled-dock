@@ -321,6 +321,23 @@ fn draw_line(s: &mut Surface, text: &str, x: i32, y: i32, max_w: i32, font: Font
     }
 }
 
+/// Draws a row's title in `max_w` px: a file's or a folder's name cut in the middle (`name_shown`), any other title, or
+/// one holding markers, as `draw_line`.
+fn draw_title(s: &mut Surface, item: &Item, x: i32, y: i32, max_w: i32, font: Font, alpha: u32) {
+    match name_shown(s, item, font, max_w) {
+        Some(shown) => s.text(&shown, x, y, font, WHITE, alpha),
+        None => draw_line(s, &item.title, x, y, max_w, font, alpha),
+    }
+}
+
+/// A file's or a folder's title cut in the middle (`ellipsize_middle`), so its end stays on screen: the extension is
+/// the only sign that Enter runs a program for a type neither gate of 5.4.6 knows. None for any other title and for one
+/// holding markers, which `draw_line` clips.
+fn name_shown(s: &Surface, item: &Item, font: Font, max_w: i32) -> Option<String> {
+    let named = matches!(item.kind, Kind::File | Kind::Folder) && !item.title.chars().any(gesture::is_marker);
+    named.then(|| ellipsize_middle(s, &item.title, font, max_w))
+}
+
 /// `text` cut in the middle with "..." so that it fits `max_w` (a path keeps its end).
 fn ellipsize_middle(s: &Surface, text: &str, font: Font, max_w: i32) -> String {
     if s.text_width(text, font) <= max_w {
@@ -1361,7 +1378,7 @@ impl Launcher {
             || item.detail.is_some() && (item.kind != Kind::App || item.from == ProviderId::Alias);
         let has_review = !g.lines.is_empty();
         let ny = if has_detail || has_review { rc.top + m.px(NAME_TOP) } else { center_y(&first_line, nlh) };
-        draw_line(s, &item.title, nx, ny, name_right - nx, font, name_alpha);
+        draw_title(s, item, nx, ny, name_right - nx, font, name_alpha);
         let dy = ny + nlh + m.px(DETAIL_GAP);
         if has_review {
             let step = m.px(style::REVIEW_LINE);
@@ -6191,6 +6208,26 @@ mod tests {
         let item = l.session.selected().unwrap().clone();
         let (first, rest) = l.detail_widths(&s, &item, true);
         assert_eq!(first, rest);
+    }
+
+    #[test]
+    fn file_and_folder_names_keep_their_end() {
+        let s = surface(96);
+        let name = "Fattura ottobre 2026 per il cliente con tutte le voci definitiva.pdf.py";
+        let w = s.text_width("Fattura ottobre 2026 per il", Font::Normal);
+        let mut item = crate::launcher::providers::tests::file_row(name, crate::launcher::model::FileClass::Other);
+        for kind in [Kind::File, Kind::Folder] {
+            item.kind = kind;
+            let got = name_shown(&s, &item, Font::Normal, w).unwrap();
+            assert!(got.starts_with("Fattura") && got.ends_with(".pdf.py") && got.contains('\u{2026}'), "{got}");
+            assert!(s.text_width(&got, Font::Normal) <= w, "{got}");
+        }
+        // Any other title, and one holding markers, is drawn by `draw_line` (cut at the end, or clipped).
+        item.kind = Kind::App;
+        assert_eq!(name_shown(&s, &item, Font::Normal, w), None);
+        item.kind = Kind::File;
+        item.title = "invoice\u{202e}fdp.exe".into();
+        assert_eq!(name_shown(&s, &item, Font::Normal, w), None);
     }
 
     #[test]
