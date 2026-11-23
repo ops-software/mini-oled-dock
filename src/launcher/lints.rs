@@ -1011,7 +1011,8 @@ fn release_strings_hold_no_probe_name() {
 /// Lines around a spawn that may hold its flags.
 const SPAWN_WINDOW: usize = 12;
 /// The Win32 starters (called with an opening parenthesis).
-const CREATE_CALLS: [&str; 4] = ["CreateProcessW(", "CreateProcessAsUserW(", "CreateProcessWithTokenW(", "CreateProcessWithLogonW("];
+const CREATE_CALLS: [&str; 4] =
+    ["CreateProcessW(", "CreateProcessAsUserW(", "CreateProcessWithTokenW(", "CreateProcessWithLogonW("];
 
 /// A process started from src/ or tests/ without CREATE_NO_WINDOW: a console-subsystem child (ping, cmd, schtasks) started
 /// from a process that has no console gets a new visible one, which takes the foreground from the person at the PC. The
@@ -1052,7 +1053,8 @@ fn every_spawned_process_has_no_window() {
     let win_good = "let flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;\nunsafe { CreateProcessW(app, line) };";
     assert!(spawn_violations("src/a.rs", win_good).is_empty());
     assert_eq!(spawn_violations("tests/a.rs", "unsafe { CreateProcessW(app, line) };").len(), 1);
-    assert!(spawn_violations("src/a.rs", "/// CreateProcessW(x)\n// Command::new(x)\nuse std::process::Command;").is_empty());
+    assert!(spawn_violations("src/a.rs", "/// CreateProcessW(x)\n// Command::new(x)\nuse std::process::Command;")
+        .is_empty());
     let far = format!("Command::new(x)\n{}\n.creation_flags(CREATE_NO_WINDOW.0)", "\n".repeat(20));
     assert_eq!(spawn_violations("src/a.rs", &far).len(), 1, "the flag must stand next to the spawn");
     let mut all = scan_tree(spawn_violations);
