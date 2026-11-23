@@ -38,6 +38,7 @@ use windows::Win32::UI::Shell::{
     AssocIsDangerous, FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
     FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
     FOLDERID_UserProfiles, FOLDERID_Videos, FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    KF_FLAG_DONT_VERIFY, KNOWN_FOLDER_FLAG,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
@@ -295,7 +296,9 @@ fn roots_of(profile: String, common: String) -> Vec<String> {
 
 /// The user's known folders that join the roots wherever they point (moved with Explorer's Location tab or by Folder
 /// Redirection, often to another drive): their paths come from HKCU, so each is a root only as `files::root_of`
-/// accepts it.
+/// accepts it. They are resolved with KF_FLAG_DONT_VERIFY: the helper reads their path text only and never touches the
+/// folders, so a sleeping disk or an unreachable share cannot hold the state frame (a folder that is not there gives no
+/// rows).
 const KNOWN: [windows::core::GUID; 6] =
     [FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Music, FOLDERID_Videos];
 
@@ -311,15 +314,15 @@ fn with_folders(mut roots: Vec<String>, known: &[String], extra: &[String], fenc
 }
 
 /// A known folder's path for `token`'s user.
-fn known_folder(id: &windows::core::GUID, token: &Handle) -> Option<String> {
+fn known_folder(id: &windows::core::GUID, token: &Handle, flags: KNOWN_FOLDER_FLAG) -> Option<String> {
     // SAFETY: a valid folder id and token; the string is freed by take_cotask.
-    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, Some(token.0)) }.ok()?;
+    let p = unsafe { SHGetKnownFolderPath(id, flags, Some(token.0)) }.ok()?;
     take_cotask(p)
 }
 
 /// The roots of `with_folders`, every folder resolved with the shell's token.
 fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
-    let path = |id: &windows::core::GUID| known_folder(id, token);
+    let path = |id: &windows::core::GUID| known_folder(id, token, KF_FLAG_DEFAULT);
     let profile = path(&FOLDERID_Profile)?;
     let fences = || {
         Some(Fences {
@@ -330,7 +333,7 @@ fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
         })
     };
     let fences = fences();
-    let known: Vec<String> = KNOWN.iter().filter_map(path).collect();
+    let known: Vec<String> = KNOWN.iter().filter_map(|id| known_folder(id, token, KF_FLAG_DONT_VERIFY)).collect();
     Some(with_folders(roots_of(profile, path(&FOLDERID_CommonPrograms)?), &known, extra, fences.as_ref()))
 }
 
