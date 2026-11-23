@@ -117,14 +117,23 @@ impl ScrollArea {
         let h = if self.content_h > 0 { (vh as i64 * vh as i64 / self.content_h as i64) as i32 } else { vh };
         let h = h.max(self.m.px(SCROLL_THUMB_MIN)).min(vh);
         let max = self.max();
-        let top = if max > 0 { self.view.top + ((vh - h) as i64 * self.offset as i64 / max as i64) as i32 } else { self.view.top };
+        let top = if max > 0 {
+            self.view.top + ((vh - h) as i64 * self.offset as i64 / max as i64) as i32
+        } else {
+            self.view.top
+        };
         let right = self.view.right - self.m.px(BAR_INSET);
         RECT { left: right - self.bar_w(), top, right, bottom: top + h }
     }
 
     /// The zone that grabs the thumb: the whole height of the view, at its right edge.
     pub(crate) fn hit_zone(&self) -> RECT {
-        RECT { left: self.view.right - self.m.px(SCROLLBAR_HIT), top: self.view.top, right: self.view.right, bottom: self.view.bottom }
+        RECT {
+            left: self.view.right - self.m.px(SCROLLBAR_HIT),
+            top: self.view.top,
+            right: self.view.right,
+            bottom: self.view.bottom,
+        }
     }
 
     pub(crate) fn in_zone(&self, x: i32, y: i32) -> bool {

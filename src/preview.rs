@@ -1182,7 +1182,13 @@ pub fn run(dir: &str) -> i32 {
         crate::config::set(plan().base_config());
         for screen in SHORT_SCREENS {
             for end in [false, true] {
-                let file = format!("popup_audio_short_{}x{}_{}{}.png", screen.0, screen.1, screen.2, if end { "_end" } else { "" });
+                let file = format!(
+                    "popup_audio_short_{}x{}_{}{}.png",
+                    screen.0,
+                    screen.1,
+                    screen.2,
+                    if end { "_end" } else { "" }
+                );
                 failures += i32::from(!short_png(dir, &file, screen, end));
             }
         }

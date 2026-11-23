@@ -1299,7 +1299,13 @@ fn render(relayout: bool) -> bool {
                 }
                 None => {
                     let work = work_area(&o.anchor.bar);
-                    o.content.limit(limit_for(o.content.scroll_cap(), &work, &o.anchor.bar, o.anchor.top, o.anchor.dpi));
+                    o.content.limit(limit_for(
+                        o.content.scroll_cap(),
+                        &work,
+                        &o.anchor.bar,
+                        o.anchor.top,
+                        o.anchor.dpi,
+                    ));
                     let (w, h) = o.content.size(&surf);
                     let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
                     let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);

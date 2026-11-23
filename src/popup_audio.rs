@@ -1040,8 +1040,8 @@ impl Content for AudioPopup {
 
     fn wheel(&mut self, notches: i32, x: i32, y: i32) -> Reply {
         let in_view = y >= self.scroll.view.top && y < self.scroll.view.bottom;
-        let over_slider = in_view
-            && self.hits.at(x, y).is_some_and(|id| id == ID_SLIDER || (ID_APP_SLIDER..ID_END).contains(&id));
+        let over_slider =
+            in_view && self.hits.at(x, y).is_some_and(|id| id == ID_SLIDER || (ID_APP_SLIDER..ID_END).contains(&id));
         if wheel_action(self.scroll.scrollable(), over_slider) == WheelAction::Scroll {
             let moved = self.scroll.by(-notches * self.scroll.step(), tick_ms());
             return if moved { Reply::Relayout } else { Reply::Redraw };
@@ -1201,14 +1201,25 @@ mod tests {
             asked: 0,
             outputs: Some(
                 (0..6)
-                    .map(|i| OutputDevice { id: format!("d{i}"), name: format!("Device {i}"), is_default: i == 0, kind: audio::DeviceKind::Speaker })
+                    .map(|i| OutputDevice {
+                        id: format!("d{i}"),
+                        name: format!("Device {i}"),
+                        is_default: i == 0,
+                        kind: audio::DeviceKind::Speaker,
+                    })
                     .collect(),
             ),
             spatial: None,
             spatial_loaded: true,
             sessions: Some(
                 (0..apps)
-                    .map(|i| AppSession { pid: i as u32 + 1, system: false, name: format!("App {i}"), level: 50, muted: false })
+                    .map(|i| AppSession {
+                        pid: i as u32 + 1,
+                        system: false,
+                        name: format!("App {i}"),
+                        level: 50,
+                        muted: false,
+                    })
                     .collect(),
             ),
             dragging: false,
