@@ -1240,6 +1240,22 @@ mod tests {
         assert_eq!(offset_of(1, i32::MIN, 0, 0), i32::MAX);
     }
 
+    /// ProfileList as this machine holds it (headless, read-only): read whole, every ProfileImagePath expanded, the
+    /// user's own profile among the entries, and a folder of that profile accepted as a root with the dock's fences.
+    /// Every known and listed folder is refused when `profile_folders` gives None, and the helper logs nothing, so
+    /// this is the one place a failed read shows. Relations only: no name of the machine is written down.
+    #[test]
+    fn profile_folders_reads_this_machine() {
+        let accounts = profile_folders().expect("ProfileList read whole");
+        assert!(!accounts.is_empty());
+        assert!(accounts.iter().all(|a| !a.contains('%')), "every ProfileImagePath expanded");
+        let profile = crate::datadir::known_folder(&FOLDERID_Profile).unwrap().into_os_string().into_string().unwrap();
+        let trim = |s: &str| s.strip_suffix('\\').unwrap_or(s).to_string();
+        assert!(accounts.iter().any(|a| trim(a).eq_ignore_ascii_case(&trim(&profile))), "the user's profile is listed");
+        let fences = file_fences().expect("the fences read whole");
+        assert!(crate::launcher::files::root_of(&format!("{profile}\\Documents"), &fences, false).is_some());
+    }
+
     const CALC: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
     const SETTINGS: &str =
         "shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
