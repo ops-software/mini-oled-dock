@@ -201,8 +201,8 @@
       "status": "pending",
       "unit": "ms",
       "gate": "max",
-      "value": 100,
-      "note": "file rows: 95th percentile from the write of the request to the rows on screen (FILES-1, V-1 b)"
+      "value": 200,
+      "note": "file rows: 95th percentile from the write of the request to the rows on screen, helper running (V-1 b). The gate is SPEC G-b (200 ms); the target of FILES-1 is 100 ms and is read from the same measurement, not gated"
     },
     {
       "id": "launcher.files_rows_first_ms",
