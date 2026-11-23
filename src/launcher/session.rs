@@ -600,7 +600,6 @@ impl Session {
     }
 
     /// The busy mark: the newest files request is taking long (`FilesEvent::Slow`).
-    #[allow(dead_code)] // L2-F4 draws it
     pub fn files_busy(&self) -> bool {
         self.files.busy.is_some_and(|g| g == self.gen)
     }
