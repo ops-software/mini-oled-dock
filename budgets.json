@@ -196,6 +196,42 @@
       "note": "private bytes left after a close and the next hidden trim, over before the open: 0.1 MiB (L3 T19; no window warm)"
     },
     {
+      "id": "launcher.files_rows_p95_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 100,
+      "note": "file rows: 95th percentile from the write of the request to the rows on screen (FILES-1, V-1 b)"
+    },
+    {
+      "id": "launcher.files_rows_first_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 250,
+      "note": "file rows: first request of an open, with the helper spawn (FILES-1, V-1 a)"
+    },
+    {
+      "id": "private.launcher_files_dock",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 131072,
+      "note": "dock private bytes growth while the files helper lives (FILES-4, V-5)"
+    },
+    {
+      "id": "private.launcher_files_helper_delta",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 2097152,
+      "note": "files helper private bytes after its rows, over its state-0 value (FILES-4)"
+    },
+    {
       "id": "exe_size.tasks",
       "where": "CI",
       "status": "pending",
