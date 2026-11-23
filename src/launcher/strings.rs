@@ -38,7 +38,7 @@ pub fn hint_copy() -> &'static str {
 }
 /// A file or folder row that has no Open (an executable while the Mark of the Web check is open): Ctrl+Enter shows it.
 pub fn hint_reveal() -> &'static str {
-    tr("Show in folder · Ctrl+Enter", "Mostra nella cartella · Ctrl+Invio")
+    tr("Open file location · Ctrl+Enter", "Apri percorso file · Ctrl+Invio")
 }
 pub fn hint_run() -> &'static str {
     tr("Run · Enter", "Esegui · Invio")

@@ -216,6 +216,8 @@ pub struct Session {
     actions: Option<ActionList>,
     /// The alias prompt, while it is open.
     alias_edit: Option<AliasEdit>,
+    /// A notice learned while the alias prompt is open, shown under its row by the next `requery`.
+    prompt_notice: Option<Item>,
     /// The last key left the alias prompt by Esc: the next Esc closes.
     esc_closes: bool,
     /// The files provider in this open (plan L2-F3).
@@ -456,6 +458,7 @@ impl Session {
             review: None,
             actions: None,
             alias_edit: None,
+            prompt_notice: None,
             esc_closes: false,
             files: FilesState::default(),
         }
@@ -491,7 +494,6 @@ impl Session {
     }
 
     /// The alias prompt is open.
-    #[cfg(test)]
     pub fn in_alias_prompt(&self) -> bool {
         self.alias_edit.is_some()
     }
@@ -556,6 +558,10 @@ impl Session {
 
     /// One more notice row after those already shown (an open that learns something new), from the next query.
     pub fn push_notice(&mut self, notice: Item) {
+        if self.alias_edit.is_some() {
+            // The prompt runs no provider: the notice shows under its row at the next `refresh`, once.
+            self.prompt_notice = Some(notice.clone());
+        }
         self.results.push_notice(notice);
     }
 
@@ -908,7 +914,7 @@ impl Session {
             // The prompt runs no provider and asks nothing of the rewrite or the files (a waiting request is withdrawn):
             // its one row.
             let row = prompt_row(edit, self.field.text(), cx);
-            self.results.only(row, self.gen);
+            self.results.only(row, self.prompt_notice.take(), self.gen);
             self.mode = Mode::Mixed;
             self.folded.clear();
             let mut fx = vec![Effect::Relayout];

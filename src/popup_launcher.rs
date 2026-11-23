@@ -22,7 +22,7 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
-use crate::launcher::aliases::AliasTable;
+use crate::launcher::aliases::{AliasTable, MAX_ALIASES};
 use crate::launcher::arena::{self, Arena, Caps, CatalogView, Kind as ArenaKind, SettingIn};
 use crate::launcher::catalog::{self, IconCache};
 use crate::launcher::datetime::TimeStyle;
@@ -636,8 +636,17 @@ impl Launcher {
                 Effect::DismissNotice(key) if key == pt_notice_key() => sys.pt_answer(answer_code(None)),
                 // An alias saved or removed: config.json is written on the dock window, outside this content and the key
                 // handler (`on_alias_message`), which then runs the query again.
-                Effect::SaveAlias { word, target } => sys.alias(AliasOp::Save { word, target }),
-                Effect::RemoveAlias(word) => sys.alias(AliasOp::Remove(word)),
+                // A post that failed drops the change at once and says so.
+                Effect::SaveAlias { word, target } => {
+                    if !sys.alias(AliasOp::Save { word, target }) {
+                        reply = reply.merge(self.show_notices(vec![alias_failed_row(AliasFail::Write)], cx, sys));
+                    }
+                }
+                Effect::RemoveAlias(word) => {
+                    if !sys.alias(AliasOp::Remove(word)) {
+                        reply = reply.merge(self.show_notices(vec![alias_failed_row(AliasFail::Write)], cx, sys));
+                    }
+                }
                 // Files (plan L2-F3): one channel send to the pump, never a wait.
                 Effect::RequestFiles(r) => {
                     self.pending_files = None;
@@ -740,6 +749,37 @@ impl Launcher {
             i.score.tier = crate::launcher::rank::T_REWRITE;
         }
         let batch = Batch { gen, from: ProviderId::Apps, items, done: true };
+        if self.session.late(batch, cx) {
+            Reply::Relayout
+        } else {
+            Reply::None
+        }
+    }
+
+    /// The settings came while this open shows none (`on_settings_ready`, the cache file made by the child after the open,
+    /// L-11 (b) of live session B): the current query's settings rows join by themselves, as one late batch of the
+    /// current generation (`Results::late`, the stability rule of the late rows). They go below every row already shown
+    /// and before the web row's slot; with the selection at or below the web row they go after everything. So the
+    /// selected row and every row above it keep their places, and Enter opens what it would have opened. With nothing
+    /// selected (the list held no row that may be the default) the first of them that may be becomes the default, as at
+    /// a keystroke. The next keystroke ranks them with the rest as usual.
+    pub(crate) fn settings_joined(&mut self, cx: &Context) -> Reply {
+        // The alias prompt runs no provider: its one row has nothing to join.
+        if self.session.in_alias_prompt() {
+            return Reply::None;
+        }
+        let gen = self.session.gen();
+        let raw = self.session.last_query();
+        let q = query::parse_query(&raw, &cx.opts.prefixes, cx.num, gen);
+        let mut items = providers::query_all(&q, cx, &mut Budget::default()).into_sorted();
+        let shown = self.session.rows();
+        items.retain(|i| {
+            i.from == ProviderId::Settings && i.kind == Kind::Setting && !shown.iter().any(|r| r.key == i.key)
+        });
+        if items.is_empty() {
+            return Reply::None;
+        }
+        let batch = Batch { gen, from: ProviderId::Settings, items, done: true };
         if self.session.late(batch, cx) {
             Reply::Relayout
         } else {
@@ -2122,21 +2162,25 @@ pub(crate) fn on_catalog(apps: Arc<Arena>) {
 }
 
 /// `ShellEvent::StartSettings`: the settings cache file is good again (or Start's list came). An open launcher that holds
-/// no settings takes them now (new rows appear at the next keystroke, under the stability rule); one that holds them
-/// keeps what it has until it closes, so an Enter never meets an entry index of another file.
+/// no settings takes them now and its rows for what is typed join at once (`Launcher::settings_joined`: below the
+/// selection, nothing above it moves); one that holds them keeps what it has until it closes, so an Enter never meets an
+/// entry index of another file.
 pub(crate) fn on_settings_ready() {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::SettingsReady);
-    if is_on() {
-        settings_ready_on(super::current() == Some(PopupKind::Launcher), &mut RealSys);
+    if is_on() && settings_ready_on(super::current() == Some(PopupKind::Launcher), &mut RealSys) {
+        super::with_launcher(|l| ctx(|cx| l.settings_joined(cx)).unwrap_or(Reply::None));
     }
 }
 
-/// `on_settings_ready` with the launcher open (`open`) or not: only an open launcher that holds no settings maps.
-fn settings_ready_on(open: bool, sys: &mut dyn SysPort) {
+/// `on_settings_ready` with the launcher open (`open`) or not: only an open launcher that holds no settings maps. True
+/// when it mapped them now (its rows may join).
+fn settings_ready_on(open: bool, sys: &mut dyn SysPort) -> bool {
     if open && with_ctrl(|c| c.opts.mask.has(ProviderId::Settings) && c.settings.is_none()) == Some(true) {
         take_settings(sys);
+        return with_ctrl(|c| c.settings.is_some()) == Some(true);
     }
+    false
 }
 
 /// The settings of an open (L3 T19), before its window shows: with the Settings provider on, the cache file mapped and
@@ -2432,8 +2476,11 @@ pub(crate) trait SysPort {
     /// Posts the PowerToys notice's answer to the dock window (`WM_DOCK_LAUNCHER_PT`, `answer_code`).
     fn pt_answer(&mut self, _code: usize) {}
     /// Holds an alias change for the dock window (one slot, `hold_alias_op`) and posts `WM_DOCK_LAUNCHER_ALIAS` to it:
-    /// config.json is written there, never in the key handler.
-    fn alias(&mut self, _op: AliasOp) {}
+    /// config.json is written there, never in the key handler. False: the post failed and the change was dropped (a notice
+    /// says so).
+    fn alias(&mut self, _op: AliasOp) -> bool {
+        true
+    }
     /// A requery's files request of the open numbered `open` to its pump (`launcher_files::request`, plan L2-F3): a
     /// channel send, never a wait.
     fn files(&mut self, _open: u32, _r: Option<crate::launcher::files::Req>) {}
@@ -3000,6 +3047,20 @@ pub(crate) fn hold_alias_op(op: AliasOp) {
     ALIAS_OP.with(|s| *s.borrow_mut() = Some(op));
 }
 
+/// The post of the held change failed: the change (the word and target the user typed) is dropped.
+pub(crate) fn drop_alias_op() {
+    ALIAS_OP.with(|s| *s.borrow_mut() = None);
+}
+
+/// Why an alias change was not written (the notice row says which).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AliasFail {
+    /// config.json could not be written, or the post to the dock window failed.
+    Write,
+    /// config.json already holds `MAX_ALIASES` entries and the word replaces none of them.
+    Full,
+}
+
 /// `WM_DOCK_LAUNCHER_ALIAS`: the alias change the launcher posted is written to config.json (only while a chord is set).
 pub(crate) fn on_alias_message() {
     let op = ALIAS_OP.with(|s| s.borrow_mut().take());
@@ -3026,8 +3087,10 @@ trait AliasCfg {
     fn modify(&mut self, op: &AliasOp) -> Result<(), String>;
     /// The launcher and the Settings window take the new config (`on_config`, `settings_window::on_config_changed`).
     fn applied(&mut self);
+    /// True when the change is a new word and config.json already holds `MAX_ALIASES` entries that stay.
+    fn full(&self, op: &AliasOp) -> bool;
     /// The open launcher runs its query again (the new table's rows), or shows that the change was not saved.
-    fn requery(&mut self, failed: bool);
+    fn requery(&mut self, failed: Option<AliasFail>);
 }
 
 /// Writes an alias change: a pending hand edit is loaded first (and followed up as the housekeeping would), so the
@@ -3037,33 +3100,55 @@ fn apply_alias_op(op: &AliasOp, cfg: &mut dyn AliasCfg) {
     if cfg.pending() && cfg.poll() {
         cfg.follow_up();
     }
+    if cfg.full(op) {
+        log!("launcher: the alias change was refused: config.json holds the most aliases");
+        cfg.requery(Some(AliasFail::Full));
+        return;
+    }
     match cfg.modify(op) {
         Ok(()) => {
             cfg.applied();
-            cfg.requery(false);
+            cfg.requery(None);
         }
         Err(e) => {
             log!("launcher: the alias change was not saved: {e}");
-            cfg.requery(true);
+            cfg.requery(Some(AliasFail::Write));
         }
     }
+}
+
+/// `w` folded as the alias table folds its words.
+fn fold_word(w: &str) -> String {
+    let mut f = String::with_capacity(w.len());
+    crate::launcher::rank::fold(w, &mut f);
+    f
+}
+
+/// Whether the entry (`w`, `t`) stays when the word folded as `f` is saved: it is not the word the table serves under
+/// that fold (the ignored ones stay as written, D9).
+fn keeps_beside(w: &str, t: &str, f: &str, p: &PrefixTable) -> bool {
+    use crate::launcher::aliases::{check_word, classify};
+    fold_word(w) != f || check_word(w, p).is_err() || classify(t).is_err()
+}
+
+/// Saving `word` would leave more than `MAX_ALIASES` entries in config.json (the entries it replaces do not count).
+fn alias_cap_reached(l: &LauncherConfig, word: &str) -> bool {
+    let (f, p) = (fold_word(word), PrefixTable::from_pairs(&l.prefixes));
+    l.aliases.iter().filter(|(w, t)| keeps_beside(w, t, &f, &p)).count() >= MAX_ALIASES
 }
 
 /// The change on `launcher.aliases`. A saved word replaces an entry the table serves whose word is equal to it once
 /// folded (the table would keep only the first of the two); the other entries, those the table ignores included, stay
 /// as written (D9).
 fn edit_aliases(l: &mut LauncherConfig, op: &AliasOp) {
-    let folded = |w: &str| {
-        let mut f = String::with_capacity(w.len());
-        crate::launcher::rank::fold(w, &mut f);
-        f
-    };
     match op {
         AliasOp::Save { word, target } => {
-            use crate::launcher::aliases::{check_word, classify};
-            let f = folded(word);
-            let p = PrefixTable::from_pairs(&l.prefixes);
-            l.aliases.retain(|w, t| folded(w) != f || check_word(w, &p).is_err() || classify(t).is_err());
+            // Never one entry too many, whatever the caller checked.
+            if alias_cap_reached(l, word) {
+                return;
+            }
+            let (f, p) = (fold_word(word), PrefixTable::from_pairs(&l.prefixes));
+            l.aliases.retain(|w, t| keeps_beside(w, t, &f, &p));
             l.aliases.insert(word.to_string(), target.to_string());
         }
         AliasOp::Remove(word) => {
@@ -3095,11 +3180,14 @@ impl AliasCfg for RealAliasCfg {
         on_config();
         crate::settings_window::on_config_changed();
     }
-    fn requery(&mut self, failed: bool) {
+    fn full(&self, op: &AliasOp) -> bool {
+        matches!(op, AliasOp::Save { word, .. } if alias_cap_reached(&crate::config::get().launcher, word))
+    }
+    fn requery(&mut self, failed: Option<AliasFail>) {
         super::with_launcher(|l| {
             ctx(|cx| {
-                if failed {
-                    l.show_notices(vec![alias_failed_row()], cx, &mut RealSys)
+                if let Some(why) = failed {
+                    l.show_notices(vec![alias_failed_row(why)], cx, &mut RealSys)
                 } else {
                     let fx = l.session.refresh(cx);
                     l.run(fx, cx, &mut RealSys)
@@ -3111,8 +3199,12 @@ impl AliasCfg for RealAliasCfg {
 }
 
 /// The row of an alias change config.json did not take (no action).
-fn alias_failed_row() -> Item {
-    notice_row("alias-not-saved", strings::alias_not_saved(), None)
+fn alias_failed_row(why: AliasFail) -> Item {
+    let text = match why {
+        AliasFail::Write => strings::alias_not_saved(),
+        AliasFail::Full => strings::alias_refusal(crate::launcher::aliases::AliasRefusal::Full),
+    };
+    notice_row("alias-not-saved", text, None)
 }
 
 /// The notice's answer may be written: Use Alt+Shift+Space only while no other app holds that chord (`held` runs the
@@ -3940,6 +4032,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeSys {
+        /// Posting an alias change to the dock window fails.
+        alias_post_fails: bool,
         now: u32,
         d3d: bool,
         fs: bool,
@@ -4067,8 +4161,9 @@ mod tests {
         fn ensure_settings(&mut self, rebuild: bool) {
             self.ensures.push(rebuild);
         }
-        fn alias(&mut self, op: AliasOp) {
+        fn alias(&mut self, op: AliasOp) -> bool {
             self.ops.push(Op::Alias(op));
+            !self.alias_post_fails
         }
         fn files(&mut self, _open: u32, r: Option<crate::launcher::files::Req>) {
             self.files.push(r.map(|r| r.gen));
@@ -4205,6 +4300,8 @@ mod tests {
         clip: Option<String>,
         /// The app that copied `clip` marked it private: the port never reads it.
         private: bool,
+        /// Posting an alias change to the dock window fails.
+        alias_post_fails: bool,
         ops: Vec<String>,
         msg_time: u32,
         now: u32,
@@ -4303,8 +4400,9 @@ mod tests {
         fn pt_answer(&mut self, code: usize) {
             self.ops.push(format!("PtAnswer({code})"));
         }
-        fn alias(&mut self, op: AliasOp) {
+        fn alias(&mut self, op: AliasOp) -> bool {
             self.ops.push(format!("Alias({op:?})"));
+            !self.alias_post_fails
         }
         fn files(&mut self, open: u32, r: Option<crate::launcher::files::Req>) {
             self.files.push(r.map(|r| r.gen));
@@ -5302,6 +5400,65 @@ mod tests {
         sys.miss = Some(SettingsMiss::NoKey);
         settings_at_open(&mut sys);
         assert_eq!(sys.ensures.len(), 3);
+    }
+
+    /// diag-start-and-warm item 3: settings that come while the launcher is open and shows none join by themselves (no
+    /// keystroke), as one late batch: the selected row and every row above it keep their places; with nothing selected
+    /// the first settings row becomes the default; with the default on the web row (nothing else answered) they go under
+    /// it and the web row stays the default; the event maps (and so joins) only for an open launcher holding none.
+    #[test]
+    fn settings_join_without_a_keystroke_below_the_selection() {
+        use crate::launcher::providers::tests::Fx;
+        let mut fx = Fx::new();
+        let all = std::mem::take(&mut fx.settings);
+        let titles = |l: &Launcher| l.session.rows().iter().map(|r| r.title.to_string()).collect::<Vec<_>>();
+        let sel = |l: &Launcher| l.session.selected().map(|r| r.title.to_string());
+        // (a) Mixed mode, an app selected: the rows down to the selection stay, the settings come below them.
+        let mut l = typed(&fx, "s");
+        let (before, at) = (titles(&l), l.session.selected_index().expect("a default row"));
+        assert!(!before.iter().any(|t| t == "Schermo"), "{before:?}");
+        fx.settings = all.clone();
+        assert_eq!(l.settings_joined(&fx.cx()), Reply::Relayout);
+        let after = titles(&l);
+        assert_eq!(after[..=at], before[..=at], "the selection and the rows above it keep their places");
+        assert_eq!(sel(&l).as_deref(), Some(before[at].as_str()));
+        let s = after.iter().position(|t| t == "Schermo").expect("joined");
+        assert!(s > at, "{after:?}");
+        assert_eq!(l.settings_joined(&fx.cx()), Reply::None, "the same rows again add nothing");
+        // (b) "$ schermo" with no settings: an empty list, nothing selected; the rows come and the first is the default.
+        fx.settings.clear();
+        let mut l = typed(&fx, "$ schermo");
+        assert!(l.session.selected().is_none() && !l.session.has_matches(), "{:?}", titles(&l));
+        fx.settings = all.clone();
+        assert_eq!(l.settings_joined(&fx.cx()), Reply::Relayout);
+        assert_eq!(sel(&l).as_deref(), Some("Schermo"), "Enter now opens it");
+        // (c) Mixed mode, only the web row answered and is the default: the settings go under it, Enter still searches.
+        fx.settings.clear();
+        let web_only = ["display", "monitor", "accessibilita"].into_iter().find_map(|q| {
+            let l = typed(&fx, q);
+            l.session.selected().is_some_and(|r| r.from == ProviderId::Web).then_some((q, l))
+        });
+        let (q, mut l) = web_only.expect("a query only the web row answers without settings");
+        let web = sel(&l);
+        fx.settings = all.clone();
+        assert_eq!(l.settings_joined(&fx.cx()), Reply::Relayout, "{q}");
+        let after = titles(&l);
+        assert_eq!(sel(&l), web, "{q}: the web row stays the default");
+        assert_eq!(after.first().map(String::as_str), web.as_deref(), "{q}: {after:?}");
+        assert!(after.len() > 1 && after[1..].iter().all(|t| t == "Schermo" || t == "Accessibilità"), "{q}: {after:?}");
+        // The event: only an open launcher holding no settings maps, and only then may its rows join.
+        let mut sys = FakeSys {
+            settings: Some(crate::launcher::arena::test_settings(&[("Schermo", &[], 1)])),
+            ..FakeSys::default()
+        };
+        with_ctrl(|c| c.settings = None);
+        assert!(!settings_ready_on(false, &mut sys), "closed: nothing");
+        assert!(settings_ready_on(true, &mut sys), "open and empty: mapped, the rows join");
+        assert!(!settings_ready_on(true, &mut sys), "held: never replaced, nothing joins");
+        with_ctrl(|c| c.settings = None);
+        sys.miss = Some(SettingsMiss::NoFile);
+        assert!(!settings_ready_on(true, &mut sys), "a failed map: nothing joins");
+        with_ctrl(|c| c.settings = None);
     }
 
     /// L3 T19: a settings row's launch takes its target and arguments from the arena this open searched, at the close,
@@ -6566,6 +6723,12 @@ mod tests {
         assert_eq!(hint("note-a.txt"), Some(strings::hint_open()));
         assert_eq!(hint("notes"), Some(strings::hint_open()));
         assert_eq!(hint("note-c.exe"), Some(strings::hint_reveal()));
+        // One term for one verb: the hint and the action list name Reveal alike, as the Start menu does.
+        assert!(strings::hint_reveal().starts_with(strings::verb_reveal()));
+        crate::i18n::with_italian(true, || {
+            assert_eq!(strings::hint_reveal(), "Apri percorso file · Ctrl+Invio");
+            assert!(strings::hint_reveal().starts_with(strings::verb_reveal()));
+        });
     }
 
     #[test]
@@ -6644,6 +6807,8 @@ mod tests {
         pending: bool,
         reloads: bool,
         fails: bool,
+        /// The table holds its cap (`AliasCfg::full`).
+        full: bool,
         calls: Vec<String>,
     }
 
@@ -6669,8 +6834,15 @@ mod tests {
         fn applied(&mut self) {
             self.calls.push("applied".into());
         }
-        fn requery(&mut self, failed: bool) {
-            self.calls.push(format!("requery {failed}"));
+        fn full(&self, _op: &AliasOp) -> bool {
+            self.full
+        }
+        fn requery(&mut self, failed: Option<AliasFail>) {
+            self.calls.push(match failed {
+                None => "requery false".into(),
+                Some(AliasFail::Write) => "requery true".into(),
+                Some(AliasFail::Full) => "requery full".into(),
+            });
         }
     }
 
@@ -6707,6 +6879,81 @@ mod tests {
         assert_eq!(l.aliases.len(), 3);
         edit_aliases(&mut l, &AliasOp::Remove("gh".into()));
         assert_eq!(l.aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["Gh", "game"]);
+    }
+
+    /// A new word is refused when config.json already holds its cap of entries (the ignored ones count), never written as
+    /// one too many; a word that replaces an entry still saves; the refusal runs no write and says so with a notice.
+    #[test]
+    fn saving_a_new_word_over_the_cap_is_refused() {
+        let mut l = LauncherConfig::default();
+        for i in 0..MAX_ALIASES {
+            l.aliases.insert(format!("w{i}"), "https://example.com/".into());
+        }
+        let save = |w: &str| AliasOp::Save { word: w.into(), target: "https://example.com/new".into() };
+        edit_aliases(&mut l, &save("extra"));
+        assert_eq!(l.aliases.len(), MAX_ALIASES, "not written as one entry too many");
+        assert!(!l.aliases.contains_key("extra"));
+        assert!(alias_cap_reached(&l, "extra"));
+        // The same word, in other letters, replaces the entry: the count stays.
+        assert!(!alias_cap_reached(&l, "W3"));
+        edit_aliases(&mut l, &save("W3"));
+        assert_eq!(
+            (l.aliases.len(), l.aliases.get("W3").map(String::as_str)),
+            (MAX_ALIASES, Some("https://example.com/new"))
+        );
+        assert!(!l.aliases.contains_key("w3"));
+        // The handler: no write, a notice.
+        let mut cfg = FakeCfg { full: true, ..FakeCfg::default() };
+        apply_alias_op(&save("extra"), &mut cfg);
+        assert_eq!(cfg.calls, ["requery full"]);
+        assert_eq!(
+            alias_failed_row(AliasFail::Full).title.as_ref(),
+            strings::alias_refusal(crate::launcher::aliases::AliasRefusal::Full)
+        );
+        assert_eq!(alias_failed_row(AliasFail::Write).title.as_ref(), strings::alias_not_saved());
+    }
+
+    /// A post to the dock window that fails drops the change the user typed at once and says so; the launcher stays.
+    #[test]
+    fn a_failed_alias_post_drops_the_change_and_says_so() {
+        let fx = alias_fx();
+        let mut l = opened(9);
+        let mut sys = EffectSys { alias_post_fails: true, ..EffectSys::default() };
+        let out = l.session.alias_prompt(&fx.cx());
+        l.run(out, &fx.cx(), &mut sys);
+        l.session.chars("docs https://example.com/docs", &fx.cx());
+        let reply = key(&mut l, &fx, &mut sys, VK_RETURN, Mods::NONE);
+        assert_ne!(reply, Reply::Close);
+        let notices: Vec<&Item> = l.session.rows().iter().filter(|r| r.kind == Kind::Notice).collect();
+        assert_eq!(notices.len(), 1, "{:?}", l.session.rows().iter().map(|r| r.title.to_string()).collect::<Vec<_>>());
+        assert_eq!(&*notices[0].title, strings::alias_not_saved());
+        // The held change is gone: a later message finds none to write.
+        hold_alias_op(AliasOp::Remove("x".into()));
+        drop_alias_op();
+        assert!(ALIAS_OP.with(|s| s.borrow().is_none()));
+    }
+
+    /// A paste refused as private while the alias prompt is open shows its notice under the prompt's row, and the prompt's
+    /// row stays the selected one.
+    #[test]
+    fn private_paste_shows_in_the_alias_prompt() {
+        let fx = alias_fx();
+        let mut l = opened(9);
+        let mut sys = EffectSys { clip: Some("hunter2".into()), private: true, ..EffectSys::default() };
+        let out = l.session.alias_prompt(&fx.cx());
+        l.run(out, &fx.cx(), &mut sys);
+        l.session.chars("docs https://example.com/docs", &fx.cx());
+        let sel = l.session.selected().map(|r| r.key);
+        assert_eq!(key(&mut l, &fx, &mut sys, 0x56, Mods::CTRL), Reply::Relayout);
+        assert!(l.session.in_alias_prompt());
+        assert_eq!(l.session.query_text(), "docs https://example.com/docs", "the field is unchanged");
+        let rows = l.session.rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(&*rows[1].title, strings::paste_private());
+        assert_eq!(l.session.selected().map(|r| r.key), sel, "the prompt's row stays selected");
+        // It shows once: the next keystroke is the prompt's one row again.
+        l.session.chars("x", &fx.cx());
+        assert_eq!(l.session.rows().len(), 1);
     }
 
     #[test]

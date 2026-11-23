@@ -473,7 +473,7 @@ fn glyph_of(dir: bool, class: FileClass) -> GlyphId {
 /// The class comes from the name as Windows opens it (`check_hit` holds it to the path's last component, so a trailing
 /// separator hides no extension; the trailing dots and spaces Windows drops are dropped), and the helper's folder flag
 /// is not taken for an executable's name: that row is an executable file, so nothing in the helper's output can give
-/// Open to what SPEC 5.4.6 holds back (a real folder so named keeps Show in folder and Copy).
+/// Open to what SPEC 5.4.6 holds back (a real folder so named keeps Open file location and Copy).
 pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
     let first = folded_words.first().copied().unwrap_or("");
     let mut out = Vec::with_capacity(hits.len().min(usize::from(cap)));

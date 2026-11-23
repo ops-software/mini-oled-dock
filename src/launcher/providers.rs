@@ -1286,7 +1286,8 @@ impl Results {
 
     /// The alias prompt's one row, as a new generation (plan L2-A2): every other row goes (the notices come back with the
     /// next `sync`); it is selected when it can be saved.
-    pub fn only(&mut self, row: Item, gen: u64) {
+    /// `after` is a notice learned while the prompt is open (a refused paste): it shows once, below the prompt's row.
+    pub fn only(&mut self, row: Item, after: Option<Item>, gen: u64) {
         self.rows.clear();
         self.web_at = None;
         self.late_len = 0;
@@ -1295,6 +1296,7 @@ impl Results {
         self.typed = true;
         self.sel = (!row.verbs.is_empty()).then_some(row.key);
         self.rows.push(row);
+        self.rows.extend(after);
         self.sync_len = self.rows.len();
     }
 

@@ -650,13 +650,17 @@ impl SysPort for RealSys {
         }
     }
 
-    fn alias(&mut self, op: crate::popup::popup_launcher::AliasOp) {
+    fn alias(&mut self, op: crate::popup::popup_launcher::AliasOp) -> bool {
         crate::popup::popup_launcher::hold_alias_op(op);
         // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
         let r = unsafe { PostMessageW(Some(crate::hwnd()), crate::msg::WM_DOCK_LAUNCHER_ALIAS, WPARAM(0), LPARAM(0)) };
         if let Err(e) = r {
             log!("launcher: posting the alias change failed: {e}");
+            // Nothing will take the held change: it goes now, not at the next change that replaces it.
+            crate::popup::popup_launcher::drop_alias_op();
+            return false;
         }
+        true
     }
 
     fn files(&mut self, open: u32, r: Option<crate::launcher::files::Req>) {
