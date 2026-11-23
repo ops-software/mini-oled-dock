@@ -521,15 +521,27 @@ const CAPTURE_MAX_BYTES: u64 = 4096;
 /// How long a staged exe may take to answer `--version`.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `exe` must hash to the value published in the release's `.sha256` asset.
-pub(crate) fn verify_bytes(exe: &[u8], sha_file: &[u8]) -> Result<(), String> {
+/// `exe` must hash to the value published in the release's `.sha256` asset and, when GitHub sent one,
+/// to `digest`, the SHA-256 GitHub computed for the uploaded asset (served by api.github.com, not by the
+/// host that serves both files). Hashes once and returns the hash.
+pub(crate) fn verify_bytes(exe: &[u8], sha_file: &[u8], digest: Option<[u8; 32]>) -> Result<[u8; 32], String> {
     let want = parse_sha256_file(sha_file).ok_or("unreadable .sha256 file")?;
     let got = crate::sha256::sha256(exe)?;
-    if got == want {
-        Ok(())
-    } else {
-        Err("SHA-256 mismatch".into())
+    if got != want {
+        return Err("SHA-256 mismatch".into());
     }
+    if digest.is_some_and(|d| d != got) {
+        return Err("SHA-256 differs from GitHub's digest of the asset".into());
+    }
+    Ok(got)
+}
+
+/// What a freshly fetched release announces: the sizes of `dock.exe` and `dock.exe.sha256`, and GitHub's
+/// SHA-256 digest of `dock.exe` when it sent one.
+pub(crate) struct Expected {
+    pub exe: u64,
+    pub sha: u64,
+    pub digest: Option<[u8; 32]>,
 }
 
 /// How often `run_capture` looks at its child.
@@ -911,7 +923,7 @@ fn command_line(exe: &Path, args: &[&str]) -> std::io::Result<Vec<u16>> {
 fn download(rel: &Release) -> Result<(), StageError> {
     let fail = StageError::Download;
     for (asset, name, cap) in [(&rel.exe, EXE_ASSET, EXE_MAX_BYTES), (&rel.sha256, SHA_ASSET, SHA_MAX_BYTES)] {
-        let Asset { url, size } = asset;
+        let Asset { url, size, .. } = asset;
         let resp = winhttp::get(url, &[("Accept", "application/octet-stream")], cap)
             .map_err(|e| fail(format!("{name}: {e}")))?;
         if resp.status != 200 {
@@ -931,7 +943,7 @@ fn download(rel: &Release) -> Result<(), StageError> {
 }
 
 /// Checks the staged `<data>\update\<tag>\dock.exe` and returns its path: hash equal to the staged
-/// `.sha256`, then `dock.exe --version` must print exactly `mini-oled-dock <tag version>`.
+/// `.sha256` (and to GitHub's digest, when `expected` has one), then `dock.exe --version` must print exactly `mini-oled-dock <tag version>`.
 ///
 /// Running the staged exe for `--version` is safe: its SHA-256 matched the `.sha256` of the same
 /// release, both fetched over HTTPS from the allowed GitHub hosts; `datadir` has checked that the
@@ -939,13 +951,14 @@ fn download(rel: &Release) -> Result<(), StageError> {
 /// inside it; the folder was created by this elevated process, so no user can swap the file after
 /// the check.
 ///
-/// `expected` = the asset sizes of a freshly fetched release (`None` only for `--update-install`,
-/// which installs what is staged): a stage of another upload of the same tag is deleted and is
-/// `Download`, so the caller fetches the current assets.
+/// `expected` = the asset sizes and GitHub's digest of a freshly fetched release (`None` only for
+/// `--update-install`, which installs what is staged): a stage of another upload of the same tag is
+/// deleted and is `Download`, so the caller fetches the current assets; an exe whose hash differs from
+/// the digest fails verification.
 ///
 /// A missing file is `Download` (the caller downloads); any other failure deletes the folder and
 /// is `Verify`.
-pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<PathBuf, StageError> {
+pub(crate) fn verify_stage(tag: &str, expected: Option<&Expected>) -> Result<PathBuf, StageError> {
     let Some(version) = parse_tag(tag) else {
         return Err(StageError::Verify(format!("{tag:?} is not a canonical tag")));
     };
@@ -965,7 +978,7 @@ pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<Pa
         (Err(e), _) | (_, Err(e)) => Err(format!("cannot read the staged files: {e}")),
     };
     let checked = files.and_then(|(exe, sha)| {
-        verify_bytes(&exe, &sha)?;
+        verify_bytes(&exe, &sha, expected.and_then(|e| e.digest))?;
         drop(exe);
         let path = datadir::checked_stage_path(tag, EXE_ASSET).map_err(|e| format!("staged exe: {e}"))?;
         let (code, out) = run_capture(&path, &["--version"], VERSION_TIMEOUT, CAPTURE_MAX_BYTES)?;
@@ -986,10 +999,9 @@ pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<Pa
     })
 }
 
-/// true when the staged files have the sizes `expected` (exe, sha256) announces, or no sizes are
-/// expected.
-fn stage_sizes_match(exe: &[u8], sha: &[u8], expected: Option<(u64, u64)>) -> bool {
-    expected.is_none_or(|(e, s)| exe.len() as u64 == e && sha.len() as u64 == s)
+/// true when the staged files have the sizes `expected` announces, or no sizes are expected.
+fn stage_sizes_match(exe: &[u8], sha: &[u8], expected: Option<&Expected>) -> bool {
+    expected.is_none_or(|e| exe.len() as u64 == e.exe && sha.len() as u64 == e.sha)
 }
 
 fn set_phase(phase: Phase) {
@@ -1002,13 +1014,16 @@ fn set_phase(phase: Phase) {
 /// `Ready` / `DownloadFailed` / `VerifyFailed` outcomes.
 fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     set_phase(Phase::Verifying);
-    let sizes = Some((rel.exe.size, rel.sha256.size));
-    let mut r = verify_stage(&rel.tag, sizes);
+    let expected = Expected { exe: rel.exe.size, sha: rel.sha256.size, digest: rel.exe.digest };
+    if expected.digest.is_none() {
+        crate::log!("update: GitHub sent no digest for {}/{EXE_ASSET}; checked against {SHA_ASSET} only", rel.tag);
+    }
+    let mut r = verify_stage(&rel.tag, Some(&expected));
     if matches!(r, Err(StageError::Download(_))) {
         set_phase(Phase::Downloading);
         r = download(rel).and_then(|()| {
             set_phase(Phase::Verifying);
-            verify_stage(&rel.tag, sizes)
+            verify_stage(&rel.tag, Some(&expected))
         });
     }
     match &r {
@@ -1393,17 +1408,34 @@ mod tests {
     #[test]
     fn verify_bytes_compares_the_published_hash() {
         let sha = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  dock.exe\r\n";
-        assert!(verify_bytes(b"abc", sha).is_ok());
-        assert!(verify_bytes(b"abd", sha).is_err());
-        assert!(verify_bytes(b"abc", b"not a hash").is_err());
+        assert!(verify_bytes(b"abc", sha, None).is_ok());
+        assert!(verify_bytes(b"abd", sha, None).is_err());
+        assert!(verify_bytes(b"abc", b"not a hash", None).is_err());
+    }
+
+    #[test]
+    fn verify_bytes_checks_the_github_digest() {
+        let sha = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  dock.exe\r\n";
+        let abc = parse_sha256_file(sha).unwrap();
+        assert_eq!(verify_bytes(b"abc", sha, Some(abc)), Ok(abc));
+        let mut other = abc;
+        other[31] ^= 1;
+        let e = verify_bytes(b"abc", sha, Some(other)).unwrap_err();
+        assert!(e.contains("digest"), "{e}");
+        // No digest: the .sha256 check alone, as before.
+        assert_eq!(verify_bytes(b"abc", sha, None), Ok(abc));
+        assert!(verify_bytes(b"abd", sha, None).unwrap_err().contains("SHA-256 mismatch"));
+        // The .sha256 asset is checked first, whatever the digest says.
+        assert!(verify_bytes(b"abd", sha, Some(abc)).unwrap_err().contains("SHA-256 mismatch"));
     }
 
     #[test]
     fn a_stage_must_match_the_fetched_asset_sizes() {
-        assert!(stage_sizes_match(b"abc", b"0123", Some((3, 4))));
+        let sizes = |exe, sha| Expected { exe, sha, digest: None };
+        assert!(stage_sizes_match(b"abc", b"0123", Some(&sizes(3, 4))));
         assert!(stage_sizes_match(b"abc", b"0123", None)); // --update-install: staged only
-        assert!(!stage_sizes_match(b"abcd", b"0123", Some((3, 4)))); // re-uploaded exe
-        assert!(!stage_sizes_match(b"abc", b"012", Some((3, 4)))); // re-uploaded .sha256
+        assert!(!stage_sizes_match(b"abcd", b"0123", Some(&sizes(3, 4)))); // re-uploaded exe
+        assert!(!stage_sizes_match(b"abc", b"012", Some(&sizes(3, 4)))); // re-uploaded .sha256
     }
 
     fn system32(exe: &str) -> PathBuf {
