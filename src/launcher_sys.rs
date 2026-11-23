@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GlobalFree, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, HGLOBAL, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, GlobalFree, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
+    HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Globalization::{
     CompareStringOrdinal, GetLocaleInfoEx, CSTR_EQUAL, LOCALE_ITIME, LOCALE_SDECIMAL, LOCALE_SSHORTDATE,
@@ -741,18 +741,14 @@ const MAX_ACCOUNTS: u32 = 4_096;
 /// cannot be read whole (no key, more than 4,096 entries, a path over 260 units or not UTF-16, a `%` left): then no
 /// known or listed folder becomes a root. The files helper calls it too, so it logs nothing.
 pub(crate) fn profile_folders() -> Option<Vec<String>> {
-    let mut windows = [0u16; crate::launcher::files::ROOT_UNITS + 1];
-    // SAFETY: `windows` holds its length in writable units.
-    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut windows)) } as usize;
-    let windows = String::from_utf16(windows.get(..n)?).ok()?;
-    let list = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+    let windows = system_windows()?;
     let mut key = HKEY::default();
     // SAFETY: a static NUL-terminated key name; `key` is a writable HKEY, closed below.
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, list, None, KEY_READ, &mut key) } != ERROR_SUCCESS {
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, PROFILE_LIST, None, KEY_READ, &mut key) } != ERROR_SUCCESS {
         return None;
     }
     let (mut all, mut whole) = (Vec::new(), false);
-    let (mut name, mut path) = ([0u16; 256], [0u16; crate::launcher::files::ROOT_UNITS + 1]);
+    let mut name = [0u16; 256];
     for i in 0..MAX_ACCOUNTS {
         let mut n = name.len() as u32;
         // SAFETY: the key is open; `name` holds `n` writable units, which the call ends with a NUL.
@@ -761,27 +757,43 @@ pub(crate) fn profile_folders() -> Option<Vec<String>> {
             whole = true;
             break;
         }
-        let mut bytes = std::mem::size_of_val(&path) as u32;
-        let (value, buf) = (w!("ProfileImagePath"), path.as_mut_ptr().cast());
-        // SAFETY: `name` is the NUL-terminated subkey name; `buf` holds `bytes` writable bytes; the call ends the string
-        // with a NUL, and RRF_NOEXPAND leaves a REG_EXPAND_SZ as stored.
-        let r = (r == ERROR_SUCCESS).then(|| unsafe {
-            let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
-            RegGetValueW(key, PCWSTR(name.as_ptr()), value, flags, None, Some(buf), Some(&mut bytes))
-        });
-        let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
-        match (r, path.get(..len).map(String::from_utf16)) {
-            (Some(ERROR_SUCCESS), Some(Ok(p))) => match expand_system(&p, &windows) {
-                Some(p) => all.push(p),
-                None => break,
-            },
-            (Some(ERROR_FILE_NOT_FOUND), _) => {}
+        let path = (r == ERROR_SUCCESS).then(|| stored_text(key, PCWSTR(name.as_ptr()), w!("ProfileImagePath")));
+        match path.map(|p| p.map(|p| expand_system(&p, &windows))) {
+            Some(Ok(Some(p))) => all.push(p),
+            Some(Err(ERROR_FILE_NOT_FOUND)) => {}
             _ => break,
         }
     }
     // SAFETY: the key opened above, closed once.
     let _ = unsafe { RegCloseKey(key) };
     whole.then_some(all)
+}
+
+/// HKLM's ProfileList key, which only an administrator can change.
+const PROFILE_LIST: PCWSTR = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+
+/// A string value of `key`\`sub` as the registry stores it: RRF_NOEXPAND leaves a REG_EXPAND_SZ unexpanded (Windows would
+/// expand it from the dock's environment), at most 260 units of UTF-16. Err with the read's error, ERROR_INVALID_DATA for
+/// text that is not UTF-16.
+fn stored_text(key: HKEY, sub: PCWSTR, value: PCWSTR) -> Result<String, WIN32_ERROR> {
+    let mut text = [0u16; crate::launcher::files::ROOT_UNITS + 1];
+    let mut bytes = std::mem::size_of_val(&text) as u32;
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    // SAFETY: `sub` and `value` are NUL-terminated; `text` holds `bytes` writable bytes, which the call ends with a NUL.
+    let r = unsafe { RegGetValueW(key, sub, value, flags, None, Some(text.as_mut_ptr().cast()), Some(&mut bytes)) };
+    if r != ERROR_SUCCESS {
+        return Err(r);
+    }
+    let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+    text.get(..len).and_then(|t| String::from_utf16(t).ok()).ok_or(ERROR_INVALID_DATA)
+}
+
+/// The system's Windows folder (GetSystemWindowsDirectoryW), never the environment's %SystemRoot%.
+fn system_windows() -> Option<String> {
+    let mut windows = [0u16; crate::launcher::files::ROOT_UNITS + 1];
+    // SAFETY: `windows` holds its length in writable units.
+    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut windows)) } as usize;
+    String::from_utf16(windows.get(..n)?).ok()
 }
 
 /// A ProfileImagePath as ProfileList stores it, with each `%SystemDrive%` and `%SystemRoot%` (any case) taken from
@@ -1277,10 +1289,6 @@ mod tests {
         assert_eq!(offset_of(1, i32::MIN, 0, 0), i32::MAX);
     }
 
-    /// ProfileList as this machine holds it (headless, read-only): read whole, every ProfileImagePath expanded, the
-    /// user's own profile among the entries, and a folder of that profile accepted as a root with the dock's fences.
-    /// Every known and listed folder is refused when `profile_folders` gives None, and the helper logs nothing, so
-    /// this is the one place a failed read shows. Relations only: no name of the machine is written down.
     /// A ProfileImagePath gets %SystemDrive% and %SystemRoot% from the system's Windows folder (injected here: a system
     /// on E:), whatever the environment says, and no other variable: a user's variable can shadow a system one.
     #[test]
@@ -1302,6 +1310,20 @@ mod tests {
         assert_eq!(expand_system("%SystemDrive%\\Users\\a", ""), None, "no Windows folder");
     }
 
+    /// ProfileList is read as stored (headless, read-only): the system account's ProfileImagePath keeps the %SystemRoot%
+    /// every Windows install stores there, which a read that let Windows expand it from the environment would lose.
+    #[test]
+    fn profile_list_is_read_unexpanded() {
+        let sub = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\S-1-5-18");
+        let raw = stored_text(HKEY_LOCAL_MACHINE, sub, w!("ProfileImagePath")).expect("the system account's profile");
+        assert!(raw.to_ascii_lowercase().starts_with("%systemroot%\\"), "read unexpanded");
+        assert_eq!(stored_text(HKEY_LOCAL_MACHINE, sub, w!("NoSuchValue")), Err(ERROR_FILE_NOT_FOUND));
+    }
+
+    /// ProfileList as this machine holds it (headless, read-only): read whole, every ProfileImagePath expanded, the
+    /// user's own profile among the entries, and a folder of that profile accepted as a root with the dock's fences.
+    /// Every known and listed folder is refused when `profile_folders` gives None, and the helper logs nothing, so
+    /// this is the one place a failed read shows. Relations only: no name of the machine is written down.
     #[test]
     fn profile_folders_reads_this_machine() {
         let accounts = profile_folders().expect("ProfileList read whole");
