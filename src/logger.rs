@@ -8,7 +8,7 @@
 //! renamed to `dock.log.1` (replacing the previous one) and a new file is opened.
 //! If there is no usable data folder (or the file cannot be opened), lines go to the debugger output
 //! (`OutputDebugStringW`, visible with DebugView) besides stdout. The watchdog process uses the same
-//! file with the `wd` tag in its lines.
+//! file with the `wd` tag in its lines, the update guard with the `ug` tag; both write synchronously.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,9 +27,9 @@ const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 static LOG_TX: OnceLock<Sender<Option<String>>> = OnceLock::new();
 /// true = the `log` thread also writes to stdout (only with an attached console).
 static STDOUT_ON: AtomicBool = AtomicBool::new(false);
-/// Process role tag ("" for the dock, "wd" for the watchdog), prepended to lines.
+/// Process role tag ("" for the dock, "wd" for the watchdog, "ug" for the update guard), prepended to lines.
 static TAG: OnceLock<&'static str> = OnceLock::new();
-/// true = synchronous mode (watchdog): no thread, each line is appended straight to the file.
+/// true = synchronous mode (watchdog, update guard): no thread, each line is appended straight to the file.
 static SYNC: AtomicBool = AtomicBool::new(false);
 
 /// Enables the log copy on stdout (call only after attaching a console).
@@ -160,12 +160,12 @@ fn rotate(path: &std::path::Path) {
     let _ = std::fs::rename(path, &old);
 }
 
-/// Starts the `log` thread. `tag` = "" for the dock, "wd" for the watchdog. Must be called once,
-/// before any `log!`. Returns the handle to pass to `stop` (`None` in synchronous `wd` mode).
+/// Starts the `log` thread. `tag` = "" for the dock, "wd" for the watchdog, "ug" for the update guard. Must be called
+/// once, before any `log!`. Returns the handle to pass to `stop` (`None` in the synchronous `wd` and `ug` modes).
 pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
     let _ = TAG.set(tag);
-    if tag == "wd" {
-        // The watchdog logs a handful of lines: no thread, no channel.
+    if logs_synchronously(tag) {
+        // The watchdog and the update guard log a handful of lines: no thread, no channel.
         SYNC.store(true, Relaxed);
         start_marker(tag);
         return None;
@@ -204,6 +204,12 @@ pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
     LOG_TX.set(tx).ok()?;
     start_marker(tag);
     Some(handle)
+}
+
+/// true for the roles that log synchronously, each line on disk when `log!` returns (no thread, no channel): the
+/// watchdog ("wd") and the update guard ("ug"), a process that may be ended at any moment.
+fn logs_synchronously(tag: &str) -> bool {
+    matches!(tag, "wd" | "ug")
 }
 
 /// First line of a run: uptime is a line's time minus this line's time.
@@ -247,5 +253,12 @@ mod tests {
     fn line_keeps_the_tag() {
         assert_eq!(format_line("[s]", "", "msg"), "[s] msg");
         assert_eq!(format_line("[s]", "wd", "msg"), "[s] [wd] msg");
+    }
+
+    #[test]
+    fn the_watchdog_and_the_update_guard_log_synchronously() {
+        assert!(logs_synchronously("wd"));
+        assert!(logs_synchronously("ug"), "a guard ended mid-update leaves its last line on disk");
+        assert!(!logs_synchronously(""), "the dock logs through its log thread");
     }
 }

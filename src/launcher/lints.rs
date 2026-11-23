@@ -1547,8 +1547,9 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// apps send it meanwhile, each of which starts the forward's 3 s again; the UI thread waits on them only through
 /// SHAppBarMessage, the fallback of a refused direct AppBar send, as taskbar::takes_fallback skips it after a timeout),
 /// the tray-fwd thread (no window, nothing to dispatch) and the shell thread's WM_GETICON (none of the dock's windows).
-/// A new SendMessageTimeoutW is listed here first.
-const TIMED_SENDS: [(&str, &str, bool, bool); 8] = [
+/// The update guard's WM_NULL to the new dock's window blocks: the guard has no window, so SMTO_BLOCK only keeps its
+/// 2 s a true bound. A new SendMessageTimeoutW is listed here first.
+const TIMED_SENDS: [(&str, &str, bool, bool); 9] = [
     ("src/ui.rs", "fn answers(", true, false),
     ("src/apps.rs", "fn sys_command(", true, true),
     ("src/taskbar.rs", "fn appbar_direct_at(", true, true),
@@ -1557,6 +1558,7 @@ const TIMED_SENDS: [(&str, &str, bool, bool); 8] = [
     ("src/tray_host.rs", "fn forward_with_shared(", false, false),
     ("src/tray_host.rs", "fn forward_main(", false, false),
     ("src/shell_thread.rs", "fn icon_from_window(", false, false),
+    ("src/update/guard.rs", "fn window_answers(", true, false),
 ];
 
 /// Each SendMessageTimeoutW outside comments, imports and the test module sits in a function `TIMED_SENDS` lists for

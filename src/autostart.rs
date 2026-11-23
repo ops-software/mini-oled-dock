@@ -327,7 +327,7 @@ fn keep_waiting(elapsed: Duration, instance_up: bool, exe_in_use: bool) -> bool 
 /// Known limit: a process whose image path cannot be queried (a protected process) is invisible
 /// here; such a holder is not a dock process, and the copy then fails after `STOP_GRACE` with the
 /// "locked by something else" error.
-fn exe_in_use_by_other(dest: &Path) -> bool {
+pub(crate) fn exe_in_use_by_other(dest: &Path) -> bool {
     let mut pids = vec![0u32; 1024];
     let mut bytes = 0u32;
     loop {

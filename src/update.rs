@@ -44,6 +44,8 @@ use crate::update_release::{
 };
 use crate::winhttp;
 
+pub(crate) mod guard;
+
 /// What the update worker is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Phase {
