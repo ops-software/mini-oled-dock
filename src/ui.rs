@@ -68,15 +68,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SendMessageTimeoutW, SetCursor,
-    SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND,
-    GWL_STYLE, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE, PBT_APMPOWERSTATUSCHANGE, SC_CLOSE,
-    SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
-    WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
+    BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow,
+    IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW,
+    SendMessageTimeoutW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint,
+    EVENT_SYSTEM_FOREGROUND, GUITHREADINFO, GWL_STYLE, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE,
+    PBT_APMPOWERSTATUSCHANGE, SC_CLOSE, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -3548,8 +3548,9 @@ fn within_grace(now: u64, taken_at: u64, grace: u64) -> bool {
 }
 
 /// "Foreground" fallback (the foreground fallback of the original design).
-/// Variant 1: AttachThreadInput to the foreground thread + SetForegroundWindow, only when that thread answers
-/// (`variant1_attempt`); a thread that does not answer is never joined and variant 1 is skipped.
+/// Variant 1: AttachThreadInput to the foreground thread + SetForegroundWindow, only when that thread answers, and so does
+/// every other thread whose window its input queue names (`variant1_attempt`); a thread that does not answer is never
+/// joined and variant 1 is skipped.
 /// Variant 2 (only if 1 failed or was skipped): a synthetic F15 key (releases the foreground
 /// lock) and SetForegroundWindow again.
 /// Variant 3 (only if 2 failed): `SwitchToThisWindow`, which bypasses the lock in cases where the
@@ -3606,22 +3607,55 @@ thread_local! {
 enum Variant1 {
     /// No other thread in front (no foreground window, or one of the dock's thread): variant 1 without a join.
     Alone,
-    /// The foreground thread answered: its input queue is joined for variant 1, as in 1.4.3.
+    /// The foreground thread answered, and so did the other threads its input queue names: the queue is joined for
+    /// variant 1, as in 1.4.3.
     Joined,
     /// The foreground thread does not answer: no join and no variant 1, whose activation would wait for it.
     Skipped,
+    /// The foreground thread answers, another thread whose window its input queue names does not (`queue_answers`):
+    /// no join and no variant 1, as for `Skipped`.
+    QueueSilent,
 }
 
 /// The choice of variant 1 for the foreground thread `fg_tid` (0: no foreground window) seen from the dock's thread
-/// `my_tid`. `answers` (the ping) is asked only when there is another thread to join.
-fn variant1(fg_tid: u32, my_tid: u32, answers: impl FnOnce() -> bool) -> Variant1 {
+/// `my_tid`. `front` (the ping of the foreground window), then `queue` (the other threads of its input queue), are
+/// asked only when there is another thread to join.
+fn variant1(fg_tid: u32, my_tid: u32, front: impl FnOnce() -> bool, queue: impl FnOnce() -> bool) -> Variant1 {
     if fg_tid == 0 || fg_tid == my_tid {
         Variant1::Alone
-    } else if answers() {
-        Variant1::Joined
-    } else {
+    } else if !front() {
         Variant1::Skipped
+    } else if !queue() {
+        Variant1::QueueSilent
+    } else {
+        Variant1::Joined
     }
+}
+
+/// Whether `tid`, the thread of a window the foreground input queue names, is a third thread that must answer before the
+/// join: neither the foreground thread `fg_tid` (pinged already) nor the dock's `my_tid`; 0 is no window or one gone.
+fn third_thread(tid: u32, fg_tid: u32, my_tid: u32) -> bool {
+    tid != 0 && tid != fg_tid && tid != my_tid
+}
+
+/// Whether the windows the input queue of the foreground thread `fg_tid` names (active, focus, capture, menu owner,
+/// move-size) answer when they belong to a third thread. Windows shares one input queue between a window and its child
+/// windows of another thread or process (a preview pane, an out-of-process designer, an in-place OLE server): joined to
+/// it, variant 1's activation sends WM_NCACTIVATE, WM_KILLFOCUS and the like to them and waits for their thread, which
+/// the foreground window's ping says nothing about. GetGUIThreadInfo sends nothing; its failure is taken as silence.
+/// UI thread.
+fn queue_answers(fg_tid: u32, my_tid: u32) -> bool {
+    let mut gti = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    // SAFETY: `gti` is writable for the call and its cbSize is set, as the call requires.
+    if unsafe { GetGUIThreadInfo(fg_tid, &mut gti) }.is_err() {
+        return false;
+    }
+    let wins = [gti.hwndActive, gti.hwndFocus, gti.hwndCapture, gti.hwndMenuOwner, gti.hwndMoveSize];
+    wins.into_iter().all(|w| {
+        // SAFETY: any handle; a null or stale one yields 0.
+        let tid = unsafe { GetWindowThreadProcessId(w, None) };
+        !third_thread(tid, fg_tid, my_tid) || front_answers(w, tid)
+    })
 }
 
 /// Whether thread `tid` is still taken as silent at `now`, `last` being the last thread that did not answer and when.
@@ -3644,8 +3678,8 @@ pub(crate) fn answers(h: HWND) -> bool {
     unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), flags, PING_MS, Some(&mut res)) }.0 != 0
 }
 
-/// `answers` for the foreground window `fg` of thread `tid`, which a thread that did not answer in the last
-/// `SILENT_MS` skips. UI thread.
+/// `answers` for a window `fg` of thread `tid` that variant 1 would wait for (the foreground window, another thread's
+/// window in its input queue), which a thread that did not answer in the last `SILENT_MS` skips. UI thread.
 fn front_answers(fg: HWND, tid: u32) -> bool {
     let now = now_ms();
     if SILENT.with(|s| still_silent(s.get(), tid, now)) {
@@ -3659,17 +3693,21 @@ fn front_answers(fg: HWND, tid: u32) -> bool {
 }
 
 /// Variant 1 of `force_foreground`, the dock's only AttachThreadInput (launcher lint 17): the dock's input queue is
-/// joined to the foreground thread's only when that thread answers (`variant1`). Joined, the raise and the activation
-/// below wait for that thread: one that stopped pumping held the dock's UI thread for as long as it hung (live check
-/// V-14, 28.5 s; the watchdog then gave the taskbar back). None when variant 1 was skipped.
+/// joined to the foreground thread's only when that thread and the others its queue names answer (`variant1`). Joined,
+/// the raise and the activation below wait for those threads: one that stopped pumping held the dock's UI thread for as
+/// long as it hung (live check V-14, 28.5 s; the watchdog then gave the taskbar back). None when variant 1 was skipped.
 fn variant1_attempt(h: HWND, fg: HWND) -> Option<bool> {
     // SAFETY: `fg` is an HWND obtained from Windows (or null: then the call returns 0); the out pid is optional.
     let fg_tid = if fg.0.is_null() { 0 } else { unsafe { GetWindowThreadProcessId(fg, None) } };
     // SAFETY: no preconditions.
     let my_tid = unsafe { GetCurrentThreadId() };
-    let v = variant1(fg_tid, my_tid, || front_answers(fg, fg_tid));
+    let v = variant1(fg_tid, my_tid, || front_answers(fg, fg_tid), || queue_answers(fg_tid, my_tid));
     if v == Variant1::Skipped {
         log!("  foreground variant 1 skipped: the foreground window does not answer, its input queue is not joined");
+        return None;
+    }
+    if v == Variant1::QueueSilent {
+        log!("  foreground variant 1 skipped: another thread's window in the foreground input queue does not answer");
         return None;
     }
     let joined = v == Variant1::Joined;
@@ -3960,13 +3998,28 @@ mod tests {
 
     #[test]
     fn variant1_joins_only_a_front_thread_that_answers() {
-        // A front window that answers: its input queue is joined, as in 1.4.3.
-        assert_eq!(variant1(7, 3, || true), Variant1::Joined);
-        // A front window that does not answer (hung, or busy past the ping): never joined (live check V-14).
-        assert_eq!(variant1(7, 3, || false), Variant1::Skipped);
+        // A front window that answers, and so does its input queue: the queue is joined, as in 1.4.3.
+        assert_eq!(variant1(7, 3, || true, || true), Variant1::Joined);
+        // A front window that does not answer (hung, or busy past the ping): never joined (live check V-14), and its
+        // queue is not looked at.
+        assert_eq!(variant1(7, 3, || false, || unreachable!("no queue look after a silent ping")), Variant1::Skipped);
+        // A front window that answers whose queue holds another thread's window that does not (a hung child window of
+        // another process, which shares the queue): never joined either.
+        assert_eq!(variant1(7, 3, || true, || false), Variant1::QueueSilent);
         // No foreground window, or the dock's own thread in front: nothing to join, and no ping.
-        assert_eq!(variant1(0, 3, || unreachable!("no ping without a foreground thread")), Variant1::Alone);
-        assert_eq!(variant1(3, 3, || unreachable!("no ping to the dock's own thread")), Variant1::Alone);
+        let none = || -> bool { unreachable!("no ping without another thread") };
+        assert_eq!(variant1(0, 3, none, none), Variant1::Alone);
+        assert_eq!(variant1(3, 3, none, none), Variant1::Alone);
+    }
+
+    #[test]
+    fn a_third_thread_in_the_front_queue_must_answer() {
+        // The focus window of a child of another thread in the foreground queue: pinged before the join.
+        assert!(third_thread(9, 7, 3));
+        // The foreground thread itself (pinged already), the dock's thread, no window or one gone: not asked.
+        assert!(!third_thread(7, 7, 3));
+        assert!(!third_thread(3, 7, 3));
+        assert!(!third_thread(0, 7, 3));
     }
 
     #[test]
@@ -4050,6 +4103,20 @@ mod tests {
             waited.as_millis(),
             t.elapsed().as_micros()
         );
+        // The look at the queue a front window that answers adds before the join: GetGUIThreadInfo and no ping (the
+        // message-only window's queue names no window; a third thread's would cost one ping as above).
+        // SAFETY: no preconditions.
+        let me = unsafe { GetCurrentThreadId() };
+        let mut us: Vec<u128> = (0..2000)
+            .map(|_| {
+                let t = Instant::now();
+                assert!(queue_answers(tid, me));
+                t.elapsed().as_micros()
+            })
+            .collect();
+        us.sort_unstable();
+        let at = |p: usize| us[(us.len() - 1) * p / 100];
+        println!("queue look: p50 {} us, p95 {} us, p99 {} us, max {} us", at(50), at(95), at(99), at(100));
         // SAFETY: a thread message to the pump thread.
         unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) }.expect("the pump thread runs");
         pump.join().expect("the pump thread ends");
