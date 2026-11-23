@@ -98,7 +98,7 @@ mod update_release;
 mod watchdog;
 mod winhttp;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed};
 use std::sync::OnceLock;
@@ -134,11 +134,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use msg::{
-    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_CONFIG_COALESCE, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
-    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_CONFIG_CHANGED,
-    WM_DOCK_DIAG,
-    WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU,
-    WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
+    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_CONFIG_COALESCE, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER,
+    TIMER_POLL, TIMER_RAM, TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_TRIM, TIMER_UPDATE_CHECK,
+    WM_DOCK_CONFIG_APPLY, WM_DOCK_CONFIG_CHANGED, WM_DOCK_DIAG, WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS,
+    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE,
+    WM_DOCK_TRAY_CHANGED, WM_DOCK_TRIM_KICK, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -441,6 +441,119 @@ fn trim_step(s: &mut TrimState, now: Instant, visible: bool, popup: bool, rearm:
     go
 }
 
+/// Milliseconds until the next hidden trim is worth trying, or None when there is nothing to wait for. None once the
+/// current hidden period has trimmed (unless `rearm`: data was freed since); 4 s while a popup or the Settings window
+/// is open (the trim never runs under the user's hands; a close kicks it sooner); else the time left to 4 s after
+/// `hidden_since` or to 60 s after `last_trim`, whichever is later, at least 250 ms.
+fn hidden_trim_retry_ms(s: &TrimState, now: Instant, popup: bool, rearm: bool) -> Option<u32> {
+    if popup {
+        return Some(TRIM_HIDDEN_DELAY.as_millis() as u32);
+    }
+    if s.trimmed && !rearm {
+        return None;
+    }
+    let since = s.hidden_since.unwrap_or(now) + TRIM_HIDDEN_DELAY;
+    let due = s.last_trim.map_or(since, |t| since.max(t + TRIM_MIN_GAP));
+    let left = due.saturating_duration_since(now).as_millis();
+    Some(left.clamp(250, u128::from(u32::MAX)) as u32)
+}
+
+/// Whether `TIMER_HOUSEKEEPING` has work: the visible-idle trim and the bar's own upkeep while shown, an automatic
+/// install waiting for an idle moment, the config poll while the folder watch is down.
+fn housekeeping_wanted(visible: bool, install_pending: bool, config_watch: bool) -> bool {
+    visible || install_pending || !config_watch
+}
+
+thread_local! {
+    /// Armed state of `TIMER_HOUSEKEEPING` and `TIMER_RAM` (UI thread): SetTimer only on a transition, since arming
+    /// again would restart the period.
+    static HOUSEKEEPING_ARMED: Cell<bool> = const { Cell::new(false) };
+    static RAM_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn timer_transition(h: HWND, id: usize, ms: u32, armed: &'static std::thread::LocalKey<Cell<bool>>, want: bool) {
+    if armed.with(|a| a.replace(want)) != want {
+        if want {
+            set_timer(h, id, ms);
+        } else {
+            // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+            let _ = unsafe { KillTimer(Some(h), id) };
+        }
+    }
+}
+
+/// Arms or kills `TIMER_HOUSEKEEPING` by `housekeeping_wanted`.
+fn housekeeping_sync(h: HWND) {
+    let want = housekeeping_wanted(ui::is_visible(), update::auto_install_pending(), config::watching());
+    timer_transition(h, TIMER_HOUSEKEEPING, 2000, &HOUSEKEEPING_ARMED, want);
+}
+
+/// Arms or kills `TIMER_RAM`: the 30 s RAM line only while the bar is shown.
+fn ram_sync(h: HWND) {
+    timer_transition(h, TIMER_RAM, 30_000, &RAM_ARMED, ui::is_visible());
+}
+
+/// Starts a new hidden period for the trim (a popup or Settings close, a data release, a show).
+fn trim_period_reset(now: Instant) {
+    TRIM.with(|s| reset_hidden_period(&mut s.borrow_mut(), now));
+}
+
+fn reset_hidden_period(s: &mut TrimState, now: Instant) {
+    s.hidden_since = None;
+    s.trimmed = false;
+    s.last_activity = Some(now);
+}
+
+/// (Re)arms the one-shot `TIMER_TRIM` while the bar is hidden: for the hidden trim still to come and for the planned
+/// second COM pass, whichever is earlier; killed when there is neither (and while the bar is shown).
+fn arm_trim_timer(h: HWND) {
+    let now = Instant::now();
+    let ms = if ui::is_visible() {
+        None
+    } else {
+        let popup = popup::is_open() || settings_window::is_open();
+        let retry = TRIM.with(|s| hidden_trim_retry_ms(&s.borrow(), now, popup, false));
+        let pass = mem::second_pass_in(now).map(|d| d.as_millis().clamp(250, u128::from(u32::MAX)) as u32);
+        retry.into_iter().chain(pass).min()
+    };
+    match ms {
+        Some(ms) => set_timer(h, TIMER_TRIM, ms),
+        // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+        None => drop(unsafe { KillTimer(Some(h), TIMER_TRIM) }),
+    }
+}
+
+/// A new hidden period starts now (a popup or the Settings window closed, data was released): with the bar hidden,
+/// the trim runs 4 s from now (at most once per 60 s) and the timer follows. Nothing while the bar is shown.
+/// UI thread only.
+pub(crate) fn trim_kick(h: HWND) {
+    if h.0.is_null() || ui::is_visible() {
+        return;
+    }
+    trim_period_reset(Instant::now());
+    trim_tick();
+    arm_trim_timer(h);
+}
+
+/// The bar was shown or hidden (`ui::on_visibility`): the RAM line and housekeeping follow, the hidden trim starts
+/// 4 s after a hide and is cancelled by a show.
+pub(crate) fn on_bar_visibility(visible: bool) {
+    let h = hwnd();
+    if h.0.is_null() {
+        return;
+    }
+    ram_sync(h);
+    housekeeping_sync(h);
+    if visible {
+        trim_period_reset(Instant::now());
+        arm_trim_timer(h);
+    } else {
+        // `trim_tick` records `hidden_since`; the timer then fires when the delay is over.
+        trim_tick();
+        arm_trim_timer(h);
+    }
+}
+
 /// Decides whether to trim memory now; never during show/hide animations (4 s hidden delay).
 fn trim_tick() {
     mem::second_pass_tick(Instant::now());
@@ -450,6 +563,10 @@ fn trim_tick() {
     let go = TRIM.with(|s| trim_step(&mut s.borrow_mut(), Instant::now(), visible, popup, mem::take_rearm()));
     if let Some(reason) = go {
         mem::trim(reason);
+        if reason == "hidden" {
+            // The hidden bar has no 30 s RAM line: one line per hidden trim instead.
+            mem::log_memory();
+        }
     }
 }
 
@@ -490,6 +607,15 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         ui::foreground_is_fullscreen(),
                     ));
                 }
+                housekeeping_sync(h);
+                LRESULT(0)
+            }
+            TIMER_TRIM => {
+                // One-shot: it kills itself before running, then arms itself again if there is more to wait for.
+                // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+                let _ = unsafe { KillTimer(Some(h), TIMER_TRIM) };
+                trim_tick();
+                arm_trim_timer(h);
                 LRESULT(0)
             }
             TIMER_CONFIG_COALESCE => {
@@ -579,6 +705,11 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_POPUP_CLOSED => {
             ui::on_popup_closed();
+            trim_kick(h);
+            LRESULT(0)
+        }
+        WM_DOCK_TRIM_KICK => {
+            trim_kick(h);
             LRESULT(0)
         }
         WM_DOCK_CONFIG_CHANGED => {
@@ -606,6 +737,8 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_UPDATE => {
             update::on_changed(h);
+            // An automatic install may just have become pending: housekeeping is its only driver.
+            housekeeping_sync(h);
             settings_window::on_update_changed();
             LRESULT(0)
         }
@@ -949,6 +1082,7 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
         TIMER_HOVER_PICKER,
         TIMER_UPDATE_CHECK,
         TIMER_CONFIG_COALESCE,
+        TIMER_TRIM,
     ] {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), id) };
@@ -1122,13 +1256,16 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     }
 
     // Service timers (the UI ones are armed by `ui::attach`).
-    set_timer(h, TIMER_HOUSEKEEPING, 2000);
-    set_timer(h, TIMER_RAM, 30_000);
     set_timer(h, TIMER_SECOND, watchdog::HEARTBEAT_MS);
     update::init(h);
     // A hand edit of config.json is applied from the folder's change notification; without it, housekeeping polls.
     config::start_watch(h);
     mem::log_memory();
+    // The service timers by state (the bar's visibility changes keep them in step from here); a bar that starts hidden
+    // trims 4 s from now.
+    housekeeping_sync(h);
+    ram_sync(h);
+    trim_kick(h);
 
     // The window already exists (HWND_RAW set): the callback can post messages to it.
     let t = hook::start()?;
@@ -1416,6 +1553,91 @@ mod tests {
         assert!(auto_install_busy(true, false, false), "popup open");
         assert!(auto_install_busy(false, false, true), "fullscreen app");
         assert!(!auto_install_busy(false, false, false));
+    }
+
+    #[test]
+    fn housekeeping_only_where_it_has_work() {
+        for visible in [false, true] {
+            for install in [false, true] {
+                for watch in [false, true] {
+                    assert_eq!(
+                        housekeeping_wanted(visible, install, watch),
+                        visible || install || !watch,
+                        "{visible} {install} {watch}"
+                    );
+                }
+            }
+        }
+        // Hidden, watching, nothing pending: off. A pending automatic install keeps it armed while hidden.
+        assert!(!housekeeping_wanted(false, false, true));
+        assert!(housekeeping_wanted(false, true, true));
+        assert!(housekeeping_wanted(false, false, false));
+    }
+
+    #[test]
+    fn hidden_trim_once_per_hidden_period() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        // The hide's own tick records hidden_since; the timer is due 4 s on.
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(hidden_trim_retry_ms(&s, at(0), false, false), Some(4000));
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        assert_eq!(hidden_trim_retry_ms(&s, at(4), false, false), None);
+        // Data freed since: one more trim, at the end of the 60 s gap.
+        assert_eq!(hidden_trim_retry_ms(&s, at(10), false, true), Some(54_000));
+    }
+
+    #[test]
+    fn the_rate_gap_retries_once() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        // A new hidden period 10 s later: the trim waits for the gap (60 s after the last one), no longer.
+        reset_hidden_period(&mut s, at(10));
+        assert_eq!(trim_step(&mut s, at(10), false, false, false), None);
+        assert_eq!(hidden_trim_retry_ms(&s, at(10), false, false), Some(54_000));
+        assert_eq!(trim_step(&mut s, at(64), false, false, false), Some("hidden"));
+        assert_eq!(hidden_trim_retry_ms(&s, at(64), false, false), None);
+        // Never below 250 ms.
+        let s = TrimState { hidden_since: Some(at(0)), last_trim: None, ..TrimState::default() };
+        assert_eq!(hidden_trim_retry_ms(&s, at(4), false, false), Some(250));
+    }
+
+    #[test]
+    fn an_open_popup_defers_the_hidden_trim() {
+        let t0 = Instant::now();
+        let mut s = TrimState::default();
+        assert_eq!(hidden_trim_retry_ms(&s, t0, true, false), Some(4000));
+        s.trimmed = true;
+        assert_eq!(hidden_trim_retry_ms(&s, t0, true, false), Some(4000));
+        // No trim while the popup is open, even a long time after the hide.
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, t0, false, true, false), None);
+        assert_eq!(trim_step(&mut s, t0 + Duration::from_secs(30), false, true, false), None);
+    }
+
+    #[test]
+    fn a_close_while_hidden_trims_again() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        assert_eq!(hidden_trim_retry_ms(&s, at(5), false, false), None);
+        // The kick after a close at 100 s: a new hidden period, the trim 4 s on.
+        reset_hidden_period(&mut s, at(100));
+        assert_eq!(trim_step(&mut s, at(100), false, false, false), None);
+        assert_eq!(s.hidden_since, Some(at(100)));
+        assert!(!s.trimmed);
+        assert_eq!(hidden_trim_retry_ms(&s, at(100), false, false), Some(4000));
+        assert_eq!(trim_step(&mut s, at(104), false, false, false), Some("hidden"));
+        // A close 20 s after a trim: the time left to the 60 s gap.
+        reset_hidden_period(&mut s, at(124));
+        assert_eq!(trim_step(&mut s, at(124), false, false, false), None);
+        assert_eq!(hidden_trim_retry_ms(&s, at(124), false, false), Some(40_000));
     }
 
     #[test]

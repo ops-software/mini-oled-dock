@@ -127,9 +127,12 @@ pub const WM_SHELL_SPATIAL_CHANGED: u32 = WM_APP + 22;
 
 /// 50 ms, always on: auto-hide, screen edge, topmost re-assertion. Handled by `ui`.
 pub const TIMER_POLL: usize = 1;
-/// 2 s: config mtime check (`config::poll_changed`), idle trim, automatic install. Handled by `main`.
+/// 2 s, armed only while it has work (`main::housekeeping_wanted`: the bar is shown, an automatic install is pending
+/// or the config watch failed): config mtime check while the folder watch is down, visible-idle trim, automatic
+/// install. Handled by `main`.
 pub const TIMER_HOUSEKEEPING: usize = 2;
-/// 30 s: RAM log (private working set). Handled by `main`.
+/// 30 s while the bar is shown: RAM log (private working set); while hidden one line follows each hidden trim.
+/// Handled by `main`.
 pub const TIMER_RAM: usize = 3;
 /// 3 s (`watchdog::HEARTBEAT_MS`): keepalive heartbeat of an idle dock + taskbar safety check
 /// (`taskbar::on_safety_timer`); while messages flow the heartbeat comes from `watchdog::beat_if_due` in `wnd_proc` (dock
@@ -169,6 +172,13 @@ pub const TIMER_BATTERY: usize = 13;
 /// then the remaining time to 24 h since `last_update_check`, 24 h after a check, 1 h after a failed
 /// scheduled check. Handled by `main` -> `update::on_timer`.
 pub const TIMER_UPDATE_CHECK: usize = 14;
+/// any thread -> dock window: start a new hidden-trim period (`mem::rearm` posts it; `main::trim_kick`). wParam =
+/// lParam = 0. Not `WM_APP + 29` (the launcher's alias message).
+pub const WM_DOCK_TRIM_KICK: u32 = WM_APP + 30;
+/// One-shot on the dock window while the bar is hidden: the hidden trim (4 s after a hide, a popup or Settings close
+/// or a data release; `main::trim_kick`) and the planned second COM pass. Kills itself, then `trim_tick`.
+/// Handled by `main`.
+pub const TIMER_TRIM: usize = 15;
 /// One-shot 250 ms on the dock window after a config change notification (`WM_DOCK_CONFIG_CHANGED`): coalesces an
 /// editor's several writes, so a half-written file is not read. Kills itself, then applies. Handled by `main`.
 pub const TIMER_CONFIG_COALESCE: usize = 16;
@@ -263,12 +273,12 @@ mod tests {
     fn message_and_timer_ids_are_distinct() {
         // WM_APP + n of msg.rs: one window, one id space.
         let msgs = scan(include_str!("msg.rs"), "WM_", "u32", "WM_APP +");
-        assert!(msgs.len() >= 26, "msg.rs scan found only {} WM_APP ids", msgs.len());
+        assert!(msgs.len() >= 28, "msg.rs scan found only {} WM_APP ids", msgs.len());
         assert_distinct("msg.rs WM_APP", &msgs);
 
         // Timer ids of the dock window: msg.rs's TIMER_ consts and ui.rs's private ones.
         let mut timers = scan(include_str!("msg.rs"), "TIMER_", "usize", "");
-        assert!(timers.len() >= 26, "msg.rs scan found only {} timer ids", timers.len());
+        assert!(timers.len() >= 28, "msg.rs scan found only {} timer ids", timers.len());
         let ui = scan(include_str!("ui.rs"), "TIMER_", "usize", "");
         assert!(ui.len() >= 3, "ui.rs scan found only {} private timer ids", ui.len());
         timers.extend(ui);

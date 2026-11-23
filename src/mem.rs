@@ -57,8 +57,20 @@ pub fn second_pass_tick(now: Instant) {
     if second_pass_due(*g, now) {
         *g = None;
         drop(g);
-        rearm();
+        // The flag only: the caller is `trim_tick`, which reads it right after, so no kick message is needed.
+        REARM.store(true, Ordering::Relaxed);
     }
+}
+
+/// Time left to the planned second pass (zero when due), None when none is planned: the hidden bar's trim timer is
+/// armed for it, since the housekeeping tick that used to notice it no longer runs while hidden.
+fn second_pass_in_at(planned: Option<Instant>, now: Instant) -> Option<Duration> {
+    planned.map(|t| t.saturating_duration_since(now))
+}
+
+/// `second_pass_in_at` for the pass planned now.
+pub fn second_pass_in(now: Instant) -> Option<Duration> {
+    second_pass_in_at(*SECOND_PASS.lock().unwrap_or_else(|e| e.into_inner()), now)
 }
 
 /// Most modules whose base and name are tracked (the process has about 80; the count itself is never capped).
@@ -232,8 +244,23 @@ pub fn last_hidden_trim() -> Option<usize> {
 }
 
 /// Asks the idle trim to run again in the next hidden period (data was freed, the earlier trim did not see it).
+///
+/// Also posts `WM_DOCK_TRIM_KICK` to the dock window (from any thread; nothing while there is no window): with the
+/// housekeeping tick off while hidden, the UI thread starts a new hidden period and arms the trim timer (`trim_kick`).
 pub fn rearm() {
     REARM.store(true, Ordering::Relaxed);
+    let h = crate::hwnd();
+    if !h.0.is_null() {
+        // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
+        let _ = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(h),
+                crate::msg::WM_DOCK_TRIM_KICK,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            )
+        };
+    }
 }
 
 /// Consumes the flag of `rearm`.
@@ -326,6 +353,15 @@ pub fn trim(reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_second_pass_arms_the_trim_timer() {
+        let t = Instant::now();
+        assert_eq!(second_pass_in_at(None, t), None);
+        let p = Some(t + SECOND_PASS_AFTER);
+        assert_eq!(second_pass_in_at(p, t + Duration::from_secs(60)), Some(Duration::from_secs(600)));
+        assert_eq!(second_pass_in_at(p, t + Duration::from_secs(700)), Some(Duration::ZERO));
+    }
 
     #[test]
     fn shell_com_work_plans_one_second_pass() {

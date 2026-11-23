@@ -1492,8 +1492,9 @@ pub fn start_watch(ui: windows::Win32::Foundation::HWND) -> bool {
     // SAFETY: `change` is a valid notification handle owned by the statics until `stop_watch`; the callback is an
     // `extern "system"` fn that stays valid for the whole process. WT_EXECUTEINWAITTHREAD: one callback per
     // notification, never two at once (the callback re-arms the handle before the wait thread waits again).
-    let reg =
-        unsafe { RegisterWaitForSingleObject(&mut wait, change, Some(on_folder_change), None, INFINITE, WT_EXECUTEINWAITTHREAD) };
+    let reg = unsafe {
+        RegisterWaitForSingleObject(&mut wait, change, Some(on_folder_change), None, INFINITE, WT_EXECUTEINWAITTHREAD)
+    };
     if let Err(e) = reg {
         WATCH_CHANGE.store(0, SeqCst);
         // SAFETY: the handle came from FindFirstChangeNotificationW and is closed once.
@@ -1515,7 +1516,8 @@ pub fn stop_watch() {
     if wait != 0 {
         // SAFETY: `wait` came from RegisterWaitForSingleObject and is unregistered once (the swap above);
         // INVALID_HANDLE_VALUE waits for a callback in progress, so the notification is idle when it is closed.
-        if let Err(e) = unsafe { UnregisterWaitEx(HANDLE(wait as *mut core::ffi::c_void), Some(INVALID_HANDLE_VALUE)) } {
+        if let Err(e) = unsafe { UnregisterWaitEx(HANDLE(wait as *mut core::ffi::c_void), Some(INVALID_HANDLE_VALUE)) }
+        {
             crate::log!("config: UnregisterWaitEx failed: {e}");
         }
     }

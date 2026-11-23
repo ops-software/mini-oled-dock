@@ -385,6 +385,8 @@ thread_local! {
     static LAST_POS: Cell<Option<POINT>> = const { Cell::new(None) };
     /// Edge watch: `now_ms()` when the pointer was last seen to move.
     static STILL_SINCE: Cell<u64> = const { Cell::new(0) };
+    /// `now_ms()` of the last `refresh_apps` (`apps_fresh`).
+    static LAST_APPS_REFRESH: Cell<u64> = const { Cell::new(0) };
     /// true if the apps debounce timer is armed.
     static DEBOUNCE_ARMED: Cell<bool> = const { Cell::new(false) };
     /// `config.names` at the last `rebuild_entries` (to redo the requests if it changes).
@@ -454,7 +456,7 @@ pub fn attach(h: HWND) -> Result<(), String> {
     rebuild_entries();
     STILL_SINCE.set(now_ms());
     poll_sync();
-    set_timer(h, TIMER_RECONCILE, RECONCILE_MS);
+    reconcile_sync(h);
     arm_clock(h);
     // SAFETY: registering a window message by name has no preconditions.
     let shell_msg = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
@@ -559,9 +561,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
                 on_foreground_changed(HWND(lp.0 as *mut std::ffi::c_void));
                 crate::hook::note_activity();
             }
-            if !DEBOUNCE_ARMED.with(|d| d.replace(true)) {
-                set_timer(h, TIMER_APPS_DEBOUNCE, DEBOUNCE_MS);
-            }
+            request_apps_refresh(h);
             Some(LRESULT(0))
         }
         WM_DOCK_SHELL_READY => {
@@ -1381,7 +1381,10 @@ fn on_shell_hook(h: HWND, what: usize, win: isize) {
             });
             if added {
                 ATTN_START.store(now_ms(), Relaxed);
-                set_timer(h, TIMER_ATTN, ATTN_HALF_MS as u32);
+                // The blink runs only while the bar is shown; `attn_sync` arms it at the next show if it is not over.
+                if VISIBLE.load(Relaxed) {
+                    set_timer(h, TIMER_ATTN, ATTN_HALF_MS as u32);
+                }
                 redraw_if_visible();
             }
         }
@@ -1403,14 +1406,38 @@ fn on_shell_hook(h: HWND, what: usize, win: isize) {
     }
 }
 
-/// Blink tick: drops destroyed windows, redraws, and stops once steady (or nothing flashes).
-fn on_attn_tick(h: HWND) {
-    let empty = ATTN.with(|a| {
+/// Whether the blink timer should run: only while the bar is shown, a window asks for attention and the blink time
+/// (`ATTN_BLINK_MS` after the flash) is not over; the steady mark after that needs no timer.
+fn attn_timer_wanted(visible: bool, any: bool, elapsed_ms: u64) -> bool {
+    visible && any && elapsed_ms < ATTN_BLINK_MS
+}
+
+/// Drops the destroyed windows of `ATTN`; true when none is left.
+fn attn_drop_dead() -> bool {
+    ATTN.with(|a| {
         let mut a = a.borrow_mut();
         // SAFETY: IsWindow accepts any handle value.
         a.retain(|w| unsafe { IsWindow(Some(HWND(*w as *mut std::ffi::c_void))) }.as_bool());
         a.is_empty()
-    });
+    })
+}
+
+/// Arms or kills `TIMER_ATTN` by the bar's visibility (`on_visibility`): at a show the destroyed windows are dropped
+/// and the timer runs when the blink is not over; at a hide it is killed.
+fn attn_sync() {
+    let visible = VISIBLE.load(Relaxed);
+    let empty = visible && attn_drop_dead();
+    let elapsed = now_ms().saturating_sub(ATTN_START.load(Relaxed));
+    if attn_timer_wanted(visible, !empty, elapsed) {
+        set_timer(hwnd(), TIMER_ATTN, ATTN_HALF_MS as u32);
+    } else {
+        kill_timer(hwnd(), TIMER_ATTN);
+    }
+}
+
+/// Blink tick: drops destroyed windows, redraws, and stops once steady (or nothing flashes).
+fn on_attn_tick(h: HWND) {
+    let empty = attn_drop_dead();
     redraw_if_visible();
     if empty || now_ms().saturating_sub(ATTN_START.load(Relaxed)) >= ATTN_BLINK_MS {
         kill_timer(h, TIMER_ATTN);
@@ -1741,8 +1768,44 @@ fn apply_network(info: crate::net::NetInfo) -> bool {
     changed
 }
 
+/// Whether a hidden bar's window list is stale enough to re-read now (a launcher open): the 5 s reconcile of a shown
+/// bar, applied on demand while the timer is off.
+fn refresh_due(visible: bool, last_ms: u64, now: u64) -> bool {
+    !visible && now.saturating_sub(last_ms) >= u64::from(RECONCILE_MS)
+}
+
+/// Whether `TIMER_RECONCILE` runs: only while the bar is shown.
+fn reconcile_wanted(visible: bool) -> bool {
+    visible
+}
+
+/// Arms or kills `TIMER_RECONCILE` by the bar's visibility.
+fn reconcile_sync(h: HWND) {
+    if reconcile_wanted(VISIBLE.load(Relaxed)) {
+        set_timer(h, TIMER_RECONCILE, RECONCILE_MS);
+    } else {
+        kill_timer(h, TIMER_RECONCILE);
+    }
+}
+
+/// One window-list refresh through the debounce (`TIMER_APPS_DEBOUNCE`): the body of the `WM_DOCK_APPS_DIRTY` arm.
+fn request_apps_refresh(h: HWND) {
+    if !DEBOUNCE_ARMED.with(|d| d.replace(true)) {
+        set_timer(h, TIMER_APPS_DEBOUNCE, DEBOUNCE_MS);
+    }
+}
+
+/// The launcher's window rows read the bar's cache while the reconcile timer may be off: re-enumerate now when the
+/// cache is older than the reconcile period and the bar is hidden (UI thread; one `EnumWindows`).
+pub(crate) fn apps_fresh() {
+    if refresh_due(VISIBLE.load(Relaxed), LAST_APPS_REFRESH.get(), now_ms()) {
+        refresh_apps();
+    }
+}
+
 /// Re-enumerates the windows; if they changed, rebuilds the items and redraws.
 fn refresh_apps() {
+    LAST_APPS_REFRESH.set(now_ms());
     if apps::refresh(hwnd()) {
         rebuild_entries();
         // Even with the bar hidden: the next appearance must already have the right width.
@@ -3232,6 +3295,14 @@ fn on_visibility(visible: bool) {
         GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::Shown));
     }
     poll_sync();
+    // The service timers follow the bar: the reconcile and the attention blink run only while it is shown; one
+    // refresh 100 ms after a show catches what the missed window events left.
+    reconcile_sync(hwnd());
+    attn_sync();
+    if visible {
+        request_apps_refresh(hwnd());
+    }
+    crate::on_bar_visibility(visible);
 }
 
 /// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is
@@ -4067,6 +4138,29 @@ mod tests {
 
     fn wi(visible: bool, still_ms: u64) -> WatchInputs {
         WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms }
+    }
+
+    #[test]
+    fn a_hidden_open_refreshes_a_stale_list() {
+        assert!(refresh_due(false, 0, 5000));
+        assert!(!refresh_due(false, 1000, 5999));
+        assert!(!refresh_due(true, 0, 60_000));
+        assert!(!refresh_due(false, 10, 5));
+    }
+
+    #[test]
+    fn the_blink_runs_only_while_shown() {
+        assert!(attn_timer_wanted(true, true, 0));
+        assert!(attn_timer_wanted(true, true, ATTN_BLINK_MS - 1));
+        assert!(!attn_timer_wanted(true, true, ATTN_BLINK_MS));
+        assert!(!attn_timer_wanted(false, true, 0));
+        assert!(!attn_timer_wanted(true, false, 0));
+    }
+
+    #[test]
+    fn reconcile_only_while_shown() {
+        assert!(reconcile_wanted(true));
+        assert!(!reconcile_wanted(false));
     }
 
     #[test]
