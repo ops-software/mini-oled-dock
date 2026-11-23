@@ -210,6 +210,10 @@ pub enum ShellRequest {
     /// The Start menu closed: its icons child is killed and reaped, the icons sent are forgotten and
     /// the queued `StartIcons` batches dropped.
     StartRelease,
+    /// Every trim (`mem::trim`): this STA's `CoFreeUnusedLibraries` pass. The proxy/stub DLLs a desktop-shell launch
+    /// loads here are unloaded by a pass at least 10 minutes after the one that found them unused, so a trim after shell
+    /// COM work and the second pass 11 minutes on (`mem::second_pass_tick`) unload them (M1 F4).
+    ComFree,
     /// Sent by the thread of `start_search::load_settings` when the settings catalog is ready
     /// -> `ShellEvent::StartSettings` (this thread is the one that can wake the UI).
     StartSettingsReady,
@@ -623,7 +627,11 @@ impl Shell {
                 enqueue(&mut self.pending, r);
             }
             let Some(req) = next_request(&mut self.pending) else { break };
+            let com = loads_com(&req);
             self.handle_request(req);
+            if com {
+                COM_WORK.store(true, SeqCst);
+            }
         }
     }
 
@@ -746,6 +754,8 @@ impl Shell {
                 // SAFETY: plain call on a COM-initialised thread.
                 unsafe { CoFreeUnusedLibraries() };
             }
+            // SAFETY: plain call on this COM-initialised thread; only DLLs whose DllCanUnloadNow says so are unloaded.
+            ShellRequest::ComFree => unsafe { CoFreeUnusedLibraries() },
             ShellRequest::StartIcons { icon_px, ids } => {
                 // A batch queued for a previous size: its ids were forgotten with that size.
                 if icon_px != self.start_px {
@@ -2332,6 +2342,43 @@ pub(crate) fn elevation() -> Option<bool> {
     })
 }
 
+/// Set after a request whose handling may have loaded in-process COM servers on this thread outside the Start menu's
+/// own cycle (a launch through the desktop shell, a name or an icon looked up in AppsFolder): the next trim's MTA pass
+/// marks what they left, and `mem` makes sure of the second pass 11 minutes on that unloads it (M1 F4; live-b L-5).
+static COM_WORK: AtomicBool = AtomicBool::new(false);
+
+/// Takes the flag of `COM_WORK` (the UI thread's trim).
+pub(crate) fn take_com_work() -> bool {
+    COM_WORK.swap(false, SeqCst)
+}
+
+/// The requests whose handling may load in-process COM servers here: every launch and reveal (the desktop shell's
+/// proxies), a bar entry's name and icon (AppsFolder, the icon pipeline), Show desktop, a notification's app, Start's
+/// in-process icons and an in-process listing. Volume, network and the launcher's state files are not.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn loads_com(req: &ShellRequest) -> bool {
+    match req {
+        ShellRequest::ListStartApps { child, .. } => !child,
+        ShellRequest::ResolveApp(_)
+        | ShellRequest::Launch { .. }
+        | ShellRequest::LaunchAdmin(_)
+        | ShellRequest::LaunchAppAdmin { .. }
+        | ShellRequest::RevealApp { .. }
+        | ShellRequest::ToggleDesktop
+        | ShellRequest::OpenNotifApp { .. }
+        | ShellRequest::StartIcons { .. }
+        | ShellRequest::OpenPath { .. }
+        | ShellRequest::RunAsTyped { .. }
+        | ShellRequest::LaunchCommand { .. }
+        | ShellRequest::RevealPath { .. }
+        | ShellRequest::OpenUrl { .. }
+        | ShellRequest::LauncherLaunch { .. }
+        | ShellRequest::LauncherAppAdmin { .. }
+        | ShellRequest::LauncherRevealApp { .. } => true,
+        _ => false,
+    }
+}
+
 /// Launches `target` (exe path, `shell:AppsFolder\...`, `ms-settings:...`) with optional `args`.
 /// From the shell thread, does not block the UI.
 ///
@@ -3399,6 +3446,44 @@ mod tests {
             assert!(open_path_with(bad, &mut recorder(&mut calls, true)).is_err(), "{bad:?}");
         }
         assert!(calls.is_empty(), "a refused path reaches no shell call: {calls:?}");
+    }
+
+    #[test]
+    fn com_work_requests_plan_the_second_pass() {
+        let resolve = ResolveApp {
+            key: "k".into(),
+            exe_path: String::new(),
+            aumid: Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into()),
+            hwnd: 0,
+            icon_px: 30,
+            custom_icon: None,
+        };
+        // A new bar entry's name and icon, every launch through the desktop shell, and an in-process listing.
+        for r in [
+            ShellRequest::ResolveApp(resolve),
+            ShellRequest::Launch { target: "shell:AppsFolder\\x!App".into(), args: None },
+            ShellRequest::LaunchAdmin(AdminTool::Terminal),
+            ShellRequest::LaunchAppAdmin { id: "x!App".into() },
+            ShellRequest::RevealApp { id: "x!App".into() },
+            ShellRequest::LauncherLaunch { target: "shell:AppsFolder\\x!App".into(), args: None },
+            ShellRequest::OpenUrl { url: "https://example.org".into() },
+            ShellRequest::ToggleDesktop,
+            ShellRequest::ListStartApps { icon_px: 30, icons: IconPlan::None, child: false },
+        ] {
+            assert!(loads_com(&r), "{r:?}");
+        }
+        // The children's listing, the volume and the launcher's state files load no COM server here.
+        for r in [
+            ShellRequest::ListStartApps { icon_px: 30, icons: IconPlan::None, child: true },
+            ShellRequest::VolumeToggleMute,
+            ShellRequest::LauncherStateLoad,
+            ShellRequest::LauncherClosed,
+            ShellRequest::StartRelease,
+            // The trim's own pass plans nothing, or every trim would plan the next one.
+            ShellRequest::ComFree,
+        ] {
+            assert!(!loads_com(&r), "{r:?}");
+        }
     }
 
     #[test]

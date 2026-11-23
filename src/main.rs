@@ -407,6 +407,7 @@ fn trim_step(s: &mut TrimState, now: Instant, visible: bool, popup: bool, rearm:
 
 /// Decides whether to trim memory now; never during show/hide animations (4 s hidden delay).
 fn trim_tick() {
+    mem::second_pass_tick(Instant::now());
     let visible = ui::is_visible();
     // An open Settings window counts like an open popup: no trim under the user's hands.
     let popup = popup::is_open() || settings_window::is_open();

@@ -7,6 +7,7 @@
 use crate::log;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HANDLE, HMODULE};
 use windows::Win32::System::Com::{CoFreeUnusedLibraries, CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Memory::{GetProcessHeaps, HeapCompact, HEAP_FLAGS};
@@ -26,6 +27,39 @@ static LAST_HIDDEN_TRIM: AtomicUsize = AtomicUsize::new(0);
 
 /// Set when data was just freed: the next hidden period trims again (`take_rearm`, consumed by `trim_tick`).
 static REARM: AtomicBool = AtomicBool::new(false);
+
+/// When COM's second MTA pass is due for the shell thread's own COM work (`shell_thread::take_com_work`): set by the
+/// trim whose MTA pass marked it, consumed by `second_pass_tick`, which re-arms the idle trim then.
+static SECOND_PASS: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// More than COM's 10 minute delay for free-threaded DLLs between the pass that marks a DLL and the one that unloads it.
+const SECOND_PASS_AFTER: Duration = Duration::from_secs(660);
+
+/// The second pass after this trim: shell COM work since the last trim moves it to 11 minutes from now (the work's
+/// DLLs are marked by this trim's MTA pass); otherwise the one already planned stays.
+fn next_second_pass(com_work: bool, planned: Option<Instant>, now: Instant) -> Option<Instant> {
+    if com_work {
+        Some(now + SECOND_PASS_AFTER)
+    } else {
+        planned
+    }
+}
+
+/// Whether the planned second pass is due at `now`.
+fn second_pass_due(planned: Option<Instant>, now: Instant) -> bool {
+    planned.is_some_and(|t| now >= t)
+}
+
+/// Each housekeeping tick (`main.rs` `trim_tick`, before `take_rearm`): a due second pass re-arms the idle trim, whose
+/// MTA pass unloads what the shell's launches and AppsFolder look-ups left (live-b L-5: two trims 496 s apart never did).
+pub fn second_pass_tick(now: Instant) {
+    let mut g = SECOND_PASS.lock().unwrap_or_else(|e| e.into_inner());
+    if second_pass_due(*g, now) {
+        *g = None;
+        drop(g);
+        rearm();
+    }
+}
 
 /// Most modules whose base and name are tracked (the process has about 80; the count itself is never capped).
 const MAX_MODULES: usize = 512;
@@ -238,6 +272,10 @@ fn free_com_libraries() {
     if let Err(e) = spawned {
         log!("trim: cannot start the com-free thread: {e}");
     }
+    // The shell thread's apartment: the proxy/stub DLLs of its desktop-shell launches are unloaded by its own pass.
+    crate::shell_thread::request(crate::shell_thread::ShellRequest::ComFree);
+    let mut g = SECOND_PASS.lock().unwrap_or_else(|e| e.into_inner());
+    *g = next_second_pass(crate::shell_thread::take_com_work(), *g, Instant::now());
 }
 
 /// Compacts every process heap; returns how many there are (0 when they cannot be listed, which is logged).
@@ -287,6 +325,24 @@ pub fn trim(reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_com_work_plans_one_second_pass() {
+        let t = Instant::now();
+        // No shell COM work: nothing planned, and a plan already made stays as it is.
+        assert_eq!(next_second_pass(false, None, t), None);
+        let planned = Some(t + Duration::from_secs(30));
+        assert_eq!(next_second_pass(false, planned, t), planned);
+        // Work since the last trim: 11 minutes from this trim (more than COM's 10), a later trim's work moves it on.
+        assert_eq!(next_second_pass(true, None, t), Some(t + SECOND_PASS_AFTER));
+        assert_eq!(next_second_pass(true, planned, t + Duration::from_secs(60)), Some(t + Duration::from_secs(720)));
+        assert!(SECOND_PASS_AFTER > Duration::from_secs(600));
+        // Due at its time, not a moment before; nothing planned is never due.
+        let p = Some(t + SECOND_PASS_AFTER);
+        assert!(!second_pass_due(p, t + Duration::from_secs(659)));
+        assert!(second_pass_due(p, t + SECOND_PASS_AFTER));
+        assert!(!second_pass_due(None, t + Duration::from_secs(10_000)));
+    }
 
     #[test]
     fn module_delta_cases() {
