@@ -175,7 +175,7 @@
       "unit": "bytes",
       "gate": "max",
       "value": 629146,
-      "note": "private bytes at rest with the launcher chord set, over the same config without it: +0.6 MiB (SPEC-launcher G-b, G-c)"
+      "note": "private bytes at rest with the launcher chord set, over the same config without it, the same day script in both runs and no app launch in either (the launch residue is checked apart, L3 L-5b): +0.6 MiB (SPEC-launcher G-b, G-c; measured resident parts 295-311 KB)"
     },
     {
       "id": "private.launcher_open_delta_125",
@@ -184,7 +184,7 @@
       "unit": "bytes",
       "gate": "max",
       "value": 3145728,
-      "note": "private bytes while the launcher is open at 125 %, over at rest: +3 MiB (SPEC-launcher G-b, G-c)"
+      "note": "peak private bytes while the launcher is open at 125 %, over the highest sample of the 2.1 s before the open, the window ending at the hide: +3 MiB (SPEC-launcher G-b, G-c; the dock's own 2 s housekeeping transient is in that baseline; the launcher's own peak is +1.99-2.08 MB)"
     },
     {
       "id": "private.launcher_close_residue",
@@ -193,7 +193,7 @@
       "unit": "bytes",
       "gate": "max",
       "value": 104858,
-      "note": "private bytes left after a close and the next hidden trim, over before the open: 0.1 MiB (L3 T22, T19)"
+      "note": "private bytes left after a close and the next hidden trim, over before the open: 0.1 MiB (L3 T19; no window warm)"
     },
     {
       "id": "exe_size.tasks",
