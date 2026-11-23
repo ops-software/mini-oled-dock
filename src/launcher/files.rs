@@ -120,14 +120,17 @@ pub const MAX_EXTRA_ROOTS: usize = 8;
 pub const ROOT_UNITS: usize = 260;
 
 /// The folders no root may be, lie in or hold, read from known folders whose paths only an administrator can change
-/// (HKLM): the Windows folder, the Program Files folders and the profiles folder; and the user's own profile, the one
-/// place inside the profiles folder a root may be.
+/// (HKLM): the Windows folder, the Program Files folders and the profiles folder; the profile of every account Windows
+/// lists, wherever it lies; and the user's own profile, the one place inside the profiles folder a root may be.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fences {
     pub windows: String,
     pub program_files: Vec<String>,
     pub profiles: String,
     pub profile: String,
+    /// Every account's profile folder (ProfileList, HKLM: `launcher_sys::profile_folders`), the user's own included,
+    /// which fences nothing.
+    pub accounts: Vec<String>,
 }
 
 /// `path` lies under `root`: the root (ASCII case-insensitive, a trailing separator ignored), a separator, then more.
@@ -157,8 +160,9 @@ fn within(a: &str, b: &str) -> bool {
 /// the folder Windows reads), none of `<>"|?*` and no administrative share (a share name ending in `$`); a drive root
 /// (`D:\`) or a share root (`\\server\share`) only when `drive_root` (the user's own list); neither the Windows folder
 /// nor a Program Files folder, nor inside or holding one; neither the profiles folder nor holding it nor holding the
-/// user's profile, and inside the profiles folder only inside the user's profile, so no root reaches another account's
-/// profile. A fence that is empty refuses every path.
+/// user's profile, and inside the profiles folder only inside the user's profile; neither inside nor holding another
+/// account's profile wherever it lies; so no root reaches another account's profile. A fence that is empty refuses every
+/// path.
 pub fn root_of(path: &str, f: &Fences, drive_root: bool) -> Option<String> {
     if path.len() > 3 * ROOT_UNITS {
         return None;
@@ -180,12 +184,15 @@ pub fn root_of(path: &str, f: &Fences, drive_root: bool) -> Option<String> {
         && (!unc || segs.get(1).is_some_and(|share| !share.ends_with('$')));
     let top = segs.len() == if unc { 2 } else { 0 };
     let apart = |fence: &str| !fence.is_empty() && !within(&p, fence) && !under(fence, &p);
+    let other = |a: &&String| !trim_sep(a).eq_ignore_ascii_case(trim_sep(&f.profile));
     let fenced = f.program_files.iter().chain([&f.windows]).all(|d| apart(d))
         && !f.profile.is_empty()
         && !f.profiles.is_empty()
+        && !f.accounts.is_empty()
         && !within(&f.profiles, &p)
         && !under(&f.profile, &p)
-        && (!under(&p, &f.profiles) || within(&p, &f.profile));
+        && (!under(&p, &f.profiles) || within(&p, &f.profile))
+        && f.accounts.iter().filter(other).all(|a| !within(&p, a) && !under(a, &p));
     (form && (drive_root || !top) && fenced).then_some(p)
 }
 
@@ -1172,6 +1179,9 @@ mod tests {
             program_files: vec!["C:\\Program Files".into(), "C:\\Program Files (x86)".into()],
             profiles: "C:\\Users".into(),
             profile: "C:\\Users\\a".into(),
+            accounts: ["C:\\Windows\\system32\\config\\systemprofile", "C:\\Users\\a", "C:\\Users\\b"]
+                .map(String::from)
+                .to_vec(),
         }
     }
 
@@ -1258,17 +1268,30 @@ mod tests {
         let edge = format!("D:\\{}", "d".repeat(257));
         assert_eq!(root_of(&edge, &f, false).as_deref(), Some(&*edge), "260 units");
         // A profile outside the profiles folder: no root holds it, so none holds its neighbours.
-        let moved = Fences { profile: "D:\\Profiles\\a".into(), ..fences() };
+        let moved =
+            Fences { profile: "D:\\Profiles\\a".into(), accounts: vec!["d:\\profiles\\A\\".into()], ..fences() };
         for bad in ["D:\\Profiles", "D:\\"] {
             assert_eq!(root_of(bad, &moved, true), None, "{bad:?}");
         }
         assert!(root_of("D:\\Profiles\\a\\Docs", &moved, false).is_some());
+        // Another account's profile kept outside the profiles folder (its own ProfileImagePath): no root lies in it or
+        // holds it, in either list; an empty entry fences nothing.
+        let outside =
+            Fences { accounts: vec!["C:\\Users\\a".into(), "D:\\Other\\b".into(), String::new()], ..fences() };
+        for bad in ["D:\\Other\\b", "d:\\other\\B\\", "D:\\Other\\b\\Docs", "D:\\Other", "D:\\"] {
+            assert_eq!(root_of(bad, &outside, false), None, "{bad:?}");
+            assert_eq!(root_of(bad, &outside, true), None, "{bad:?}");
+        }
+        for good in ["D:\\Other2", "D:\\Docs", "E:\\", "C:\\Users\\a\\Documents"] {
+            assert!(root_of(good, &outside, true).is_some(), "{good:?}");
+        }
         // A fence missing refuses everything.
         for missing in [
             Fences { windows: String::new(), ..fences() },
             Fences { profiles: String::new(), ..fences() },
             Fences { profile: String::new(), ..fences() },
             Fences { program_files: vec![String::new()], ..fences() },
+            Fences { accounts: Vec::new(), ..fences() },
             Fences::default(),
         ] {
             assert_eq!(root_of("D:\\Docs", &missing, true), None, "{missing:?}");

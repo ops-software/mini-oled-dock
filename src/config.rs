@@ -2036,6 +2036,7 @@ mod tests {
             program_files: vec!["C:\\Program Files".into()],
             profiles: "C:\\Users".into(),
             profile: "C:\\Users\\a".into(),
+            accounts: vec!["C:\\Users\\a".into()],
         };
         for e in &examples {
             assert_eq!(crate::launcher::files::root_of(e, &f, true).as_deref(), Some(e.as_str()), "{e:?}");

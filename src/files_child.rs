@@ -330,6 +330,7 @@ fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
             program_files: vec![path(&FOLDERID_ProgramFiles)?, path(&FOLDERID_ProgramFilesX86)?],
             profiles: path(&FOLDERID_UserProfiles)?,
             profile: profile.clone(),
+            accounts: crate::launcher_sys::profile_folders()?,
         })
     };
     let fences = fences();
@@ -666,6 +667,7 @@ mod tests {
             program_files: vec!["C:\\Program Files".into(), "C:\\Program Files (x86)".into()],
             profiles: "C:\\Users".into(),
             profile: "C:\\Users\\a".into(),
+            accounts: vec!["C:\\Users\\a".into(), "C:\\Users\\b".into()],
         }
     }
 

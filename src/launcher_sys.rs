@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GlobalFree, HANDLE, HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, GlobalFree, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, HGLOBAL, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Globalization::{
     GetLocaleInfoEx, LOCALE_ITIME, LOCALE_SDECIMAL, LOCALE_SSHORTDATE, LOCALE_STHOUSAND,
@@ -31,6 +32,9 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
+};
 use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
@@ -713,7 +717,52 @@ pub(crate) fn file_fences() -> Option<crate::launcher::files::Fences> {
         program_files: vec![s(&FOLDERID_ProgramFiles)?, s(&FOLDERID_ProgramFilesX86)?],
         profiles: s(&FOLDERID_UserProfiles)?,
         profile: s(&FOLDERID_Profile)?,
+        accounts: profile_folders()?,
     })
+}
+
+/// At most this many ProfileList entries are read; a longer list counts as unreadable.
+const MAX_ACCOUNTS: u32 = 4_096;
+
+/// The profile folder of every account Windows lists (`ProfileImagePath` of each key under HKLM's ProfileList, which
+/// only an administrator can change, expanded), the user's own included: `files::root_of` keeps every root out of the
+/// others, those kept outside the profiles folder too. None when the list cannot be read whole (no key, more than 4,096
+/// entries, a path over 260 units or not UTF-16): then no known or listed folder becomes a root. The files helper calls
+/// it too, so it logs nothing.
+pub(crate) fn profile_folders() -> Option<Vec<String>> {
+    let list = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+    let mut key = HKEY::default();
+    // SAFETY: a static NUL-terminated key name; `key` is a writable HKEY, closed below.
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, list, None, KEY_READ, &mut key) } != ERROR_SUCCESS {
+        return None;
+    }
+    let (mut all, mut whole) = (Vec::new(), false);
+    let (mut name, mut path) = ([0u16; 256], [0u16; crate::launcher::files::ROOT_UNITS + 1]);
+    for i in 0..MAX_ACCOUNTS {
+        let mut n = name.len() as u32;
+        // SAFETY: the key is open; `name` holds `n` writable units, which the call ends with a NUL.
+        let r = unsafe { RegEnumKeyExW(key, i, Some(PWSTR(name.as_mut_ptr())), &mut n, None, None, None, None) };
+        if r == ERROR_NO_MORE_ITEMS {
+            whole = true;
+            break;
+        }
+        let mut bytes = std::mem::size_of_val(&path) as u32;
+        let (value, buf) = (w!("ProfileImagePath"), path.as_mut_ptr().cast());
+        // SAFETY: `name` is the NUL-terminated subkey name; `buf` holds `bytes` writable bytes; RRF_RT_REG_SZ expands a
+        // REG_EXPAND_SZ and ends the string with a NUL.
+        let r = (r == ERROR_SUCCESS).then(|| unsafe {
+            RegGetValueW(key, PCWSTR(name.as_ptr()), value, RRF_RT_REG_SZ, None, Some(buf), Some(&mut bytes))
+        });
+        let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+        match (r, path.get(..len).map(String::from_utf16)) {
+            (Some(ERROR_SUCCESS), Some(Ok(p))) => all.push(p),
+            (Some(ERROR_FILE_NOT_FOUND), _) => {}
+            _ => break,
+        }
+    }
+    // SAFETY: the key opened above, closed once.
+    let _ = unsafe { RegCloseKey(key) };
+    whole.then_some(all)
 }
 
 // ---------------------------------------------------------------- PowerToys (L1b-5, SPEC 5.7)
