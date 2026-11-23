@@ -1126,7 +1126,8 @@ pub(crate) fn com_guard(per_user: bool) -> bool {
 /// Counts of one index build, for its log line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct IndexStats {
-    /// Per-user links whose target the Rust parser read, or could not read.
+    /// Per-user links whose target the Rust parser read, or could not read (or that start a Windows
+    /// program, left out of the index, see `index_links`).
     rust_parsed: usize,
     rust_unresolved: usize,
     /// All-users links given to the shell link loader.
@@ -1291,7 +1292,9 @@ fn build_start_index() -> HashMap<String, String> {
 
 /// The loop of `build_start_index` (pure): `exe path -> name` pairs of `files`, ambiguous targets
 /// dropped. A per-user link is read by `rust_target` only and named after its file; an all-users
-/// one by `com_target` and `com_display`.
+/// one by `com_target` and `com_display`. A per-user link to a program under `%SystemRoot%` is left
+/// out: Windows' own shortcuts there are renamed through `desktop.ini`, which only the shell reads,
+/// so `natural_name` gives the program its localized FileDescription, not the English file name.
 fn index_links(
     files: &[StartLnk],
     rust_target: &mut dyn FnMut(&StartLnk) -> Option<String>,
@@ -1303,7 +1306,7 @@ fn index_links(
     let mut ambiguous: Vec<String> = Vec::new();
     for lnk in files {
         let target = if lnk.per_user {
-            let t = rust_target(lnk);
+            let t = rust_target(lnk).filter(|t| !in_windows_dir(&expand_env(t)));
             if t.is_some() {
                 stats.rust_parsed += 1;
             } else {
@@ -3578,10 +3581,15 @@ mod tests {
             l(r"C:\All\Other (x64).lnk", false),
             l(r"C:\Me\Broken.lnk", true),
             l(r"C:\All\Uninstall Tool.lnk", false),
+            l(r"C:\Me\Magnify.lnk", true),
         ];
         let mut rust_calls = Vec::new();
         let mut rust = |s: &StartLnk| {
             rust_calls.push(s.path.clone());
+            // A Windows program of the per-user folder, renamed there by its `desktop.ini`.
+            if s.path.ends_with("Magnify.lnk") {
+                return Some(r"%SystemRoot%\System32\x.exe".to_string());
+            }
             s.path.ends_with("Mine.lnk").then(|| r"C:\Me\mine.exe".to_string())
         };
         let mut com_target = |s: &StartLnk| {
@@ -3593,8 +3601,11 @@ mod tests {
             s.path.ends_with("Tool.lnk").then(|| "Strumento".to_string())
         };
         let (map, stats) = index_links(&files, &mut rust, &mut com_target, &mut com_display);
-        assert_eq!(rust_calls, [std::path::PathBuf::from(r"C:\Me\Mine.lnk"), r"C:\Me\Broken.lnk".into()]);
-        assert_eq!(stats, IndexStats { rust_parsed: 1, rust_unresolved: 1, com_common: 3 });
+        let me = |p: &str| std::path::PathBuf::from(p);
+        assert_eq!(rust_calls, [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Broken.lnk"), me(r"C:\Me\Magnify.lnk")]);
+        assert_eq!(stats, IndexStats { rust_parsed: 1, rust_unresolved: 2, com_common: 3 });
+        let windows_exe = norm_path(&expand_env(r"%SystemRoot%\System32\x.exe"));
+        assert!(!map.contains_key(&windows_exe), "a per-user Windows program keeps its FileDescription: {map:?}");
         assert_eq!(map.get(r"c:\me\mine.exe").map(String::as_str), Some("Mine"), "per-user: the file name");
         assert_eq!(map.get(r"c:\all\tool.exe").map(String::as_str), Some("Strumento"), "the shell's name");
         assert_eq!(map.get(r"c:\all\other (x64).exe").map(String::as_str), Some("Other"));
