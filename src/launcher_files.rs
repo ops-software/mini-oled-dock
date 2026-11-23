@@ -506,7 +506,9 @@ mod tests {
     /// What the fake helpers were asked to do, in order.
     type Log = Arc<Mutex<Vec<String>>>;
 
-    /// A helper that answers its first request with one row (twice when `twice`) and then never again (a stall).
+    /// A helper that answers its first request with one row (twice when `twice`) and then never again (a stall). Its
+    /// write returns once the reader has queued the answer in the pump's inbox, so the pump reads the answer before any
+    /// of its clocks: no test races the reader thread against a deadline.
     struct FakeHelper {
         n: u32,
         answers: bool,
@@ -514,6 +516,7 @@ mod tests {
         out: Option<std::io::PipeWriter>,
         log: Log,
         ended: bool,
+        inbox: Arc<Inbox>,
     }
 
     impl Helper for FakeHelper {
@@ -534,6 +537,11 @@ mod tests {
                     f.extend_from_slice(&f.clone());
                 }
                 self.out.as_mut().unwrap().write_all(&f).unwrap();
+                // A guard against a hang, not a timing assertion: the inbox was empty at the write.
+                let until = Instant::now() + Duration::from_secs(20);
+                while self.inbox.q.lock().unwrap().is_empty() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
             true
         }
@@ -559,6 +567,7 @@ mod tests {
         n: u32,
         log: Log,
         twice: bool,
+        inbox: Arc<Inbox>,
     }
 
     impl Spawner for FakeSpawner {
@@ -576,6 +585,7 @@ mod tests {
                 out: Some(w),
                 log: self.log.clone(),
                 ended: false,
+                inbox: self.inbox.clone(),
             };
             Ok((Box::new(helper), r))
         }
@@ -585,15 +595,16 @@ mod tests {
         Msg::Request(Some(Req { gen, text: format!("quokka {gen}").into(), quiet_ms: 0, cap: 20 }))
     }
 
-    /// The pump thread's body over fake helpers, with fast clocks; the events it posts, busy marks left out.
+    /// The pump thread's body over fake helpers; the events it posts, busy marks left out. The deadline is short, since
+    /// it only ever ends a helper that never answers; no spawn deadline fires.
     fn pump_thread(log: &Log, twice: bool) -> (Arc<Inbox>, Receiver<FilesEvent>, std::thread::JoinHandle<()>) {
         let inbox = Arc::new(Inbox::default());
         let (ev_tx, ev_rx) = mpsc::channel();
         let own = inbox.clone();
         let log = log.clone();
-        let limits = Limits { slow_ms: 20, stale_kill_ms: 20, deadline_ms: 60, spawn_deadline_ms: 5_000 };
+        let limits = Limits { slow_ms: 20, stale_kill_ms: 20, deadline_ms: 60, spawn_deadline_ms: 600_000 };
         let thread = std::thread::spawn(move || {
-            let mut spawner = FakeSpawner { n: 0, log, twice };
+            let mut spawner = FakeSpawner { n: 0, log, twice, inbox: own.clone() };
             let mut post = |ev| {
                 let _ = ev_tx.send(ev);
             };
