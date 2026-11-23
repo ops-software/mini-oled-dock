@@ -286,7 +286,7 @@ mod tests {
 
         // The tray host window has its own WM_APP space.
         let host = scan(include_str!("tray_host.rs"), "WM_HOST_", "u32", "WM_APP +");
-        assert!(host.len() >= 5, "tray_host.rs scan found only {} WM_HOST_ ids", host.len());
+        assert!(host.len() >= 6, "tray_host.rs scan found only {} WM_HOST_ ids", host.len());
         assert_distinct("tray_host.rs WM_HOST_", &host);
     }
 }
