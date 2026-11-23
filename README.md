@@ -79,7 +79,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 
 ### Launcher
 
-An optional search box on a shortcut key, **off until you pick one**: Settings → Launcher → Shortcut (Alt+Space or Alt+Shift+Space), or `"launcher": { "chord": "alt+space" }` in `config.json`. With it off the dock behaves exactly as before.
+An optional search box on a shortcut key, **off until you pick one**: Settings → Launcher → Shortcut (Alt+Space or Alt+Shift+Space), or `"launcher": { "chord": "alt+space" }` in `config.json`. The launcher itself adds no hook, timer or process until you pick a shortcut. The Start menu, for everyone, now makes its icons and settings list in short-lived copies of `dock.exe`, unloads unneeded COM libraries about 11 minutes later, and until you answer it begins its search results with a row offering the launcher.
 
 - **One box, many kinds**: apps (the native Start catalogue, Store apps included), settings, files and folders, an answer to a sum or a unit conversion, today's date and time, commands (Lock, Sleep, Restart, Shut down, Sign out, Window menu, Clipboard history), a command line or a web search. The best name match comes first; what you pick often rises.
 - **Prefixes** (typed at the start; each is a setting): `=` calculator and units, `>` run a command, `<` open windows (switch or close), `??` web search, `$` Windows settings, `)` date and time, `:` Registry Editor, `file ` files only.
@@ -88,8 +88,8 @@ An optional search box on a shortcut key, **off until you pick one**: Settings �
   `"aliases": { "docs": "https://example.com", "notes": "app:Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", "work": "D:\\Projects" }`.
   Add one from a row's action list (Assign alias), remove it in Settings → Launcher.
 - **Files**: names that start with the typed words, from the Windows Search index, in your profile and the Start menu folders. A short-lived helper process searches; it exists only while the launcher is open. Off under Administrator protection.
-- **Privacy and rights**: everything it starts runs without administrator rights; the only elevated start is Ctrl+Shift+Enter on a row, through the normal UAC prompt. Nothing you type or copy is logged or stored; the clipboard is read only when you paste into the box, and a paste marked private is refused. A small per-user history of picks can be switched off or cleared in Settings.
-- **Cost**: per key about 0.14 ms of work at the median, at most 3.7 ms in the slowest measured key; about 0.3 MB resident at rest, none with the launcher off.
+- **Privacy and rights**: what it starts runs at your normal rights through the desktop shell; a program that itself asks for administrator rights shows the usual UAC prompt, and Ctrl+Shift+Enter on a row is the only way the launcher asks for elevation. Nothing you type or copy is logged; the commands you run and your picks are kept per user and can be switched off or cleared; the clipboard is read only when you paste into the box, and a paste marked private is refused. Aliases are kept in `config.json`.
+- **Cost** (measured on an earlier 1.5.0 build, synthetic keys; at rest in a test harness): per key about 0.14 ms of work at the median, at most 3.7 ms in the slowest measured key; about 0.3 MB resident at rest with the launcher on.
 - **PowerToys Command Palette** also wants Alt+Space: the launcher yields while it answers and offers the choice once; turn its shortcut off in PowerToys to take the key. The dock never changes PowerToys.
 - **To turn it off**: Settings → Launcher → Shortcut → Off (or `"chord": "off"`).
 
@@ -266,7 +266,7 @@ Everything the dock stores is in `%ProgramData%\mini-oled-dock`:
 |---|---|---|
 | `config.json` (+ `config.json.bak`) | settings | you (edit in place) and administrators; the `.bak` copy is admin-only |
 | `icons\` | your custom PNGs | you can add, replace and delete files |
-| `cache\` | extracted icon cache (PNG) | administrators only |
+| `cache\` | extracted icon cache (PNG); `cache\<SID>\` holds one user's launcher history (commands run, picks as hashes), readable by that user and administrators | administrators only |
 | `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), deleted once that version or a newer one runs | administrators only |
 | `dock.log`, `dock.log.1` | log, rotated at 2 MB | administrators only |
 | `taskbar-state` | the original taskbar state, used to restore it | administrators only |
