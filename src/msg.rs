@@ -99,7 +99,11 @@ pub const WM_DOCK_LAUNCHER_ALIAS: u32 = WM_APP + 29;
 
 // `WM_APP + 10` stays RESERVED: it was the UI -> hook thread message `WM_HOOK_REINSTALL`, retired by wsC Q6; do not
 // reuse it.
-// `WM_APP + 18` and `+ 19` are RESERVED by WS-C: the config change and `WM_HOOK_NOTE`, the hook thread's thread
+/// config watch -> dock window (`config::on_folder_change`, a thread-pool wait thread): `config.json` changed on disk
+/// (wParam 0: apply it after a 250 ms coalescing timer) or the folder watch broke (wParam 1: fall back to the 2 s poll).
+pub const WM_DOCK_CONFIG_CHANGED: u32 = WM_APP + 18;
+
+// `WM_APP + 19` is RESERVED by WS-C: `WM_HOOK_NOTE`, the hook thread's thread
 // message (defined privately in `hook.rs`). `WM_HOOK_NOTE`'s wParam values: 4 = activity (wsC Q6: foreground change,
 // bar shown or hidden, pointer motion, resume); 1-3 and 5-15 stay reserved for WS-C; 16-31 the launcher (16 =
 // `NOTE_LAUNCHER_FAIL_OPEN`). `WM_APP + 20..23` stay for shell-thread messages.
@@ -165,6 +169,9 @@ pub const TIMER_BATTERY: usize = 13;
 /// then the remaining time to 24 h since `last_update_check`, 24 h after a check, 1 h after a failed
 /// scheduled check. Handled by `main` -> `update::on_timer`.
 pub const TIMER_UPDATE_CHECK: usize = 14;
+/// One-shot 250 ms on the dock window after a config change notification (`WM_DOCK_CONFIG_CHANGED`): coalesces an
+/// editor's several writes, so a half-written file is not read. Kills itself, then applies. Handled by `main`.
+pub const TIMER_CONFIG_COALESCE: usize = 16;
 
 // POPUP window timers (different hwnd from the dock's; handled only by `popup`).
 /// 15 ms: popup open fade and hover plate; off when idle.

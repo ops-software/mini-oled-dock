@@ -134,8 +134,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use msg::{
-    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
-    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG,
+    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_CONFIG_COALESCE, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
+    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_CONFIG_CHANGED,
+    WM_DOCK_DIAG,
     WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU,
     WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
 };
@@ -476,8 +477,8 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
     match m {
         WM_TIMER => match wp.0 {
             TIMER_HOUSEKEEPING => {
-                if config::poll_changed() {
-                    ui::config_reloaded();
+                if !config::watching() {
+                    apply_config_change();
                 }
                 trim_tick();
                 if update::auto_install_pending() {
@@ -489,6 +490,13 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         ui::foreground_is_fullscreen(),
                     ));
                 }
+                LRESULT(0)
+            }
+            TIMER_CONFIG_COALESCE => {
+                // One-shot: it kills itself before running.
+                // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+                let _ = unsafe { KillTimer(Some(h), TIMER_CONFIG_COALESCE) };
+                apply_config_change();
                 LRESULT(0)
             }
             TIMER_UPDATE_CHECK => {
@@ -571,6 +579,16 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_POPUP_CLOSED => {
             ui::on_popup_closed();
+            LRESULT(0)
+        }
+        WM_DOCK_CONFIG_CHANGED => {
+            if wp.0 == 1 {
+                config::stop_watch();
+                log!("config: change watch broken, polling every 2 s");
+            } else {
+                // Re-armed by every notification: an editor's several writes become one read.
+                set_timer(h, TIMER_CONFIG_COALESCE, 250);
+            }
             LRESULT(0)
         }
         WM_DOCK_CONFIG_APPLY => {
@@ -745,6 +763,13 @@ fn message_loop() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+/// Loads a hand edit of `config.json` (if its mtime differs from the remembered one) and lets the UI rebuild.
+fn apply_config_change() {
+    if config::poll_changed() {
+        ui::config_reloaded();
     }
 }
 
@@ -923,6 +948,7 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
         TIMER_TRAY_REANNOUNCE,
         TIMER_HOVER_PICKER,
         TIMER_UPDATE_CHECK,
+        TIMER_CONFIG_COALESCE,
     ] {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), id) };
@@ -952,6 +978,8 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
     }
     ui::shutdown();
     restore_console_mode();
+    // The config watch's callback posts to the window: it ends first (and waits for a callback in progress).
+    config::stop_watch();
     if !h.0.is_null() {
         // SAFETY: window created by this thread (WM_DESTROY also restores the taskbar: idempotent).
         if let Err(e) = unsafe { DestroyWindow(h) } {
@@ -1098,6 +1126,8 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     set_timer(h, TIMER_RAM, 30_000);
     set_timer(h, TIMER_SECOND, watchdog::HEARTBEAT_MS);
     update::init(h);
+    // A hand edit of config.json is applied from the folder's change notification; without it, housekeeping polls.
+    config::start_watch(h);
     mem::log_memory();
 
     // The window already exists (HWND_RAW set): the callback can post messages to it.
