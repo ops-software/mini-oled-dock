@@ -70,12 +70,13 @@ use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SetCursor, SetForegroundWindow,
-    SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GWL_STYLE, HTCLIENT,
-    HWND_TOPMOST, IDC_HAND, PBT_APMPOWERSTATUSCHANGE,
-    MA_NOACTIVATE, SC_CLOSE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
+    KillTimer, LoadCursorW, RegisterShellHookWindow, RegisterWindowMessageW, SendMessageTimeoutW, SetCursor,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND,
+    GWL_STYLE, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE, PBT_APMPOWERSTATUSCHANGE, SC_CLOSE,
+    SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
+    WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -3547,15 +3548,17 @@ fn within_grace(now: u64, taken_at: u64, grace: u64) -> bool {
 }
 
 /// "Foreground" fallback (the foreground fallback of the original design).
-/// Variant 1: AttachThreadInput to the foreground thread + SetForegroundWindow.
-/// Variant 2 (only if 1 failed): a synthetic F15 key (releases the foreground
+/// Variant 1: AttachThreadInput to the foreground thread + SetForegroundWindow, only when that thread answers
+/// (`variant1_attempt`); a thread that does not answer is never joined and variant 1 is skipped.
+/// Variant 2 (only if 1 failed or was skipped): a synthetic F15 key (releases the foreground
 /// lock) and SetForegroundWindow again.
 /// Variant 3 (only if 2 failed): `SwitchToThisWindow`, which bypasses the lock in cases where the
 /// first two are refused (e.g. an ELEVATED app in front: UIPI blocks both the attach and the F15).
+/// Variants 2 and 3 never wait for the foreground thread: without a joined queue its deactivation is posted to it.
 /// A null foreground (transient, e.g. right after a window was hidden) is NOT a reason to give up:
 /// with no foreground window SetForegroundWindow is allowed.
 /// The outcome of each is in the log. Returns true if `h` is the foreground window at the end.
-/// `pub` because `popup` also uses it to activate the popup window.
+/// `pub` because `popup` also uses it to activate the popup window, and the launcher to give the foreground back.
 pub fn force_foreground(h: HWND) -> bool {
     FG_TAKEN_AT.store(now_ms(), Relaxed);
     // SAFETY: no preconditions.
@@ -3563,30 +3566,7 @@ pub fn force_foreground(h: HWND) -> bool {
     if fg == h {
         return true;
     }
-    // SAFETY: `fg` is an HWND obtained from Windows (or null: then the call returns 0); the out pid is optional.
-    let fg_tid = if fg.0.is_null() { 0 } else { unsafe { GetWindowThreadProcessId(fg, None) } };
-    // SAFETY: no preconditions.
-    let my_tid = unsafe { GetCurrentThreadId() };
-    let attached = fg_tid != 0 && fg_tid != my_tid;
-    if attached {
-        // SAFETY: valid thread ids; the attach is always undone below.
-        let _ = unsafe { AttachThreadInput(my_tid, fg_tid, true) };
-    }
-    // SAFETY: `h` is our window.
-    let ok = unsafe {
-        let _ = BringWindowToTop(h);
-        SetForegroundWindow(h)
-    };
-    if attached {
-        // SAFETY: undoes the attach done above.
-        let _ = unsafe { AttachThreadInput(my_tid, fg_tid, false) };
-    }
-    log!(
-        "  foreground variant 1 (AttachThreadInput, fg null={}): SetForegroundWindow -> {}",
-        fg.0.is_null(),
-        ok.as_bool()
-    );
-    if ok.as_bool() && is_foreground(h) {
+    if variant1_attempt(h, fg).is_some_and(|ok| ok && is_foreground(h)) {
         return true;
     }
     // A window hidden meanwhile (a popup closed during its own activation) is not pushed to the front: variants 2 and 3
@@ -3596,17 +3576,130 @@ pub fn force_foreground(h: HWND) -> bool {
         return false;
     }
     let sent = send_f15();
-    // SAFETY: `h` is our window.
+    // SAFETY: `h` is a window handle; SetForegroundWindow accepts any.
     let ok2 = unsafe { SetForegroundWindow(h) };
     log!("  foreground variant 2 (synthetic F15, SendInput={sent}): SetForegroundWindow -> {}", ok2.as_bool());
     if ok2.as_bool() && is_foreground(h) {
         return true;
     }
-    // SAFETY: `h` is our window; SwitchToThisWindow has no other preconditions.
+    // SAFETY: `h` is a window handle; SwitchToThisWindow has no other preconditions.
     unsafe { SwitchToThisWindow(h, true) };
     let ok3 = is_foreground(h);
     log!("  foreground variant 3 (SwitchToThisWindow): foreground -> {ok3}");
     ok3
+}
+
+/// How long `answers` waits for another thread's window (ms): a pumping thread answers in microseconds; one that stopped
+/// pumping costs this once per open (`SILENT_MS`).
+const PING_MS: u32 = 50;
+/// A foreground thread that did not answer is taken as silent without a new ping for this long (ms): the open's
+/// foreground retries (6 x 80 ms) and a Start opened by the Win key right after the bar's show wait once.
+const SILENT_MS: u64 = 1000;
+
+thread_local! {
+    /// The last foreground thread that did not answer and when (thread id, tick in ms).
+    static SILENT: Cell<(u32, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// How variant 1 of `force_foreground` runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant1 {
+    /// No other thread in front (no foreground window, or one of the dock's thread): variant 1 without a join.
+    Alone,
+    /// The foreground thread answered: its input queue is joined for variant 1, as in 1.4.3.
+    Joined,
+    /// The foreground thread does not answer: no join and no variant 1, whose activation would wait for it.
+    Skipped,
+}
+
+/// The choice of variant 1 for the foreground thread `fg_tid` (0: no foreground window) seen from the dock's thread
+/// `my_tid`. `answers` (the ping) is asked only when there is another thread to join.
+fn variant1(fg_tid: u32, my_tid: u32, answers: impl FnOnce() -> bool) -> Variant1 {
+    if fg_tid == 0 || fg_tid == my_tid {
+        Variant1::Alone
+    } else if answers() {
+        Variant1::Joined
+    } else {
+        Variant1::Skipped
+    }
+}
+
+/// Whether thread `tid` is still taken as silent at `now`, `last` being the last thread that did not answer and when.
+fn still_silent(last: (u32, u64), tid: u32, now: u64) -> bool {
+    tid != 0 && last.0 == tid && now.saturating_sub(last.1) < SILENT_MS
+}
+
+/// Whether the thread of window `h` answers now: a WM_NULL through SendMessageTimeoutW, which returns at once for a
+/// window Windows already calls hung (SMTO_ABORTIFHUNG, 5 s without pumping) and after `PING_MS` at most otherwise. A
+/// window of the dock's own thread answers; a refused or failed send (a window gone, a higher integrity) does not.
+/// UI thread.
+pub(crate) fn answers(h: HWND) -> bool {
+    // SAFETY: any handle; a stale one yields 0.
+    if unsafe { GetWindowThreadProcessId(h, None) } == unsafe { GetCurrentThreadId() } {
+        return true;
+    }
+    let mut res = 0usize;
+    let flags = SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT;
+    // SAFETY: `res` is writable for the call; any handle is accepted (a stale one fails at once); WM_NULL does nothing.
+    unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), flags, PING_MS, Some(&mut res)) }.0 != 0
+}
+
+/// `answers` for the foreground window `fg` of thread `tid`, which a thread that did not answer in the last
+/// `SILENT_MS` skips. UI thread.
+fn front_answers(fg: HWND, tid: u32) -> bool {
+    let now = now_ms();
+    if SILENT.with(|s| still_silent(s.get(), tid, now)) {
+        return false;
+    }
+    let ok = answers(fg);
+    if !ok {
+        SILENT.with(|s| s.set((tid, now)));
+    }
+    ok
+}
+
+/// Variant 1 of `force_foreground`, the dock's only AttachThreadInput (launcher lint 17): the dock's input queue is
+/// joined to the foreground thread's only when that thread answers (`variant1`). Joined, the raise and the activation
+/// below wait for that thread: one that stopped pumping held the dock's UI thread for as long as it hung (live check
+/// V-14, 28.5 s; the watchdog then gave the taskbar back). None when variant 1 was skipped.
+fn variant1_attempt(h: HWND, fg: HWND) -> Option<bool> {
+    // SAFETY: `fg` is an HWND obtained from Windows (or null: then the call returns 0); the out pid is optional.
+    let fg_tid = if fg.0.is_null() { 0 } else { unsafe { GetWindowThreadProcessId(fg, None) } };
+    // SAFETY: no preconditions.
+    let my_tid = unsafe { GetCurrentThreadId() };
+    let v = variant1(fg_tid, my_tid, || front_answers(fg, fg_tid));
+    if v == Variant1::Skipped {
+        log!("  foreground variant 1 skipped: the foreground window does not answer, its input queue is not joined");
+        return None;
+    }
+    let joined = v == Variant1::Joined;
+    if joined {
+        // SAFETY: valid thread ids; the attach is always undone below.
+        let _ = unsafe { AttachThreadInput(my_tid, fg_tid, true) };
+    }
+    raise(h);
+    // SAFETY: `h` is a window handle; SetForegroundWindow accepts any.
+    let ok = unsafe { SetForegroundWindow(h) }.as_bool();
+    if joined {
+        // SAFETY: undoes the attach done above.
+        let _ = unsafe { AttachThreadInput(my_tid, fg_tid, false) };
+    }
+    log!("  foreground variant 1 (AttachThreadInput, fg null={}): SetForegroundWindow -> {ok}", fg.0.is_null());
+    Some(ok)
+}
+
+/// `BringWindowToTop` for a window of the dock's thread. Another thread's window (the launcher gives the foreground back
+/// to the window it came from, the bar activates an app) gets the same request posted to its own thread
+/// (SWP_ASYNCWINDOWPOS): done in place, it waits for that thread, without bound when the window hangs.
+pub(crate) fn raise(h: HWND) {
+    // SAFETY: any handle; a stale one yields 0 and the calls below fail harmlessly.
+    unsafe {
+        if GetWindowThreadProcessId(h, None) == GetCurrentThreadId() {
+            let _ = BringWindowToTop(h);
+        } else {
+            let _ = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
+        }
+    }
 }
 
 /// true if `h` is the foreground window right now.
@@ -3863,5 +3956,102 @@ mod tests {
         assert!(within_grace(1799, 1000, 800));
         assert!(!within_grace(1800, 1000, 800));
         assert!(within_grace(900, 1000, 800), "clock before the take saturates to 0");
+    }
+
+    #[test]
+    fn variant1_joins_only_a_front_thread_that_answers() {
+        // A front window that answers: its input queue is joined, as in 1.4.3.
+        assert_eq!(variant1(7, 3, || true), Variant1::Joined);
+        // A front window that does not answer (hung, or busy past the ping): never joined (live check V-14).
+        assert_eq!(variant1(7, 3, || false), Variant1::Skipped);
+        // No foreground window, or the dock's own thread in front: nothing to join, and no ping.
+        assert_eq!(variant1(0, 3, || unreachable!("no ping without a foreground thread")), Variant1::Alone);
+        assert_eq!(variant1(3, 3, || unreachable!("no ping to the dock's own thread")), Variant1::Alone);
+    }
+
+    #[test]
+    fn a_silent_front_thread_is_not_asked_again_for_a_second() {
+        let last = (7, 10_000);
+        assert!(still_silent(last, 7, 10_000));
+        assert!(still_silent(last, 7, 10_000 + SILENT_MS - 1), "the open's retries pay no second ping");
+        assert!(!still_silent(last, 7, 10_000 + SILENT_MS), "asked again after SILENT_MS");
+        assert!(!still_silent(last, 8, 10_100), "another thread is asked");
+        assert!(!still_silent((0, 0), 0, 50), "none yet");
+    }
+
+    /// What the WM_NULL ping of `answers` costs (live check V-14): a pumping thread's message-only window, then the same
+    /// thread asleep past PING_MS, then the memo of `front_answers`. Headless: a message-only window is never shown and
+    /// never takes the focus. In-process (another thread), where the dock pings another process. No timing assertion:
+    /// `cargo test --release ping_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ping_cost() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, PostThreadMessageW, HWND_MESSAGE, MSG,
+            WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_QUIT,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pump = std::thread::spawn(move || {
+            // SAFETY: a message-only STATIC window of this thread, destroyed before the thread ends.
+            let h = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!(""),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("a message-only window");
+            // SAFETY: no preconditions.
+            tx.send((h.0 as isize, unsafe { GetCurrentThreadId() })).expect("the test thread waits");
+            let mut msg = MSG::default();
+            // SAFETY: a plain message loop on this thread; WM_APP asks it to stop pumping for wParam ms.
+            while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+                if msg.message == WM_APP {
+                    std::thread::sleep(Duration::from_millis(msg.wParam.0 as u64));
+                } else {
+                    let _ = unsafe { DispatchMessageW(&msg) };
+                }
+            }
+            // SAFETY: the window of this thread.
+            let _ = unsafe { DestroyWindow(h) };
+        });
+        let (raw, tid) = rx.recv().expect("the pump thread starts");
+        let h = HWND(raw as *mut std::ffi::c_void);
+        let mut us: Vec<u128> = (0..2000)
+            .map(|_| {
+                let t = Instant::now();
+                assert!(answers(h));
+                t.elapsed().as_micros()
+            })
+            .collect();
+        us.sort_unstable();
+        let at = |p: usize| us[(us.len() - 1) * p / 100];
+        println!("ping, pumping thread: p50 {} us, p95 {} us, p99 {} us, max {} us", at(50), at(95), at(99), at(100));
+        // SAFETY: a thread message to the pump thread.
+        unsafe { PostThreadMessageW(tid, WM_APP, WPARAM(400), LPARAM(0)) }.expect("the pump thread runs");
+        std::thread::sleep(Duration::from_millis(20));
+        let t = Instant::now();
+        let first = front_answers(h, tid);
+        let waited = t.elapsed();
+        let t = Instant::now();
+        let again = front_answers(h, tid);
+        println!(
+            "thread asleep: first ping {first} after {} ms (PING_MS {PING_MS}), retry {again} after {} us (memo)",
+            waited.as_millis(),
+            t.elapsed().as_micros()
+        );
+        // SAFETY: a thread message to the pump thread.
+        unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) }.expect("the pump thread runs");
+        pump.join().expect("the pump thread ends");
     }
 }
