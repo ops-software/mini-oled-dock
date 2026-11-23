@@ -470,6 +470,10 @@ fn glyph_of(dir: bool, class: FileClass) -> GlyphId {
 
 /// The rows of a re-sorted batch, the first `cap`: a file or a folder by its path, its name and its folder, a glyph by
 /// class, the file kinds' verbs (an executable has no Open while the Mark of the Web check is open), never destructive.
+/// The class comes from the name as Windows opens it (`check_hit` holds it to the path's last component, so a trailing
+/// separator hides no extension; the trailing dots and spaces Windows drops are dropped), and the helper's folder flag
+/// is not taken for an executable's name: that row is an executable file, so nothing in the helper's output can give
+/// Open to what SPEC 5.4.6 holds back (a real folder so named keeps Show in folder and Copy).
 pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
     let first = folded_words.first().copied().unwrap_or("");
     let mut out = Vec::with_capacity(hits.len().min(usize::from(cap)));
@@ -479,8 +483,10 @@ pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
             1 => rank::T_WORD,
             _ => rank::T_SUBSTR,
         };
-        let class = if h.dir { FileClass::Other } else { providers::file_class(&h.path) };
-        let (kind, rank_kind, verbs) = if h.dir {
+        let class = providers::file_class(h.name.trim_end_matches(['.', ' ']));
+        let dir = h.dir && class != FileClass::Executable;
+        let class = if dir { FileClass::Other } else { class };
+        let (kind, rank_kind, verbs) = if dir {
             (Kind::Folder, KIND_FOLDER, providers::verbs(Kind::Folder, false, Some(class)))
         } else {
             (Kind::File, KIND_FILE, providers::file_verbs(&h.path, class))
@@ -499,10 +505,10 @@ pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
             kind,
             title: h.name,
             detail: (!h.folder.is_empty()).then_some(h.folder),
-            icon: IconRef::Glyph(glyph_of(h.dir, class)),
+            icon: IconRef::Glyph(glyph_of(dir, class)),
             score,
             verbs,
-            payload: Payload::Path { path: h.path, dir: h.dir, class },
+            payload: Payload::Path { path: h.path, dir, class },
             destructive: false,
         });
     }
@@ -1233,6 +1239,18 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.score.rank).collect::<Vec<_>>(), (0..7).collect::<Vec<u32>>());
         assert!(rows.iter().all(|r| !r.destructive && r.from == ProviderId::Files));
         assert_eq!(items(hits, &["quokka"], 3).len(), 3);
+        // The helper's folder flag on an executable's name, a trailing separator and the trailing dots and spaces
+        // Windows drops: executable files, no Open, never the Mixed default.
+        let odd = vec![
+            hit("C:\\u\\Downloads\\setup.exe", true),
+            hit("C:\\u\\quokka.cmd\\", false),
+            hit("C:\\u\\quokka.exe. .", false),
+        ];
+        for r in items(odd, &["quokka"], 20) {
+            assert_eq!((r.kind, &r.icon), (Kind::File, &IconRef::Glyph(Executable)), "{}", r.title);
+            assert!(matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. }));
+            assert!(!r.verbs.has(Verb::Open) && r.verbs.has(Verb::Reveal), "{}", r.title);
+        }
     }
 
     #[test]
