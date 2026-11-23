@@ -206,8 +206,9 @@ pub fn index_settings(rows: &[SettingRow]) -> IndexBuf {
 
 /// The settings entries of `list` as the encoder takes them (L3 T18), each folded once: the row (names, words, initials and
 /// keywords folded; the position among the entries is its index), the launch target and arguments, and Start's packed
-/// keywords as `build_settings` made them (cut after a whole line when longer than an arena string). A setting no arena can
-/// hold (a name, target or argument over 4 KiB; never seen) is left out instead of failing the whole catalogue.
+/// keywords as 1.4.3 searched them (`start_search::start_keys_of`; cut after a whole line when longer than an arena
+/// string). A setting no arena can hold (a name, target or argument over 4 KiB; never seen) is left out instead of
+/// failing the whole catalogue.
 pub fn setting_entries(list: &[Setting]) -> Vec<SettingIn> {
     let fits = |s: &&Setting| {
         !s.name.is_empty()
@@ -222,7 +223,7 @@ pub fn setting_entries(list: &[Setting]) -> Vec<SettingIn> {
             row: SettingRow::new(u32::try_from(i).unwrap_or(u32::MAX), &s.name, fold_keys(&s.keys), s.rank),
             target: s.target.to_string(),
             args: s.args.clone(),
-            start_keys: start_copy(&s.keys).packed().to_string(),
+            start_keys: start_copy(&crate::start_search::start_keys_of(&s.keys)).packed().to_string(),
         })
         .collect()
 }

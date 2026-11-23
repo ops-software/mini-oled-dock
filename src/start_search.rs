@@ -61,6 +61,10 @@ const MAX_FILE: u64 = 16 * 1024 * 1024;
 /// (`u32::MAX / 2`), so `Keys::tidy` keeps a curated synonym over the same XML word and the launcher reads "XML"
 /// exactly when the penalty equals this value.
 pub(crate) const XML_KEYWORD_PENALTY: u32 = 999_999;
+/// The penalty Start scores a keyword of Windows' XML bag of words with (`popup_startmenu::rank`: a keyword match scores its
+/// penalty): the value Windows Search uses for them, as 1.4.3 stored it. Start's copy of the keywords (`start_keys_of`)
+/// carries it in place of `XML_KEYWORD_PENALTY`, so Start lists and orders its rows exactly as 1.4.3 did.
+pub(crate) const START_XML_PENALTY: u32 = 500;
 /// The Settings app inside `shell:AppsFolder`.
 const SETTINGS_APP: &str =
     r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
@@ -1058,7 +1062,10 @@ fn build_settings() -> Vec<Setting> {
     };
     let synonyms = parse_synonyms(&read_index("settingssynonyms.txt"));
     let (ranks, default_rank) = parse_ranks(&read_index("settingsglobals.txt"));
-    // Built loose, packed at the end (`Keys::tidy`, exact-size strings): what stays is small.
+    // Built loose and left loose (every synonym row and every XML word, each XML word at `XML_KEYWORD_PENALTY`): each
+    // consumer tidies its own copy (`catalog::setting_entries`: the launcher's folded keys, Start's `start_keys_of`), so
+    // a word that is both a synonym and an XML word keeps, in each copy, the penalty that copy's search wants. The list
+    // lives only until it is encoded (in the child, or in the in-process fallback).
     let mut by_name: HashMap<String, Setting> = HashMap::new();
     for raw in parse_settings_xml(&xml) {
         let Some((target, args)) = setting_launch(&raw, &windir) else { continue };
@@ -1082,7 +1089,6 @@ fn build_settings() -> Vec<Setting> {
     let mut list: Vec<Setting> = by_name
         .into_values()
         .map(|mut s| {
-            s.keys = s.keys.tidy();
             s.name.shrink_to_fit();
             s.lower.shrink_to_fit();
             if let Some(a) = s.args.as_mut() {
@@ -1094,6 +1100,18 @@ fn build_settings() -> Vec<Setting> {
     list.sort_by(|a, b| a.lower.cmp(&b.lower));
     list.shrink_to_fit();
     list
+}
+
+/// Start's copy of a setting's keywords, from the loose keywords `build_settings` makes: every XML word at
+/// `START_XML_PENALTY` (the sentinel is the launcher's), then tidied. That is exactly 1.4.3's `Keys` of the entry: the
+/// same rows, and a word that is both a synonym and an XML word keeps the better of its penalty and 500, as 1.4.3's tidy
+/// did. (Tidying first and mapping after would lose that: the sentinel would have dropped the XML line.)
+pub(crate) fn start_keys_of(keys: &Keys) -> Keys {
+    let mut out = Keys::default();
+    for (key, penalty) in keys.iter() {
+        out.push(key, if penalty == XML_KEYWORD_PENALTY { START_XML_PENALTY } else { penalty });
+    }
+    out.tidy()
 }
 
 /// True for the name of one of the catalog's XML files.
@@ -1164,11 +1182,12 @@ fn catalog_key_of(dock: &str, build: &str, lang: u16, files: &[(String, u64, u64
         return None;
     }
     let printable = |c: &char| c.is_ascii_graphic() && *c != '|';
-    // "l3s1": the settings keywords carry `XML_KEYWORD_PENALTY` since L3; a file written with the old penalty is rebuilt once.
+    // "l3s2": the settings keywords carry `XML_KEYWORD_PENALTY` in the launcher's copy and `START_XML_PENALTY` in Start's
+    // (diag-start-and-warm item 1); a file written by an older layout of these copies is rebuilt once.
     let mut key: String = dock.chars().filter(printable).collect();
     key.push('|');
     key.extend(build.chars().filter(printable));
-    key.push_str(&format!("|{lang:04x}|l3s1"));
+    key.push_str(&format!("|{lang:04x}|l3s2"));
     for (name, len, mtime) in files {
         key.push('|');
         key.extend(name.chars().filter(printable));
@@ -1396,6 +1415,11 @@ mod tests {
             .collect()
     }
 
+    /// `list` as Start's rows carry it: each entry's keywords as `start_keys_of` copies them.
+    fn as_start(list: &[Setting]) -> Vec<Setting> {
+        list.iter().map(|s| Setting { keys: start_keys_of(&s.keys), ..s.clone() }).collect()
+    }
+
     /// The key of the sample cache (the dock's identity first, the arena's format last).
     fn key() -> String {
         catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &[("allsystemsettings_x.xml".to_string(), 100, 5)]).unwrap()
@@ -1426,7 +1450,8 @@ mod tests {
         let bytes = arena_of(&key(), &list);
         assert!(bytes.starts_with(b"mini-oled-dock settings-catalog 2\n"));
         let back = rows_of(&bytes, &key());
-        assert_eq!(back, list);
+        assert_eq!(back, as_start(&list), "Start's rows: the list, with Start's copy of the keywords");
+        assert!(back.iter().flat_map(|s| s.keys.iter()).all(|(_, p)| p == START_XML_PENALTY));
         assert!(
             back.iter().filter(|s| matches!(s.target, Cow::Borrowed(_))).count() > 100,
             "the shared target stays shared"
@@ -1455,10 +1480,12 @@ mod tests {
             assert_ne!(other, k);
             assert_eq!(cache_use(&bytes, &other), CacheUse::Rebuild, "{other}");
         }
-        // A key written before the XML sentinel (no salt) does not match.
-        let old = k.replace("|l3s1", "");
-        assert_ne!(old, k);
-        assert_eq!(cache_use(&arena_of(&old, &sample(5)), &k), CacheUse::Rebuild, "a pre-L3 cache is rebuilt once");
+        // A key written before the XML sentinel (no salt) does not match, nor one of 97ea8ed (Start's copy then carried the
+        // sentinel: diag-start-and-warm item 1).
+        for old in [k.replace("|l3s2", ""), k.replace("|l3s2", "|l3s1")] {
+            assert_ne!(old, k);
+            assert_eq!(cache_use(&arena_of(&old, &sample(5)), &k), CacheUse::Rebuild, "an older cache is rebuilt once");
+        }
         assert!(catalog_key_of("1.5.0:9:9", "", 0x409, &files).is_none(), "unknown build: no cache");
         assert!(catalog_key_of("1.5.0:9:9", "26100.1", 0x409, &[]).is_none(), "no XML: no cache");
         // The line is printable ASCII whatever a file is called, and one past an arena's key line gives no key at all.
@@ -1491,7 +1518,7 @@ mod tests {
     fn settings_key_has_the_arena_format() {
         let k = key();
         let fmt = format!("|fmt {}", arena::ARENA_FORMAT);
-        assert!(k.ends_with(&fmt) && k.starts_with("1.5.0:9:9|26100.1742|0409|l3s1|"), "{k}");
+        assert!(k.ends_with(&fmt) && k.starts_with("1.5.0:9:9|26100.1742|0409|l3s2|"), "{k}");
         let other = k.replace(&fmt, &format!("|fmt {}", arena::ARENA_FORMAT + 1));
         assert_eq!(cache_use(&arena_of(&other, &sample(3)), &k), CacheUse::Rebuild);
         assert!(matches!(cache_use(&arena_of(&k, &sample(3)), &k), CacheUse::Use(_)));
@@ -1575,8 +1602,9 @@ mod tests {
         }
     }
 
-    /// L3 T18: Start's rows of the arena are the ones `build_settings` made: names, Start's keywords as written, ranks, the
-    /// shared Settings-app target as `Cow::Borrowed`, a Control Panel entry with arguments, one without.
+    /// L3 T18: Start's rows of the arena are the ones `build_settings` made: names, Start's keywords as 1.4.3 searched them
+    /// (an XML word at `START_XML_PENALTY`), ranks, the shared Settings-app target as `Cow::Borrowed`, a Control Panel entry
+    /// with arguments, one without.
     #[test]
     fn start_rows_from_the_arena() {
         let mut access = Keys::default();
@@ -1586,7 +1614,7 @@ mod tests {
             Setting {
                 name: "Accessibilità".into(),
                 lower: "accessibilità".into(),
-                keys: access.tidy(),
+                keys: access,
                 rank: 2,
                 target: Cow::Borrowed(SETTINGS_APP),
                 args: Some("page=SettingsPageEaseOfAccess".into()),
@@ -1609,12 +1637,234 @@ mod tests {
             },
         ];
         let rows = rows_of(&arena_of(&key(), &list), &key());
-        assert_eq!(rows, list);
+        assert_eq!(rows, as_start(&list));
         assert!(matches!(rows[0].target, Cow::Borrowed(t) if t == SETTINGS_APP), "the shared constant, not a copy");
         assert!(matches!(&rows[1].target, Cow::Owned(t) if t.ends_with("control.exe")));
         assert_eq!((rows[1].args.as_deref(), rows[2].args.as_deref()), (Some("/name Microsoft.Mouse"), None));
         let keys: Vec<(&str, u32)> = rows[0].keys.iter().collect();
-        assert_eq!(keys, [("contrasto elevato", 3), ("ipovedenti", XML_KEYWORD_PENALTY)], "as Start searches them");
+        assert_eq!(keys, [("contrasto elevato", 3), ("ipovedenti", START_XML_PENALTY)], "as Start searches them");
+    }
+
+    /// One synthetic setting: Windows' synonyms of its name and the words of its XML entry, as `build_settings` reads them.
+    struct Raw {
+        name: &'static str,
+        synonyms: &'static [(&'static str, u32)],
+        xml: &'static [&'static str],
+        rank: u32,
+    }
+
+    /// The catalogue of `raws` as 1.4.3's (main's) `build_settings` made it: the synonyms, every XML word at 500, tidied.
+    fn as_main(raws: &[Raw]) -> Vec<Setting> {
+        let mut v: Vec<Setting> = raws
+            .iter()
+            .map(|r| {
+                let mut keys = Keys::default();
+                r.synonyms.iter().for_each(|(k, p)| keys.push(k, *p));
+                r.xml.iter().for_each(|k| keys.push(k, 500));
+                let name = r.name.to_string();
+                let lower = name.to_lowercase();
+                Setting {
+                    name,
+                    lower,
+                    keys: keys.tidy(),
+                    rank: r.rank,
+                    target: Cow::Borrowed(SETTINGS_APP),
+                    args: None,
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| a.lower.cmp(&b.lower));
+        v
+    }
+
+    /// The same catalogue as this build's `build_settings` makes it: loose keywords, every XML word at the sentinel.
+    fn as_built(raws: &[Raw]) -> Vec<Setting> {
+        let mut v: Vec<Setting> = raws
+            .iter()
+            .map(|r| {
+                let mut keys = Keys::default();
+                r.synonyms.iter().for_each(|(k, p)| keys.push(k, *p));
+                r.xml.iter().for_each(|k| keys.push(k, XML_KEYWORD_PENALTY));
+                let name = r.name.to_string();
+                let lower = name.to_lowercase();
+                Setting { name, lower, keys, rank: r.rank, target: Cow::Borrowed(SETTINGS_APP), args: None }
+            })
+            .collect();
+        v.sort_by(|a, b| a.lower.cmp(&b.lower));
+        v
+    }
+
+    /// The names Start lists for `q` over `list` (`popup_startmenu::filter`, the ranking Start runs).
+    fn start_lists(list: &[Setting], q: &str) -> Vec<String> {
+        let cands: Vec<crate::popup::popup_startmenu::Cand> = list
+            .iter()
+            .map(|s| crate::popup::popup_startmenu::Cand { lower: &s.lower, keys: &s.keys, rank: s.rank })
+            .collect();
+        crate::popup::popup_startmenu::filter(&cands, q).into_iter().map(|i| list[i].name.clone()).collect()
+    }
+
+    /// Every query worth asking of `list`: each prefix (1 to 6 characters) of each word of the names and keywords.
+    fn queries_of(list: &[Setting]) -> Vec<String> {
+        let mut qs: Vec<String> = Vec::new();
+        for s in list {
+            let words = s.lower.split_whitespace().map(str::to_string);
+            let keys = s.keys.iter().flat_map(|(k, _)| k.split_whitespace().map(str::to_string).collect::<Vec<_>>());
+            for w in words.chain(keys) {
+                for n in 1..=w.chars().count().min(6) {
+                    qs.push(w.chars().take(n).collect());
+                }
+            }
+        }
+        qs.sort_unstable();
+        qs.dedup();
+        qs
+    }
+
+    /// diag-start-and-warm item 1: Start lists exactly what 1.4.3 listed, in the same order, for every query. The catalogue
+    /// is the shape of the real case ("blue" on an Italian Windows): a setting found only by a curated synonym of penalty
+    /// 1273 ("Modalità aereo" by "bluetooth"), settings found only by an XML word, and a word that is both a synonym and an
+    /// XML word of the same entry, with a penalty under and over 500.
+    #[test]
+    fn start_lists_settings_as_1_4_3() {
+        let raws = [
+            Raw { name: "Bluetooth", synonyms: &[], xml: &["dispositivi"], rank: 10 },
+            Raw { name: "Dispositivi Bluetooth e altro", synonyms: &[("blut", 4296)], xml: &[], rank: 20 },
+            Raw { name: "Modalità aereo", synonyms: &[("wi-fi", 2234), ("bluetooth", 1273)], xml: &["volo"], rank: 5 },
+            Raw { name: "Dispositivi", synonyms: &[], xml: &["bluetooth", "stampante"], rank: 30 },
+            Raw { name: "Luce notturna", synonyms: &[], xml: &["blue light", "luce blu"], rank: 40 },
+            Raw { name: "Mouse", synonyms: &[("bluetooth mouse", 300)], xml: &["bluetooth mouse"], rank: 50 },
+            Raw { name: "Tastiera", synonyms: &[("bluetooth keyboard", 4000)], xml: &["bluetooth keyboard"], rank: 60 },
+            Raw { name: "Schermo", synonyms: &[("monitor", 900)], xml: &["display", "monitor"], rank: 1 },
+        ];
+        let main = as_main(&raws);
+        let built = as_built(&raws);
+        // What Start searches now: the real entry builder, encoder, check and decoder.
+        let now = rows_of(&arena_of(&key(), &built), &key());
+        assert_eq!(now.iter().map(|s| &s.keys).collect::<Vec<_>>(), main.iter().map(|s| &s.keys).collect::<Vec<_>>());
+        // 97ea8ed: Start's copy was the loose keywords tidied with the sentinel.
+        let old: Vec<Setting> = built.iter().map(|s| Setting { keys: s.keys.tidy(), ..s.clone() }).collect();
+        let qs = queries_of(&main);
+        assert!(qs.len() > 80, "{}", qs.len());
+        let mut differed = 0;
+        for q in &qs {
+            assert_eq!(start_lists(&now, q), start_lists(&main, q), "{q:?}");
+            differed += usize::from(start_lists(&old, q) != start_lists(&main, q));
+        }
+        assert!(differed > 0, "the comparison sees 97ea8ed's order");
+        assert_eq!(
+            start_lists(&main, "blue"),
+            [
+                "Bluetooth",
+                "Dispositivi Bluetooth e altro",
+                "Mouse",
+                "Dispositivi",
+                "Luce notturna",
+                "Tastiera",
+                "Modalità aereo"
+            ]
+        );
+        assert_eq!(
+            start_lists(&old, "blue"),
+            [
+                "Bluetooth",
+                "Dispositivi Bluetooth e altro",
+                "Mouse",
+                "Modalità aereo",
+                "Tastiera",
+                "Dispositivi",
+                "Luce notturna"
+            ],
+            "97ea8ed: the synonym row jumps the XML rows"
+        );
+        // The launcher's copy keeps the sentinel and the curated synonym over the same XML word.
+        let ins = crate::launcher::catalog::setting_entries(&built);
+        let tastiera = ins.iter().find(|e| &*e.row.name == "Tastiera").unwrap();
+        assert_eq!(tastiera.row.keys.iter().collect::<Vec<_>>(), [("bluetooth keyboard", 4000)]);
+        let disp = ins.iter().find(|e| &*e.row.name == "Dispositivi").unwrap();
+        assert!(disp.row.keys.iter().all(|(_, p)| p == XML_KEYWORD_PENALTY));
+    }
+
+    /// diag-start-and-warm item 1, on THIS machine's real catalogue (run by hand: `cargo test -- --ignored --nocapture
+    /// real_start_settings_as_1_4_3`): Start's rows through the real child path against 1.4.3's and 97ea8ed's.
+    #[test]
+    #[ignore]
+    fn real_start_settings_as_1_4_3() {
+        // SAFETY: COM for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let syn = parse_synonyms(&read_index("settingssynonyms.txt"));
+        assert!(
+            syn.values().flat_map(|k| k.iter()).all(|(_, p)| p != XML_KEYWORD_PENALTY),
+            "no Windows synonym has the sentinel's penalty: mapping it back to 500 is 1.4.3's build"
+        );
+        let t = Instant::now();
+        let built = build_settings();
+        println!("{} settings in {} ms", built.len(), t.elapsed().as_millis());
+        let loose: usize = built.iter().map(|s| s.keys.packed().len()).sum();
+        let tidied: usize = built.iter().map(|s| s.keys.tidy().packed().len()).sum();
+        println!("keyword text: loose {loose} B, tidied {tidied} B (the loose list lives only until it is encoded)");
+        let main: Vec<Setting> = built
+            .iter()
+            .map(|s| {
+                let mut k = Keys::default();
+                s.keys.iter().for_each(|(w, p)| k.push(w, if p == XML_KEYWORD_PENALTY { 500 } else { p }));
+                Setting { keys: k.tidy(), ..s.clone() }
+            })
+            .collect();
+        let old: Vec<Setting> = built.iter().map(|s| Setting { keys: s.keys.tidy(), ..s.clone() }).collect();
+        let k = key();
+        let now = rows_of(&arena_of(&k, &built), &k);
+        let longest = main.iter().map(|s| s.keys.packed().len()).max().unwrap_or(0);
+        println!("longest Start keywords of one setting: {longest} B (arena string cap {})", arena::STR_MAX);
+        assert_eq!(now.len(), main.len());
+        let same_keys = now.iter().zip(&main).filter(|(a, b)| a.keys == b.keys).count();
+        let old_same = old.iter().zip(&main).filter(|(a, b)| a.keys == b.keys).count();
+        // A word that is both a synonym (penalty over 500) and an XML word of the same entry.
+        let both: usize = built
+            .iter()
+            .map(|s| {
+                let pairs: Vec<(&str, u32)> = s.keys.iter().collect();
+                let mut words: Vec<&str> = pairs
+                    .iter()
+                    .filter(|(w, p)| {
+                        *p > 500 && *p != XML_KEYWORD_PENALTY && pairs.contains(&(*w, XML_KEYWORD_PENALTY))
+                    })
+                    .map(|(w, _)| *w)
+                    .collect();
+                words.sort_unstable();
+                words.dedup();
+                words.len()
+            })
+            .sum();
+        println!(
+            "entries whose Start keywords equal 1.4.3's: now {same_keys} of {}, 97ea8ed {old_same}; synonym-and-XML words over 500: {both}",
+            main.len()
+        );
+        for q in ["blue", "note"] {
+            for (label, l) in [("1.4.3", &main), ("97ea8ed", &old), ("now", &now)] {
+                let rows = start_lists(l, q);
+                println!("{q:?} {label}: {} rows: {:?}", rows.len(), rows.iter().take(14).collect::<Vec<_>>());
+            }
+        }
+        let qs = queries_of(&main);
+        let (mut differ_old, mut differ_old_top, mut differ_now) = (0, 0, 0);
+        let t = Instant::now();
+        for q in &qs {
+            let m = start_lists(&main, q);
+            let o = start_lists(&old, q);
+            differ_old += usize::from(o != m);
+            differ_old_top += usize::from(o.iter().take(12).ne(m.iter().take(12)));
+            differ_now += usize::from(start_lists(&now, q) != m);
+        }
+        println!(
+            "{} queries in {} ms: 97ea8ed differs from 1.4.3 in {differ_old} ({differ_old_top} in the first 12 settings rows), now in {differ_now}",
+            qs.len(),
+            t.elapsed().as_millis()
+        );
+        assert_eq!((same_keys, differ_now), (main.len(), 0));
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
     }
 
     /// A recorder of a settings thread run's world: the keys `key` answers in turn (the last one stays), a cache file,
