@@ -440,7 +440,8 @@ pub fn init() -> Result<Geom, String> {
 /// After the window is created: `render::init`, initial items from the config, the UI's own timers
 /// (`TIMER_POLL` 50 ms, `TIMER_RECONCILE` 5 s, `TIMER_CLOCK` aligned to the minute),
 /// first `redraw`, and initial visibility of `SHOW_MS_STARTUP` ms (always visible if
-/// `!config::effective_autohide()`). Also installs `apps::install_winevent_hook`.
+/// `!config::effective_autohide()`), a plain show that takes the foreground only with `--foreground`
+/// (`show_dock_as`'s `startup`). Also installs `apps::install_winevent_hook`.
 pub fn attach(h: HWND) -> Result<(), String> {
     let (metrics, sizes) = UI.with(|u| {
         let st = u.borrow();
@@ -470,7 +471,7 @@ pub fn attach(h: HWND) -> Result<(), String> {
         }
     }
     let ms = if config::effective_autohide() { SHOW_MS_STARTUP } else { u64::MAX / 4 };
-    show_dock("startup", ms);
+    show_dock_as("startup", ms, false, true);
     Ok(())
 }
 
@@ -3140,19 +3141,26 @@ fn hide_window(h: HWND) {
 /// the foreground (or with `--foreground`) it also tries to bring itself to the foreground
 /// (`force_foreground`) and remembers the app to give the foreground back when it hides.
 pub fn show_dock(reason: &str, hide_after_ms: u64) {
-    show_dock_as(reason, hide_after_ms, false);
+    show_dock_as(reason, hide_after_ms, false, false);
 }
 
 /// `show_dock` for the Win key: like the Windows taskbar and Start it always takes the foreground
 /// (`show_takes_foreground`), over any window, fullscreen or not.
 fn show_dock_win(reason: &str) {
-    show_dock_as(reason, SHOW_MS, true);
+    show_dock_as(reason, SHOW_MS, true, false);
 }
 
 /// true if a show takes the foreground: by the Win key or over a recognised fullscreen app, unless
-/// `--no-foreground`; always with `--foreground`. The screen edge and other shows do not.
-fn show_takes_foreground(by_win: bool, fullscreen: bool, foreground_flag: bool, no_foreground: bool) -> bool {
-    foreground_flag || ((by_win || fullscreen) && !no_foreground)
+/// `--no-foreground`; always with `--foreground`. The screen edge, the startup show (whatever window is in
+/// front) and other shows do not.
+fn show_takes_foreground(
+    by_win: bool,
+    startup: bool,
+    fullscreen: bool,
+    foreground_flag: bool,
+    no_foreground: bool,
+) -> bool {
+    foreground_flag || (!startup && (by_win || fullscreen) && !no_foreground)
 }
 
 /// Window (as isize, 0 = none) to remember on a fresh show: the fullscreen app, else the previous
@@ -3168,7 +3176,9 @@ fn prev_to_remember(fullscreen: isize, other_fg: isize, takes: bool, kept: isize
     }
 }
 
-fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
+/// `startup`: the show `attach` makes when the dock starts. Nobody asked for it, so it covers no fullscreen
+/// app and does not take the foreground (`show_takes_foreground`), unless `--foreground`.
+fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool, startup: bool) {
     if GEOM.with(|g| g.get()).is_none() {
         return;
     }
@@ -3189,7 +3199,8 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
     EDGE_SINCE.store(0, Relaxed);
     EDGE_ARMED.store(false, Relaxed);
     // The foreground must be read BEFORE showing/activating the dock (afterwards it would be the dock itself).
-    let fs = if was_visible { None } else { fullscreen_window(&g.mon) };
+    // The startup show reads no fullscreen app to cover: FS_SHOWN stays false (no retake, no instant hide).
+    let fs = if was_visible || startup { None } else { fullscreen_window(&g.mon) };
     let other_fg = if was_visible { HWND::default() } else { foreign_foreground() };
     let (dy, _) = vis_offset(config_top());
     show_topmost(hwnd(), &Geom { y: g.y + dy, ..g });
@@ -3209,7 +3220,7 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
     }
     let args = crate::args();
     let fullscreen = FS_SHOWN.load(Relaxed) || fs.is_some();
-    let takes = show_takes_foreground(by_win, fullscreen, args.foreground, args.no_foreground);
+    let takes = show_takes_foreground(by_win, startup, fullscreen, args.foreground, args.no_foreground);
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
         let fs_raw = fs.map(|h| h.0 as isize).unwrap_or(0);
@@ -4237,14 +4248,28 @@ mod tests {
 
     #[test]
     fn win_show_takes_the_foreground() {
-        assert!(show_takes_foreground(true, false, false, false), "Win over a normal window or a missed game");
-        assert!(show_takes_foreground(true, true, false, false), "Win over a recognised fullscreen app");
-        assert!(show_takes_foreground(false, true, false, false), "fullscreen show: as before");
-        assert!(!show_takes_foreground(false, false, false, false), "screen edge / startup: no focus");
-        assert!(!show_takes_foreground(true, false, false, true), "--no-foreground wins over Win");
-        assert!(!show_takes_foreground(true, true, false, true), "--no-foreground wins over fullscreen");
-        assert!(show_takes_foreground(false, false, true, false), "--foreground always");
-        assert!(show_takes_foreground(false, false, true, true), "--foreground wins over --no-foreground");
+        assert!(show_takes_foreground(true, false, false, false, false), "Win over a normal window or a missed game");
+        assert!(show_takes_foreground(true, false, true, false, false), "Win over a recognised fullscreen app");
+        assert!(show_takes_foreground(false, false, true, false, false), "fullscreen show: as before");
+        assert!(!show_takes_foreground(false, false, false, false, false), "screen edge: no focus");
+        assert!(!show_takes_foreground(true, false, false, false, true), "--no-foreground wins over Win");
+        assert!(!show_takes_foreground(true, false, true, false, true), "--no-foreground wins over fullscreen");
+        assert!(show_takes_foreground(false, false, false, true, false), "--foreground always");
+        assert!(show_takes_foreground(false, false, false, true, true), "--foreground wins over --no-foreground");
+    }
+
+    #[test]
+    fn startup_show_takes_the_foreground_only_with_the_flag() {
+        // A start (sign-in, the update's restart, a watchdog or task restart) is not a user request.
+        assert!(!show_takes_foreground(false, true, true, false, false), "startup over a fullscreen app: no focus");
+        assert!(!show_takes_foreground(false, true, false, false, false), "startup over a normal window: no focus");
+        assert!(!show_takes_foreground(false, true, true, false, true), "startup with --no-foreground: no focus");
+        assert!(show_takes_foreground(false, true, true, true, false), "--foreground: the startup show takes it");
+        assert!(show_takes_foreground(false, true, false, true, false), "--foreground over a normal window");
+        assert!(show_takes_foreground(false, true, true, true, true), "--foreground wins over --no-foreground");
+        // The startup show reads no fullscreen app (0) and does not take the foreground: PREV_FG is kept.
+        assert_eq!(prev_to_remember(0, 9, false, 0), 0, "startup: nothing to give back");
+        assert_eq!(prev_to_remember(0, 9, false, 5), 5, "startup: PREV_FG not changed");
     }
 
     #[test]
