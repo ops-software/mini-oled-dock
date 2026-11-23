@@ -1176,21 +1176,19 @@ pub fn run(dir: &str) -> i32 {
             failures += i32::from(!ok);
         }
     }
-    // The short-screen audio popups are not part of the golden matrix (their goldens come from the runner):
-    // only with DOCK_PREVIEW_SHORT set.
-    if std::env::var_os("DOCK_PREVIEW_SHORT").is_some() {
-        crate::config::set(plan().base_config());
-        for screen in SHORT_SCREENS {
-            for end in [false, true] {
-                let file = format!(
-                    "popup_audio_short_{}x{}_{}{}.png",
-                    screen.0,
-                    screen.1,
-                    screen.2,
-                    if end { "_end" } else { "" }
-                );
-                failures += i32::from(!short_png(dir, &file, screen, end));
-            }
+    // The short-screen audio popups (wsD D8): every screen in the legacy run, in a matrix cell the screens of
+    // its DPI.
+    crate::config::set(plan().base_config());
+    for screen in SHORT_SCREENS.into_iter().filter(|s| !plan().matrix || s.2 == plan().dpi) {
+        for end in [false, true] {
+            let file = format!(
+                "popup_audio_short_{}x{}_{}{}.png",
+                screen.0,
+                screen.1,
+                screen.2,
+                if end { "_end" } else { "" }
+            );
+            failures += i32::from(!short_png(dir, &file, screen, end));
         }
     }
     // Settings window pages, then the same pages in Italian at 144 DPI.
