@@ -1551,7 +1551,9 @@ unsafe extern "system" fn on_folder_change(_context: *mut core::ffi::c_void, _ti
         let w = WATCH_WAIT.swap(0, SeqCst);
         if w != 0 {
             // SAFETY: `w` came from RegisterWaitForSingleObject and is unregistered once (the swap above).
-            let _ = unsafe { windows::Win32::System::Threading::UnregisterWaitEx(HANDLE(w as *mut core::ffi::c_void), None) };
+            let _ = unsafe {
+                windows::Win32::System::Threading::UnregisterWaitEx(HANDLE(w as *mut core::ffi::c_void), None)
+            };
         }
         // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
         let _ = unsafe { PostMessageW(Some(ui), crate::msg::WM_DOCK_CONFIG_CHANGED, WPARAM(1), LPARAM(0)) };
