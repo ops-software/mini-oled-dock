@@ -1550,7 +1550,7 @@ pub fn yield_now() {
 
 /// For processes that do NOT own the host (watchdog, `--restore`): finds every window with
 /// `PROP_DOCK_TRAY_HOST` and sends it `DockTrayYield` (`SendMessageTimeoutW`, `SMTO_BLOCK | SMTO_ABORTIFHUNG`, 500 ms,
-/// a true bound also when the dock's UI thread restores);
+/// a true bound also when the dock's UI thread restores, which removes the popup's mouse hook for the wait);
 /// if it does not respond, `SetWindowPos(HWND_BOTTOM, SWP_ASYNCWINDOWPOS)` as best effort. Returns true if
 /// at least one host was left unresponsive (the watchdog decides the policy).
 pub fn yield_foreign_hosts() -> bool {
@@ -1572,10 +1572,12 @@ pub fn yield_foreign_hosts() -> bool {
             continue;
         }
         let mut res = 0usize;
+        let flags = SMTO_BLOCK | SMTO_ABORTIFHUNG;
+        let hook = crate::popup::suspend_mouse_hook();
         // SAFETY: registered message without pointers; `res` valid; SMTO_ABORTIFHUNG avoids waiting on hung hosts,
         // SMTO_BLOCK keeps the 500 ms whole.
-        let flags = SMTO_BLOCK | SMTO_ABORTIFHUNG;
         let r = unsafe { SendMessageTimeoutW(h, msg, WPARAM(0), LPARAM(0), flags, 500, Some(&mut res)) };
+        crate::popup::resume_mouse_hook(hook);
         if r.0 == 0 {
             log!("tray: host {:?} did not respond to DockTrayYield, sending it to the bottom", h.0);
             unanswered = true;

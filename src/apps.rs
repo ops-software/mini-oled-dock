@@ -1018,12 +1018,15 @@ pub fn close_group(key: &str) {
 /// thread does not answer the ping (`ui::answers`, 50 ms at most) is not sent it: the caller's ShowWindowAsync does it.
 /// SMTO_BLOCK keeps the 300 ms a true bound for an app that stops answering after the ping: without it the UI thread
 /// dispatches the messages other processes send the dock while it waits, and each one starts the timeout again (live
-/// check V-14). A send that times out is reported as not delivered, so the caller's ShowWindowAsync acts.
+/// check V-14). A send that times out is reported as not delivered, so the caller's ShowWindowAsync acts. SMTO_BLOCK
+/// does not serve the popup's low-level mouse hook either, which Windows calls through a message to this thread: the
+/// hook is removed for the wait (`popup::suspend_mouse_hook`), or every mouse event would wait for it.
 fn sys_command(h: isize, cmd: u32) -> bool {
     if !crate::ui::answers(hw(h)) {
         return false;
     }
     let mut res = 0usize;
+    let hook = crate::popup::suspend_mouse_hook();
     // SAFETY: arbitrary HWND allowed; `res` is valid for writing; SMTO_BLOCK, SMTO_ABORTIFHUNG and
     // a 300 ms timeout bound the wait if the target thread does not respond.
     let r = unsafe {
@@ -1037,6 +1040,7 @@ fn sys_command(h: isize, cmd: u32) -> bool {
             Some(&mut res),
         )
     };
+    crate::popup::resume_mouse_hook(hook);
     r.0 != 0
 }
 

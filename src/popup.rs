@@ -839,8 +839,13 @@ fn install_mouse_hook() {
 
 /// Removes the outside-click hook for the duration of a long blocking call on the UI thread (a stalled
 /// low-level hook freezes the system mouse and is dropped by Windows after `LowLevelHooksTimeout`).
-/// Returns true if it was installed; pass that to `resume_mouse_hook` afterwards.
+/// Returns true if it was installed; pass that to `resume_mouse_hook` afterwards. On any other thread it does nothing
+/// and returns false: the UI thread installed the hook and serves it, and `resume_mouse_hook` installs it on the
+/// calling thread.
 pub fn suspend_mouse_hook() -> bool {
+    if !crate::on_ui_thread() {
+        return false;
+    }
     let was = MOUSE_HOOK.load(Ordering::Relaxed) != 0;
     remove_mouse_hook();
     was

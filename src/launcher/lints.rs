@@ -1540,22 +1540,26 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// each one starts the timeout again (live check V-14: a 50 ms ping lasted 7.45 s while another process sent the dock a
 /// message every 10 ms; the heartbeat starved and the watchdog gave the taskbar back). The sends the UI thread makes
 /// block: the ping, the bar's minimize and restore, the taskbar's AppBar messages to Explorer and the restore's yield
-/// to another dock's tray host. The others feed no heartbeat: the tray host's forwards to Explorer (its thread keeps
+/// to another dock's tray host. Those longer than the 50 ms ping also remove the popup's low-level mouse hook for the
+/// wait (suspend_mouse_hook): Windows calls the hook through a message to the UI thread, which SMTO_BLOCK does not serve,
+/// so every mouse event would wait for the send and Windows drops a hook that misses LowLevelHooksTimeout (at most 1 s)
+/// without notice. The others feed no heartbeat: the tray host's forwards to Explorer (its thread keeps
 /// serving the icons apps send it meanwhile), the tray-fwd thread (no window, nothing to dispatch) and the shell
 /// thread's WM_GETICON (none of the dock's windows). A new SendMessageTimeoutW is listed here first.
-const TIMED_SENDS: [(&str, &str, bool); 8] = [
-    ("src/ui.rs", "fn answers(", true),
-    ("src/apps.rs", "fn sys_command(", true),
-    ("src/taskbar.rs", "fn appbar_direct_at(", true),
-    ("src/tray_host.rs", "fn yield_foreign_hosts(", true),
-    ("src/tray_host.rs", "fn forward_sync(", false),
-    ("src/tray_host.rs", "fn forward_with_shared(", false),
-    ("src/tray_host.rs", "fn forward_main(", false),
-    ("src/shell_thread.rs", "fn icon_from_window(", false),
+const TIMED_SENDS: [(&str, &str, bool, bool); 8] = [
+    ("src/ui.rs", "fn answers(", true, false),
+    ("src/apps.rs", "fn sys_command(", true, true),
+    ("src/taskbar.rs", "fn appbar_direct_at(", true, true),
+    ("src/tray_host.rs", "fn yield_foreign_hosts(", true, true),
+    ("src/tray_host.rs", "fn forward_sync(", false, false),
+    ("src/tray_host.rs", "fn forward_with_shared(", false, false),
+    ("src/tray_host.rs", "fn forward_main(", false, false),
+    ("src/shell_thread.rs", "fn icon_from_window(", false, false),
 ];
 
 /// Each SendMessageTimeoutW outside comments, imports and the test module sits in a function `TIMED_SENDS` lists for
-/// its file, under its own name, and each listed function that blocks names SMTO_BLOCK in its code.
+/// its file, under its own name, each listed function that blocks names SMTO_BLOCK in its code, and each that unhooks
+/// calls suspend_mouse_hook().
 fn timed_send_violations(path: &str, text: &str) -> Vec<String> {
     let mut v = Vec::new();
     let token = "SendMessageTimeoutW";
@@ -1564,25 +1568,29 @@ fn timed_send_violations(path: &str, text: &str) -> Vec<String> {
     let listed: Vec<_> = TIMED_SENDS
         .iter()
         .filter(|s| s.0 == path)
-        .map(|&(_, sig, blocks)| (sig, blocks, fn_body(text, sig, 0)))
+        .map(|&(_, sig, blocks, unhooks)| (sig, blocks, unhooks, fn_body(text, sig, 0)))
         .collect();
     for at in tokens(text, token) {
         let start = text.get(..at).and_then(|t| t.rfind('\n')).map_or(0, |i| i + 1);
         let line = text.get(start..).and_then(|t| t.lines().next()).unwrap_or("").trim_start();
         let renamed = text.get(at + token.len()..).is_some_and(|r| r.trim_start().starts_with("as "));
         let import = imports.iter().any(|&(s, e)| s <= at && at < e);
-        let inside = listed.iter().any(|(_, _, b)| b.is_some_and(|(s, e)| s <= at && at < e));
+        let inside = listed.iter().any(|(_, _, _, b)| b.is_some_and(|(s, e)| s <= at && at < e));
         if renamed || !(line.starts_with("//") || import || at >= tests || inside) {
             v.push(format!("{path}:{}: {token} outside the functions lint 19 lists", line_of(text, at)));
         }
     }
-    for (sig, blocks, body) in listed {
-        match body {
-            None => v.push(format!("{path}: {sig}..) is missing")),
-            Some((b, e)) if blocks && !code_of(text.get(b..e).unwrap_or("")).contains("SMTO_BLOCK") => {
-                v.push(format!("{path}:{}: {sig}..) waits without SMTO_BLOCK", line_of(text, b)));
-            }
-            Some(_) => {}
+    for (sig, blocks, unhooks, body) in listed {
+        let Some((b, e)) = body else {
+            v.push(format!("{path}: {sig}..) is missing"));
+            continue;
+        };
+        let code = code_of(text.get(b..e).unwrap_or(""));
+        if blocks && !code.contains("SMTO_BLOCK") {
+            v.push(format!("{path}:{}: {sig}..) waits without SMTO_BLOCK", line_of(text, b)));
+        }
+        if unhooks && !code.contains("suspend_mouse_hook()") {
+            v.push(format!("{path}:{}: {sig}..) blocks under the mouse hook", line_of(text, b)));
         }
     }
     v
@@ -1594,19 +1602,30 @@ fn every_timed_send_is_listed_and_the_ui_threads_block() {
     let good = "use x::{\n    SendMessageTimeoutW, SMTO_BLOCK,\n};\n// SendMessageTimeoutW(h) waits\n\
                 fn sys_command(h: HWND) -> bool {\n\
                 \x20   let flags = SMTO_BLOCK | SMTO_ABORTIFHUNG;\n\
-                \x20   unsafe { SendMessageTimeoutW(h, WM_SYSCOMMAND, w, l, flags, 300, None) }.0 != 0\n}\n";
+                \x20   let hook = suspend_mouse_hook();\n\
+                \x20   let r = unsafe { SendMessageTimeoutW(h, WM_SYSCOMMAND, w, l, flags, 300, None) }.0 != 0;\n\
+                \x20   resume_mouse_hook(hook);\n\
+                \x20   r\n}\n";
     assert!(timed_send_violations(p, good).is_empty());
     // 1.5.0's sends: the timeout restarts at every message the dock is sent meanwhile.
     let unbounded = ["src/apps.rs:5: fn sys_command(..) waits without SMTO_BLOCK"];
     assert_eq!(timed_send_violations(p, &good.replace("SMTO_BLOCK | ", "")), unbounded);
-    let comment = good.replace("SMTO_BLOCK | ", "").replace("    unsafe", "    // SMTO_BLOCK\n    unsafe");
+    let comment = good.replace("SMTO_BLOCK | ", "").replace("    let r", "    // SMTO_BLOCK\n    let r");
     assert_eq!(timed_send_violations(p, &comment), unbounded);
+    // A wait past the ping under the popup's low-level mouse hook, also with the call in a comment only.
+    let hooked = ["src/apps.rs:5: fn sys_command(..) blocks under the mouse hook"];
+    let bare = good.replace("    let hook = suspend_mouse_hook();\n", "");
+    assert_eq!(timed_send_violations(p, &bare), hooked);
+    let commented = good.replace("let hook = suspend_mouse_hook();", "// suspend_mouse_hook()");
+    assert_eq!(timed_send_violations(p, &commented), hooked);
+    // The 50 ms ping stays under it.
+    assert!(timed_send_violations("src/ui.rs", &bare.replace("sys_command", "answers")).is_empty());
     // A send in a function the list does not name, a renamed import and a missing function.
     let outside =
         |line: usize| [format!("src/apps.rs:{line}: SendMessageTimeoutW outside the functions lint 19 lists")];
     let other =
         format!("{good}fn restore(h: HWND) {{\n    SendMessageTimeoutW(h, 1, w, l, SMTO_NORMAL, 9, None);\n}}\n");
-    assert_eq!(timed_send_violations(p, &other), outside(10));
+    assert_eq!(timed_send_violations(p, &other), outside(13));
     let renamed = good.replace("SendMessageTimeoutW, SMTO_BLOCK", "SendMessageTimeoutW as Send, SMTO_BLOCK");
     assert_eq!(timed_send_violations(p, &renamed), outside(2));
     assert_eq!(timed_send_violations(p, "fn minimize() {}"), ["src/apps.rs: fn sys_command(..) is missing"]);

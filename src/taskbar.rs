@@ -224,7 +224,9 @@ fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Option<usize> {
 /// dispatches the messages other processes send the dock while Explorer is slow, each one starts the timeout again
 /// (live check V-14), and the heartbeat starves. Explorer has nothing to send the dock while it answers (the dock
 /// registers no AppBar, so it gets no ABN_ notification); were it to, the send would end at its timeout and the
-/// fallback would run, as for a slow Explorer.
+/// fallback would run, as for a slow Explorer. Nor does the wait serve the popup's low-level mouse hook, which Windows
+/// calls through a message to the UI thread: the hook is removed for the wait (`popup::suspend_mouse_hook`, UI thread
+/// only), or every mouse event would wait for Explorer and Windows would drop the hook.
 fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, timeout_ms: u32) -> Option<usize> {
     let mut m = AppBarMsg {
         abd: AppBarData32 { cb_size: 0x28, hwnd: hwnd.0 as usize as u32, callback: 0, edge, rc, lparam: lparam as i64 },
@@ -240,6 +242,7 @@ fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, 
         lpData: (&mut m as *mut AppBarMsg).cast::<c_void>(),
     };
     let mut res = 0usize;
+    let hook = crate::popup::suspend_mouse_hook();
     // SAFETY: `cds` and `m` live for the whole call, which copies the data to Explorer; `res` is
     // writable; SMTO_ABORTIFHUNG avoids waits on a hung Explorer, SMTO_BLOCK keeps the timeout whole.
     let r = unsafe {
@@ -253,6 +256,7 @@ fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, 
             Some(&mut res),
         )
     };
+    crate::popup::resume_mouse_hook(hook);
     (r.0 != 0).then_some(res)
 }
 

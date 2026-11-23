@@ -150,6 +150,15 @@ pub fn hwnd() -> HWND {
     HWND(HWND_RAW.load(Relaxed) as *mut c_void)
 }
 
+/// Whether the calling thread is the dock window's (the UI thread): false on any other thread and before the window
+/// exists.
+pub fn on_ui_thread() -> bool {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    // SAFETY: no preconditions; a null or stale handle yields 0, which is no thread's id.
+    unsafe { GetWindowThreadProcessId(hwnd(), None) == GetCurrentThreadId() }
+}
+
 // --------------------------------------------------------------------- CLI
 
 /// Command-line arguments. `dock.exe [--top|--bottom] [--no-autohide] [--keep-taskbar]
