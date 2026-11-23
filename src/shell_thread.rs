@@ -2902,10 +2902,12 @@ fn command_parts_with(
         if !sys.is_absolute() {
             return Err("no system directory");
         }
-        // A file that is the whole line (a drive path with spaces, one token) goes quoted: cmd splits at a space. /c hands the
+        // A file that is the whole line goes quoted when cmd would split it (a drive path with spaces) or its %VAR%
+        // may expand to a space; a bare word (dir, set) stays as typed, as cmd runs no quoted built-in. /c hands the
         // line to cmd's `start`, which resolves App Paths and raises the attachment prompt as the Run dialog does.
         let t = line.trim();
-        let body = if !quoted && rest.is_empty() && !t.contains('"') { format!("\"{t}\"") } else { t.to_string() };
+        let split = !t.contains('"') && t.contains(|c: char| c.is_whitespace() || "&|<>^(),;=%".contains(c));
+        let body = if !quoted && rest.is_empty() && split { format!("\"{t}\"") } else { t.to_string() };
         let start = if switch == "/c" { "start \"\" " } else { "" };
         let args = format!("/s {switch} \"{start}{body}\"");
         return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(args)));
@@ -3793,6 +3795,27 @@ mod tests {
         assert!(launch_command_with(&line, file, true, sys, &mut recorder(&mut calls, true)).is_ok());
         assert_eq!(calls[0].1.as_deref(), Some("/s /c \"start \"\" \"C:\\My Files\\%USERNAME%.txt\"\""));
         assert_eq!(calls[1].1.as_deref(), Some("/s /k \"\"C:\\My Files\\%USERNAME%.exe\"\""));
+        // Only a whole-line file cmd would split, or whose variable may expand to a space, goes quoted: cmd runs no
+        // quoted built-in ('"dir"' is not recognized), so Shift+Enter on a bare word runs it as before (spec 5.4.9).
+        calls.clear();
+        for word in ["dir", "set", "ipconfig", "C:\\My Files\\x.exe", "%ProgramFiles%\\x.exe"] {
+            let (line, file) = run_line(word);
+            assert!(launch_command_with(&line, file, true, sys, &mut recorder(&mut calls, true)).is_ok(), "{word}");
+        }
+        let (line, file) = run_line("%ProgramFiles%\\x.exe");
+        assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        let args: Vec<_> = calls.iter().map(|c| c.1.as_deref().unwrap_or("")).collect();
+        assert_eq!(
+            args,
+            [
+                "/s /k \"dir\"",
+                "/s /k \"set\"",
+                "/s /k \"ipconfig\"",
+                "/s /k \"\"C:\\My Files\\x.exe\"\"",
+                "/s /k \"\"%ProgramFiles%\\x.exe\"\"",
+                "/s /c \"start \"\" \"%ProgramFiles%\\x.exe\"\"",
+            ]
+        );
         // No system directory: nothing runs, and no guess from the environment.
         calls.clear();
         let (line, file) = run_line("notepad %X%");
