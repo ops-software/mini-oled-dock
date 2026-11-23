@@ -2954,7 +2954,8 @@ fn command_parts_with(
         }
         // A file that is the whole line goes quoted when cmd would split it (a drive path with spaces) or its %VAR%
         // may expand to a space; a bare word (dir, set) stays as typed, as cmd runs no quoted built-in. /c hands the
-        // line to cmd's `start`, which resolves App Paths and raises the attachment prompt as the Run dialog does.
+        // line to cmd's `start`, which resolves App Paths; no attachment prompt is promised for such a line, as at a command
+        // prompt (owner's decision, SPEC 5.4.9).
         let t = line.trim();
         let split = !t.contains('"') && t.contains(|c: char| c.is_whitespace() || "&|<>^(),;=%".contains(c));
         let body = if !quoted && rest.is_empty() && split { format!("\"{t}\"") } else { t.to_string() };
@@ -2987,8 +2988,8 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
 
 /// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /s /k "<line>"`; a line with a
 /// %VAR%, which the desktop shell does not expand, `<sys>\cmd.exe /s /c "start "" <line>"`: cmd expands it in the user's
-/// context, `start` hands it to ShellExecuteEx (App Paths, the attachment prompt) and cmd closes at once; an address
-/// is never wrapped), one shell call with no working directory. Nothing is
+/// context, `start` hands it to ShellExecuteEx (App Paths; no attachment prompt is promised, SPEC 5.4.9) and cmd closes
+/// at once; an address is never wrapped), one shell call with no working directory. Nothing is
 /// expanded or looked up here: the line goes to the shell as typed.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), Fail> {
