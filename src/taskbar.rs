@@ -49,6 +49,9 @@ static RESTORING: AtomicBool = AtomicBool::new(false);
 /// Set by `restore_at_session_end` and never cleared: `restore_force` keeps the state file for the next sign-in.
 /// Only the dock sets it, so a watchdog restore after a crash still deletes the file.
 static SESSION_END: AtomicBool = AtomicBool::new(false);
+/// Set by `restored_externally` when the restore from outside was the watchdog's hang restore
+/// (`after_outside_restore`): the next safety check hides the taskbar again (`hide_again`). UI thread.
+static HIDE_AGAIN: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "TaskbarCreated" message (0 = not registered yet).
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// true while the taskbar wants the raw WinEvents that `apps::winevent_proc` hands to `on_raw_event` (set by
@@ -756,8 +759,9 @@ fn allow_taskbar_created() {
 
 /// true if, while this process was hiding the taskbar, someone else (watchdog after missed
 /// heartbeats, CLI `--restore` with the dock stuck) restored it: the state file is gone.
-/// In that case it stops hiding it (`HIDDEN` = false): hiding it again would leave the taskbar
-/// hidden with no state file and, possibly, no watchdog.
+/// In that case it stops hiding it (`HIDDEN` = false), for good unless the restore was the watchdog's hang restore
+/// (`after_outside_restore`): then the next safety check hides it again (`hide_again`), which saves the state first
+/// and needs a live watchdog, so the taskbar is never hidden with no state file or no watchdog.
 fn restored_externally() -> bool {
     if !HIDDEN.load(Relaxed) {
         return false;
@@ -766,10 +770,78 @@ fn restored_externally() -> bool {
         return false;
     }
     HIDDEN.store(false, Relaxed);
-    // The tray host yields to Explorer: apps will re-register their icons with it.
-    crate::tray_host::yield_now();
-    log!("taskbar: state file gone (external restore), no longer hiding the taskbar");
+    match after_outside_restore(
+        RESTORING.load(Relaxed),
+        crate::watchdog::stop_requested(),
+        config::effective_hide_native_taskbar(),
+        crate::watchdog::alive(),
+    ) {
+        Outside::StopHiding => {
+            // The tray host yields to Explorer: apps will re-register their icons with it.
+            crate::tray_host::yield_now();
+            log!("taskbar: state file gone (external restore), no longer hiding the taskbar");
+        }
+        Outside::HideAgain => {
+            HIDE_AGAIN.store(true, Relaxed);
+            log!(
+                "taskbar: state file gone, restored by the watchdog (no stop request): hiding it again at the next \
+                 safety check"
+            );
+        }
+    }
     true
+}
+
+/// What the dock does once it finds the taskbar restored from outside (`restored_externally`).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Outside {
+    /// Stop hiding for good: an exit, a stop request, hiding no longer wanted, or no watchdog to guard a new hide.
+    StopHiding,
+    /// The watchdog's hang restore: hide again at the next safety check.
+    HideAgain,
+}
+
+/// Pure: only the watchdog's hang restore is undone. A restore a user starts from outside signals the stop event
+/// before it deletes the state file (`--restore`, `--install`, `--uninstall`), the in-process ones exit, and the
+/// watchdog's wait-failed branch restores and exits; the hang restore does none of these and leaves the dock running.
+fn after_outside_restore(exiting: bool, stop_requested: bool, hide_wanted: bool, watchdog_alive: bool) -> Outside {
+    if !exiting && !stop_requested && hide_wanted && watchdog_alive {
+        Outside::HideAgain
+    } else {
+        Outside::StopHiding
+    }
+}
+
+/// Hides the taskbar again after the watchdog's hang restore (`HIDE_AGAIN`; `on_safety_timer` only, UI thread).
+/// Its `TIMER_SECOND` tick comes after a heartbeat, so the watchdog has left its hang state and needs another 6.6 s of
+/// silence to restore again. The restore set Explorer to the saved original and removed the marks, so the state saved
+/// again here is the user's.
+fn hide_again() {
+    if RESTORING.load(Relaxed) || crate::watchdog::stop_requested() || !config::effective_hide_native_taskbar() {
+        log!("taskbar: not hiding again (exit or stop request)");
+        return;
+    }
+    if !crate::watchdog::alive() {
+        log!("taskbar: not hiding again (no watchdog)");
+        return;
+    }
+    if native_taskbars().is_empty() {
+        HIDE_AGAIN.store(true, Relaxed); // Explorer restarting: the next tick tries again
+        return;
+    }
+    // The host the watchdog's yield ended, and its forwarder, are stopped first: `tray_sync` below then starts one host
+    // and one forwarder. `stop` waits, so not under the popup's mouse hook.
+    let hook = crate::popup::suspend_mouse_hook();
+    crate::tray_host::stop();
+    crate::popup::resume_mouse_hook(hook);
+    if !ensure_state_saved(None) {
+        log!("taskbar: state not saveable after the watchdog's restore, not hiding");
+        return;
+    }
+    HIDDEN.store(true, Relaxed);
+    hide_all();
+    crate::ui::tray_sync(); // starts the host and announces it when show_tray
+    log!("taskbar: hidden again after the watchdog's restore");
 }
 
 /// Stops asking for the raw events (the apps hook stays). Idempotent. UI thread.
@@ -1039,10 +1111,17 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
 /// 3 s safety check (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
 /// no longer a window (`holder_left`), redoes `hide_all()`. A visible taskbar is logged for the first 20 times
 /// (`safety_logs`): the event path should have hidden it already.
-/// No-op if `HIDDEN` is false or if the taskbar was restored from outside (see `restored_externally`).
+/// With `HIDDEN` false it only runs a pending re-hide after the watchdog's restore (`hide_again`); no-op if the
+/// taskbar was restored from outside (see `restored_externally`).
 pub fn on_safety_timer() {
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-    if !HIDDEN.load(Relaxed) || restored_externally() {
+    if !HIDDEN.load(Relaxed) {
+        if HIDE_AGAIN.swap(false, Relaxed) {
+            hide_again();
+        }
+        return;
+    }
+    if restored_externally() {
         return;
     }
     let holder = EDGE_HOLDER.load(Relaxed);
@@ -1690,6 +1769,29 @@ mod tests {
             stuckrects_subkey("S-1-5-21-1-2-3-1001"),
             r"S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3"
         );
+    }
+
+    /// r151 N1: of the restores from outside, only the watchdog's hang restore is undone: not exiting, no stop request
+    /// (--restore, --install, --uninstall), hiding still wanted and the watchdog process still running. All 16 rows.
+    #[test]
+    fn only_the_watchdogs_restore_is_undone() {
+        let mut undone = 0;
+        for row in 0u8..16 {
+            let (exiting, stop, wanted, alive) = (row & 8 != 0, row & 4 != 0, row & 2 != 0, row & 1 != 0);
+            let got = after_outside_restore(exiting, stop, wanted, alive);
+            if (exiting, stop, wanted, alive) == (false, false, true, true) {
+                assert_eq!(got, Outside::HideAgain);
+                undone += 1;
+            } else {
+                assert_eq!(
+                    got,
+                    Outside::StopHiding,
+                    "exiting {exiting}, stop {stop}, wanted {wanted}, watchdog {alive}"
+                );
+            }
+        }
+        assert_eq!(undone, 1, "one row of 16");
+        assert_eq!(after_outside_restore(false, false, true, false), Outside::StopHiding, "no watchdog: never again");
     }
 
     /// wsC Q7: the safety check's line is logged for the first 20 hits of a process, not every 3 s.

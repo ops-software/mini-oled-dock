@@ -9,8 +9,9 @@
 //!    the event, then waits (`WaitForMultipleObjects`) on the process and the event with a 3.3 s timeout
 //!    (sized for the 3 s keepalive; while the dock handles messages each wait returns at a beat). 2 timeouts
 //!    in a row (6.6 s without a beat) are a hang; before the first beat, 10 (33 s). On a hang it runs
-//!    `taskbar::restore_force()` but stays alive as long as the dock lives (a stuck dock can recover; the
-//!    dock itself stops hiding the taskbar if it finds the state file deleted). If the process ends with
+//!    `taskbar::restore_force()` but stays alive as long as the dock lives (a stuck dock can recover: the dock hides
+//!    the taskbar again once it handles messages again, unless a stop was requested (`--restore`, `--install`,
+//!    `--uninstall`), see `stop_requested` and `alive`). If the process ends with
 //!    exit code != 0 (including abort/crash) it restores and exits; with code 0 it exits doing nothing (the
 //!    dock has already restored). It does NOT relaunch the dock. Before restoring it waits up to 30 s for a
 //!    `Shell_TrayWnd` (Explorer restarting).
@@ -385,6 +386,34 @@ pub fn shutdown(stop_watcher: Option<JoinHandle<()>>) {
     close_slot(&WATCHDOG_PROCESS);
 }
 
+/// true when a stop was requested: `--restore`, `--install` and `--uninstall` signal `Local\DockStop` (manual-reset,
+/// so it stays set) before they restore. Also true when it cannot be told (no stop event): the dock then stops hiding
+/// after an outside restore, as before. UI thread (`shutdown` closes the event on it).
+pub fn stop_requested() -> bool {
+    let raw = STOP_EVENT.load(Relaxed);
+    raw == 0 || is_set(to_handle(raw))
+}
+
+/// true only while the watchdog process this dock started runs: false without one (not started, ended for the
+/// session end, closed by `shutdown`) and once it has exited (its wait-failed branch restores and exits). UI thread
+/// (the slot is emptied and closed on it).
+pub(crate) fn alive() -> bool {
+    let raw = WATCHDOG_PROCESS.load(Relaxed);
+    raw != 0 && unsignalled(to_handle(raw))
+}
+
+/// true when `h` (an event, a process) is signalled now; a failed wait reads as false. Never blocks.
+fn is_set(h: HANDLE) -> bool {
+    // SAFETY: a zero-timeout wait; an invalid handle only makes it fail.
+    (unsafe { WaitForSingleObject(h, 0) }) == WAIT_OBJECT_0
+}
+
+/// true when `h` is not signalled now (a process that still runs); a failed wait reads as false. Never blocks.
+fn unsignalled(h: HANDLE) -> bool {
+    // SAFETY: a zero-timeout wait; an invalid handle only makes it fail.
+    (unsafe { WaitForSingleObject(h, 0) }) == WAIT_TIMEOUT
+}
+
 /// Session end (`taskbar::restore_at_session_end`, UI thread): ends the watchdog process before the dock's own
 /// restore, so it cannot restore again after the dock exits and delete the state file kept for the next sign-in.
 /// No-op without a watchdog (never started, or already ended).
@@ -707,6 +736,25 @@ mod tests {
             attempt_note("without breakaway", &denied, "x.exe"),
             Some(format!("spawn: CreateProcessW of x.exe (without breakaway) failed: {denied}"))
         );
+    }
+
+    /// r151 N1: the stop event (manual-reset) reads as set once signalled and stays set; a handle not signalled (a
+    /// running watchdog process) reads as unsignalled, and a failed wait never does.
+    #[test]
+    fn a_set_manual_reset_event_reads_as_set() {
+        // SAFETY: an unnamed manual-reset event of this test, closed below.
+        let h = unsafe { CreateEventW(None, true, false, None) }.expect("CreateEventW");
+        assert!(!is_set(h));
+        assert!(unsignalled(h));
+        // SAFETY: the event created above.
+        unsafe { SetEvent(h) }.expect("SetEvent");
+        assert!(is_set(h));
+        assert!(is_set(h), "a manual-reset event stays set");
+        assert!(!unsignalled(h));
+        assert!(!unsignalled(HANDLE::default()), "a failed wait never reads as a live watchdog");
+        assert!(!is_set(HANDLE::default()));
+        // SAFETY: the event created above, closed once.
+        let _ = unsafe { CloseHandle(h) };
     }
 
     #[test]
