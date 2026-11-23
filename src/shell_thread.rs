@@ -438,9 +438,16 @@ pub(crate) fn push_event(ui: isize, ev: ShellEvent) {
 
 // ------------------------------------------------------------------ constants
 
-/// Period of the thread timer used as a safety net: if a `WM_SHELL_WAKE` were
-/// swallowed by a nested COM message loop, the mpsc queue is still drained within 1 s.
+/// Period of the thread timer that runs only while an icons child exists: `reap_icon_jobs` (at the start of
+/// every `pump`) is the only place that reaps an ended child and kills one past its deadline, and nothing
+/// posts a message when a normal child ends. With no job there is no timer and no wake (a `WM_SHELL_WAKE`
+/// swallowed by a nested COM loop leaves nothing behind: `pump` drains the channel after every message).
 const SAFETY_TIMER_MS: u32 = 1000;
+
+/// True while the thread needs its timer: a Start menu or a launcher icons child is running.
+fn timer_wanted(start_job: bool, launcher_job: bool) -> bool {
+    start_job || launcher_job
+}
 /// Side (px) requested from high-resolution icon sources.
 const SRC_ICON_PX: i32 = 256;
 /// `WM_GETICON` timeout towards other apps' windows.
@@ -508,9 +515,9 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         icons_child_off: false,
     };
 
-    // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
-    // WM_TIMER in the thread queue. Cancelled at the end.
-    let timer = unsafe { SetTimer(None, 0, SAFETY_TIMER_MS, None) };
+    // The thread timer (null hwnd, system-chosen id, no callback: it arrives as WM_TIMER in the thread queue)
+    // exists only while an icons child does; 0 = none. Cancelled at the end.
+    let mut timer: usize = 0;
     #[cfg(feature = "wake-probe")]
     let probe_hook = crate::probe::install_send_hook(crate::probe::Th::Shell);
 
@@ -539,11 +546,20 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             }
         }
         shell.pump(&rx);
+        let wanted = timer_wanted(shell.start_job.is_some(), shell.launcher_job.is_some());
+        if wanted && timer == 0 {
+            // SAFETY: thread timer on this thread, see above.
+            timer = unsafe { SetTimer(None, 0, SAFETY_TIMER_MS, None) };
+        } else if !wanted && timer != 0 {
+            // SAFETY: `timer` is the id returned by SetTimer on this thread.
+            let _ = unsafe { KillTimer(None, timer) };
+            timer = 0;
+        }
     }
     #[cfg(feature = "wake-probe")]
     crate::probe::remove_send_hook(probe_hook);
     if timer != 0 {
-        // SAFETY: `timer` is the id returned by SetTimer on the same thread.
+        // SAFETY: `timer` is the id returned by SetTimer on this thread.
         let _ = unsafe { KillTimer(None, timer) };
     }
     // No icons child outlives the thread that started it.
@@ -4299,6 +4315,48 @@ mod tests {
         assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIconsFor { ids, .. }) if ids == ["b"]));
         assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIcons { .. })));
         assert!(next_request(&mut pending).is_none());
+    }
+
+    #[test]
+    fn one_pump_drains_every_request() {
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        let ids = |s: &str| vec![s.to_string()];
+        enqueue(&mut pending, ShellRequest::VolumeAdjust { delta_percent: 2 });
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
+        enqueue(&mut pending, ShellRequest::Launch { target: "x.exe".into(), args: None });
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 1, query: "q".into() });
+        enqueue(&mut pending, ShellRequest::VolumeRefresh);
+        enqueue(&mut pending, ShellRequest::StartIcons { icon_px: 48, ids: ids("s") });
+        let mut taken = 0;
+        let mut seen_icons = false;
+        while let Some(r) = next_request(&mut pending) {
+            taken += 1;
+            let low = matches!(r, ShellRequest::StartIcons { .. });
+            assert!(!seen_icons || low, "a normal request came after a Start batch");
+            seen_icons |= low;
+        }
+        assert_eq!(taken, 6, "every request comes out exactly once");
+        // Newer ones replace older ones; the launcher's close drops a pending icon request.
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("b") });
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 1, query: "q".into() });
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 2, query: "qq".into() });
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIconsFor { ids, .. }) if ids == ["b"]));
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::LauncherConvert { gen: 2, .. })));
+        assert!(next_request(&mut pending).is_none());
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("c") });
+        enqueue(&mut pending, ShellRequest::LauncherClosed);
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::LauncherClosed)));
+        assert!(next_request(&mut pending).is_none());
+    }
+
+    #[test]
+    fn the_safety_timer_follows_the_icon_jobs() {
+        assert!(!timer_wanted(false, false));
+        assert!(timer_wanted(true, false));
+        assert!(timer_wanted(false, true));
+        assert!(timer_wanted(true, true));
     }
 
     #[test]
