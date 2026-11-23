@@ -1519,12 +1519,142 @@ fn report_legacy_dir() {
 /// `poll_changed` has not loaded yet). Does not consume the change.
 pub fn external_edit_pending() -> bool {
     let Some(path) = crate::datadir::config_path() else { return false };
-    file_mtime(&path) != *lock_mtime()
+    should_post(file_mtime(&path), *lock_mtime())
+}
+
+/// The change notification of the data folder fires for every write in it (dock.log, the launcher's state file); only
+/// a modification time of `config.json` that differs from the remembered one is worth a message to the UI thread.
+fn should_post(now: Option<SystemTime>, remembered: Option<SystemTime>) -> bool {
+    now != remembered
+}
+
+/// Raw handle of the folder's change notification (`FindFirstChangeNotificationW`), 0 = no watch.
+static WATCH_CHANGE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Raw handle of the thread-pool wait registered on it, 0 = none.
+static WATCH_WAIT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// The UI window the callback posts to.
+static WATCH_UI: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// true while the folder watch runs; when it does not, the housekeeping timer polls the mtime every 2 s instead.
+pub fn watching() -> bool {
+    WATCH_WAIT.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Starts the wait on the data folder's change notification (no timer, no thread of ours: a thread-pool wait runs
+/// `on_folder_change` in its wait thread). Returns false (and logs) when it cannot be set up; the caller then polls.
+pub fn start_watch(ui: windows::Win32::Foundation::HWND) -> bool {
+    use std::sync::atomic::Ordering::{Release, SeqCst};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FindCloseChangeNotification, FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    };
+    use windows::Win32::System::Threading::{RegisterWaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD};
+
+    if watching() {
+        return true;
+    }
+    let fail = |e: String| {
+        crate::log!("config: change watch unavailable ({e}), polling every 2 s");
+        false
+    };
+    let Some(path) = crate::datadir::config_path() else { return fail("no data folder".into()) };
+    let Some(dir) = path.parent() else { return fail("no data folder".into()) };
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(dir.as_os_str()).chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call.
+    let change = match unsafe {
+        FindFirstChangeNotificationW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            false,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => return fail(e.to_string()),
+    };
+    WATCH_CHANGE.store(change.0 as isize, SeqCst);
+    WATCH_UI.store(ui.0 as isize, SeqCst);
+    let mut wait = HANDLE::default();
+    // SAFETY: `change` is a valid notification handle owned by the statics until `stop_watch`; the callback is an
+    // `extern "system"` fn that stays valid for the whole process. WT_EXECUTEINWAITTHREAD: one callback per
+    // notification, never two at once (the callback re-arms the handle before the wait thread waits again).
+    let reg = unsafe {
+        RegisterWaitForSingleObject(&mut wait, change, Some(on_folder_change), None, INFINITE, WT_EXECUTEINWAITTHREAD)
+    };
+    if let Err(e) = reg {
+        WATCH_CHANGE.store(0, SeqCst);
+        // SAFETY: the handle came from FindFirstChangeNotificationW and is closed once.
+        let _ = unsafe { FindCloseChangeNotification(change) };
+        return fail(e.to_string());
+    }
+    WATCH_WAIT.store(wait.0 as isize, Release);
+    true
+}
+
+/// Ends the watch: waits for a running callback, then closes the notification. Idempotent; true when a notification
+/// handle was closed (the watch was still held).
+pub fn stop_watch() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::FindCloseChangeNotification;
+    use windows::Win32::System::Threading::UnregisterWaitEx;
+
+    let wait = WATCH_WAIT.swap(0, SeqCst);
+    if wait != 0 {
+        // SAFETY: `wait` came from RegisterWaitForSingleObject and is unregistered once (the swap above);
+        // INVALID_HANDLE_VALUE waits for a callback in progress, so the notification is idle when it is closed.
+        if let Err(e) = unsafe { UnregisterWaitEx(HANDLE(wait as *mut core::ffi::c_void), Some(INVALID_HANDLE_VALUE)) }
+        {
+            crate::log!("config: UnregisterWaitEx failed: {e}");
+        }
+    }
+    let change = WATCH_CHANGE.swap(0, SeqCst);
+    if change != 0 {
+        // SAFETY: the handle came from FindFirstChangeNotificationW and is closed once (the swap above).
+        let _ = unsafe { FindCloseChangeNotification(HANDLE(change as *mut core::ffi::c_void)) };
+    }
+    change != 0
+}
+
+/// Thread-pool callback of the folder notification (wait thread): re-arms the handle first, then posts one message
+/// only when `config.json` itself changed. Never logs (a log line would signal this callback again).
+unsafe extern "system" fn on_folder_change(_context: *mut core::ffi::c_void, _timed_out: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
+    use windows::Win32::Storage::FileSystem::FindNextChangeNotification;
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    probe!(crate::probe::bump(crate::probe::C::ConfigWatch));
+    let change = WATCH_CHANGE.load(SeqCst);
+    let ui = HWND(WATCH_UI.load(SeqCst) as *mut core::ffi::c_void);
+    if change == 0 || ui.0.is_null() {
+        return;
+    }
+    // SAFETY: the handle stays open until `stop_watch`, which first waits for this callback to return.
+    if unsafe { FindNextChangeNotification(HANDLE(change as *mut core::ffi::c_void)) }.is_err() {
+        // wParam 1 = the watch is broken: the UI thread falls back to the 2 s poll. First end the wait (non-blocking
+        // form, allowed in the callback) so a still-signaled handle cannot re-fire this callback in a loop.
+        let w = WATCH_WAIT.swap(0, SeqCst);
+        if w != 0 {
+            // SAFETY: `w` came from RegisterWaitForSingleObject and is unregistered once (the swap above).
+            let _ = unsafe {
+                windows::Win32::System::Threading::UnregisterWaitEx(HANDLE(w as *mut core::ffi::c_void), None)
+            };
+        }
+        // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
+        let _ = unsafe { PostMessageW(Some(ui), crate::msg::WM_DOCK_CONFIG_CHANGED, WPARAM(1), LPARAM(0)) };
+        return;
+    }
+    if external_edit_pending() {
+        // SAFETY: as above.
+        let _ = unsafe { PostMessageW(Some(ui), crate::msg::WM_DOCK_CONFIG_CHANGED, WPARAM(0), LPARAM(0)) };
+    }
 }
 
 /// Checks the mtime of `config.json`; if it changed, re-reads, updates the global snapshot and
 /// returns `true` (the UI must rebuild its entries). Does not block: one stat + read of a
-/// small file. Called by the UI thread every 2 s (`TIMER_HOUSEKEEPING`).
+/// small file. Called by the UI thread after a change notification of the folder (`start_watch`), or every 2 s
+/// (`TIMER_HOUSEKEEPING`) while that watch is not running.
 ///
 /// If the new content is invalid (half-saved edit or syntax error) the previous
 /// snapshot is kept, a message is logged once and `false` is returned; the file is re-read on the next
@@ -2548,6 +2678,52 @@ mod tests {
         c.pinned.push(PinnedApp { key: "k".into(), name: "N".into(), launch: "L".into(), icon: Some("i.png".into()) });
         c.names.insert("code.exe".into(), "VS Code".into());
         assert_eq!(parse(&serde_json::to_string_pretty(&c).unwrap()).unwrap(), c);
+    }
+
+    #[test]
+    fn only_a_config_mtime_change_posts() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(!should_post(Some(t0), Some(t0)));
+        assert!(should_post(Some(t1), Some(t0)));
+        assert!(should_post(None, Some(t0)));
+        assert!(should_post(Some(t0), None));
+        assert!(!should_post(None, None));
+    }
+
+    #[test]
+    fn a_write_in_the_folder_signals_the_notification() {
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::Storage::FileSystem::{
+            FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
+            FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        };
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let dir = std::env::temp_dir().join(format!("dock-cfgwatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(dir.as_os_str()).chain(Some(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        let h: HANDLE = unsafe {
+            FindFirstChangeNotificationW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                false,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+            )
+        }
+        .unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, b"{}").unwrap();
+        // SAFETY: `h` is the notification handle opened above.
+        assert_eq!(unsafe { WaitForSingleObject(h, 2000) }, WAIT_OBJECT_0);
+        // SAFETY: as above: re-arms the handle.
+        unsafe { FindNextChangeNotification(h) }.unwrap();
+        std::fs::write(&file, b"{\"a\":1}").unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { WaitForSingleObject(h, 2000) }, WAIT_OBJECT_0);
+        // SAFETY: closes the handle once.
+        unsafe { FindCloseChangeNotification(h) }.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

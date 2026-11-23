@@ -40,7 +40,9 @@
 //!    With `config.monitor == "pointer"` the Win key brings the bar to the display under the pointer
 //!    (`follow_pointer`), and a double tap opens the dock's Start menu there (`open_start_menu`, `popup_startmenu`).
 //!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
-//!    false = always visible.
+//!    false = always visible. The edge poll runs every 50 ms while the bar is shown, while a dwell or an
+//!    icon request is pending, and for 1 s after the pointer last moved; otherwise raw input waits for the
+//!    next motion (see "edge watch": `WM_INPUT`, `RIDEV_INPUTSINK`).
 //!
 //! REENTRANCY: `SetWindowPos`/`UpdateLayeredWindow` can re-enter (WM_DPICHANGED), so
 //! no `borrow` of `UI` is held across calls that pump messages (`SetWindowPos`, `present`).
@@ -66,6 +68,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
     VK_ESCAPE, VK_F15, VK_LBUTTON, VK_LWIN, VK_RBUTTON,
 };
+use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
@@ -374,6 +377,18 @@ thread_local! {
     static TRAY_HIDDEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     /// true if some items have no ResolveApp request because the shell thread was not ready yet.
     static NEED_REQUESTS: Cell<bool> = const { Cell::new(false) };
+    /// Edge watch (see "edge watch"): true while `TIMER_POLL` is armed (no timer is armed when the UI thread starts).
+    static POLL_ON: Cell<bool> = const { Cell::new(false) };
+    /// Edge watch: true while the raw input registration is in place.
+    static RAW_ON: Cell<bool> = const { Cell::new(false) };
+    /// Edge watch: false after a failed registration, until the next show (the poll then stays on).
+    static GATE_OK: Cell<bool> = const { Cell::new(MOTION_GATE) };
+    /// Edge watch: the pointer position read by the last poll.
+    static LAST_POS: Cell<Option<POINT>> = const { Cell::new(None) };
+    /// Edge watch: `now_ms()` when the pointer was last seen to move.
+    static STILL_SINCE: Cell<u64> = const { Cell::new(0) };
+    /// `now_ms()` of the last `refresh_apps` (`apps_fresh`).
+    static LAST_APPS_REFRESH: Cell<u64> = const { Cell::new(0) };
     /// true if the apps debounce timer is armed.
     static DEBOUNCE_ARMED: Cell<bool> = const { Cell::new(false) };
     /// `config.names` at the last `rebuild_entries` (to redo the requests if it changes).
@@ -427,7 +442,8 @@ pub fn init() -> Result<Geom, String> {
 /// After the window is created: `render::init`, initial items from the config, the UI's own timers
 /// (`TIMER_POLL` 50 ms, `TIMER_RECONCILE` 5 s, `TIMER_CLOCK` aligned to the minute),
 /// first `redraw`, and initial visibility of `SHOW_MS_STARTUP` ms (always visible if
-/// `!config::effective_autohide()`). Also installs `apps::install_winevent_hook`.
+/// `!config::effective_autohide()`), a plain show that takes the foreground only with `--foreground`
+/// (`show_dock_as`'s `startup`). Also installs `apps::install_winevent_hook`.
 pub fn attach(h: HWND) -> Result<(), String> {
     let (metrics, sizes) = UI.with(|u| {
         let st = u.borrow();
@@ -440,9 +456,10 @@ pub fn attach(h: HWND) -> Result<(), String> {
     tray_host::set_icon_px((sizes.tray_px(metrics)).max(metrics.px(16)) as u32);
     refresh_tray_state();
     apps::refresh(h);
+    STILL_SINCE.set(now_ms());
     rebuild_entries();
-    set_timer(h, TIMER_POLL, 50);
-    set_timer(h, TIMER_RECONCILE, RECONCILE_MS);
+    poll_sync();
+    reconcile_sync(h);
     arm_clock(h);
     // SAFETY: registering a window message by name has no preconditions.
     let shell_msg = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
@@ -456,7 +473,7 @@ pub fn attach(h: HWND) -> Result<(), String> {
         }
     }
     let ms = if config::effective_autohide() { SHOW_MS_STARTUP } else { u64::MAX / 4 };
-    show_dock("startup", ms);
+    show_dock_as("startup", ms, false, true);
     Ok(())
 }
 
@@ -547,9 +564,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
                 on_foreground_changed(HWND(lp.0 as *mut std::ffi::c_void));
                 crate::hook::note_activity();
             }
-            if !DEBOUNCE_ARMED.with(|d| d.replace(true)) {
-                set_timer(h, TIMER_APPS_DEBOUNCE, DEBOUNCE_MS);
-            }
+            request_apps_refresh(h);
             Some(LRESULT(0))
         }
         WM_DOCK_SHELL_READY => {
@@ -618,6 +633,17 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         WM_SETTINGCHANGE => {
             on_setting_change(lp);
             None // DefWindowProc may do its own thing
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_INPUT => {
+            // Raw input waits for the pointer's first motion (see "edge watch"). The few messages still queued after
+            // the registration was removed find RAW_ON false. None: the caller runs DefWindowProc (RIM_INPUT cleanup).
+            if RAW_ON.get() {
+                STILL_SINCE.set(now_ms());
+                poll_sync();
+                on_poll();
+                crate::hook::note_activity();
+            }
+            None
         }
         _ => None,
     }
@@ -1358,7 +1384,10 @@ fn on_shell_hook(h: HWND, what: usize, win: isize) {
             });
             if added {
                 ATTN_START.store(now_ms(), Relaxed);
-                set_timer(h, TIMER_ATTN, ATTN_HALF_MS as u32);
+                // The blink runs only while the bar is shown; `attn_sync` arms it at the next show if it is not over.
+                if VISIBLE.load(Relaxed) {
+                    set_timer(h, TIMER_ATTN, ATTN_HALF_MS as u32);
+                }
                 redraw_if_visible();
             }
         }
@@ -1380,14 +1409,38 @@ fn on_shell_hook(h: HWND, what: usize, win: isize) {
     }
 }
 
-/// Blink tick: drops destroyed windows, redraws, and stops once steady (or nothing flashes).
-fn on_attn_tick(h: HWND) {
-    let empty = ATTN.with(|a| {
+/// Whether the blink timer should run: only while the bar is shown, a window asks for attention and the blink time
+/// (`ATTN_BLINK_MS` after the flash) is not over; the steady mark after that needs no timer.
+fn attn_timer_wanted(visible: bool, any: bool, elapsed_ms: u64) -> bool {
+    visible && any && elapsed_ms < ATTN_BLINK_MS
+}
+
+/// Drops the destroyed windows of `ATTN`; true when none is left.
+fn attn_drop_dead() -> bool {
+    ATTN.with(|a| {
         let mut a = a.borrow_mut();
         // SAFETY: IsWindow accepts any handle value.
         a.retain(|w| unsafe { IsWindow(Some(HWND(*w as *mut std::ffi::c_void))) }.as_bool());
         a.is_empty()
-    });
+    })
+}
+
+/// Arms or kills `TIMER_ATTN` by the bar's visibility (`on_visibility`): at a show the destroyed windows are dropped
+/// and the timer runs when the blink is not over; at a hide it is killed.
+fn attn_sync() {
+    let visible = VISIBLE.load(Relaxed);
+    let empty = visible && attn_drop_dead();
+    let elapsed = now_ms().saturating_sub(ATTN_START.load(Relaxed));
+    if attn_timer_wanted(visible, !empty, elapsed) {
+        set_timer(hwnd(), TIMER_ATTN, ATTN_HALF_MS as u32);
+    } else {
+        kill_timer(hwnd(), TIMER_ATTN);
+    }
+}
+
+/// Blink tick: drops destroyed windows, redraws, and stops once steady (or nothing flashes).
+fn on_attn_tick(h: HWND) {
+    let empty = attn_drop_dead();
     redraw_if_visible();
     if empty || now_ms().saturating_sub(ATTN_START.load(Relaxed)) >= ATTN_BLINK_MS {
         kill_timer(h, TIMER_ATTN);
@@ -1399,6 +1452,9 @@ pub fn shutdown() {
     kill_timer(hwnd(), TIMER_ANIM);
     kill_timer(hwnd(), TIMER_VIS);
     kill_timer(hwnd(), TIMER_ATTN);
+    if RAW_ON.get() {
+        raw_motion(false);
+    }
     if SHELLHOOK_MSG.load(Relaxed) != 0 {
         // SAFETY: `hwnd()` is our window, registered in `attach`.
         let _ = unsafe { DeregisterShellHookWindow(hwnd()) };
@@ -1604,6 +1660,7 @@ fn request_missing() {
         }
         NEED_REQUESTS.with(|n| n.set(pending));
     });
+    poll_sync();
 }
 
 /// Applies a result from the shell thread; true if something changed.
@@ -1714,8 +1771,44 @@ fn apply_network(info: crate::net::NetInfo) -> bool {
     changed
 }
 
+/// Whether a hidden bar's window list is stale enough to re-read now (a launcher open): the 5 s reconcile of a shown
+/// bar, applied on demand while the timer is off.
+fn refresh_due(visible: bool, last_ms: u64, now: u64) -> bool {
+    !visible && now.saturating_sub(last_ms) >= u64::from(RECONCILE_MS)
+}
+
+/// Whether `TIMER_RECONCILE` runs: only while the bar is shown.
+fn reconcile_wanted(visible: bool) -> bool {
+    visible
+}
+
+/// Arms or kills `TIMER_RECONCILE` by the bar's visibility.
+fn reconcile_sync(h: HWND) {
+    if reconcile_wanted(VISIBLE.load(Relaxed)) {
+        set_timer(h, TIMER_RECONCILE, RECONCILE_MS);
+    } else {
+        kill_timer(h, TIMER_RECONCILE);
+    }
+}
+
+/// One window-list refresh through the debounce (`TIMER_APPS_DEBOUNCE`): the body of the `WM_DOCK_APPS_DIRTY` arm.
+fn request_apps_refresh(h: HWND) {
+    if !DEBOUNCE_ARMED.with(|d| d.replace(true)) {
+        set_timer(h, TIMER_APPS_DEBOUNCE, DEBOUNCE_MS);
+    }
+}
+
+/// The launcher's window rows read the bar's cache while the reconcile timer may be off: re-enumerate now when the
+/// cache is older than the reconcile period and the bar is hidden (UI thread; one `EnumWindows`).
+pub(crate) fn apps_fresh() {
+    if refresh_due(VISIBLE.load(Relaxed), LAST_APPS_REFRESH.get(), now_ms()) {
+        refresh_apps();
+    }
+}
+
 /// Re-enumerates the windows; if they changed, rebuilds the items and redraws.
 fn refresh_apps() {
+    LAST_APPS_REFRESH.set(now_ms());
     if apps::refresh(hwnd()) {
         rebuild_entries();
         // Even with the bar hidden: the next appearance must already have the right width.
@@ -3050,19 +3143,26 @@ fn hide_window(h: HWND) {
 /// the foreground (or with `--foreground`) it also tries to bring itself to the foreground
 /// (`force_foreground`) and remembers the app to give the foreground back when it hides.
 pub fn show_dock(reason: &str, hide_after_ms: u64) {
-    show_dock_as(reason, hide_after_ms, false);
+    show_dock_as(reason, hide_after_ms, false, false);
 }
 
 /// `show_dock` for the Win key: like the Windows taskbar and Start it always takes the foreground
 /// (`show_takes_foreground`), over any window, fullscreen or not.
 fn show_dock_win(reason: &str) {
-    show_dock_as(reason, SHOW_MS, true);
+    show_dock_as(reason, SHOW_MS, true, false);
 }
 
 /// true if a show takes the foreground: by the Win key or over a recognised fullscreen app, unless
-/// `--no-foreground`; always with `--foreground`. The screen edge and other shows do not.
-fn show_takes_foreground(by_win: bool, fullscreen: bool, foreground_flag: bool, no_foreground: bool) -> bool {
-    foreground_flag || ((by_win || fullscreen) && !no_foreground)
+/// `--no-foreground`; always with `--foreground`. The screen edge, the startup show (whatever window is in
+/// front) and other shows do not.
+fn show_takes_foreground(
+    by_win: bool,
+    startup: bool,
+    fullscreen: bool,
+    foreground_flag: bool,
+    no_foreground: bool,
+) -> bool {
+    foreground_flag || (!startup && (by_win || fullscreen) && !no_foreground)
 }
 
 /// Window (as isize, 0 = none) to remember on a fresh show: the fullscreen app, else the previous
@@ -3078,7 +3178,9 @@ fn prev_to_remember(fullscreen: isize, other_fg: isize, takes: bool, kept: isize
     }
 }
 
-fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
+/// `startup`: the show `attach` makes when the dock starts. Nobody asked for it, so it covers no fullscreen
+/// app and does not take the foreground (`show_takes_foreground`), unless `--foreground`.
+fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool, startup: bool) {
     if GEOM.with(|g| g.get()).is_none() {
         return;
     }
@@ -3099,7 +3201,8 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
     EDGE_SINCE.store(0, Relaxed);
     EDGE_ARMED.store(false, Relaxed);
     // The foreground must be read BEFORE showing/activating the dock (afterwards it would be the dock itself).
-    let fs = if was_visible { None } else { fullscreen_window(&g.mon) };
+    // The startup show reads no fullscreen app to cover: FS_SHOWN stays false (no retake, no instant hide).
+    let fs = if was_visible || startup { None } else { fullscreen_window(&g.mon) };
     let other_fg = if was_visible { HWND::default() } else { foreign_foreground() };
     let (dy, _) = vis_offset(config_top());
     show_topmost(hwnd(), &Geom { y: g.y + dy, ..g });
@@ -3119,7 +3222,7 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool) {
     }
     let args = crate::args();
     let fullscreen = FS_SHOWN.load(Relaxed) || fs.is_some();
-    let takes = show_takes_foreground(by_win, fullscreen, args.foreground, args.no_foreground);
+    let takes = show_takes_foreground(by_win, startup, fullscreen, args.foreground, args.no_foreground);
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
         let fs_raw = fs.map(|h| h.0 as isize).unwrap_or(0);
@@ -3201,6 +3304,18 @@ fn hide(reason: &str, now: bool) {
 fn on_visibility(visible: bool) {
     crate::notif::set_bar_visible(visible);
     crate::hook::note_activity();
+    if visible {
+        GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::Shown));
+    }
+    poll_sync();
+    // The service timers follow the bar: the reconcile and the attention blink run only while it is shown; one
+    // refresh 100 ms after a show catches what the missed window events left.
+    reconcile_sync(hwnd());
+    attn_sync();
+    if visible {
+        request_apps_refresh(hwnd());
+    }
+    crate::on_bar_visibility(visible);
 }
 
 /// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is
@@ -3781,6 +3896,141 @@ fn send_f15() -> u32 {
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
+// ------------------------------------------------------------ edge watch
+
+/// How long the pointer must be still before the poll hands over to raw input.
+const STILL_MS: u64 = 1000;
+/// The one switch: false gives the always-on 50 ms poll of 1.5.0.
+const MOTION_GATE: bool = true;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeWatch {
+    /// The 50 ms `TIMER_POLL` runs.
+    Poll,
+    /// No timer: raw input wakes the UI thread at the pointer's next motion.
+    Motion,
+}
+
+#[derive(Clone, Copy)]
+struct WatchInputs {
+    visible: bool,
+    gate_ok: bool,
+    dwell: bool,
+    requests: bool,
+    drag: bool,
+    still_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+enum GateEvent {
+    RegisterFailed,
+    Shown,
+}
+
+fn edge_watch(w: WatchInputs) -> EdgeWatch {
+    if w.visible || !w.gate_ok || w.dwell || w.requests || w.drag || w.still_ms < STILL_MS {
+        EdgeWatch::Poll
+    } else {
+        EdgeWatch::Motion
+    }
+}
+
+fn still_since(prev: Option<POINT>, cur: Option<POINT>, since: u64, now: u64) -> u64 {
+    match (prev, cur) {
+        (_, None) => since,
+        (Some(a), Some(b)) if a.x == b.x && a.y == b.y => since,
+        _ => now,
+    }
+}
+
+fn gate_after(_gate_ok: bool, ev: GateEvent) -> bool {
+    match ev {
+        GateEvent::RegisterFailed => false,
+        GateEvent::Shown => MOTION_GATE,
+    }
+}
+
+/// Registers (`on`) or removes the raw input of the pointing devices (mouse, pen, touch screen, touch pad) with
+/// RIDEV_INPUTSINK: no foreground needed, other programs' input untouched. Known limit: a pointer moved only by
+/// SetCursorPos makes no input event and does not open the gate; injected input (SendInput, remote desktop, KVM
+/// tools) does. Pen, touch screen and touch pad usages cannot be tried here: pure tests only.
+/// Invariant: only one window per process may register a raw input device class and nothing else in the dock
+/// registers raw input; a future user of raw input must share this registration.
+fn raw_motion(on: bool) -> bool {
+    let target = if on { hwnd() } else { HWND::default() };
+    let flags = if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE };
+    let dev = |page: u16, usage: u16| RAWINPUTDEVICE {
+        usUsagePage: page,
+        usUsage: usage,
+        dwFlags: flags,
+        hwndTarget: target,
+    };
+    let all = [dev(0x01, 0x02), dev(0x0D, 0x02), dev(0x0D, 0x04), dev(0x0D, 0x05)];
+    let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
+    // SAFETY: the slices hold valid RAWINPUTDEVICEs; hwndTarget is our window (or null with RIDEV_REMOVE).
+    let mut res = unsafe { RegisterRawInputDevices(&all, size) };
+    if res.is_err() {
+        // SAFETY: as above, the mouse alone.
+        res = unsafe { RegisterRawInputDevices(&all[..1], size) };
+    }
+    match res {
+        Ok(()) => {
+            RAW_ON.set(on);
+            true
+        }
+        Err(e) => {
+            if on {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Relaxed) {
+                    log!("ui: raw input unavailable ({e}), the edge poll stays on until the next show");
+                }
+            } else {
+                // The registration is gone or never was: do not wait for a message that cannot come.
+                RAW_ON.set(false);
+            }
+            false
+        }
+    }
+}
+
+/// Puts the edge watch in the state `edge_watch` asks for; touches the timer and the registration only on a change.
+fn poll_sync() {
+    let h = hwnd();
+    if h.0.is_null() {
+        return;
+    }
+    let want = edge_watch(WatchInputs {
+        visible: VISIBLE.load(Relaxed),
+        gate_ok: GATE_OK.get(),
+        dwell: EDGE_SINCE.load(Relaxed) != 0,
+        requests: NEED_REQUESTS.with(|n| n.get()),
+        drag: drag_active(),
+        still_ms: now_ms().saturating_sub(STILL_SINCE.get()),
+    });
+    match want {
+        EdgeWatch::Poll => {
+            if RAW_ON.get() {
+                raw_motion(false);
+            }
+            if !POLL_ON.get() {
+                set_timer(h, TIMER_POLL, 50);
+                POLL_ON.set(true);
+            }
+        }
+        EdgeWatch::Motion => {
+            if POLL_ON.get() {
+                kill_timer(h, TIMER_POLL);
+                POLL_ON.set(false);
+            }
+            if !RAW_ON.get() && !raw_motion(true) {
+                GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::RegisterFailed));
+                set_timer(h, TIMER_POLL, 50);
+                POLL_ON.set(true);
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------ poll timer
 
 /// With several monitors: the edge `y == mon.top` (or `mon.bottom - 1`) is a real screen border
@@ -3796,18 +4046,33 @@ fn point_in(r: &RECT, p: POINT) -> bool {
     p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
 }
 
-/// 50 ms timer: auto-hide, screen edge, topmost re-assertion.
+/// 50 ms timer while the bar is shown, while a dwell or an icon request is pending and for 1 s after the pointer last
+/// moved (otherwise raw input waits for the next motion, see "edge watch"): auto-hide, screen edge, topmost
+/// re-assertion.
 /// With `!config::effective_autohide()` the bar never hides by itself; nor does it
 /// while the context menu (popup) is open.
 fn on_poll() {
+    on_poll_body();
+    if !VISIBLE.load(Relaxed) {
+        poll_sync();
+    }
+}
+
+fn on_poll_body() {
     // Esc cancels a drag (the bar has the keyboard focus only after the Win key, so the key state is polled).
     // SAFETY: GetAsyncKeyState has no preconditions; the high bit means "pressed".
     if drag_active() && unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } as u16 & 0x8000 != 0 {
         end_drag(true);
     }
     let Some(g) = GEOM.with(|g| g.get()) else { return };
-    let Some(p) = cursor_pos() else { return };
+    let cur = cursor_pos();
     let now = now_ms();
+    STILL_SINCE.set(still_since(LAST_POS.get(), cur, STILL_SINCE.get(), now));
+    if cur.is_some() {
+        LAST_POS.set(cur);
+    }
+    // A failed read (locked session, secure desktop, disconnected RDP) counts as stillness.
+    let Some(p) = cur else { return };
     let autohide = crate::config::effective_autohide();
     if VISIBLE.load(Relaxed) {
         let bar = RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h };
@@ -3884,6 +4149,95 @@ fn on_poll() {
 mod tests {
     use super::*;
 
+    fn wi(visible: bool, still_ms: u64) -> WatchInputs {
+        WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms }
+    }
+
+    #[test]
+    fn the_edge_watch_starts_with_nothing_armed() {
+        assert!(!POLL_ON.get());
+        assert!(!RAW_ON.get());
+    }
+
+    #[test]
+    fn a_hidden_open_refreshes_a_stale_list() {
+        assert!(refresh_due(false, 0, 5000));
+        assert!(!refresh_due(false, 1000, 5999));
+        assert!(!refresh_due(true, 0, 60_000));
+        assert!(!refresh_due(false, 10, 5));
+    }
+
+    #[test]
+    fn the_blink_runs_only_while_shown() {
+        assert!(attn_timer_wanted(true, true, 0));
+        assert!(attn_timer_wanted(true, true, ATTN_BLINK_MS - 1));
+        assert!(!attn_timer_wanted(true, true, ATTN_BLINK_MS));
+        assert!(!attn_timer_wanted(false, true, 0));
+        assert!(!attn_timer_wanted(true, false, 0));
+    }
+
+    #[test]
+    fn reconcile_only_while_shown() {
+        assert!(reconcile_wanted(true));
+        assert!(!reconcile_wanted(false));
+    }
+
+    #[test]
+    fn a_shown_bar_polls() {
+        for ms in [0, 1000, 60_000] {
+            assert_eq!(edge_watch(wi(true, ms)), EdgeWatch::Poll);
+        }
+    }
+
+    #[test]
+    fn a_still_hidden_pointer_waits_for_motion() {
+        assert_eq!(edge_watch(wi(false, 1000)), EdgeWatch::Motion);
+        assert_eq!(edge_watch(wi(false, 999)), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn a_dwell_in_progress_keeps_polling() {
+        assert_eq!(edge_watch(WatchInputs { dwell: true, ..wi(false, 5000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn pending_icon_requests_keep_polling() {
+        assert_eq!(edge_watch(WatchInputs { requests: true, ..wi(false, 5000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn without_raw_input_it_polls_as_today() {
+        assert_eq!(edge_watch(WatchInputs { gate_ok: false, ..wi(false, 60_000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn a_drag_keeps_polling() {
+        assert_eq!(edge_watch(WatchInputs { drag: true, ..wi(false, 5000) }), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn stillness_restarts_on_any_move() {
+        let a = POINT { x: 5, y: 6 };
+        let b = POINT { x: 5, y: 7 };
+        assert_eq!(still_since(None, Some(a), 10, 50), 50);
+        assert_eq!(still_since(Some(a), Some(b), 10, 50), 50);
+        assert_eq!(still_since(Some(a), Some(a), 10, 50), 10);
+    }
+
+    #[test]
+    fn an_unreadable_cursor_counts_as_still() {
+        let a = POINT { x: 5, y: 6 };
+        assert_eq!(still_since(Some(a), None, 10, 50), 10);
+        assert_eq!(still_since(None, None, 10, 50), 10);
+    }
+
+    #[test]
+    fn a_failed_registration_is_retried_at_the_next_show() {
+        let ok = gate_after(true, GateEvent::RegisterFailed);
+        assert!(!ok);
+        assert_eq!(gate_after(ok, GateEvent::Shown), MOTION_GATE);
+    }
+
     #[test]
     fn tray_sync_waits_for_explorer() {
         use TraySync::*;
@@ -3902,14 +4256,28 @@ mod tests {
 
     #[test]
     fn win_show_takes_the_foreground() {
-        assert!(show_takes_foreground(true, false, false, false), "Win over a normal window or a missed game");
-        assert!(show_takes_foreground(true, true, false, false), "Win over a recognised fullscreen app");
-        assert!(show_takes_foreground(false, true, false, false), "fullscreen show: as before");
-        assert!(!show_takes_foreground(false, false, false, false), "screen edge / startup: no focus");
-        assert!(!show_takes_foreground(true, false, false, true), "--no-foreground wins over Win");
-        assert!(!show_takes_foreground(true, true, false, true), "--no-foreground wins over fullscreen");
-        assert!(show_takes_foreground(false, false, true, false), "--foreground always");
-        assert!(show_takes_foreground(false, false, true, true), "--foreground wins over --no-foreground");
+        assert!(show_takes_foreground(true, false, false, false, false), "Win over a normal window or a missed game");
+        assert!(show_takes_foreground(true, false, true, false, false), "Win over a recognised fullscreen app");
+        assert!(show_takes_foreground(false, false, true, false, false), "fullscreen show: as before");
+        assert!(!show_takes_foreground(false, false, false, false, false), "screen edge: no focus");
+        assert!(!show_takes_foreground(true, false, false, false, true), "--no-foreground wins over Win");
+        assert!(!show_takes_foreground(true, false, true, false, true), "--no-foreground wins over fullscreen");
+        assert!(show_takes_foreground(false, false, false, true, false), "--foreground always");
+        assert!(show_takes_foreground(false, false, false, true, true), "--foreground wins over --no-foreground");
+    }
+
+    #[test]
+    fn startup_show_takes_the_foreground_only_with_the_flag() {
+        // A start (sign-in, the update's restart, a watchdog or task restart) is not a user request.
+        assert!(!show_takes_foreground(false, true, true, false, false), "startup over a fullscreen app: no focus");
+        assert!(!show_takes_foreground(false, true, false, false, false), "startup over a normal window: no focus");
+        assert!(!show_takes_foreground(false, true, true, false, true), "startup with --no-foreground: no focus");
+        assert!(show_takes_foreground(false, true, true, true, false), "--foreground: the startup show takes it");
+        assert!(show_takes_foreground(false, true, false, true, false), "--foreground over a normal window");
+        assert!(show_takes_foreground(false, true, true, true, true), "--foreground wins over --no-foreground");
+        // The startup show reads no fullscreen app (0) and does not take the foreground: PREV_FG is kept.
+        assert_eq!(prev_to_remember(0, 9, false, 0), 0, "startup: nothing to give back");
+        assert_eq!(prev_to_remember(0, 9, false, 5), 5, "startup: PREV_FG not changed");
     }
 
     #[test]

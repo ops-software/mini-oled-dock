@@ -99,7 +99,11 @@ pub const WM_DOCK_LAUNCHER_ALIAS: u32 = WM_APP + 29;
 
 // `WM_APP + 10` stays RESERVED: it was the UI -> hook thread message `WM_HOOK_REINSTALL`, retired by wsC Q6; do not
 // reuse it.
-// `WM_APP + 18` and `+ 19` are RESERVED by WS-C: the config change and `WM_HOOK_NOTE`, the hook thread's thread
+/// config watch -> dock window (`config::on_folder_change`, a thread-pool wait thread): `config.json` changed on disk
+/// (wParam 0: apply it after a 250 ms coalescing timer) or the folder watch broke (wParam 1: fall back to the 2 s poll).
+pub const WM_DOCK_CONFIG_CHANGED: u32 = WM_APP + 18;
+
+// `WM_APP + 19` is RESERVED by WS-C: `WM_HOOK_NOTE`, the hook thread's thread
 // message (defined privately in `hook.rs`). `WM_HOOK_NOTE`'s wParam values: 4 = activity (wsC Q6: foreground change,
 // bar shown or hidden, pointer motion, resume); 1-3 and 5-15 stay reserved for WS-C; 16-31 the launcher (16 =
 // `NOTE_LAUNCHER_FAIL_OPEN`). `WM_APP + 20..23` stay for shell-thread messages.
@@ -123,16 +127,19 @@ pub const WM_SHELL_SPATIAL_CHANGED: u32 = WM_APP + 22;
 
 /// 50 ms, always on: auto-hide, screen edge, topmost re-assertion. Handled by `ui`.
 pub const TIMER_POLL: usize = 1;
-/// 2 s: config mtime check (`config::poll_changed`), idle trim, automatic install. Handled by `main`.
+/// 2 s, armed only while it has work (`main::housekeeping_wanted`: the bar is shown, an automatic install is pending
+/// or the config watch failed): config mtime check while the folder watch is down, visible-idle trim, automatic
+/// install. Handled by `main`.
 pub const TIMER_HOUSEKEEPING: usize = 2;
-/// 30 s: RAM log (private working set). Handled by `main`.
+/// 30 s while the bar is shown: RAM log (private working set); while hidden one line follows each hidden trim.
+/// Handled by `main`.
 pub const TIMER_RAM: usize = 3;
 /// 3 s (`watchdog::HEARTBEAT_MS`): keepalive heartbeat of an idle dock + taskbar safety check
 /// (`taskbar::on_safety_timer`); while messages flow the heartbeat comes from `watchdog::beat_if_due` in `wnd_proc` (dock
 /// window, the shell hook's messages excepted) and in the loop (other windows, thread messages), at most once a second.
 /// Handled by `main`.
 pub const TIMER_SECOND: usize = 4;
-/// 5 s: window list reconciliation (`ui::on_reconcile`). Handled by `ui`.
+/// 5 s while the bar is shown: window list reconciliation (`ui::on_reconcile`). Handled by `ui`.
 pub const TIMER_RECONCILE: usize = 5;
 /// 100 ms one-shot: debounce after `WM_DOCK_APPS_DIRTY`. Handled by `ui`.
 pub const TIMER_APPS_DEBOUNCE: usize = 6;
@@ -165,6 +172,16 @@ pub const TIMER_BATTERY: usize = 13;
 /// then the remaining time to 24 h since `last_update_check`, 24 h after a check, 1 h after a failed
 /// scheduled check. Handled by `main` -> `update::on_timer`.
 pub const TIMER_UPDATE_CHECK: usize = 14;
+/// any thread -> dock window: start a new hidden-trim period (`mem::rearm` posts it; `main::trim_kick`). wParam =
+/// lParam = 0. Not `WM_APP + 29` (the launcher's alias message).
+pub const WM_DOCK_TRIM_KICK: u32 = WM_APP + 30;
+/// One-shot on the dock window while the bar is hidden: the hidden trim (4 s after a hide, a popup or Settings close
+/// or a data release; `main::trim_kick`) and the planned second COM pass. Kills itself, then `trim_tick`.
+/// Handled by `main`.
+pub const TIMER_TRIM: usize = 15;
+/// One-shot 250 ms on the dock window after a config change notification (`WM_DOCK_CONFIG_CHANGED`): coalesces an
+/// editor's several writes, so a half-written file is not read. Kills itself, then applies. Handled by `main`.
+pub const TIMER_CONFIG_COALESCE: usize = 16;
 
 // POPUP window timers (different hwnd from the dock's; handled only by `popup`).
 /// 15 ms: popup open fade and hover plate; off when idle.
@@ -256,12 +273,12 @@ mod tests {
     fn message_and_timer_ids_are_distinct() {
         // WM_APP + n of msg.rs: one window, one id space.
         let msgs = scan(include_str!("msg.rs"), "WM_", "u32", "WM_APP +");
-        assert!(msgs.len() >= 26, "msg.rs scan found only {} WM_APP ids", msgs.len());
+        assert!(msgs.len() >= 28, "msg.rs scan found only {} WM_APP ids", msgs.len());
         assert_distinct("msg.rs WM_APP", &msgs);
 
         // Timer ids of the dock window: msg.rs's TIMER_ consts and ui.rs's private ones.
         let mut timers = scan(include_str!("msg.rs"), "TIMER_", "usize", "");
-        assert!(timers.len() >= 26, "msg.rs scan found only {} timer ids", timers.len());
+        assert!(timers.len() >= 28, "msg.rs scan found only {} timer ids", timers.len());
         let ui = scan(include_str!("ui.rs"), "TIMER_", "usize", "");
         assert!(ui.len() >= 3, "ui.rs scan found only {} private timer ids", ui.len());
         timers.extend(ui);

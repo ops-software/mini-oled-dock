@@ -899,6 +899,8 @@ pub fn close(reason: &str) {
             log!("settings: DestroyWindow failed: {e}");
         }
         log!("settings: window closed ({reason})");
+        // A hidden bar trims 4 s after the window is gone (the hidden period it ended starts again).
+        crate::trim_kick(crate::hwnd());
     }
     if registered {
         unregister_class(module());

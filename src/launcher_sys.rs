@@ -1012,6 +1012,7 @@ pub(crate) fn row_name(bar: Option<&str>, exe_path: &str) -> String {
 /// is sent anything. Titles are left out (`fill_titles`).
 pub(crate) fn window_rows() -> Vec<WindowRow> {
     let mut rows = Vec::new();
+    crate::ui::apps_fresh();
     for g in crate::apps::groups() {
         let name =
             row_name(crate::ui::bar_name(&g.key).as_deref(), if g.exe_path.is_empty() { &g.key } else { &g.exe_path });

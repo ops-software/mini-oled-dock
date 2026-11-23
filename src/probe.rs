@@ -26,8 +26,8 @@
 //!    messages each one posts to the UI.
 //!  * hook, shell and tray-host threads: every `GetMessageW` return by message; shell and tray host also get the
 //!    sent-message hook; the tray host's `WM_COPYDATA` calls by kind (NIM op, AppBar, icon rect) and sender
-//!    image name. tray-fwd, notif, notif-icons, log, stop-watch, audio callbacks, transient workers: counted where
-//!    they wait.
+//!    image name. tray-fwd, notif, notif-icons, log, stop-watch, audio callbacks, the config watch callback,
+//!    transient workers: counted where they wait.
 //!  * A `wake-probe` thread waits 30 s on an event, then reads every thread of the process from the system
 //!    (`NtQuerySystemInformation(SystemProcessInformation)`: context switches, CPU, state) and appends one
 //!    compact JSON line to `wakeprobe.jsonl` next to dock.log (rotated to `wakeprobe.1.jsonl` at 16 MiB), with
@@ -38,7 +38,8 @@
 //! once; per counted event 1-3 uncontended atomic adds; per WinEvent and tray call a `GetWindowThreadProcessId`
 //! (the owner's image name is resolved with OpenProcess/QueryFullProcessImageNameW once per pid per 30 s); per UI
 //! wake one more `PeekMessageW` (the final empty one) and a few `Instant::now` reads; one `WH_CALLWNDPROC` call
-//! per message sent to the UI, shell or tray-host thread. None of it posts a message or arms a timer.
+//! per message sent to the UI, shell or tray-host thread; one config watch callback per JSON line (wakeprobe.jsonl
+//! sits in the data folder the watch observes). None of it posts a message or arms a timer.
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
@@ -132,6 +133,7 @@ counters! {
     Spawned = "transient_threads_started",
     ImportPolls = "start_import.poll_wakes",
     OwnerExited = "launcher.owner_exited_waits",
+    ConfigWatch = "config.watch_callbacks",
     Reports = "probe.reports",
 }
 
@@ -1219,6 +1221,8 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Ui, WM_DOCK_APP_MENU_CMD) => "WM_DOCK_APP_MENU_CMD",
         (Th::Ui, WM_POPUP_OUTSIDE) => "WM_POPUP_OUTSIDE",
         (Th::Ui, WM_DOCK_CONFIG_APPLY) => "WM_DOCK_CONFIG_APPLY",
+        (Th::Ui, WM_DOCK_CONFIG_CHANGED) => "WM_DOCK_CONFIG_CHANGED",
+        (Th::Ui, WM_DOCK_TRIM_KICK) => "WM_DOCK_TRIM_KICK",
         (Th::Ui, WM_DOCK_START_MENU) => "WM_DOCK_START_MENU",
         (Th::Ui, WM_DOCK_OPEN_SETTINGS) => "WM_DOCK_OPEN_SETTINGS",
         (Th::Ui, WM_DOCK_UPDATE) => "WM_DOCK_UPDATE",
@@ -1273,6 +1277,8 @@ fn timer_name(th: Th, id: u32, thread_timer: bool) -> String {
         (Th::Ui, TIMER_RAM) => "TIMER_RAM",
         (Th::Ui, TIMER_SECOND) => "TIMER_SECOND",
         (Th::Ui, TIMER_RECONCILE) => "TIMER_RECONCILE",
+        (Th::Ui, TIMER_TRIM) => "TIMER_TRIM",
+        (Th::Ui, TIMER_CONFIG_COALESCE) => "TIMER_CONFIG_COALESCE",
         (Th::Ui, TIMER_APPS_DEBOUNCE) => "TIMER_APPS_DEBOUNCE",
         (Th::Ui, TIMER_ANIM) => "TIMER_ANIM",
         (Th::Ui, TIMER_CLOCK) => "TIMER_CLOCK",
@@ -1715,6 +1721,10 @@ mod tests {
         assert_eq!(msg_name(Th::Shell, 0x0113), "WM_TIMER");
         assert_eq!(msg_name(Th::Ui, 0x0401), "0x0401");
         assert_eq!(timer_name(Th::Ui, 1, false), "TIMER_POLL");
+        assert_eq!(timer_name(Th::Ui, crate::msg::TIMER_TRIM as u32, false), "TIMER_TRIM");
+        assert_eq!(timer_name(Th::Ui, crate::msg::TIMER_CONFIG_COALESCE as u32, false), "TIMER_CONFIG_COALESCE");
+        assert_eq!(msg_name(Th::Ui, crate::msg::WM_DOCK_CONFIG_CHANGED), "WM_DOCK_CONFIG_CHANGED");
+        assert_eq!(msg_name(Th::Ui, crate::msg::WM_DOCK_TRIM_KICK), "WM_DOCK_TRIM_KICK");
         assert_eq!(timer_name(Th::Tray, 1, false), "TIMER_ZORDER");
         assert_eq!(timer_name(Th::Shell, 0x7FFF, true), "thread_timer#7FFF");
         assert_eq!(timer_name(Th::Hook, 0x7FFE, true), "REINSTALL_TICK");
