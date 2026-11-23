@@ -67,6 +67,9 @@ pub enum Outcome {
     VerifyFailed,
     Ready,
     InstallFailed(i32),
+    /// The available release was installed, failed and was rolled back (`update\<tag>\rolled-back`
+    /// exists): not installed automatically again; Update now retries it.
+    RolledBack,
 }
 
 /// Why a check gave no answer about the latest release.
@@ -149,6 +152,7 @@ impl UpdateStatus {
                 format!("Installation failed (exit code {c})"),
                 format!("Installazione non riuscita (codice {c})"),
             ),
+            Outcome::RolledBack => pick(format!("Update to {v} rolled back"), format!("Aggiornamento a {v} annullato")),
         }
     }
 }
@@ -197,8 +201,15 @@ pub(crate) fn status_from_config(c: &Config, installed: Version) -> UpdateStatus
     UpdateStatus { installed, phase: Phase::Idle, available, last_check, outcome, staged: false }
 }
 
-/// Folds a finished check into the status. A failed check changes only `outcome`.
-pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>, installed: Version, now: u64) {
+/// Folds a finished check into the status. A failed check changes only `outcome`. `rolled_back`: the
+/// newer release found has the rolled-back mark; it stays available and is shown as rolled back.
+pub(crate) fn apply_check(
+    st: &mut UpdateStatus,
+    r: &Result<Release, CheckError>,
+    installed: Version,
+    now: u64,
+    rolled_back: bool,
+) {
     match r {
         Ok(rel) if rel.version > installed => {
             // `staged` only holds for the tag that was verified: a newer tag is not downloaded yet.
@@ -209,7 +220,11 @@ pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>
                 date: rel.published.get(..10).unwrap_or("").to_string(),
                 notes: rel.notes.clone(),
             });
-            st.outcome = if st.staged { Outcome::Ready } else { Outcome::Available };
+            st.outcome = match (rolled_back, st.staged) {
+                (true, _) => Outcome::RolledBack,
+                (false, true) => Outcome::Ready,
+                (false, false) => Outcome::Available,
+            };
             st.last_check = rfc3339_utc(now);
         }
         Ok(_) => {
@@ -448,11 +463,19 @@ pub fn check_now() -> bool {
     spawn_worker(|| {
         check_once();
         // With `update_auto_install` on, a newer release is downloaded and verified right away, so
-        // the idle gate (`on_idle`) only has to start the installer. With it off nothing is downloaded.
-        if config::get().update_auto_install {
-            if let Some(rel) = latest_target(Version::current()) {
-                let _ = stage(&rel);
+        // the idle gate (`on_idle`) only has to start the installer. With it off nothing is downloaded,
+        // and a rolled-back release is never staged, so `on_idle` never installs it.
+        let latest = LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let skip = |tag: &str| {
+            let rb = rolled_back(tag);
+            if rb {
+                crate::log!("update: {tag} was rolled back, not installed automatically");
             }
+            rb
+        };
+        let auto = config::get().update_auto_install;
+        if let Some(rel) = auto_stage_target(latest.as_ref(), Version::current(), auto, skip) {
+            let _ = stage(&rel);
         }
     })
 }
@@ -463,6 +486,7 @@ fn check_once() {
     notify();
     let installed = Version::current();
     let r = fetch_latest(true);
+    let rb = matches!(&r, Ok(rel) if rel.version > installed && rolled_back(&rel.tag));
     match &r {
         Ok(rel) if rel.version > installed => crate::log!("update: {} available", rel.tag),
         Ok(rel) => crate::log!("update: up to date (latest {})", rel.tag),
@@ -472,7 +496,7 @@ fn check_once() {
         *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = is_newer(&rel.tag, installed).then(|| rel.clone());
     }
     let (last, tag) = with_state(|s| {
-        apply_check(s, &r, installed, now_unix());
+        apply_check(s, &r, installed, now_unix(), rb);
         s.phase = Phase::Idle;
         (s.last_check.clone(), s.available.as_ref().map(|a| a.tag.clone()).unwrap_or_default())
     });
@@ -1055,6 +1079,26 @@ pub(crate) fn install_target(latest: Option<&Release>, installed: Version) -> Op
     latest.filter(|r| r.version > installed).cloned()
 }
 
+/// The release a check stages for the automatic install: the freshly fetched newer one, only with
+/// `update_auto_install` on, and never one `rolled_back` says was rolled back. Pure.
+pub(crate) fn auto_stage_target(
+    latest: Option<&Release>,
+    installed: Version,
+    auto_install: bool,
+    rolled_back: impl Fn(&str) -> bool,
+) -> Option<Release> {
+    if !auto_install {
+        return None;
+    }
+    install_target(latest, installed).filter(|r| !rolled_back(&r.tag))
+}
+
+/// true when `update\<tag>\rolled-back` exists in the admin-only stage folder (the update guard rolled
+/// `<tag>` back). Reads the disk: never on the UI thread.
+fn rolled_back(tag: &str) -> bool {
+    datadir::checked_stage_path(tag, update_release::ROLLED_BACK_FILE).is_ok()
+}
+
 fn latest_target(installed: Version) -> Option<Release> {
     install_target(LATEST.lock().unwrap_or_else(|e| e.into_inner()).as_ref(), installed)
 }
@@ -1247,7 +1291,21 @@ pub fn init(h: HWND) {
     with_state(|s| *s = st);
     let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(|| {
         probe!(crate::probe::bump(crate::probe::C::Spawned));
-        cleanup_stages()
+        cleanup_stages();
+        // A release rolled back before this start says so again (its stage, above this version, is kept).
+        let Some(tag) = status().available.map(|a| a.tag).filter(|t| rolled_back(t)) else {
+            return;
+        };
+        let set = with_state(|s| {
+            let idle = s.phase == Phase::Idle && s.available.as_ref().is_some_and(|a| a.tag == tag);
+            if idle {
+                s.outcome = Outcome::RolledBack;
+            }
+            idle
+        });
+        if set {
+            notify();
+        }
     });
     if let Err(e) = spawned {
         crate::log!("update: cannot start the cleanup thread: {e}");
@@ -1378,15 +1436,15 @@ mod tests {
         let cur = Version::parse("1.4.0").unwrap();
         let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap();
         let mut s = status_from_config(&Config::default(), cur);
-        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_227_696);
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_227_696, false);
         assert_eq!((s.outcome.clone(), s.badge()), (Outcome::Available, 1));
         assert_eq!(s.available.as_ref().unwrap().date, "2026-11-20");
         assert_eq!(s.last_check, "2026-11-09T12:34:56Z");
-        apply_check(&mut s, &Err(CheckError::Http(403)), cur, 1_794_300_000);
+        apply_check(&mut s, &Err(CheckError::Http(403)), cur, 1_794_300_000, false);
         assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::Http(403)));
-        apply_check(&mut s, &Err(CheckError::Network("timeout".into())), cur, 1_794_300_000);
+        apply_check(&mut s, &Err(CheckError::Network("timeout".into())), cur, 1_794_300_000, false);
         assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::NoConnection));
-        apply_check(&mut s, &Err(CheckError::Invalid("no dock.exe asset".into())), cur, 1_794_300_000);
+        apply_check(&mut s, &Err(CheckError::Invalid("no dock.exe asset".into())), cur, 1_794_300_000, false);
         assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::Invalid));
         if !crate::i18n::italian() {
             assert_eq!(s.line(), "Could not check for updates (unexpected answer)");
@@ -1395,14 +1453,51 @@ mod tests {
         assert_eq!((s.badge(), s.last_check.as_str()), (1, "2026-11-09T12:34:56Z"));
         // the staged tag survives a re-check of the same tag, not a newer one
         s.staged = true;
-        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_300_000);
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_300_000, false);
         assert_eq!((s.staged, s.outcome.clone()), (true, Outcome::Ready));
         let newer = Release { tag: "v1.4.9".into(), version: Version::parse("1.4.9").unwrap(), ..rel.clone() };
-        apply_check(&mut s, &Ok(newer), cur, 1_794_300_000);
+        apply_check(&mut s, &Ok(newer), cur, 1_794_300_000, false);
         assert_eq!((s.staged, s.outcome.clone(), s.badge()), (false, Outcome::Available, 1));
         let same = Release { tag: "v1.4.0".into(), version: cur, ..rel };
-        apply_check(&mut s, &Ok(same), cur, 1_794_300_000);
+        apply_check(&mut s, &Ok(same), cur, 1_794_300_000, false);
         assert_eq!((s.outcome.clone(), s.badge()), (Outcome::UpToDate, 0));
+    }
+
+    #[test]
+    fn rolled_back_release_line() {
+        let mut s = status_from_config(&Config::default(), Version::parse("1.5.0").unwrap());
+        let version = Version::parse("1.5.3").unwrap();
+        s.available = Some(Available { tag: version.tag(), version, date: String::new(), notes: String::new() });
+        s.outcome = Outcome::RolledBack;
+        if !crate::i18n::italian() {
+            assert_eq!(s.line(), "Update to 1.5.3 rolled back");
+        }
+    }
+
+    #[test]
+    fn a_check_keeps_a_rolled_back_release_visible() {
+        let cur = Version::parse("1.4.0").unwrap();
+        let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap(); // v1.4.1
+        let mut s = status_from_config(&Config::default(), cur);
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_227_696, true);
+        assert_eq!((s.outcome.clone(), s.badge(), s.staged), (Outcome::RolledBack, 1, false));
+        assert_eq!(s.available.as_ref().map(|a| a.tag.as_str()), Some("v1.4.1"));
+        assert_eq!(s.last_check, "2026-11-09T12:34:56Z");
+        // Nothing newer: up to date, whatever the mark says.
+        let same = Release { tag: "v1.4.0".into(), version: cur, ..rel };
+        apply_check(&mut s, &Ok(same), cur, 1_794_300_000, true);
+        assert_eq!((s.outcome.clone(), s.badge()), (Outcome::UpToDate, 0));
+    }
+
+    #[test]
+    fn auto_stage_skips_a_rolled_back_release() {
+        let cur = Version::parse("1.4.0").unwrap();
+        let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap(); // v1.4.1
+        assert_eq!(auto_stage_target(Some(&rel), cur, true, |t| t == "v1.4.1"), None);
+        assert_eq!(auto_stage_target(Some(&rel), cur, true, |_| false), Some(rel.clone()));
+        assert_eq!(auto_stage_target(Some(&rel), cur, false, |_| false), None);
+        assert_eq!(auto_stage_target(None, cur, true, |_| false), None);
+        assert_eq!(auto_stage_target(Some(&rel), Version::parse("1.4.1").unwrap(), true, |_| false), None);
     }
 
     #[test]

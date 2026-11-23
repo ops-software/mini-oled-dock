@@ -105,6 +105,11 @@ pub const SHA_MAX_BYTES: u64 = 1024;
 pub const NOTES_MAX_CHARS: usize = 16 * 1024;
 pub const EXE_ASSET: &str = "dock.exe";
 pub const SHA_ASSET: &str = "dock.exe.sha256";
+/// `update\<tag>\dock-guard.exe`: the old exe that judges the update to `<tag>` (the update guard).
+pub const GUARD_FILE: &str = "dock-guard.exe";
+/// `update\<tag>\rolled-back`: `<tag>` was installed, failed and was rolled back; never installed
+/// automatically again.
+pub const ROLLED_BACK_FILE: &str = "rolled-back";
 pub const FIRST_CHECK_MS: u32 = 60_000;
 pub const CHECK_PERIOD_MS: u32 = 86_400_000;
 pub const RETRY_MS: u32 = 3_600_000;

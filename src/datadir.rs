@@ -22,9 +22,9 @@
 //!    the user can create entries there, custom icons are opened WITHOUT following reparse points,
 //!    must be single-link regular files whose final path is exactly `<icons>\<name>`, and are decoded
 //!    from memory (`read_icon`). The elevated process never writes into `icons\`.
-//!  * `<root>\update\<tag>\`: releases staged by the updater (`dock.exe`, `dock.exe.sha256`),
-//!    admin-only (inherited root DACL). A staged file is read or executed only through the checked
-//!    path (`read_stage_file`, `checked_stage_path`).
+//!  * `<root>\update\<tag>\`: releases staged by the updater (`dock.exe`, `dock.exe.sha256`), the update
+//!    guard's `dock-guard.exe` and its `rolled-back` mark, admin-only (inherited root DACL). A staged file is
+//!    read or executed only through the checked path (`read_stage_file`, `checked_stage_path`).
 //!
 //! MODES: `init()` runs once, in the processes that need persistent data (dock, watchdog,
 //! `--install`/`--uninstall`, `--restore`). Elevated: creates, verifies and repairs the folders.
@@ -83,8 +83,9 @@ const CACHE_NAME: &str = "cache";
 const ICONS_NAME: &str = "icons";
 /// `<root>\update\<tag>\`: staged releases (admin-only, inherited root DACL).
 const UPDATE_NAME: &str = "update";
-/// The only files a staging folder holds.
-const STAGE_FILES: [&str; 2] = ["dock.exe", "dock.exe.sha256"];
+/// The only files a staging folder holds: the release's two assets, the update guard's copy of the old
+/// exe and the mark of a rolled-back update (`update_release::GUARD_FILE`, `ROLLED_BACK_FILE`).
+const STAGE_FILES: [&str; 4] = ["dock.exe", "dock.exe.sha256", "dock-guard.exe", "rolled-back"];
 
 /// Size caps of the files read into memory.
 pub const CONFIG_MAX_BYTES: u64 = 1024 * 1024;
@@ -1203,6 +1204,18 @@ mod tests {
 
     fn allow(sid: &str, mask: u32) -> AceFacts {
         AceFacts { deny: false, sid: Some(sid.into()), mask }
+    }
+
+    #[test]
+    fn stage_files_are_the_updater_files_only() {
+        for n in ["dock.exe", "dock.exe.sha256", "dock-guard.exe", "rolled-back"] {
+            assert!(check_stage_names("v1.5.1", Some(n)).is_ok(), "{n}");
+        }
+        for n in ["dock-guard.exe.bak", "x.exe", ""] {
+            assert!(check_stage_names("v1.5.1", Some(n)).is_err(), "{n:?}");
+        }
+        assert!(STAGE_FILES.contains(&crate::update_release::GUARD_FILE));
+        assert!(STAGE_FILES.contains(&crate::update_release::ROLLED_BACK_FILE));
     }
 
     #[test]
