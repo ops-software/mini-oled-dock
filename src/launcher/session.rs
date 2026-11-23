@@ -678,27 +678,32 @@ impl Session {
         if text.is_empty() {
             return Vec::new();
         }
-        // Typing closes the action list and goes on searching.
-        self.actions = None;
-        self.edit(Edit::Insert(text), cx)
+        match self.insert_text(text, cx) {
+            FieldOut::Changed => self.requery(cx),
+            FieldOut::CaretOnly => vec![Effect::Redraw],
+            _ => Vec::new(),
+        }
     }
 
-    /// `chars` for one typed character without the query that follows a change (the replay's); whether the text
-    /// changed.
+    /// The edit of typed text, shared by typing and the replay: it closes the action list, inserts, and takes the mode
+    /// chip when the text now starts with a prefix. The query that follows a change is the caller's.
+    fn insert_text(&mut self, text: String, cx: &Context) -> FieldOut {
+        self.actions = None;
+        let out = self.field.apply(Edit::Insert(text));
+        if matches!(out, FieldOut::Changed) {
+            self.take_chip(cx);
+        }
+        out
+    }
+
+    /// One typed character of a replay: `chars` without the query that follows a change; whether the text changed.
     fn insert_unqueried(&mut self, c: char, cx: &Context) -> bool {
         self.keyed();
         if c.is_control() {
             return false;
         }
-        self.actions = None;
         let mut buf = [0u8; 4];
-        match self.field.apply(Edit::Insert(String::from(&*c.encode_utf8(&mut buf)))) {
-            FieldOut::Changed => {
-                self.take_chip(cx);
-                true
-            }
-            _ => false,
-        }
+        matches!(self.insert_text(String::from(&*c.encode_utf8(&mut buf)), cx), FieldOut::Changed)
     }
 
     /// The clipboard's text (after `Effect::Paste`): line breaks and tabs become spaces, cut at 256 characters;
@@ -1936,12 +1941,18 @@ mod tests {
             let out = merged.replay(&keys, &fx.cx());
             let mut single = open(&fx);
             let mut out_single = Vec::new();
+            // The oracle is typing: WM_CHAR and key events one at a time, each with its own query.
+            single.replaying = true;
             for key in &keys {
-                out_single.extend(single.replay(std::slice::from_ref(key), &fx.cx()));
+                out_single.extend(match *key {
+                    ReplayKey::Text(c) => single.chars(c.encode_utf8(&mut [0u8; 4]), &fx.cx()),
+                    ReplayKey::Key(ev) => single.key(ev, None, &fx.cx()),
+                });
                 if out_single.iter().any(|e| matches!(e, Effect::Hide { .. })) {
                     break;
                 }
             }
+            single.replaying = false;
             let shown = |s: &Session| s.rows().iter().map(|r| (r.title.clone(), r.score)).collect::<Vec<_>>();
             assert_eq!(shown(&merged), shown(&single), "{keys:?}");
             assert_eq!(sel_title(&merged), sel_title(&single), "{keys:?}");
