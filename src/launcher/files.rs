@@ -494,7 +494,8 @@ pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
             1 => rank::T_WORD,
             _ => rank::T_SUBSTR,
         };
-        let class = if h.dangerous { FileClass::Executable } else { providers::file_class(&h.name) };
+        // By the path, which Open acts on: a name of "." or ".." passes check_hit when it is the path's last component.
+        let class = if h.dangerous { FileClass::Executable } else { providers::file_class(&h.path) };
         let dir = h.dir && class != FileClass::Executable;
         let class = if dir { FileClass::Other } else { class };
         let (kind, rank_kind, verbs) = if dir {
@@ -1295,6 +1296,29 @@ mod tests {
             assert_eq!((r.kind, &r.icon), (Kind::File, &IconRef::Glyph(Executable)), "{}", r.title);
             assert!(matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. }));
             assert!(!r.verbs.has(Verb::Open) && r.verbs.has(Verb::Reveal), "{}", r.title);
+        }
+    }
+
+    #[test]
+    fn a_dot_name_is_classed_by_the_path_it_opens() {
+        let dot = |path: &str, name: &str, dir: bool| FileHit {
+            path: path.into(),
+            name: name.into(),
+            folder: "x".into(),
+            dir,
+            dangerous: false,
+        };
+        let hits = vec![
+            dot("C:\\u\\Downloads\\setup.exe\\.", ".", false),
+            dot("C:\\u\\Downloads\\setup.exe\\x\\..", "..", false),
+            dot("C:\\u\\Downloads\\setup.exe\\x\\..", "..", true),
+        ];
+        for h in &hits {
+            assert!(check_hit(&h.path, &h.name, &h.folder).is_ok(), "{}", h.path);
+        }
+        for r in items(hits, &[""], 20) {
+            assert!(matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. }));
+            assert!(!r.verbs.has(Verb::Open) && r.verbs.has(Verb::Reveal), "{:?}", r.key);
         }
     }
 
