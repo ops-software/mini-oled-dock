@@ -292,11 +292,15 @@ pub fn check_hit(path: &str, name: &str, folder: &str) -> Result<(), FrameError>
 
 /// A drive path (`C:\...`) or a UNC path (`\\server\...`); never one with a device or long-path prefix, nor a colon
 /// past a drive's: no NTFS or SMB name holds one, and `C:\u\tool.exe::$DATA` (a stream) would hide the extension.
+/// Nor a segment of dots and spaces alone (`.`, `..`, `...`, `. `): Windows Search lists none, and Windows' path
+/// normalization would resolve it, so the name, the helper's roots fence and type check and the class would no longer
+/// read the path that Open acts on.
 fn path_form_ok(p: &str) -> bool {
     let b = p.as_bytes();
     let drive = b.first().is_some_and(u8::is_ascii_alphabetic) && b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\');
     let unc = b.starts_with(b"\\\\") && b.get(2).is_some_and(|c| !matches!(c, b'\\' | b'/' | b'?' | b'.'));
-    (drive || unc) && !b.get(if drive { 2 } else { 0 }..).unwrap_or_default().contains(&b':')
+    let dots = p.split(['\\', '/']).any(|s| !s.is_empty() && s.bytes().all(|c| c == b'.' || c == b' '));
+    (drive || unc) && !dots && !b.get(if drive { 2 } else { 0 }..).unwrap_or_default().contains(&b':')
 }
 
 /// How far a read filled its buffer.
@@ -479,12 +483,13 @@ fn glyph_of(dir: bool, class: FileClass) -> GlyphId {
 
 /// The rows of a re-sorted batch, the first `cap`: a file or a folder by its path, its name and its folder, a glyph by
 /// class, the file kinds' verbs (an executable has no Open while the Mark of the Web check is open), never destructive.
-/// The class comes from the name as Windows opens it (`check_hit` holds it to the path's last component, so a trailing
-/// separator hides no extension; `file_class` drops the trailing dots and spaces Windows drops) or, when the helper
-/// says Windows names that type dangerous (`FileHit::dangerous`), is executable whatever the list says: the list is
-/// the floor and the helper only adds. The helper's folder flag is not taken for an executable's name: that row is an
-/// executable file, so nothing in the helper's output can give Open to what SPEC 5.4.6 holds back (a real folder so
-/// named keeps Open file location and Copy).
+/// The class comes from the path's last name as Windows opens it (`check_hit` holds the name to that component and
+/// refuses dot segments, so the name, the helper's type check and the class read one name; a trailing separator hides
+/// no extension; `file_class` drops the trailing dots and spaces Windows drops) or, when the helper says Windows names
+/// that type dangerous (`FileHit::dangerous`), is executable whatever the list says: the list is the floor and the
+/// helper only adds. The helper's folder flag is not taken for an executable's name: that row is an executable file, so
+/// nothing in the helper's output can give Open to what SPEC 5.4.6 holds back (a real folder so named keeps Open file
+/// location and Copy).
 pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
     let first = folded_words.first().copied().unwrap_or("");
     let mut out = Vec::with_capacity(hits.len().min(usize::from(cap)));
@@ -494,7 +499,7 @@ pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
             1 => rank::T_WORD,
             _ => rank::T_SUBSTR,
         };
-        // By the path, which Open acts on: a name of "." or ".." passes check_hit when it is the path's last component.
+        // By the path, which Open acts on (check_hit refused its dot segments: its last name is the row's name).
         let class = if h.dangerous { FileClass::Executable } else { providers::file_class(&h.path) };
         let dir = h.dir && class != FileClass::Executable;
         let class = if dir { FileClass::Other } else { class };
@@ -1173,6 +1178,7 @@ mod tests {
             ("named stream", after_state(row(&ok(b"a.txt:evil.exe"), b"a.txt:evil.exe")), FrameError::PathForm),
             ("unc colon", after_state(row(b"\\\\srv\\s\\a:b.exe", b"a:b.exe")), FrameError::PathForm),
             ("drive twice", after_state(row(b"C:\\C:\\a.txt", b"a.txt")), FrameError::PathForm),
+            ("dot segment", after_state(row(b"C:\\u\\..\\v\\a.txt", b"a.txt")), FrameError::PathForm),
             ("not the last part", after_state(row(&ok(b"a.txt"), b"b.txt")), FrameError::NameMismatch),
         ];
         let mut seen = Vec::new();
@@ -1299,26 +1305,26 @@ mod tests {
         }
     }
 
+    /// Windows Search never lists a segment of dots and spaces alone; resolved, one would move the path away from the
+    /// name the helper asks Windows about, from its roots fence and from the class.
     #[test]
-    fn a_dot_name_is_classed_by_the_path_it_opens() {
-        let dot = |path: &str, name: &str, dir: bool| FileHit {
-            path: path.into(),
-            name: name.into(),
-            folder: "x".into(),
-            dir,
-            dangerous: false,
-        };
-        let hits = vec![
-            dot("C:\\u\\Downloads\\setup.exe\\.", ".", false),
-            dot("C:\\u\\Downloads\\setup.exe\\x\\..", "..", false),
-            dot("C:\\u\\Downloads\\setup.exe\\x\\..", "..", true),
+    fn a_dot_segment_is_refused() {
+        let refused = [
+            ("C:\\u\\Downloads\\setup.exe\\.", "."),
+            ("C:\\u\\Downloads\\setup.exe\\x\\..", ".."),
+            ("C:\\Users\\me\\..\\..\\other\\report.pdf\\x\\..", ".."),
+            ("C:\\Users\\me\\..\\other\\report.pdf", "report.pdf"),
+            ("C:\\Users\\me\\x/../..\\other\\report.pdf", "report.pdf"),
+            ("\\\\srv\\share\\.\\a.txt", "a.txt"),
+            ("C:\\u\\...\\a.txt", "a.txt"),
+            ("C:\\u\\. \\a.txt", "a.txt"),
         ];
-        for h in &hits {
-            assert!(check_hit(&h.path, &h.name, &h.folder).is_ok(), "{}", h.path);
+        for (path, name) in refused {
+            assert_eq!(check_hit(path, name, "x"), Err(FrameError::PathForm), "{path}");
         }
-        for r in items(hits, &[""], 20) {
-            assert!(matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. }));
-            assert!(!r.verbs.has(Verb::Open) && r.verbs.has(Verb::Reveal), "{:?}", r.key);
+        let listed = [("C:\\u\\.config\\a.txt", "a.txt"), ("C:\\u\\a..b.txt", "a..b.txt"), ("C:\\u\\..x", "..x")];
+        for (path, name) in listed {
+            assert_eq!(check_hit(path, name, "x"), Ok(()), "{path}");
         }
     }
 

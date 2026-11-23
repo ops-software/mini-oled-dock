@@ -117,8 +117,9 @@ fn row_of(raw: RawRow, roots: &[String]) -> Option<FileHit> {
 }
 
 /// At most 50 rows of a query, mapped: the hits in Windows' order and the number skipped. Each hit with an extension
-/// (`providers::extension`, the one `file_class` reads) is marked dangerous when `ask` says so; `ask` is called once
-/// per extension of the query (ASCII case-insensitive), never for a skipped row or a name without one.
+/// (`providers::extension` of its name, which `check_hit` holds to the path's last component with no dot segment, so
+/// it is the one `file_class` reads of the path) is marked dangerous when `ask` says so; `ask` is called once per
+/// extension of the query (ASCII case-insensitive), never for a skipped row or a name without one.
 fn collect(rows: &mut dyn Rows, roots: &[String], ask: &mut dyn FnMut(&str) -> bool) -> (Vec<FileHit>, u32) {
     let mut hits = Vec::new();
     let mut skipped = 0u32;
