@@ -892,6 +892,15 @@ impl Content for AudioPopup {
         Reply::Redraw
     }
 
+    fn leave(&mut self) -> Reply {
+        let was = std::mem::replace(&mut self.scroll.hot, false);
+        if was {
+            Reply::Redraw
+        } else {
+            Reply::None
+        }
+    }
+
     fn tick(&mut self) -> Reply {
         if self.scroll.hide_due(tick_ms()) {
             Reply::Redraw
@@ -1281,6 +1290,17 @@ mod tests {
         // The bar zone wins at the right edge and is not clickable.
         assert_eq!(p.hit(319, 50), Some(ID_SCROLLBAR));
         assert!(!p.clickable(ID_SCROLLBAR));
+    }
+
+    #[test]
+    fn leaving_the_popup_clears_the_hot_bar() {
+        let mut p = loaded(Some(400), audio::MAX_SESSIONS);
+        size_of(&mut p);
+        assert!(matches!(p.pointer(319, 50), Reply::Redraw));
+        assert!(p.scroll.hot);
+        assert!(matches!(p.leave(), Reply::Redraw));
+        assert!(!p.scroll.hot);
+        assert!(matches!(p.leave(), Reply::None));
     }
 
     #[test]

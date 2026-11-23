@@ -351,6 +351,10 @@ pub(crate) trait Content {
     fn pointer(&mut self, _x: i32, _y: i32) -> Reply {
         Reply::None
     }
+    /// The pointer left the popup window.
+    fn leave(&mut self) -> Reply {
+        Reply::None
+    }
     /// true: the popup closes when the foreground retries end without the keyboard (the launcher: what the user types
     /// would reach the window behind it).
     fn focus_lost_closes(&self) -> bool {
@@ -1700,11 +1704,12 @@ fn on_mouse_leave() {
     let changed = with(|st| {
         let o = st.open.as_mut()?;
         o.tracking = false;
+        let left = o.content.leave();
         if o.pressed.is_none() && o.hot.is_some() {
             o.hot = None;
             return Some(true);
         }
-        Some(false)
+        Some(matches!(left, Reply::Redraw | Reply::Relayout))
     })
     .flatten();
     if changed == Some(true) {
