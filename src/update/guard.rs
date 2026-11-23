@@ -84,7 +84,6 @@ pub(crate) const EXIT_NOT_INSTALLED: i32 = 3;
 pub(crate) const EXIT_ROLLBACK_FAILED: i32 = 4;
 
 /// The guard's command line after the exe path.
-#[cfg_attr(not(test), allow(dead_code))] // used by B7's arm_guard
 pub(crate) fn guard_args(tag: &str) -> String {
     format!("--update-guard {tag}")
 }

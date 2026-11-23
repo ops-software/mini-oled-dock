@@ -64,8 +64,8 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, MoveFileExW,
-    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+    CopyFileW, CreateDirectoryW, CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    MoveFileExW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
     FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -669,6 +669,37 @@ pub fn write_stage_file(tag: &str, name: &str, bytes: &[u8]) -> Result<(), Strin
     check_stage_names(tag, Some(name))?;
     let dir = update_stage_dir(tag)?;
     write_atomic(&dir.join(name), bytes, FileAcl::Inherit)
+}
+
+/// Copies `src` to `<root>\update\<tag>\<name>`: `CopyFileW` creates `<name>.tmp` new (the kernel copies the file, so
+/// the caller's heap never holds it; the copy gets the stage folder's inherited admin-only DACL, as `FileAcl::Inherit`
+/// does), then it is renamed over `<name>`. On an error the temp is deleted.
+pub fn copy_into_stage(tag: &str, name: &str, src: &Path) -> Result<(), String> {
+    writable_root()?;
+    check_stage_names(tag, Some(name))?;
+    let dest = update_stage_dir(tag)?.join(name);
+    let mut tmp_name = dest.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    // A stale temp (crash): deleting a name removes the link itself, never a link target.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("removing {}: {e}", tmp.display())),
+    }
+    let (s, t, d) = (HSTRING::from(src.as_os_str()), HSTRING::from(tmp.as_os_str()), HSTRING::from(dest.as_os_str()));
+    // SAFETY: the strings are NUL-terminated and live for the call; bFailIfExists = TRUE never writes through an
+    // existing name or link.
+    if let Err(e) = unsafe { CopyFileW(&s, &t, true) } {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("copying {} to {}: {e}", src.display(), tmp.display()));
+    }
+    // SAFETY: both strings are NUL-terminated and live for the call.
+    if let Err(e) = unsafe { MoveFileExW(&t, &d, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("replacing {}: {e}", dest.display()));
+    }
+    Ok(())
 }
 
 /// `NotFound` when the stage folder (or `update\` above it) does not exist, i.e. nothing is staged
@@ -1355,6 +1386,15 @@ mod tests {
         assert!(remove_update_stage("v1.4.0").is_err());
         assert!(remove_update_dir().is_err());
         assert!(purge().is_err());
+    }
+
+    #[test]
+    fn copy_into_stage_refuses_without_a_data_folder() {
+        // Unit tests never call init(): there is no stage folder to copy into, whatever the name.
+        let src = std::env::current_exe().unwrap();
+        assert!(copy_into_stage("v1.5.1", crate::update_release::GUARD_FILE, &src).is_err());
+        assert!(copy_into_stage("v1.5.1", "x.exe", &src).is_err());
+        assert!(update_stage_names().is_empty(), "nothing was created");
     }
 
     #[test]

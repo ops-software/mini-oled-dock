@@ -1336,7 +1336,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
 
-    // --update-install <tag> mode: hands an already staged, verified release to --install --quiet.
+    // --update-install <tag> mode: hands an already staged, verified release to the update guard.
     if let Some(tag) = &args.update_install {
         if attach_console() {
             logger::enable_stdout();

@@ -4,7 +4,8 @@
 //! `update` thread (the UI thread never blocks on the network). Everything the worker learns is
 //! kept in `STATE` and mirrored into `config.json` (`last_update_check`, `update_available`).
 //! `stage()` downloads a release into the admin-only `<data>\update\<tag>\` folder and verifies it
-//! (SHA-256, then `--version`); `install_now()` hands the verified exe to `--install --quiet`.
+//! (SHA-256, then `--version`); `install_now()` hands the verified release to the update guard (`guard`: a copy of
+//! this exe that runs the release's installer, starts the new dock, judges it and puts this version back if it fails).
 //! `init`/`sync_timer`/`on_timer` drive the daily check (`TIMER_UPDATE_CHECK` on the dock window);
 //! `on_idle` installs a staged release when `update_auto_install` is on and nothing is open.
 
@@ -1069,11 +1070,62 @@ fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     r
 }
 
-/// Arguments the staged exe is started with: it stops this dock through `Local\DockStop`, replaces
-/// the installed exe, re-registers the task, writes the ARP key and relaunches.
-pub(crate) const INSTALL_ARGS: &str = "--install --quiet";
-/// How long the dock (or `--update-install`) waits for the installer child.
+/// How long the dock waits for the update guard, and the guard (or `--rollback`) for the installer it starts.
 const INSTALL_WAIT: Duration = Duration::from_secs(120);
+
+/// Why the update guard was not started (`arm_guard`).
+#[derive(Debug)]
+pub(crate) enum ArmError {
+    /// `CreateProcessW` of the guard failed.
+    Spawn(String),
+    /// This process is not the installed `dock.exe`: the guard must be a copy of the installed old version.
+    NotInstalledCopy,
+    /// The guard's copy in the stage could not be made or checked.
+    Stage(String),
+}
+
+impl ArmError {
+    /// The code `Outcome::InstallFailed` shows: negative, never one of the guard's own exit codes.
+    fn code(&self) -> i32 {
+        match self {
+            ArmError::Spawn(_) => -1,
+            ArmError::NotInstalledCopy => -2,
+            ArmError::Stage(_) => -3,
+        }
+    }
+}
+
+impl std::fmt::Display for ArmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArmError::Spawn(e) => write!(f, "cannot start the update guard: {e}"),
+            ArmError::NotInstalledCopy => write!(f, "this is not the installed dock.exe"),
+            ArmError::Stage(e) => write!(f, "cannot stage the update guard: {e}"),
+        }
+    }
+}
+
+/// Starts the update guard for the verified stage `tag`: a copy of this exe, which must be the installed old version,
+/// as `update\<tag>\dock-guard.exe --update-guard <tag>` (`guard::run_cli`). The kernel copies the file
+/// (`datadir::copy_into_stage`), so this process's heap never holds the image. Started by `spawn_breakaway`, never by
+/// `spawn_in_job`: the guard must outlive this dock, which the release's installer stops.
+fn arm_guard(tag: &str) -> Result<OwnedHandle, ArmError> {
+    let me = std::env::current_exe().map_err(|_| ArmError::NotInstalledCopy)?;
+    if !crate::autostart::installed_exe().is_ok_and(|dest| crate::autostart::same_file(&me, &dest)) {
+        return Err(ArmError::NotInstalledCopy);
+    }
+    let name = update_release::GUARD_FILE;
+    datadir::copy_into_stage(tag, name, &me).map_err(ArmError::Stage)?;
+    let path = datadir::checked_stage_path(tag, name).map_err(|e| ArmError::Stage(e.to_string()))?;
+    let child = crate::watchdog::spawn_breakaway(&path, &guard::guard_args(tag)).map_err(ArmError::Spawn)?;
+    crate::log!("update: {tag}: update guard started");
+    Ok(child)
+}
+
+/// true when an automatic install leaves the release alone: it was rolled back. Update now (`manual`) retries it. Pure.
+fn skip_install(manual: bool, rolled_back: bool) -> bool {
+    !manual && rolled_back
+}
 
 /// The release to install: only a freshly fetched one (`LATEST`), and only if newer than
 /// `installed`. A badge restored from `config.json` alone never installs anything.
@@ -1119,12 +1171,23 @@ fn wait_exit(process: &OwnedHandle, timeout: Duration) -> Option<i32> {
     Some(code as i32)
 }
 
-/// Installs the newest release on the worker thread: check if nothing fresh is known, stage (download +
-/// verify), then hand the verified exe to `--install --quiet`. The child stops this dock through its
-/// normal stop path (`WM_DOCK_QUIT_REQUEST`, cleanup, taskbar restored, exit 0). false = an update
+/// Update now (Settings): installs the newest release, a rolled-back one too (`start_install`). false = an update
 /// operation is already running.
 pub fn install_now() -> bool {
-    spawn_worker(|| {
+    start_install(true)
+}
+
+/// The automatic install (`on_idle`): as `install_now`, but never a release that was rolled back.
+fn install_auto() -> bool {
+    start_install(false)
+}
+
+/// Installs the newest release on the worker thread: check if nothing fresh is known, stage (download +
+/// verify), then hand the verified release to the update guard (`arm_guard`). The guard's installer stops this
+/// dock through its normal stop path (`WM_DOCK_QUIT_REQUEST`, cleanup, taskbar restored, exit 0). `manual` = Update
+/// now. false = an update operation is already running.
+fn start_install(manual: bool) -> bool {
+    spawn_worker(move || {
         let installed = Version::current();
         let rel = match latest_target(installed) {
             Some(r) => r,
@@ -1137,6 +1200,10 @@ pub fn install_now() -> bool {
                 }
             }
         };
+        if skip_install(manual, rolled_back(&rel.tag)) {
+            crate::log!("update: {} was rolled back, not installed automatically", rel.tag);
+            return;
+        }
         let Ok(path) = stage(&rel) else { return };
         set_phase(Phase::Installing);
         crate::log!("update: installing {} from {}", rel.tag, path.display());
@@ -1147,24 +1214,24 @@ pub fn install_now() -> bool {
             });
             notify();
         };
-        let child = match crate::watchdog::spawn_breakaway(&path, INSTALL_ARGS) {
+        let child = match arm_guard(&rel.tag) {
             Ok(c) => c,
             Err(e) => {
-                crate::log!("update: cannot start the installer: {e}");
-                return failed(-1);
+                crate::log!("update: {}: {e}", rel.tag);
+                return failed(e.code());
             }
         };
         match wait_exit(&child, INSTALL_WAIT) {
             Some(0) => {
-                crate::log!("update: the installer finished but the dock is still running");
+                crate::log!("update: the update guard finished but the dock is still running");
                 set_phase(Phase::Idle);
             }
             Some(code) => {
-                crate::log!("update: the installer exited with {code}; the stage {} is kept", rel.tag);
+                crate::log!("update: the update guard exited with {code}; the stage {} is kept", rel.tag);
                 failed(code);
             }
             None => {
-                crate::log!("update: the installer did not finish within {} s", INSTALL_WAIT.as_secs());
+                crate::log!("update: the update guard did not finish within {} s", INSTALL_WAIT.as_secs());
                 set_phase(Phase::Idle);
             }
         }
@@ -1187,8 +1254,9 @@ fn cleanup_stages() {
     }
 }
 
-/// `--update-install <tag>`: installs an already staged release. The only input is a canonical tag,
-/// mapped to `<data>\update\<tag>\`; there is no path argument. Returns the installer's exit code.
+/// `--update-install <tag>`: hands an already staged release to the update guard (`arm_guard`). The only input is a
+/// canonical tag, mapped to `<data>\update\<tag>\`; there is no path argument. Runs only from the installed
+/// `dock.exe` (the guard is a copy of it) and exits at once: that image must not stay mapped for the install's swap.
 pub fn run_install_cli(tag: &str) -> i32 {
     let say = crate::logger::say;
     if parse_tag(tag).is_none() {
@@ -1199,44 +1267,24 @@ pub fn run_install_cli(tag: &str) -> i32 {
         say("the data folder is not writable (run elevated)");
         return 1;
     }
-    let path = match verify_stage(tag, None) {
-        Ok(p) => p,
-        Err(e) => {
-            say(&format!("{tag}: {e}"));
-            return 1;
-        }
-    };
-    crate::log!("update: installing {tag} from {}", path.display());
-    let child = match crate::watchdog::spawn_breakaway(&path, INSTALL_ARGS) {
-        Ok(c) => c,
-        Err(e) => {
-            say(&format!("cannot start the installer: {e}"));
-            return 1;
-        }
-    };
-    // Run from the installed dock.exe, waiting would keep that image mapped: the installer's rename
-    // over it fails and `exe_in_use_by_other` counts this process as a holder, so the install could
-    // never succeed. Let it run on its own; it logs its outcome.
-    let from_installed = match (std::env::current_exe(), crate::autostart::installed_exe()) {
-        (Ok(me), Ok(dest)) => crate::autostart::same_file(&me, &dest),
-        _ => false,
-    };
-    if from_installed {
-        drop(child);
-        say("Installer started; see dock.log.");
-        return 0;
+    if let Err(e) = verify_stage(tag, None) {
+        say(&format!("{tag}: {e}"));
+        return 1;
     }
-    match wait_exit(&child, INSTALL_WAIT) {
-        Some(0) => {
-            say(&format!("Installed {tag}."));
+    // Waiting would keep the installed image mapped: the installer's rename over it fails and `exe_in_use_by_other`
+    // counts this process as a holder. The guard runs on its own and logs its outcome.
+    match arm_guard(tag) {
+        Ok(child) => {
+            drop(child);
+            say(&format!("Update guard started for {tag}; see dock.log."));
             0
         }
-        Some(code) => {
-            say(&format!("Installer exited with {code}."));
-            cli_code(code)
+        Err(ArmError::NotInstalledCopy) => {
+            say(r"run the installed dock.exe (%ProgramFiles%\mini-oled-dock\dock.exe)");
+            1
         }
-        None => {
-            say(&format!("The installer did not finish within {} s.", INSTALL_WAIT.as_secs()));
+        Err(e) => {
+            say(&e.to_string());
             1
         }
     }
@@ -1397,7 +1445,7 @@ pub fn on_idle(busy: bool) {
         return;
     }
     let Some(a) = st.available else { return };
-    if install_now() {
+    if install_auto() {
         *AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner()) = a.tag.clone();
         crate::log!("update: auto-install {}", a.tag);
     }
@@ -1776,6 +1824,21 @@ mod tests {
         assert_eq!(install_target(None, cur), None); // a badge from config.json alone never installs
         assert_eq!(install_target(Some(&rel), cur), Some(rel.clone()));
         assert_eq!(install_target(Some(&rel), Version::parse("1.4.1").unwrap()), None);
-        assert_eq!(INSTALL_ARGS, "--install --quiet");
+        assert_eq!(guard::guard_args("v1.4.1"), "--update-guard v1.4.1");
+    }
+
+    #[test]
+    fn arm_errors_have_distinct_codes() {
+        assert_eq!(ArmError::Spawn("x".into()).code(), -1);
+        assert_eq!(ArmError::NotInstalledCopy.code(), -2);
+        assert_eq!(ArmError::Stage("x".into()).code(), -3);
+    }
+
+    #[test]
+    fn an_automatic_install_skips_a_rolled_back_release() {
+        assert!(skip_install(false, true));
+        assert!(!skip_install(true, true), "Update now retries a rolled-back release");
+        assert!(!skip_install(false, false));
+        assert!(!skip_install(true, false));
     }
 }
