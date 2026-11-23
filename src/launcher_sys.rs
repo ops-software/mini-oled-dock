@@ -47,7 +47,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOD_ALT, MOD_SHIFT, VIRTUAL_KEY, VK_CAPITAL,
     VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT, VK_SPACE,
 };
-use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
+use windows::Win32::UI::Shell::{
+    FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_UserProfiles, FOLDERID_Windows,
+    SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime,
     GetShellWindow, GetWindowThreadProcessId, InternalGetWindowText, IsHungAppWindow, IsWindow, IsWindowVisible,
@@ -696,6 +699,21 @@ impl SysPort for RealSys {
     fn files_end(&mut self) {
         crate::launcher_files::end();
     }
+}
+
+// ---------------------------------------------------------------- files (SPEC 5.4.6)
+
+/// The fences of the files roots as the dock reads them (its own token: the shell user's, when the SIDs match, which the
+/// helper checks), for its check of `launcher.file_folders` before it passes them on; the helper reads and checks them
+/// again. None when one is missing.
+pub(crate) fn file_fences() -> Option<crate::launcher::files::Fences> {
+    let s = |id: &windows::core::GUID| crate::datadir::known_folder(id)?.into_os_string().into_string().ok();
+    Some(crate::launcher::files::Fences {
+        windows: s(&FOLDERID_Windows)?,
+        program_files: vec![s(&FOLDERID_ProgramFiles)?, s(&FOLDERID_ProgramFilesX86)?],
+        profiles: s(&FOLDERID_UserProfiles)?,
+        profile: s(&FOLDERID_Profile)?,
+    })
 }
 
 // ---------------------------------------------------------------- PowerToys (L1b-5, SPEC 5.7)

@@ -1,16 +1,16 @@
 //! `dock.exe --launcher-files` (plan L2-F2): the launcher's file search, in a short-lived child of the dock, so the
 //! search client (OLE DB and the Windows Search DLLs, which stay loaded once used) never enters the dock (D1). The dock
 //! starts it when the first files request of an open is due and ends it at the close (launcher_files.rs). It checks once
-//! that it can answer (its user against the shell's, the WSearch service, the shell user's two roots, the index) and
+//! that it can answer (its user against the shell's, the WSearch service, the shell user's roots, the index) and
 //! says so in its state frame; then it answers each request line on stdin with one rows frame on stdout, until stdin
 //! ends (Appendix A of the plan). It runs with the dock's token and reads index columns only: it never opens a listed
-//! file, and a row outside its two roots is skipped here, never sent. For each row it sends it asks Windows whether the
+//! file, and a row outside its roots is skipped here, never sent. For each row it sends it asks Windows whether the
 //! type of the name's extension is dangerous (`AssocIsDangerous`, once per extension per query: the shell's association
 //! code stays out of the dock too) and says so in the row's flags. It has no logger and writes nothing but its frames
 //! (lint `search_stays_in_the_files_helper`): the words it gets are typed text, given to Windows Search only.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use crate::launcher::files::{self, FileHit};
+use crate::launcher::files::{self, under, Fences, FileHit};
 use crate::launcher::providers;
 use std::io::{BufRead, Read, Write};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
@@ -35,7 +35,9 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{
-    AssocIsDangerous, FOLDERID_CommonPrograms, FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    AssocIsDangerous, FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
+    FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
+    FOLDERID_UserProfiles, FOLDERID_Videos, FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
@@ -80,16 +82,6 @@ trait Rows {
     fn next(&mut self) -> Option<RawRow>;
 }
 
-/// `path` lies under `root`: the root (ASCII case-insensitive, a trailing separator ignored), a separator, then more.
-fn under(path: &str, root: &str) -> bool {
-    let root = root.strip_suffix('\\').unwrap_or(root).as_bytes();
-    let p = path.as_bytes();
-    !root.is_empty()
-        && p.len() > root.len() + 1
-        && p.get(..root.len()).is_some_and(|head| head.eq_ignore_ascii_case(root))
-        && p.get(root.len()) == Some(&b'\\')
-}
-
 /// The file-system path of an index URL: `file:` (any case), then the path with `/` for each separator
 /// (`file:C:/Users/a/b.txt`, `file://server/share/b.txt`); a file name cannot hold a `/`. None for any other scheme.
 fn path_of_url(url: &str) -> Option<String> {
@@ -98,7 +90,7 @@ fn path_of_url(url: &str) -> Option<String> {
 }
 
 /// A row the dock may be sent: its URL names a file-system path, every check of the dock's reader
-/// (`files::check_hit`) passes, and the path lies under one of the helper's two roots (the SQL Windows builds around
+/// (`files::check_hit`) passes, and the path lies under one of the helper's roots (the SQL Windows builds around
 /// the typed text is the only other fence). None: it is skipped, and only counted.
 fn row_of(raw: RawRow, roots: &[String]) -> Option<FileHit> {
     let (Cell::Text(url), Cell::Text(name)) = (raw.url, raw.name) else { return None };
@@ -185,11 +177,12 @@ fn serve(state: u32, input: &mut impl BufRead, out: &mut impl Write, query: &mut
 // ---------------------------------------------------------------- Windows
 
 /// Runs the helper (the child mode `--launcher-files`, dispatched by main before the data folder, the logger, the
-/// mutex and the watchdog). `stall_ms`, from `--stall` in owner-probe builds only, sleeps before each query.
-pub(crate) fn run(stall_ms: u32) -> i32 {
+/// mutex and the watchdog). `stall_ms`, from `--stall` in owner-probe builds only, sleeps before each query. `extra`,
+/// from `--root`: the folders of `launcher.file_folders` the dock accepted, checked again (`with_folders`).
+pub(crate) fn run(stall_ms: u32, extra: &[String]) -> i32 {
     // SAFETY: the first COM call of the helper's only thread; paired with CoUninitialize below.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-    let (state, search) = if com { setup(stall_ms) } else { (files::STATE_NO_INDEX, None) };
+    let (state, search) = if com { setup(stall_ms, extra) } else { (files::STATE_NO_INDEX, None) };
     let code = serve(state, &mut std::io::stdin().lock(), &mut std::io::stdout().lock(), &mut |text| {
         search.as_ref().and_then(|s| s.query(text))
     });
@@ -287,10 +280,11 @@ fn search_running() -> bool {
     }
 }
 
-/// The helper's roots (SPEC 5.4.6): the shell user's profile, then the common Start Menu Programs folder unless it holds
-/// the profile. Both paths come from HKLM, which only an administrator can change. The user's own Programs folder is not
-/// a root: it lies under the profile by default, and its path comes from HKCU, which any process of the user can point
-/// at C:\Users or C:\, where the helper's elevated token would let the index list other accounts' files.
+/// The helper's first two roots (SPEC 5.4.6): the shell user's profile, then the common Start Menu Programs folder
+/// unless it holds the profile. Both paths come from HKLM, which only an administrator can change. The user's own
+/// Programs folder is not a root: it lies under the profile by default, and its path comes from HKCU, which any process
+/// of the user can point at C:\Users or C:\, where the helper's elevated token would let the index list other accounts'
+/// files; the known folders that HKCU also holds join only as `files::root_of` accepts them (`with_folders`).
 fn roots_of(profile: String, common: String) -> Vec<String> {
     if under(&profile, &common) {
         vec![profile]
@@ -299,18 +293,49 @@ fn roots_of(profile: String, common: String) -> Vec<String> {
     }
 }
 
-/// The roots of `roots_of`, resolved with the shell's token.
-fn shell_roots(token: &Handle) -> Option<Vec<String>> {
-    let path = |id: &windows::core::GUID| {
-        // SAFETY: a valid folder id and token; the string is freed by take_cotask.
-        let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, Some(token.0)) }.ok()?;
-        take_cotask(p)
+/// The user's known folders that join the roots wherever they point (moved with Explorer's Location tab or by Folder
+/// Redirection, often to another drive): their paths come from HKCU, so each is a root only as `files::root_of`
+/// accepts it.
+const KNOWN: [windows::core::GUID; 6] =
+    [FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Music, FOLDERID_Videos];
+
+/// `roots` (`roots_of`'s two), then each of `known` that `files::root_of` accepts (no drive root), then the first 8 of
+/// `extra`, the folders of `launcher.file_folders` the dock passed (a drive root allowed), checked again here: the
+/// helper trusts none of them. With no fences, `roots` alone. None of them holds another (`files::add_roots`).
+fn with_folders(mut roots: Vec<String>, known: &[String], extra: &[String], fences: Option<&Fences>) -> Vec<String> {
+    if let Some(f) = fences {
+        files::add_roots(&mut roots, known.iter().map(String::as_str), f, false);
+        files::add_roots(&mut roots, extra.iter().take(files::MAX_EXTRA_ROOTS).map(String::as_str), f, true);
+    }
+    roots
+}
+
+/// A known folder's path for `token`'s user.
+fn known_folder(id: &windows::core::GUID, token: &Handle) -> Option<String> {
+    // SAFETY: a valid folder id and token; the string is freed by take_cotask.
+    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, Some(token.0)) }.ok()?;
+    take_cotask(p)
+}
+
+/// The roots of `with_folders`, every folder resolved with the shell's token.
+fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
+    let path = |id: &windows::core::GUID| known_folder(id, token);
+    let profile = path(&FOLDERID_Profile)?;
+    let fences = || {
+        Some(Fences {
+            windows: path(&FOLDERID_Windows)?,
+            program_files: vec![path(&FOLDERID_ProgramFiles)?, path(&FOLDERID_ProgramFilesX86)?],
+            profiles: path(&FOLDERID_UserProfiles)?,
+            profile: profile.clone(),
+        })
     };
-    Some(roots_of(path(&FOLDERID_Profile)?, path(&FOLDERID_CommonPrograms)?))
+    let fences = fences();
+    let known: Vec<String> = KNOWN.iter().filter_map(path).collect();
+    Some(with_folders(roots_of(profile, path(&FOLDERID_CommonPrograms)?), &known, extra, fences.as_ref()))
 }
 
 /// The checks of the state frame, in order: the SIDs, the service, the roots, the index.
-fn setup(stall_ms: u32) -> (u32, Option<Search>) {
+fn setup(stall_ms: u32, extra: &[String]) -> (u32, Option<Search>) {
     let Some(shell) = shell_token() else { return (files::STATE_NO_ROOTS, None) };
     let own = {
         let mut t = HANDLE::default();
@@ -328,7 +353,7 @@ fn setup(stall_ms: u32) -> (u32, Option<Search>) {
     if !search_running() {
         return (files::STATE_SEARCH_OFF, None);
     }
-    let Some(roots) = shell_roots(&shell) else { return (files::STATE_NO_ROOTS, None) };
+    let Some(roots) = shell_roots(&shell, extra) else { return (files::STATE_NO_ROOTS, None) };
     let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
     let Ok(scope) = files::scope_clause(&refs) else { return (files::STATE_NO_ROOTS, None) };
     match Search::new(&scope, roots, stall_ms) {
@@ -630,6 +655,103 @@ mod tests {
         let one = vec![raw(start, "Tool.lnk", text("Programs"), "x")];
         let (hits, skipped) = collect(&mut Fake(one.into_iter()), &roots(), &mut |_| false);
         assert_eq!((hits.len(), skipped), (1, 0));
+    }
+
+    fn fences() -> Fences {
+        Fences {
+            windows: "C:\\Windows".into(),
+            program_files: vec!["C:\\Program Files".into(), "C:\\Program Files (x86)".into()],
+            profiles: "C:\\Users".into(),
+            profile: "C:\\Users\\a".into(),
+        }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn known_folders_join_the_roots_wherever_they_point() {
+        let f = fences();
+        let common = "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\";
+        // Documents, Downloads, Pictures, Music and Videos moved to other drives; the Desktop left in the profile.
+        let known = strings(&[
+            "C:\\Users\\a\\Desktop",
+            "D:\\Docs",
+            "D:\\Downloads",
+            "E:\\Media\\Pictures",
+            "E:\\Media\\Music",
+            "e:\\media\\music\\",
+        ]);
+        let want = ["C:\\Users\\a", common, "D:\\Docs", "D:\\Downloads", "E:\\Media\\Pictures", "E:\\Media\\Music"];
+        assert_eq!(with_folders(roots(), &known, &[], Some(&f)), want);
+        // A known folder pointed at another account's profile, the profiles folder, a drive or share root, the
+        // Windows tree or an odd path is refused.
+        let bad = strings(&[
+            "C:\\Users\\b\\Documents",
+            "C:\\Users",
+            "D:\\",
+            "C:\\",
+            "C:\\Windows\\Temp",
+            "\\\\nas\\share",
+            "\\\\nas\\c$\\Users",
+            "Docs",
+        ]);
+        assert_eq!(with_folders(roots(), &bad, &[], Some(&f)), roots());
+        // The user's own folders may be a drive or a share root; never C:\ or another profile; at most 8 are read.
+        let extra = strings(&[
+            "D:\\",
+            "\\\\nas\\share",
+            "C:\\",
+            "C:\\Users\\b",
+            "F:\\Archive",
+            "G:\\Photos",
+            "H:\\Music",
+            "I:\\Old",
+            "J:\\Ninth",
+        ]);
+        let want = [
+            "C:\\Users\\a",
+            common,
+            "E:\\Media\\Pictures",
+            "E:\\Media\\Music",
+            "D:\\",
+            "\\\\nas\\share",
+            "F:\\Archive",
+            "G:\\Photos",
+            "H:\\Music",
+            "I:\\Old",
+        ];
+        assert_eq!(with_folders(roots(), &known, &extra, Some(&f)), want);
+        // No fences: the two roots alone.
+        assert_eq!(with_folders(roots(), &known, &extra, None), roots());
+    }
+
+    #[test]
+    fn the_scope_binds_the_accepted_roots() {
+        let known = strings(&["D:\\Docs", "C:\\Users\\b\\Documents"]);
+        let roots =
+            with_folders(roots(), &known, &strings(&["\\\\nas\\share", "E:\\O'Brien", "C:\\"]), Some(&fences()));
+        let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+        assert_eq!(
+            files::scope_clause(&refs).unwrap(),
+            "SCOPE='file:C:\\Users\\a' OR SCOPE='file:C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\' OR \
+             SCOPE='file:D:\\Docs' OR SCOPE='file:\\\\nas\\share' OR SCOPE='file:E:\\O''Brien'"
+        );
+        // The rows: only those under an accepted root pass the fence.
+        let rows = [
+            "D:\\Docs\\quokka.txt",
+            "\\\\nas\\share\\quokka.txt",
+            "E:\\O'Brien\\quokka.txt",
+            "C:\\Users\\b\\Documents\\quokka.txt",
+            "D:\\Docs2\\quokka.txt",
+            "D:\\quokka.txt",
+            "C:\\quokka.txt",
+        ];
+        let raws: Vec<RawRow> = rows.iter().map(|p| raw(p, "quokka.txt", text("x"), "x")).collect();
+        let (hits, skipped) = collect(&mut Fake(raws.into_iter()), &roots, &mut |_| false);
+        let paths: Vec<&str> = hits.iter().map(|h| &*h.path).collect();
+        assert_eq!((paths, skipped), (rows[..3].to_vec(), 4));
     }
 
     #[test]

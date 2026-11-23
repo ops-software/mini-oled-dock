@@ -211,10 +211,13 @@ pub struct Args {
     /// frames on stdout (`shell_thread::run_icons_child`); combines with nothing.
     pub start_icons: Option<u32>,
     /// `--launcher-files`: the launcher's file search in a child of the dock (`files_child::run`, plan L2-F2): request
-    /// lines on stdin, frames on stdout; combines with nothing but `--stall`.
+    /// lines on stdin, frames on stdout; combines with nothing but `--stall` and `--root`.
     pub launcher_files: bool,
     /// `--stall <ms>` (owner-probe builds only, with `--launcher-files`): the helper sleeps before each query (V-4).
     pub stall: Option<u32>,
+    /// `--root <folder>` (with `--launcher-files`; at most 8, each at most 260 UTF-16 units): a folder of
+    /// `launcher.file_folders` the dock accepted; the helper checks each again and trusts none (SPEC 5.4.6).
+    pub roots: Vec<String>,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -275,6 +278,10 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--launcher-files" => a.launcher_files = true,
             #[cfg(feature = "owner-probe")]
             "--stall" => a.stall = Some(it.next().and_then(|v| v.parse().ok()).ok_or("--stall requires <ms>")?),
+            "--root" if a.roots.len() < launcher::files::MAX_EXTRA_ROOTS => {
+                let r = it.next().filter(|r| r.encode_utf16().count() <= launcher::files::ROOT_UNITS);
+                a.roots.push(r.ok_or("--root requires a folder of at most 260 characters")?);
+            }
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
@@ -296,7 +303,10 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if a.stall.is_some() && !a.launcher_files {
         return Err("--stall requires --launcher-files".into());
     }
-    if a.launcher_files && flags > 1 + usize::from(a.stall.is_some()) {
+    if !a.roots.is_empty() && !a.launcher_files {
+        return Err("--root requires --launcher-files".into());
+    }
+    if a.launcher_files && flags > 1 + usize::from(a.stall.is_some()) + a.roots.len() {
         return Err("--launcher-files cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
@@ -1153,7 +1163,7 @@ fn main() -> std::process::ExitCode {
     // --launcher-files: the launcher's file search in a child of the dock (`files_child::run`, plan L2-F2); stdin and
     // stdout only, no data folder, logger, mutex or console.
     if args.launcher_files {
-        return std::process::ExitCode::from(files_child::run(args.stall.unwrap_or(0)).clamp(0, 255) as u8);
+        return std::process::ExitCode::from(files_child::run(args.stall.unwrap_or(0), &args.roots).clamp(0, 255) as u8);
     }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
@@ -1380,7 +1390,7 @@ mod tests {
             "run_apps_child()",
             "run_settings_child()",
             "run_icons_child(px)",
-            "run(args.stall.unwrap_or(0))",
+            "run(args.stall.unwrap_or(0), &args.roots)",
         ];
         for first in firsts {
             let at = src.find(&format!("::{first}.clamp")).expect(first);
@@ -1437,6 +1447,28 @@ mod tests {
         }
         #[cfg(not(feature = "owner-probe"))]
         assert!(stalled.is_err(), "no --stall in a release build");
+        // The folders of launcher.file_folders the dock passes: only with the helper, at most 8, each bounded.
+        let edge = format!("D:\\{}", "d".repeat(257));
+        let f = p(&["--launcher-files", "--root", "D:\\", "--root", "\\\\nas\\share docs", "--root", &edge]).unwrap();
+        assert_eq!((f.launcher_files, f.roots), (true, vec!["D:\\".to_string(), "\\\\nas\\share docs".into(), edge]));
+        assert!(p(&["--launcher-files"]).unwrap().roots.is_empty());
+        let mut eight = vec!["--launcher-files"];
+        for _ in 0..8 {
+            eight.extend(["--root", "E:\\x"]);
+        }
+        assert_eq!(p(&eight).unwrap().roots.len(), 8);
+        eight.extend(["--root", "E:\\x"]);
+        let over = format!("D:\\{}", "d".repeat(258));
+        for bad in [
+            &eight[..],
+            &["--root", "D:\\"],
+            &["--launcher-files", "--root"],
+            &["--launcher-files", "--root", over.as_str()],
+            &["--launcher-files", "--root", "D:\\", "--autostart"],
+            &["--autostart", "--root", "D:\\"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

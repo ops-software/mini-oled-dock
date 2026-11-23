@@ -459,6 +459,11 @@ pub struct LauncherConfig {
     /// it; `launcher::aliases::AliasTable` ignores (and counts) the entries it refuses, so a save never deletes them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
+    /// Folders of the user's own that file search covers too (SPEC 5.4.6): at most 8 are read, a drive root allowed.
+    /// Kept as written: the dock ignores (and counts in the log) the entries `files::root_of` refuses, so a save never
+    /// deletes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_folders: Vec<String>,
     /// "google", "bing", "duckduckgo" or "custom".
     pub web_engine: String,
     /// The search URL template of the "custom" engine, "" otherwise.
@@ -502,6 +507,7 @@ impl Default for LauncherConfig {
                 m
             }),
             aliases: BTreeMap::new(),
+            file_folders: Vec::new(),
             web_engine: "google".into(),
             web_url: String::new(),
             offer_done: false,
@@ -1245,6 +1251,8 @@ fn render(c: &Config) -> String {
     "prefixes": {l_prefixes},
     // Words that open something when typed alone in Mixed mode: "word": "app:<id>", an http(s) address, "ms-settings:...", a path or a command line (at most 64).
     "aliases": {l_aliases},
+    // More folders for file search, e.g. "D:\\\\Archive" or a whole drive "E:\\\\" (at most 8; not Windows, Program Files or other profiles).
+    "file_folders": {l_file_folders},
     // Web search: "google", "bing", "duckduckgo" or "custom" (then "web_url" is an https:// address with {{q}}).
     "web_engine": {l_web_engine},
     "web_url": {l_web_url},
@@ -1317,6 +1325,7 @@ fn render(c: &Config) -> String {
         l_providers = js_block(&c.launcher.providers).replace("\n", "\n  "),
         l_prefixes = js_block(&c.launcher.prefixes).replace("\n", "\n  "),
         l_aliases = js_block(&c.launcher.aliases).replace("\n", "\n  "),
+        l_file_folders = js_block(&c.launcher.file_folders).replace("\n", "\n  "),
         l_web_engine = js(&c.launcher.web_engine),
         l_web_url = js(&c.launcher.web_url),
         l_offer_done = c.launcher.offer_done,
@@ -2003,6 +2012,19 @@ mod tests {
         }
         let r = render(&c);
         assert_eq!(parse(&r).unwrap(), c, "every entry, those the table refuses included");
+        assert_eq!(render(&parse(&r).unwrap()), r);
+    }
+
+    #[test]
+    fn file_folders_kept_as_written_and_rendered() {
+        let mut c = Config::default();
+        assert!(render(&c).contains("\"file_folders\": []"), "written always, [] when empty");
+        // What the acceptance rule refuses stays in the file: a drive root, a relative path, Windows' own folder.
+        let c2 = parse(r#"{"launcher": {"file_folders": ["D:\\", "relative", "C:\\Windows", "E:/Archive"]}}"#).unwrap();
+        assert_eq!(c2.launcher.file_folders, ["D:\\", "relative", "C:\\Windows", "E:/Archive"]);
+        c.launcher.file_folders = c2.launcher.file_folders;
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c, "every entry, those the dock refuses included");
         assert_eq!(render(&parse(&r).unwrap()), r);
     }
 

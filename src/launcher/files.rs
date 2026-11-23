@@ -112,6 +112,115 @@ pub fn words_of(text: &str) -> Vec<&str> {
         .collect()
 }
 
+// ---------------------------------------------------------------- the roots (SPEC 5.4.6)
+
+/// `launcher.file_folders`: at most this many folders of the user's own join the roots; later entries are ignored.
+pub const MAX_EXTRA_ROOTS: usize = 8;
+/// A root's length in UTF-16 units: a folder deeper than MAX_PATH is no root.
+pub const ROOT_UNITS: usize = 260;
+
+/// The folders no root may be, lie in or hold, read from known folders whose paths only an administrator can change
+/// (HKLM): the Windows folder, the Program Files folders and the profiles folder; and the user's own profile, the one
+/// place inside the profiles folder a root may be.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fences {
+    pub windows: String,
+    pub program_files: Vec<String>,
+    pub profiles: String,
+    pub profile: String,
+}
+
+/// `path` lies under `root`: the root (ASCII case-insensitive, a trailing separator ignored), a separator, then more.
+pub fn under(path: &str, root: &str) -> bool {
+    let root = root.strip_suffix('\\').unwrap_or(root).as_bytes();
+    let p = path.as_bytes();
+    !root.is_empty()
+        && p.len() > root.len() + 1
+        && p.get(..root.len()).is_some_and(|head| head.eq_ignore_ascii_case(root))
+        && p.get(root.len()) == Some(&b'\\')
+}
+
+fn trim_sep(s: &str) -> &str {
+    s.strip_suffix('\\').unwrap_or(s)
+}
+
+/// `a` is the folder `b` (ASCII case-insensitive, a trailing separator of either ignored) or lies under it.
+fn within(a: &str, b: &str) -> bool {
+    (!trim_sep(b).is_empty() && trim_sep(a).eq_ignore_ascii_case(trim_sep(b))) || under(a, b)
+}
+
+/// `path` as a root of the files helper, in the form roots are compared and quoted in (`\` for each `/`, no trailing
+/// `\` but a drive root's), or None when it is no safe root (SPEC 5.4.6). A safe root is a drive path (`D:\...`) or a
+/// UNC path (`\\server\share\...`) of at most 260 UTF-16 units in the form the files reader accepts (no device or
+/// long-path prefix, no colon past the drive's, no segment of dots and spaces alone), with no control, bidi or format
+/// character, no empty segment, no segment ending in a dot or a space (Windows drops them, so the text would not name
+/// the folder Windows reads), none of `<>"|?*` and no administrative share (a share name ending in `$`); a drive root
+/// (`D:\`) or a share root (`\\server\share`) only when `drive_root` (the user's own list); neither the Windows folder
+/// nor a Program Files folder, nor inside or holding one; neither the profiles folder nor holding it nor holding the
+/// user's profile, and inside the profiles folder only inside the user's profile, so no root reaches another account's
+/// profile. A fence that is empty refuses every path.
+pub fn root_of(path: &str, f: &Fences, drive_root: bool) -> Option<String> {
+    if path.len() > 3 * ROOT_UNITS {
+        return None;
+    }
+    let mut p = path.replace('/', "\\");
+    if p.len() > 3 && p.ends_with('\\') {
+        p.pop();
+    }
+    let unc = p.starts_with("\\\\");
+    let rest = p.get(if unc { 2 } else { 3 }..).unwrap_or_default();
+    let segs: Vec<&str> = rest.split('\\').filter(|_| !rest.is_empty()).collect();
+    let seg_ok = |s: &&str| {
+        !s.is_empty() && !s.ends_with('.') && !s.ends_with(' ') && !s.bytes().any(|c| b"<>\"|?*".contains(&c))
+    };
+    let form = p.encode_utf16().count() <= ROOT_UNITS
+        && !p.chars().any(is_hidden)
+        && path_form_ok(&p)
+        && segs.iter().all(seg_ok)
+        && (!unc || segs.get(1).is_some_and(|share| !share.ends_with('$')));
+    let top = segs.len() == if unc { 2 } else { 0 };
+    let apart = |fence: &str| !fence.is_empty() && !within(&p, fence) && !under(fence, &p);
+    let fenced = f.program_files.iter().chain([&f.windows]).all(|d| apart(d))
+        && !f.profile.is_empty()
+        && !f.profiles.is_empty()
+        && !within(&f.profiles, &p)
+        && !under(&f.profile, &p)
+        && (!under(&p, &f.profiles) || within(&p, &f.profile));
+    (form && (drive_root || !top) && fenced).then_some(p)
+}
+
+/// Adds each of `folders` that `root_of` accepts to `roots`, unless a root already holds it; the roots it holds leave.
+/// Returns how many it refused.
+pub fn add_roots<'a>(
+    roots: &mut Vec<String>,
+    folders: impl IntoIterator<Item = &'a str>,
+    f: &Fences,
+    drive_root: bool,
+) -> usize {
+    let mut refused = 0;
+    for folder in folders {
+        match root_of(folder, f, drive_root) {
+            None => refused += 1,
+            Some(r) if roots.iter().any(|a| within(&r, a)) => {}
+            Some(r) => {
+                roots.retain(|a| !under(a, &r));
+                roots.push(r);
+            }
+        }
+    }
+    refused
+}
+
+/// The folders of `launcher.file_folders` the dock hands the helper (which checks them again): the first 8 entries,
+/// each as `root_of` accepts it with a drive root allowed, none twice nor inside another; and how many entries are
+/// ignored (refused, or past the 8th). With no fences every entry is ignored.
+pub fn extra_roots(list: &[String], f: Option<&Fences>) -> (Vec<String>, usize) {
+    let mut roots = Vec::new();
+    let Some(f) = f else { return (roots, list.len()) };
+    let refused = add_roots(&mut roots, list.iter().take(MAX_EXTRA_ROOTS).map(String::as_str), f, true);
+    (roots, refused + list.len().saturating_sub(MAX_EXTRA_ROOTS))
+}
+
 // ---------------------------------------------------------------- requests
 
 /// One files request of the session (`Effect::RequestFiles`): the query's generation, its text as typed (without the
@@ -1055,6 +1164,153 @@ mod tests {
         assert_eq!(c.len(), "SCOPE='file:'".len() + long.len() + 1);
         assert!(c.ends_with("d'''"));
         assert_eq!(scope_clause(&[&"e".repeat(1_025)]), Err(Refusal::TooLong));
+    }
+
+    fn fences() -> Fences {
+        Fences {
+            windows: "C:\\Windows".into(),
+            program_files: vec!["C:\\Program Files".into(), "C:\\Program Files (x86)".into()],
+            profiles: "C:\\Users".into(),
+            profile: "C:\\Users\\a".into(),
+        }
+    }
+
+    #[test]
+    fn a_root_is_accepted_only_when_safe() {
+        let f = fences();
+        // Known folders moved to other drives or to a share are roots, in one form; so is a folder of the profile.
+        for (path, root) in [
+            ("D:\\Docs", "D:\\Docs"),
+            ("E:\\Media\\Pictures\\", "E:\\Media\\Pictures"),
+            ("d:/docs/2026", "d:\\docs\\2026"),
+            ("\\\\nas\\share\\docs", "\\\\nas\\share\\docs"),
+            ("//nas/share/docs/", "\\\\nas\\share\\docs"),
+            ("C:\\Users\\a\\Documents", "C:\\Users\\a\\Documents"),
+            ("c:\\users\\A", "c:\\users\\A"),
+            ("C:\\Data", "C:\\Data"),
+            ("C:\\Windowsx\\a", "C:\\Windowsx\\a"),
+            ("C:\\Program Files Data", "C:\\Program Files Data"),
+            ("D:\\O'Brien", "D:\\O'Brien"),
+        ] {
+            assert_eq!(root_of(path, &f, false).as_deref(), Some(root), "{path:?}");
+            assert_eq!(root_of(path, &f, true).as_deref(), Some(root), "{path:?}");
+        }
+        // A drive root or a share root: only in the user's own list.
+        for (top, root) in [
+            ("D:\\", "D:\\"),
+            ("e:/", "e:\\"),
+            ("\\\\nas\\share", "\\\\nas\\share"),
+            ("\\\\nas\\share\\", "\\\\nas\\share"),
+        ] {
+            assert_eq!(root_of(top, &f, false), None, "{top:?}");
+            assert_eq!(root_of(top, &f, true).as_deref(), Some(root), "{top:?}");
+        }
+        // Never: the drive that holds Windows and the profiles, the system trees, the profiles folder, another
+        // account's profile, the public one, relative and odd paths, a device or long-path prefix, an administrative
+        // share, a hidden character, an over-long path.
+        let long = format!("D:\\{}", "d".repeat(258));
+        for bad in [
+            "C:\\",
+            "c:/",
+            "C:\\Windows",
+            "c:\\windows\\Temp",
+            "C:\\Program Files",
+            "C:\\Program Files (x86)\\Tool",
+            "C:\\Users",
+            "C:\\Users\\",
+            "c:\\users\\b",
+            "C:\\Users\\b\\Documents",
+            "C:\\Users\\ab",
+            "C:\\Users\\Public\\Documents",
+            "",
+            "Docs",
+            "Docs\\a",
+            "\\Docs",
+            "C:",
+            "C:Docs",
+            "D:\\a\\..\\b",
+            "D:\\a\\.",
+            "D:\\a.",
+            "D:\\a ",
+            "D:\\a\\\\b",
+            "D:\\a\\\\",
+            "D:\\a:b",
+            "D:\\a*",
+            "D:\\a?",
+            "D:\\a|b",
+            "D:\\a\"b",
+            "D:\\a<b",
+            "\\\\?\\D:\\Docs",
+            "\\\\.\\D:",
+            "\\\\nas",
+            "\\\\nas\\c$\\Users",
+            "\\\\localhost\\C$",
+            "\\\\nas\\share$",
+            "\\\\\\nas\\share",
+            "D:\\a\u{7}",
+            "D:\\a\u{202e}b",
+            "D:\\a\nb",
+            &long,
+        ] {
+            assert_eq!(root_of(bad, &f, false), None, "{bad:?}");
+            assert_eq!(root_of(bad, &f, true), None, "{bad:?}");
+        }
+        let edge = format!("D:\\{}", "d".repeat(257));
+        assert_eq!(root_of(&edge, &f, false).as_deref(), Some(&*edge), "260 units");
+        // A profile outside the profiles folder: no root holds it, so none holds its neighbours.
+        let moved = Fences { profile: "D:\\Profiles\\a".into(), ..fences() };
+        for bad in ["D:\\Profiles", "D:\\"] {
+            assert_eq!(root_of(bad, &moved, true), None, "{bad:?}");
+        }
+        assert!(root_of("D:\\Profiles\\a\\Docs", &moved, false).is_some());
+        // A fence missing refuses everything.
+        for missing in [
+            Fences { windows: String::new(), ..fences() },
+            Fences { profiles: String::new(), ..fences() },
+            Fences { profile: String::new(), ..fences() },
+            Fences { program_files: vec![String::new()], ..fences() },
+            Fences::default(),
+        ] {
+            assert_eq!(root_of("D:\\Docs", &missing, true), None, "{missing:?}");
+        }
+    }
+
+    #[test]
+    fn a_root_is_added_once() {
+        let f = fences();
+        let common = "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs";
+        let mut roots = vec!["C:\\Users\\a".to_string(), common.into()];
+        let folders =
+            ["C:\\Users\\a\\Desktop", "D:\\Docs", "d:\\docs\\", "D:\\Docs\\Work", "C:\\Users\\b", "E:\\Pictures"];
+        assert_eq!(add_roots(&mut roots, folders, &f, false), 1);
+        assert_eq!(roots, ["C:\\Users\\a", common, "D:\\Docs", "E:\\Pictures"]);
+        // A wider root takes the place of those it holds.
+        assert_eq!(add_roots(&mut roots, ["E:\\", "D:\\"], &f, true), 0);
+        assert_eq!(roots, ["C:\\Users\\a", common, "E:\\", "D:\\"]);
+    }
+
+    #[test]
+    fn file_folders_are_capped_and_counted() {
+        let f = fences();
+        let list: Vec<String> = [
+            "D:\\",
+            "C:\\Windows",
+            "relative",
+            "E:\\Archive",
+            "e:\\archive\\2025",
+            "\\\\nas\\share",
+            "C:\\Users\\b",
+            "F:\\A",
+            "G:\\B",
+            "H:\\C",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (roots, ignored) = extra_roots(&list, Some(&f));
+        assert_eq!(roots, ["D:\\", "E:\\Archive", "\\\\nas\\share", "F:\\A"]);
+        assert_eq!(ignored, 3 + 2, "three refused, two past the 8th; a folder inside another is no error");
+        assert_eq!(extra_roots(&list, None), (Vec::new(), 10));
+        assert_eq!(extra_roots(&[], Some(&f)), (Vec::new(), 0));
     }
 
     #[test]

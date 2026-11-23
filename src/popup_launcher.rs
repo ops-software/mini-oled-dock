@@ -2939,6 +2939,7 @@ pub(crate) fn on_config() {
                 super::close("launcher chord off");
             }
             let save = with_ctrl(Ctrl::chord_off).flatten();
+            crate::launcher_files::configure(&[]);
             crate::start_search::chord_changed(false);
             crate::launcher_sys::release_owner_waits();
             if let Some(h) = crate::launcher_sys::timer_window() {
@@ -2960,6 +2961,7 @@ pub(crate) fn on_config() {
                 c.configure(&cfg.launcher);
                 (was, c.pt_on)
             });
+            crate::launcher_files::configure(&cfg.launcher.file_folders);
             match pt {
                 // Alt+Space: PowerToys is looked for now (the dock's start), and again 60 s later (it may start later
                 // at logon).

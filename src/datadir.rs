@@ -1098,7 +1098,7 @@ fn token_user_sid() -> Option<String> {
     sid_string(tu.User.Sid)
 }
 
-fn known_folder(id: &GUID) -> Option<PathBuf> {
+pub(crate) fn known_folder(id: &GUID) -> Option<PathBuf> {
     // SAFETY: `id` is a valid KNOWNFOLDERID; no token = current user. The PWSTR is freed below.
     let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.ok()?;
     // SAFETY: `p` is a NUL-terminated string returned by the call above.

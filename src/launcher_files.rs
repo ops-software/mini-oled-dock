@@ -73,6 +73,8 @@ impl Inbox {
 thread_local! {
     /// The open's pump while its thread runs, with the open's number (the UI thread's only).
     static PUMP: RefCell<Option<(u32, Arc<Inbox>)>> = const { RefCell::new(None) };
+    /// The folders of `launcher.file_folders` the dock accepted (`configure`), passed to every helper it spawns.
+    static FOLDERS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 const PUMP_STACK: usize = 128 * 1024;
@@ -117,14 +119,34 @@ pub(crate) fn end() {
     });
 }
 
+/// `launcher.file_folders` taken over (`popup_launcher::on_config`: the chord set, or none, which drops them): the
+/// folders `files::extra_roots` accepts go to every helper spawned from now on, one `--root` each; the entries it
+/// ignores are counted in the log, never named (SPEC 5.4.6). An empty list reads nothing and logs nothing.
+pub(crate) fn configure(list: &[String]) {
+    let mut roots = Vec::new();
+    if !list.is_empty() {
+        let ignored;
+        (roots, ignored) = files::extra_roots(list, crate::launcher_sys::file_fences().as_ref());
+        if ignored > 0 {
+            log!("launcher.file_folders: {n} entries ignored", n = ignored);
+        }
+    }
+    FOLDERS.with(|f| {
+        if let Ok(mut f) = f.try_borrow_mut() {
+            *f = roots;
+        }
+    });
+}
+
 /// The pump thread of open `open`, with its first request queued.
 fn start(open: u32, r: Req, ui: isize) -> Option<Arc<Inbox>> {
     let inbox = Arc::new(Inbox::default());
     inbox.push(Msg::Request(Some(r)));
     let own = inbox.clone();
+    let folders = FOLDERS.with(|f| f.try_borrow().map(|f| f.clone()).unwrap_or_default());
     let body = move || {
         let mut post = |ev| crate::shell_thread::push_event(ui, ShellEvent::LauncherFiles(open, ev));
-        run_pump(&own, &mut RealSpawner, &mut post, files::LIMITS);
+        run_pump(&own, &mut RealSpawner(folders), &mut post, files::LIMITS);
         crate::mem::rearm();
     };
     match std::thread::Builder::new().name("launcher-files".into()).stack_size(PUMP_STACK).spawn(body) {
@@ -163,8 +185,22 @@ pub(crate) trait Spawner {
     fn spawn(&mut self) -> std::io::Result<(Box<dyn Helper>, PipeReader)>;
 }
 
-/// `dock.exe --launcher-files` through `update::spawn_in_job`, from the exe `update::child_exe` trusts.
-struct RealSpawner;
+/// The helper's arguments: `--launcher-files`, `--stall <ms>` when the probe asks it, and one `--root <folder>` per
+/// folder of `launcher.file_folders` the dock accepted (`configure`).
+fn helper_args<'a>(stall: Option<&'a str>, roots: &'a [String]) -> Vec<&'a str> {
+    let mut args = vec!["--launcher-files"];
+    if let Some(ms) = stall {
+        args.extend(["--stall", ms]);
+    }
+    for r in roots {
+        args.extend(["--root", r.as_str()]);
+    }
+    args
+}
+
+/// `dock.exe --launcher-files` through `update::spawn_in_job`, from the exe `update::child_exe` trusts, with the
+/// accepted folders of `launcher.file_folders`.
+struct RealSpawner(Vec<String>);
 
 impl Spawner for RealSpawner {
     fn spawn(&mut self) -> std::io::Result<(Box<dyn Helper>, PipeReader)> {
@@ -173,10 +209,7 @@ impl Spawner for RealSpawner {
         let stall = crate::launcher_probe::files_stall_ms().map(|ms| ms.to_string());
         #[cfg(not(feature = "owner-probe"))]
         let stall: Option<String> = None;
-        let mut args = vec!["--launcher-files"];
-        if let Some(ms) = &stall {
-            args.extend(["--stall", ms.as_str()]);
-        }
+        let args = helper_args(stall.as_deref(), &self.0);
         let mut child = crate::update::spawn_in_job(&exe, &args, true)?;
         let out = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
         Ok((Box::new(RealHelper(child)), out))
@@ -779,5 +812,16 @@ mod tests {
         request(1, None, 0);
         end();
         assert!(PUMP.with(|p| p.borrow().is_none()), "a withdrawal with no pump starts nothing");
+    }
+
+    #[test]
+    fn the_accepted_folders_reach_the_helper() {
+        let roots = ["D:\\".to_string(), "\\\\nas\\share docs".into()];
+        let args = helper_args(None, &roots);
+        assert_eq!(args, ["--launcher-files", "--root", "D:\\", "--root", "\\\\nas\\share docs"]);
+        // The helper reads them back as its folders (and checks them again, with_folders in files_child.rs).
+        let parsed = crate::parse_args_from(args.iter().map(|s| s.to_string())).unwrap();
+        assert!(parsed.launcher_files && parsed.roots == roots);
+        assert_eq!(helper_args(Some("3000"), &[]), ["--launcher-files", "--stall", "3000"]);
     }
 }
