@@ -3044,8 +3044,9 @@ fn apply_alias_op(op: &AliasOp, cfg: &mut dyn AliasCfg) {
     }
 }
 
-/// The change on `launcher.aliases`. A saved word replaces any word equal to it once folded (the table would keep only
-/// the first of the two); the other entries, those the table ignores included, stay as written.
+/// The change on `launcher.aliases`. A saved word replaces an entry the table serves whose word is equal to it once
+/// folded (the table would keep only the first of the two); the other entries, those the table ignores included, stay
+/// as written (D9).
 fn edit_aliases(l: &mut LauncherConfig, op: &AliasOp) {
     let folded = |w: &str| {
         let mut f = String::with_capacity(w.len());
@@ -3054,8 +3055,10 @@ fn edit_aliases(l: &mut LauncherConfig, op: &AliasOp) {
     };
     match op {
         AliasOp::Save { word, target } => {
+            use crate::launcher::aliases::{check_word, classify};
             let f = folded(word);
-            l.aliases.retain(|w, _| folded(w) != f);
+            let p = PrefixTable::from_pairs(&l.prefixes);
+            l.aliases.retain(|w, t| folded(w) != f || check_word(w, &p).is_err() || classify(t).is_err());
             l.aliases.insert(word.to_string(), target.to_string());
         }
         AliasOp::Remove(word) => {
@@ -6462,14 +6465,17 @@ mod tests {
     fn saving_replaces_a_word_equal_once_folded() {
         let mut l = LauncherConfig::default();
         l.aliases.insert("GH".into(), "https://example.com/old".into());
+        // Equal once folded too, but the table refuses its target: it shadows nothing and stays as written (D9).
+        l.aliases.insert("Gh".into(), "steam://run/1".into());
         l.aliases.insert("game".into(), "steam://run/1".into());
         edit_aliases(&mut l, &AliasOp::Save { word: "gh".into(), target: "https://example.com/new".into() });
         let all: Vec<(&str, &str)> = l.aliases.iter().map(|(w, t)| (w.as_str(), t.as_str())).collect();
-        assert_eq!(all, [("game", "steam://run/1"), ("gh", "https://example.com/new")], "the ignored entry stays");
+        let kept = [("Gh", "steam://run/1"), ("game", "steam://run/1"), ("gh", "https://example.com/new")];
+        assert_eq!(all, kept, "the ignored entries stay");
         edit_aliases(&mut l, &AliasOp::Remove("nope".into()));
-        assert_eq!(l.aliases.len(), 2);
+        assert_eq!(l.aliases.len(), 3);
         edit_aliases(&mut l, &AliasOp::Remove("gh".into()));
-        assert_eq!(l.aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["game"]);
+        assert_eq!(l.aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["Gh", "game"]);
     }
 
     #[test]
