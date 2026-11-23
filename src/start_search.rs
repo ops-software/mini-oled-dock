@@ -885,47 +885,50 @@ impl SettingsIo for RealIo {
     }
 }
 
-/// The key the settings thread computed last (`None` before its first run, or when no key could be computed).
-static EXPECTED_KEY: Mutex<Option<Arc<str>>> = Mutex::new(None);
+/// Whether a launcher chord is set, and the key the settings thread computed last (`None` before its first run, when no
+/// key could be computed, or while no chord is set). One lock holds both, so a run that read "set" cannot store the key
+/// after `chord_changed(false)` dropped it.
+static EXPECTED: Mutex<(bool, Option<Arc<str>>)> = Mutex::new((false, None));
 
-fn expected_key_slot() -> std::sync::MutexGuard<'static, Option<Arc<str>>> {
-    EXPECTED_KEY.lock().unwrap_or_else(|p| p.into_inner())
+fn expected_slot() -> std::sync::MutexGuard<'static, (bool, Option<Arc<str>>)> {
+    EXPECTED.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The launcher chord was set or switched off (`popup_launcher::on_config`). Off drops the stored key: nothing the
+/// launcher needs stays resident without a chord.
+pub(crate) fn chord_changed(on: bool) {
+    let mut g = expected_slot();
+    g.0 = on;
+    if !on {
+        g.1 = None;
+    }
 }
 
 /// Each run of the settings thread stores the key it computed, so a settings file that changed during a session is seen
 /// at the thread's next run, never turned into a permanent mismatch.
 /// A launcher chord is set (`chord_changed`): only then does the key stay stored, because only the launcher reads it.
-static CHORD_SET: AtomicBool = AtomicBool::new(false);
-
-/// The launcher chord was set or switched off (`popup_launcher::on_config`). Off drops the stored key: nothing the
-/// launcher needs stays resident without a chord.
-pub(crate) fn chord_changed(on: bool) {
-    CHORD_SET.store(on, SeqCst);
-    if !on {
-        *expected_key_slot() = None;
-    }
-}
-
 fn store_key(key: Option<&str>) {
-    if !CHORD_SET.load(SeqCst) {
+    let mut g = expected_slot();
+    if !g.0 {
         return;
     }
-    let mut slot = expected_key_slot();
-    if slot.as_deref() != key {
-        *slot = key.map(Arc::from);
+    if g.1.as_deref() != key {
+        g.1 = key.map(Arc::from);
     }
 }
 
 /// The key the launcher checks the mapped cache file against (L3 T19): the one the settings thread stored, or computed
-/// here (well under 1 ms: a folder listing, two registry values, the exe's size and time) and stored when none is.
+/// here (well under 1 ms: a folder listing, two registry values, the exe's size and time) and, while a chord is set,
+/// stored when none is.
 /// `None` when Windows' build or the settings files cannot be read: then no file is ever written.
 pub(crate) fn expected_settings_key() -> Option<Arc<str>> {
-    if let Some(k) = expected_key_slot().clone() {
+    if let Some(k) = expected_slot().1.clone() {
         return Some(k);
     }
     let key: Arc<str> = current_key()?.into();
-    if CHORD_SET.load(SeqCst) {
-        *expected_key_slot() = Some(key.clone());
+    let mut g = expected_slot();
+    if g.0 {
+        g.1 = Some(key.clone());
     }
     Some(key)
 }
@@ -1425,24 +1428,24 @@ mod tests {
         assert!(catalog_key_of("1.5.0:9:9", "26100.1742", 0x409, &many).is_none());
     }
 
-    /// L3 T18: the key ends with the arena's format, so a cache file of another layout is rebuilt once.
     #[test]
     fn the_cache_key_is_stored_only_while_a_chord_is_set() {
         // One test owns the statics: the others never touch them.
         chord_changed(false);
         store_key(Some("k1"));
-        assert!(expected_key_slot().is_none(), "no chord: nothing stored");
+        assert!(expected_slot().1.is_none(), "no chord: nothing stored");
         chord_changed(true);
         store_key(Some("k1"));
-        assert_eq!(expected_key_slot().as_deref(), Some("k1"));
+        assert_eq!(expected_slot().1.as_deref(), Some("k1"));
         store_key(Some("k2"));
-        assert_eq!(expected_key_slot().as_deref(), Some("k2"), "each run replaces it");
+        assert_eq!(expected_slot().1.as_deref(), Some("k2"), "each run replaces it");
         chord_changed(false);
-        assert!(expected_key_slot().is_none(), "the chord off drops it");
+        assert!(expected_slot().1.is_none(), "the chord off drops it");
         store_key(Some("k3"));
-        assert!(expected_key_slot().is_none(), "and a later run does not bring it back");
+        assert!(expected_slot().1.is_none(), "and a later run does not bring it back");
     }
 
+    /// L3 T18: the key ends with the arena's format, so a cache file of another layout is rebuilt once.
     #[test]
     fn settings_key_has_the_arena_format() {
         let k = key();
