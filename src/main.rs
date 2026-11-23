@@ -245,6 +245,11 @@ pub struct Args {
     pub roots: Vec<String>,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
+    /// `--update-guard <tag>`: the old binary judges the staged release (started only by the updater as
+    /// `update\<tag>\dock-guard.exe`); combines with nothing.
+    pub update_guard: Option<String>,
+    /// `--rollback` (alone or with `--quiet`): install `dock.prev.exe` again.
+    pub rollback: bool,
     /// `--settings`: ask the running dock to open its Settings window and exit.
     pub settings: bool,
 }
@@ -309,6 +314,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             }
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
+            "--update-guard" => a.update_guard = Some(it.next().ok_or("--update-guard requires <tag>")?),
+            "--rollback" => a.rollback = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -334,11 +341,17 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if a.launcher_files && flags > 1 + usize::from(a.stall.is_some()) + a.roots.len() {
         return Err("--launcher-files cannot be combined with other arguments".into());
     }
+    if a.update_guard.is_some() && flags > 1 {
+        return Err("--update-guard cannot be combined with other arguments".into());
+    }
+    if a.rollback && flags > 1 + usize::from(a.quiet) {
+        return Err("--rollback combines only with --quiet".into());
+    }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
     }
-    if a.quiet && !(a.install || a.uninstall) {
-        return Err("--quiet requires --install or --uninstall".into());
+    if a.quiet && !(a.install || a.uninstall || a.rollback) {
+        return Err("--quiet requires --install, --uninstall or --rollback".into());
     }
     if a.no_relaunch && !a.install {
         return Err("--no-relaunch requires --install".into());
@@ -370,6 +383,17 @@ enum CliReport {
     MessageBox,
     /// `--quiet`: log file only, the exit code carries the result.
     LogOnly,
+}
+
+/// `--rollback` run from the installed `dock.exe` must leave at once, as the older installer it starts replaces that
+/// file (`update::guard::run_rollback_cli`): a message box becomes the log only (that installer shows its own result);
+/// a console still gets the lines. Pure.
+fn rollback_report(report: CliReport, from_installed: bool) -> CliReport {
+    if from_installed && report == CliReport::MessageBox {
+        CliReport::LogOnly
+    } else {
+        report
+    }
 }
 
 fn cli_report(quiet: bool, has_console: bool) -> CliReport {
@@ -1148,8 +1172,9 @@ fn usage() {
         e,
         "usage: dock [--top | --bottom] [--no-autohide] [--keep-taskbar] [--diag] [--restore] \
          [--install [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
-         [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] [--console] \
-         [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] [--list-apps]"
+         [--rollback [--quiet]] [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] \
+         [--console] [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] \
+         [--list-apps]"
     );
 }
 
@@ -1232,10 +1257,11 @@ fn main() -> std::process::ExitCode {
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
-    // --install / --uninstall mode: messages via `logger::say`, log to file only.
-    if args.install || args.uninstall {
+    // --install / --uninstall / --rollback mode: messages via `logger::say`, log to file only.
+    if args.install || args.uninstall || args.rollback {
         // Without a console (UAC from a non-elevated terminal, Explorer) the result would be lost: message box.
         let report = cli_report(args.quiet, !args.quiet && attach_console());
+        let report = if args.rollback { rollback_report(report, update::guard::runs_installed()) } else { report };
         if report != CliReport::Console {
             logger::buffer_say();
         }
@@ -1246,8 +1272,10 @@ fn main() -> std::process::ExitCode {
         }
         let mut code = if args.install {
             autostart::run_install_cli(args.no_relaunch)
-        } else {
+        } else if args.uninstall {
             autostart::run_uninstall_cli(args.remove)
+        } else {
+            update::guard::run_rollback_cli(args.quiet)
         };
         if report == CliReport::LogOnly {
             // Keep the messages in the log, then keep buffering whatever is said later (nobody shows it).
@@ -1315,6 +1343,14 @@ fn main() -> std::process::ExitCode {
         }
         let (log_thread, _) = start_logging("");
         let code = update::run_install_cli(tag);
+        logger::stop(log_thread);
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    // --update-guard <tag>: the old binary judges the staged release (`update::guard`). Its lines carry the `ug` tag
+    // and are on disk at once; it never takes `Local\DockInstance`.
+    if let Some(tag) = &args.update_guard {
+        let (log_thread, _) = start_logging("ug");
+        let code = update::guard::run_cli(tag);
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
@@ -1444,7 +1480,14 @@ mod tests {
         for a in all {
             assert!(is_child_mode(&p(a).unwrap()), "{a:?}");
         }
-        for a in [&[][..], &["--preview", "x"], &["--watchdog", "1", "ev"], &["--version"]] {
+        for a in [
+            &[][..],
+            &["--preview", "x"],
+            &["--watchdog", "1", "ev"],
+            &["--version"],
+            &["--rollback"],
+            &["--update-guard", "v1"],
+        ] {
             assert!(!is_child_mode(&p(a).unwrap()), "{a:?}");
         }
     }
@@ -1541,8 +1584,38 @@ mod tests {
     }
 
     #[test]
+    fn cli_update_guard_and_rollback() {
+        assert_eq!(p(&["--update-guard", "v1.5.3"]).unwrap().update_guard.as_deref(), Some("v1.5.3"));
+        let r = p(&["--rollback"]).unwrap();
+        assert!(r.rollback && !r.quiet && !r.install && !r.uninstall && r.update_guard.is_none());
+        let q = p(&["--rollback", "--quiet"]).unwrap();
+        assert!(q.rollback && q.quiet);
+        for bad in [&["--update-guard"][..], &["--rollback", "--install"], &["--rollback", "--uninstall"]] {
+            assert!(matches!(p(bad), Err(e) if !e.is_empty()), "{bad:?}");
+        }
+        // The command lines the guard and --rollback start other releases with (contract C2).
+        let words = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let g = parse_args_from(words(&update::guard::guard_args("v1.5.3")).into_iter()).unwrap();
+        assert_eq!(g.update_guard.as_deref(), Some("v1.5.3"));
+        let n = parse_args_from(words(update::guard::NEW_INSTALL_ARGS).into_iter()).unwrap();
+        assert!(n.install && n.quiet && n.no_relaunch && !n.rollback);
+        for quiet in [true, false] {
+            let i = parse_args_from(words(update::guard::rollback_install_args(quiet)).into_iter()).unwrap();
+            assert!(i.install && i.quiet == quiet && !i.no_relaunch, "{quiet}");
+        }
+    }
+
+    #[test]
+    fn a_rollback_from_the_installed_exe_never_waits_on_a_box() {
+        assert_eq!(rollback_report(CliReport::MessageBox, true), CliReport::LogOnly);
+        assert_eq!(rollback_report(CliReport::Console, true), CliReport::Console);
+        assert_eq!(rollback_report(CliReport::MessageBox, false), CliReport::MessageBox);
+        assert_eq!(rollback_report(CliReport::LogOnly, false), CliReport::LogOnly);
+    }
+
+    #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 24] = [
+        let bad: [&[&str]; 28] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1567,6 +1640,10 @@ mod tests {
             &["--settings", "--start-icons", "40"],
             &["--start-icons", "40", "--start-apps"],
             &["--start-icons", "40", "--start-icons", "40"],
+            &["--update-guard", "v1.5.3", "--install"],
+            &["--update-guard", "v1.5.3", "--update-fetch"],
+            &["--update-fetch", "--update-guard", "v1.5.3"],
+            &["--rollback", "--update-install", "t"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");

@@ -10,12 +10,13 @@
 //! the taskbar back, and `copy_self` waits for that watchdog to leave.
 //!
 //! Contracts later releases keep (pinned by the tests below):
-//! - C1: the dock's top-level window class is `DockWindow`, owned by its UI thread, which pumps within 30 s of the start.
-//! - C2: `--install --quiet --no-relaunch` copies the exe over `dock.exe`, keeps `dock.prev.exe` on an upgrade, registers
-//!   the "Dock" task, writes the Add/Remove Programs entry and starts no dock: an older guard runs a newer installer
-//!   with exactly these arguments.
-//! - C5: the stage `update\<tag>\` holds `dock.exe`, `dock.exe.sha256`, `dock-guard.exe` and `rolled-back`; releases before
-//!   `FIRST_RELEASE_WITH_MARKS` do not read `rolled-back`, and `--rollback` to one of them says so.
+//! - C1: the dock's top-level window class is `DockWindow`, owned by its UI thread, which pumps within 30 s of the
+//!   start.
+//! - C2: `--install --quiet --no-relaunch` copies the exe over `dock.exe`, keeps `dock.prev.exe` on an upgrade,
+//!   registers the "Dock" task, writes the Add/Remove Programs entry and starts no dock: an older guard runs a newer
+//!   installer with exactly these arguments.
+//! - C5: the stage `update\<tag>\` holds `dock.exe`, `dock.exe.sha256`, `dock-guard.exe` and `rolled-back`; releases
+//!   before `FIRST_RELEASE_WITH_MARKS` do not read `rolled-back`, and `--rollback` to one of them says so.
 //! - C6: the exit codes `EXIT_COMMITTED` to `EXIT_ROLLBACK_FAILED` (0 to 4).
 //!
 //! `--rollback` installs `dock.prev.exe` again through that binary's own `--install`.
@@ -23,9 +24,6 @@
 //! `panic = "abort"`: a guard that aborts mid-update leaves the new version installed but not judged, so this module
 //! denies the panicking shortcuts.
 
-// Wired in by B6 (B6 moves the allow onto guard_args, B7 removes it); unconditional until then, as the tests do not
-// reach run_cli or run_rollback_cli either.
-#![allow(dead_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::io::Read;
@@ -86,6 +84,7 @@ pub(crate) const EXIT_NOT_INSTALLED: i32 = 3;
 pub(crate) const EXIT_ROLLBACK_FAILED: i32 = 4;
 
 /// The guard's command line after the exe path.
+#[cfg_attr(not(test), allow(dead_code))] // used by B7's arm_guard
 pub(crate) fn guard_args(tag: &str) -> String {
     format!("--update-guard {tag}")
 }
@@ -160,8 +159,8 @@ fn exit_of(h: &OwnedHandle, wait_ms: u32) -> Option<u32> {
     super::wait_exit(h, Duration::from_millis(u64::from(wait_ms))).map(|c| c as u32)
 }
 
-/// true when the top-level `DockWindow` of process `pid` answers `WM_NULL` within `ANSWER_MS` (contract C1). A window of
-/// that class owned by another process (a squatter) is skipped.
+/// true when the top-level `DockWindow` of process `pid` answers `WM_NULL` within `ANSWER_MS` (contract C1). A window
+/// of that class owned by another process (a squatter) is skipped.
 fn window_answers(pid: u32) -> bool {
     let mut after: Option<HWND> = None;
     // SAFETY: the class is a static NUL-terminated literal and a null name matches any window; `after` is a window
