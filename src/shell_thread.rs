@@ -2580,7 +2580,8 @@ fn plain_open(verb: Verb, elevation: Option<bool>) -> bool {
 /// Whether one launcher launch of `kind` may run in the dock's own process: `plain_open`, except for a path or a
 /// command line (`OpenPath`, `LaunchCommand`), which leave through the desktop shell whether or not the dock is
 /// elevated. The in-process call carries SEE_MASK_FLAG_NO_UI, which may hide the prompt Windows raises before it runs
-/// a downloaded file, and that prompt is the second gate for typed paths and alias targets (5.4.6).
+/// a downloaded file, and that prompt is the second gate for typed paths and alias targets (5.4.6). A line with a %VAR% reaches its program through
+/// cmd's `start` (ShellExecuteEx, in the user's context): live check 6 must show the prompt for that case too.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn in_process_exec(kind: LaunchKind, verb: Verb, elevation: Option<bool>) -> bool {
     !matches!(kind, LaunchKind::Path | LaunchKind::Command) && plain_open(verb, elevation)
@@ -2901,7 +2902,12 @@ fn command_parts_with(
         if !sys.is_absolute() {
             return Err("no system directory");
         }
-        let args = format!("/s {switch} \"{}\"", line.trim());
+        // A file that is the whole line (a drive path with spaces, one token) goes quoted: cmd splits at a space. /c hands the
+        // line to cmd's `start`, which resolves App Paths and raises the attachment prompt as the Run dialog does.
+        let t = line.trim();
+        let body = if !quoted && rest.is_empty() && !t.contains('"') { format!("\"{t}\"") } else { t.to_string() };
+        let start = if switch == "/c" { "start \"\" " } else { "" };
+        let args = format!("/s {switch} \"{start}{body}\"");
         return Ok((sys.join("cmd.exe").to_string_lossy().into_owned(), Some(args)));
     }
     let args = rest.trim();
@@ -2928,8 +2934,9 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
 }
 
 /// `LaunchCommand`: the line split by `command_parts` (with `console`: `<sys>\cmd.exe /s /k "<line>"`; a line with a
-/// %VAR%, which the desktop shell does not expand, `<sys>\cmd.exe /s /c "<line>"`: cmd expands it in the user's
-/// context and closes once it has started a windowed program), one shell call with no working directory. Nothing is
+/// %VAR%, which the desktop shell does not expand, `<sys>\cmd.exe /s /c "start "" <line>"`: cmd expands it in the user's
+/// context, `start` hands it to ShellExecuteEx (App Paths, the attachment prompt) and cmd closes at once; an address
+/// is never wrapped), one shell call with no working directory. Nothing is
 /// expanded or looked up here: the line goes to the shell as typed.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), Fail> {
@@ -3750,8 +3757,13 @@ mod tests {
         assert_eq!(
             calls,
             [
-                (cmd(), Some("/s /c \"notepad %USERPROFILE%\\x.txt\"".to_string()), None, Verb::Open),
-                (cmd(), Some("/s /c \"\"C:\\Program Files\\x.exe\" \"%TEMP%\\a b\"\"".to_string()), None, Verb::Open),
+                (cmd(), Some("/s /c \"start \"\" notepad %USERPROFILE%\\x.txt\"".to_string()), None, Verb::Open),
+                (
+                    cmd(),
+                    Some("/s /c \"start \"\" \"C:\\Program Files\\x.exe\" \"%TEMP%\\a b\"\"".to_string()),
+                    None,
+                    Verb::Open
+                ),
                 (cmd(), Some("/s /k \"ping %COMPUTERNAME%\"".to_string()), None, Verb::Open),
                 ("notepad".to_string(), Some("100%".to_string()), None, Verb::Open),
             ]
@@ -3760,6 +3772,27 @@ mod tests {
         let (line, file) = run_line("notepad %X%\u{202e}a");
         assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_err());
         assert_eq!(calls.len(), 4);
+        // An address stays with Explorer (a % in it is percent-encoding; cmd would split it at an &).
+        calls.clear();
+        for url in [
+            "https://example.com/s?q=a%20b%20c&x=1",
+            "shell:%20x%20",
+            "ms-settings:%20a%20",
+            "\"https://e.com/a%20b%20c\"",
+        ] {
+            let (line, file) = run_line(url);
+            assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_ok());
+            assert_ne!(calls.last().map(|c| c.0.as_str()), Some("C:\\Windows\\System32\\cmd.exe"), "{url}");
+        }
+        assert_eq!(calls.len(), 4);
+        // A file that is the whole line goes quoted into the start (cmd splits at a space), also under /k.
+        calls.clear();
+        let (line, file) = run_line("C:\\My Files\\%USERNAME%.txt");
+        assert!(launch_command_with(&line, file, false, sys, &mut recorder(&mut calls, true)).is_ok());
+        let (line, file) = run_line("C:\\My Files\\%USERNAME%.exe");
+        assert!(launch_command_with(&line, file, true, sys, &mut recorder(&mut calls, true)).is_ok());
+        assert_eq!(calls[0].1.as_deref(), Some("/s /c \"start \"\" \"C:\\My Files\\%USERNAME%.txt\"\""));
+        assert_eq!(calls[1].1.as_deref(), Some("/s /k \"\"C:\\My Files\\%USERNAME%.exe\"\""));
         // No system directory: nothing runs, and no guess from the environment.
         calls.clear();
         let (line, file) = run_line("notepad %X%");

@@ -156,12 +156,19 @@ pub fn runs_in_console(r: &RunLine) -> bool {
 }
 
 /// Whether the shell thread hands the line to `cmd.exe /s /c` so that cmd expands its %VAR% (the desktop shell does
-/// not): a line with a %VAR% that does not already run in a console kept open. The console is not kept open here: a
+/// not): a line with a %VAR% that does not already run in a console kept open and is not an address (see `is_address`). The console is not kept open here: a
 /// windowed program (Notepad) must not leave an empty console on screen, and cmd closes once it has started it. The
 /// dock still expands nothing and reads nothing; the typed line, byte for byte, is the argument of a de-elevated
 /// cmd.exe that Explorer starts at medium integrity.
 pub fn expands_in_cmd(line: &str) -> bool {
-    !EXPLORER_EXPANDS_VARS && needs_console_for_vars(line)
+    !EXPLORER_EXPANDS_VARS && needs_console_for_vars(line) && !is_address(line)
+}
+
+/// A URL or a shell: or ms-settings: address (also inside quotes): Explorer opens it as typed, a % in it is
+/// percent-encoding and cmd would read the scheme as a command name and split it at an &.
+fn is_address(line: &str) -> bool {
+    let l = line.trim().trim_start_matches('"');
+    is_url(l) || has_prefix_ci(l, "shell:") || has_prefix_ci(l, "ms-settings:")
 }
 
 /// Where a suggestion came from.
@@ -306,6 +313,10 @@ mod tests {
         assert!(!runs_in_console(&var));
         assert!(!EXPLORER_EXPANDS_VARS && expands_in_cmd(&var.line));
         assert!(expands_in_cmd("%windir%\\notepad.exe"));
+        // An address is opened by Explorer as typed: its % is percent-encoding.
+        for a in ["https://a.com/s?q=a%20b%20c", "shell:%20x%20", "ms-settings:%20a%20", "\"https://a.com/%20%20\""] {
+            assert!(!expands_in_cmd(a), "{a}");
+        }
         assert!(!expands_in_cmd("notepad 100%"));
         assert!(!expands_in_cmd("notepad a.txt"));
     }
