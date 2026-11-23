@@ -238,6 +238,8 @@ struct Win {
     dpi: u32,
     client: (i32, i32),
     page: Page,
+    /// A chord pick refused because another app holds it (`settings_pages::chord_to_probe`); shown under the row.
+    chord_held: Option<bool>,
     focus: Focus,
     scroll: i32,
     /// Wheel delta not yet turned into a notch.
@@ -460,6 +462,8 @@ impl Win {
             data_dir: self.data_dir.as_deref(),
             log_path: self.log_path.as_deref(),
             trust_elevated: self.trust_elevated,
+            powertoys: crate::popup::popup_launcher::pt_detected(),
+            chord_held: self.chord_held,
         }
     }
 
@@ -612,6 +616,16 @@ impl Win {
 
     /// A click on a setting: written at once and applied.
     fn save(&mut self, e: Edit) {
+        if matches!(e, Edit::Choose(settings_pages::Setting::LauncherChord, _)) {
+            // A new chord is written only while no other app holds it, as the offer in Start does.
+            let probe = settings_pages::chord_to_probe(e, &config::get().launcher.chord);
+            self.chord_held = probe.filter(|shift| !crate::launcher_sys::chord_is_free(*shift));
+            if self.chord_held.is_some() {
+                log!("settings: another app holds the launcher chord, nothing written");
+                self.refresh();
+                return;
+            }
+        }
         if let Err(err) = config::modify(|c| apply_edit(c, e, &self.screens)) {
             // Not writable (or the write failed): the change still applies for this session.
             log!("settings: saving failed ({err}), applied in memory only");
@@ -675,10 +689,14 @@ impl Win {
         self.refresh();
     }
 
-    /// Shows `page`: top of the page, chooser closed, picker open when the colour is not a preset.
+    /// Shows `page`: top of the page, chooser closed, picker open when the colour is not a preset. The Launcher page
+    /// looks for PowerToys first (its row).
     fn goto(&mut self, page: Page) {
         self.finish();
         let bg = config::get().background;
+        if page == Page::Launcher {
+            crate::popup::popup_launcher::pt_refresh();
+        }
         self.page = page;
         self.scroll = 0;
         self.chooser_open = false;
@@ -716,6 +734,20 @@ pub fn open() {
     if let Err(e) = create() {
         log!("settings: cannot open the window: {e}");
     }
+}
+
+/// Opens the window (or the open one) on `page`. The Launcher page, already shown, is built again after its look for
+/// PowerToys.
+pub fn open_at(page: Page) {
+    open();
+    with_win(|w| {
+        if w.page != page {
+            w.goto(page);
+        } else if page == Page::Launcher {
+            crate::popup::popup_launcher::pt_refresh();
+            w.refresh();
+        }
+    });
 }
 
 fn create() -> Result<(), String> {
@@ -804,6 +836,7 @@ fn open_window(inst: HINSTANCE) -> Result<(), String> {
         dpi,
         client,
         page: Page::Appearance,
+        chord_held: None,
         focus: Focus::Nav,
         scroll: 0,
         wheel: 0,
@@ -922,6 +955,9 @@ fn run(act: Act) {
 fn run_effect(e: Effect) {
     match e {
         Effect::None => {}
+        // An alias goes out through the launcher's handler (it reads a pending hand edit first and refreshes this window
+        // itself, so it runs outside `with_win`).
+        Effect::Save(Edit::RemoveLauncherAlias(h)) => crate::popup::popup_launcher::remove_alias_by_hash(h),
         Effect::Save(edit) => {
             with_win(|w| w.save(edit));
         }
@@ -996,7 +1032,30 @@ fn run_action(a: Action) {
             close("exit");
             crate::power::run(crate::power::PowerAction::ExitDock);
         }
+        Action::AddLauncherAlias => crate::popup::popup_launcher::open_alias_prompt(),
+        Action::RemoveLauncherAlias(h) => crate::popup::popup_launcher::remove_alias_by_hash(h),
+        Action::ForgetHistory => {
+            crate::popup::popup_launcher::forget_history();
+            log!("settings: launcher history forgotten");
+        }
+        // `config.json` is the one file the interactive user may write; the shell thread opens it as that user.
+        Action::EditConfig => match (crate::datadir::config_path(), notepad_path()) {
+            (Some(p), Some(notepad)) => {
+                shell_thread::request(ShellRequest::Launch {
+                    target: notepad,
+                    args: Some(format!("\"{}\"", p.display())),
+                });
+            }
+            (_, None) => log!("settings: no system directory (GetSystemDirectoryW failed), config.json not opened"),
+            (None, _) => {}
+        },
     }
+}
+
+/// `<System32>\notepad.exe`, the folder from `GetSystemDirectoryW` (never from the environment, whose
+/// %SystemRoot% is the user's to set), never found through the search path. None when the API fails.
+fn notepad_path() -> Option<String> {
+    Some(shell_thread::system_dir()?.join("notepad.exe").display().to_string())
 }
 
 // ------------------------------------------------------------------ messages
@@ -1291,6 +1350,14 @@ mod tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_TAB, VK_UP};
     const FRAME: RECT = RECT { left: -8, top: -31, right: 8, bottom: 8 };
+
+    #[test]
+    fn notepad_comes_from_the_system_directory() {
+        // GetSystemDirectoryW, never %SystemRoot%: the elevated dock stats this path before the shell launch.
+        let p = notepad_path().expect("GetSystemDirectoryW");
+        assert_eq!(p, shell_thread::system_dir().unwrap().join("notepad.exe").display().to_string());
+        assert!(std::path::Path::new(&p).is_absolute(), "{p}");
+    }
 
     #[test]
     fn initial_rect_centres_and_clamps() {

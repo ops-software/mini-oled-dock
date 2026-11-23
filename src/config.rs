@@ -413,6 +413,217 @@ pub const TRAY_ICON_SIZE: SizeRange = SizeRange { min: 12, max: 24, default: 16 
 /// Scale of the system modules on the right (percent).
 pub const MODULE_SIZE: SizeRange = SizeRange { min: 75, max: 150, default: 100 };
 
+/// The providers a `launcher.providers` map may name, in the order the template lists them.
+pub(crate) const LAUNCHER_PROVIDERS: [&str; 10] =
+    ["apps", "windows", "files", "settings", "calc", "commands", "run", "web", "datetime", "registry"];
+
+/// The launcher's prefix defaults (SPEC-launcher 5.6).
+pub(crate) const LAUNCHER_PREFIXES: [(&str, &str); 8] = [
+    ("=", "calc"),
+    (">", "run"),
+    ("<", "windows"),
+    ("??", "web"),
+    ("$", "settings"),
+    (")", "datetime"),
+    (":", "registry"),
+    ("file ", "files"),
+];
+
+/// `launcher` section of the config (SPEC-launcher 5.6). Plain data: nothing here names a program, a path or a verb.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LauncherConfig {
+    pub enabled: bool,
+    /// "off", "alt+space" or "alt+shift+space".
+    pub chord: String,
+    /// "yield" or "take": what the chord does while PowerToys Command Palette or PowerToys Run runs (SPEC-launcher 5.7,
+    /// `launcher::powertoys`). Only with the chord "alt+space".
+    pub with_powertoys: String,
+    /// "pointer", "active" or "primary".
+    pub monitor: String,
+    /// Distance of the panel from the top of the display, percent of its height (10..=50).
+    pub top_percent: u8,
+    /// Panel width in logical px (560..=880, multiples of 40).
+    pub width: u16,
+    /// Visible result rows (4..=12).
+    pub rows: u8,
+    pub animate: bool,
+    pub keep_query: bool,
+    /// "pass" or "open".
+    pub over_fullscreen: String,
+    pub learn: bool,
+    pub announce_selection: bool,
+    pub providers: BTreeMap<String, bool>,
+    pub prefixes: BTreeMap<String, String>,
+    /// Words that open something when typed alone (plan L2 D9): word to target. Kept as written, `sanitize` only caps
+    /// it; `launcher::aliases::AliasTable` ignores (and counts) the entries it refuses, so a save never deletes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, String>,
+    /// Folders of the user's own that file search covers too (SPEC 5.4.6): at most 8 are read, a drive root allowed.
+    /// Kept as written: the dock ignores (and counts in the log) the entries `files::root_of` refuses, so a save never
+    /// deletes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_folders: Vec<String>,
+    /// "google", "bing", "duckduckgo" or "custom".
+    pub web_engine: String,
+    /// The search URL template of the "custom" engine, "" otherwise.
+    pub web_url: String,
+    /// true once the one-time launcher offer in the Start menu (SPEC-launcher 5.2.1) was answered: a chord taken from
+    /// it or "Don't show again". The offer is shown only while this is false and the chord is "off".
+    pub offer_done: bool,
+    /// true once the launcher's PowerToys notice (SPEC-launcher 5.7) was answered: any choice, or "Don't show again". A
+    /// chord owner found later is then yielded to (or taken, with "take") without asking again.
+    pub powertoys_done: bool,
+}
+
+pub const LAUNCHER_TOP_PERCENT: (u8, u8, u8) = (10, 50, 24);
+pub const LAUNCHER_WIDTH: (u16, u16, u16) = (560, 880, 640);
+pub const LAUNCHER_ROWS: (u8, u8, u8) = (4, 12, 8);
+/// `launcher.aliases`: at most this many entries are kept, each word and target of at most `ALIAS_TEXT_CAP` characters.
+pub const ALIAS_ENTRIES_CAP: usize = 256;
+pub const ALIAS_TEXT_CAP: usize = 1_024;
+
+impl Default for LauncherConfig {
+    fn default() -> Self {
+        LauncherConfig {
+            enabled: true,
+            chord: "off".into(),
+            with_powertoys: "yield".into(),
+            monitor: "pointer".into(),
+            top_percent: LAUNCHER_TOP_PERCENT.2,
+            width: LAUNCHER_WIDTH.2,
+            rows: LAUNCHER_ROWS.2,
+            animate: false,
+            keep_query: false,
+            over_fullscreen: "pass".into(),
+            learn: true,
+            announce_selection: false,
+            providers: LAUNCHER_PROVIDERS.iter().fold(BTreeMap::new(), |mut m, p| {
+                m.insert(p.to_string(), true);
+                m
+            }),
+            prefixes: LAUNCHER_PREFIXES.iter().fold(BTreeMap::new(), |mut m, (p, n)| {
+                m.insert(p.to_string(), n.to_string());
+                m
+            }),
+            aliases: BTreeMap::new(),
+            file_folders: Vec::new(),
+            web_engine: "google".into(),
+            web_url: String::new(),
+            offer_done: false,
+            powertoys_done: false,
+        }
+    }
+}
+
+/// Puts `v` back to `default` unless it is one of `allowed`; the message names the key.
+fn fix_choice(v: &mut String, allowed: &[&str], default: &str, key: &str, out: &mut Vec<String>) {
+    if !allowed.contains(&v.as_str()) {
+        out.push(format!("launcher.{key}: unknown value, using \"{default}\""));
+        *v = default.to_string();
+    }
+}
+
+impl LauncherConfig {
+    /// Brings every key into its closed list or range and returns one message per fix. Never runs anything.
+    pub fn sanitize(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        fix_choice(&mut self.chord, &["off", "alt+space", "alt+shift+space"], "off", "chord", &mut out);
+        fix_choice(&mut self.with_powertoys, &["yield", "take"], "yield", "with_powertoys", &mut out);
+        fix_choice(&mut self.monitor, &["pointer", "active", "primary"], "pointer", "monitor", &mut out);
+        fix_choice(&mut self.over_fullscreen, &["pass", "open"], "pass", "over_fullscreen", &mut out);
+        let (lo, hi, _) = LAUNCHER_TOP_PERCENT;
+        let v = self.top_percent.clamp(lo, hi);
+        if v != self.top_percent {
+            out.push("launcher.top_percent: out of range, clamped".into());
+            self.top_percent = v;
+        }
+        let (lo, hi, _) = LAUNCHER_ROWS;
+        let v = self.rows.clamp(lo, hi);
+        if v != self.rows {
+            out.push("launcher.rows: out of range, clamped".into());
+            self.rows = v;
+        }
+        let (lo, hi, _) = LAUNCHER_WIDTH;
+        let v = (self.width.clamp(lo, hi) + 20) / 40 * 40;
+        let v = v.clamp(lo, hi);
+        if v != self.width {
+            out.push("launcher.width: out of range or not a multiple of 40, adjusted".into());
+            self.width = v;
+        }
+        // providers: unknown names dropped, apps always on, a missing one stays at its default (on)
+        let before = self.providers.len();
+        self.providers.retain(|k, _| crate::launcher::model::ProviderId::from_name(k).is_some());
+        if self.providers.len() != before {
+            out.push("launcher.providers: unknown names dropped".into());
+        }
+        for p in LAUNCHER_PROVIDERS {
+            self.providers.entry(p.to_string()).or_insert(true);
+        }
+        if self.providers.get("apps") != Some(&true) {
+            out.push("launcher.providers.apps: always on".into());
+            self.providers.insert("apps".into(), true);
+        }
+        // prefixes: 1-5 characters, known provider, unique, a word prefix ends with a space
+        // sorted, each prefix once (lower case)
+        let mut seen: Vec<String> = Vec::new();
+        let mut dropped = false;
+        self.prefixes.retain(|p, name| {
+            let chars = p.chars().count();
+            let closed = !p.chars().any(char::is_alphabetic) || p.ends_with(' ');
+            // invisible prefixes (whitespace only, control or bidi/format marks) cannot be typed or seen
+            let visible = !p.trim().is_empty()
+                && !p.chars().any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'));
+            let ok = (1..=5).contains(&chars)
+                && closed
+                && visible
+                && crate::launcher::model::ProviderId::from_name(name).is_some()
+                && {
+                    let lower = p.to_ascii_lowercase();
+                    let at = seen.binary_search(&lower);
+                    if let Err(at) = at {
+                        seen.insert(at, lower);
+                    }
+                    at.is_err()
+                };
+            dropped |= !ok;
+            ok
+        });
+        if dropped {
+            out.push("launcher.prefixes: invalid entries dropped".into());
+        }
+        // aliases: kept as written (the alias table ignores and counts what it refuses, plan L2 D9); only the hard caps,
+        // so a file that is far too large cannot make the table's build long. The message names no word and no target.
+        let before = self.aliases.len();
+        self.aliases.retain(|w, t| w.chars().count() <= ALIAS_TEXT_CAP && t.chars().count() <= ALIAS_TEXT_CAP);
+        if let Some(first_over) = self.aliases.keys().nth(ALIAS_ENTRIES_CAP).cloned() {
+            self.aliases.split_off(&first_over);
+        }
+        let over = before - self.aliases.len();
+        if over > 0 {
+            out.push(format!("launcher.aliases: {over} entries over a cap dropped"));
+        }
+        // web: a custom template must pass the validator, else Google
+        fix_choice(&mut self.web_engine, &["google", "bing", "duckduckgo", "custom"], "google", "web_engine", &mut out);
+        if self.web_engine == "custom" {
+            if let Err(why) = crate::launcher::web::validate_template(&self.web_url) {
+                out.push(format!("launcher.web_url: {why}, using google"));
+                self.web_engine = "google".into();
+                self.web_url.clear();
+            }
+        }
+        out
+    }
+
+    /// The chord to hook; None when the launcher is disabled or the chord is "off".
+    pub fn chord_spec(&self) -> Option<crate::launcher::model::ChordSpec> {
+        if !self.enabled {
+            return None;
+        }
+        crate::launcher::model::ChordSpec::parse(&self.chord)
+    }
+}
+
 /// Default opacity of the bar background (percent).
 pub const DEFAULT_BAR_OPACITY: u8 = 95;
 
@@ -559,6 +770,8 @@ pub struct Config {
     pub last_update_check: String,
     /// Internal: tag of the newest release found by the last check, "" = none.
     pub update_available: String,
+    /// The launcher (Alt+Space style search box); off until a chord is set.
+    pub launcher: LauncherConfig,
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -631,6 +844,7 @@ impl Default for Config {
             update_auto_install: false,
             last_update_check: String::new(),
             update_available: String::new(),
+            launcher: LauncherConfig::default(),
         }
     }
 }
@@ -738,6 +952,9 @@ fn parse(text: &str) -> Result<Config, String> {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut c = serde_json::from_str::<Config>(&strip_comments(t)).map_err(|e| e.to_string())?;
     migrate_bar_size(&mut c);
+    for msg in c.launcher.sanitize() {
+        crate::log!("config error: {msg}");
+    }
     Ok(c)
 }
 
@@ -997,6 +1214,54 @@ fn render(c: &Config) -> String {
   "last_update_check": {last_update_check},
   "update_available": {update_available},
 
+  // Launcher: a search box over the desktop (apps, open windows, settings, commands, calculator).
+  // It stays off until "chord" is set. Unknown or out-of-range values fall back to the default.
+  "launcher": {{
+    // false = the launcher is never started, whatever the chord says.
+    "enabled": {l_enabled},
+    // The key chord that opens it: "off", "alt+space" or "alt+shift+space".
+    "chord": {l_chord},
+    // While PowerToys Command Palette or PowerToys Run runs and "chord" is "alt+space": "yield" lets Alt+Space reach
+    // it as long as it answers (after two presses in a row with no answer the launcher keeps the chord until it exits,
+    // the dock restarts or this value changes); "take" keeps Alt+Space for the launcher (turn its shortcut off in
+    // PowerToys, or it may still open on some presses). With "yield" and "powertoys_done" false, the first Alt+Space
+    // the dock sees after finding it opens the launcher with the PowerToys question instead of reaching it.
+    "with_powertoys": {l_with_powertoys},
+    // Display the box opens on: "pointer", "active" or "primary".
+    "monitor": {l_monitor},
+    // Distance of the box from the top of the display, percent of its height (10-50).
+    "top_percent": {l_top_percent},
+    // Width in px, 560 to 880 in steps of 40.
+    "width": {l_width},
+    // Result rows shown at once (4-12).
+    "rows": {l_rows},
+    // Reserved: animation of the box.
+    "animate": {l_animate},
+    // true = the box reopens with the last text selected.
+    "keep_query": {l_keep_query},
+    // Over a fullscreen window: "pass" (the chord goes through) or "open".
+    "over_fullscreen": {l_over_fullscreen},
+    // true = results you pick often move up.
+    "learn": {l_learn},
+    // Reserved: spoken announcement of the selected row.
+    "announce_selection": {l_announce},
+    // Sources of results: apps (always on), windows, files, settings, calc, commands, run, web, datetime, registry.
+    "providers": {l_providers},
+    // Text that starts a query for one source, 1-5 characters (a word ends with a space), e.g. "= 2+2".
+    "prefixes": {l_prefixes},
+    // Words that open something when typed alone in Mixed mode: "word": "app:<id>", an http(s) address, "ms-settings:...", a path or a command line (at most 64).
+    "aliases": {l_aliases},
+    // More folders for file search, e.g. "D:\\Archive" or a whole drive "E:\\" (at most 8; not Windows, Program Files or other profiles).
+    "file_folders": {l_file_folders},
+    // Web search: "google", "bing", "duckduckgo" or "custom" (then "web_url" is an https:// address with {{q}}).
+    "web_engine": {l_web_engine},
+    "web_url": {l_web_url},
+    // Internal: set once the launcher offer in Start was answered (a chord taken, or Don't show again). Leave as is.
+    "offer_done": {l_offer_done},
+    // Internal: set once that PowerToys question was answered (any choice, or Don't show again). Leave as is.
+    "powertoys_done": {l_powertoys_done}
+  }},
+
   // Internal: set once the notification-access prompt has been shown. Leave as is.
   "notif_prompted": {notif}
 }}
@@ -1045,6 +1310,26 @@ fn render(c: &Config) -> String {
         update_auto_install = c.update_auto_install,
         last_update_check = js(&c.last_update_check),
         update_available = js(&c.update_available),
+        l_enabled = c.launcher.enabled,
+        l_chord = js(&c.launcher.chord),
+        l_with_powertoys = js(&c.launcher.with_powertoys),
+        l_monitor = js(&c.launcher.monitor),
+        l_top_percent = c.launcher.top_percent,
+        l_width = c.launcher.width,
+        l_rows = c.launcher.rows,
+        l_animate = c.launcher.animate,
+        l_keep_query = c.launcher.keep_query,
+        l_over_fullscreen = js(&c.launcher.over_fullscreen),
+        l_learn = c.launcher.learn,
+        l_announce = c.launcher.announce_selection,
+        l_providers = js_block(&c.launcher.providers).replace("\n", "\n  "),
+        l_prefixes = js_block(&c.launcher.prefixes).replace("\n", "\n  "),
+        l_aliases = js_block(&c.launcher.aliases).replace("\n", "\n  "),
+        l_file_folders = js_block(&c.launcher.file_folders).replace("\n", "\n  "),
+        l_web_engine = js(&c.launcher.web_engine),
+        l_web_url = js(&c.launcher.web_url),
+        l_offer_done = c.launcher.offer_done,
+        l_powertoys_done = c.launcher.powertoys_done,
     )
 }
 
@@ -1572,6 +1857,202 @@ mod fixtures;
 #[allow(clippy::items_after_test_module)] // clippy: kept as is; moving the items below the tests is churn in a file other streams own
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_defaults_when_missing() {
+        let c = parse("{}").unwrap();
+        assert_eq!(c.launcher.chord, "off");
+        assert!(!c.launcher.offer_done && c.launcher.enabled);
+        assert!(!c.launcher.powertoys_done && c.launcher.with_powertoys == "yield");
+        assert_eq!(c.launcher.chord_spec(), None);
+        assert_eq!(c.launcher, LauncherConfig::default());
+        let mut d = LauncherConfig::default();
+        assert!(d.sanitize().is_empty(), "the defaults need no fix");
+        assert_eq!(d, LauncherConfig::default());
+        // the template with the defaults reads back as the defaults
+        let r = render(&Config::default());
+        assert_eq!(parse(&r).unwrap().launcher, LauncherConfig::default());
+        // the PowerToys answer (SPEC-launcher 5.7) is kept through the template
+        let mut c = Config::default();
+        c.launcher.with_powertoys = "take".into();
+        c.launcher.powertoys_done = true;
+        assert_eq!(parse(&render(&c)).unwrap().launcher, c.launcher);
+    }
+
+    fn sane(f: impl FnOnce(&mut LauncherConfig)) -> (LauncherConfig, Vec<String>) {
+        let mut l = LauncherConfig::default();
+        f(&mut l);
+        let msgs = l.sanitize();
+        (l, msgs)
+    }
+
+    #[test]
+    fn launcher_sanitize_vectors() {
+        let (l, m) = sane(|l| l.chord = "ctrl+alt+space".into());
+        assert_eq!((l.chord.as_str(), m.len()), ("off", 1));
+        let (l, _) = sane(|l| l.chord = "alt+shift+space".into());
+        assert!(l.chord_spec().is_some());
+        let (l, _) = sane(|l| {
+            l.chord = "alt+space".into();
+            l.enabled = false;
+        });
+        assert_eq!(l.chord_spec(), None);
+        let (l, _) = sane(|l| {
+            l.with_powertoys = "x".into();
+            l.monitor = "x".into();
+            l.over_fullscreen = "x".into();
+        });
+        assert_eq!((&l.with_powertoys[..], &l.monitor[..], &l.over_fullscreen[..]), ("yield", "pointer", "pass"));
+        let (l, _) = sane(|l| {
+            l.top_percent = 3;
+            l.rows = 99;
+            l.width = 1000;
+        });
+        assert_eq!((l.top_percent, l.rows, l.width), (10, 12, 880));
+        let (l, _) = sane(|l| l.width = 100);
+        assert_eq!(l.width, 560);
+        let (l, _) = sane(|l| l.width = 661);
+        assert_eq!(l.width, 680);
+        let (l, _) = sane(|l| l.width = 659);
+        assert_eq!(l.width, 640);
+        let (l, _) = sane(|l| {
+            l.providers.insert("apps".into(), false);
+            l.providers.insert("bogus".into(), true);
+            l.providers.insert("calc".into(), false);
+        });
+        assert_eq!(l.providers.get("apps"), Some(&true));
+        assert_eq!(l.providers.get("calc"), Some(&false));
+        assert!(!l.providers.contains_key("bogus"));
+        let (l, _) = sane(|l| {
+            l.prefixes.clear();
+            for (p, n) in [
+                ("x", "calc"),
+                ("file", "files"),
+                ("f ", "files"),
+                ("toolong", "web"),
+                ("", "web"),
+                ("=", "calc"),
+                ("%", "nope"),
+                (" ", "calc"),
+                ("\t", "calc"),
+                ("\n", "calc"),
+                ("\u{202e}", "calc"),
+                ("a\u{202e} ", "files"),
+            ] {
+                l.prefixes.insert(p.into(), n.into());
+            }
+        });
+        let keys: Vec<&str> = l.prefixes.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["=", "f "]);
+    }
+
+    #[test]
+    fn launcher_web_url_rules() {
+        let (l, _) = sane(|l| {
+            l.web_engine = "custom".into();
+            l.web_url = "https://example.com/?q={q}".into();
+        });
+        assert_eq!(l.web_engine, "custom");
+        for bad in ["https://user:pw@example.com/?q={q}", "http://example.com/?q={q}", "", "javascript:alert(1)"] {
+            let (l, m) = sane(|l| {
+                l.web_engine = "custom".into();
+                l.web_url = bad.into();
+            });
+            assert_eq!((l.web_engine.as_str(), l.web_url.as_str()), ("google", ""), "{bad:?}");
+            assert_eq!(m.len(), 1);
+        }
+        let (l, _) = sane(|l| l.web_engine = "yahoo".into());
+        assert_eq!(l.web_engine, "google");
+    }
+
+    #[test]
+    fn launcher_aliases_kept_as_written() {
+        // What the alias table refuses stays in the file: a custom scheme, a word with a space, a 17-character word.
+        let c = parse(
+            r#"{"launcher": {"aliases": {"game": "steam://run/1", "bad word": "x", "seventeen-chars-x": "calc",
+            "docs": "https://example.com/docs"}}}"#,
+        )
+        .unwrap();
+        let words: Vec<&str> = c.launcher.aliases.keys().map(String::as_str).collect();
+        assert_eq!(words, ["bad word", "docs", "game", "seventeen-chars-x"]);
+        assert_eq!(c.launcher.aliases.get("game").map(String::as_str), Some("steam://run/1"));
+        // Hard caps only: at most 256 entries, a word and a target of at most 1,024 characters each; one message.
+        let (l, m) = sane(|l| {
+            for i in 0..257 {
+                l.aliases.insert(format!("w{i:03}"), "calc".into());
+            }
+            l.aliases.insert("long".into(), "x".repeat(1_025));
+            l.aliases.insert("y".repeat(1_025), "calc".into());
+            l.aliases.insert("edge".into(), "x".repeat(1_024));
+        });
+        assert_eq!(l.aliases.len(), 256);
+        assert!(!l.aliases.contains_key("long") && !l.aliases.keys().any(|k| k.len() > 1_024));
+        let capped: Vec<&String> = m.iter().filter(|s| s.starts_with("launcher.aliases")).collect();
+        assert_eq!(capped, ["launcher.aliases: 4 entries over a cap dropped"], "{m:?}");
+        assert!(m.iter().all(|s| !s.contains("calc") && !s.contains('w')), "no word or target in the log: {m:?}");
+        let (l, m) = sane(|l| {
+            l.aliases.insert("gh".into(), "https://example.com/".into());
+        });
+        assert!(m.is_empty() && l.aliases.len() == 1, "{m:?}");
+    }
+
+    #[test]
+    fn aliases_survive_render() {
+        let mut c = Config::default();
+        assert!(render(&c).contains("\"aliases\": {}"), "written always, {{}} when empty");
+        for (w, t) in [
+            ("docs", "https://example.com/docs"),
+            ("game", "steam://run/1"),
+            ("bad word", "x"),
+            ("win", "C:\\Windows"),
+            ("q", "\"C:\\Program Files\\Example\\tool.exe\" --a \"b c\""),
+            ("u", "ünïcødé → ok"),
+        ] {
+            c.launcher.aliases.insert(w.into(), t.into());
+        }
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c, "every entry, those the table refuses included");
+        assert_eq!(render(&parse(&r).unwrap()), r);
+    }
+
+    #[test]
+    fn file_folders_kept_as_written_and_rendered() {
+        let mut c = Config::default();
+        assert!(render(&c).contains("\"file_folders\": []"), "written always, [] when empty");
+        // What the acceptance rule refuses stays in the file: a drive root, a relative path, Windows' own folder.
+        let c2 = parse(r#"{"launcher": {"file_folders": ["D:\\", "relative", "C:\\Windows", "E:/Archive"]}}"#).unwrap();
+        assert_eq!(c2.launcher.file_folders, ["D:\\", "relative", "C:\\Windows", "E:/Archive"]);
+        c.launcher.file_folders = c2.launcher.file_folders;
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c, "every entry, those the dock refuses included");
+        assert_eq!(render(&parse(&r).unwrap()), r);
+        // The comment's examples are JSON text: copied into the list, each is a folder the dock accepts.
+        let line = r.lines().find(|l| l.contains("More folders for file search")).unwrap();
+        let examples: Vec<String> =
+            line.split('"').skip(1).step_by(2).map(|q| serde_json::from_str(&format!("\"{q}\"")).unwrap()).collect();
+        assert_eq!(examples, ["D:\\Archive", "E:\\"]);
+        let f = crate::launcher::files::Fences {
+            windows: "C:\\Windows".into(),
+            program_files: vec!["C:\\Program Files".into()],
+            profiles: "C:\\Users".into(),
+            profile: "C:\\Users\\a".into(),
+            accounts: vec!["C:\\Users\\a".into()],
+            same: crate::launcher_sys::same_text,
+        };
+        for e in &examples {
+            assert_eq!(crate::launcher::files::root_of(e, &f, true).as_deref(), Some(e.as_str()), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn launcher_section_roundtrips_and_parse_sanitizes() {
+        let c = parse(r#"{"launcher": {"chord": "alt+space", "rows": 20, "prefixes": {"file ": "files"}}}"#).unwrap();
+        assert_eq!(c.launcher.rows, 12);
+        assert_eq!(c.launcher.chord_spec().map(|s| s.vk), Some(0x20));
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(render(&parse(&r).unwrap()), r);
+    }
 
     #[test]
     fn parse_partial_uses_defaults() {

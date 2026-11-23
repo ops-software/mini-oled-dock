@@ -4,7 +4,8 @@
 //! WINDOW: class `DockPopup`, `WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`
 //! (WITHOUT `WS_EX_NOACTIVATE`: it needs focus for Esc and to know when the user clicks outside). Lives on the
 //! UI thread, drawn with `surface::Surface` (no WM_PAINT). Created on first open and
-//! reused (hidden on close).
+//! reused (hidden on close). With `LAUNCHER_UNOWNED` (the S-OWNER fallback) the launcher gets a second window of the
+//! same class with no owner, created on its first open and never destroyed before `shutdown`.
 //!
 //! CLOSING: `WM_ACTIVATE` with `WA_INACTIVE` (click on another window/desktop, Alt+Tab), Esc,
 //! `close()` from the bar (the bar is NOACTIVATE: clicking it does not deactivate the popup, so the UI
@@ -25,10 +26,10 @@
 //! State is ALWAYS taken with `try_borrow_mut` (`with`): an unexpected re-entry is a logged no-op,
 //! never a panic (panic = abort).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{MonitorFromRect, ScreenToClient, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -46,17 +47,32 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+// The launcher's additions (L1a-13), a group of their own.
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowTextW, SC_CLOSE, SC_KEYMENU, WM_CLOSE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+};
+
 // Child module via #[path]: this way main.rs does not need to declare it.
 #[path = "popup_app.rs"]
 pub(crate) mod popup_app;
+#[path = "popup_launcher.rs"]
+pub(crate) mod popup_launcher;
 #[path = "popup_start.rs"]
 pub(crate) mod popup_start;
 #[path = "popup_startmenu.rs"]
 pub(crate) mod popup_startmenu;
 
 use crate::audio::{OutputDevice, VolumeState};
+use crate::launcher::field::KeyEvent;
+use crate::launcher::model::Mods;
 use crate::log;
-use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
+use crate::msg::{
+    TIMER_POPUP_ANIM, TIMER_POPUP_COM_FREE, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_TICK,
+    WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE,
+};
 use crate::render::Metrics;
 use crate::surface::Surface;
 
@@ -93,6 +109,8 @@ pub enum PopupKind {
     StartMenu = 10,
     /// Battery details of the BATTERY module (`popup_battery`).
     Battery = 11,
+    /// The launcher (`popup_launcher`, SPEC-launcher), opened by its chord.
+    Launcher = 12,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -106,6 +124,16 @@ pub struct Anchor {
     pub top: bool,
     /// DPI of the bar's monitor.
     pub dpi: u32,
+}
+
+/// Where a centred popup opens (the launcher, SPEC 5.2.1): the work area (screen px) and DPI of its monitor, and the
+/// top edge as a percentage of the work height. The panel grows downward only.
+#[derive(Clone, Copy, Debug)]
+pub struct Centred {
+    pub work: RECT,
+    pub dpi: u32,
+    /// The top edge sits at `work.top` plus this percentage of the work height.
+    pub top_percent: u8,
 }
 
 /// Data of the app item for the themed context menu (`open_app_menu`).
@@ -159,7 +187,7 @@ pub fn open_app_menu(anchor: Anchor, info: AppMenuInfo) {
             *g = Some(info);
         }
     });
-    open(PopupKind::AppMenu, anchor);
+    open(PopupKind::AppMenu, anchor, None);
 }
 
 /// Key of the app chosen last in the context menu (consumes it). UI thread.
@@ -289,9 +317,37 @@ pub(crate) trait Content {
     fn key(&mut self, _vk: u16) -> Option<Reply> {
         None
     }
-    /// Character typed while the popup has the focus (`WM_CHAR`).
+    /// Character typed while the popup has the focus (`WM_CHAR`; also `WM_SYSCHAR` while `wants_sys_keys`).
     fn char(&mut self, _c: char) -> Reply {
         Reply::None
+    }
+    /// Key pressed while the popup has the focus, for a content that `wants_sys_keys`: `WM_KEYDOWN` and
+    /// `WM_SYSKEYDOWN` with the modifiers held. `None` = not handled: Esc then closes the popup, an unhandled system
+    /// key is swallowed.
+    fn key_ex(&mut self, _ev: KeyEvent) -> Option<Reply> {
+        None
+    }
+    /// true: the window procedure sends the system keys (Alt held) to `key_ex` and `char` and swallows the Alt release
+    /// and the keyboard menu (the launcher only; `route`).
+    fn wants_sys_keys(&self) -> bool {
+        false
+    }
+    /// Alt+F4 (`SC_CLOSE`) or `WM_CLOSE` while `wants_sys_keys`: the content says how it closes.
+    fn close_request(&mut self) -> Reply {
+        Reply::Close
+    }
+    /// `true`: the popup became the foreground window (once per open). `false`: it lost it and is about to close.
+    fn focus(&mut self, _active: bool) -> Reply {
+        Reply::None
+    }
+    /// The pointer moved to `(x, y)` (client px); called before the hit test.
+    fn pointer(&mut self, _x: i32, _y: i32) -> Reply {
+        Reply::None
+    }
+    /// true: the popup closes when the foreground retries end without the keyboard (the launcher: what the user types
+    /// would reach the window behind it).
+    fn focus_lost_closes(&self) -> bool {
+        false
     }
     /// 1 s tick (`TIMER_POPUP_TICK`); also fired early by `popup::tick_soon`.
     fn tick(&mut self) -> Reply {
@@ -305,6 +361,10 @@ pub(crate) trait Content {
     fn closing(&mut self) {}
     /// The popup is already hidden: run the actions to perform AFTER closing here.
     fn after_close(&mut self) {}
+    /// The launcher's content (`with_launcher`); None for every other kind.
+    fn launcher(&mut self) -> Option<&mut popup_launcher::Launcher> {
+        None
+    }
 }
 
 /// Clickable zones of a content (client coordinates, physical px). The last one added wins.
@@ -334,6 +394,8 @@ impl HitMap {
 /// Open popup.
 struct Open {
     kind: PopupKind,
+    /// The window it is shown in (`ensure_window_for`).
+    hwnd: HWND,
     content: Box<dyn Content>,
     /// `None` only while the surface is temporarily out for `present`.
     surf: Option<Surface>,
@@ -355,8 +417,10 @@ struct Open {
     /// true once the popup has been seen as the foreground window.
     was_active: bool,
     wheel_acc: i32,
-    /// Foreground retries still allowed (`TIMER_POPUP_FOCUS`) while the popup is not foreground.
+    /// Foreground retries still allowed (`TIMER_POPUP_FOCUS`) while the popup is not foreground; 0 once none is armed.
     focus_tries: u8,
+    /// Set for a centred popup (the launcher): placed on that work area instead of next to `anchor`.
+    centred: Option<Centred>,
 }
 
 /// Delay between two foreground retries after open.
@@ -365,7 +429,10 @@ const FOCUS_RETRY_MS: u32 = 80;
 const FOCUS_RETRIES: u8 = 6;
 
 struct State {
+    /// The shared popup window.
     hwnd: HWND,
+    /// The launcher's own window (`LAUNCHER_UNOWNED`); null until its first open, and always without the fallback.
+    launcher_hwnd: HWND,
     available: bool,
     registered: bool,
     open: Option<Open>,
@@ -382,6 +449,7 @@ struct State {
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         hwnd: HWND::default(),
+        launcher_hwnd: HWND::default(),
         available: false,
         registered: false,
         open: None,
@@ -434,6 +502,7 @@ pub fn init() -> Result<(), String> {
         st.available = true;
     });
     log!("popup::init: DockPopup class registered");
+    popup_launcher::init();
     Ok(())
 }
 
@@ -474,7 +543,9 @@ pub fn toggle(kind: PopupKind, anchor: Anchor) {
     match plan {
         Plan::Skip => {}
         Plan::Close => close_inner("toggle"),
-        Plan::Open => open(kind, anchor),
+        Plan::Open => {
+            open(kind, anchor, None);
+        }
     }
 }
 
@@ -483,13 +554,47 @@ pub fn close(reason: &str) {
     close_inner(reason);
 }
 
+/// Whether a close the host applies (the bar hides or moves) reaches the open popup: the launcher is exempt (SPEC 5.2.1).
+fn host_close_applies(open: Option<PopupKind>) -> bool {
+    open != Some(PopupKind::Launcher)
+}
+
+/// `close` for the host's own closes (the bar hides or moves): a no-op while the launcher is open.
+pub fn close_unless_launcher(reason: &str) {
+    if host_close_applies(current()) {
+        close_inner(reason);
+    }
+}
+
+/// Opens popup `kind` centred on `c.work` (the launcher), first closing any other popup: the open path of `toggle`
+/// with the placement of `Centred`. false when nothing is shown (no popups, no surface, or the first render failed).
+pub fn open_centred(kind: PopupKind, c: Centred) -> bool {
+    if !is_available() {
+        return false;
+    }
+    open(kind, Anchor { item: c.work, bar: c.work, top: false, dpi: c.dpi }, Some(c))
+}
+
+/// Runs `f` on the open launcher's content and applies its reply (the launcher's controller reaches its open content
+/// through it, never while a content method runs). false when the launcher is not the open popup.
+pub(crate) fn with_launcher(f: impl FnOnce(&mut popup_launcher::Launcher) -> Reply) -> bool {
+    let reply = with(|st| st.open.as_mut().and_then(|o| o.content.launcher()).map(f)).flatten();
+    match reply {
+        Some(r) => {
+            apply(r);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Links the open popup to the bar's show/hide animation (Win with `win_opens_start`): its own fade
 /// stops and `follow_bar` sets its alpha and slide on the bar's frames. false if no popup is open.
 pub fn link_to_bar() -> bool {
     let hwnd = with(|st| {
         let o = st.open.as_mut()?;
         o.linked = true;
-        Some(st.hwnd)
+        Some(o.hwnd)
     })
     .flatten();
     let Some(hwnd) = hwnd else { return false };
@@ -508,8 +613,8 @@ pub fn is_linked() -> bool {
 /// show is over). No-op when nothing is linked.
 pub fn follow_bar(dy: i32, alpha: u8, settled: bool) {
     let prepared = with(|st| {
-        let hwnd = st.hwnd;
         let o = st.open.as_mut()?;
+        let hwnd = o.hwnd;
         if !o.linked {
             return None;
         }
@@ -629,9 +734,11 @@ pub fn on_tray_changed() {
     dispatch(DataEvent::TrayChanged);
 }
 
-/// `ShellEvent::StartApps` reached the UI: stores the catalog and refreshes the Start menu if open.
-pub fn on_start_apps(list: Vec<crate::shell_thread::StartApp>) {
-    popup_startmenu::store_apps(list);
+/// `ShellEvent::StartApps` reached the UI: one listing for both (L3 T17). The launcher keeps the arena (with a chord
+/// set), the Start menu makes its rows of it (when open), and the catalog is refreshed in an open Start menu.
+pub fn on_start_apps(apps: std::sync::Arc<crate::launcher::arena::Arena>) {
+    popup_startmenu::store_apps(&apps);
+    popup_launcher::on_catalog(apps);
     if current() == Some(PopupKind::StartMenu) {
         dispatch(DataEvent::StartMenuChanged);
     }
@@ -647,6 +754,7 @@ pub fn on_start_icons(icon_px: u32, icons: Vec<(String, Option<crate::icons::Ico
 /// `ShellEvent::StartSettings` reached the UI: the settings catalog is ready, so an open Start menu
 /// searches again (what was typed may match a setting).
 pub fn on_start_settings() {
+    popup_launcher::on_settings_ready();
     if current() == Some(PopupKind::StartMenu) {
         dispatch(DataEvent::StartMenuChanged);
     }
@@ -656,20 +764,29 @@ pub fn on_start_settings() {
 /// `ui::shutdown`. Idempotent.
 pub fn shutdown() {
     close_inner("shutdown");
-    if let Some(h) = with(|st| st.hwnd).filter(|h| !h.0.is_null()) {
+    popup_launcher::shutdown();
+    for h in with(|st| [st.hwnd, st.launcher_hwnd]).unwrap_or_default().into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: our window.
         let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_START_RELEASE) };
+        let _ = unsafe { KillTimer(Some(h), TIMER_POPUP_COM_FREE) };
     }
-    let Some((hwnd, registered)) = with(|st| {
-        let r = (st.hwnd, st.registered);
+    if let Some(h) = crate::launcher_sys::timer_window() {
+        for id in LAUNCHER_TIMERS {
+            // SAFETY: the dock window (same thread), still alive here; an id that is not armed fails harmlessly.
+            let _ = unsafe { KillTimer(Some(h), id) };
+        }
+    }
+    let Some((windows, registered)) = with(|st| {
+        let r = ([st.hwnd, st.launcher_hwnd], st.registered);
         st.hwnd = HWND::default();
+        st.launcher_hwnd = HWND::default();
         st.registered = false;
         st.available = false;
         r
     }) else {
         return;
     };
-    if !hwnd.0.is_null() {
+    for hwnd in windows.into_iter().filter(|h| !h.0.is_null()) {
         // SAFETY: window created by this module on the UI thread.
         if let Err(e) = unsafe { DestroyWindow(hwnd) } {
             log!("popup: DestroyWindow failed: {e}");
@@ -722,16 +839,21 @@ fn install_mouse_hook() {
 
 /// Removes the outside-click hook for the duration of a long blocking call on the UI thread (a stalled
 /// low-level hook freezes the system mouse and is dropped by Windows after `LowLevelHooksTimeout`).
-/// Returns true if it was installed; pass that to `resume_mouse_hook` afterwards.
+/// Returns true if it was installed; pass that to `resume_mouse_hook` afterwards. On any other thread it does nothing
+/// and returns false: the UI thread installed the hook and serves it, and `resume_mouse_hook` installs it on the
+/// calling thread.
 pub fn suspend_mouse_hook() -> bool {
+    if !crate::on_ui_thread() {
+        return false;
+    }
     let was = MOUSE_HOOK.load(Ordering::Relaxed) != 0;
     remove_mouse_hook();
     was
 }
 
-/// Reinstalls the hook removed by `suspend_mouse_hook`, if a popup is still open.
+/// Reinstalls the hook removed by `suspend_mouse_hook`, if a popup is still open (never for the launcher).
 pub fn resume_mouse_hook(was: bool) {
-    if was && is_open() {
+    if was && is_open() && current() != Some(PopupKind::Launcher) {
         install_mouse_hook();
     }
 }
@@ -755,7 +877,8 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
             let pt = unsafe { (*(lp.0 as *const MSLLHOOKSTRUCT)).pt };
             if !in_rect(&POPUP_RECT, pt) && !in_rect(&ITEM_RECT, pt) {
                 // try_borrow: if the state is busy the hwnd read is skipped (the tick safety net remains).
-                let hwnd = STATE.with(|s| s.try_borrow().map(|g| g.hwnd).unwrap_or_default());
+                let hwnd = STATE
+                    .with(|s| s.try_borrow().map(|g| g.open.as_ref().map_or(g.hwnd, |o| o.hwnd)).unwrap_or_default());
                 if !hwnd.0.is_null() {
                     // SAFETY: posting to our own window; failure is harmless.
                     let _ = unsafe { PostMessageW(Some(hwnd), WM_POPUP_OUTSIDE, WPARAM(0), LPARAM(0)) };
@@ -787,15 +910,62 @@ fn make_content(
         PopupKind::Battery => crate::popup_battery::new(battery, crate::battery::power_mode()),
         PopupKind::Start => popup_start::new(),
         PopupKind::StartMenu => popup_startmenu::new(),
+        PopupKind::Launcher => popup_launcher::new(),
     }
 }
 
-/// Popup window, created on first request and reused.
-fn ensure_window() -> Option<HWND> {
-    let existing = with(|st| st.hwnd)?;
+/// Name of the popup window while `kind` is shown: screen readers get the launcher's static name (SPEC 5.6), every
+/// other kind keeps the shared window's name.
+fn window_name_for(kind: PopupKind) -> &'static str {
+    match kind {
+        PopupKind::Launcher => crate::launcher::strings::window_name(),
+        _ => "Dock popup",
+    }
+}
+
+/// S-OWNER (L0 owner session): false = the launcher shows in the shared popup window, owned by the dock window (the
+/// default until S-OWNER is recorded); true = the launcher gets its own unowned window, the fallback for an owned window
+/// that does not show or take the keyboard while its owner, the bar, is hidden.
+const LAUNCHER_UNOWNED: bool = false;
+
+/// The window a popup kind is shown in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    /// The shared popup window (`State::hwnd`), owned by the dock window.
+    Shared,
+    /// The launcher's own window (`State::launcher_hwnd`), with no owner.
+    Launcher,
+}
+
+/// `unowned_launcher` is `LAUNCHER_UNOWNED`.
+fn window_for_kind(kind: PopupKind, unowned_launcher: bool) -> Slot {
+    if kind == PopupKind::Launcher && unowned_launcher {
+        Slot::Launcher
+    } else {
+        Slot::Shared
+    }
+}
+
+/// true while `kind` is shown in the shared window under the launcher's name (renamed at open, named back at close).
+fn renames_shared_window(kind: PopupKind) -> bool {
+    kind == PopupKind::Launcher && window_for_kind(kind, LAUNCHER_UNOWNED) == Slot::Shared
+}
+
+/// The window of popup `kind`, created on first request and reused.
+fn ensure_window_for(kind: PopupKind) -> Option<HWND> {
+    let slot = window_for_kind(kind, LAUNCHER_UNOWNED);
+    let existing = with(|st| match slot {
+        Slot::Shared => st.hwnd,
+        Slot::Launcher => st.launcher_hwnd,
+    })?;
     // SAFETY: IsWindow accepts any handle, even null.
     if !existing.0.is_null() && unsafe { IsWindow(Some(existing)) }.as_bool() {
         return Some(existing);
+    }
+    // It existed and was destroyed (Alt+F4 on a kind that does not take the system keys reaches DefWindowProc): the
+    // timers armed on it are gone. Logged only with the launcher on, so the log without a chord stays 1.4.3's.
+    if !existing.0.is_null() && popup_launcher::is_on() {
+        log!("popup: {slot:?} window was destroyed, recreated (its timers are gone)");
     }
     // SAFETY: no preconditions.
     let module = match unsafe { GetModuleHandleW(PCWSTR::null()) } {
@@ -806,14 +976,17 @@ fn ensure_window() -> Option<HWND> {
         }
     };
     let owner = crate::hwnd();
-    let owner = if owner.0.is_null() { None } else { Some(owner) };
-    // SAFETY: class registered by `init`; the PCWSTRs are static literals; the owner is the dock
-    // window (same thread) or none.
+    let owner = if owner.0.is_null() || slot == Slot::Launcher { None } else { Some(owner) };
+    // The launcher's own window keeps its name for good.
+    let launcher_name = (slot == Slot::Launcher).then(|| HSTRING::from(window_name_for(PopupKind::Launcher)));
+    let name = launcher_name.as_ref().map_or(w!("Dock popup"), |n| PCWSTR(n.as_ptr()));
+    // SAFETY: class registered by `init`; the names are a static literal or `launcher_name`, alive for the call; the
+    // owner is the dock window (same thread) or none.
     let r = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             CLASS_NAME,
-            w!("Dock popup"),
+            name,
             WS_POPUP,
             0,
             0,
@@ -825,15 +998,24 @@ fn ensure_window() -> Option<HWND> {
             None,
         )
     };
-    match r {
-        Ok(h) => {
+    match (r, slot) {
+        (Ok(h), Slot::Shared) => {
             with(|st| st.hwnd = h);
             POPUP_HWND.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
             Some(h)
         }
-        Err(e) => {
+        (Ok(h), Slot::Launcher) => {
+            with(|st| st.launcher_hwnd = h);
+            Some(h)
+        }
+        (Err(e), Slot::Shared) => {
             log!("popup: CreateWindowExW failed: {e}");
             with(|st| st.available = false);
+            None
+        }
+        // Only the launcher fails to open; the other popups keep their window.
+        (Err(e), Slot::Launcher) => {
+            log!("popup: CreateWindowExW (launcher) failed: {e}");
             None
         }
     }
@@ -872,27 +1054,57 @@ pub(crate) fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
     (x, y)
 }
 
-fn open(kind: PopupKind, anchor: Anchor) {
+/// The top edge of a centred popup: `top_percent` of the work height below the work-area top.
+fn centred_top(c: &Centred) -> i32 {
+    c.work.top + (c.work.bottom - c.work.top) * i32::from(c.top_percent.min(100)) / 100
+}
+
+/// Largest size of a centred popup: the work width minus `margin` on each side, and from its top edge down to
+/// `margin` above the work-area bottom (it never moves up to make room).
+fn centred_max(c: &Centred, margin: i32) -> (i32, i32) {
+    ((c.work.right - c.work.left - 2 * margin).max(1), (c.work.bottom - margin - centred_top(c)).max(1))
+}
+
+/// Position and size `(x, y, w, h)` of a centred popup that wants `w` x `h`: capped by `centred_max`,
+/// horizontally centred on the work area, its top edge at `centred_top`.
+fn centred_place(c: &Centred, margin: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let (mw, mh) = centred_max(c, margin);
+    let (w, h) = (w.min(mw).max(1), h.min(mh).max(1));
+    (c.work.left + (c.work.right - c.work.left - w) / 2, centred_top(c), w, h)
+}
+
+/// Alpha a popup opens at: the launcher shows at once (its field takes the typing), every other kind fades in.
+fn initial_alpha(kind: PopupKind) -> u8 {
+    if kind == PopupKind::Launcher {
+        255
+    } else {
+        0
+    }
+}
+
+/// Opens `kind` (see `toggle` and `open_centred`); false when nothing is shown.
+fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     // Any other popup closes without a fade; so does the window picker.
     close_inner("popup switch");
     crate::picker::close("popup opened");
-    let Some(hwnd) = ensure_window() else { return };
+    let Some(hwnd) = ensure_window_for(kind) else { return false };
     if kind == PopupKind::StartMenu {
         // SAFETY: our window; fails harmlessly if the timer is not armed.
         let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
+        let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_COM_FREE) };
     }
     let metrics = Metrics { dpi: anchor.dpi.max(96) };
     let surf = match Surface::new(metrics) {
         Ok(s) => s,
         Err(e) => {
             log!("popup: Surface::new failed: {e}");
-            return;
+            return false;
         }
     };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     let Some((volume, net, battery)) = with(|st| (st.last_volume, st.last_net.clone(), st.last_battery)) else {
-        return;
+        return false;
     };
     let content = make_content(kind, volume, net, battery);
     debug_assert_eq!(content.kind(), kind);
@@ -900,6 +1112,7 @@ fn open(kind: PopupKind, anchor: Anchor) {
         st.last_inactive = None;
         st.open = Some(Open {
             kind,
+            hwnd,
             content,
             surf: Some(surf),
             anchor,
@@ -908,39 +1121,68 @@ fn open(kind: PopupKind, anchor: Anchor) {
             pressed: None,
             tracking: false,
             fade_start: now_ms(),
-            alpha: 0,
+            alpha: initial_alpha(kind),
             linked: false,
             dy: 0,
             fg_at_open: fg,
             was_active: false,
             wheel_acc: 0,
             focus_tries: FOCUS_RETRIES,
+            centred,
         });
     });
     if installed.is_none() {
-        return;
+        return false;
     }
+    // `current_hwnd` and `tick_soon` reach the open popup's window.
+    POPUP_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::render_start(kind == PopupKind::Launcher);
     if !render(true) {
         close_inner("initial render failed");
-        return;
+        return false;
     }
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::presented(kind == PopupKind::Launcher);
     log!("popup: opening {kind:?}");
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
     // SHOWNA: activated only by `force_foreground`. Active before its AttachThreadInput, the popup would get
     // WA_INACTIVE from the merged input queues and close at once (first click lost when another app was in front).
+    if renames_shared_window(kind) {
+        // SAFETY: `hwnd` is our popup window (same thread); no state borrow is held.
+        if let Err(e) = unsafe { SetWindowTextW(hwnd, &HSTRING::from(window_name_for(kind))) } {
+            log!("popup: SetWindowTextW failed: {e}");
+        }
+    }
     // SAFETY: `hwnd` is our popup window.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
     store_rect(&ITEM_RECT, &anchor.item);
-    install_mouse_hook();
-    let focused = crate::ui::force_foreground(hwnd);
+    // The launcher installs no mouse hook (SPEC 5.2.10): a busy UI thread would stall the system mouse. It closes on
+    // focus loss alone.
+    if kind != PopupKind::Launcher {
+        install_mouse_hook();
+    }
+    let outcome = retry_outcome(FOCUS_RETRIES, crate::ui::force_foreground(hwnd), false);
+    if outcome == Retry::Focused {
+        #[cfg(feature = "owner-probe")]
+        crate::launcher_probe::won_foreground(hwnd);
+        // A no-op when WM_ACTIVATE already saw the popup in front (`was_active`).
+        became_foreground();
+    }
+    // A close during the activation (the content's `focus` runs from WM_ACTIVATE inside SetForegroundWindow, or from the
+    // won attempt's `became_foreground` just above) leaves no popup to arm timers for: the tick would re-arm itself on a
+    // closed popup.
+    if with(|st| st.open.as_ref().map(|o| o.hwnd)).flatten() != Some(hwnd) {
+        return true;
+    }
+    // The foreground can be refused (lock, elevated app in front, a transient null foreground):
+    // visible but without the keyboard, the Start menu search box would not receive typing.
+    if outcome == Retry::Again {
+        arm_retry(hwnd);
+    }
     // SAFETY: `hwnd` is our window; the callbacks are in its wnd_proc.
     unsafe {
-        // The foreground can be refused (lock, elevated app in front, a transient null foreground):
-        // visible but without the keyboard, the Start menu search box would not receive typing.
-        if !focused && SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) == 0 {
-            log!("popup: SetTimer(focus) failed");
-        }
-        if SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
+        if initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
             log!("popup: SetTimer(anim) failed");
         }
         if SetTimer(Some(hwnd), TIMER_POPUP_TICK, 1000, None) == 0 {
@@ -952,6 +1194,7 @@ fn open(kind: PopupKind, anchor: Anchor) {
             o.fade_start = now_ms();
         }
     });
+    true
 }
 
 /// Closes the open popup. Idempotent.
@@ -967,9 +1210,11 @@ pub fn closed_within(ms: u64) -> bool {
 }
 
 fn close_inner(reason: &str) {
-    let Some((taken, hwnd)) = with(|st| (st.open.take(), st.hwnd)) else { return };
+    let Some(taken) = with(|st| st.open.take()) else { return };
     let Some(mut o) = taken else { return };
+    let hwnd = o.hwnd;
     log!("popup: closing {:?} ({reason})", o.kind);
+    HIGH.with(|h| h.set(0));
     // SAFETY: GetTickCount64 has no preconditions.
     let tick = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
     LAST_CLOSE_MS.store(tick, std::sync::atomic::Ordering::Relaxed);
@@ -988,6 +1233,11 @@ fn close_inner(reason: &str) {
     if !hwnd.0.is_null() {
         // SAFETY: `hwnd` is our window; the state is not borrowed.
         let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        if renames_shared_window(o.kind) {
+            // The shared window gets its own name back once hidden.
+            // SAFETY: `hwnd` is our window; the state is not borrowed.
+            let _ = unsafe { SetWindowTextW(hwnd, w!("Dock popup")) };
+        }
     }
     o.content.after_close();
     let kind = o.kind;
@@ -1004,15 +1254,27 @@ fn close_inner(reason: &str) {
 fn render(relayout: bool) -> bool {
     // The surface leaves the state for the whole of `present`: no borrow during UpdateLayeredWindow.
     let prepared = with(|st| {
-        let hwnd = st.hwnd;
         let o = st.open.as_mut()?;
+        let hwnd = o.hwnd;
         let mut surf = o.surf.take()?;
         // A previous failed resize leaves the surface without a DIB (0 x 0): retry the layout.
         if relayout || surf.size() == (0, 0) {
-            o.content.limit(max_size(&o.anchor));
-            let (w, h) = o.content.size(&surf);
-            let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
-            let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
+            let (w, h, centred_at) = match o.centred {
+                Some(c) => {
+                    let margin = Metrics { dpi: c.dpi }.px(POPUP_SCREEN_MARGIN);
+                    o.content.limit(centred_max(&c, margin));
+                    let (w, h) = o.content.size(&surf);
+                    let (x, y, w, h) = centred_place(&c, margin, w, h);
+                    (w, h, Some((x, y)))
+                }
+                None => {
+                    o.content.limit(max_size(&o.anchor));
+                    let (w, h) = o.content.size(&surf);
+                    let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
+                    let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
+                    (w, h, None)
+                }
+            };
             if let Err(e) = surf.resize(w.max(1), h.max(1)) {
                 log!("popup: resize failed: {e}");
                 // The surface goes back into the state: the next render retries instead of staying
@@ -1020,7 +1282,7 @@ fn render(relayout: bool) -> bool {
                 o.surf = Some(surf);
                 return None;
             }
-            o.pos = compute_pos(&o.anchor, w.max(1), h.max(1));
+            o.pos = centred_at.unwrap_or_else(|| compute_pos(&o.anchor, w.max(1), h.max(1)));
         }
         o.content.paint(&mut surf, o.hot, o.pressed);
         Some((hwnd, surf, o.pos, o.alpha, o.dy))
@@ -1069,7 +1331,163 @@ fn hi_i16(v: isize) -> i32 {
     ((v >> 16) & 0xFFFF) as u16 as i16 as i32
 }
 
+/// What the window procedure does with a keyboard or close message while the open content `wants_sys_keys`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// A key down for the content's `key_ex`.
+    ToContent,
+    /// A system character for the content's `char`.
+    Char,
+    /// Swallowed: answered 0, never DefWindowProc (no menu mode, no beep).
+    Consume,
+    /// The content's `close_request`; answered 0, so the shared window is never destroyed.
+    CloseRequest,
+    /// The usual arm, as for every other kind.
+    Default,
+}
+
+/// How `msg` is handled: the one list of the routed messages (lint 12). `wants_sys` reads the open content's
+/// `wants_sys_keys`, asked only for a listed message (every other one costs no state borrow); false gives `Default`.
+fn route(msg: u32, wp: usize, wants_sys: impl FnOnce() -> bool) -> Route {
+    let r = match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN => Route::ToContent,
+        WM_SYSCHAR => Route::Char,
+        WM_SYSKEYUP if wp == usize::from(VK_MENU.0) => Route::Consume,
+        // The low four bits of an SC_ code are the system's own.
+        WM_SYSCOMMAND => match (wp & 0xFFF0) as u32 {
+            SC_KEYMENU => Route::Consume,
+            SC_CLOSE => Route::CloseRequest,
+            _ => Route::Default,
+        },
+        WM_CLOSE => Route::CloseRequest,
+        _ => Route::Default,
+    };
+    if r != Route::Default && wants_sys() {
+        r
+    } else {
+        Route::Default
+    }
+}
+
+/// The modifiers of a key event.
+fn mods_of(ctrl: bool, shift: bool, alt: bool, win: bool) -> Mods {
+    let mut m = Mods::NONE;
+    for (down, bit) in [(ctrl, Mods::CTRL), (shift, Mods::SHIFT), (alt, Mods::ALT), (win, Mods::WIN)] {
+        if down {
+            m = m.with(bit);
+        }
+    }
+    m
+}
+
+/// The modifiers held when the key message being handled was posted.
+fn held_mods() -> Mods {
+    // SAFETY: GetKeyState has no preconditions.
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+    mods_of(down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU), down(VK_LWIN) || down(VK_RWIN))
+}
+
+/// The `KeyEvent` of a `WM_KEYDOWN` or `WM_SYSKEYDOWN`: lParam bit 30 is the auto-repeat.
+fn key_event(msg: u32, wp: usize, lp: isize, mods: Mods) -> KeyEvent {
+    KeyEvent { vk: wp as u16, mods, repeat: lp & (1 << 30) != 0, sys: msg == WM_SYSKEYDOWN }
+}
+
+thread_local! {
+    /// The high surrogate of a character outside the BMP, held until its low half arrives (0 = none).
+    static HIGH: Cell<u16> = const { Cell::new(0) };
+}
+
+/// One UTF-16 unit of a `WM_CHAR` or `WM_SYSCHAR`: a high surrogate is held in `held` until the low one completes
+/// the character; a lone surrogate is dropped.
+fn utf16_char(held: &mut u16, unit: u32) -> Option<char> {
+    let high = std::mem::take(held);
+    match unit {
+        0xD800..=0xDBFF => {
+            *held = unit as u16;
+            None
+        }
+        0xDC00..=0xDFFF if high != 0 => char::decode_utf16([high, unit as u16]).next()?.ok(),
+        _ => char::from_u32(unit),
+    }
+}
+
+/// A `WM_CHAR` (or routed `WM_SYSCHAR`) for the open content.
+fn on_char_unit(unit: u32) {
+    #[cfg(feature = "owner-probe")]
+    let work = crate::launcher_probe::work_start();
+    let c = HIGH.with(|h| {
+        let mut held = h.get();
+        let c = utf16_char(&mut held, unit);
+        h.set(held);
+        c
+    });
+    let Some(c) = c else { return };
+    let reply = with(|st| st.open.as_mut().map(|o| o.content.char(c))).flatten();
+    if let Some(r) = reply {
+        apply(r);
+    }
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::work_end(work);
+}
+
+/// true if the open content takes the system keys. A busy state (re-entry) reads as false: the usual arms.
+fn open_wants_sys_keys() -> bool {
+    STATE
+        .with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.content.wants_sys_keys())))
+        .unwrap_or(false)
+}
+
+/// The keyboard and close messages while the open content `wants_sys_keys` (`route`); None = the usual arm.
+fn sys_key_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    match route(msg, wp.0, open_wants_sys_keys) {
+        Route::Default => None,
+        Route::ToContent => {
+            #[cfg(feature = "owner-probe")]
+            let work = crate::launcher_probe::work_start();
+            let r = on_key_ex(hwnd, msg, wp, lp);
+            #[cfg(feature = "owner-probe")]
+            crate::launcher_probe::work_end(work);
+            Some(r)
+        }
+        Route::Char => {
+            on_char_unit(wp.0 as u32);
+            Some(LRESULT(0))
+        }
+        Route::Consume => Some(LRESULT(0)),
+        Route::CloseRequest => {
+            let reply = with(|st| st.open.as_mut().map(|o| o.content.close_request())).flatten();
+            if let Some(r) = reply {
+                apply(r);
+            }
+            Some(LRESULT(0))
+        }
+    }
+}
+
+/// A key down for `key_ex`, with the modifiers read once.
+fn on_key_ex(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let ev = key_event(msg, wp.0, lp.0, held_mods());
+    let handled = with(|st| st.open.as_mut().and_then(|o| o.content.key_ex(ev))).flatten();
+    if let Some(reply) = handled {
+        apply(reply);
+        return LRESULT(0);
+    }
+    if msg == WM_SYSKEYDOWN {
+        // Never DefWindowProc: no menu mode, no beep, no SC_CLOSE of its own.
+        return LRESULT(0);
+    }
+    if wp.0 == VK_ESCAPE.0 as usize {
+        close_inner("Esc");
+        return LRESULT(0);
+    }
+    // SAFETY: forwarding to the default handler with the same arguments.
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(r) = sys_key_msg(hwnd, msg, wp, lp) {
+        return r;
+    }
     match msg {
         WM_ACTIVATE => {
             if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE {
@@ -1098,13 +1516,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_CHAR => {
-            // Characters outside the BMP arrive as two surrogates: not searchable, ignored.
-            if let Some(c) = char::from_u32(wp.0 as u32) {
-                let reply = with(|st| st.open.as_mut().map(|o| o.content.char(c))).flatten();
-                if let Some(r) = reply {
-                    apply(r);
-                }
-            }
+            // Characters outside the BMP arrive as two surrogates: combined by `utf16_char`.
+            on_char_unit(wp.0 as u32);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1143,12 +1556,14 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_TIMER => {
-            match wp.0 {
-                TIMER_POPUP_ANIM => on_anim(hwnd),
-                TIMER_POPUP_TICK => on_tick(hwnd),
-                TIMER_POPUP_FOCUS => on_focus_retry(hwnd),
-                TIMER_POPUP_START_RELEASE => on_start_release(hwnd),
-                _ => {}
+            match (timer_owner(wp.0), wp.0) {
+                (TimerOwner::Launcher, id) => popup_launcher::on_timer(hwnd, id),
+                (TimerOwner::Host, TIMER_POPUP_ANIM) => on_anim(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_TICK) => on_tick(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_FOCUS) => on_focus_retry(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_START_RELEASE) => on_start_release(hwnd),
+                (TimerOwner::Host, TIMER_POPUP_COM_FREE) => on_com_free(hwnd),
+                (TimerOwner::Host, _) => {}
             }
             LRESULT(0)
         }
@@ -1169,12 +1584,27 @@ fn mark_active(hwnd: HWND) {
     let _ = unsafe { SetFocus(Some(hwnd)) };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
+    // Variant 1 of `ui::force_foreground` on the synthetic-F15 path: active in the dock's thread, another window in front.
+    #[cfg(feature = "owner-probe")]
+    crate::launcher_probe::activated(fg == hwnd);
     if fg == hwnd {
-        with(|st| {
-            if let Some(o) = st.open.as_mut() {
-                o.was_active = true;
-            }
-        });
+        became_foreground();
+    }
+}
+
+/// The open popup is seen as the foreground window: the first time per open the content hears `focus(true)`.
+fn became_foreground() {
+    let reply = with(|st| {
+        let o = st.open.as_mut()?;
+        if o.was_active {
+            return None;
+        }
+        o.was_active = true;
+        Some(o.content.focus(true))
+    })
+    .flatten();
+    if let Some(r) = reply {
+        apply(r);
     }
 }
 
@@ -1186,7 +1616,13 @@ fn on_inactive(other: HWND) {
             log!("popup: focus lost to the fullscreen app's bounce: staying open");
             return;
         }
-        with(|st| st.last_inactive = Some((k, now_ms())));
+        with(|st| {
+            st.last_inactive = Some((k, now_ms()));
+            if let Some(o) = st.open.as_mut() {
+                // The popup closes right below: the reply has nothing left to change.
+                let _ = o.content.focus(false);
+            }
+        });
         close_inner("focus lost");
     }
 }
@@ -1194,10 +1630,10 @@ fn on_inactive(other: HWND) {
 fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
     let r = with(|st| {
         let o = st.open.as_mut()?;
+        let mut reply = o.content.pointer(x, y);
         let hit = o.content.hit(x, y);
-        let mut reply = Reply::None;
         if let Some(id) = o.pressed {
-            reply = o.content.drag(id, x, y);
+            reply = reply.merge(o.content.drag(id, x, y));
             let nh = if hit == Some(id) { hit } else { None };
             if nh != o.hot {
                 o.hot = nh;
@@ -1205,7 +1641,7 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
             }
         } else if hit != o.hot {
             o.hot = hit;
-            reply = Reply::Redraw;
+            reply = reply.merge(Reply::Redraw);
         }
         let need = !o.tracking;
         o.tracking = true;
@@ -1375,6 +1811,48 @@ fn on_anim(hwnd: HWND) {
 /// The popup window (0 = none), readable while the state is borrowed.
 static POPUP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// The launcher's one-shot timers (msg.rs 34-39 without 37, unused since L3 T19, and 38, unused since plan L2 D2), armed
+/// on the dock window (`launcher_sys::timer_window`), which hands them over through `on_launcher_timer`. None is armed on
+/// a popup window: the shared one can be destroyed.
+const LAUNCHER_TIMERS: [usize; 4] = [
+    crate::msg::TIMER_LAUNCHER_SHRINK,
+    crate::msg::TIMER_LAUNCHER_WARM,
+    crate::msg::TIMER_LAUNCHER_SAVE,
+    crate::msg::TIMER_LAUNCHER_PT,
+];
+
+/// Who handles a `WM_TIMER` of the popup window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerOwner {
+    /// This module (fade, tick, focus retries, Start release); an unknown id is ignored here.
+    Host,
+    /// `popup_launcher::on_timer`.
+    Launcher,
+}
+
+fn timer_owner(id: usize) -> TimerOwner {
+    if LAUNCHER_TIMERS.contains(&id) {
+        TimerOwner::Launcher
+    } else {
+        TimerOwner::Host
+    }
+}
+
+/// A `WM_TIMER` of the dock window that `ui::on_timer` does not know: true when it was one of the launcher's one-shots,
+/// now handled.
+pub(crate) fn on_launcher_timer(h: HWND, id: usize) -> bool {
+    let ours = timer_owner(id) == TimerOwner::Launcher;
+    if ours {
+        popup_launcher::on_timer(h, id);
+    }
+    ours
+}
+
+/// The launcher's popup window, created if needed (`launcher_sys::chord_is_free` registers its probe on it).
+pub(crate) fn popup_hwnd() -> Option<HWND> {
+    ensure_window_for(PopupKind::Launcher)
+}
+
 /// Fires the content's `tick` once after about `ms` (re-arms the 1 s tick timer, which `close_inner`
 /// kills, so nothing outlives the popup). Only meaningful while a popup is open.
 pub(crate) fn tick_soon(ms: u32) {
@@ -1389,6 +1867,10 @@ pub(crate) fn tick_soon(ms: u32) {
 
 /// Delay after a Start menu close before its catalog and icons are released (`TIMER_POPUP_START_RELEASE`).
 const START_RELEASE_MS: u32 = 60_000;
+
+/// Delay after the Start data release before the trim is re-armed for COM's second `CoFreeUnusedLibraries` call: more
+/// than COM's 10 minute default delay for free-threaded DLLs (`TIMER_POPUP_COM_FREE`).
+const COM_FREE_MS: u32 = 660_000;
 
 /// Whether the release timer may free the Start data: not while a Start menu is open.
 fn start_release_due(open: Option<PopupKind>) -> bool {
@@ -1413,44 +1895,127 @@ fn on_start_release(hwnd: HWND) {
     let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_START_RELEASE) };
     if start_release_due(current()) {
         popup_startmenu::release();
+        // The shell thread's COM libraries are freed with the release; the catalog and icons freed here are trimmed in
+        // the next hidden period (M1 F3), and the free-threaded ones are unloaded by a second pass 11 minutes on (F4).
+        crate::mem::rearm();
+        // SAFETY: our window; the callback is in its wnd_proc.
+        if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_COM_FREE, COM_FREE_MS, None) } == 0 {
+            log!("popup: SetTimer(com free) failed");
+        }
+        // With the launcher on its release also trims at once while the bar is hidden.
+        if popup_launcher::is_on() {
+            crate::mem::released_data();
+        }
+    }
+}
+
+/// `TIMER_POPUP_COM_FREE`: one-shot; the idle trim runs again, and its MTA pass unloads what the first one marked.
+fn on_com_free(hwnd: HWND) {
+    // SAFETY: timer of our window.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_COM_FREE) };
+    crate::mem::rearm();
+}
+
+/// What follows a foreground attempt of `on_focus_retry`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    /// Try again after `FOCUS_RETRY_MS`.
+    Again,
+    /// No more tries; the popup stays (the tick safety net remains).
+    Stop,
+    /// No more tries and the content closes without the keyboard (`focus_lost_closes`).
+    Close,
+    /// The attempt left the popup in front: the content hears `focus(true)` now. `force_foreground` can win with no
+    /// WM_ACTIVATE that sees the popup in front (variant 1 activates it in the dock's thread while another window keeps
+    /// the foreground, variant 2 then wins without a new activation), and nothing else would tell the content before
+    /// the 1 s tick.
+    Focused,
+}
+
+/// The outcome of a foreground attempt: `tries_left` after it, `focused` its result. A won attempt is `Focused`
+/// whatever is left: the caller tells the content at once (B1: the type-ahead window is 500 ms, the tick 1 s).
+fn retry_outcome(tries_left: u8, focused: bool, focus_lost_closes: bool) -> Retry {
+    if focused {
+        Retry::Focused
+    } else if tries_left > 0 {
+        Retry::Again
+    } else if focus_lost_closes {
+        Retry::Close
+    } else {
+        Retry::Stop
     }
 }
 
 /// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
 /// the foreground is still the window that was in front at open time (or null, or ours): if the
-/// user has meanwhile moved to another window, the popup is not pushed in front of it (the tick
-/// safety net closes it).
+/// user has meanwhile moved to another window, the popup is not pushed in front of it, and a content
+/// that `focus_lost_closes` closes then, or when the last try fails (`retry_gate`).
 fn on_focus_retry(hwnd: HWND) {
     // SAFETY: timer of our window.
     let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_FOCUS) };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
+    if fg == hwnd {
+        became_foreground();
+        return;
+    }
     let go = with(|st| {
         let o = st.open.as_mut()?;
-        if fg == hwnd {
-            o.was_active = true;
-            return None;
+        let kept =
+            fg.0.is_null() || fg == o.fg_at_open || crate::ui::is_own_window(fg) || crate::ui::fs_bounce_grace(fg);
+        let closes = o.content.focus_lost_closes();
+        let gate = retry_gate(o.focus_tries, kept, closes);
+        if gate.is_none() {
+            o.focus_tries -= 1;
         }
-        if o.focus_tries == 0 {
-            return None;
-        }
-        let own = crate::ui::is_own_window(fg);
-        if !(fg.0.is_null() || fg == o.fg_at_open || own || crate::ui::fs_bounce_grace(fg)) {
-            return None;
-        }
-        o.focus_tries -= 1;
-        Some((o.focus_tries, ()))
+        Some((gate, o.focus_tries, closes))
     })
     .flatten();
-    let Some((left, _)) = go else { return };
-    let ok = crate::ui::force_foreground(hwnd);
-    log!("popup: foreground retry ({left} left) -> {ok}");
-    if !ok && left > 0 {
-        // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
-        if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
-            log!("popup: SetTimer(focus) failed");
-        }
+    let Some((gate, left, closes)) = go else { return };
+    let outcome = gate.unwrap_or_else(|| {
+        let ok = crate::ui::force_foreground(hwnd);
+        log!("popup: foreground retry ({left} left) -> {ok}");
+        retry_outcome(left, ok, closes)
+    });
+    match outcome {
+        Retry::Again => arm_retry(hwnd),
+        Retry::Focused => became_foreground(),
+        Retry::Stop => {}
+        Retry::Close => close_inner("no foreground"),
     }
+}
+
+/// Before a foreground retry: None makes the attempt, Some ends the retries without one. `kept`: the foreground is
+/// still the window in front at open time, null, ours or a fullscreen bounce. A content that `focus_lost_closes`
+/// closes at once when the user went elsewhere: back in the window of the open before the tick, they would find it
+/// shown, topmost and without the keyboard, its type-ahead kept for a later click to replay.
+fn retry_gate(tries_left: u8, kept: bool, closes: bool) -> Option<Retry> {
+    if tries_left > 0 && kept {
+        None
+    } else {
+        Some(retry_outcome(0, false, closes))
+    }
+}
+
+/// Arms the next foreground retry. A timer Windows refuses ends the retries (`focus_tries` 0: the tick's safety net
+/// knows none will come).
+fn arm_retry(hwnd: HWND) {
+    // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
+    if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
+        log!("popup: SetTimer(focus) failed");
+        with(|st| {
+            if let Some(o) = st.open.as_mut() {
+                o.focus_tries = 0;
+            }
+        });
+    }
+}
+
+/// The tick's safety net for a popup never seen in front, which no WA_INACTIVE will close: true closes it. `moved`:
+/// the foreground is another window than the one in front at open time (and no fullscreen bounce). A content that
+/// `focus_lost_closes` also closes once no retry is left to come.
+fn unseen_tick_closes(moved: bool, tries_left: u8, closes: bool) -> bool {
+    moved || (closes && tries_left == 0)
 }
 
 fn on_tick(hwnd: HWND) {
@@ -1461,10 +2026,10 @@ fn on_tick(hwnd: HWND) {
     }
     let r = with(|st| {
         let o = st.open.as_mut()?;
-        Some((o.content.tick(), o.was_active, o.fg_at_open))
+        Some((o.content.tick(), o.was_active, o.fg_at_open, o.focus_tries, o.content.focus_lost_closes()))
     })
     .flatten();
-    let Some((reply, was_active, fg_at_open)) = r else { return };
+    let Some((reply, was_active, fg_at_open, tries, closes)) = r else { return };
     if was_active {
         // Activation was seen: if the foreground is now another window, WA_INACTIVE was missed.
         // SAFETY: no preconditions.
@@ -1478,12 +2043,8 @@ fn on_tick(hwnd: HWND) {
         // SAFETY: no preconditions.
         let fg = unsafe { GetForegroundWindow() };
         if fg == hwnd {
-            with(|st| {
-                if let Some(o) = st.open.as_mut() {
-                    o.was_active = true;
-                }
-            });
-        } else if fg != fg_at_open && !crate::ui::fs_bounce_grace(fg) {
+            became_foreground();
+        } else if unseen_tick_closes(fg != fg_at_open && !crate::ui::fs_bounce_grace(fg), tries, closes) {
             close_inner("foreground changed");
             return;
         }
@@ -1581,6 +2142,8 @@ pub(crate) fn tick_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::msg::{TIMER_LAUNCHER_PT, TIMER_LAUNCHER_SAVE, TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM};
+    use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
 
     #[test]
     fn popup_is_clamped_to_the_work_area() {
@@ -1595,6 +2158,207 @@ mod tests {
             "20 - 32 < 0: never zero or negative"
         );
         assert_eq!(fit_to_work(10, 10, &RECT { left: 0, top: 0, right: 10, bottom: 10 }, 16), (1, 1), "never zero");
+    }
+
+    #[test]
+    fn launcher_kind_makes_a_launcher_content() {
+        let c = make_content(
+            PopupKind::Launcher,
+            VolumeState::default(),
+            crate::net::NetInfo::default(),
+            crate::battery::BatteryStatus::NONE,
+        );
+        assert_eq!(c.kind(), PopupKind::Launcher);
+    }
+
+    #[test]
+    fn launcher_window_name() {
+        assert_eq!(window_name_for(PopupKind::Launcher), "Launcher");
+        assert_eq!(window_name_for(PopupKind::StartMenu), "Dock popup");
+        assert_eq!(window_name_for(PopupKind::Audio), "Dock popup");
+    }
+
+    #[test]
+    fn centred_position() {
+        let c = Centred { work: RECT { left: 0, top: 0, right: 1920, bottom: 1040 }, dpi: 96, top_percent: 24 };
+        assert_eq!(centred_max(&c, 8), (1904, 1040 - 8 - 249));
+        assert_eq!(centred_place(&c, 8, 640, 422), (640, 249, 640, 422), "1040 * 24 % = 249.6: the top edge at 249");
+        // 720 high: the panel grows down to 8 px above the work-area bottom and no further, it never moves up.
+        let small = Centred { work: RECT { left: 0, top: 0, right: 1280, bottom: 720 }, ..c };
+        assert_eq!(centred_place(&small, 8, 640, 600), (320, 172, 640, 540));
+        assert_eq!(centred_place(&small, 8, 2000, 100), (8, 172, 1264, 100), "never wider than the work area");
+        // A monitor left of the primary one with a work area that does not start at 0.
+        let left = Centred { work: RECT { left: -1280, top: 100, right: 0, bottom: 820 }, ..c };
+        assert_eq!(centred_place(&left, 8, 640, 62), (-960, 272, 640, 62));
+    }
+
+    #[test]
+    fn launcher_opens_at_full_alpha() {
+        assert_eq!(initial_alpha(PopupKind::Launcher), 255, "no fade: the field is there at once");
+        assert_eq!(initial_alpha(PopupKind::StartMenu), 0);
+        assert_eq!(initial_alpha(PopupKind::Audio), 0);
+    }
+
+    #[test]
+    fn sys_key_routing() {
+        let alt = usize::from(VK_MENU.0);
+        let cases: [(u32, usize, Route); 11] = [
+            (WM_KEYDOWN, 0x41, Route::ToContent),
+            (WM_SYSKEYDOWN, 0x41, Route::ToContent),
+            (WM_SYSKEYDOWN, alt, Route::ToContent),
+            (WM_SYSCHAR, 0x61, Route::Char),
+            (WM_SYSKEYUP, alt, Route::Consume),
+            (WM_SYSKEYUP, 0x41, Route::Default),
+            (WM_SYSCOMMAND, SC_KEYMENU as usize, Route::Consume),
+            (WM_SYSCOMMAND, SC_KEYMENU as usize | 0x3, Route::Consume),
+            (WM_SYSCOMMAND, 0xF010, Route::Default),
+            (WM_CHAR, 0x61, Route::Default),
+            (WM_KEYUP, 0x41, Route::Default),
+        ];
+        for (msg, wp, want) in cases {
+            assert_eq!(route(msg, wp, || true), want, "launcher: msg {msg:#x} wp {wp:#x}");
+            assert_eq!(route(msg, wp, || false), Route::Default, "other kinds: msg {msg:#x} wp {wp:#x}");
+        }
+        // The open content is asked only for a routed message: every other one costs no state borrow.
+        let asked = Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        for (msg, wp) in [(WM_MOUSEMOVE, 0), (WM_TIMER, 30), (WM_CHAR, 0x61), (WM_KEYUP, 0x41), (WM_SYSKEYUP, 0x41)] {
+            assert_eq!(route(msg, wp, ask), Route::Default, "msg {msg:#x}");
+        }
+        assert_eq!(asked.get(), 0);
+        assert_eq!(route(WM_CLOSE, 0, ask), Route::CloseRequest);
+        assert_eq!(asked.get(), 1);
+        // The KeyEvent of a key message: lParam bit 30 is the auto-repeat, WM_SYSKEYDOWN is a system key.
+        let ev = key_event(WM_SYSKEYDOWN, 0x46, 1 << 30, Mods::ALT);
+        assert_eq!(ev, KeyEvent { vk: 0x46, mods: Mods::ALT, repeat: true, sys: true });
+        assert_eq!(
+            key_event(WM_KEYDOWN, 0x0D, 1, Mods::NONE),
+            KeyEvent { vk: 0x0D, mods: Mods::NONE, repeat: false, sys: false }
+        );
+        assert_eq!(mods_of(true, true, false, false), Mods::CTRL.with(Mods::SHIFT));
+        assert_eq!(mods_of(false, false, true, true), Mods::ALT.with(Mods::WIN));
+        assert_eq!(mods_of(false, false, false, false), Mods::NONE);
+        // Only the launcher takes the system keys.
+        assert!(popup_launcher::new().wants_sys_keys());
+        assert!(!popup_start::new().wants_sys_keys());
+    }
+
+    #[test]
+    fn alt_f4_and_wm_close_are_close_requests() {
+        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, || true), Route::CloseRequest);
+        assert_eq!(
+            route(WM_SYSCOMMAND, SC_CLOSE as usize | 0x2, || true),
+            Route::CloseRequest,
+            "low 4 bits are the system's"
+        );
+        assert_eq!(route(WM_CLOSE, 0, || true), Route::CloseRequest);
+        assert_eq!(route(WM_SYSCOMMAND, SC_CLOSE as usize, || false), Route::Default, "other kinds: as today");
+        assert_eq!(route(WM_CLOSE, 0, || false), Route::Default);
+        // The stub launcher closes like the final Esc (L1a-15 hands it to the session); the default is a close.
+        assert_eq!(popup_launcher::new().close_request(), Reply::Close);
+        assert_eq!(popup_start::new().close_request(), Reply::Close);
+    }
+
+    #[test]
+    fn surrogate_pairs_combine() {
+        let mut held = 0u16;
+        assert_eq!(utf16_char(&mut held, 0x61), Some('a'));
+        // U+1F600 arrives as D83D DE00.
+        assert_eq!(utf16_char(&mut held, 0xD83D), None);
+        assert_eq!(utf16_char(&mut held, 0xDE00), Some('\u{1F600}'));
+        assert_eq!(held, 0);
+        // A lone low surrogate is dropped.
+        assert_eq!(utf16_char(&mut held, 0xDE00), None);
+        // A high surrogate followed by anything but a low one is dropped; the next character passes.
+        assert_eq!(utf16_char(&mut held, 0xD83D), None);
+        assert_eq!(utf16_char(&mut held, 0x62), Some('b'));
+        assert_eq!(utf16_char(&mut held, 0xD83D), None);
+        assert_eq!(utf16_char(&mut held, 0xD83C), None, "a second high replaces the first");
+        assert_eq!(utf16_char(&mut held, 0xDF89), Some('\u{1F389}'));
+        assert_eq!(utf16_char(&mut held, 0xE9), Some('\u{E9}'));
+    }
+
+    #[test]
+    fn focus_retry_outcomes() {
+        assert_eq!(retry_outcome(3, false, false), Retry::Again);
+        assert_eq!(retry_outcome(3, false, true), Retry::Again);
+        assert_eq!(retry_outcome(2, true, true), Retry::Focused, "got the foreground");
+        assert_eq!(retry_outcome(0, true, true), Retry::Focused);
+        assert_eq!(retry_outcome(0, true, false), Retry::Focused);
+        assert_eq!(retry_outcome(0, false, true), Retry::Close, "the launcher never sits there without the keyboard");
+        assert_eq!(retry_outcome(0, false, false), Retry::Stop, "another kind stays (the tick safety net remains)");
+        assert!(popup_launcher::new().focus_lost_closes());
+        assert!(!popup_start::new().focus_lost_closes());
+    }
+
+    /// A launcher never seen in front never stays shown without the keyboard: a user who moved to another window
+    /// during the retries (and may come back to the window of the open before the tick) gets no attempt and the
+    /// launcher closes at once; the tick closes one whose retries are over. Another kind keeps its rules.
+    #[test]
+    fn an_unfocused_launcher_never_stays() {
+        assert_eq!(retry_gate(3, true, true), None, "still the window of the open: the attempt");
+        assert_eq!(retry_gate(3, true, false), None);
+        assert_eq!(retry_gate(3, false, true), Some(Retry::Close), "the user went elsewhere: the launcher closes now");
+        assert_eq!(retry_gate(3, false, false), Some(Retry::Stop), "another kind is not pushed in front, and stays");
+        assert_eq!(retry_gate(0, true, true), Some(Retry::Close), "no try left");
+        assert_eq!(retry_gate(0, true, false), Some(Retry::Stop));
+        assert!(unseen_tick_closes(true, 3, false), "the foreground moved: every kind closes");
+        assert!(unseen_tick_closes(true, 0, true));
+        assert!(unseen_tick_closes(false, 0, true), "back in the window of the open, no retry to come: it closes");
+        assert!(!unseen_tick_closes(false, 2, true), "retries still to come: they decide");
+        assert!(!unseen_tick_closes(false, 0, false), "another kind stays");
+    }
+
+    #[test]
+    fn a_won_foreground_is_heard_at_once() {
+        // B1: a foreground attempt that wins is heard now, never at the 1 s tick.
+        for left in 0..=FOCUS_RETRIES {
+            for closes in [false, true] {
+                assert_eq!(retry_outcome(left, true, closes), Retry::Focused, "{left} {closes}");
+            }
+        }
+    }
+
+    #[test]
+    fn close_unless_launcher_keeps_the_launcher() {
+        assert!(!host_close_applies(Some(PopupKind::Launcher)), "the bar hides or moves: the launcher stays");
+        assert!(host_close_applies(Some(PopupKind::StartMenu)));
+        assert!(host_close_applies(Some(PopupKind::Audio)));
+        assert!(host_close_applies(None));
+    }
+
+    #[test]
+    fn launcher_timer_ids_forwarded() {
+        assert_eq!(
+            LAUNCHER_TIMERS,
+            [TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM, TIMER_LAUNCHER_SAVE, TIMER_LAUNCHER_PT]
+        );
+        for id in [34, 35, 36, 39] {
+            assert_eq!(timer_owner(id), TimerOwner::Launcher, "timer {id}");
+        }
+        assert_eq!(timer_owner(37), TimerOwner::Host, "37 is unused since L3 T19 (the 10-minute release)");
+        assert_eq!(timer_owner(38), TimerOwner::Host, "38 is unused since plan L2 D2 (the files worker's 60 s linger)");
+        for id in
+            [TIMER_POPUP_ANIM, TIMER_POPUP_TICK, TIMER_POPUP_FOCUS, TIMER_POPUP_START_RELEASE, TIMER_POPUP_COM_FREE]
+        {
+            assert_eq!(timer_owner(id), TimerOwner::Host, "timer {id}");
+        }
+        assert_eq!((TIMER_POPUP_ANIM, TIMER_POPUP_START_RELEASE), (30, 33));
+        assert_eq!(timer_owner(40), TimerOwner::Host);
+        assert_eq!(timer_owner(29), TimerOwner::Host);
+    }
+
+    #[test]
+    fn window_for_kind_slots() {
+        assert_eq!(window_for_kind(PopupKind::Launcher, true), Slot::Launcher, "S-OWNER failed: its own window");
+        assert_eq!(window_for_kind(PopupKind::Launcher, false), Slot::Shared, "S-OWNER passed: the shared window");
+        for kind in [PopupKind::StartMenu, PopupKind::Audio, PopupKind::AppMenu] {
+            assert_eq!(window_for_kind(kind, true), Slot::Shared, "{kind:?}");
+            assert_eq!(window_for_kind(kind, false), Slot::Shared, "{kind:?}");
+        }
     }
 
     #[test]

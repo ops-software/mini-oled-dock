@@ -12,15 +12,17 @@
 //!
 //! THREADING: UI thread only (GDI objects of the thread).
 
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
-    GetDC, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, HBITMAP, HDC, HFONT,
-    HGDIOBJ, LOGFONTW, SRCCOPY, TEXTMETRICW, TRANSPARENT,
+    GetDC, GetTextExtentExPointW, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, HBITMAP,
+    HDC, HFONT, HGDIOBJ, LOGFONTW, SRCCOPY, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
@@ -79,6 +81,8 @@ pub enum Font {
     Title,
     /// 12 px, weight 400: descriptions under the options of the Settings window.
     Caption,
+    /// 18 px, weight 400: the launcher's query (Q7). Made on first use, so surfaces that never draw it do not pay for it.
+    Query,
 }
 
 impl Font {
@@ -90,6 +94,8 @@ impl Font {
             Font::Big => 3,
             Font::Title => 4,
             Font::Caption => 5,
+            // Not in the table: `Surface::face` makes it.
+            Font::Query => 1,
         }
     }
 }
@@ -235,6 +241,8 @@ pub(crate) struct Gdi {
     dc_txt: HDC,
     main: Option<Dib>,
     txt: Option<Dib>,
+    /// The UTF-16 of the text being measured or drawn: one buffer, its capacity kept, freed with the Gdi.
+    wide: RefCell<Vec<u16>>,
 }
 
 impl Gdi {
@@ -265,7 +273,7 @@ impl Gdi {
             SetBkMode(dc_txt, TRANSPARENT);
             SetTextColor(dc_txt, COLORREF(0x00FF_FFFF));
         }
-        Ok(Gdi { dc_main, dc_txt, main: None, txt: None })
+        Ok(Gdi { dc_main, dc_txt, main: None, txt: None, wide: RefCell::new(Vec::new()) })
     }
 
     /// DC holding the main DIB (source for `present_layered` / `BitBlt`).
@@ -325,7 +333,11 @@ impl Gdi {
         if s.is_empty() {
             return 0;
         }
-        let wide: Vec<u16> = s.encode_utf16().collect();
+        #[cfg(test)]
+        EXTENT_CALLS.with(|c| c.set(c.get() + 1));
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
         let mut sz = SIZE::default();
         // SAFETY: `dc_txt` is valid; `wide` and `sz` outlive the call; the font is restored.
         let ok = unsafe {
@@ -339,6 +351,54 @@ impl Gdi {
         } else {
             wide.len() as i32 * per_char
         }
+    }
+
+    /// The width of the text up to and including each character of `s` (`out[i]` for the character `i`, so the last
+    /// is the whole width), from one `GetTextExtentExPointW` call. If GDI fails, `per_char` px per UTF-16 unit.
+    pub(crate) fn char_extents(&self, s: &str, font: HFONT, per_char: i32, out: &mut Vec<i32>) {
+        out.clear();
+        if s.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        EXTENT_CALLS.with(|c| c.set(c.get() + 1));
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
+        let units = wide.len();
+        out.resize(units, 0);
+        let mut sz = SIZE::default();
+        // SAFETY: `dc_txt` is valid; `wide` holds `units` units and `out` has `units` writable entries, both alive for
+        // the call; `lpnFit` is null, so `nMaxExtent` is ignored and every partial extent is written; the font is restored.
+        let ok = unsafe {
+            let old = SelectObject(self.dc_txt, HGDIOBJ(font.0));
+            let ok = GetTextExtentExPointW(
+                self.dc_txt,
+                PCWSTR(wide.as_ptr()),
+                units as i32,
+                0,
+                None,
+                Some(out.as_mut_ptr()),
+                &mut sz,
+            );
+            SelectObject(self.dc_txt, old);
+            ok
+        };
+        if !ok.as_bool() {
+            for (i, e) in out.iter_mut().enumerate() {
+                *e = (i as i32 + 1) * per_char;
+            }
+        }
+        // One entry per UTF-16 unit became one per character: the extent after its last unit (forward, in place).
+        let mut end = 0usize;
+        for (j, ch) in s.chars().enumerate() {
+            end += ch.len_utf16();
+            let v = out.get(end.saturating_sub(1)).copied().unwrap_or(0);
+            if let Some(slot) = out.get_mut(j) {
+                *slot = v;
+            }
+        }
+        out.truncate(s.chars().count());
     }
 
     /// Single-line text `s` with the top-left corner at `(x, y)` onto `cv` (a canvas of this
@@ -375,7 +435,9 @@ impl Gdi {
             let start = row * txt.w as usize;
             tbuf[start..start + w as usize].fill(0);
         }
-        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
         let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
         // SAFETY: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the call;
         // the font is restored right away. GdiFlush guarantees GDI has written before the read.
@@ -385,6 +447,7 @@ impl Gdi {
             SelectObject(self.dc_txt, old);
             let _ = GdiFlush();
         }
+        drop(wide);
         for row in 0..h {
             for col in 0..w {
                 let cov = (tbuf[(row * txt.w + col) as usize] >> 8) & 0xFF; // coverage = G channel
@@ -414,7 +477,9 @@ impl Gdi {
             let start = row * txt.w as usize;
             tbuf[start..start + w as usize].fill(0);
         }
-        let mut wide: Vec<u16> = s.encode_utf16().collect();
+        let mut wide = self.wide.borrow_mut();
+        wide.clear();
+        wide.extend(s.encode_utf16());
         let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
         // SAFETY: as in `text`: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the
         // call; the font is restored right away; GdiFlush makes GDI write before the read.
@@ -503,9 +568,17 @@ pub struct Surface {
     gdi: Gdi,
     fonts: [HFONT; 6],
     lhs: [i32; 6],
+    /// The `Font::Query` font and its line height, made by the first `face` call that needs it.
+    query: Cell<Option<(HFONT, i32)>>,
     /// Clipping rectangle (physical px) applied to every write; `None` = the whole DIB.
     clip: Option<RECT>,
+    /// 4 x 4 hit counts of the glyphs painted with `glyph_cached`: (key, size, counts); freed with the surface.
+    glyph_hits: Vec<(u32, i32, Box<[u8]>)>,
 }
+
+/// Largest glyph (side in physical px) and number of entries `glyph_cached` keeps.
+const GLYPH_CACHE_MAX_SIZE: i32 = 64;
+const GLYPH_CACHE_MAX_ENTRIES: usize = 32;
 
 fn delete_fonts(fonts: &[HFONT; 6]) {
     for f in fonts {
@@ -544,7 +617,7 @@ impl Surface {
         let gdi = Gdi::new()?;
         // On error `gdi` is dropped, which deletes the DCs.
         let (fonts, lhs) = build_fonts(gdi.dc_txt(), m)?;
-        Ok(Surface { metrics: m, gdi, fonts, lhs, clip: None })
+        Ok(Surface { metrics: m, gdi, fonts, lhs, query: Cell::new(None), clip: None, glyph_hits: Vec::new() })
     }
 
     /// Current metrics.
@@ -579,23 +652,8 @@ impl Surface {
         let radius = self.metrics.px(PANEL_RADIUS);
         let bw = 1.max(self.metrics.px(1));
         let cfg = crate::config::get();
-        let (r, g, b) = cfg.background.rgb();
         let bg_alpha = cfg.bar_alpha().max(1);
-        for y in 0..h {
-            for x in 0..w {
-                let outer = rr_cov(x, y, 0, 0, w, h, radius);
-                let i = (y * w + x) as usize;
-                if outer <= 0.0 {
-                    buf[i] = 0;
-                    continue;
-                }
-                let inner = rr_cov(x, y, bw, bw, w - bw, h - bw, radius - bw);
-                let base = argb((bg_alpha as f32 * outer + 0.5) as u32, r, g, b);
-                let ring = (outer - inner).max(0.0);
-                let ba = (PANEL_BORDER_ALPHA as f32 * ring + 0.5) as u32;
-                buf[i] = over(base, white(ba));
-            }
-        }
+        panel_pixels(buf, w, h, radius, bw, cfg.background.rgb(), bg_alpha);
     }
 
     /// Filled AA rounded rectangle (client coordinates, physical px; `radius` in physical px).
@@ -642,6 +700,49 @@ impl Surface {
         self.glyph_rgb(x, y, size, WHITE, alpha, shape);
     }
 
+    /// Like `glyph`, but the 4 x 4 hit counts of the shape are kept per (`key`, `size`) in the surface, so a frame
+    /// after the first only blends. `key` names the shape (never a pointer: capture-less closures can share an
+    /// address). A size over 64 px, or a full cache, paints like `glyph`.
+    pub fn glyph_cached(&mut self, key: u32, x: i32, y: i32, size: i32, alpha: u32, shape: &dyn Fn(f32, f32) -> bool) {
+        self.glyph_cached_rgb(key, x, y, size, WHITE, alpha, shape);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn glyph_hits_clear(&mut self) {
+        self.glyph_hits.clear();
+    }
+
+    /// Like `glyph_cached` with color `rgb`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn glyph_cached_rgb(
+        &mut self,
+        key: u32,
+        x: i32,
+        y: i32,
+        size: i32,
+        rgb: (u32, u32, u32),
+        alpha: u32,
+        shape: &dyn Fn(f32, f32) -> bool,
+    ) {
+        if size <= 0 || size > GLYPH_CACHE_MAX_SIZE {
+            return self.glyph_rgb(x, y, size, rgb, alpha, shape);
+        }
+        let at = match self.glyph_hits.iter().position(|(k, sz, _)| *k == key && *sz == size) {
+            Some(i) => i,
+            None if self.glyph_hits.len() >= GLYPH_CACHE_MAX_ENTRIES => {
+                return self.glyph_rgb(x, y, size, rgb, alpha, shape);
+            }
+            None => {
+                self.glyph_hits.push((key, size, glyph_hit_counts(size, shape)));
+                self.glyph_hits.len() - 1
+            }
+        };
+        let Some((_, _, hits)) = self.glyph_hits.get(at) else { return };
+        if let Some(mut cv) = self.gdi.canvas(self.clip) {
+            cv.glyph_from_hits(x, y, size, rgb, alpha, hits);
+        }
+    }
+
     /// Like `glyph` with color `rgb` (e.g. black on the white plate).
     pub fn glyph_rgb(
         &mut self,
@@ -660,23 +761,78 @@ impl Surface {
     /// Single-line text with the top-left corner at `(x, y)`; `rgb` non-premultiplied
     /// (white normally, black for today's day on the white plate).
     pub fn text(&mut self, s: &str, x: i32, y: i32, font: Font, rgb: (u32, u32, u32), alpha: u32) {
+        if self.gdi.size().is_none() || s.is_empty() || alpha == 0 {
+            return;
+        }
+        let w = self.text_width(s, font);
+        self.text_w(s, w, x, y, font, rgb, alpha);
+    }
+
+    /// `text` with the width of `s` in `font` already measured by `text_width`: drawn without measuring it again.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn text_w(&mut self, s: &str, w: i32, x: i32, y: i32, font: Font, rgb: (u32, u32, u32), alpha: u32) {
         let Some(mut cv) = self.gdi.canvas(self.clip) else { return };
         if s.is_empty() || alpha == 0 {
             return;
         }
-        let w = self.text_width(s, font);
-        let f = (self.fonts[font.idx()], self.lhs[font.idx()]);
+        let f = self.face(font);
         self.gdi.text(&mut cv, s, x, y, f, w, rgb, alpha);
+    }
+
+    /// Like `text` with a font made for this one call, `px` physical px tall and of `weight`, in the dock's text face. Returns
+    /// the width. Only the Q7 field-size candidate of the preview needs a size the six fonts do not have.
+    pub(crate) fn text_sized(
+        &mut self,
+        s: &str,
+        x: i32,
+        y: i32,
+        size: (i32, i32),
+        rgb: (u32, u32, u32),
+        alpha: u32,
+    ) -> i32 {
+        let (px, weight) = size;
+        let Ok(font) = create_font(self.gdi.dc_txt(), &TEXT_FACES, px, weight) else { return 0 };
+        let w = self.gdi.text_width(s, font, self.metrics.px(7));
+        let lh = line_height(self.gdi.dc_txt(), font);
+        if let Some(mut cv) = self.gdi.canvas(self.clip) {
+            self.gdi.text(&mut cv, s, x, y, (font, lh), w, rgb, alpha);
+        }
+        delete_font(font);
+        w
+    }
+
+    /// The width of each prefix of `s` in `font`: `out[i]` is the width up to and including the character `i`, from one
+    /// GDI call (a character's own width is the difference of two neighbours). `out` keeps its capacity.
+    pub(crate) fn char_extents(&self, s: &str, font: Font, out: &mut Vec<i32>) {
+        self.gdi.char_extents(s, self.face(font).0, self.metrics.px(7), out);
     }
 
     /// Width in physical px of `s` with `font`.
     pub fn text_width(&self, s: &str, font: Font) -> i32 {
-        self.gdi.text_width(s, self.fonts[font.idx()], self.metrics.px(7))
+        self.gdi.text_width(s, self.face(font).0, self.metrics.px(7))
     }
 
     /// Line height (physical px) of `font`.
     pub fn line_height(&self, font: Font) -> i32 {
-        self.lhs[font.idx()]
+        self.face(font).1
+    }
+
+    /// The GDI font and line height of `font`. `Font::Query` is made on the first call (a failure falls back to
+    /// `Normal`, and is tried again next time).
+    fn face(&self, font: Font) -> (HFONT, i32) {
+        if font == Font::Query {
+            if let Some(q) = self.query.get() {
+                return q;
+            }
+            let dc = self.gdi.dc_txt();
+            if let Ok(f) = create_font(dc, &TEXT_FACES, self.metrics.px(18), 400) {
+                let q = (f, line_height(dc, f));
+                self.query.set(Some(q));
+                return q;
+            }
+        }
+        let i = font.idx();
+        (self.fonts[i], self.lhs[i])
     }
 
     /// `s` truncated with "…" so that `text_width <= max_w`.
@@ -747,6 +903,84 @@ impl Drop for Surface {
     /// Releases the fonts; the DIBs and the DCs are released by the `Gdi` field.
     fn drop(&mut self) {
         delete_fonts(&self.fonts);
+        if let Some((f, _)) = self.query.take() {
+            delete_font(f);
+        }
+    }
+}
+
+/// What `panel_px` needs besides the position.
+#[derive(Clone, Copy)]
+struct PanelSpec {
+    w: i32,
+    h: i32,
+    radius: i32,
+    bw: i32,
+    rgb: (u32, u32, u32),
+    bg_alpha: u32,
+}
+
+/// One panel pixel: the exact formula (two rounded-rectangle coverages, the border over the tone).
+fn panel_px(x: i32, y: i32, p: &PanelSpec) -> u32 {
+    let PanelSpec { w, h, radius, bw, rgb, bg_alpha } = *p;
+    let outer = rr_cov(x, y, 0, 0, w, h, radius);
+    if outer <= 0.0 {
+        return 0;
+    }
+    let inner = rr_cov(x, y, bw, bw, w - bw, h - bw, radius - bw);
+    let base = argb((bg_alpha as f32 * outer + 0.5) as u32, rgb.0, rgb.1, rgb.2);
+    let ring = (outer - inner).max(0.0);
+    let ba = (PANEL_BORDER_ALPHA as f32 * ring + 0.5) as u32;
+    over(base, white(ba))
+}
+
+/// The panel background of a `w` x `h` buffer, pixel for pixel what evaluating the formula everywhere gives, but the
+/// exact value is computed only where it varies: with `k = max(radius, bw) + 1`, the `k` columns at each side of a
+/// row; the columns between repeat the value at column `k`; the rows clear of both corner bands repeat one row.
+/// A buffer smaller than `2k + 1` in either direction uses the exact formula everywhere.
+fn panel_pixels(buf: &mut [u32], w: i32, h: i32, radius: i32, bw: i32, rgb: (u32, u32, u32), bg_alpha: u32) {
+    if w <= 0 || h <= 0 || buf.len() < (w as usize) * (h as usize) {
+        return;
+    }
+    let spec = PanelSpec { w, h, radius, bw, rgb, bg_alpha };
+    let k = radius.max(bw) + 1;
+    let wu = w as usize;
+    if w < 2 * k + 1 || h < 2 * k + 1 {
+        for y in 0..h {
+            for x in 0..w {
+                buf[(y * w + x) as usize] = panel_px(x, y, &spec);
+            }
+        }
+        return;
+    }
+    let row = |buf: &mut [u32], y: i32| {
+        let base = (y * w) as usize;
+        for x in (0..k).chain(w - k..w) {
+            buf[base + x as usize] = panel_px(x, y, &spec);
+        }
+        let mid = panel_px(k, y, &spec);
+        if let Some(s) = buf.get_mut(base + k as usize..base + (w - k) as usize) {
+            s.fill(mid);
+        }
+    };
+    for y in (0..k).chain(h - k..h) {
+        row(buf, y);
+    }
+    row(buf, k);
+    let first = (k as usize) * wu;
+    for y in k + 1..h - k {
+        buf.copy_within(first..first + wu, (y as usize) * wu);
+    }
+}
+
+/// Today's loop, kept to prove `panel_pixels` equal to it.
+#[cfg(test)]
+fn panel_pixels_reference(buf: &mut [u32], w: i32, h: i32, radius: i32, bw: i32, rgb: (u32, u32, u32), bg_alpha: u32) {
+    let spec = PanelSpec { w, h, radius, bw, rgb, bg_alpha };
+    for y in 0..h {
+        for x in 0..w {
+            buf[(y * w + x) as usize] = panel_px(x, y, &spec);
+        }
     }
 }
 
@@ -778,35 +1012,128 @@ impl Canvas<'_> {
         self.buf[i] = over(self.buf[i], src);
     }
 
-    /// Filled AA rounded rectangle (physical px; `radius` in physical px), colour `rgb` and alpha `alpha`.
+    /// "Source over" of the premultiplied `src` onto the pixels `[x0, x1)` of row `y`, clipped to the buffer and
+    /// the clip rectangle. A run of identical destination pixels gives an identical result, so the last
+    /// `over(dst, src)` is reused while the destination value repeats.
+    pub(crate) fn blend_run(&mut self, y: i32, x0: i32, x1: i32, src: u32) {
+        let (mut x0, mut x1) = (x0.max(0), x1.min(self.w));
+        if y < 0 || y >= self.h {
+            return;
+        }
+        if let Some(c) = self.clip {
+            if y < c.top || y >= c.bottom {
+                return;
+            }
+            x0 = x0.max(c.left);
+            x1 = x1.min(c.right);
+        }
+        if x0 >= x1 {
+            return;
+        }
+        let base = (y * self.w) as usize;
+        let Some(run) = self.buf.get_mut(base + x0 as usize..base + x1 as usize) else { return };
+        let mut memo: Option<(u32, u32)> = None;
+        for px in run {
+            let d = *px;
+            *px = match memo {
+                Some((from, to)) if from == d => to,
+                _ => {
+                    let to = over(d, src);
+                    memo = Some((d, to));
+                    to
+                }
+            };
+        }
+    }
+
+    /// Filled AA rounded rectangle (physical px; `radius` in physical px), colour `rgb` and alpha `alpha`. Only the
+    /// corner pixels of the corner rows are evaluated exactly; the rest of a row is one value.
     pub(crate) fn fill_rr(&mut self, rc: RECT, radius: i32, rgb: (u32, u32, u32), alpha: u32) {
         if alpha == 0 {
             return;
         }
+        let rad = eff_radius(rc.left, rc.top, rc.right, rc.bottom, radius);
+        let (xa, xb) = (rc.left.max(0), rc.right.min(self.w));
+        let full = argb((alpha as f32 + 0.5) as u32, rgb.0, rgb.1, rgb.2);
         for y in rc.top.max(0)..rc.bottom.min(self.h) {
-            for x in rc.left.max(0)..rc.right.min(self.w) {
-                let cov = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
-                let a = (alpha as f32 * cov + 0.5) as u32;
-                if a > 0 {
-                    self.blend(x, y, argb(a, rgb.0, rgb.1, rgb.2));
-                }
+            if y >= rc.top + rad && y < rc.bottom - rad {
+                self.blend_run(y, xa, xb, full);
+                continue;
+            }
+            let (le, rs) = (rc.left + rad, rc.right - rad);
+            for x in xa..xb.min(le) {
+                self.fill_px(x, y, rc, radius, rgb, alpha);
+            }
+            self.blend_run(y, xa.max(le), xb.min(rs), full);
+            for x in xa.max(rs).max(le)..xb {
+                self.fill_px(x, y, rc, radius, rgb, alpha);
             }
         }
     }
 
-    /// Inner ring of `bw` physical px of a rounded rectangle, white with alpha `alpha`.
+    #[inline]
+    fn fill_px(&mut self, x: i32, y: i32, rc: RECT, radius: i32, rgb: (u32, u32, u32), alpha: u32) {
+        let cov = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
+        let a = (alpha as f32 * cov + 0.5) as u32;
+        if a > 0 {
+            self.blend(x, y, argb(a, rgb.0, rgb.1, rgb.2));
+        }
+    }
+
+    /// Inner ring of `bw` physical px of a rounded rectangle, white with alpha `alpha`. Nothing is evaluated or drawn
+    /// inside the inner rectangle; the straight parts of the ring are one value per row.
     pub(crate) fn stroke_rr(&mut self, rc: RECT, radius: i32, bw: i32, alpha: u32) {
         if alpha == 0 {
             return;
         }
+        let rad = eff_radius(rc.left, rc.top, rc.right, rc.bottom, radius);
+        let irad = eff_radius(rc.left + bw, rc.top + bw, rc.right - bw, rc.bottom - bw, radius - bw);
+        // Columns and rows nearer than `m` to a side are the corner bands; beyond them the outer coverage is 1
+        // and the inner one repeats along the row.
+        let m = rad.max(bw + irad);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if bw < 1 || w < 2 * m + 1 || h < 2 * m + 1 {
+            self.stroke_rr_exact(rc, radius, bw, alpha);
+            return;
+        }
+        let (xa, xb) = (rc.left.max(0), rc.right.min(self.w));
+        let flat = white((alpha as f32 + 0.5) as u32);
+        for y in rc.top.max(0)..rc.bottom.min(self.h) {
+            if y >= rc.top + m && y < rc.bottom - m {
+                self.blend_run(y, xa, xb.min(rc.left + bw), flat);
+                self.blend_run(y, xa.max(rc.right - bw), xb, flat);
+                continue;
+            }
+            for x in (xa..xb.min(rc.left + m)).chain(xa.max(rc.right - m)..xb) {
+                self.stroke_px(x, y, rc, radius, bw, alpha);
+            }
+            let mx = rc.left + m;
+            let (outer, inner) = (
+                rr_cov(mx, y, rc.left, rc.top, rc.right, rc.bottom, radius),
+                rr_cov(mx, y, rc.left + bw, rc.top + bw, rc.right - bw, rc.bottom - bw, radius - bw),
+            );
+            let a = (alpha as f32 * (outer - inner).max(0.0) + 0.5) as u32;
+            if a > 0 {
+                self.blend_run(y, xa.max(mx), xb.min(rc.right - m), white(a));
+            }
+        }
+    }
+
+    #[inline]
+    fn stroke_px(&mut self, x: i32, y: i32, rc: RECT, radius: i32, bw: i32, alpha: u32) {
+        let outer = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
+        let inner = rr_cov(x, y, rc.left + bw, rc.top + bw, rc.right - bw, rc.bottom - bw, radius - bw);
+        let a = (alpha as f32 * (outer - inner).max(0.0) + 0.5) as u32;
+        if a > 0 {
+            self.blend(x, y, white(a));
+        }
+    }
+
+    /// The ring evaluated at every pixel of the rectangle (rectangles too small for the spans, and the reference).
+    fn stroke_rr_exact(&mut self, rc: RECT, radius: i32, bw: i32, alpha: u32) {
         for y in rc.top.max(0)..rc.bottom.min(self.h) {
             for x in rc.left.max(0)..rc.right.min(self.w) {
-                let outer = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
-                let inner = rr_cov(x, y, rc.left + bw, rc.top + bw, rc.right - bw, rc.bottom - bw, radius - bw);
-                let a = (alpha as f32 * (outer - inner).max(0.0) + 0.5) as u32;
-                if a > 0 {
-                    self.blend(x, y, white(a));
-                }
+                self.stroke_px(x, y, rc, radius, bw, alpha);
             }
         }
     }
@@ -881,26 +1208,47 @@ impl Canvas<'_> {
         if size <= 0 {
             return;
         }
-        crate::glyphs::set_scale(size);
-        let k = 16.0 / size as f32;
+        let hits = glyph_hit_counts(size, shape);
+        self.glyph_from_hits(x, y, size, rgb, alpha, &hits);
+    }
+
+    /// Blends a glyph from its 4 x 4 hit counts (`glyph_hit_counts`), `size` x `size` of them, row by row.
+    pub(crate) fn glyph_from_hits(&mut self, x: i32, y: i32, size: i32, rgb: (u32, u32, u32), alpha: u32, hits: &[u8]) {
+        if size <= 0 || hits.len() < (size as usize) * (size as usize) {
+            return;
+        }
         for py in 0..size {
             for px in 0..size {
-                let mut hits = 0u32;
-                for sy in 0..4 {
-                    for sx in 0..4 {
-                        let u = (px as f32 + (sx as f32 + 0.5) / 4.0) * k;
-                        let v = (py as f32 + (sy as f32 + 0.5) / 4.0) * k;
-                        if shape(u, v) {
-                            hits += 1;
-                        }
-                    }
-                }
-                if hits > 0 {
-                    self.blend(x + px, y + py, argb(alpha * hits / 16, rgb.0, rgb.1, rgb.2));
+                let n = hits.get((py * size + px) as usize).copied().unwrap_or(0) as u32;
+                if n > 0 {
+                    self.blend(x + px, y + py, argb(alpha * n / 16, rgb.0, rgb.1, rgb.2));
                 }
             }
         }
     }
+}
+
+/// How many of the 4 x 4 samples of each pixel of a `size` x `size` glyph are inside `shape` (16x16 space).
+fn glyph_hit_counts(size: i32, shape: &dyn Fn(f32, f32) -> bool) -> Box<[u8]> {
+    let mut out = Vec::with_capacity((size.max(0) as usize).pow(2));
+    crate::glyphs::set_scale(size);
+    let k = 16.0 / size as f32;
+    for py in 0..size {
+        for px in 0..size {
+            let mut hits = 0u8;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let u = (px as f32 + (sx as f32 + 0.5) / 4.0) * k;
+                    let v = (py as f32 + (sy as f32 + 0.5) / 4.0) * k;
+                    if shape(u, v) {
+                        hits += 1;
+                    }
+                }
+            }
+            out.push(hits);
+        }
+    }
+    out.into_boxed_slice()
 }
 
 // ------------------------------------------------------- pixel primitives (shared with render.rs)
@@ -941,9 +1289,17 @@ pub(crate) fn over(dst: u32, src: u32) -> u32 {
         | ch(src & 255, dst & 255)
 }
 
+/// The radius `rr_cov` actually uses for the rectangle `[l, r) x [t, b)`.
+#[inline]
+fn eff_radius(l: i32, t: i32, r: i32, b: i32, rad: i32) -> i32 {
+    rad.min((r - l) / 2).min((b - t) / 2).max(0)
+}
+
 /// Coverage (0..1) of pixel `(x, y)` with respect to the rounded rectangle `[l, r) x [t, b)` with
 /// radius `rad`: manual antialiasing at the corners only (the sides are pixel-aligned).
 pub(crate) fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -> f32 {
+    #[cfg(test)]
+    RR_COV_CALLS.with(|c| c.set(c.get() + 1));
     if x < l || x >= r || y < t || y >= b {
         return 0.0;
     }
@@ -965,6 +1321,19 @@ pub(crate) fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -
     let dx = (x as f32 + 0.5) - cx as f32;
     let dy = (y as f32 + 0.5) - cy as f32;
     (rad as f32 + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
+}
+
+// Number of GDI text-extent calls on this thread, `GetTextExtentExPointW` (`char_extents`) and `GetTextExtentPoint32W`
+// (`text_width`, which `text` calls): the measurement gate of the launcher's field.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXTENT_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+// Number of `rr_cov` calls on this thread (the evaluation-count gates).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RR_COV_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Average (premultiplied) of the source pixels covered by destination pixel `(dx, dy)` of a
@@ -1009,12 +1378,171 @@ mod tests {
     const M: Metrics = Metrics { dpi: 96 };
 
     #[test]
+    fn panel_spans_equal_reference() {
+        for (w, h) in [(1, 1), (2, 2), (10, 3), (640, 62), (800, 528), (960, 634)] {
+            for dpi in [96, 120, 144, 192] {
+                let m = Metrics { dpi };
+                let (radius, bw) = (m.px(PANEL_RADIUS), 1.max(m.px(1)));
+                for alpha in [1, 128, 255] {
+                    let mut a = vec![0xDEAD_BEEFu32; (w * h) as usize];
+                    let mut b = a.clone();
+                    panel_pixels(&mut a, w, h, radius, bw, (7, 9, 11), alpha);
+                    panel_pixels_reference(&mut b, w, h, radius, bw, (7, 9, 11), alpha);
+                    let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+                    assert_eq!(diff, 0, "{w}x{h} dpi {dpi} alpha {alpha}");
+                }
+            }
+        }
+    }
+
+    /// Today's bodies of `fill_rr` and `stroke_rr`, kept to prove the span versions equal to them.
+    fn fill_reference(cv: &mut Canvas, rc: RECT, radius: i32, rgb: (u32, u32, u32), alpha: u32) {
+        if alpha == 0 {
+            return;
+        }
+        for y in rc.top.max(0)..rc.bottom.min(cv.h) {
+            for x in rc.left.max(0)..rc.right.min(cv.w) {
+                let cov = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
+                let a = (alpha as f32 * cov + 0.5) as u32;
+                if a > 0 {
+                    cv.blend(x, y, argb(a, rgb.0, rgb.1, rgb.2));
+                }
+            }
+        }
+    }
+
+    fn stroke_reference(cv: &mut Canvas, rc: RECT, radius: i32, bw: i32, alpha: u32) {
+        if alpha == 0 {
+            return;
+        }
+        cv.stroke_rr_exact(rc, radius, bw, alpha);
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, n: i32) -> i32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as i32
+        }
+    }
+
+    #[test]
+    fn fill_stroke_spans_equal_reference() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (cw, ch) = (70, 50);
+        for case in 0..2000 {
+            let mut a: Vec<u32> =
+                (0..cw * ch).map(|_| (rng.next(256) as u32) << 24 | rng.next(0x100_0000) as u32).collect();
+            // premultiplied-valid backgrounds are not required: both paths read the same values
+            let mut b = a.clone();
+            let (l, t) = (rng.next(90) - 15, rng.next(70) - 10);
+            let rc = RECT { left: l, top: t, right: l + rng.next(80), bottom: t + rng.next(60) };
+            let clip = (rng.next(2) == 0).then(|| {
+                let (cl, ct) = (rng.next(60), rng.next(40));
+                RECT { left: cl, top: ct, right: cl + rng.next(60), bottom: ct + rng.next(45) }
+            });
+            let radius = rng.next(21);
+            let bw = 1 + rng.next(3);
+            let alpha = rng.next(256) as u32;
+            let rgb = (rng.next(256) as u32, rng.next(256) as u32, rng.next(256) as u32);
+            let stroke = case % 2 == 1;
+            {
+                let mut cv = Canvas { buf: &mut a, w: cw, h: ch, clip };
+                if stroke {
+                    cv.stroke_rr(rc, radius, bw, alpha);
+                } else {
+                    cv.fill_rr(rc, radius, rgb, alpha);
+                }
+            }
+            {
+                let mut cv = Canvas { buf: &mut b, w: cw, h: ch, clip };
+                if stroke {
+                    stroke_reference(&mut cv, rc, radius, bw, alpha);
+                } else {
+                    fill_reference(&mut cv, rc, radius, rgb, alpha);
+                }
+            }
+            let (rl, rt, rr, rb) = (rc.left, rc.top, rc.right, rc.bottom);
+            assert!(
+                a == b,
+                "case {case} stroke {stroke} rc ({rl},{rt},{rr},{rb}) radius {radius} bw {bw} clip {clip:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_stroke_evaluations_bounded() {
+        let (cw, ch) = (700, 100);
+        let mut buf = vec![0u32; (cw * ch) as usize];
+        let mut cv = Canvas { buf: &mut buf, w: cw, h: ch, clip: None };
+        let rc = rect_wh(10, 10, 600, 48);
+        RR_COV_CALLS.with(|c| c.set(0));
+        cv.fill_rr(rc, 12, (1, 2, 3), 200);
+        let fill = RR_COV_CALLS.with(|c| c.get());
+        assert!(fill <= 4 * 12 * 12, "{fill} rr_cov calls for the fill");
+        RR_COV_CALLS.with(|c| c.set(0));
+        cv.stroke_rr(rc, 12, 1, 60);
+        let stroke = RR_COV_CALLS.with(|c| c.get());
+        assert!(stroke <= 2 * 2 * 12 * (2 * 12 + 1), "{stroke} rr_cov calls for the stroke");
+    }
+
+    #[test]
+    fn panel_coverage_evaluations_bounded() {
+        let m = Metrics { dpi: 120 };
+        let mut buf = vec![0u32; 800 * 528];
+        RR_COV_CALLS.with(|c| c.set(0));
+        panel_pixels(&mut buf, 800, 528, m.px(PANEL_RADIUS), 1.max(m.px(1)), (0, 0, 0), 255);
+        let n = RR_COV_CALLS.with(|c| c.get());
+        assert!(n <= 8_000, "{n} rr_cov calls");
+    }
+
+    #[test]
+    fn glyph_shape_called_once_per_surface() {
+        let mut s = Surface::new(M).expect("surface");
+        s.resize(64, 64).unwrap();
+        let calls = Cell::new(0u32);
+        let shape = |u: f32, v: f32| {
+            calls.set(calls.get() + 1);
+            u + v < 16.0
+        };
+        s.glyph_cached(7, 4, 4, 20, 255, &shape);
+        assert_eq!(calls.get(), 16 * 20 * 20);
+        s.glyph_cached(7, 30, 30, 20, 90, &shape);
+        assert_eq!(calls.get(), 16 * 20 * 20, "the second paint reads the cache");
+    }
+
+    #[test]
+    fn glyph_cache_is_bounded() {
+        let mut s = Surface::new(M).expect("surface");
+        s.resize(200, 200).unwrap();
+        let shape = |u: f32, _v: f32| u < 8.0;
+        for key in 0..(GLYPH_CACHE_MAX_ENTRIES as u32 + 10) {
+            s.glyph_cached(key, 0, 0, 12, 255, &shape);
+        }
+        assert_eq!(s.glyph_hits.len(), GLYPH_CACHE_MAX_ENTRIES);
+        s.glyph_cached(1, 0, 0, GLYPH_CACHE_MAX_SIZE + 1, 255, &shape);
+        assert_eq!(s.glyph_hits.len(), GLYPH_CACHE_MAX_ENTRIES, "a big glyph is not kept");
+        assert!(s.glyph_hits.iter().all(|(_, size, h)| h.len() == (size * size) as usize));
+    }
+
+    #[test]
     fn title_and_caption_fonts_exist() {
         let s = Surface::new(M).expect("surface");
         assert!(s.line_height(Font::Title) > s.line_height(Font::Normal));
         let c = s.line_height(Font::Caption);
         assert!(c >= s.line_height(Font::Small) && c <= s.line_height(Font::Normal));
         assert!(s.text_width("Appearance", Font::Title) > s.text_width("Appearance", Font::Bold));
+    }
+
+    #[test]
+    fn query_font_is_made_on_first_use_and_is_larger_than_normal() {
+        let s = Surface::new(M).expect("surface");
+        assert!(s.query.get().is_none(), "not made with the surface");
+        assert!(s.line_height(Font::Query) > s.line_height(Font::Normal));
+        assert!(s.query.get().is_some());
+        assert!(s.text_width("calc", Font::Query) > s.text_width("calc", Font::Normal));
     }
 
     #[test]

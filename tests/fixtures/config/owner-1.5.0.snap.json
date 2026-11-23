@@ -1,0 +1,150 @@
+{
+  "language": "auto",
+  "position": "top",
+  "monitor": "",
+  "autohide": true,
+  "window_previews": true,
+  "win_opens_start": false,
+  "hide_native_taskbar": true,
+  "pinned": [
+    {
+      "key": "c:\\windows\\explorer.exe",
+      "name": "Esplora risorse",
+      "launch": "C:\\Windows\\explorer.exe"
+    },
+    {
+      "key": "A1B2C3D4E5F60789",
+      "name": "Example Browser",
+      "launch": "C:\\Program Files\\Example Browser\\browser.exe"
+    },
+    {
+      "key": "c:\\users\\user\\appdata\\local\\examplechat\\app-*\\examplechat.exe",
+      "name": "Example Chat",
+      "launch": "C:\\Users\\user\\AppData\\Local\\ExampleChat\\app-1.2.3456\\ExampleChat.exe"
+    },
+    {
+      "key": "12345ABC.ExampleMessenger_abcdefgh12345!App",
+      "name": "Example Messenger",
+      "launch": "shell:AppsFolder\\12345ABC.ExampleMessenger_abcdefgh12345!App"
+    },
+    {
+      "key": "c:\\users\\user\\appdata\\local\\programs\\exampleplayer\\exampleplayer.exe",
+      "name": "Example Player",
+      "launch": "C:\\Users\\user\\AppData\\Local\\Programs\\ExamplePlayer\\exampleplayer.exe"
+    }
+  ],
+  "start_pins": [],
+  "start_folders": [],
+  "start_style": "compact",
+  "start_grid": false,
+  "names": {},
+  "show_date": true,
+  "show_volume_percent": true,
+  "show_tray": true,
+  "show_notifications": true,
+  "show_volume": true,
+  "show_network": false,
+  "show_metrics": false,
+  "show_battery": "auto",
+  "battery_percent": true,
+  "battery_percent_inside": false,
+  "show_clock": true,
+  "show_desktop_button": true,
+  "show_start_button": false,
+  "display_mode": "icon_text",
+  "app_icon_size": 20,
+  "app_text_size": 14,
+  "tray_icon_size": 18,
+  "module_size": 105,
+  "background": "#000000",
+  "bar_opacity": 100,
+  "settings_window_size": [
+    860,
+    594
+  ],
+  "time_format": "HH:mm",
+  "show_seconds": true,
+  "date_format": "ddd d MMM",
+  "tray_hidden_guids": [
+    "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae77-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae82-23e3-4229-82c1-e41cb67d5b9c"
+  ],
+  "tray_hidden": [
+    "alpha.exe#197480"
+  ],
+  "app_order": [],
+  "tray_order": [
+    "11111111-2222-4333-8444-555555555551",
+    "bravo.exe#3",
+    "charlie.exe#1",
+    "delta.exe#1",
+    "11111111-2222-4333-8444-555555555552",
+    "echo.exe#1000",
+    "11111111-2222-4333-8444-555555555553",
+    "foxtrot.exe#1",
+    "alpha.exe#132114",
+    "11111111-2222-3333-8444-555555555554",
+    "golf.exe#0",
+    "hotel.exe#1",
+    "india.exe#2",
+    "11111111-2222-c333-8444-555555555555",
+    "alpha.exe#197562",
+    "11111111-2222-d333-8444-555555555556"
+  ],
+  "modules_order": [
+    "volume",
+    "clock",
+    "notifications",
+    "show_desktop",
+    "power"
+  ],
+  "audio_layout": "Mo-S-X",
+  "notif_prompted": false,
+  "update_check": true,
+  "update_auto_install": true,
+  "last_update_check": "2026-11-21T17:45:49Z",
+  "update_available": "v1.4.2",
+  "launcher": {
+    "enabled": true,
+    "chord": "alt+space",
+    "with_powertoys": "yield",
+    "monitor": "pointer",
+    "top_percent": 24,
+    "width": 640,
+    "rows": 8,
+    "animate": false,
+    "keep_query": false,
+    "over_fullscreen": "pass",
+    "learn": true,
+    "announce_selection": false,
+    "providers": {
+      "apps": true,
+      "calc": true,
+      "commands": true,
+      "datetime": true,
+      "files": true,
+      "registry": true,
+      "run": true,
+      "settings": true,
+      "web": true,
+      "windows": true
+    },
+    "prefixes": {
+      "$": "settings",
+      ")": "datetime",
+      ":": "registry",
+      "<": "windows",
+      "=": "calc",
+      ">": "run",
+      "??": "web",
+      "file ": "files"
+    },
+    "web_engine": "google",
+    "web_url": "",
+    "offer_done": false,
+    "powertoys_done": false
+  }
+}

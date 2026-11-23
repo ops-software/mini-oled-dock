@@ -54,7 +54,31 @@ pub fn set_preview(on: bool) {
 
 /// True when the dock speaks Italian.
 pub fn italian() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ITALIAN.with(std::cell::Cell::get) {
+        return on;
+    }
     italian_in(STATE.load(Relaxed))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own UI language: the process-wide state is never flipped, so tests running in parallel keep seeing
+    /// English.
+    static TEST_ITALIAN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the UI language of this thread set to Italian or English; restored afterwards, also on unwind.
+#[cfg(test)]
+pub fn with_italian<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_ITALIAN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_ITALIAN.with(|c| c.replace(Some(on))));
+    f()
 }
 
 fn italian_in(s: u8) -> bool {

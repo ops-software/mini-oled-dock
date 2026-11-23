@@ -46,13 +46,13 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, FindWindowExW, GetAncestor, GetClassNameW,
-    GetDesktopWindow, GetForegroundWindow, GetPropW, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync,
-    SwitchToThisWindow, ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER, GET_WINDOW_CMD, GWL_EXSTYLE,
-    OBJID_WINDOW, SC_MINIMIZE, SC_RESTORE, SMTO_ABORTIFHUNG, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDesktopWindow,
+    GetForegroundWindow, GetPropW, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync, SwitchToThisWindow,
+    ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER, GET_WINDOW_CMD, GWL_EXSTYLE, OBJID_WINDOW, SC_MINIMIZE,
+    SC_RESTORE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_CLOSE, WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::log;
@@ -342,7 +342,7 @@ pub fn refresh(own: HWND) -> bool {
         // New groups: progressive first_seen in the order of appearance of their oldest window.
         let mut fresh: Vec<usize> =
             (0..accs.len()).filter(|&i| !old_first.contains_key(accs[i].key.as_str())).collect();
-        fresh.sort_by_key(|&i| accs[i].min_seq);
+        crate::tinysort::sort_by_key(&mut fresh, |&i| accs[i].min_seq);
         let mut assigned: HashMap<usize, u64> = HashMap::new();
         let mut next = st.next_group_seq;
         for i in fresh {
@@ -354,7 +354,7 @@ pub fn refresh(own: HWND) -> bool {
             .into_iter()
             .enumerate()
             .map(|(i, mut a)| {
-                a.wins.sort_by(|x, y| y.1.cmp(&x.1)); // decreasing stamp = MRU
+                crate::tinysort::sort_by(&mut a.wins, |x, y| y.1.cmp(&x.1)); // decreasing stamp = MRU
                 let windows: Vec<isize> = a.wins.iter().map(|w| w.0).collect();
                 let first_seen =
                     old_first.get(a.key.as_str()).copied().or_else(|| assigned.get(&i).copied()).unwrap_or(0);
@@ -362,7 +362,7 @@ pub fn refresh(own: HWND) -> bool {
                 AppGroup { key: a.key, exe_path: a.exe_path, aumid: a.aumid, windows, active, first_seen }
             })
             .collect();
-        new_groups.sort_by_key(|g| g.first_seen);
+        crate::tinysort::sort_by_key(&mut new_groups, |g| g.first_seen);
 
         st.next_group_seq = next;
         let changed = new_groups != st.groups;
@@ -981,7 +981,7 @@ pub fn click_group(key: &str) -> ClickOutcome {
     }
     // Active group with multiple windows: move to the next one in stable order of appearance.
     let mut by_seq = wins.clone();
-    by_seq.sort_by_key(|w| w.1);
+    crate::tinysort::sort_by_key(&mut by_seq, |w| w.1);
     let pos = by_seq.iter().position(|w| w.0 == fg).unwrap_or(0);
     let target = by_seq[(pos + 1) % by_seq.len()].0;
     activate_window(target);
@@ -998,7 +998,7 @@ pub fn windows_in_order(key: &str) -> Vec<isize> {
             .find(|g| g.key == key)
             .map(|g| g.windows.iter().map(|&h| (h, st.cache.get(&h).map(|e| e.seq).unwrap_or(0))).collect())
             .unwrap_or_default();
-        v.sort_by_key(|w| w.1);
+        crate::tinysort::sort_by_key(&mut v, |w| w.1);
         v.into_iter().map(|w| w.0).collect()
     })
 }
@@ -1014,22 +1014,33 @@ pub fn close_group(key: &str) {
     }
 }
 
-/// Sends `WM_SYSCOMMAND` with a timeout (does not block the UI on hung apps). `true` if delivered.
+/// Sends `WM_SYSCOMMAND` with a timeout (does not block the UI on hung apps). `true` if delivered. A window whose
+/// thread does not answer the ping (`ui::answers`, 50 ms at most) is not sent it: the caller's ShowWindowAsync does it.
+/// SMTO_BLOCK keeps the 300 ms a true bound for an app that stops answering after the ping: without it the UI thread
+/// dispatches the messages other processes send the dock while it waits, and each one starts the timeout again (live
+/// check V-14). A send that times out is reported as not delivered, so the caller's ShowWindowAsync acts. SMTO_BLOCK
+/// does not serve the popup's low-level mouse hook either, which Windows calls through a message to this thread: the
+/// hook is removed for the wait (`popup::suspend_mouse_hook`), or every mouse event would wait for it.
 fn sys_command(h: isize, cmd: u32) -> bool {
+    if !crate::ui::answers(hw(h)) {
+        return false;
+    }
     let mut res = 0usize;
-    // SAFETY: arbitrary HWND allowed; `res` is valid for writing; SMTO_ABORTIFHUNG +
-    // a 300 ms timeout limit the wait if the target thread does not respond.
+    let hook = crate::popup::suspend_mouse_hook();
+    // SAFETY: arbitrary HWND allowed; `res` is valid for writing; SMTO_BLOCK, SMTO_ABORTIFHUNG and
+    // a 300 ms timeout bound the wait if the target thread does not respond.
     let r = unsafe {
         SendMessageTimeoutW(
             hw(h),
             WM_SYSCOMMAND,
             WPARAM(cmd as usize),
             LPARAM(0),
-            SMTO_ABORTIFHUNG,
+            SMTO_BLOCK | SMTO_ABORTIFHUNG,
             SYSCMD_TIMEOUT_MS,
             Some(&mut res),
         )
     };
+    crate::popup::resume_mouse_hook(hook);
     r.0 != 0
 }
 
@@ -1053,7 +1064,8 @@ pub(crate) fn activate_window(h: isize) {
         // Allows any process (including the target app) to take the foreground.
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         let ok = SetForegroundWindow(w).as_bool();
-        let _ = BringWindowToTop(w);
+        // Posted to the app's thread: raised in place, a hung app would hold the UI thread.
+        crate::ui::raise(w);
         if !ok || !is_foreground(h) {
             // Foreground lock: `SwitchToThisWindow` bypasses it and is
             // the same call used by Alt+Tab; it also restores if still minimized.

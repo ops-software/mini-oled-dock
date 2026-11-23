@@ -99,3 +99,25 @@ fn the_truncated_fixture_is_still_truncated() {
 fn the_1_4_2_default_file_is_todays_default() {
     assert_eq!(parse(&read("v1.4.2-default.json")).unwrap(), Config::default());
 }
+
+#[test]
+fn owner_fixture_sets_alt_space() {
+    let c = parse(&read("owner-1.5.0.json")).unwrap();
+    assert_eq!(c.launcher.chord, "alt+space");
+    assert!(c.launcher.chord_spec().is_some());
+    // the rest of the file is the 1.4.2 owner file
+    let mut old = parse(&read("owner-1.4.2.json")).unwrap();
+    old.launcher.chord = "alt+space".into();
+    assert_eq!(c, old);
+}
+
+#[test]
+fn launcher_chord_off_by_default() {
+    // the default and every file written by 1.4.3 (its config is the 1.4.2 shape) leave the chord unset
+    assert_eq!(Config::default().launcher.chord_spec(), None);
+    for f in ["v1.4.2-default.json", "v1.4.2-custom.json", "owner-1.4.2.json"] {
+        let c = parse(&read(f)).unwrap();
+        assert_eq!(c.launcher.chord, "off", "{f}");
+        assert_eq!(c.launcher.chord_spec(), None, "{f}");
+    }
+}

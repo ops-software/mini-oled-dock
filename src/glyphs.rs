@@ -695,6 +695,80 @@ pub fn folder_shape(u: f32, v: f32) -> bool {
     polyline(u, v, &[(l, t), (6.0, t), (7.6, m), (r, m), (r, b), (l, b), (l, t)], half())
 }
 
+// ---------------------------------------------------------------- launcher glyphs (SPEC-launcher 5.3)
+
+/// Equals sign (the calculator's answer row).
+pub fn equals_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    [5.8, 10.2].iter().any(|&y| dist_seg(u, v, 3.5, snap(y), 12.5, snap(y)) <= st)
+}
+
+/// Command prompt: a chevron and an underscore (run lines).
+pub fn prompt_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    polyline(u, v, &[(3.5, 4.5), (7.5, 8.0), (3.5, 11.5)], st)
+        || dist_seg(u, v, 8.8, snap(12.0), 12.8, snap(12.0)) <= st
+}
+
+/// Application window: frame with a title bar (open windows).
+pub fn window_shape(u: f32, v: f32) -> bool {
+    rrect_outline(u, v, 1.5, 2.5, 14.5, 13.5, 2.0) || dist_seg(u, v, 1.5, snap(6.0), 14.5, snap(6.0)) <= half()
+}
+
+/// Page with a folded corner and two text lines (documents).
+pub fn document_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let (l, r, t, b) = (snap(3.5), snap(12.5), snap(1.5), snap(14.5));
+    let fold = 9.5;
+    polyline(u, v, &[(l, t), (fold, t), (r, t + (r - fold)), (r, b), (l, b), (l, t)], st)
+        || polyline(u, v, &[(fold, t), (fold, t + (r - fold)), (r, t + (r - fold))], st)
+        || [8.2, 11.2].iter().any(|&y| dist_seg(u, v, 6.0, snap(y), 10.0, snap(y)) <= st)
+}
+
+/// Picture: frame, a sun and two hills (images).
+pub fn image_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    rrect_outline(u, v, 1.5, 2.5, 14.5, 13.5, 2.0)
+        || disc_at(u, v, 10.6, 6.2, 1.1)
+        || polyline(u, v, &[(2.5, 12.2), (6.0, 8.2), (8.6, 10.8), (10.4, 9.2), (13.5, 12.2)], st)
+}
+
+/// Box with a lid and a handle slot (archives).
+pub fn archive_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let (l, r) = (snap(3.0), snap(13.0));
+    rrect_outline(u, v, 1.5, 2.5, 14.5, 6.0, 1.0)
+        || polyline(u, v, &[(l, 6.0), (l, snap(13.5)), (r, snap(13.5)), (r, 6.0)], st)
+        || dist_seg(u, v, 6.5, snap(9.2), 9.5, snap(9.2)) <= st
+}
+
+/// Window with a play triangle (programs and installers).
+pub fn executable_shape(u: f32, v: f32) -> bool {
+    let (a, b, c) = ((6.2, 5.8), (6.2, 11.2), (11.0, 8.5));
+    let side = |p: (f32, f32), q: (f32, f32)| (q.0 - p.0) * (v - p.1) - (q.1 - p.1) * (u - p.0);
+    let (s1, s2, s3) = (side(a, b), side(b, c), side(c, a));
+    let inside = (s1 >= 0.0 && s2 >= 0.0 && s3 >= 0.0) || (s1 <= 0.0 && s2 <= 0.0 && s3 <= 0.0);
+    rrect_outline(u, v, 1.5, 2.5, 14.5, 13.5, 2.0) || inside
+}
+
+/// Two sheets, one behind the other (Copy).
+pub fn copy_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    rrect_outline(u, v, 2.5, 5.5, 10.5, 14.0, 1.5)
+        || polyline(
+            u,
+            v,
+            &[
+                (snap(5.5), 3.2),
+                (snap(5.5), snap(2.0)),
+                (snap(13.5), snap(2.0)),
+                (snap(13.5), snap(10.5)),
+                (11.8, snap(10.5)),
+            ],
+            st,
+        )
+}
+
 /// Page with text lines (Log).
 pub fn log_shape(u: f32, v: f32) -> bool {
     let st = half();

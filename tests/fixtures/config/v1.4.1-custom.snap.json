@@ -94,5 +94,45 @@
   "update_check": false,
   "update_auto_install": true,
   "last_update_check": "2026-01-01T00:00:00Z",
-  "update_available": "v9.9.9"
+  "update_available": "v9.9.9",
+  "launcher": {
+    "enabled": true,
+    "chord": "off",
+    "with_powertoys": "yield",
+    "monitor": "pointer",
+    "top_percent": 24,
+    "width": 640,
+    "rows": 8,
+    "animate": false,
+    "keep_query": false,
+    "over_fullscreen": "pass",
+    "learn": true,
+    "announce_selection": false,
+    "providers": {
+      "apps": true,
+      "calc": true,
+      "commands": true,
+      "datetime": true,
+      "files": true,
+      "registry": true,
+      "run": true,
+      "settings": true,
+      "web": true,
+      "windows": true
+    },
+    "prefixes": {
+      "$": "settings",
+      ")": "datetime",
+      ":": "registry",
+      "<": "windows",
+      "=": "calc",
+      ">": "run",
+      "??": "web",
+      "file ": "files"
+    },
+    "web_engine": "google",
+    "web_url": "",
+    "offer_done": false,
+    "powertoys_done": false
+  }
 }

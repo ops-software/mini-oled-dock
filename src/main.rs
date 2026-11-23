@@ -39,11 +39,17 @@ mod calendar;
 mod clock;
 mod config;
 mod datadir;
+mod files_child;
 mod glyphs;
 mod hook;
 mod i18n;
 mod icons;
 mod jumplist;
+mod launcher;
+mod launcher_files;
+#[cfg(feature = "owner-probe")]
+mod launcher_probe;
+mod launcher_sys;
 mod logger;
 mod mem;
 mod metrics;
@@ -71,6 +77,7 @@ mod start_import;
 mod start_search;
 mod surface;
 mod taskbar;
+mod tinysort;
 mod tray_host;
 mod ui;
 mod update;
@@ -92,6 +99,9 @@ use windows::Win32::System::Console::{
     AttachConsole, GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode, SetStdHandle,
     ATTACH_PARENT_PROCESS, CONSOLE_MODE as ConMode, CTRL_BREAK_EVENT, CTRL_C_EVENT, ENABLE_EXTENDED_FLAGS,
     ENABLE_QUICK_EDIT_MODE, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::Diagnostics::Debug::{
+    SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcess;
@@ -138,6 +148,15 @@ thread_local! {
 /// HWND of the dock window (null if it does not exist). Usable from any thread.
 pub fn hwnd() -> HWND {
     HWND(HWND_RAW.load(Relaxed) as *mut c_void)
+}
+
+/// Whether the calling thread is the dock window's (the UI thread): false on any other thread and before the window
+/// exists.
+pub fn on_ui_thread() -> bool {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    // SAFETY: no preconditions; a null or stale handle yields 0, which is no thread's id.
+    unsafe { GetWindowThreadProcessId(hwnd(), None) == GetCurrentThreadId() }
 }
 
 // --------------------------------------------------------------------- CLI
@@ -188,6 +207,26 @@ pub struct Args {
     pub purge_data: bool,
     /// `--update-check`: check for a new release, print the result and exit.
     pub update_check: bool,
+    /// `--update-fetch`: the update check's GET in a child of the dock, its answer on stdout
+    /// (`update::run_fetch_child`); combines with nothing.
+    pub update_fetch: bool,
+    /// `--start-apps`: the AppsFolder catalogue listed in a child of the dock, its arena on stdout
+    /// (`shell_thread::run_apps_child`); combines with nothing.
+    pub start_apps: bool,
+    /// `--start-settings`: the settings catalogue built in a child of the dock, its arena on stdout
+    /// (`start_search::run_settings_child`); combines with nothing.
+    pub start_settings: bool,
+    /// `--start-icons <px>` (8-256): the icons of the AppsFolder ids on stdin made in a child of the dock at `px`, as
+    /// frames on stdout (`shell_thread::run_icons_child`); combines with nothing.
+    pub start_icons: Option<u32>,
+    /// `--launcher-files`: the launcher's file search in a child of the dock (`files_child::run`, plan L2-F2): request
+    /// lines on stdin, frames on stdout; combines with nothing but `--stall` and `--root`.
+    pub launcher_files: bool,
+    /// `--stall <ms>` (owner-probe builds only, with `--launcher-files`): the helper sleeps before each query (V-4).
+    pub stall: Option<u32>,
+    /// `--root <folder>` (with `--launcher-files`; at most 8, each at most 260 UTF-16 units): a folder of
+    /// `launcher.file_folders` the dock accepted; the helper checks each again and trusts none (SPEC 5.4.6).
+    pub roots: Vec<String>,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
     /// `--settings`: ask the running dock to open its Settings window and exit.
@@ -207,7 +246,9 @@ fn parse_args() -> Result<Args, String> {
 
 fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut a = Args::default();
+    let mut flags = 0usize;
     while let Some(s) = it.next() {
+        flags += 1;
         match s.as_str() {
             "--top" => a.top = Some(true),
             "--bottom" => a.top = Some(false),
@@ -235,11 +276,47 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--remove" => a.remove = true,
             "--purge-data" => a.purge_data = true,
             "--update-check" => a.update_check = true,
+            "--update-fetch" => a.update_fetch = true,
+            "--start-apps" => a.start_apps = true,
+            "--start-settings" => a.start_settings = true,
+            "--start-icons" => {
+                let px =
+                    it.next().and_then(|v| v.parse::<u32>().ok()).filter(|px| shell_thread::ICON_PX_RANGE.contains(px));
+                a.start_icons = Some(px.ok_or("--start-icons requires a pixel size from 8 to 256")?);
+            }
+            "--launcher-files" => a.launcher_files = true,
+            #[cfg(feature = "owner-probe")]
+            "--stall" => a.stall = Some(it.next().and_then(|v| v.parse().ok()).ok_or("--stall requires <ms>")?),
+            "--root" if a.roots.len() < launcher::files::MAX_EXTRA_ROOTS => {
+                let r = it.next().filter(|r| r.encode_utf16().count() <= launcher::files::ROOT_UNITS);
+                a.roots.push(r.ok_or("--root requires a folder of at most 260 characters")?);
+            }
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    if a.update_fetch && flags > 1 {
+        return Err("--update-fetch cannot be combined with other arguments".into());
+    }
+    if a.start_apps && flags > 1 {
+        return Err("--start-apps cannot be combined with other arguments".into());
+    }
+    if a.start_settings && flags > 1 {
+        return Err("--start-settings cannot be combined with other arguments".into());
+    }
+    if a.start_icons.is_some() && flags > 1 {
+        return Err("--start-icons cannot be combined with other arguments".into());
+    }
+    if a.stall.is_some() && !a.launcher_files {
+        return Err("--stall requires --launcher-files".into());
+    }
+    if !a.roots.is_empty() && !a.launcher_files {
+        return Err("--root requires --launcher-files".into());
+    }
+    if a.launcher_files && flags > 1 + usize::from(a.stall.is_some()) + a.roots.len() {
+        return Err("--launcher-files cannot be combined with other arguments".into());
     }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
@@ -312,41 +389,48 @@ thread_local! {
     static TRIM: RefCell<TrimState> = RefCell::new(TrimState::default());
 }
 
+/// The trim decision of one tick: `rearm` (data was freed since the last trim, `mem::take_rearm`) allows one more
+/// "hidden" trim in the current hidden period; the 4 s hidden delay, the 60 s gap and "never with a popup or Settings
+/// window open" stay.
+fn trim_step(s: &mut TrimState, now: Instant, visible: bool, popup: bool, rearm: bool) -> Option<&'static str> {
+    if rearm {
+        s.trimmed = false;
+    }
+    let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
+    let mut go = None;
+    if !visible && !popup {
+        let since = *s.hidden_since.get_or_insert(now);
+        if !s.trimmed && rate_ok && now.duration_since(since) >= TRIM_HIDDEN_DELAY {
+            go = Some("hidden");
+        }
+        s.last_activity = Some(now);
+    } else {
+        s.hidden_since = None;
+        s.trimmed = false;
+        if popup {
+            s.last_activity = Some(now);
+        } else {
+            let base = *s.last_activity.get_or_insert(now);
+            if rate_ok && now.duration_since(base) >= TRIM_VISIBLE_IDLE {
+                go = Some("visible-idle");
+                s.last_activity = Some(now);
+            }
+        }
+    }
+    if go.is_some() {
+        s.trimmed = true;
+        s.last_trim = Some(now);
+    }
+    go
+}
+
 /// Decides whether to trim memory now; never during show/hide animations (4 s hidden delay).
 fn trim_tick() {
-    let now = Instant::now();
+    mem::second_pass_tick(Instant::now());
     let visible = ui::is_visible();
     // An open Settings window counts like an open popup: no trim under the user's hands.
     let popup = popup::is_open() || settings_window::is_open();
-    let go = TRIM.with(|s| {
-        let mut s = s.borrow_mut();
-        let rate_ok = s.last_trim.is_none_or(|t| now.duration_since(t) >= TRIM_MIN_GAP);
-        let mut go = None;
-        if !visible && !popup {
-            let since = *s.hidden_since.get_or_insert(now);
-            if !s.trimmed && rate_ok && now.duration_since(since) >= TRIM_HIDDEN_DELAY {
-                go = Some("hidden");
-            }
-            s.last_activity = Some(now);
-        } else {
-            s.hidden_since = None;
-            s.trimmed = false;
-            if popup {
-                s.last_activity = Some(now);
-            } else {
-                let base = *s.last_activity.get_or_insert(now);
-                if rate_ok && now.duration_since(base) >= TRIM_VISIBLE_IDLE {
-                    go = Some("visible-idle");
-                    s.last_activity = Some(now);
-                }
-            }
-        }
-        if go.is_some() {
-            s.trimmed = true;
-            s.last_trim = Some(now);
-        }
-        go
-    });
+    let go = TRIM.with(|s| trim_step(&mut s.borrow_mut(), Instant::now(), visible, popup, mem::take_rearm()));
     if let Some(reason) = go {
         mem::trim(reason);
     }
@@ -373,9 +457,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                     }
                 });
                 if config::poll_changed() {
-                    tray_host::invalidate_trust_cache();
-                    ui::on_config_changed();
-                    update::sync_timer(h);
+                    ui::config_reloaded();
                 }
                 trim_tick();
                 if update::auto_install_pending() {
@@ -477,7 +559,11 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_DOCK_OPEN_SETTINGS => {
-            settings_window::open();
+            if wp.0 == msg::SETTINGS_PAGE_LAUNCHER {
+                settings_window::open_at(settings_pages::Page::Launcher);
+            } else {
+                settings_window::open();
+            }
             LRESULT(0)
         }
         WM_DOCK_UPDATE => {
@@ -638,6 +724,24 @@ fn set_timer(h: HWND, id: usize, ms: u32) {
 }
 
 // --------------------------------------------------------- console / process
+
+/// The error mode of a child mode (`--update-fetch`, `--start-apps`, `--start-settings`, `--start-icons`): a crash in a
+/// third-party shell or icon handler, or a failed file open, ends the child silently instead of showing the user a
+/// dialog; the dock sees the failed exit and takes its fallback.
+fn child_error_mode() -> THREAD_ERROR_MODE {
+    SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+}
+
+/// Whether the arguments select a child mode of the dock; add each new child flag here (the error mode is set for them).
+fn is_child_mode(a: &Args) -> bool {
+    a.update_fetch || a.start_apps || a.start_settings || a.start_icons.is_some() || a.launcher_files
+}
+
+/// Sets `child_error_mode` for the whole process, first thing of a child mode.
+fn set_child_error_mode() {
+    // SAFETY: no preconditions; the mode of this short-lived child process only.
+    unsafe { SetErrorMode(child_error_mode()) };
+}
 
 /// Attaches the parent process console (if any) so that stdout/stderr are visible again in a
 /// terminal despite the `windows` subsystem. Failures are ignored (started from Explorer/task:
@@ -1042,6 +1146,34 @@ fn main() -> std::process::ExitCode {
         println!("{}", version_line());
         return std::process::ExitCode::SUCCESS;
     }
+    if is_child_mode(args) {
+        set_child_error_mode();
+    }
+    // --update-fetch: the update check's GET in a child of the dock (`update::fetch_latest`); stdout only,
+    // no data folder, logger, mutex or console.
+    if args.update_fetch {
+        return std::process::ExitCode::from(update::run_fetch_child().clamp(0, 255) as u8);
+    }
+    // --start-apps: the AppsFolder catalogue listed in a child of the dock (`shell_thread::list_apps_arena`); stdout
+    // only, no data folder, logger, mutex or console.
+    if args.start_apps {
+        return std::process::ExitCode::from(shell_thread::run_apps_child().clamp(0, 255) as u8);
+    }
+    // --start-settings: the settings catalogue built in a child of the dock (`start_search::ensure_settings_cache` and
+    // Start's load); stdout only, no data folder, logger, mutex or console.
+    if args.start_settings {
+        return std::process::ExitCode::from(start_search::run_settings_child().clamp(0, 255) as u8);
+    }
+    // --start-icons <px>: the Start menu's and the launcher's icons made in a child of the dock
+    // (`shell_thread::spawn_icon_job`); stdin and stdout only, no data folder, logger, mutex or console.
+    if let Some(px) = args.start_icons {
+        return std::process::ExitCode::from(shell_thread::run_icons_child(px).clamp(0, 255) as u8);
+    }
+    // --launcher-files: the launcher's file search in a child of the dock (`files_child::run`, plan L2-F2); stdin and
+    // stdout only, no data folder, logger, mutex or console.
+    if args.launcher_files {
+        return std::process::ExitCode::from(files_child::run(args.stall.unwrap_or(0), &args.roots).clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1197,11 +1329,82 @@ mod tests {
     }
 
     #[test]
+    fn rearm_trims_again_once() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        // Hidden for 4 s trims once.
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(2), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        // Still hidden at 60 s with no rearm: nothing.
+        assert_eq!(trim_step(&mut s, at(60), false, false, false), None);
+        // Rearm at 70 s while hidden: a trim at 70 s.
+        assert_eq!(trim_step(&mut s, at(70), false, false, true), Some("hidden"));
+        // Rearm at 75 s: nothing until the gap (130 s) is over, then one.
+        assert_eq!(trim_step(&mut s, at(75), false, false, true), None);
+        assert_eq!(trim_step(&mut s, at(100), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(129), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(130), false, false, false), Some("hidden"));
+        assert_eq!(trim_step(&mut s, at(200), false, false, false), None);
+
+        // A rearm while visible does not trim; the bar hidden at t trims at t + 4 s.
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), true, false, true), None);
+        assert_eq!(trim_step(&mut s, at(10), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(13), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(14), false, false, false), Some("hidden"));
+
+        // A popup open plus a rearm: no trim; the trim comes 4 s after the popup closes, the bar still hidden.
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), false, true, true), None);
+        assert_eq!(trim_step(&mut s, at(30), false, true, false), None);
+        assert_eq!(trim_step(&mut s, at(31), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(34), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(35), false, false, false), Some("hidden"));
+    }
+
+    #[test]
     fn settings_flag_parses() {
         let a = p(&["--settings"]).unwrap();
         assert!(a.settings && !a.install);
         assert!(!p(&[]).unwrap().settings);
         assert!(p(&["--setings"]).is_err());
+    }
+
+    #[test]
+    fn the_child_modes_are_told_from_the_rest() {
+        let all = [
+            &["--update-fetch"][..],
+            &["--start-apps"],
+            &["--start-settings"],
+            &["--start-icons", "32"],
+            &["--launcher-files"],
+        ];
+        for a in all {
+            assert!(is_child_mode(&p(a).unwrap()), "{a:?}");
+        }
+        for a in [&[][..], &["--preview", "x"], &["--watchdog", "1", "ev"], &["--version"]] {
+            assert!(!is_child_mode(&p(a).unwrap()), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn the_child_modes_set_the_error_mode_before_any_work() {
+        assert_eq!(child_error_mode().0, 0x0001 | 0x0002 | 0x8000);
+        let src = include_str!("main.rs");
+        let call = src.find("        set_child_error_mode();").expect("the call");
+        let firsts = [
+            "run_fetch_child()",
+            "run_apps_child()",
+            "run_settings_child()",
+            "run_icons_child(px)",
+            "run(args.stall.unwrap_or(0), &args.roots)",
+        ];
+        for first in firsts {
+            let at = src.find(&format!("::{first}.clamp")).expect(first);
+            assert!(call < at, "{first} runs after the error mode is set");
+        }
     }
 
     #[test]
@@ -1213,11 +1416,73 @@ mod tests {
         assert_eq!(p(&["--update-install", "v1.4.1"]).unwrap().update_install.as_deref(), Some("v1.4.1"));
         assert!(p(&["--update-check"]).unwrap().update_check);
         assert!(p(&["--version"]).unwrap().version);
+        let f = p(&[update::FETCH_FLAG]).unwrap(); // the flag the dock starts its child with
+        assert!(f.update_fetch && !f.update_check);
+        assert!(!p(&["--update-check"]).unwrap().update_fetch);
+        let s = p(&[shell_thread::APPS_FLAG]).unwrap(); // the flag of the apps child (L3 T17)
+        assert!(s.start_apps && !s.settings && !s.autostart && !s.update_fetch);
+        assert!(!p(&["--autostart"]).unwrap().start_apps);
+        let s = p(&[start_search::SETTINGS_FLAG]).unwrap(); // the flag of the settings child (L3 T18)
+        assert!(s.start_settings && !s.start_apps && !s.settings && !s.autostart);
+        assert!(!p(&["--settings"]).unwrap().start_settings);
+        let i = p(&[shell_thread::ICONS_FLAG, "40"]).unwrap(); // the flag of the icons child (L3 T20)
+        assert!(i.start_icons == Some(40) && !i.start_apps && !i.start_settings && !i.settings);
+        assert_eq!(p(&["--start-icons", "8"]).unwrap().start_icons, Some(8));
+        assert_eq!(p(&["--start-icons", "256"]).unwrap().start_icons, Some(256));
+        assert_eq!(p(&["--autostart"]).unwrap().start_icons, None);
+        for bad in ["0", "300", "x", "7", "257", "-1", "", " 40", "40px"] {
+            assert!(p(&["--start-icons", bad]).is_err(), "{bad:?}");
+        }
+        assert!(p(&["--start-icons"]).is_err(), "a size is required");
+        // The files helper (plan L2-F2): alone; `--stall` only in owner-probe builds and only with it.
+        let f = p(&["--launcher-files"]).unwrap();
+        assert!(f.launcher_files && f.stall.is_none() && f.start_icons.is_none() && !f.autostart);
+        assert!(!p(&["--autostart"]).unwrap().launcher_files);
+        for bad in [
+            &["--launcher-files", "--autostart"][..],
+            &["--autostart", "--launcher-files"],
+            &["--launcher-files", "--launcher-files"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
+        let stalled = p(&["--launcher-files", "--stall", "3000"]);
+        #[cfg(feature = "owner-probe")]
+        {
+            assert_eq!(stalled.unwrap().stall, Some(3000));
+            assert_eq!(p(&["--stall", "3000", "--launcher-files"]).unwrap().stall, Some(3000));
+            assert!(p(&["--stall", "3000"]).is_err(), "only with --launcher-files");
+            assert!(p(&["--launcher-files", "--stall", "x"]).is_err());
+            assert!(p(&["--launcher-files", "--stall", "1", "--autostart"]).is_err());
+        }
+        #[cfg(not(feature = "owner-probe"))]
+        assert!(stalled.is_err(), "no --stall in a release build");
+        // The folders of launcher.file_folders the dock passes: only with the helper, at most 8, each bounded.
+        let edge = format!("D:\\{}", "d".repeat(257));
+        let f = p(&["--launcher-files", "--root", "D:\\", "--root", "E:\\Old docs", "--root", &edge]).unwrap();
+        assert_eq!((f.launcher_files, f.roots), (true, vec!["D:\\".to_string(), "E:\\Old docs".into(), edge]));
+        assert!(p(&["--launcher-files"]).unwrap().roots.is_empty());
+        let mut eight = vec!["--launcher-files"];
+        for _ in 0..8 {
+            eight.extend(["--root", "E:\\x"]);
+        }
+        assert_eq!(p(&eight).unwrap().roots.len(), 8);
+        eight.extend(["--root", "E:\\x"]);
+        let over = format!("D:\\{}", "d".repeat(258));
+        for bad in [
+            &eight[..],
+            &["--root", "D:\\"],
+            &["--launcher-files", "--root"],
+            &["--launcher-files", "--root", over.as_str()],
+            &["--launcher-files", "--root", "D:\\", "--autostart"],
+            &["--autostart", "--root", "D:\\"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 8] = [
+        let bad: [&[&str]; 24] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1226,6 +1491,22 @@ mod tests {
             &["--install", "--uninstall"],
             &["--uninstall", "--no-relaunch"],
             &["--update-install"],
+            &["--update-fetch", "--console"],
+            &["--update-check", "--update-fetch"],
+            &["--version", "--update-fetch"],
+            &["--update-fetch", "--update-fetch"],
+            &["--start-apps", "--autostart"],
+            &["--settings", "--start-apps"],
+            &["--start-apps", "--update-fetch"],
+            &["--start-apps", "--start-apps"],
+            &["--start-settings", "--autostart"],
+            &["--settings", "--start-settings"],
+            &["--start-settings", "--start-apps"],
+            &["--start-settings", "--start-settings"],
+            &["--start-icons", "40", "--autostart"],
+            &["--settings", "--start-icons", "40"],
+            &["--start-icons", "40", "--start-apps"],
+            &["--start-icons", "40", "--start-icons", "40"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");

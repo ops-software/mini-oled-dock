@@ -46,6 +46,13 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # The owner-probe build (launcher L0 sessions and live checks): its switches and probe lines compile only with it.
+      - name: Clippy (owner-probe)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo clippy --locked --all-targets --features owner-probe -- -D warnings
+
       - name: Cache cargo-deny
         uses: actions/cache@v4
         with:
@@ -109,6 +116,12 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked
 
+      - name: Tests (owner-probe)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked --features owner-probe
+
       - name: Golden diffs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -152,6 +165,36 @@ jobs:
           name: dock-release
           path: target/release/dock.exe
           retention-days: 7
+
+  # Launcher query cost (LC-3): the operation-count tests run in the test job; this one times the release build against a
+  # reference workload in the same process. The gate is a pending budgets.json row until the owner approves the calibration.
+  bench:
+    runs-on: windows-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      - name: Launcher bench
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-bench
+        run: |
+          $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
+          $out = cargo test --release --locked --bin dock launcher::providers::bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          # A filter that matches no test passes silently: the job fails unless the bench ran and printed its line.
+          if ($out -match 'running 0 tests') { throw 'launcher bench: no test ran' }
+          if (-not ($out -match 'bench: launcher \d+ ns')) { throw 'launcher bench: no bench line printed' }
 
   regen-golden:
     runs-on: windows-latest

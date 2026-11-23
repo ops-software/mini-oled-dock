@@ -702,6 +702,8 @@ fn settings_png_with(
         data_dir: Some("C:\\ProgramData\\mini-oled-dock"),
         log_path: Some("C:\\ProgramData\\mini-oled-dock\\dock.log"),
         trust_elevated: false,
+        powertoys: false,
+        chord_held: None,
     };
     // The mini bar is drawn by the bar renderer, which reads the global config.
     crate::config::set(c.clone());
@@ -812,6 +814,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         "popup_start" => crate::popup::popup_start::new(),
         "popup_startmenu"
         | "popup_startmenu_search"
+        | "popup_startmenu_offer"
         | "popup_startmenu_win11"
         | "popup_startmenu_win11_grid"
         | "popup_startmenu_menu"
@@ -853,6 +856,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             let (over, folders) = match name {
                 "popup_startmenu_menu" => (Some(PreviewOver::Menu), Vec::new()),
                 "popup_startmenu_letters" => (Some(PreviewOver::Letters), Vec::new()),
+                "popup_startmenu_offer" => (Some(PreviewOver::Offer), Vec::new()),
                 "popup_startmenu_win11_folder" => {
                     let apps = ["spotify", "steam", "discord"].map(str::to_string).to_vec();
                     (Some(PreviewOver::Folder), vec![crate::config::StartFolder { name: "Games".to_string(), apps }])
@@ -867,18 +871,17 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             });
             let apps =
                 APPS.iter().map(|&(n, l, c)| (n.to_lowercase(), n.to_string(), mock_icon(l, c, m.px(32)))).collect();
-            let query = if name == "popup_startmenu_search" { "te" } else { "" };
+            let query = if matches!(name, "popup_startmenu_search" | "popup_startmenu_offer") { "te" } else { "" };
             let style = if name.starts_with("popup_startmenu_win11") {
                 crate::config::StartStyle::Windows11
             } else {
                 crate::config::StartStyle::Compact
             };
-            crate::popup::popup_startmenu::preview_new(
-                apps,
-                query,
-                style,
-                over,
-            )
+            crate::popup::popup_startmenu::preview_new(apps, query, style, over)
+        }
+        n if crate::popup::popup_launcher::PreviewScene::from_name(n).is_some() => {
+            let scene = crate::popup::popup_launcher::PreviewScene::from_name(n)?;
+            crate::popup::popup_launcher::preview_new(scene)
         }
         "popup_tray" | "popup_tray_customize" => {
             let ic = mock_icons(m, BarSizes::default());
@@ -891,7 +894,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 .enumerate()
                 .map(|(i, (n, b))| (n.to_lowercase(), n.to_string(), Some(b.clone()), i < TRAY_BAR))
                 .collect();
-            rows.sort_by_key(|r| r.1.to_lowercase());
+            crate::tinysort::sort_by_key(&mut rows, |r| r.1.to_lowercase());
             crate::popup_tray::preview_new(cells, rows, name == "popup_tray_customize")
         }
         _ => return None,
@@ -1072,6 +1075,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_start", 4),
             ("popup_startmenu", 12),
             ("popup_startmenu_search", 1),
+            ("popup_startmenu_offer", 1),
             ("popup_startmenu_win11", 5),
             ("popup_startmenu_win11_grid", 6),
             // Overlays open: control 0 is the backdrop, then their rows / cells.
@@ -1080,6 +1084,29 @@ pub fn run(dir: &str) -> i32 {
             ("popup_startmenu_win11_folder", 1),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
+            // Start's search control, the launcher's and the larger candidate, for the owner's Q7 choice.
+            ("launcher_empty", 0),
+            ("launcher_inactive", 0),
+            ("launcher_apps", 0),
+            ("launcher_running", 0),
+            ("launcher_calc", 0),
+            ("launcher_time", 0),
+            ("launcher_units", 0),
+            ("launcher_run", 0),
+            ("launcher_run_review", 0),
+            ("launcher_windows", 0),
+            ("launcher_notice", 0),
+            ("launcher_error", 0),
+            ("launcher_field_pair", 0),
+            ("launcher_actions", 0),
+            ("launcher_notice_actions", 0),
+            ("launcher_notice_took_over", 0),
+            ("launcher_alias", 0),
+            ("launcher_alias_prompt", 0),
+            ("launcher_files", 0),
+            ("launcher_files_busy", 0),
+            ("launcher_files_mode", 0),
+            ("launcher_search_off", 0),
         ] {
             // Popups read the background tone from the config: every one starts from the defaults.
             crate::config::set(plan().base_config());
@@ -1111,6 +1138,19 @@ pub fn run(dir: &str) -> i32 {
         let tall =
             settings_png_with(dir, "settings_modules_tray.png", m, modules, &c, (false, false), None, (860, 900));
         failures += i32::from(!tall);
+        // The whole Launcher page, down to the config file row.
+        let launcher = crate::settings_pages::Page::Launcher;
+        // With the chord set and four invented aliases, one of them a kind the launcher ignores.
+        let mut c = c;
+        c.launcher.chord = "alt+space".into();
+        for (w, t) in
+            [("web", "https://example.com/"), ("notes", "app:Contoso.Notes_1234!App"), ("proj", "D:\\Projects")]
+        {
+            c.launcher.aliases.insert(w.into(), t.into());
+        }
+        c.launcher.aliases.insert("game".into(), "steam://run/1".into());
+        let file = "settings_launcher_full.png";
+        failures += i32::from(!settings_png_with(dir, file, m, launcher, &c, (false, false), None, (860, 1860)));
         crate::i18n::set_preview(false);
         for page in crate::settings_pages::Page::ALL {
             let c = Config { language: crate::config::Language::It, ..Config::default() };

@@ -15,6 +15,9 @@
 //!    (`write_atomic`), so the ACE is never lost and the replace is atomic.
 //!  * `<root>\config.json.bak`, `dock.log`, `dock.log.1`, `taskbar-state`, `cache\`: admin-only
 //!    write (they inherit the root DACL).
+//!  * `<root>\cache\<SID>\`: the launcher's history of the shell user with that SID
+//!    (`user_cache_dir`): its own protected DACL, SYSTEM and Administrators full control, that user
+//!    read only, no ACE for BUILTIN\Users (who can read the rest of the root).
 //!  * `<root>\icons\`: extra ACEs let the token user add files (and change the files inside). Since
 //!    the user can create entries there, custom icons are opened WITHOUT following reparse points,
 //!    must be single-link regular files whose final path is exactly `<icons>\<name>`, and are decoded
@@ -65,9 +68,9 @@ use windows::Win32::Storage::FileSystem::{
     SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, VOLUME_NAME_DOS,
-    WRITE_DAC,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GETFINALPATHNAMEBYHANDLE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL,
+    SYNCHRONIZE, VOLUME_NAME_DOS, WRITE_DAC,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
@@ -115,6 +118,12 @@ const MASK_WRITE_LIKE: u32 =
 /// SDDL of the root: owner Administrators, protected DACL, inheritable to files and subfolders.
 fn root_sddl() -> String {
     format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x{MASK_READ_EXECUTE:x};;;BU)")
+}
+
+/// SDDL of `cache\<user>` (the launcher's history): SYSTEM and Administrators full control, `user` read
+/// only, inherited by the files; no BUILTIN\Users ACE, so no other account reads it.
+fn user_cache_sddl(user: &str) -> Option<String> {
+    is_sid_string(user).then(|| format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;{user})"))
 }
 
 /// SDDL of `config.json`: like the root (not inheritable: it is a file) plus read + write data for `user`.
@@ -277,6 +286,23 @@ pub fn config_path() -> Option<PathBuf> {
 /// `<root>\cache` (icon PNG cache), only if verified.
 pub fn cache_dir() -> Option<PathBuf> {
     root_ref().filter(|r| r.cache_ok).map(|r| r.path.join(CACHE_NAME))
+}
+
+/// `<root>\cache\<sid>`, the launcher's history folder of the shell user `sid`, created or checked and
+/// re-secured with `user_cache_sddl` (elevated, verified root only). Anything that is not a SID string is
+/// refused before it reaches a path or an SDDL string.
+pub fn user_cache_dir(sid: &str) -> Result<PathBuf, String> {
+    let sddl = user_cache_sddl(sid).ok_or_else(|| "not a SID".to_string())?;
+    let r = writable_root()?;
+    if !r.cache_ok {
+        return Err("no verified cache folder".into());
+    }
+    let path = r.path.join(CACHE_NAME).join(sid);
+    let mut notes = Vec::new();
+    match ensure_subdir(&path, Some(&sddl), true, &mut notes) {
+        Some(_) => Ok(path),
+        None => Err(notes.join("; ")),
+    }
 }
 
 /// `<root>\icons` (the user's custom PNGs), only if verified.
@@ -494,12 +520,19 @@ pub enum FileAcl {
 
 /// Opens `path` for reading WITHOUT following reparse points and checks it is a regular file
 /// (single hard link if `single_link`). Errors keep `NotFound` for a missing file.
-fn open_checked(path: &Path, single_link: bool) -> io::Result<File> {
-    let f = OpenOptions::new()
-        .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)?;
+pub(crate) fn open_checked(path: &Path, single_link: bool) -> io::Result<File> {
+    open_checked_shared(path, single_link, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+}
+
+/// `open_checked` with read sharing only: while the handle is open nobody can open the file for writing, truncate,
+/// rename or delete it (a file mapped from it can never change under its reader, L3 T19).
+pub(crate) fn open_checked_read_only(path: &Path, single_link: bool) -> io::Result<File> {
+    open_checked_shared(path, single_link, FILE_SHARE_READ)
+}
+
+fn open_checked_shared(path: &Path, single_link: bool, share: FILE_SHARE_MODE) -> io::Result<File> {
+    let f =
+        OpenOptions::new().read(true).share_mode(share.0).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0).open(path)?;
     let info = file_info(&f)?;
     check_regular(info.dwFileAttributes, info.nNumberOfLinks, single_link)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
@@ -579,6 +612,12 @@ fn checked_dir(path: &Path) -> Result<String, String> {
         Verdict::Use => final_path(handle_of(&dir.handle)).ok_or_else(|| format!("{shown}: final path unavailable")),
         v => Err(format!("{shown} is not usable ({v:?})")),
     }
+}
+
+/// true for an existing folder no non-admin can write in: it classifies `Use` as is (a real folder, admin-owned, with an
+/// admin-only DACL). `update::child_exe` asks it of the running exe's folder.
+pub(crate) fn is_admin_only_dir(path: &Path) -> bool {
+    checked_dir(path).is_ok()
 }
 
 /// `<root>\update`, which must already exist and be admin-only.
@@ -1059,7 +1098,7 @@ fn token_user_sid() -> Option<String> {
     sid_string(tu.User.Sid)
 }
 
-fn known_folder(id: &GUID) -> Option<PathBuf> {
+pub(crate) fn known_folder(id: &GUID) -> Option<PathBuf> {
     // SAFETY: `id` is a valid KNOWNFOLDERID; no token = current user. The PWSTR is freed below.
     let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.ok()?;
     // SAFETY: `p` is a NUL-terminated string returned by the call above.
@@ -1195,6 +1234,22 @@ mod tests {
         assert!(config_sddl("S-1-5)(A;;FA;;;WD").is_none());
         assert!(icons_sddl("WD").is_none());
         assert!(config_sddl("").is_none());
+    }
+
+    #[test]
+    fn user_cache_sddl_has_no_users_ace() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let s = user_cache_sddl(sid).unwrap_or_default();
+        assert_eq!(s, "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;S-1-5-21-1-2-3-1001)");
+        assert!(!s.contains(";BU)") && !s.contains("S-1-5-32-545"), "no BUILTIN\\Users ACE: {s}");
+        assert!(SecDesc::from_sddl(&s).is_ok(), "{s}");
+        // Neither an SDDL injection nor a path is ever made of something that is not a SID.
+        for bad in ["S-1-5)(A;OICI;FA;;;WD", "WD", "", "S-1-", "..", "S-1-5-21-1\\..\\x", "s-1-5-18"] {
+            assert!(user_cache_sddl(bad).is_none(), "{bad:?}");
+            assert!(user_cache_dir(bad).is_err(), "{bad:?}");
+        }
+        // Unit tests never call init(): nothing is created.
+        assert!(user_cache_dir(sid).is_err());
     }
 
     #[test]

@@ -537,7 +537,7 @@ fn read_items(l: &UserNotificationListener, rd: &mut Reader, full: bool) -> Resu
             Err(e) => log!("notif: entry {i} skipped: {e}"),
         }
     }
-    raw.sort_by(|a, b| b.1.cmp(&a.1));
+    crate::tinysort::sort_by(&mut raw, |a, b| b.1.cmp(&a.1));
     raw.truncate(MAX_ITEMS);
     let mut old = std::mem::take(&mut rd.cache);
     let mut items = Vec::with_capacity(raw.len());

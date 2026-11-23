@@ -66,14 +66,43 @@ pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
 /// INSTEAD of the second `WM_DOCK_TOGGLE`. `main` calls `ui::open_start_menu()`.
 pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
 /// Popups, the quick-links menu and `--settings` -> dock window: open the Settings window (or bring
-/// the open one to the front). wParam = lParam = 0. `main` calls `settings_window::open()`.
+/// the open one to the front). wParam = 0 (`SETTINGS_PAGE_LAUNCHER` from the launcher's Ctrl+,), lParam = 0. `main` calls
+/// `settings_window::open()`, or `open_at(Page::Launcher)` for the launcher's value.
 pub const WM_DOCK_OPEN_SETTINGS: u32 = WM_APP + 40;
+/// wParam of `WM_DOCK_OPEN_SETTINGS`: open on the Launcher page.
+pub const SETTINGS_PAGE_LAUNCHER: usize = 1;
 /// update worker (`update` thread) -> UI: the update status changed. wParam = lParam = 0.
 /// Consecutive posts may be coalesced: re-read `update::status()`.
 pub const WM_DOCK_UPDATE: u32 = WM_APP + 17;
+/// hook -> UI: the launcher's chord was swallowed. wParam = the sequence number (`hook::LAUNCHER_SEQ`), lParam =
+/// `kb.time` of the key (GetTickCount clock). The UI calls `hook::ack_launcher(seq)` before anything else, then
+/// `hook::post_verdict` decides (open, close or drop).
+pub const WM_DOCK_LAUNCHER: u32 = WM_APP + 24;
+/// hook -> UI: the chord passed under the YIELD flag (PowerToys answers it). wParam = 0, lParam = `kb.time`.
+pub const WM_DOCK_LAUNCHER_YIELDED: u32 = WM_APP + 25;
+/// launcher -> dock window: the close a type-ahead replay asked for at the launcher's first activation, posted so it
+/// runs outside that activation (`popup_launcher::on_focus`). wParam = the open's sequence, lParam = 0.
+pub const WM_DOCK_LAUNCHER_CLOSE: u32 = WM_APP + 26;
+/// hook -> UI: the chord passed under the FULLSCREEN flag, or failed open. wParam = the newest sequence the hook issued
+/// (`hook::LAUNCHER_SEQ`), lParam = `kb.time`. The UI calls `hook::resync_launcher(wParam)` first (every post before
+/// the note was handled, a lost one included), then computes the pass flags again: a window can leave fullscreen
+/// without a foreground change.
+pub const WM_DOCK_LAUNCHER_PASSED: u32 = WM_APP + 27;
+/// PowerToys (SPEC-launcher 5.7), only while the chord is Alt+Space. wParam 0: a chord owner the launcher waits on exited
+/// (posted by the thread-pool wait of `launcher_sys`); 1-4: the answer to the PowerToys notice (posted by the launcher, so
+/// the config is written outside the popup's content). lParam = 0.
+pub const WM_DOCK_LAUNCHER_PT: u32 = WM_APP + 28;
+/// launcher -> dock window: an alias was saved or removed in the launcher (plan L2-A2), posted so config.json is written
+/// outside the popup's content and the key handler. The change waits in `popup_launcher::hold_alias_op`'s slot (a newer
+/// one replaces it). wParam = lParam = 0. Posted only while a chord is set.
+pub const WM_DOCK_LAUNCHER_ALIAS: u32 = WM_APP + 29;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
+// `WM_APP + 18` and `+ 19` are RESERVED by WS-C: the config change and `WM_HOOK_NOTE`, the hook thread's message to
+// itself (defined privately in `hook.rs`). `WM_HOOK_NOTE`'s wParam values 1-15 belong to WS-C (1 fail-open on,
+// 2 fail-open off, 3 test stall, 4 bar shown, 5 bar hidden) and 16-31 to the launcher (16 =
+// `NOTE_LAUNCHER_FAIL_OPEN`). `WM_APP + 20..23` stay for shell-thread messages.
 
 // -------------------------------------- THREAD messages (PostThreadMessageW)
 
@@ -148,6 +177,26 @@ pub const TIMER_POPUP_FOCUS: usize = 32;
 /// 60 s one-shot armed when the Start menu closes, killed when one opens: frees the Start catalog
 /// and icon cache (`popup_startmenu::release`) if no Start menu is open by then.
 pub const TIMER_POPUP_START_RELEASE: usize = 33;
+/// 11 min one-shot (on the popup window) armed when the Start data is released, killed when a Start menu opens: it
+/// re-arms the idle trim so the next hidden trim makes COM's second, MTA `CoFreeUnusedLibraries` call (M1 F4).
+/// 34 is the launcher's, 40 to 42 belong to the dock window, so 43.
+pub const TIMER_POPUP_COM_FREE: usize = 43;
+// The launcher's one-shots, on the DOCK window (a popup window can be destroyed, and its timers with it):
+// `ui::on_timer` forwards 34-36 and 39 to `popup_launcher::on_timer`, which kills each before acting; `popup::shutdown` kills
+// them all. None is armed while the chord is off.
+/// 120 ms one-shot while the launcher is open: the panel shrinks once no key came for that long.
+pub const TIMER_LAUNCHER_SHRINK: usize = 34;
+/// 10 s one-shot after the dock starts: the launcher's catalogue is listed.
+pub const TIMER_LAUNCHER_WARM: usize = 35;
+/// 2 s one-shot after a launcher close: its state files are saved.
+pub const TIMER_LAUNCHER_SAVE: usize = 36;
+// 37: unused. It was the launcher's 10-minute release of its settings rows; since L3 T19 the settings are mapped at each
+// open and dropped at its close.
+// 38: unused. It was to end the launcher's files worker 60 s after a close; since plan L2 D2 the files helper ends at the
+// close itself (`launcher_files::end`), so nothing of files stays while the launcher is closed.
+/// 60 s one-shot after the chord becomes Alt+Space (the dock's start): PowerToys detection again; `ANSWER_MS`
+/// (`launcher::powertoys`) after a chord passed under YIELD: the end of its answer window (L1b-5).
+pub const TIMER_LAUNCHER_PT: usize = 39;
 
 // SETTINGS window timers (`DockSettings` hwnd; handled only by `settings_window`). Timer ids are per
 // HWND, so they could not clash with the dock window's private ones (`ui.rs`: 40, 41, 42), but 50 to

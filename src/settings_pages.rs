@@ -25,6 +25,7 @@ pub(crate) enum Page {
     Appearance,
     Bar,
     Start,
+    Launcher,
     Modules,
     Screen,
     Updates,
@@ -32,14 +33,23 @@ pub(crate) enum Page {
 }
 
 impl Page {
-    pub(crate) const ALL: [Page; 7] =
-        [Page::Appearance, Page::Bar, Page::Start, Page::Modules, Page::Screen, Page::Updates, Page::About];
+    pub(crate) const ALL: [Page; 8] = [
+        Page::Appearance,
+        Page::Bar,
+        Page::Start,
+        Page::Launcher,
+        Page::Modules,
+        Page::Screen,
+        Page::Updates,
+        Page::About,
+    ];
 
     pub(crate) fn title(self) -> &'static str {
         match self {
             Page::Appearance => tr("Appearance", "Aspetto"),
             Page::Bar => tr("Bar", "Barra"),
             Page::Start => "Start",
+            Page::Launcher => "Launcher",
             Page::Modules => tr("Modules", "Moduli"),
             Page::Screen => tr("Screen", "Schermo"),
             Page::Updates => tr("Updates", "Aggiornamenti"),
@@ -52,6 +62,7 @@ impl Page {
             Page::Appearance => tr("Colour, sizes and language of the bar", "Colore, dimensioni e lingua della barra"),
             Page::Bar => tr("Where the bar sits and how it behaves", "Dove sta la barra e come si comporta"),
             Page::Start => tr("The Start button and the Start menu", "Il pulsante Start e il menu Start"),
+            Page::Launcher => tr("Find and start anything from one bar", "Trova e avvia qualsiasi cosa da una barra"),
             Page::Modules => tr("What the bar shows on the right", "Cosa mostra la barra a destra"),
             Page::Screen => tr("The display the bar sits on", "Lo schermo su cui sta la barra"),
             Page::Updates => tr("New versions from GitHub", "Nuove versioni da GitHub"),
@@ -64,6 +75,7 @@ impl Page {
             Page::Appearance => glyphs::palette_shape,
             Page::Bar => glyphs::bar_shape,
             Page::Start => glyphs::grid_shape,
+            Page::Launcher => crate::popup::popup_startmenu::magnifier,
             Page::Modules => glyphs::list_shape,
             Page::Screen => glyphs::monitor_shape,
             Page::Updates => glyphs::refresh_shape,
@@ -77,6 +89,7 @@ impl Page {
             Page::Appearance => "appearance",
             Page::Bar => "bar",
             Page::Start => "start",
+            Page::Launcher => "launcher",
             Page::Modules => "modules",
             Page::Screen => "screen",
             Page::Updates => "updates",
@@ -119,6 +132,22 @@ pub(crate) enum Setting {
     /// Admin-only `HKLM\SOFTWARE\mini-oled-dock\TrustElevatedTrayIcons`, NOT in the config: the state
     /// comes from `Ctx::trust_elevated` and a click gives `Effect::TrustElevated`.
     TrustElevatedTray,
+    /// `launcher.enabled`.
+    LauncherOn,
+    /// `launcher.chord`: Alt+Space / Alt+Shift+Space / Off.
+    LauncherChord,
+    /// `launcher.with_powertoys`: leave Alt+Space to Command Palette / take it.
+    LauncherPowerToys,
+    /// `launcher.monitor`: Pointer / Active window / Primary.
+    LauncherMonitor,
+    /// `launcher.over_fullscreen`: Pass / Open.
+    LauncherFullscreen,
+    /// `launcher.providers` entry (apps cannot be switched off).
+    LauncherProvider(&'static str),
+    /// `launcher.web_engine`: Google / Bing / DuckDuckGo / Custom (the template is set in the config file).
+    LauncherWeb,
+    /// `launcher.learn`: frecency and run history.
+    LauncherLearn,
 }
 
 /// A value set by a slider.
@@ -129,6 +158,10 @@ pub(crate) enum Slider {
     AppText,
     TrayIcon,
     Module,
+    /// `launcher.width`, in steps of 40.
+    LauncherWidth,
+    /// `launcher.rows`.
+    LauncherRows,
 }
 
 /// A button that runs something instead of changing a setting.
@@ -142,6 +175,14 @@ pub(crate) enum Action {
     OpenDataFolder,
     OpenLog,
     ExitDock,
+    /// Settings > Launcher: the run history and the learned order go.
+    ForgetHistory,
+    /// Settings > Launcher: `config.json` in Notepad.
+    EditConfig,
+    /// Settings > Launcher: the launcher opens on its alias prompt.
+    AddLauncherAlias,
+    /// Settings > Launcher: Remove on an alias row, the `aliases::word_hash` of its word.
+    RemoveLauncherAlias(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +269,10 @@ pub(crate) struct Ctx<'a> {
     pub log_path: Option<&'a str>,
     /// `tray_host::trust_elevated_tray_icons` (the HKLM switch).
     pub trust_elevated: bool,
+    /// A PowerToys chord owner (Command Palette or PowerToys Run) is running (`popup_launcher::pt_detected`).
+    pub powertoys: bool,
+    /// The last chord picked on the Launcher page was refused because another app holds it: `Some(shift)` is Alt+Shift+Space.
+    pub chord_held: Option<bool>,
 }
 
 // ------------------------------------------------------------------ helpers moved from the old popup
@@ -264,6 +309,15 @@ pub(crate) fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
         }
         Setting::DisplayMode => vec![tr("Icon + name", "Icona + nome"), tr("Icon", "Icona"), tr("Name", "Nome")],
         Setting::BatteryShow => vec![tr("Auto", "Automatica"), tr("On", "S\u{ec}"), tr("Off", "No")],
+        Setting::LauncherChord => {
+            vec![tr("Alt+Space", "Alt+Spazio"), tr("Alt+Shift+Space", "Alt+Maiusc+Spazio"), tr("Off", "No")]
+        }
+        Setting::LauncherPowerToys => vec![tr("Leave it", "Lascialo"), tr("Take it", "Prendilo")],
+        Setting::LauncherMonitor => {
+            vec![tr("Pointer", "Puntatore"), tr("Active window", "Finestra attiva"), tr("Primary", "Principale")]
+        }
+        Setting::LauncherFullscreen => vec![tr("Pass", "Passa"), tr("Open", "Apri")],
+        Setting::LauncherWeb => vec!["Google", "Bing", "DuckDuckGo", tr("Custom", "Personalizzato")],
         _ => Vec::new(),
     }
 }
@@ -296,6 +350,24 @@ pub(crate) fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
             BatteryShow::On => 1,
             BatteryShow::Off => 2,
         },
+        Setting::LauncherChord => match c.launcher.chord.as_str() {
+            "alt+space" => 0,
+            "alt+shift+space" => 1,
+            _ => 2,
+        },
+        Setting::LauncherPowerToys => usize::from(c.launcher.with_powertoys == "take"),
+        Setting::LauncherMonitor => match c.launcher.monitor.as_str() {
+            "active" => 1,
+            "primary" => 2,
+            _ => 0,
+        },
+        Setting::LauncherFullscreen => usize::from(c.launcher.over_fullscreen == "open"),
+        Setting::LauncherWeb => match c.launcher.web_engine.as_str() {
+            "bing" => 1,
+            "duckduckgo" => 2,
+            "custom" => 3,
+            _ => 0,
+        },
         _ => return None,
     })
 }
@@ -318,7 +390,45 @@ pub(crate) fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
             c.display_mode = [DisplayMode::IconText, DisplayMode::Icon, DisplayMode::Text][j.min(2)];
         }
         Setting::BatteryShow => c.show_battery = [BatteryShow::Auto, BatteryShow::On, BatteryShow::Off][j.min(2)],
+        Setting::LauncherChord => {
+            c.launcher.chord = ["alt+space", "alt+shift+space", "off"][j.min(2)].into();
+            // Chosen here: the one-time offer in the Start menu has nothing left to ask.
+            c.launcher.offer_done = true;
+        }
+        Setting::LauncherPowerToys => {
+            c.launcher.with_powertoys = if j == 0 { "yield" } else { "take" }.into();
+            c.launcher.powertoys_done = true;
+        }
+        Setting::LauncherMonitor => c.launcher.monitor = ["pointer", "active", "primary"][j.min(2)].into(),
+        Setting::LauncherFullscreen => c.launcher.over_fullscreen = if j == 0 { "pass" } else { "open" }.into(),
+        Setting::LauncherWeb => {
+            let engine = ["google", "bing", "duckduckgo", "custom"][j.min(3)];
+            // Custom needs a template that passes the validator, and the Settings window has no text field: with none
+            // in the config file the click changes nothing.
+            if engine != "custom" || crate::launcher::web::validate_template(&c.launcher.web_url).is_ok() {
+                c.launcher.web_engine = engine.into();
+            }
+        }
         _ => {}
+    }
+}
+
+/// The notice under the Shortcut row after a refused pick.
+fn chord_held_text(shift: bool) -> &'static str {
+    if shift {
+        tr("Another app holds Alt+Shift+Space", "Un'altra app usa Alt+Maiusc+Spazio")
+    } else {
+        tr("Another app holds Alt+Space", "Un'altra app usa Alt+Spazio")
+    }
+}
+
+/// The chord an edit would newly take, to be probed first: `Some(shift)` for a pick of Alt+Space or Alt+Shift+Space that
+/// differs from the config's. Off, the current chord and every other edit need no probe.
+pub(crate) fn chord_to_probe(e: Edit, current: &str) -> Option<bool> {
+    match e {
+        Edit::Choose(Setting::LauncherChord, 0) if current != "alt+space" => Some(false),
+        Edit::Choose(Setting::LauncherChord, 1) if current != "alt+shift+space" => Some(true),
+        _ => None,
     }
 }
 
@@ -334,6 +444,9 @@ pub(crate) fn is_on(c: &Config, s: Setting) -> bool {
         Setting::UpdateCheck => c.update_check,
         Setting::UpdateAutoInstall => c.update_auto_install,
         Setting::Module(n) => c.module_visible(n),
+        Setting::LauncherOn => c.launcher.enabled,
+        Setting::LauncherLearn => c.launcher.learn,
+        Setting::LauncherProvider(n) => c.launcher.providers.get(n).copied().unwrap_or(true),
         _ => false,
     }
 }
@@ -353,6 +466,14 @@ pub(crate) fn flip(c: &mut Config, s: Setting) {
             let on = c.module_visible(n);
             c.set_module_visible(n, !on);
         }
+        Setting::LauncherOn => c.launcher.enabled = !c.launcher.enabled,
+        Setting::LauncherLearn => c.launcher.learn = !c.launcher.learn,
+        // Apps are always on (the config sanitizer holds the same line).
+        Setting::LauncherProvider("apps") => {}
+        Setting::LauncherProvider(n) => {
+            let on = c.launcher.providers.get(n).copied().unwrap_or(true);
+            c.launcher.providers.insert(n.to_string(), !on);
+        }
         _ => {}
     }
 }
@@ -368,10 +489,17 @@ pub(crate) fn slider_range(sl: Slider) -> (i32, i32, &'static str) {
         Slider::AppText => r(APP_TEXT_SIZE, " px"),
         Slider::TrayIcon => r(TRAY_ICON_SIZE, " px"),
         Slider::Module => r(MODULE_SIZE, "%"),
+        Slider::LauncherWidth => (config::LAUNCHER_WIDTH.0 as i32, config::LAUNCHER_WIDTH.1 as i32, " px"),
+        Slider::LauncherRows => (config::LAUNCHER_ROWS.0 as i32, config::LAUNCHER_ROWS.1 as i32, ""),
     }
 }
 
 pub(crate) fn slider_value(c: &Config, sl: Slider) -> i32 {
+    match sl {
+        Slider::LauncherWidth => return i32::from(c.launcher.width),
+        Slider::LauncherRows => return i32::from(c.launcher.rows),
+        _ => {}
+    }
     let (icon, text, tray, module) = c.sizes();
     (match sl {
         Slider::Opacity => c.bar_opacity.min(100),
@@ -379,19 +507,28 @@ pub(crate) fn slider_value(c: &Config, sl: Slider) -> i32 {
         Slider::AppText => text,
         Slider::TrayIcon => tray,
         Slider::Module => module,
+        Slider::LauncherWidth | Slider::LauncherRows => 0,
     }) as i32
 }
 
 /// Sets slider `sl` to `v` (clamped to its range).
 pub(crate) fn set_slider(c: &mut Config, sl: Slider, v: i32) {
     let (lo, hi, _) = slider_range(sl);
-    let v = v.clamp(lo, hi) as u8;
+    let v = v.clamp(lo, hi);
+    // The width moves in steps of 40 (the config sanitizer holds the same grid).
+    if sl == Slider::LauncherWidth {
+        c.launcher.width = ((v + 20) / 40 * 40).clamp(lo, hi) as u16;
+        return;
+    }
+    let v = v as u8;
     match sl {
         Slider::Opacity => c.bar_opacity = v,
         Slider::AppIcon => c.app_icon_size = v,
         Slider::AppText => c.app_text_size = v,
         Slider::TrayIcon => c.tray_icon_size = v,
         Slider::Module => c.module_size = v,
+        Slider::LauncherRows => c.launcher.rows = v,
+        Slider::LauncherWidth => {}
     }
 }
 
@@ -503,6 +640,8 @@ pub(crate) enum Edit {
     Slider(Slider, i32),
     Background(Background),
     ResetSizes,
+    /// Takes out the alias whose word has this `aliases::word_hash` (a list changed in between never loses another).
+    RemoveLauncherAlias(u64),
 }
 
 pub(crate) fn apply_edit(c: &mut Config, e: Edit, screens: &[Screen]) {
@@ -512,6 +651,9 @@ pub(crate) fn apply_edit(c: &mut Config, e: Edit, screens: &[Screen]) {
         Edit::Slider(sl, v) => set_slider(c, sl, v),
         Edit::Background(b) => c.background = b,
         Edit::ResetSizes => reset_sizes(c),
+        Edit::RemoveLauncherAlias(h) => {
+            crate::launcher::aliases::remove_by_hash(&mut c.launcher.aliases, h);
+        }
     }
 }
 
@@ -552,6 +694,7 @@ pub(crate) fn click(row: &Row, part: Option<usize>, ctx: &Ctx<'_>) -> Effect {
         Control::Buttons(buttons) => match part.and_then(|j| buttons.get(j)) {
             Some(b) if b.enabled => match b.action {
                 Action::ResetSizes => Effect::Save(Edit::ResetSizes),
+                Action::RemoveLauncherAlias(h) => Effect::Save(Edit::RemoveLauncherAlias(h)),
                 a => Effect::Run(a),
             },
             _ => Effect::None,
@@ -620,6 +763,7 @@ pub(crate) fn rows(page: Page, c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         Page::Appearance => appearance(c, ctx),
         Page::Bar => bar(c, ctx),
         Page::Start => start(c, ctx),
+        Page::Launcher => launcher(c, ctx),
         Page::Modules => modules(c, ctx),
         Page::Screen => screen(c, ctx),
         Page::Updates => updates(c, ctx),
@@ -911,6 +1055,270 @@ fn start(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     ]
 }
 
+/// The first prefix of the config that names provider `name`, as the page shows it ("file " is "file" and a space).
+fn prefix_phrase(c: &Config, name: &str) -> Option<String> {
+    let p = c.launcher.prefixes.iter().find(|(_, n)| n.as_str() == name).map(|(p, _)| p.as_str())?;
+    Some(if p.ends_with(' ') {
+        format!("\"{}\" {}", p.trim_end(), tr("and a space", "e uno spazio"))
+    } else {
+        format!("\"{p}\"")
+    })
+}
+
+/// One provider of "What it finds": name, glyph, label (EN, IT) and description (EN, IT). The description of a provider
+/// with a prefix gets ". Prefix <p>" after it; Files has its own tail.
+type ProviderText = (&'static str, Glyph, [&'static str; 2], [&'static str; 2]);
+
+fn provider_texts() -> [ProviderText; 10] {
+    [
+        (
+            "apps",
+            glyphs::grid_shape,
+            ["Apps", "App"],
+            ["Installed apps and shortcuts. Always on", "App installate e collegamenti. Sempre attivo"],
+        ),
+        (
+            "windows",
+            glyphs::window_shape,
+            ["Open windows", "Finestre aperte"],
+            ["Switch to a window", "Passa a una finestra"],
+        ),
+        (
+            "files",
+            glyphs::folder_shape,
+            ["Files", "File"],
+            [
+                "Names starting with the typed words, from the Windows Search index",
+                "Nomi che iniziano con le parole scritte, dall'indice di Windows Search",
+            ],
+        ),
+        (
+            "settings",
+            glyphs::gear_shape,
+            ["Windows settings", "Impostazioni di Windows"],
+            ["Pages of the Settings app", "Pagine dell'app Impostazioni"],
+        ),
+        (
+            "calc",
+            glyphs::equals_shape,
+            ["Calculator", "Calcolatrice"],
+            ["Sums typed in the box", "Calcoli scritti nella casella"],
+        ),
+        (
+            "commands",
+            glyphs::power_shape,
+            ["Commands", "Comandi"],
+            [
+                "Lock, sleep, restart and the other power commands",
+                "Blocca, sospendi, riavvia e gli altri comandi di alimentazione",
+            ],
+        ),
+        (
+            "run",
+            glyphs::prompt_shape,
+            ["Run", "Esegui"],
+            ["Start a typed command line", "Avvia una riga di comando scritta"],
+        ),
+        (
+            "web",
+            glyphs::globe_shape,
+            ["Web search", "Ricerca sul web"],
+            ["Search the web with the engine below", "Cerca sul web con il motore qui sotto"],
+        ),
+        (
+            "datetime",
+            glyphs::clock_shape,
+            ["Date and time", "Data e ora"],
+            ["Today, the time, a date's weekday", "Oggi, l'ora, il giorno di una data"],
+        ),
+        (
+            "registry",
+            glyphs::list_shape,
+            ["Registry", "Registro"],
+            ["Open a registry key in Regedit", "Apri una chiave di registro in Regedit"],
+        ),
+    ]
+}
+
+/// The toggle of one provider in "What it finds".
+fn provider_row(c: &Config, (name, icon, label, desc): ProviderText) -> Row {
+    let (label, base) = (tr(label[0], label[1]), tr(desc[0], desc[1]));
+    let desc = match (name, prefix_phrase(c, name)) {
+        ("apps", _) | (_, None) => base.to_string(),
+        ("files", Some(p)) => {
+            format!("{base}; {} {p} {}", tr("type", "scrivi"), tr("for files only", "per i soli file"))
+        }
+        (_, Some(p)) => format!("{base}. {} {p}", tr("Prefix", "Prefisso")),
+    };
+    let setting = Setting::LauncherProvider(name);
+    row(icon, label, Some(&desc), Control::Toggle { setting, on: is_on(c, setting), enabled: name != "apps" })
+}
+
+fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
+    let sc = ctx.screens;
+    let mut v = vec![
+        header(tr("Launcher", "Launcher"), None),
+        toggle(
+            crate::popup::popup_startmenu::magnifier,
+            tr("Launcher", "Launcher"),
+            Some(tr("Find and start anything from one bar", "Trova e avvia qualsiasi cosa da una barra")),
+            c,
+            Setting::LauncherOn,
+        ),
+        choice(
+            glyphs::keycap_shape,
+            tr("Shortcut", "Scorciatoia"),
+            Some(tr(
+                "With Alt+Space taken, type \"window menu\" for a window's menu",
+                "Con Alt+Spazio preso, scrivi \"menu finestra\" per il menu della finestra",
+            )),
+            c,
+            Setting::LauncherChord,
+            sc,
+        ),
+    ];
+    if let Some(shift) = ctx.chord_held {
+        v.push(row(
+            glyphs::info_shape,
+            tr("Not changed", "Non cambiata"),
+            None,
+            Control::Status(chord_held_text(shift).to_string()),
+        ));
+    }
+    if ctx.powertoys && c.launcher.chord == "alt+space" {
+        v.push(choice(
+            glyphs::info_shape,
+            "PowerToys",
+            Some(tr("Command Palette also uses Alt+Space", "Anche Command Palette usa Alt+Spazio")),
+            c,
+            Setting::LauncherPowerToys,
+            sc,
+        ));
+    }
+    v.push(header(tr("Window", "Finestra"), None));
+    v.push(choice(glyphs::monitor_shape, tr("Opens on", "Si apre su"), None, c, Setting::LauncherMonitor, sc));
+    v.push(slider_row(glyphs::window_shape, tr("Width", "Larghezza"), c, Slider::LauncherWidth));
+    v.push(slider_row(glyphs::list_shape, tr("Rows", "Righe"), c, Slider::LauncherRows));
+    v.push(choice(
+        glyphs::show_desktop_shape,
+        tr("Over full-screen apps", "Sopra le app a schermo intero"),
+        Some(tr(
+            "Games keep their keys; exclusive full screen always passes",
+            "I giochi tengono i loro tasti; lo schermo intero esclusivo passa sempre",
+        )),
+        c,
+        Setting::LauncherFullscreen,
+        sc,
+    ));
+    v.push(header(tr("What it finds", "Cosa trova"), None));
+    for text in provider_texts() {
+        v.push(provider_row(c, text));
+    }
+    v.push(header(tr("Web search", "Ricerca sul web"), None));
+    let custom_desc = match crate::launcher::web::validate_template(&c.launcher.web_url) {
+        Ok(t) if c.launcher.web_engine == "custom" => format!("{}: {}", tr("Custom", "Personalizzato"), t.host()),
+        _ => tr("Custom is set in the config file", "Personalizzato si imposta nel file di configurazione").to_string(),
+    };
+    v.push(row(
+        glyphs::globe_shape,
+        tr("Search engine", "Motore di ricerca"),
+        Some(&custom_desc),
+        Control::Choice {
+            setting: Setting::LauncherWeb,
+            options: options(Setting::LauncherWeb, sc),
+            selected: selected(c, Setting::LauncherWeb, sc),
+        },
+    ));
+    v.push(header(tr("History", "Cronologia"), None));
+    v.push(toggle(
+        glyphs::clock_shape,
+        tr("Learn from what I pick", "Impara da ci\u{f2} che scelgo"),
+        Some(tr("Kept for your account only", "Conservato solo per il tuo account")),
+        c,
+        Setting::LauncherLearn,
+    ));
+    v.push(buttons(
+        glyphs::refresh_shape,
+        tr("Forget history", "Dimentica la cronologia"),
+        Some(tr("The commands you ran and the order it learned", "I comandi eseguiti e l'ordine appreso")),
+        vec![Button { action: Action::ForgetHistory, text: tr("Forget", "Dimentica"), enabled: true }],
+    ));
+    v.push(header(tr("Aliases", "Alias"), None));
+    v.extend(alias_rows(c));
+    v.push(buttons(
+        glyphs::text_shape,
+        tr("Add an alias", "Aggiungi un alias"),
+        Some(tr("A word that opens an app, a link or a folder", "Una parola che apre un'app, un link o una cartella")),
+        // The prompt is the launcher's own field: it needs the launcher shortcut.
+        vec![Button {
+            action: Action::AddLauncherAlias,
+            text: tr("Add\u{2026}", "Aggiungi\u{2026}"),
+            enabled: c.launcher.chord_spec().is_some(),
+        }],
+    ));
+    v.push(header(tr("Prefixes", "Prefissi"), None));
+    // The defaults in their table order, then the owner's own.
+    let own = |k: &&str| !config::LAUNCHER_PREFIXES.iter().any(|(p, _)| p == k);
+    let mut keys: Vec<&str> =
+        config::LAUNCHER_PREFIXES.iter().map(|(p, _)| *p).filter(|p| c.launcher.prefixes.contains_key(*p)).collect();
+    keys.extend(c.launcher.prefixes.keys().map(String::as_str).filter(own));
+    let table = keys.iter().map(|p| p.trim_end()).collect::<Vec<_>>().join("  ");
+    v.push(row(
+        glyphs::text_shape,
+        tr("Prefixes", "Prefissi"),
+        Some(tr("Typed first, they pick one source", "Scritti all'inizio, scelgono una sola fonte")),
+        Control::Status(table),
+    ));
+    v.push(buttons(
+        glyphs::pencil_shape,
+        tr("Config file", "File di configurazione"),
+        Some(tr("This window has no text field yet", "Questa finestra non ha ancora un campo di testo")),
+        vec![Button { action: Action::EditConfig, text: tr("Edit config", "Modifica"), enabled: true }],
+    ));
+    v
+}
+
+/// The glyph of an alias's target kind (an entry the launcher refuses shows the info mark).
+fn alias_glyph(target: &str) -> Glyph {
+    use crate::launcher::aliases::{classify, AliasTarget};
+    match classify(target) {
+        Ok(AliasTarget::App(_)) => glyphs::grid_shape,
+        Ok(AliasTarget::Url(_)) => glyphs::globe_shape,
+        Ok(AliasTarget::Settings(_)) => glyphs::gear_shape,
+        Ok(AliasTarget::Path { dir: true, .. }) => glyphs::folder_shape,
+        Ok(AliasTarget::Path { dir: false, .. }) => glyphs::document_shape,
+        Ok(AliasTarget::Command(_)) => glyphs::prompt_shape,
+        Err(_) => glyphs::info_shape,
+    }
+}
+
+/// `s` cut to `max` characters with an ellipsis (a config value can be 1,024 characters long).
+fn ellipsize(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}\u{2026}", s[..i].trim_end()),
+        None => s.to_string(),
+    }
+}
+
+/// One row per alias of `launcher.aliases`, sorted by word (the map's order), the ones the launcher ignores too, so
+/// they can be removed. Remove carries the hash of the word.
+fn alias_rows(c: &Config) -> Vec<Row> {
+    let remove = tr("Remove", "Rimuovi");
+    c.launcher
+        .aliases
+        .iter()
+        .map(|(word, target)| {
+            let action = Action::RemoveLauncherAlias(crate::launcher::aliases::word_hash(word));
+            buttons(
+                alias_glyph(target),
+                &ellipsize(word, 32),
+                Some(&ellipsize(target, 60)),
+                vec![Button { action, text: remove, enabled: true }],
+            )
+        })
+        .collect()
+}
+
 fn screen(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     if ctx.screens.len() < 2 {
         return vec![Row {
@@ -969,6 +1377,8 @@ mod tests {
             data_dir: None,
             log_path: None,
             trust_elevated: false,
+            powertoys: false,
+            chord_held: None,
         }
     }
 
@@ -1399,6 +1809,300 @@ mod tests {
         assert!(r
             .iter()
             .any(|r| matches!(&r.control, Control::Buttons(b) if b[0].action == Action::ExitDock && b[0].enabled)));
+    }
+
+    fn launcher_rows(c: &Config, powertoys: bool) -> Vec<Row> {
+        let st = idle();
+        let mut cx = ctx(&[], &st);
+        cx.powertoys = powertoys;
+        rows(Page::Launcher, c, &cx)
+    }
+
+    fn alias_config() -> Config {
+        let mut c = Config::default();
+        c.launcher.chord = "alt+space".into();
+        for (w, t) in [
+            ("web", "https://example.com/"),
+            ("calc", "app:Contoso.Calc_1234!App"),
+            ("proj", "D:\\Projects"),
+            ("steam", "steam://run/1"),
+        ] {
+            c.launcher.aliases.insert(w.into(), t.into());
+        }
+        c
+    }
+
+    fn alias_buttons(r: &[Row]) -> Vec<(String, Option<String>, Action, bool)> {
+        r.iter()
+            .filter_map(|x| match &x.control {
+                Control::Buttons(b) if matches!(b[0].action, Action::RemoveLauncherAlias(_)) => {
+                    Some((x.label.clone(), x.desc.clone(), b[0].action, b[0].enabled))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn launcher_page_lists_aliases() {
+        use crate::launcher::aliases::word_hash;
+        let c = alias_config();
+        let r = launcher_rows(&c, false);
+        // The header comes before the rows, the Add row after them, the prefixes after that.
+        let pos = |f: &dyn Fn(&Row) -> bool| r.iter().position(f).unwrap();
+        let head = pos(&|x| matches!(x.control, Control::Header { .. }) && x.label == "Aliases");
+        let add = pos(&|x| x.label == "Add an alias");
+        let prefixes = pos(&|x| matches!(x.control, Control::Header { .. }) && x.label == "Prefixes");
+        assert!(head < add && add < prefixes);
+        // One row per entry in word order (the ignored "steam:" one too), the word as title, the target as description.
+        let list = alias_buttons(&r);
+        let words: Vec<&str> = list.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(words, ["calc", "proj", "steam", "web"]);
+        assert_eq!(list[3].1.as_deref(), Some("https://example.com/"));
+        for (w, _, a, enabled) in &list {
+            assert_eq!(*a, Action::RemoveLauncherAlias(word_hash(w)));
+            assert!(enabled);
+        }
+        assert!((head + 1..add).all(|i| matches!(&r[i].control, Control::Buttons(_))));
+        // The kinds have their own glyphs, a refused target the info mark.
+        let is = |t: &str, f: Glyph| std::ptr::fn_addr_eq(alias_glyph(t), f);
+        assert!(is("https://example.com/", glyphs::globe_shape));
+        assert!(is("app:Contoso.Calc_1234!App", glyphs::grid_shape));
+        assert!(is("ms-settings:display", glyphs::gear_shape));
+        assert!(is("C:\\Windows", glyphs::folder_shape));
+        assert!(is("C:\\Windows\\win.ini", glyphs::document_shape));
+        assert!(is("steam://run/1", glyphs::info_shape));
+        // A long target is cut, a long word too.
+        let mut long = Config::default();
+        long.launcher.aliases.insert("x".repeat(100), "y".repeat(900));
+        let l = alias_buttons(&launcher_rows(&long, false));
+        assert_eq!(l[0].0.chars().count(), 33);
+        assert_eq!(l[0].1.as_ref().map(|d| d.chars().count()), Some(61));
+        // Italian texts.
+        let r = crate::i18n::with_italian(true, || launcher_rows(&alias_config(), false));
+        assert!(r.iter().any(|x| x.label == "Aggiungi un alias"));
+        assert!(r.iter().any(|x| matches!(&x.control, Control::Buttons(b) if b[0].text == "Rimuovi")));
+    }
+
+    #[test]
+    fn remove_alias_by_hash_removes_only_that_one() {
+        use crate::launcher::aliases::word_hash;
+        let mut c = alias_config();
+        let r = launcher_rows(&c, false);
+        let row = r.iter().find(|x| x.label == "proj").unwrap();
+        let e = click(row, Some(0), &ctx(&[], &idle()));
+        assert_eq!(e, Effect::Save(Edit::RemoveLauncherAlias(word_hash("proj"))));
+        let Effect::Save(edit) = e else { unreachable!() };
+        apply_edit(&mut c, edit, &[]);
+        let left: Vec<&str> = c.launcher.aliases.keys().map(String::as_str).collect();
+        assert_eq!(left, ["calc", "steam", "web"]);
+        // A refused entry is removable too, and nothing else of the config moves.
+        apply_edit(&mut c, Edit::RemoveLauncherAlias(word_hash("steam")), &[]);
+        assert_eq!(c.launcher.aliases.len(), 2);
+        assert_eq!(c.launcher.chord, "alt+space");
+    }
+
+    #[test]
+    fn remove_alias_unknown_hash_is_noop() {
+        use crate::launcher::aliases::word_hash;
+        let mut c = alias_config();
+        let before = c.clone();
+        apply_edit(&mut c, Edit::RemoveLauncherAlias(word_hash("gone")), &[]);
+        apply_edit(&mut c, Edit::RemoveLauncherAlias(0), &[]);
+        assert_eq!(c, before);
+        // An empty list gives no alias rows, only the Add row.
+        let r = launcher_rows(&Config::default(), false);
+        assert!(alias_buttons(&r).is_empty());
+        assert!(r.iter().any(|x| x.label == "Add an alias"));
+    }
+
+    #[test]
+    fn add_alias_disabled_with_the_chord_off() {
+        let add = |c: &Config| {
+            launcher_rows(c, false).into_iter().find_map(|x| match x.control {
+                Control::Buttons(b) if b[0].action == Action::AddLauncherAlias => Some((b[0].enabled, b[0].text)),
+                _ => None,
+            })
+        };
+        let mut c = Config::default();
+        assert_eq!(c.launcher.chord_spec(), None, "off by default");
+        assert_eq!(add(&c), Some((false, "Add\u{2026}")));
+        let row = launcher_rows(&c, false).into_iter().find(|x| x.label == "Add an alias").unwrap();
+        assert_eq!(click(&row, Some(0), &ctx(&[], &idle())), Effect::None);
+        c.launcher.chord = "alt+space".into();
+        assert_eq!(add(&c), Some((true, "Add\u{2026}")));
+        let row = launcher_rows(&c, false).into_iter().find(|x| x.label == "Add an alias").unwrap();
+        assert_eq!(click(&row, Some(0), &ctx(&[], &idle())), Effect::Run(Action::AddLauncherAlias));
+    }
+
+    #[test]
+    fn launcher_rows_en_it() {
+        // Every provider names its texts in both languages, and the provider table is the config's list.
+        let t = provider_texts();
+        assert_eq!(t.map(|p| p.0), config::LAUNCHER_PROVIDERS);
+        for (name, _, label, desc) in t {
+            for pair in [label, desc] {
+                assert!(!pair[0].is_empty() && !pair[1].is_empty(), "{name}");
+                assert_ne!(pair[0], pair[1], "{name}: the Italian text is not the English one");
+            }
+        }
+        // Every row of the page outside the providers has a description, but the ones that need none.
+        let r = launcher_rows(&Config::default(), true);
+        let bare = ["Launcher", "Opens on", "Width", "Rows"];
+        for x in &r {
+            let header = matches!(x.control, Control::Header { .. });
+            assert!(x.desc.is_some() || header || bare.contains(&x.label.as_str()), "{}", x.label);
+        }
+        assert_eq!(Page::Launcher.title(), "Launcher");
+        assert_eq!(Page::Launcher.slug(), "launcher");
+        assert!(
+            Page::ALL.iter().position(|p| *p == Page::Launcher)
+                == Page::ALL.iter().position(|p| *p == Page::Start).map(|i| i + 1)
+        );
+        assert_eq!(Page::ALL.len(), 8);
+    }
+
+    #[test]
+    fn launcher_page_rows_and_prefixes() {
+        let mut c = Config::default();
+        let r = launcher_rows(&c, false);
+        let toggle_of = |r: &[Row], s: Setting| {
+            r.iter().find_map(|x| match x.control {
+                Control::Toggle { setting, on, enabled } if setting == s => Some((on, enabled, x.desc.clone())),
+                _ => None,
+            })
+        };
+        // Apps: present, on and disabled; the other providers can be switched.
+        assert_eq!(toggle_of(&r, Setting::LauncherProvider("apps")).map(|t| (t.0, t.1)), Some((true, false)));
+        for p in config::LAUNCHER_PROVIDERS.into_iter().filter(|p| *p != "apps") {
+            assert_eq!(toggle_of(&r, Setting::LauncherProvider(p)).map(|t| (t.0, t.1)), Some((true, true)), "{p}");
+        }
+        // A click on the disabled Apps row does nothing; a flip of apps does nothing either.
+        let apps = r.iter().find(|x| {
+            x.control == Control::Toggle { setting: Setting::LauncherProvider("apps"), on: true, enabled: false }
+        });
+        assert_eq!(click(apps.unwrap(), None, &ctx(&[], &idle())), Effect::None);
+        flip(&mut c, Setting::LauncherProvider("apps"));
+        assert!(is_on(&c, Setting::LauncherProvider("apps")));
+        // Descriptions name the prefix of the config, "file " as the word and a space.
+        let files = toggle_of(&r, Setting::LauncherProvider("files")).and_then(|t| t.2).unwrap();
+        assert!(files.contains("\"file\" and a space"), "{files}");
+        let calc = toggle_of(&r, Setting::LauncherProvider("calc")).and_then(|t| t.2).unwrap();
+        assert!(calc.ends_with("Prefix \"=\""), "{calc}");
+        c.launcher.prefixes.remove("=");
+        c.launcher.prefixes.insert("#".into(), "calc".into());
+        let r = launcher_rows(&c, false);
+        assert!(toggle_of(&r, Setting::LauncherProvider("calc")).and_then(|t| t.2).unwrap().ends_with("Prefix \"#\""));
+        let table = r.iter().find_map(|x| match &x.control {
+            Control::Status(s) if s.contains("??") => Some(s.clone()),
+            _ => None,
+        });
+        let table = table.unwrap();
+        assert!(table.contains('#'), "{table}");
+        assert!(table.ends_with("file  #"), "{table}");
+        // The table reads in the defaults' order, the owner's own prefixes after them.
+        let d = launcher_rows(&Config::default(), false);
+        assert!(d.iter().any(|x| x.control == Control::Status("=  >  <  ??  $  )  :  file".into())));
+        // The PowerToys row is there only when one runs and the chord is Alt+Space.
+        let has_pt = |r: &[Row]| {
+            r.iter().any(|x| matches!(x.control, Control::Choice { setting: Setting::LauncherPowerToys, .. }))
+        };
+        c.launcher.chord = "alt+space".into();
+        assert!(!has_pt(&launcher_rows(&c, false)));
+        assert!(has_pt(&launcher_rows(&c, true)));
+        c.launcher.chord = "alt+shift+space".into();
+        assert!(!has_pt(&launcher_rows(&c, true)));
+    }
+
+    #[test]
+    fn launcher_choices_and_sliders() {
+        let mut c = Config::default();
+        let sc = [];
+        for set in
+            [Setting::LauncherChord, Setting::LauncherPowerToys, Setting::LauncherMonitor, Setting::LauncherFullscreen]
+        {
+            for j in 0..options(set, &sc).len() {
+                apply_edit(&mut c, Edit::Choose(set, j), &sc);
+                assert_eq!(selected(&c, set, &sc), Some(j), "{set:?} {j}");
+            }
+        }
+        // A chord chosen here answers the Start menu's one-time offer; the PowerToys choice answers its notice.
+        let mut d = Config::default();
+        apply_edit(&mut d, Edit::Choose(Setting::LauncherChord, 1), &sc);
+        assert_eq!((d.launcher.chord.as_str(), d.launcher.offer_done), ("alt+shift+space", true));
+        apply_edit(&mut d, Edit::Choose(Setting::LauncherPowerToys, 1), &sc);
+        assert_eq!((d.launcher.with_powertoys.as_str(), d.launcher.powertoys_done), ("take", true));
+        // Only a pick of another chord is probed; Off and the current chord are not.
+        let pick = |j| Edit::Choose(Setting::LauncherChord, j);
+        assert_eq!(chord_to_probe(pick(0), "off"), Some(false));
+        assert_eq!(chord_to_probe(pick(1), "alt+space"), Some(true));
+        assert_eq!(chord_to_probe(pick(0), "alt+space"), None);
+        assert_eq!(chord_to_probe(pick(2), "alt+space"), None);
+        assert_eq!(chord_to_probe(Edit::Choose(Setting::LauncherMonitor, 0), "off"), None);
+        // A refused pick leaves a line under the Shortcut row.
+        let st = idle();
+        let mut cx = ctx(&sc, &st);
+        cx.chord_held = Some(true);
+        let r = rows(Page::Launcher, &Config::default(), &cx);
+        assert!(r.iter().any(|x| x.control == Control::Status("Another app holds Alt+Shift+Space".into())));
+        assert!(!launcher_rows(&Config::default(), false).iter().any(|x| x.label == "Not changed"));
+        // Every value the page writes is one the config accepts untouched.
+        for set in
+            [Setting::LauncherChord, Setting::LauncherPowerToys, Setting::LauncherMonitor, Setting::LauncherFullscreen]
+        {
+            for j in 0..options(set, &sc).len() {
+                let mut x = Config::default();
+                apply_edit(&mut x, Edit::Choose(set, j), &sc);
+                assert!(x.launcher.sanitize().is_empty(), "{set:?} {j}");
+            }
+        }
+        // Web: Custom needs a valid template in the file, else the click changes nothing.
+        let mut w = Config::default();
+        apply_edit(&mut w, Edit::Choose(Setting::LauncherWeb, 3), &sc);
+        assert_eq!(w.launcher.web_engine, "google");
+        w.launcher.web_url = "https://search.example.org/?q={q}".into();
+        apply_edit(&mut w, Edit::Choose(Setting::LauncherWeb, 3), &sc);
+        assert_eq!((w.launcher.web_engine.as_str(), selected(&w, Setting::LauncherWeb, &sc)), ("custom", Some(3)));
+        let st = idle();
+        let r = rows(Page::Launcher, &w, &ctx(&[], &st));
+        assert!(r.iter().any(|x| x.desc.as_deref() == Some("Custom: search.example.org")));
+        for (j, e) in ["bing", "duckduckgo"].into_iter().enumerate() {
+            apply_edit(&mut w, Edit::Choose(Setting::LauncherWeb, j + 1), &sc);
+            assert_eq!(w.launcher.web_engine, e);
+        }
+        // Sliders: width in steps of 40 inside 560..=880, rows 4..=12; both read back what was set.
+        assert_eq!(slider_range(Slider::LauncherWidth), (560, 880, " px"));
+        assert_eq!(slider_range(Slider::LauncherRows).0, 4);
+        for (v, want) in [(0, 560), (579, 560), (581, 600), (639, 640), (700, 720), (9999, 880)] {
+            set_slider(&mut c, Slider::LauncherWidth, v);
+            assert_eq!(slider_value(&c, Slider::LauncherWidth), want, "{v}");
+            assert!(c.launcher.sanitize().is_empty());
+        }
+        for (v, want) in [(0, 4), (7, 7), (99, 12)] {
+            set_slider(&mut c, Slider::LauncherRows, v);
+            assert_eq!(slider_value(&c, Slider::LauncherRows), want);
+        }
+        // Switches.
+        flip(&mut c, Setting::LauncherOn);
+        flip(&mut c, Setting::LauncherLearn);
+        assert!(!is_on(&c, Setting::LauncherOn) && !is_on(&c, Setting::LauncherLearn));
+    }
+
+    #[test]
+    fn launcher_toggle_reaches_opts() {
+        let mut c = Config::default();
+        assert!(crate::popup::popup_launcher::opts_from_config(&c.launcher)
+            .mask
+            .has(crate::launcher::model::ProviderId::Files));
+        flip(&mut c, Setting::LauncherProvider("files"));
+        let mask = crate::popup::popup_launcher::opts_from_config(&c.launcher).mask;
+        assert!(!mask.has(crate::launcher::model::ProviderId::Files));
+        assert!(mask.has(crate::launcher::model::ProviderId::Calc));
+        // The same row switched back on.
+        flip(&mut c, Setting::LauncherProvider("files"));
+        assert!(crate::popup::popup_launcher::opts_from_config(&c.launcher)
+            .mask
+            .has(crate::launcher::model::ProviderId::Files));
     }
 
     #[test]

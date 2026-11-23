@@ -1,7 +1,11 @@
 //! THIRD_PARTY_NOTICES.md must cover what ships in dock.exe.
 //! Regenerate the crate part with `pwsh tools/gen-notices.ps1`.
 
+use std::os::windows::process::CommandExt;
 use std::process::Command;
+
+/// `CREATE_NO_WINDOW` (winbase.h): every process a test starts carries it (lint `every_spawned_process_has_no_window`).
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn read(rel: &str) -> Vec<u8> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -15,6 +19,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 #[test]
 fn notices_list_every_crate_in_the_exe() {
     let out = Command::new(env!("CARGO"))
+        .creation_flags(CREATE_NO_WINDOW)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args([
             "tree",

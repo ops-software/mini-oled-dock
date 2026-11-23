@@ -9,17 +9,17 @@
       "unit": "bytes",
       "gate": "ledger",
       "base_bytes": 1400320,
-      "target": "1.4.3",
-      "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test.",
+      "target": "1.5.0",
+      "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test. 1.5.0 step re-keyed (owner decision, L3 T23): the launcher was never in the ledger; the release exe of feat/launcher after plan L3 was 1765888 bytes. Re-keyed again at the close of the 1.5.0 branch (owner's delegated decision, no reserve: part L2 is in): the release exe (cargo build --release --locked, manifest kept) is 1859584 bytes after the size trims of part L2 (AliasTable::build sort, preview alias map by insert), rounded up to the next 16 KiB 1867776 bytes, which is 456.5 KiB over base_bytes and is written as 457 whole KiB (limit 1868288, 8704 bytes of room). Raised by one 16 KiB unit at the verification fixes of 920d775 (owner's delegated decision): the release exe measured 1869312 bytes, 1884160 bytes is 472.5 KiB over base_bytes and is written as 473 whole KiB (limit 1884672, 15360 bytes of room). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of it; the target is 1.5.0, the version this branch ships as.",
       "ledger_kib_cumulative": {
         "1.4.2": 0,
         "1.4.3": 80,
         "1.4.4": 120,
-        "1.5.0": 180,
-        "1.6.0": 330,
-        "1.7.0": 780,
-        "1.8.0": 1030,
-        "1.9.0": 1280
+        "1.5.0": 473,
+        "1.6.0": 623,
+        "1.7.0": 1073,
+        "1.8.0": 1323,
+        "1.9.0": 1573
       }
     },
     {
@@ -151,6 +151,87 @@
       "note": "open and close each surface 20 times, growth strictly below 1 MiB (AG2 section 3.4)"
     },
     {
+      "id": "launcher.key_p95_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 4000,
+      "note": "keystroke to presented results, p95 (SPEC-launcher 5.5.7, L3 T23); activation is the owner's"
+    },
+    {
+      "id": "launcher.key_max_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 8000,
+      "note": "keystroke to presented results, max (SPEC-launcher 5.5.7)"
+    },
+    {
+      "id": "private.launcher_rest_delta",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 629146,
+      "note": "private bytes at rest with the launcher chord set, over the same config without it, the same day script in both runs and no app launch in either (the launch residue is checked apart, L3 L-5b): +0.6 MiB (SPEC-launcher G-b, G-c; measured resident parts 295-311 KB)"
+    },
+    {
+      "id": "private.launcher_open_delta_125",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 3145728,
+      "note": "peak private bytes while the launcher is open at 125 %, over the highest sample of the 2.1 s before the open, the window ending at the hide: +3 MiB (SPEC-launcher G-b, G-c; the dock's own 2 s housekeeping transient is in that baseline; the launcher's own peak is +1.99-2.08 MB)"
+    },
+    {
+      "id": "private.launcher_close_residue",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 104858,
+      "note": "private bytes left after a close and the next hidden trim, over before the open: 0.1 MiB (L3 T19; no window warm)"
+    },
+    {
+      "id": "launcher.files_rows_p95_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 200,
+      "note": "file rows: 95th percentile from the write of the request to the rows on screen, helper running (V-1 b). The gate is SPEC G-b (200 ms); the target of FILES-1 is 100 ms and is read from the same measurement, not gated"
+    },
+    {
+      "id": "launcher.files_rows_first_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 250,
+      "note": "file rows: first request of an open, with the helper spawn (FILES-1, V-1 a)"
+    },
+    {
+      "id": "private.launcher_files_dock",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 131072,
+      "note": "dock private bytes growth while the files helper lives (FILES-4, V-5)"
+    },
+    {
+      "id": "private.launcher_files_helper_delta",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 2097152,
+      "note": "files helper private bytes after its rows, over its state-0 value (FILES-4)"
+    },
+    {
       "id": "exe_size.tasks",
       "where": "CI",
       "status": "pending",
@@ -272,6 +353,15 @@
       "gate": "max",
       "value": 0.5,
       "note": "of one core at 1 s refresh, sampling only while visible"
+    },
+    {
+      "id": "bench.launcher_query_ratio",
+      "where": "CI",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 0,
+      "note": "launcher_ns / reference_ns x 100, windows-latest, release, same process; calibrated in LC-3"
     }
   ]
 }

@@ -77,6 +77,23 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - **Win opens Start** (optional): one tap of Win opens the dock and Start together in a single animation.
 - **Quick-links menu** on right click of the Start button, like the native Win+X one (Installed apps, Device Manager, Terminal (admin), Task Manager, Run, Sign out, ...).
 
+### Launcher
+
+An optional search box on a shortcut key, **off until you pick one**: Settings → Launcher → Shortcut (Alt+Space or Alt+Shift+Space), or `"launcher": { "chord": "alt+space" }` in `config.json`. The launcher itself adds no hook, timer or process until you pick a shortcut. The Start menu, for everyone, now never waits for a window that has stopped responding (in 1.4.3 a hung foreground program could freeze the dock, and the Windows taskbar then came back), makes its icons and settings list in short-lived copies of `dock.exe`, unloads unneeded COM libraries about 11 minutes later, and until you answer it begins its search results with a row offering the launcher.
+
+- **One box, many kinds**: apps (the native Start catalogue, Store apps included), settings, files and folders, an answer to a sum or a unit conversion, today's date and time (typing "date", "time" or "week" always shows its row), commands (Lock, Sleep, Restart, Shut down, Sign out, Window menu, Clipboard history), a command line or a web search. The best name match comes first; what you pick often rises.
+- **Prefixes** (typed at the start; each is a setting): `=` calculator and units, `>` run a command, `<` open windows (switch or close), `??` web search, `$` Windows settings, `)` date and time, `:` Registry Editor, `file ` files only.
+- **Keys**: Enter opens, Shift+Enter opens a new instance, Ctrl+Enter shows the file in its folder, Ctrl+C copies, Ctrl+K opens the row's action list, Tab completes, Shift+Delete forgets a row, Esc clears and then closes.
+- **Aliases**: your own words for a program, folder, page or link (`launcher.aliases`, at most 64):
+  `"aliases": { "docs": "https://example.com", "notes": "app:Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", "work": "D:\\Projects" }`.
+  Add one from a row's action list (Assign alias), remove it in Settings → Launcher. Aliases are saved in `config.json`, which other accounts of this PC can read.
+- **Files**: names that start with the typed words, from the Windows Search index, in your profile, the Start menu folders and your Desktop, Documents, Downloads, Pictures, Music and Videos folders wherever they are on a local drive (a personal folder set to the top of a drive (`D:\`) is searched only when you list it in `file_folders`; one on a network share is not searched), plus up to 8 folders of your own: `"file_folders": ["D:\\Archive", "E:\\"]` in the `launcher` section of `config.json` (a whole data drive is allowed; never a network path, a short `~1` name, the Windows or Program Files folders or another account's profile). A short-lived helper process searches; it exists only while the launcher is open. It searches with the dock's administrator rights, so in a folder you list in `file_folders` it can show the names of files another account of this PC keeps there: only you and other administrators can change that list (other accounts can only read `config.json`), your personal folders never count a whole drive, and no folder searched may hold or lie in another account's profile, the Windows folder or Program Files. Needs the dock installed (`dock.exe --install`): a dock started from another folder shows no file rows. Off under Administrator protection.
+- **Privacy and rights**: what it starts runs at your normal rights through the desktop shell; a program that itself asks for administrator rights shows the usual UAC prompt, and the launcher asks for elevation only when you choose to (Ctrl+Shift+Enter on a row, or Run as administrator in an app's action list), through the same prompt. Nothing you type, copy or pick is logged; the commands you run and your picks are kept per user and can be switched off or cleared; the clipboard is read only when you paste into the box, and a paste marked private is refused. Aliases are kept in `config.json`.
+- **Cost** (measured on pre-release builds of 1.5.0 on the developer's machine, Windows 11 build 26300, synthetic keys, while compilers ran on the same PC): per key at most 3.4 ms of work, and a key waited in the queue 0.47 ms at the median and 1.9 ms or less at the 95th percentile; at rest with the launcher on, 36 KB more memory than with it off and the same hidden wake-ups as 1.4.3; peak while open 0.6 to 2.5 MB, given back on close.
+- **Run lines with a `%VAR%`** go through `cmd.exe` at your normal rights so the variable is expanded with your own environment; as at a command prompt, Windows' downloaded-file warning does not appear for a program named that way, and a console window may flash. System keys (CapsLock, volume, PrintScreen) pass through to Windows right after the shortcut.
+- **PowerToys Command Palette** also wants Alt+Space: the launcher yields while it answers and offers the choice once; turn its shortcut off in PowerToys to take the key. The dock never changes PowerToys.
+- **To turn it off**: Settings → Launcher → Shortcut → Off (or `"chord": "off"`).
+
 ### Multi-monitor
 
 - The bar can sit on any connected display (Settings → **Screen**: **Main**, the display number, or **Pointer**) and follows that display's DPI; a disconnected display falls back to the primary one.
@@ -127,6 +144,8 @@ To start with Windows (or use the toggle in the power popup):
 The logon task runs the dock elevated, so the installed copy lives in an admin-only folder (`%ProgramFiles%\mini-oled-dock\dock.exe`, inheriting the Program Files permissions) that normal programs cannot modify. Its data lives in `%ProgramData%\mini-oled-dock` (see [Data folder](#data-folder)).
 
 **Update:** the dock checks GitHub Releases once a day (`update_check`, one request to api.github.com, nothing is downloaded by the check). When a newer version exists, an orange dot with a count on **Settings** in the power popup shows it. Nothing is installed unless you set `update_auto_install` to `true`: then a verified release is installed when no popup is open and no fullscreen app is in front. The installer downloads `dock.exe` and its `.sha256` into the admin-only folder `%ProgramData%\mini-oled-dock\update\<tag>\`, checks the hash, runs the new exe's `--version`, and then runs its `--install --quiet`. No UAC prompt is shown, and the dock restarts from the new copy by itself. Trust rests on HTTPS to github.com and on the hash published with the same release; the exe is not code-signed.
+
+Going back to 1.4.x: copy `config.json` first, because 1.4.x drops the launcher settings and aliases the first time it writes the file.
 
 Manual updating still works: run `--install` from a downloaded `dock.exe`. Diagnostics: `dock.exe --update-check` makes one check and prints the result (exit `0` when GitHub answered, `1` when it could not be checked); `dock.exe --update-install <tag>` verifies and installs a release already staged in `update\<tag>\`, and accepts no other path.
 
@@ -197,8 +216,9 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `start_style` | `"compact"` | Start menu layout: `"compact"` (quick launcher) or `"windows11"` (full menu); the old names `"vertical"` / `"horizontal"` are still read |
 | `start_grid` | `false` | Windows 11 layout: "All apps" as a grid of icons instead of a list (the button next to "All apps") |
 | `audio_layout` | `"MOSX"` | Volume popup sections in order (M master, O output, S spatial, X mixer; lowercase = collapsed, `-` in front = hidden); normally set from the popup |
-| `update_check` | `true` | Ask GitHub once a day whether a newer release exists (badge only) |
+| `update_check` | `true` | Ask GitHub once a day whether a newer release exists (badge only); the request is made by a short-lived copy of `dock.exe` (`--update-fetch`) that exits at once |
 | `update_auto_install` | `false` | Download, verify and install new releases by themselves |
+| `launcher` | `{ "chord": "off", ... }` | The launcher (see Launcher above). `chord`: `"off"`, `"alt+space"` or `"alt+shift+space"`; `enabled`; `with_powertoys` (`"yield"` or `"take"`); `monitor` (`"pointer"`, `"active"`, `"primary"`); `top_percent` 10-50; `width` 560-880; `rows` 4-12; `keep_query`; `over_fullscreen` (`"pass"` or `"open"`); `learn`; `providers` (switch each source on or off); `prefixes`; `aliases`; `file_folders` (up to 8 more folders for file search, e.g. `["D:\\Archive", "E:\\"]`; file search already covers your profile, the Start menu folders and your Desktop, Documents, Downloads, Pictures, Music and Videos folders wherever they are on a local drive (a personal folder set to the top of a drive (`D:\`) only when you list it here), and only what Windows Search has indexed; a whole data drive is allowed, network paths, the Windows and Program Files folders and other accounts' profiles never are, a refused entry is ignored and counted in `dock.log`; the search runs with the dock's administrator rights, so it can show the names of files other accounts keep in a folder listed here); `web_engine` (`"google"`, `"bing"`, `"duckduckgo"`, `"custom"`) and `web_url` for `"custom"` |
 
 `last_update_check` and `update_available` are written by the dock itself.
 
@@ -249,7 +269,7 @@ Everything the dock stores is in `%ProgramData%\mini-oled-dock`:
 |---|---|---|
 | `config.json` (+ `config.json.bak`) | settings | you (edit in place) and administrators; the `.bak` copy is admin-only |
 | `icons\` | your custom PNGs | you can add, replace and delete files |
-| `cache\` | extracted icon cache (PNG) | administrators only |
+| `cache\` | extracted icon cache (PNG); `settings-catalog.bin`, the Windows Settings list that the launcher and Start search read (rebuilt when stale or damaged); `cache\<SID>\` holds one user's launcher history (commands run, picks as hashes), readable by that user and administrators | administrators only |
 | `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), deleted once that version or a newer one runs | administrators only |
 | `dock.log`, `dock.log.1` | log, rotated at 2 MB | administrators only |
 | `taskbar-state` | the original taskbar state, used to restore it | administrators only |
@@ -266,6 +286,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
+| [1.5.0](.github/release-notes/v1.5.0.md) | 2026-11-23 | The launcher (off by default), no freeze on a hung foreground window, taskbar edge fixes, full third-party licence texts |
 | [1.4.3](.github/release-notes/v1.4.3.md) | 2026-11-22 | Taskbar auto-hide: checks whether another bar holds the screen edge first |
 | [1.4.2](.github/release-notes/v1.4.2.md) | 2026-11-12 | Hotfix: the self-updater can download its first update |
 | [1.4.1](.github/release-notes/v1.4.1.md) | 2026-11-12 | Start menu rework, the app's jump list on right click, pins survive app updates |

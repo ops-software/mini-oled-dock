@@ -63,10 +63,13 @@ use windows::Win32::Foundation::RECT;
 use crate::config::StartStyle;
 use crate::i18n::tr;
 use crate::icons::IconBitmap;
+use crate::launcher::arena::Arena;
+use crate::launcher::catalog;
+use crate::launcher::strings;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, Button, Content, DataEvent, HitMap, PopupKind, Reply};
 use crate::render::Metrics;
-use crate::shell_thread::{self, ShellRequest, StartApp};
+use crate::shell_thread::{self, IconPlan, ShellRequest, StartApp};
 use crate::start_search::{self, Keys};
 use crate::surface::{
     rect_wh, Font, Surface, HOVER_ALPHA, PANEL_BORDER_ALPHA, ROW_RADIUS, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE,
@@ -80,7 +83,7 @@ const W: i32 = 420;
 const H: i32 = 540;
 /// Outer inset of the content.
 const INSET: i32 = 14;
-const SEARCH_H: i32 = 38;
+pub(crate) const SEARCH_H: i32 = 38;
 /// Space between the sections.
 const GAP: i32 = 10;
 /// Pin strip: side of a cell, icon side inside it, height of the line under it (the name of the
@@ -243,25 +246,26 @@ pub(crate) fn release() {
     shell_thread::request(ShellRequest::StartRelease);
 }
 
-/// `ShellEvent::StartApps`: replaces the catalog (sorted by name).
-pub(crate) fn store_apps(list: Vec<StartApp>) {
-    // Read by the shell thread before it sent the catalog (`None` only in tests and previews).
-    // Taken, not shared: the apps copy their own few keywords below and the rest is freed here.
-    let index = start_search::take_app_index();
-    let mut apps: Vec<App> = list
-        .into_iter()
-        .map(|a| {
-            let lower = a.name.to_lowercase();
-            let (keys, rank) = index.as_ref().map_or((Keys::default(), 0), |x| {
-                let rank = x.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(x.default_rank);
-                (x.synonyms.get(&lower).cloned().unwrap_or_default(), rank)
-            });
-            App { keys, rank, lower, id: a.id, name: a.name }
-        })
-        .collect();
-    apps.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.name.cmp(&b.name)));
+/// `ShellEvent::StartApps`: replaces the catalog (sorted by name) while the menu is open. The rows are made from the
+/// listing's arena (L3 T17), which carries what Start searches with exactly as before: Windows' synonyms of each name as
+/// Windows wrote them and the rank of the app's own id.
+pub(crate) fn store_apps(arena: &Arena) {
     STORE.with(|s| match s.try_borrow_mut() {
         Ok(mut s) if s.open => {
+            let v = arena.view();
+            let mut apps: Vec<App> = (0..v.len())
+                .map(|i| {
+                    let name = v.name(i);
+                    App {
+                        id: v.id(i).to_string(),
+                        name: name.to_string(),
+                        lower: name.to_lowercase(),
+                        keys: Keys::from_packed(v.start_keys(i)),
+                        rank: v.start_rank(i),
+                    }
+                })
+                .collect();
+            apps.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.name.cmp(&b.name)));
             s.apps = apps;
             s.loaded = true;
         }
@@ -288,6 +292,14 @@ pub(crate) fn store_icons(icon_px: u32, icons: Vec<(String, Option<IconBitmap>)>
     })
 }
 
+/// What a Start open asks the shell thread for: the catalogue and the icons still missing at `px`, the pins (`first`)
+/// first. The catalogue comes from an `--start-apps` child only while a launcher chord is set (one listing then feeds
+/// the launcher too); with no chord it is listed in-process, as in M1.
+fn catalog_request(px: u32, first: Vec<String>) -> ShellRequest {
+    let child = crate::popup::popup_launcher::is_on();
+    ShellRequest::ListStartApps { icon_px: px, icons: IconPlan::All { first }, child }
+}
+
 /// Asks the shell thread for a fresh catalog (and the icons still missing) at `px`. A larger size
 /// than the stored one (a display with a higher DPI) starts the icons over; a smaller one reuses
 /// them (they are shrunk when drawn).
@@ -304,9 +316,9 @@ fn request_catalog(px: u32) {
         Err(_) => px,
     });
     let first = crate::config::get().start_pins.clone();
-    shell_thread::request(ShellRequest::ListStartApps { icon_px: px, first });
+    shell_thread::request(catalog_request(px, first));
     // The settings the search also finds: built in the background, unless they are still there.
-    start_search::load_settings();
+    start_search::hold_settings(start_search::Holder::Start);
 }
 
 // ------------------------------------------------------------------ search (pure)
@@ -378,6 +390,8 @@ pub(crate) enum Item {
     Setting(usize),
     /// Letter heading of the "All apps" list (a click opens the letter grid).
     Letter(char),
+    /// The one-time offer of the launcher (`offer_due`), first among the results of a search.
+    Offer,
 }
 
 /// The "All apps" list: the apps (`letters`: the letter of each, in order) with a heading before
@@ -655,7 +669,7 @@ fn tail_fit(s: &Surface, text: &str, max_w: i32) -> String {
 }
 
 /// Magnifier glyph (16x16 space): a ring and a handle towards the bottom right.
-fn magnifier(u: f32, v: f32) -> bool {
+pub(crate) fn magnifier(u: f32, v: f32) -> bool {
     let (dx, dy) = (u - 6.5, v - 6.5);
     if ((dx * dx + dy * dy).sqrt() - 4.6).abs() <= 0.85 {
         return true;
@@ -727,6 +741,7 @@ enum Target {
     Setting(usize),
     Letter,
     Folder(usize),
+    Offer,
 }
 
 /// What runs after the popup has closed.
@@ -758,6 +773,53 @@ enum MenuAct {
     Uninstall,
     /// Drop the folder with this index (its apps stay pinned).
     Ungroup(usize),
+    /// The launcher's offer: take the chord (`LauncherChord`), or never show the offer again.
+    OfferUse(OfferChord),
+    OfferDismiss,
+}
+
+/// The chords the launcher's offer can set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OfferChord {
+    AltSpace,
+    AltShiftSpace,
+}
+
+impl OfferChord {
+    /// The `launcher.chord` value.
+    fn config_value(self) -> &'static str {
+        match self {
+            OfferChord::AltSpace => "alt+space",
+            OfferChord::AltShiftSpace => "alt+shift+space",
+        }
+    }
+}
+
+/// What the offer row says (5.2.1): the offer, or what the probe found when the chord was tried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OfferState {
+    #[default]
+    Ask,
+    /// Alt+Space is held by another app: Alt+Shift+Space is proposed.
+    AltSpaceHeld,
+    /// Both are held: nothing to propose.
+    BothHeld,
+}
+
+/// The offer is due: the launcher is on, its chord is off and the owner has not answered (5.2.1).
+pub(crate) fn offer_due(cfg: &crate::config::Config) -> bool {
+    cfg.launcher.enabled && cfg.launcher.chord == "off" && !cfg.launcher.offer_done
+}
+
+/// What taking `chord` leads to, given whether another app holds each chord (`held`, the RegisterHotKey probe).
+pub(crate) fn offer_next(chord: OfferChord, held: &dyn Fn(OfferChord) -> bool) -> Result<OfferChord, OfferState> {
+    if !held(chord) {
+        return Ok(chord);
+    }
+    Err(match chord {
+        OfferChord::AltSpace => OfferState::AltSpaceHeld,
+        OfferChord::AltShiftSpace => OfferState::BothHeld,
+    })
 }
 
 /// An overlay drawn by this popup over its own surface, like the power flyout: a backdrop hit
@@ -873,6 +935,10 @@ pub(crate) struct StartMenu {
     max: (i32, i32),
     /// PREVIEW-HOOK: overlay to open once the first layout exists (`preview_new`).
     preview_over: Option<PreviewOver>,
+    /// What the launcher's offer row says (`Item::Offer`), and whether it may show at all (the real menu; a preview only
+    /// when the scene asks for it).
+    offer: OfferState,
+    offer_on: bool,
 }
 
 /// PREVIEW-HOOK: the overlay a preview shows open.
@@ -884,6 +950,8 @@ pub(crate) enum PreviewOver {
     Letters,
     /// The first folder of the pinned grid.
     Folder,
+    /// No overlay: the launcher's offer row shows first among the results.
+    Offer,
 }
 
 /// Creates the content in the configured style; labels in the dock language (`i18n`).
@@ -894,6 +962,7 @@ pub(crate) fn new() -> Box<dyn Content> {
         // The account name of the process (as GetUserNameW): no picture, nothing else loaded.
         c.user = std::env::var("USERNAME").unwrap_or_default();
     }
+    c.offer_on = true;
     Box::new(c)
 }
 
@@ -926,6 +995,8 @@ fn make() -> StartMenu {
         button_w: 0,
         max: UNCAPPED,
         preview_over: None,
+        offer: OfferState::Ask,
+        offer_on: false,
     }
 }
 
@@ -945,7 +1016,9 @@ pub(crate) fn preview_new(
             *s = Store { icon_px: px, open: true, ..Store::default() };
         }
     });
-    store_apps(apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect());
+    let list: Vec<StartApp> =
+        apps.iter().map(|(id, name, _)| StartApp { id: id.clone(), name: name.clone() }).collect();
+    store_apps(&catalog::build_apps(&list, None).unwrap_or_default());
     store_icons(px, apps.into_iter().map(|(id, _, b)| (id, Some(b))).collect());
     let mut c = make();
     c.requested = true;
@@ -955,8 +1028,10 @@ pub(crate) fn preview_new(
         c.user = "User".to_string();
     }
     c.query = query.to_string();
+    c.offer_on = over == Some(PreviewOver::Offer);
     if c.searching() {
-        c.sel = Some(0);
+        // The offer is first but never the default (the first app is).
+        c.sel = Some(usize::from(c.offer_on));
     }
     Box::new(c)
 }
@@ -1007,6 +1082,10 @@ impl StartMenu {
             }
             (results, Vec::new())
         });
+        let mut results = results;
+        if searching && self.offer_on && offer_due(&cfg) {
+            results.insert(0, Item::Offer);
+        }
         self.results = results;
         self.pins = pins;
         self.grid = win11 && !searching && cfg.start_grid;
@@ -1017,6 +1096,9 @@ impl StartMenu {
         self.scroll = self.scroll.min(self.max_scroll());
         if let Some(s) = self.sel {
             self.sel = if self.results.is_empty() { None } else { Some(s.min(self.results.len() - 1)) };
+        } else if searching {
+            // Typed before the data arrived: the first app that shows up becomes the default, never the offer.
+            self.sel = self.default_sel();
         }
         self.layout_over();
         self.rebuild_hits();
@@ -1226,11 +1308,51 @@ impl StartMenu {
         }
     }
 
+    /// A click or Enter on the offer row: its main action (Alt+Space; after a refusal, Alt+Shift+Space).
+    fn offer_click(&mut self) -> Reply {
+        match self.offer {
+            OfferState::Ask => self.offer_use(OfferChord::AltSpace),
+            OfferState::AltSpaceHeld => self.offer_use(OfferChord::AltShiftSpace),
+            OfferState::BothHeld => Reply::None,
+        }
+    }
+
+    /// Sets the launcher's chord when no other app holds it (the probe of `launcher_sys::chord_is_free`): the offer is
+    /// answered for good. A held chord changes the row instead.
+    fn offer_use(&mut self, chord: OfferChord) -> Reply {
+        match offer_next(chord, &|c| !crate::launcher_sys::chord_is_free(c == OfferChord::AltShiftSpace)) {
+            Ok(chord) => {
+                let value = chord.config_value();
+                match crate::config::modify(|c| {
+                    c.launcher.chord = value.to_string();
+                    c.launcher.offer_done = true;
+                }) {
+                    Ok(()) => {
+                        log!("startmenu: the launcher offer was taken");
+                        crate::popup::popup_launcher::on_config();
+                    }
+                    Err(e) => log!("startmenu: cannot save the launcher chord: {e}"),
+                }
+            }
+            Err(state) => self.offer = state,
+        }
+        self.refresh();
+        Reply::Redraw
+    }
+
     /// Runs a context menu row for the app `id`: the config changes apply at once (the Start stays
     /// open), the launches wait for the popup to close.
     fn run_menu(&mut self, act: MenuAct, id: &str) -> Reply {
         self.over = None;
         let saved = match act {
+            MenuAct::OfferUse(chord) => return self.offer_use(chord),
+            MenuAct::OfferDismiss => {
+                if let Err(e) = crate::config::modify(|c| c.launcher.offer_done = true) {
+                    log!("startmenu: cannot save the dismissed offer: {e}");
+                }
+                self.refresh();
+                return Reply::Redraw;
+            }
             MenuAct::Pin => crate::config::toggle_start_pin(id),
             MenuAct::LeaveFolder => crate::config::start_folder_leave(id),
             MenuAct::Ungroup(f) => crate::config::start_folder_dissolve(f),
@@ -1368,6 +1490,7 @@ impl StartMenu {
 
     fn item_target(item: &Item) -> Target {
         match *item {
+            Item::Offer => Target::Offer,
             Item::App(i) => Target::App(i),
             Item::Setting(i) => Target::Setting(i),
             Item::Letter(_) => Target::Letter,
@@ -1378,8 +1501,15 @@ impl StartMenu {
     fn query_changed(&mut self) -> Reply {
         self.scroll = 0;
         self.refresh();
-        self.sel = (self.searching() && !self.results.is_empty()).then_some(0);
+        // The offer row is first but never the default: Enter after typing opens the first app, not the offer.
+        self.sel = self.default_sel();
         Reply::Redraw
+    }
+
+    /// The result Enter opens while searching: the first one, skipping the offer row.
+    fn default_sel(&self) -> Option<usize> {
+        let first = usize::from(self.results.first() == Some(&Item::Offer));
+        (self.searching() && self.results.len() > first).then_some(first)
     }
 
     /// Moves the selection by `delta` results (clamped); the first move from no selection lands on
@@ -1418,6 +1548,7 @@ impl StartMenu {
             }
             Target::Letter => return self.open_letters(),
             Target::Folder(f) => return self.open_folder(f),
+            Target::Offer => return self.offer_click(),
         };
         match pending {
             Some(p) => {
@@ -1445,7 +1576,8 @@ impl StartMenu {
         let max_w = g.search.right - m.px(12) - tx;
         let caret_x = if self.query.is_empty() {
             s.text(labels().placeholder, tx, ty, Font::Normal, WHITE, TEXT3_ALPHA);
-            tx
+            // Before the placeholder, as the launcher's field (5.2.2).
+            tx - m.px(1).max(1)
         } else {
             let shown = tail_fit(s, &self.query, max_w);
             s.text(&shown, tx, ty, Font::Normal, WHITE, TEXT_ALPHA);
@@ -1600,7 +1732,7 @@ impl StartMenu {
                 }
             }
         }
-        if !st.loaded || self.results.is_empty() {
+        if !st.loaded || self.results.iter().all(|r| *r == Item::Offer) {
             // Still loading, or nothing matches: said under whatever was drawn.
             let msg = if st.loaded { labels().none } else { labels().loading };
             let top = self.placed.last().map_or(g.view.top, |p| p.1.bottom);
@@ -1635,6 +1767,20 @@ impl StartMenu {
         let (ix, iy) = (rc.left + rpad, rc.top + (rc.bottom - rc.top - ri) / 2);
         let catalog = start_search::settings();
         let name: &str = match item {
+            // The launcher's offer: an info mark where the icon goes, the offer in the small face.
+            Item::Offer => {
+                let gs = m.px(16);
+                s.glyph(ix + (ri - gs) / 2, iy + (ri - gs) / 2, gs, lift(TEXT2_ALPHA, lit), &crate::glyphs::info_shape);
+                let text = match self.offer {
+                    OfferState::Ask => strings::offer_text(),
+                    OfferState::AltSpaceHeld => strings::offer_alt_space_held(),
+                    OfferState::BothHeld => strings::offer_both_held(),
+                };
+                let tx = rc.left + rpad + ri + m.px(12);
+                let text = s.ellipsize(text, Font::Small, rc.right - rpad - tx);
+                s.text(&text, tx, center_y(&rc, s.line_height(Font::Small)), Font::Small, WHITE, lift(TEXT_ALPHA, lit));
+                return;
+            }
             // A letter heading: the letter alone (a click opens the letter grid).
             Item::Letter(c) => {
                 let y = center_y(&rc, s.line_height(Font::Bold));
@@ -1846,7 +1992,7 @@ impl Content for StartMenu {
                     self.click(ID_PIN + i as u32);
                 }
             }
-            None => {}
+            Some(PreviewOver::Offer) | None => {}
         }
         (self.geo.w, self.geo.h)
     }
@@ -1928,6 +2074,14 @@ impl Content for StartMenu {
         }
         match self.target_at(id) {
             Some(Target::App(idx)) => self.open_menu(idx, anchor),
+            Some(Target::Offer) => {
+                let rows = vec![
+                    (MenuAct::OfferUse(OfferChord::AltSpace), strings::offer_use_alt_space().to_string()),
+                    (MenuAct::OfferUse(OfferChord::AltShiftSpace), strings::offer_use_alt_shift_space().to_string()),
+                    (MenuAct::OfferDismiss, strings::offer_dismiss().to_string()),
+                ];
+                self.open_over(Over::Menu { id: String::new(), rows }, anchor)
+            }
             Some(Target::Folder(f)) => {
                 let l = labels();
                 let rows = vec![(MenuAct::Rename(f), l.rename.to_string()), (MenuAct::Ungroup(f), l.ungroup.to_string())];
@@ -2054,7 +2208,7 @@ impl Content for StartMenu {
             VK_HOME => self.move_sel(i64::MIN / 2),
             VK_END => self.move_sel(i64::MAX / 2),
             VK_RETURN => {
-                let target = self.sel.or((self.searching() && !self.results.is_empty()).then_some(0));
+                let target = self.sel.or(self.default_sel());
                 match target.and_then(|i| self.results.get(i)).map(Self::item_target) {
                     Some(t) => self.activate(t),
                     None => Reply::None,
@@ -2131,6 +2285,54 @@ mod tests {
 
     const M: Metrics = Metrics { dpi: 96 };
 
+    /// With no launcher chord a Start open lists its apps in-process, as in M1: no `--start-apps` child.
+    #[test]
+    fn start_lists_in_process_with_the_chord_off() {
+        // A thread of its own: no chord was ever set on it.
+        std::thread::spawn(|| {
+            assert!(!crate::popup::popup_launcher::is_on());
+            let r = catalog_request(32, vec!["a".into()]);
+            let ShellRequest::ListStartApps { icon_px, icons: IconPlan::All { first }, child } = &r else {
+                panic!("{r:?}");
+            };
+            assert!(*icon_px == 32 && *first == ["a"], "{r:?}");
+            assert!(!child, "no chord: Start lists in-process, with no --start-apps child");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn offer_row_only_when_due() {
+        use crate::config::Config;
+        let mut c = Config::default();
+        assert!(offer_due(&c), "a config that predates the launcher: chord off, not answered");
+        c.launcher.offer_done = true;
+        assert!(!offer_due(&c), "answered");
+        c.launcher.offer_done = false;
+        c.launcher.chord = "alt+shift+space".into();
+        assert!(!offer_due(&c), "a chord is set");
+        c.launcher.chord = "off".into();
+        c.launcher.enabled = false;
+        assert!(!offer_due(&c), "the launcher is off");
+    }
+
+    #[test]
+    fn offer_probe_leads_to_a_chord_or_a_refusal() {
+        use OfferChord::{AltShiftSpace, AltSpace};
+        assert_eq!(offer_next(AltSpace, &|_| false), Ok(AltSpace));
+        assert_eq!(offer_next(AltSpace, &|c| c == AltSpace), Err(OfferState::AltSpaceHeld));
+        assert_eq!(offer_next(AltShiftSpace, &|c| c == AltSpace), Ok(AltShiftSpace), "the proposal is free");
+        assert_eq!(offer_next(AltShiftSpace, &|_| true), Err(OfferState::BothHeld));
+        assert_eq!(AltSpace.config_value(), "alt+space");
+        assert_eq!(AltShiftSpace.config_value(), "alt+shift+space");
+        assert!(crate::config::LauncherConfig::default().chord_spec().is_none());
+        for v in [AltSpace.config_value(), AltShiftSpace.config_value()] {
+            let c = crate::config::LauncherConfig { chord: v.into(), ..Default::default() };
+            assert!(c.chord_spec().is_some(), "{v} is a chord the config accepts");
+        }
+    }
+
     #[test]
     fn releasing_frees_the_store_and_late_events_are_dropped() {
         let apps = vec![
@@ -2143,9 +2345,50 @@ mod tests {
             let s = s.borrow();
             assert!(s.apps.is_empty() && s.icons.is_empty() && !s.loaded && !s.open);
         });
-        store_apps(vec![StartApp { id: "x".into(), name: "X".into() }]);
+        store_apps(&catalog::build_apps(&[StartApp { id: "x".into(), name: "X".into() }], None).unwrap());
         assert!(!store_icons(32, vec![("x".into(), Some(IconBitmap::new(32, 32)))]), "closed menu ignores late icons");
         STORE.with(|s| assert!(s.borrow().apps.is_empty()));
+    }
+
+    /// L3 T17: Start's rows made from the apps arena (what the `--start-apps` child lists) are the rows Start made from
+    /// the list and Windows' app index before: the same ids, names, order, synonyms (as Windows wrote them) and ranks.
+    #[test]
+    fn store_apps_from_an_arena() {
+        let mut index = start_search::AppIndex { default_rank: 900, ..Default::default() };
+        index.synonyms.insert("connessione desktop remoto".into(), Keys::from(&[("RDP", 10), ("Remoto", 40)][..]));
+        index.ranks.insert("rdc.exe".into(), 3);
+        // An inbox app with no rank of its own: the launcher ranks it as its classic program, Start as before.
+        index.ranks.insert("{1ac14e77-02e7-4e5d-b744-2eb1ae5198b7}\\notepad.exe".into(), 7);
+        let list = vec![
+            StartApp { id: "Zeta.exe".into(), name: "Zeta".into() },
+            StartApp { id: "RDC.exe".into(), name: "Connessione Desktop Remoto".into() },
+            StartApp { id: "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App".into(), name: "Blocco note".into() },
+        ];
+        // The rows of the old `store_apps(list, Some(&index))`.
+        let mut old: Vec<(String, String, String, Keys, u32)> = list
+            .iter()
+            .map(|a| {
+                let lower = a.name.to_lowercase();
+                let rank = index.ranks.get(&a.id.to_lowercase()).copied().unwrap_or(index.default_rank);
+                let keys = index.synonyms.get(&lower).cloned().unwrap_or_default();
+                (a.id.clone(), a.name.clone(), lower, keys, rank)
+            })
+            .collect();
+        old.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        let arena = catalog::build_apps(&list, Some(&index)).unwrap();
+        let notepad = (0..arena.len()).find(|&i| arena.view().name(i) == "Blocco note").unwrap();
+        assert_eq!(arena.view().rank(notepad), 7, "the launcher's rank");
+        STORE.with(|s| *s.borrow_mut() = Store { open: true, ..Store::default() });
+        store_apps(&arena);
+        let rows: Vec<(String, String, String, Keys, u32)> = STORE.with(|s| {
+            let s = s.borrow();
+            assert!(s.loaded);
+            s.apps.iter().map(|a| (a.id.clone(), a.name.clone(), a.lower.clone(), a.keys.clone(), a.rank)).collect()
+        });
+        assert_eq!(rows, old);
+        assert_eq!(rows[0].4, 900, "Start keeps the default rank of an app with no rank of its own");
+        assert_eq!(rank(&Cand { lower: &rows[1].2, keys: &rows[1].3, rank: rows[1].4 }, "rdp"), Some((1, 10)));
+        release_store();
     }
 
     fn named(lower: &str) -> Cand<'_> {
@@ -2362,6 +2605,24 @@ mod tests {
         assert_eq!(c.button(ID_ROW, Button::Right), Reply::None);
         assert_eq!(c.click(ID_ROW + 1), Reply::Close);
         assert_eq!(c.pending, Some(Pending::App("a".into())));
+        release_store();
+    }
+
+    #[test]
+    fn enter_without_a_selection_skips_the_offer_row() {
+        let apps = vec![("a".to_string(), "Alpha".to_string(), IconBitmap::new(32, 32))];
+        drop(preview_new(apps, "", StartStyle::Compact, None));
+        let mut c = make();
+        c.query = "al".into();
+        c.results = vec![Item::Offer, Item::App(0)];
+        c.sel = None;
+        assert_eq!(c.key(VK_RETURN), Some(Reply::Close));
+        assert_eq!(c.pending, Some(Pending::App("a".into())));
+        // Only the offer: nothing to open.
+        c.pending = None;
+        c.results = vec![Item::Offer];
+        assert_eq!(c.key(VK_RETURN), Some(Reply::None));
+        assert!(c.pending.is_none());
         release_store();
     }
 
