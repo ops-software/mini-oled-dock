@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 
 /// `CREATE_NO_WINDOW` (winbase.h): every process a test starts carries it (lint `every_spawned_process_has_no_window`).
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Appendix A's header, checked byte by byte.
-const HEADER: &[u8] = b"mini-oled-dock launcher-files 1\n";
+/// Appendix A's header (protocol version 2), checked byte by byte.
+const HEADER: &[u8] = b"mini-oled-dock launcher-files 2\n";
 
 #[test]
 fn header_and_one_state_frame_then_exit_0() {

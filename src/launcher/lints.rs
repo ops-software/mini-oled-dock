@@ -1081,7 +1081,7 @@ fn every_spawned_process_has_no_window() {
 
 /// The files helper child (plan L2-F2, D1): the only file that may name the search client or the service manager.
 const FILES_HELPER: &str = "src/files_child.rs";
-const SEARCH_TOKENS: [&str; 8] = [
+const SEARCH_TOKENS: [&str; 9] = [
     "Win32::System::Search",
     "ISearchManager",
     "CSearchManager",
@@ -1090,6 +1090,8 @@ const SEARCH_TOKENS: [&str; 8] = [
     "ICommandText",
     "IRowset",
     "OpenSCManagerW",
+    // Windows' word on a listed name's type: the shell's association code reads it in the helper, never in the dock.
+    "AssocIsDangerous",
 ];
 
 /// No module the helper loads ever enters the dock (FILES-5): the search client's names appear in the helper only, and
@@ -1133,6 +1135,8 @@ fn search_stays_in_the_files_helper() {
     assert!(search_violations(FILES_HELPER, client).is_empty());
     assert_eq!(search_violations("src/shell_thread.rs", client).len(), 3);
     assert_eq!(search_violations("src/launcher_files.rs", "let s = unsafe { OpenSCManagerW(a, b, c) };").len(), 1);
+    assert_eq!(search_violations("src/launcher/files.rs", "unsafe { AssocIsDangerous(w!(\".x\")) }").len(), 1);
+    assert!(search_violations(FILES_HELPER, "unsafe { AssocIsDangerous(PCWSTR(e.as_ptr())) }").is_empty());
     assert!(search_violations("src/launcher_files.rs", "let r: IRowsetX = x; let c = CSearchManagerY;").is_empty());
     let entry = "return files_child::run(0);";
     assert!(search_violations("src/main.rs", entry).is_empty());

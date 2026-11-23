@@ -25,8 +25,9 @@ pub const MAX_LINE_BYTES: usize = 1_100;
 /// The words sent to Windows Search: at most 8, each cut to 64 characters.
 const MAX_WORDS: usize = 8;
 const MAX_WORD_CHARS: usize = 64;
-/// The first bytes the helper writes.
-pub const HEADER: &[u8] = b"mini-oled-dock launcher-files 1\n";
+/// The first bytes the helper writes: protocol version 2 (a row's flags carry bit 1, `FLAG_DANGEROUS`). A dock of
+/// another version refuses the header, so a helper the dock does not understand never names a row.
+pub const HEADER: &[u8] = b"mini-oled-dock launcher-files 2\n";
 /// Rows of one frame, the skipped ones included (the helper asks Windows for 50).
 pub const MAX_ROWS: u32 = 50;
 /// A frame's bytes, its tag included: never more by construction (50 rows of capped columns, `frame_cap_holds`).
@@ -42,6 +43,9 @@ pub const FOLDER_UNITS: usize = 260;
 
 const TAG_STATE: u32 = 1;
 const TAG_ROWS: u32 = 2;
+/// A row's flags: bit 0 a folder, bit 1 Windows names the type of its name dangerous; any other bit is refused.
+const FLAG_FOLDER: u8 = 1;
+const FLAG_DANGEROUS: u8 = 2;
 /// The helper's states (the state frame).
 pub const STATE_READY: u32 = 0;
 pub const STATE_SEARCH_OFF: u32 = 1;
@@ -176,6 +180,10 @@ pub struct FileHit {
     /// The parent folder's display name (may be empty).
     pub folder: Box<str>,
     pub dir: bool,
+    /// Windows names the type of the name's extension dangerous (its own check of a type, asked by the helper, which
+    /// runs the shell's association code in its own process, files_child.rs): the row is an executable file whatever
+    /// `file_class` says. The helper can only add to the list, never take a type off it.
+    pub dangerous: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -246,7 +254,7 @@ pub fn encode_rows(gen: u64, status: u32, skipped: u32, hits: &[FileHit], out: &
     out.extend_from_slice(&skipped.to_le_bytes());
     out.extend_from_slice(&n.to_le_bytes());
     for h in hits.iter().filter(ok).take(n as usize) {
-        out.push(u8::from(h.dir));
+        out.push(if h.dir { FLAG_FOLDER } else { 0 } | if h.dangerous { FLAG_DANGEROUS } else { 0 });
         for s in [&h.path, &h.name, &h.folder] {
             // Within the caps `check_hit` holds them to, far below u16::MAX.
             out.extend_from_slice(&u16::try_from(s.len()).unwrap_or(0).to_le_bytes());
@@ -405,16 +413,16 @@ fn read_rows(r: &mut impl Read) -> Result<Frame, FrameError> {
     for _ in 0..n {
         let mut f = [0u8; 1];
         take(r, &mut f)?;
-        let dir = match f {
-            [0] => false,
-            [1] => true,
-            _ => return Err(FrameError::Flags),
-        };
+        let [flags] = f;
+        if flags & !(FLAG_FOLDER | FLAG_DANGEROUS) != 0 {
+            return Err(FrameError::Flags);
+        }
         let path = read_str(r, PATH_BYTES, FrameError::PathLen)?;
         let name = read_str(r, NAME_BYTES, FrameError::NameLen)?;
         let folder = read_str(r, FOLDER_BYTES, FrameError::FolderLen)?;
         check_hit(&path, &name, &folder)?;
-        hits.push(FileHit { path, name, folder, dir });
+        let (dir, dangerous) = (flags & FLAG_FOLDER != 0, flags & FLAG_DANGEROUS != 0);
+        hits.push(FileHit { path, name, folder, dir, dangerous });
     }
     Ok(Frame::Rows { gen, status, skipped, hits })
 }
@@ -471,9 +479,11 @@ fn glyph_of(dir: bool, class: FileClass) -> GlyphId {
 /// The rows of a re-sorted batch, the first `cap`: a file or a folder by its path, its name and its folder, a glyph by
 /// class, the file kinds' verbs (an executable has no Open while the Mark of the Web check is open), never destructive.
 /// The class comes from the name as Windows opens it (`check_hit` holds it to the path's last component, so a trailing
-/// separator hides no extension; `file_class` drops the trailing dots and spaces Windows drops), and the helper's
-/// folder flag is not taken for an executable's name: that row is an executable file, so nothing in the helper's output
-/// can give Open to what SPEC 5.4.6 holds back (a real folder so named keeps Open file location and Copy).
+/// separator hides no extension; `file_class` drops the trailing dots and spaces Windows drops) or, when the helper
+/// says Windows names that type dangerous (`FileHit::dangerous`), is executable whatever the list says: the list is
+/// the floor and the helper only adds. The helper's folder flag is not taken for an executable's name: that row is an
+/// executable file, so nothing in the helper's output can give Open to what SPEC 5.4.6 holds back (a real folder so
+/// named keeps Open file location and Copy).
 pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
     let first = folded_words.first().copied().unwrap_or("");
     let mut out = Vec::with_capacity(hits.len().min(usize::from(cap)));
@@ -483,7 +493,7 @@ pub fn items(hits: Vec<FileHit>, folded_words: &[&str], cap: u8) -> Vec<Item> {
             1 => rank::T_WORD,
             _ => rank::T_SUBSTR,
         };
-        let class = providers::file_class(&h.name);
+        let class = if h.dangerous { FileClass::Executable } else { providers::file_class(&h.name) };
         let dir = h.dir && class != FileClass::Executable;
         let class = if dir { FileClass::Other } else { class };
         let (kind, rank_kind, verbs) = if dir {
@@ -953,7 +963,12 @@ mod tests {
         let p = path.strip_suffix('\\').unwrap_or(path);
         let name = p.rsplit('\\').next().unwrap();
         let folder = p.rsplit('\\').nth(1).unwrap_or("");
-        FileHit { path: path.into(), name: name.into(), folder: folder.into(), dir }
+        FileHit { path: path.into(), name: name.into(), folder: folder.into(), dir, dangerous: false }
+    }
+
+    /// A hit whose type Windows names dangerous (the helper's flag bit 1).
+    fn dangerous(path: &str, dir: bool) -> FileHit {
+        FileHit { dangerous: true, ..hit(path, dir) }
     }
 
     fn stream(frames: &[Vec<u8>]) -> Vec<u8> {
@@ -1084,6 +1099,8 @@ mod tests {
             hit("C:\\Users\\a\\quokka plan.md", false),
             hit("C:\\Users\\a\\quokka-dir\\", true),
             hit("\\\\server\\share\\Perché.txt", false),
+            dangerous("C:\\Users\\a\\quokka.qqq", false),
+            dangerous("C:\\Users\\a\\quokka.qqd\\", true),
         ];
         let mut failed = Vec::new();
         encode_rows(8, STATUS_FAILED, 0, &[], &mut failed);
@@ -1119,7 +1136,8 @@ mod tests {
         let row = |path: &[u8], name: &[u8]| raw_rows(1, 0, 0, 1, &[(0, path, name, b"u")]);
         let after_state = |f: Vec<u8>| stream(&[state(0), f]);
         let cases: Vec<(&str, Vec<u8>, FrameError)> = vec![
-            ("wrong header", b"mini-oled-dock launcher-files 2\n".to_vec(), FrameError::Header),
+            ("wrong header", b"mini-oled-dock launcher-files 3\n".to_vec(), FrameError::Header),
+            ("version 1", b"mini-oled-dock launcher-files 1\n".to_vec(), FrameError::Header),
             ("short header", HEADER[..10].to_vec(), FrameError::Header),
             ("no state", HEADER.to_vec(), FrameError::Truncated),
             ("cut tag", [stream(&[state(0)]), vec![2, 0]].concat(), FrameError::Truncated),
@@ -1133,7 +1151,9 @@ mod tests {
             ("too many", after_state(raw_rows(1, 0, 40, 11, &[])), FrameError::TooManyRows),
             ("overflow", after_state(raw_rows(1, 0, u32::MAX, 2, &[])), FrameError::TooManyRows),
             ("failed with rows", after_state(raw_rows(1, 1, 1, 0, &[])), FrameError::FailedWithRows),
-            ("flags", after_state(raw_rows(1, 0, 0, 1, &[(2, &ok(b"a"), b"a", b"u")])), FrameError::Flags),
+            ("flags", after_state(raw_rows(1, 0, 0, 1, &[(4, &ok(b"a"), b"a", b"u")])), FrameError::Flags),
+            ("flags 7", after_state(raw_rows(1, 0, 0, 1, &[(7, &ok(b"a"), b"a", b"u")])), FrameError::Flags),
+            ("flags 128", after_state(raw_rows(1, 0, 0, 1, &[(128, &ok(b"a"), b"a", b"u")])), FrameError::Flags),
             ("path short", after_state(row(b"C:", b"C:")), FrameError::PathLen),
             ("path bytes", after_state(row(&ok(&[b'a'; 3_068]), &[b'a'; 200])), FrameError::PathLen),
             ("path units", after_state(row(&ok(&[b'a'; 1_020]), &[b'a'; 200])), FrameError::PathLen),
@@ -1158,6 +1178,12 @@ mod tests {
         }
         // Every check but the pump's generation (`pump_checks_the_generation`) and the pipe's own failure is covered.
         assert_eq!(seen.len(), 18);
+        // Bit 0 (folder) and bit 1 (Windows names the type dangerous) are the only flags.
+        for flags in 0..=3u8 {
+            let (frames, end) = read_all(&after_state(raw_rows(1, 0, 0, 1, &[(flags, &ok(b"a.q"), b"a.q", b"u")])));
+            let Frame::Rows { hits, .. } = &frames[1] else { panic!("{flags}") };
+            assert_eq!((end, hits[0].dir, hits[0].dangerous), (Ok(()), flags & 1 != 0, flags & 2 != 0), "{flags}");
+        }
         // The name is compared ASCII case-insensitively, with one trailing separator ignored.
         assert_eq!(first_error(&after_state(row(&ok(b"Quokka.TXT"), b"quokka.txt"))), None);
         assert_eq!(first_error(&after_state(row(b"C:\\u\\dir\\", b"DIR"))), None);
@@ -1262,6 +1288,29 @@ mod tests {
             assert!(matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. }));
             assert!(!r.verbs.has(Verb::Open) && r.verbs.has(Verb::Reveal), "{}", r.title);
         }
+    }
+
+    #[test]
+    fn a_type_windows_names_dangerous_is_an_executable_row() {
+        let hits = vec![
+            dangerous("C:\\u\\quokka.qqq", false),
+            dangerous("C:\\u\\quokka.qqd\\", true),
+            hit("C:\\u\\quokka.exe", false),
+            hit("C:\\u\\quokka.qqq", false),
+            dangerous("C:\\u\\quokka.txt", false),
+        ];
+        let rows = items(hits, &["quokka"], 20);
+        // The helper's bit makes a file, whatever its extension's class and its folder flag, an executable file.
+        for r in [&rows[0], &rows[1], &rows[4]] {
+            assert_eq!((r.kind, &r.icon), (Kind::File, &IconRef::Glyph(GlyphId::Executable)), "{:?}", r.key);
+            assert!(matches!(r.payload, Payload::Path { dir: false, class: FileClass::Executable, .. }));
+            assert!(!r.verbs.has(Verb::Open) && r.verbs.has(Verb::Reveal) && r.verbs.has(Verb::Copy));
+        }
+        // The list is the floor: without the bit an executable stays one, and another type keeps Open.
+        assert!(matches!(rows[2].payload, Payload::Path { class: FileClass::Executable, .. }));
+        assert!(!rows[2].verbs.has(Verb::Open));
+        assert!(matches!(rows[3].payload, Payload::Path { dir: false, class: FileClass::Other, .. }));
+        assert!(rows[3].verbs.has(Verb::Open));
     }
 
     #[test]

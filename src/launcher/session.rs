@@ -1929,7 +1929,8 @@ mod tests {
 
     fn file_hit(path: &str) -> crate::launcher::files::FileHit {
         let name = path.rsplit('\\').next().unwrap();
-        crate::launcher::files::FileHit { path: path.into(), name: name.into(), folder: "u".into(), dir: false }
+        let folder = "u".into();
+        crate::launcher::files::FileHit { path: path.into(), name: name.into(), folder, dir: false, dangerous: false }
     }
 
     #[test]
@@ -1980,6 +1981,19 @@ mod tests {
         let b = batch(&s, vec![exe]);
         assert!(s.late(b, &fx.cx()));
         assert_eq!(s.selected(), None, "the executable alone: nothing");
+        // A type Windows names dangerous (the helper's bit) is held back as one, and Enter on it runs nothing.
+        let risky = crate::launcher::files::FileHit { dangerous: true, ..file_hit("C:\\u\\zz plan.qqq") };
+        let mut s = typed(&fx, "zz");
+        let b = batch(&s, vec![risky.clone(), file_hit("C:\\u\\zz plan.txt")]);
+        assert!(s.late(b, &fx.cx()));
+        assert_eq!(s.selected().map(|r| &*r.title), Some("zz plan.txt"), "the document, not the dangerous type");
+        let mut s = typed(&fx, "zz");
+        let b = batch(&s, vec![risky]);
+        assert!(s.late(b, &fx.cx()));
+        assert_eq!(s.selected(), None, "the dangerous type alone: nothing");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        assert!(matches!(s.selected().unwrap().payload, Payload::Path { class: FileClass::Executable, .. }));
+        assert!(press(&mut s, &fx, VK_RETURN, Mods::NONE).is_empty(), "Enter opens nothing");
     }
 
     fn files_of(fx: &[Effect]) -> Vec<Option<Req>> {

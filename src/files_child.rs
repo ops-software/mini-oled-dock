@@ -4,11 +4,14 @@
 //! that it can answer (its user against the shell's, the WSearch service, the shell user's two roots, the index) and
 //! says so in its state frame; then it answers each request line on stdin with one rows frame on stdout, until stdin
 //! ends (Appendix A of the plan). It runs with the dock's token and reads index columns only: it never opens a listed
-//! file, and a row outside its two roots is skipped here, never sent. It has no logger and writes nothing but its
-//! frames (lint `search_stays_in_the_files_helper`): the words it gets are typed text, given to Windows Search only.
+//! file, and a row outside its two roots is skipped here, never sent. For each row it sends it asks Windows whether the
+//! type of the name's extension is dangerous (`AssocIsDangerous`, once per extension per query: the shell's association
+//! code stays out of the dock too) and says so in the row's flags. It has no logger and writes nothing but its frames
+//! (lint `search_stays_in_the_files_helper`): the words it gets are typed text, given to Windows Search only.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use crate::launcher::files::{self, FileHit};
+use crate::launcher::providers;
 use std::io::{BufRead, Read, Write};
 use windows::core::{w, Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -31,7 +34,9 @@ use windows::Win32::System::Services::{
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::{FOLDERID_CommonPrograms, FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+use windows::Win32::UI::Shell::{
+    AssocIsDangerous, FOLDERID_CommonPrograms, FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
 /// Exit codes: 0 stdin ended (or a state other than 0 was sent), 2 a request line the helper refuses, 3 stdout failed.
@@ -108,11 +113,13 @@ fn row_of(raw: RawRow, roots: &[String]) -> Option<FileHit> {
     if !roots.iter().any(|r| under(&path, r)) {
         return None;
     }
-    Some(FileHit { path: path.into(), name: name.into(), folder: folder.into(), dir })
+    Some(FileHit { path: path.into(), name: name.into(), folder: folder.into(), dir, dangerous: false })
 }
 
-/// At most 50 rows of a query, mapped: the hits in Windows' order and the number skipped.
-fn collect(rows: &mut dyn Rows, roots: &[String]) -> (Vec<FileHit>, u32) {
+/// At most 50 rows of a query, mapped: the hits in Windows' order and the number skipped. Each hit with an extension
+/// (`providers::extension`, the one `file_class` reads) is marked dangerous when `ask` says so; `ask` is called once
+/// per extension of the query (ASCII case-insensitive), never for a skipped row or a name without one.
+fn collect(rows: &mut dyn Rows, roots: &[String], ask: &mut dyn FnMut(&str) -> bool) -> (Vec<FileHit>, u32) {
     let mut hits = Vec::new();
     let mut skipped = 0u32;
     for _ in 0..files::MAX_ROWS {
@@ -121,6 +128,17 @@ fn collect(rows: &mut dyn Rows, roots: &[String]) -> (Vec<FileHit>, u32) {
             Some(h) => hits.push(h),
             None => skipped += 1,
         }
+    }
+    // An earlier hit of the same extension holds Windows' answer (at most 50 hits: no map needed).
+    for i in 0..hits.len() {
+        let (done, rest) = hits.split_at_mut(i);
+        let Some(h) = rest.first_mut() else { break };
+        let Some(ext) = providers::extension(&h.name) else { continue };
+        let same = |d: &&FileHit| providers::extension(&d.name).is_some_and(|e| e.eq_ignore_ascii_case(ext));
+        h.dangerous = match done.iter().find(same) {
+            Some(d) => d.dangerous,
+            None => ask(ext),
+        };
     }
     (hits, skipped)
 }
@@ -377,9 +395,24 @@ impl Search {
             let mut rs = None;
             c.Execute(None::<&windows::core::IUnknown>, &IRowset::IID, None, None, Some(&mut rs)).ok()?;
             let mut rows = Rowset::new(rs?.cast().ok()?)?;
-            Some(collect(&mut rows, &self.roots))
+            Some(collect(&mut rows, &self.roots, &mut dangerous_type))
         }
     }
+}
+
+/// Windows' word on a type: `AssocIsDangerous` on "." and `ext` (its built-in list of types that can run code, and any
+/// type whose class carries FTA_AlwaysUnsafe). `ext` is part of a name `files::check_hit` passed: no NUL in it.
+fn dangerous_type(ext: &str) -> bool {
+    // "." then the extension, at most 259 units (a name holds at most 260), then at least one NUL: no allocation.
+    let mut assoc = [0u16; files::NAME_UNITS + 2];
+    if let Some((dot, rest)) = assoc.split_first_mut() {
+        *dot = u16::from(b'.');
+        for (slot, u) in rest.iter_mut().zip(ext.encode_utf16().take(files::NAME_UNITS)) {
+            *slot = u;
+        }
+    }
+    // SAFETY: `assoc` ends with a NUL (at most NAME_UNITS units follow the dot) and outlives the call, which reads it.
+    unsafe { AssocIsDangerous(PCWSTR(assoc.as_ptr())) }.as_bool()
 }
 
 /// One bound column: what GetData writes (provider-owned UTF-16 and its length in bytes).
@@ -548,7 +581,7 @@ mod tests {
             RawRow { url: text("file:C:/Users/a/b.txt"), name: Cell::Null, folder: u("a"), kind: u("x") },
             raw("C:\\Users\\a\\b.txt", "b.txt", Cell::Bad, "x"),
         ];
-        let (hits, skipped) = collect(&mut Fake(rows.into_iter()), &roots());
+        let (hits, skipped) = collect(&mut Fake(rows.into_iter()), &roots(), &mut |_| false);
         let got: Vec<(&str, &str, &str, bool)> = hits.iter().map(|h| (&*h.path, &*h.name, &*h.folder, h.dir)).collect();
         assert_eq!(
             got,
@@ -570,7 +603,7 @@ mod tests {
         let many: Vec<RawRow> =
             (0..80).map(|i| raw(&format!("C:\\Users\\a\\f{i}"), &format!("f{i}"), u("a"), "x")).collect();
         let mut fake = Fake(many.into_iter());
-        let (hits, skipped) = collect(&mut fake, &roots());
+        let (hits, skipped) = collect(&mut fake, &roots(), &mut |_| false);
         assert_eq!((hits.len(), skipped, fake.0.len()), (50, 0, 30));
     }
 
@@ -588,13 +621,62 @@ mod tests {
                 raw("C:\\Users\\a\\quokka.txt", "quokka.txt", text("a"), "x"),
             ]
         };
-        let (hits, skipped) = collect(&mut Fake(rows().into_iter()), &roots_of(profile.into(), "C:\\Users".into()));
+        let fence = roots_of(profile.into(), "C:\\Users".into());
+        let (hits, skipped) = collect(&mut Fake(rows().into_iter()), &fence, &mut |_| false);
         assert_eq!((hits.len(), &*hits[0].path, skipped), (1, "C:\\Users\\a\\quokka.txt", 1), "another account's row");
         // The user's own Start Menu Programs folder lies under the profile: its rows pass as the profile's.
         let start = "C:\\Users\\a\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Tool.lnk";
-        let (hits, skipped) =
-            collect(&mut Fake(vec![raw(start, "Tool.lnk", text("Programs"), "x")].into_iter()), &roots());
+        let one = vec![raw(start, "Tool.lnk", text("Programs"), "x")];
+        let (hits, skipped) = collect(&mut Fake(one.into_iter()), &roots(), &mut |_| false);
         assert_eq!((hits.len(), skipped), (1, 0));
+    }
+
+    #[test]
+    fn windows_is_asked_once_per_extension() {
+        let u = |s: &str| text(s);
+        let rows = vec![
+            raw("C:\\Users\\a\\quokka.EXE", "quokka.EXE", u("a"), "x"),
+            raw("C:\\Users\\a\\b\\quokka.exe", "quokka.exe", u("b"), "x"),
+            raw("C:\\Users\\a\\plan.qqq", "plan.qqq", u("a"), "x"),
+            raw("C:\\Users\\a\\plan.txt", "plan.txt", u("a"), "x"),
+            raw("C:\\Users\\a\\plan.Txt. .", "plan.Txt. .", u("a"), "x"),
+            raw("C:\\Users\\a\\README", "README", u("a"), "x"),
+            raw("C:\\Users\\a\\tools.qqq", "tools.qqq", u("a"), "Directory"),
+            // Skipped before Windows is asked: outside the roots.
+            raw("C:\\Users\\b\\other.zzz", "other.zzz", u("b"), "x"),
+        ];
+        let mut asked = Vec::new();
+        let (hits, skipped) = collect(&mut Fake(rows.into_iter()), &roots(), &mut |ext| {
+            asked.push(ext.to_string());
+            ext.eq_ignore_ascii_case("exe") || ext == "qqq"
+        });
+        assert_eq!(asked, ["EXE", "qqq", "txt"], "once per extension of the query, in any case; none without one");
+        let got: Vec<(&str, bool)> = hits.iter().map(|h| (&*h.name, h.dangerous)).collect();
+        let want = [
+            ("quokka.EXE", true),
+            ("quokka.exe", true),
+            ("plan.qqq", true),
+            ("plan.txt", false),
+            ("plan.Txt. .", false),
+            ("README", false),
+            ("tools.qqq", true),
+        ];
+        assert_eq!((got.as_slice(), skipped), (want.as_slice(), 1));
+        // The next query asks again: no answer is kept between queries.
+        let again = vec![raw("C:\\Users\\a\\quokka.exe", "quokka.exe", u("a"), "x")];
+        let mut n = 0;
+        let (hits, _) = collect(&mut Fake(again.into_iter()), &roots(), &mut |_| {
+            n += 1;
+            false
+        });
+        assert_eq!((n, hits[0].dangerous), (1, false));
+    }
+
+    #[test]
+    fn windows_names_its_own_dangerous_types() {
+        // A read of the type associations only: an exe is dangerous in Windows' built-in list, a text file is not.
+        assert!(dangerous_type("exe") && dangerous_type("EXE") && dangerous_type("vbs"));
+        assert!(!dangerous_type("txt"));
     }
 
     #[test]
@@ -629,8 +711,14 @@ mod tests {
 
     #[test]
     fn request_loop_over_fake_io() {
-        let hit =
-            FileHit { path: "C:\\u\\quokka.txt".into(), name: "quokka.txt".into(), folder: "u".into(), dir: false };
+        // Windows' word on the type (bit 1) reaches the dock as the helper's query gave it.
+        let hit = FileHit {
+            path: "C:\\u\\quokka.txt".into(),
+            name: "quokka.txt".into(),
+            folder: "u".into(),
+            dir: false,
+            dangerous: true,
+        };
         let mut asked = Vec::new();
         let mut out = Vec::new();
         let input = b"1 quokka\n2   ext:pdf  plan \n3 fail\n4  \n";

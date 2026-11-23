@@ -3784,6 +3784,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
             name: name.into(),
             folder: folder.into(),
             dir,
+            dangerous: false,
         };
         let (words, cap, hits) = if scene == PreviewScene::Files {
             let hits = vec![
@@ -5132,7 +5133,13 @@ mod tests {
         use crate::launcher::providers::tests::Fx;
         let fx = Fx::new();
         let mut l = typed(&fx, "zzq");
-        let hit = FileHit { path: "C:\\u\\zzq.txt".into(), name: "zzq.txt".into(), folder: "u".into(), dir: false };
+        let hit = FileHit {
+            path: "C:\\u\\zzq.txt".into(),
+            name: "zzq.txt".into(),
+            folder: "u".into(),
+            dir: false,
+            dangerous: false,
+        };
         let batch = |gen| {
             let items = files::items(vec![hit.clone()], &["zzq"], 3);
             FilesEvent::Batch(crate::launcher::model::Batch { gen, from: ProviderId::Files, items, done: true })
@@ -5187,7 +5194,13 @@ mod tests {
         let mut l = typed(&fx, "file zzq");
         l.open_no = 2;
         let gen = l.session.gen();
-        let hit = FileHit { path: "C:\\u\\zzq.txt".into(), name: "zzq.txt".into(), folder: "u".into(), dir: false };
+        let hit = FileHit {
+            path: "C:\\u\\zzq.txt".into(),
+            name: "zzq.txt".into(),
+            folder: "u".into(),
+            dir: false,
+            dangerous: false,
+        };
         let items = files::items(vec![hit], &["zzq"], 20);
         let batch = FilesEvent::Batch(Batch { gen, from: ProviderId::Files, items, done: true });
         for ev in [FilesEvent::Off(Why::Stalled), FilesEvent::Stalled(gen), FilesEvent::Slow(gen), batch] {
@@ -6654,6 +6667,7 @@ mod tests {
             name: name.into(),
             folder: "x".into(),
             dir,
+            dangerous: false,
         };
         let hits =
             vec![hit("note-a.txt", false), hit("note-b.png", false), hit("note-c.exe", false), hit("notes", true)];

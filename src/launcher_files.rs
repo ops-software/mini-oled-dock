@@ -558,6 +558,7 @@ mod tests {
                     name: "quokka.txt".into(),
                     folder: "u".into(),
                     dir: false,
+                    dangerous: false,
                 };
                 let mut f = Vec::new();
                 encode_rows(gen, 0, 0, &[hit], &mut f);
