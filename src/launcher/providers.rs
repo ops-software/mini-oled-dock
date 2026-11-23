@@ -142,12 +142,18 @@ impl TopK {
     }
 
     /// Below capacity the item is inserted in order (after its equals); at capacity it replaces the worst only when
-    /// it is better. Never grows the vector past its capacity.
+    /// it is better. Never grows the vector past its capacity. The date and time keyword's answer (Mixed mode) is never
+    /// the row that goes (live check V-8: `Results::sync` shows it among the first three rows): the one before it is.
     pub fn push(&mut self, item: Item) {
         if self.items.len() >= self.cap {
-            match self.items.last() {
+            let last = self.items.len().saturating_sub(1);
+            let at = match self.items.get(last) {
+                Some(w) if w.from == ProviderId::DateTime => last.saturating_sub(1),
+                _ => last,
+            };
+            match self.items.get(at) {
                 Some(worst) if order(&item, worst) == Ordering::Less => {
-                    self.items.pop();
+                    self.items.remove(at);
                 }
                 _ => return,
             }
@@ -201,6 +207,9 @@ pub(super) const KIND_FILE: u8 = 6;
 /// Rows that the merge order places rather than the ranking (the answer, a typed address, the web row) carry the best
 /// score, so a full `TopK` never drops them.
 const PINNED: Score = Score { tier: 0, learned: Reverse(u16::MAX), idle: false, kind: 0, rank: 0, len: 0 };
+
+/// The place (0-based, among the ranked rows) the date and time keyword's answer takes when ranking alone would put it lower.
+const KEYWORD_PLACE: usize = 2;
 
 /// In Mixed mode at most this many settings rows that only a hidden word matched (tiers 4, 6 and 7).
 const HIDDEN_SETTINGS_CAP: usize = 3;
@@ -590,7 +599,8 @@ fn units(q: &Query, top: &mut TopK) {
 // ---- date and time
 
 /// ")" mode lists the eight rows in their order (each at its own rank, so they sort as listed); Mixed mode answers an
-/// exact keyword with one row at the hidden-word tier with no learned boost, which a name always outranks.
+/// exact keyword with one row at the hidden-word tier with no learned boost, which a name always outranks as the default
+/// row; `Results::sync` keeps it among the first three rows however many names match (live check V-8).
 fn datetime(q: &Query, cx: &Context, top: &mut TopK) {
     match q.mode {
         Mode::Only(ProviderId::DateTime) => {
@@ -1330,6 +1340,12 @@ impl Results {
                 let named_top = ranked.first().is_some_and(|r| r.score.tier <= rank::T_WORD);
                 ranked.insert(usize::from(named_top).min(ranked.len()), run);
             }
+        }
+        // The date and time keyword's answer (Mixed mode, the whole query is a keyword) is always shown: ranked below the
+        // third row it takes the third place, so rows one and two stay what ranking gave and a name is still the default.
+        if let Some(i) = ranked.iter().position(|r| r.from == ProviderId::DateTime).filter(|i| *i > KEYWORD_PLACE) {
+            let row = ranked.remove(i);
+            ranked.insert(KEYWORD_PLACE, row);
         }
         self.rows.append(&mut ranked);
         self.sync_len = self.rows.len();
@@ -2208,6 +2224,47 @@ pub(crate) mod tests {
         assert!(setting < date, "{rows:#?}");
         // A learned row of the keyword's tier stays above it too (no learned boost on the date row).
         assert_eq!(rows[date].score.learned, Reverse(0));
+    }
+
+    /// Live check V-8: on a real catalogue seven or more settings match "ora", "data" or "settimana" by name and the
+    /// keyword's row never showed. It takes the third place; rows one and two stay the names ranking gave, the default is
+    /// still a name; fewer than three rows keep the ranked place.
+    #[test]
+    fn datetime_keyword_shows_among_many_names() {
+        for kw in ["ora", "data", "settimana", "time", "date", "week", "oggi"] {
+            for count in [12u32, 30] {
+                let mut fx = Fx::new();
+                fx.settings = (0..count)
+                    .map(|i| SettingRow::new(i, &format!("{kw} option {i:02}"), Keys::default(), 3))
+                    .collect();
+                let mut res = Results::default();
+                fx.sync(&mut res, kw, 1);
+                let rows = res.rows();
+                let at = rows.iter().position(|r| r.from == ProviderId::DateTime);
+                assert_eq!(at, Some(2), "{kw} x{count}: {rows:#?}");
+                assert!(rows[..2].iter().all(|r| r.from == ProviderId::Settings), "{kw}: rows one and two are names");
+                assert_eq!(&*rows[0].title, format!("{kw} option 00"), "{kw}: the ranking's first stays the first");
+                assert_eq!(res.selected().map(|r| r.from), Some(ProviderId::Settings), "{kw}: a name is the default");
+                assert_eq!(rows.iter().filter(|r| r.from == ProviderId::DateTime).count(), 1);
+                assert!(rows.iter().any(|r| r.key == web_search_key()), "{kw}: the web row stays");
+            }
+        }
+        // Fewer than three rows: the ranked place (a name above it, the web row after).
+        let mut fx = Fx::new();
+        fx.settings = vec![SettingRow::new(0, "ora option", Keys::default(), 3)];
+        let mut res = Results::default();
+        fx.sync(&mut res, "ora", 1);
+        let order: Vec<ProviderId> = res.rows().iter().map(|r| r.from).collect();
+        assert_eq!(order[..2], [ProviderId::Settings, ProviderId::DateTime], "{order:?}");
+        // No name at all: the keyword's row is first and the default, as before.
+        fx.settings.clear();
+        fx.sync(&mut res, "oggi", 2);
+        assert_eq!(res.rows()[0].from, ProviderId::DateTime);
+        assert_eq!(res.selected().map(|r| r.from), Some(ProviderId::DateTime));
+        // A query that is not a keyword shows no date row, whatever matches.
+        fx.settings = (0..12).map(|i| SettingRow::new(i, &format!("ora option {i:02}"), Keys::default(), 3)).collect();
+        fx.sync(&mut res, "ora o", 3);
+        assert!(res.rows().iter().all(|r| r.from != ProviderId::DateTime));
     }
 
     #[test]
