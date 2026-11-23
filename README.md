@@ -77,6 +77,22 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - **Win opens Start** (optional): one tap of Win opens the dock and Start together in a single animation.
 - **Quick-links menu** on right click of the Start button, like the native Win+X one (Installed apps, Device Manager, Terminal (admin), Task Manager, Run, Sign out, ...).
 
+### Launcher
+
+An optional search box on a shortcut key, **off until you pick one**: Settings → Launcher → Shortcut (Alt+Space or Alt+Shift+Space), or `"launcher": { "chord": "alt+space" }` in `config.json`. With it off the dock behaves exactly as before.
+
+- **One box, many kinds**: apps (the native Start catalogue, Store apps included), settings, files and folders, an answer to a sum or a unit conversion, today's date and time, commands (Lock, Sleep, Restart, Shut down, Sign out, Window menu, Clipboard history), a command line or a web search. The best name match comes first; what you pick often rises.
+- **Prefixes** (typed at the start; each is a setting): `=` calculator and units, `>` run a command, `<` open windows (switch or close), `??` web search, `$` Windows settings, `)` date and time, `:` Registry Editor, `file ` files only.
+- **Keys**: Enter opens, Shift+Enter opens a new instance, Ctrl+Enter shows the file in its folder, Ctrl+C copies, Ctrl+K opens the row's action list, Tab completes, Shift+Delete forgets a row, Esc clears and then closes.
+- **Aliases**: your own words for a program, folder, page or link (`launcher.aliases`, at most 64):
+  `"aliases": { "docs": "https://example.com", "notes": "app:Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", "work": "D:\\Projects" }`.
+  Add one from a row's action list (Assign alias), remove it in Settings → Launcher.
+- **Files**: names that start with the typed words, from the Windows Search index, in your profile and the Start menu folders. A short-lived helper process searches; it exists only while the launcher is open. Off under Administrator protection.
+- **Privacy and rights**: everything it starts runs without administrator rights; the only elevated start is Ctrl+Shift+Enter on a row, through the normal UAC prompt. Nothing you type or copy is logged or stored; the clipboard is read only when you paste into the box, and a paste marked private is refused. A small per-user history of picks can be switched off or cleared in Settings.
+- **Cost**: per key about 0.14 ms of work at the median, at most 3.7 ms in the slowest measured key; about 0.3 MB resident at rest, none with the launcher off.
+- **PowerToys Command Palette** also wants Alt+Space: the launcher yields while it answers and offers the choice once; turn its shortcut off in PowerToys to take the key. The dock never changes PowerToys.
+- **To turn it off**: Settings → Launcher → Shortcut → Off (or `"chord": "off"`).
+
 ### Multi-monitor
 
 - The bar can sit on any connected display (Settings → **Screen**: **Main**, the display number, or **Pointer**) and follows that display's DPI; a disconnected display falls back to the primary one.
@@ -199,6 +215,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `audio_layout` | `"MOSX"` | Volume popup sections in order (M master, O output, S spatial, X mixer; lowercase = collapsed, `-` in front = hidden); normally set from the popup |
 | `update_check` | `true` | Ask GitHub once a day whether a newer release exists (badge only) |
 | `update_auto_install` | `false` | Download, verify and install new releases by themselves |
+| `launcher` | `{ "chord": "off", ... }` | The launcher (see Launcher above). `chord`: `"off"`, `"alt+space"` or `"alt+shift+space"`; `enabled`; `with_powertoys` (`"yield"` or `"take"`); `monitor` (`"pointer"`, `"active"`, `"primary"`); `top_percent` 10-50; `width` 560-880; `rows` 4-12; `keep_query`; `over_fullscreen` (`"pass"` or `"open"`); `learn`; `providers` (switch each source on or off); `prefixes`; `aliases`; `web_engine` (`"google"`, `"bing"`, `"duckduckgo"`, `"custom"`) and `web_url` for `"custom"` |
 
 `last_update_check` and `update_available` are written by the dock itself.
 
@@ -266,6 +283,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
+| [1.5.0](.github/release-notes/v1.5.0.md) | 2026-11-23 | The launcher (off by default), taskbar edge fixes, full third-party licence texts |
 | [1.4.3](.github/release-notes/v1.4.3.md) | 2026-11-22 | Taskbar auto-hide: checks whether another bar holds the screen edge first |
 | [1.4.2](.github/release-notes/v1.4.2.md) | 2026-11-12 | Hotfix: the self-updater can download its first update |
 | [1.4.1](.github/release-notes/v1.4.1.md) | 2026-11-12 | Start menu rework, the app's jump list on right click, pins survive app updates |

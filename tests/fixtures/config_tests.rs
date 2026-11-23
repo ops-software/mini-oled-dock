@@ -110,3 +110,14 @@ fn owner_fixture_sets_alt_space() {
     old.launcher.chord = "alt+space".into();
     assert_eq!(c, old);
 }
+
+#[test]
+fn launcher_chord_off_by_default() {
+    // the default and every file written by 1.4.3 (its config is the 1.4.2 shape) leave the chord unset
+    assert_eq!(Config::default().launcher.chord_spec(), None);
+    for f in ["v1.4.2-default.json", "v1.4.2-custom.json", "owner-1.4.2.json"] {
+        let c = parse(&read(f)).unwrap();
+        assert_eq!(c.launcher.chord, "off", "{f}");
+        assert_eq!(c.launcher.chord_spec(), None, "{f}");
+    }
+}
