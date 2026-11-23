@@ -11,8 +11,10 @@
 //! The dock only polls for the two names (`poll_step`, `LAYOUT_TIMEOUT`), never writes, renames or
 //! deletes anything in that folder and never reads the `.err` content. The JSON is untrusted input:
 //! read through `datadir::read_file` (no reparse points, single link, `MAX_JSON` cap), parsed by
-//! serde_json (`map_layout`, pure; only local `.lnk` files under the Start menu folders reach the
-//! shell link loader, `link_allowed`), then the pins are saved through `config::modify`. The
+//! serde_json (`map_layout`, pure; only local `.lnk` files under the Start menu folders are read,
+//! `link_allowed`: those of the shell user's own folder, which any program of the user can write, by
+//! the Rust parser `jumplist::read_lnk`, only the all-users ones by the shell link loader,
+//! `target_for`), then the pins are saved through `config::modify`. The
 //! AppsFolder catalog (`shell_thread::enum_apps_folder`) is enumerated on that same thread and only
 //! when a `.lnk` entry needs it, so nothing stays in memory afterwards.
 //!
@@ -236,7 +238,7 @@ fn shell_user_folder(explorer_pid: u32, id: &GUID) -> Result<PathBuf, String> {
 
 /// true if the layout's `desktopAppLink` `path` may be opened by the (elevated) shell link loader:
 /// a local `X:\...` path (no `\\` UNC, `\\?\` or `\\.\` form, no `..`, no stream `:`), a `.lnk`
-/// file, strictly under one of `roots` (component-wise, case-insensitive).
+/// file, strictly under one of `roots` (`under_root`).
 fn link_allowed(path: &str, roots: &[PathBuf]) -> bool {
     let b = path.as_bytes();
     if b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\' || path[2..].contains(':') {
@@ -245,15 +247,43 @@ fn link_allowed(path: &str, roots: &[PathBuf]) -> bool {
     if !Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
         return false;
     }
-    let parts = |s: &str| s.split(['\\', '/']).filter(|c| !c.is_empty()).map(str::to_lowercase).collect::<Vec<_>>();
-    let p = parts(path);
-    if p.iter().any(|c| c == "..") {
+    if path_parts(path).iter().any(|c| c == "..") {
         return false;
     }
-    roots.iter().any(|r| {
-        let r = parts(&r.to_string_lossy());
-        !r.is_empty() && p.len() > r.len() && p[..r.len()] == r[..]
-    })
+    roots.iter().any(|r| under_root(path, r))
+}
+
+/// The components of a path, lowercase.
+fn path_parts(s: &str) -> Vec<String> {
+    s.split(['\\', '/']).filter(|c| !c.is_empty()).map(str::to_lowercase).collect()
+}
+
+/// true if `path` is strictly under `root`, compared component by component, case-insensitive.
+fn under_root(path: &str, root: &Path) -> bool {
+    let (p, r) = (path_parts(path), path_parts(&root.to_string_lossy()));
+    !r.is_empty() && p.len() > r.len() && p[..r.len()] == r[..]
+}
+
+/// Target of the layout's shortcut `link` (already `link_allowed`): one under the shell user's own
+/// Programs folder `user_root` goes to `rust` (production: `rust_target`), any other to the shell
+/// link loader `com`.
+fn target_for(
+    link: &str,
+    user_root: Option<&Path>,
+    rust: &dyn Fn(&str) -> Option<String>,
+    com: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if user_root.is_some_and(|r| under_root(link, r)) {
+        rust(link)
+    } else {
+        com(link)
+    }
+}
+
+/// The target of the per-user shortcut `link`, read and parsed in Rust, environment variables expanded.
+fn rust_target(link: &str) -> Option<String> {
+    let target = crate::shell_thread::expand_env(&crate::jumplist::read_lnk(Path::new(link))?.target);
+    crate::jumplist::is_local_file_path(&target).then_some(target)
 }
 
 /// Uninitializes COM when `job` returns (declared first there, so dropped after every COM object).
@@ -278,11 +308,11 @@ fn job() -> Result<usize, JobError> {
         ))
     })?;
     let dir = shell_user_local_appdata(pid)?;
-    // Only shortcuts of the Start menu folders (all users + the shell user) reach the link loader.
-    let roots: Vec<PathBuf> = [FOLDERID_CommonPrograms, FOLDERID_Programs]
-        .iter()
-        .filter_map(|id| shell_user_folder(pid, id).map_err(|e| log!("start import: {e}")).ok())
-        .collect();
+    // Only shortcuts of the Start menu folders (all users + the shell user) are read; the shell
+    // user's own (`user_root`) by the Rust parser.
+    let folder = |id: &GUID| shell_user_folder(pid, id).map_err(|e| log!("start import: {e}")).ok();
+    let (common_root, user_root) = (folder(&FOLDERID_CommonPrograms), folder(&FOLDERID_Programs));
+    let roots: Vec<PathBuf> = common_root.into_iter().chain(user_root.clone()).collect();
     let id = random_id()?;
     let file = dir.join(layout_file_name(&id));
     let mut err = file.clone().into_os_string();
@@ -323,7 +353,17 @@ fn job() -> Result<usize, JobError> {
                 })
                 .collect()
         };
-        map_layout(&text, &mut catalog, &|lnk| link.as_ref().and_then(|l| l.target(lnk)), &roots)
+        let com = |lnk: &str| {
+            // Fail-closed: a per-user shortcut never reaches the loader, whatever the routing.
+            let refused = crate::shell_thread::com_guard(user_root.as_deref().is_some_and(|r| under_root(lnk, r)));
+            debug_assert!(!refused, "a per-user shortcut reached the shell link loader");
+            if refused {
+                None
+            } else {
+                link.as_ref().and_then(|l| l.target(lnk))
+            }
+        };
+        map_layout(&text, &mut catalog, &|lnk| target_for(lnk, user_root.as_deref(), &rust_target, &com), &roots)
     };
     let pins = mapped?;
     if pins.is_empty() {
@@ -552,6 +592,69 @@ mod tests {
         let ok = r"c:\programdata\microsoft\windows\START MENU\Programs\Sub\X.LNK";
         assert_eq!(map_layout(&one(ok), &mut cat, &target, &roots).unwrap(), ["X"]);
         assert!(reached.get(), "an allowed link reaches the shell link loader");
+    }
+
+    #[test]
+    fn under_root_matches_link_allowed() {
+        let root = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs");
+        let roots = std::slice::from_ref(&root);
+        // Well-formed .lnk paths: link_allowed is the root test.
+        for (p, under) in [
+            (r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.lnk", true),
+            (r"c:\programdata\microsoft\windows\START MENU\Programs\Sub\X.LNK", true),
+            (r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\\x.lnk", true),
+            (r"C:\ProgramData\Microsoft\Windows\Start Menu\ProgramsX\x.lnk", false),
+            (r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs.lnk", false),
+            (r"C:\Users\me\evil.lnk", false),
+            (r"D:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.lnk", false),
+        ] {
+            assert_eq!(under_root(p, &root), under, "{p}");
+            assert_eq!(link_allowed(p, roots), under, "{p}");
+        }
+        // Under the root, refused by the form checks before it.
+        for p in [
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\..\..\evil.lnk",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.exe",
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.lnk:stream.lnk",
+            r"C:/ProgramData/Microsoft/Windows/Start Menu/Programs/x.lnk",
+        ] {
+            assert!(under_root(p, &root) && !link_allowed(p, roots), "{p}");
+        }
+        assert!(!under_root(r"\\?\C:\ProgramData\Microsoft\Windows\Start Menu\Programs\x.lnk", &root));
+        assert!(!under_root(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs", &root), "the root itself");
+        assert!(!under_root(r"C:\x.lnk", Path::new("")), "an empty root holds nothing");
+    }
+
+    #[test]
+    fn target_for_routes_by_root() {
+        let user = PathBuf::from(r"C:\Users\someone\AppData\Roaming\Microsoft\Windows\Start Menu\Programs");
+        let rust = |l: &str| -> Option<String> {
+            assert!(under_root(l, &user), "{l}: an all-users link reached the Rust parser");
+            Some("rust".into())
+        };
+        let com = |l: &str| -> Option<String> {
+            assert!(!under_root(l, &user), "{l}: a per-user link reached the shell link loader");
+            Some("com".into())
+        };
+        let mine = r"C:\Users\someone\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Sub\Mine.lnk";
+        let common = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\All.lnk";
+        assert_eq!(target_for(mine, Some(&user), &rust, &com).as_deref(), Some("rust"));
+        assert_eq!(target_for(&mine.to_uppercase(), Some(&user), &rust, &com).as_deref(), Some("rust"));
+        assert_eq!(target_for(common, Some(&user), &rust, &com).as_deref(), Some("com"));
+        // Without the shell user's folder, `link_allowed` (same roots) already refused its links.
+        assert_eq!(target_for(common, None, &rust, &com).as_deref(), Some("com"));
+    }
+
+    #[test]
+    fn per_user_links_use_the_rust_parser() {
+        let (base, user_root, lnk) = crate::jumplist::tests::lnk_file("import", r"C:\Tools\tool.exe");
+        let roots = [PathBuf::from(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"), user_root.clone()];
+        let json = serde_json::json!({ "pinnedList": [{ "desktopAppLink": lnk.to_string_lossy() }] }).to_string();
+        let mut cat = || vec![app("C:\\Tools\\tool.exe", "Some Tool", None), app("Other", "Shortcut name", None)];
+        let com = |l: &str| -> Option<String> { panic!("{l} reached the shell link loader") };
+        let got = map_layout(&json, &mut cat, &|l| target_for(l, Some(&user_root), &rust_target, &com), &roots);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(got.unwrap(), ["C:\\Tools\\tool.exe"], "matched by the target the Rust parser read");
     }
 
     #[test]
