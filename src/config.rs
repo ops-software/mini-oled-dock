@@ -1251,7 +1251,7 @@ fn render(c: &Config) -> String {
     "prefixes": {l_prefixes},
     // Words that open something when typed alone in Mixed mode: "word": "app:<id>", an http(s) address, "ms-settings:...", a path or a command line (at most 64).
     "aliases": {l_aliases},
-    // More folders for file search, e.g. "D:\\\\Archive" or a whole drive "E:\\\\" (at most 8; not Windows, Program Files or other profiles).
+    // More folders for file search, e.g. "D:\\Archive" or a whole drive "E:\\" (at most 8; not Windows, Program Files or other profiles).
     "file_folders": {l_file_folders},
     // Web search: "google", "bing", "duckduckgo" or "custom" (then "web_url" is an https:// address with {{q}}).
     "web_engine": {l_web_engine},
@@ -2026,6 +2026,20 @@ mod tests {
         let r = render(&c);
         assert_eq!(parse(&r).unwrap(), c, "every entry, those the dock refuses included");
         assert_eq!(render(&parse(&r).unwrap()), r);
+        // The comment's examples are JSON text: copied into the list, each is a folder the dock accepts.
+        let line = r.lines().find(|l| l.contains("More folders for file search")).unwrap();
+        let examples: Vec<String> =
+            line.split('"').skip(1).step_by(2).map(|q| serde_json::from_str(&format!("\"{q}\"")).unwrap()).collect();
+        assert_eq!(examples, ["D:\\Archive", "E:\\"]);
+        let f = crate::launcher::files::Fences {
+            windows: "C:\\Windows".into(),
+            program_files: vec!["C:\\Program Files".into()],
+            profiles: "C:\\Users".into(),
+            profile: "C:\\Users\\a".into(),
+        };
+        for e in &examples {
+            assert_eq!(crate::launcher::files::root_of(e, &f, true).as_deref(), Some(e.as_str()), "{e:?}");
+        }
     }
 
     #[test]
