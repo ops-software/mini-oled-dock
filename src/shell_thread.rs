@@ -1102,9 +1102,11 @@ const INDEX_MAX_FILES: usize = 4096;
 ///
 /// RESIDUAL (accepted for 1.5.1): `enum_apps_folder` (and the `--start-apps` child, `APPS_FLAG`, as
 /// elevated as the dock), `appsfolder_name`, `app_target_path` and the AppsFolder icon factories
-/// (`start_icon`, `icon_from_appsfolder`) still have the shell resolve per-user shortcuts in an
-/// elevated process; a subfolder of the all-users Start menu that an installer left writable is
-/// treated as admin-writable.
+/// (`start_icon`, `icon_from_appsfolder`, and `icons::appsfolder_icon` for the notification icons)
+/// still have the shell resolve per-user shortcuts in an elevated process; `FileInfo::read` (version
+/// strings) and the exe icon extractors (`icon_from_jumbo_list`, `icon_from_def_extract`) still have
+/// the shell read user-writable exes; a subfolder of the all-users Start menu that an installer left
+/// writable is treated as admin-writable.
 struct StartLnk {
     path: std::path::PathBuf,
     per_user: bool,
