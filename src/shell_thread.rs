@@ -2994,7 +2994,7 @@ fn run_as_typed_with(line: &str, file: Range<usize>, _proof: &Gesture, exec: Exe
 fn launch_command_with(line: &str, file: Range<usize>, console: bool, sys: &Path, exec: Exec) -> Result<(), Fail> {
     let wrapper = if console { Some("/k") } else { crate::launcher::runline::expands_in_cmd(line).then_some("/c") };
     // cmd reads the whole line (its & | > and %): what is shown is what runs, so no control or bidi character in it.
-    if wrapper == Some("/c") && line.chars().any(is_marker) {
+    if wrapper.is_some() && line.chars().any(is_marker) {
         return Err(Fail::Refused("a control or bidi character"));
     }
     let (file, args) = command_parts_with(line, file, wrapper, sys).map_err(Fail::Refused)?;
@@ -3814,6 +3814,20 @@ mod tests {
     /// Live check V-13: the desktop shell does not expand %VAR%, so such a line goes through `cmd.exe /s /c` (cmd expands
     /// it, closes after a windowed program started, and keeps no console open); the typed line stays whole, quotes
     /// included; a line without a variable, and Ctrl+Shift+Enter's elevated run, are not wrapped.
+    #[test]
+    fn launch_command_with_a_marker_is_refused_under_k_as_under_c() {
+        let sys = Path::new("C:\\Windows\\System32");
+        for (line, console) in
+            [("ping 1.1.1.1\u{202E}& calc", true), ("ping 1.1.1.1\u{7}x", true), ("notepad %A%\u{2066}", false)]
+        {
+            let (line, file) = run_line(line);
+            let mut calls = Vec::new();
+            let r = launch_command_with(&line, file, console, sys, &mut recorder(&mut calls, true));
+            assert_eq!(r, Err(Fail::Refused("a control or bidi character")), "{line:?}");
+            assert!(calls.is_empty());
+        }
+    }
+
     #[test]
     fn launch_command_with_a_variable_goes_through_cmd_c() {
         let sys = Path::new("C:\\Windows\\System32");
