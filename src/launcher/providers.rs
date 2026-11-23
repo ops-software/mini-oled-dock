@@ -938,13 +938,20 @@ fn settings(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratc
 // ---- run lines and typed paths
 
 /// The class of a path by its extension alone, the text after the last dot in any case (5.4.6): it picks a row's glyph,
-/// and an executable is never the default in Mixed mode.
+/// and an executable is never the default in Mixed mode. Executable: the spec's twelve, then the other types that run
+/// code when Explorer opens them (the Attachment Manager's high-risk list), held back as well until live check V-7.
 pub fn file_class(path: &str) -> FileClass {
-    const CLASSES: [(FileClass, &[&str]); 4] = [
+    const CLASSES: [(FileClass, &[&str]); 5] = [
         (
             FileClass::Executable,
-            &["exe", "com", "bat", "cmd", "ps1", "vbs", "js", "msi", "scr", "lnk", "url", "appref-ms"],
+            &[
+                "exe", "com", "bat", "cmd", "ps1", "vbs", "js", "msi", "scr", "lnk", "url", "hta", "cpl", "msc", "wsf",
+                "wsh", "jse", "vbe", "pif", "scf", "reg", "chm", "msp", "mst", "msix", "appx", "diagcab", "jar",
+                "ps1xml", "psc1",
+            ],
         ),
+        // The long names apart: rustfmt would lay out a list holding them one name per line.
+        (FileClass::Executable, &["appref-ms", "application", "appinstaller", "settingcontent-ms"]),
         (
             FileClass::Document,
             &[
@@ -1713,6 +1720,8 @@ pub(crate) mod tests {
             ("C:\\a\\setup.EXE", Executable),
             ("C:\\a\\run.ps1", Executable),
             ("C:\\a\\x.appref-ms", Executable),
+            ("C:\\a\\invoice.HTA", Executable),
+            ("C:\\a\\x.Settingcontent-MS", Executable),
             ("C:\\a\\notes.md", Document),
             ("C:\\a\\Budget 2026.XLSX", Document),
             ("C:\\a\\b.pdf", Document),
@@ -1730,6 +1739,12 @@ pub(crate) mod tests {
         ];
         for (path, want) in cases {
             assert_eq!(file_class(path), want, "{path}");
+        }
+        // The types that run code when Explorer opens them, beyond the spec's twelve (no Open until V-7).
+        let more = "hta cpl msc wsf wsh jse vbe pif scf reg chm msp mst application appinstaller msix appx diagcab \
+                    settingcontent-ms jar ps1xml psc1";
+        for ext in more.split(' ') {
+            assert_eq!(file_class(&format!("C:\\a\\invoice.{ext}")), Executable, "{ext}");
         }
     }
 
