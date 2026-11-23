@@ -54,8 +54,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::Shell::{
-    FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_UserProfiles, FOLDERID_Windows,
-    SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN,
+    FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Windows, SHQueryUserNotificationState,
+    QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetMessageExtraInfo, GetMessageTime,
@@ -717,7 +717,7 @@ pub(crate) fn file_fences() -> Option<crate::launcher::files::Fences> {
     Some(crate::launcher::files::Fences {
         windows: s(&FOLDERID_Windows)?,
         program_files: vec![s(&FOLDERID_ProgramFiles)?, s(&FOLDERID_ProgramFilesX86)?],
-        profiles: s(&FOLDERID_UserProfiles)?,
+        profiles: profiles_directory()?,
         profile: s(&FOLDERID_Profile)?,
         accounts: profile_folders()?,
         same: same_text,
@@ -767,6 +767,14 @@ pub(crate) fn profile_folders() -> Option<Vec<String>> {
     // SAFETY: the key opened above, closed once.
     let _ = unsafe { RegCloseKey(key) };
     whole.then_some(all)
+}
+
+/// The profiles folder: ProfileList's ProfilesDirectory as stored, expanded by `expand_system`. Not FOLDERID_UserProfiles,
+/// which expands that value's %SystemDrive% from the process environment (a shadowed SystemDrive moves it), where a
+/// user variable can shadow the system's. None when it cannot be read or a `%` is left: then no known or listed folder
+/// becomes a root. The files helper calls it too, so it logs nothing.
+pub(crate) fn profiles_directory() -> Option<String> {
+    expand_system(&stored_text(HKEY_LOCAL_MACHINE, PROFILE_LIST, w!("ProfilesDirectory")).ok()?, &system_windows()?)
 }
 
 /// HKLM's ProfileList key, which only an administrator can change.
@@ -1295,6 +1303,7 @@ mod tests {
     fn a_profile_path_expands_only_from_the_system() {
         let win = "E:\\Win";
         for (raw, path) in [
+            ("%SystemDrive%\\Users", "E:\\Users"),
             ("%SystemDrive%\\Users\\a", "E:\\Users\\a"),
             ("%SYSTEMDRIVE%\\Users\\b.domain", "E:\\Users\\b.domain"),
             ("%systemroot%\\system32\\config\\systemprofile", "E:\\Win\\system32\\config\\systemprofile"),
@@ -1318,6 +1327,18 @@ mod tests {
         let raw = stored_text(HKEY_LOCAL_MACHINE, sub, w!("ProfileImagePath")).expect("the system account's profile");
         assert!(raw.to_ascii_lowercase().starts_with("%systemroot%\\"), "read unexpanded");
         assert_eq!(stored_text(HKEY_LOCAL_MACHINE, sub, w!("NoSuchValue")), Err(ERROR_FILE_NOT_FOUND));
+    }
+
+    /// The profiles folder as this machine's ProfileList holds it (headless, read-only): read and expanded, the one the
+    /// shell gives where nothing shadows SystemDrive, and the dock's fence.
+    #[test]
+    fn profiles_directory_reads_this_machine() {
+        let dir = profiles_directory().expect("ProfilesDirectory read");
+        let id = windows::Win32::UI::Shell::FOLDERID_UserProfiles;
+        let shell = crate::datadir::known_folder(&id).unwrap().into_os_string().into_string().unwrap();
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert!(!dir.contains('%') && same_text(&w(&dir), &w(&shell)), "the shell's profiles folder");
+        assert_eq!(file_fences().expect("the fences read whole").profiles, dir);
     }
 
     /// ProfileList as this machine holds it (headless, read-only): read whole, every ProfileImagePath expanded, the

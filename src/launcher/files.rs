@@ -124,8 +124,8 @@ pub const ROOT_UNITS: usize = 260;
 /// cannot call Windows, so the fences carry it.
 pub type Same = fn(&[u16], &[u16]) -> bool;
 
-/// The folders no root may be, lie in or hold, read from known folders whose paths only an administrator can change
-/// (HKLM): the Windows folder, the Program Files folders and the profiles folder; the profile of every account Windows
+/// The folders no root may be, lie in or hold, read from what only an administrator can change (HKLM): the Windows
+/// folder and the Program Files folders (known folders), the profiles folder (ProfileList, unexpanded); the profile of every account Windows
 /// lists, wherever it lies; and the user's own profile, the one place inside the profiles folder a root may be. `same`
 /// compares them with a root.
 #[derive(Clone, Debug)]

@@ -38,8 +38,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{
     AssocIsDangerous, FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
     FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
-    FOLDERID_UserProfiles, FOLDERID_Videos, FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
-    KF_FLAG_DONT_VERIFY, KNOWN_FOLDER_FLAG,
+    FOLDERID_Videos, FOLDERID_Windows, SHGetKnownFolderPath, KF_FLAG_DEFAULT, KF_FLAG_DONT_VERIFY, KNOWN_FOLDER_FLAG,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
@@ -329,7 +328,7 @@ fn shell_roots(token: &Handle, extra: &[String]) -> Option<Vec<String>> {
         Some(Fences {
             windows: path(&FOLDERID_Windows)?,
             program_files: vec![path(&FOLDERID_ProgramFiles)?, path(&FOLDERID_ProgramFilesX86)?],
-            profiles: path(&FOLDERID_UserProfiles)?,
+            profiles: crate::launcher_sys::profiles_directory()?,
             profile: profile.clone(),
             accounts: crate::launcher_sys::profile_folders()?,
             same: same_text,
