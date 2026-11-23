@@ -218,3 +218,57 @@ pub const ID_MENU_UNPIN: u32 = 2;
 pub const ID_MENU_CLOSE_ALL: u32 = 3;
 /// "New window" (launches a new instance, like a middle click).
 pub const ID_MENU_NEW_WINDOW: u32 = 5;
+
+#[cfg(test)]
+mod tests {
+    /// Every `const NAME: <ty> = <prefix> + n;` (or `= n;` when the prefix is empty) of `src`, as (name, n).
+    fn scan(src: &str, name_prefix: &str, ty: &str, value_prefix: &str) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let line = line.trim_start();
+            let line = line.strip_prefix("pub(crate) ").or_else(|| line.strip_prefix("pub ")).unwrap_or(line);
+            let Some(rest) = line.strip_prefix("const ") else { continue };
+            let Some((name, rest)) = rest.split_once(':') else { continue };
+            if !name.starts_with(name_prefix) {
+                continue;
+            }
+            let Some(rest) = rest.trim_start().strip_prefix(ty) else { continue };
+            let Some(value) = rest.trim_start().strip_prefix('=') else { continue };
+            let value = value.trim().trim_end_matches(';').trim();
+            let number = if value_prefix.is_empty() { value } else { value.strip_prefix(value_prefix).unwrap_or("") };
+            if let Ok(n) = number.trim().parse::<u32>() {
+                out.push((name.to_string(), n));
+            }
+        }
+        out
+    }
+
+    fn assert_distinct(what: &str, ids: &[(String, u32)]) {
+        for (i, (a, x)) in ids.iter().enumerate() {
+            for (b, y) in &ids[i + 1..] {
+                assert!(x != y, "{what}: {a} and {b} both use {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn message_and_timer_ids_are_distinct() {
+        // WM_APP + n of msg.rs: one window, one id space.
+        let msgs = scan(include_str!("msg.rs"), "WM_", "u32", "WM_APP +");
+        assert!(msgs.len() >= 26, "msg.rs scan found only {} WM_APP ids", msgs.len());
+        assert_distinct("msg.rs WM_APP", &msgs);
+
+        // Timer ids of the dock window: msg.rs's TIMER_ consts and ui.rs's private ones.
+        let mut timers = scan(include_str!("msg.rs"), "TIMER_", "usize", "");
+        assert!(timers.len() >= 26, "msg.rs scan found only {} timer ids", timers.len());
+        let ui = scan(include_str!("ui.rs"), "TIMER_", "usize", "");
+        assert!(ui.len() >= 3, "ui.rs scan found only {} private timer ids", ui.len());
+        timers.extend(ui);
+        assert_distinct("timers", &timers);
+
+        // The tray host window has its own WM_APP space.
+        let host = scan(include_str!("tray_host.rs"), "WM_HOST_", "u32", "WM_APP +");
+        assert!(host.len() >= 5, "tray_host.rs scan found only {} WM_HOST_ ids", host.len());
+        assert_distinct("tray_host.rs WM_HOST_", &host);
+    }
+}
