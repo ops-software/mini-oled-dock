@@ -1136,8 +1136,15 @@ pub fn run(dir: &str) -> i32 {
         failures += i32::from(!tall);
         // The whole Launcher page, down to the config file row.
         let launcher = crate::settings_pages::Page::Launcher;
+        // With the chord set and four invented aliases, one of them a kind the launcher ignores.
+        let mut c = c;
+        c.launcher.chord = "alt+space".into();
+        for (w, t) in [("web", "https://example.com/"), ("notes", "app:Contoso.Notes_1234!App"), ("proj", "D:\\Projects")] {
+            c.launcher.aliases.insert(w.into(), t.into());
+        }
+        c.launcher.aliases.insert("game".into(), "steam://run/1".into());
         let file = "settings_launcher_full.png";
-        failures += i32::from(!settings_png_with(dir, file, m, launcher, &c, (false, false), None, (860, 1560)));
+        failures += i32::from(!settings_png_with(dir, file, m, launcher, &c, (false, false), None, (860, 1860)));
         crate::i18n::set_preview(false);
         for page in crate::settings_pages::Page::ALL {
             let c = Config { language: crate::config::Language::It, ..Config::default() };

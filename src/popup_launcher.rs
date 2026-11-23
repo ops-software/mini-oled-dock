@@ -1964,7 +1964,6 @@ fn reopen_with_error(query: &str) {
 /// Opens the launcher on the alias prompt in its "word target" form (Settings > Launcher's "Add…", L2-A3): a
 /// programmatic open like `reopen_with_error`'s, with what a chord's open reads of the window in front (the window the
 /// close gives the foreground back to: Settings), the window check and the locale styles. Only while a chord is set.
-#[allow(dead_code)] // L2-A3: Settings > Launcher calls it
 pub(crate) fn open_alias_prompt() {
     if alias_prompt_flow(&mut RealHook, &mut RealSys) {
         super::with_launcher(|l| {
@@ -2981,6 +2980,8 @@ pub(crate) enum AliasOp {
     },
     /// The word as configured.
     Remove(Box<str>),
+    /// The entry whose word has this `aliases::word_hash` (Settings > Launcher's Remove button).
+    RemoveHash(u64),
 }
 
 thread_local! {
@@ -3000,6 +3001,12 @@ pub(crate) fn on_alias_message() {
     if let (Some(op), true) = (op, is_on()) {
         apply_alias_op(&op, &mut RealAliasCfg);
     }
+}
+
+/// Settings > Launcher's Remove: the entry with this word hash goes through the same handler as the launcher's own
+/// alias changes (a pending hand edit is loaded first and kept), whether or not a chord is set.
+pub(crate) fn remove_alias_by_hash(hash: u64) {
+    apply_alias_op(&AliasOp::RemoveHash(hash), &mut RealAliasCfg);
 }
 
 /// What `apply_alias_op` does with the config, in its order (a recorder in the tests).
@@ -3053,6 +3060,9 @@ fn edit_aliases(l: &mut LauncherConfig, op: &AliasOp) {
         }
         AliasOp::Remove(word) => {
             l.aliases.remove(&**word);
+        }
+        AliasOp::RemoveHash(h) => {
+            crate::launcher::aliases::remove_by_hash(&mut l.aliases, *h);
         }
     }
 }
@@ -6459,6 +6469,25 @@ mod tests {
         edit_aliases(&mut l, &AliasOp::Remove("nope".into()));
         assert_eq!(l.aliases.len(), 2);
         edit_aliases(&mut l, &AliasOp::Remove("gh".into()));
+        assert_eq!(l.aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["game"]);
+    }
+
+    #[test]
+    fn remove_alias_goes_through_the_alias_handler() {
+        // The hash removal is an alias change like the launcher's own: a pending hand edit is loaded first.
+        let hash = crate::launcher::aliases::word_hash("gh");
+        let op = AliasOp::RemoveHash(hash);
+        let m = format!("modify {op:?}");
+        let mut cfg = FakeCfg { pending: true, reloads: true, ..FakeCfg::default() };
+        apply_alias_op(&op, &mut cfg);
+        assert_eq!(cfg.calls, ["poll", "follow_up", m.as_str(), "applied", "requery false"]);
+        // On the config: only the entry with that hash goes, the ones the table ignores stay.
+        let mut l = LauncherConfig::default();
+        l.aliases.insert("gh".into(), "https://example.com/".into());
+        l.aliases.insert("game".into(), "steam://run/1".into());
+        edit_aliases(&mut l, &AliasOp::RemoveHash(crate::launcher::aliases::word_hash("nope")));
+        assert_eq!(l.aliases.len(), 2);
+        edit_aliases(&mut l, &op);
         assert_eq!(l.aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["game"]);
     }
 

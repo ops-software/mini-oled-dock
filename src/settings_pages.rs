@@ -179,6 +179,10 @@ pub(crate) enum Action {
     ForgetHistory,
     /// Settings > Launcher: `config.json` in Notepad.
     EditConfig,
+    /// Settings > Launcher: the launcher opens on its alias prompt.
+    AddLauncherAlias,
+    /// Settings > Launcher: Remove on an alias row, the `aliases::word_hash` of its word.
+    RemoveLauncherAlias(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -636,6 +640,8 @@ pub(crate) enum Edit {
     Slider(Slider, i32),
     Background(Background),
     ResetSizes,
+    /// Takes out the alias whose word has this `aliases::word_hash` (a list changed in between never loses another).
+    RemoveLauncherAlias(u64),
 }
 
 pub(crate) fn apply_edit(c: &mut Config, e: Edit, screens: &[Screen]) {
@@ -645,6 +651,9 @@ pub(crate) fn apply_edit(c: &mut Config, e: Edit, screens: &[Screen]) {
         Edit::Slider(sl, v) => set_slider(c, sl, v),
         Edit::Background(b) => c.background = b,
         Edit::ResetSizes => reset_sizes(c),
+        Edit::RemoveLauncherAlias(h) => {
+            crate::launcher::aliases::remove_by_hash(&mut c.launcher.aliases, h);
+        }
     }
 }
 
@@ -685,6 +694,7 @@ pub(crate) fn click(row: &Row, part: Option<usize>, ctx: &Ctx<'_>) -> Effect {
         Control::Buttons(buttons) => match part.and_then(|j| buttons.get(j)) {
             Some(b) if b.enabled => match b.action {
                 Action::ResetSizes => Effect::Save(Edit::ResetSizes),
+                Action::RemoveLauncherAlias(h) => Effect::Save(Edit::RemoveLauncherAlias(h)),
                 a => Effect::Run(a),
             },
             _ => Effect::None,
@@ -1233,6 +1243,19 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         Some(tr("The commands you ran and the order it learned", "I comandi eseguiti e l'ordine appreso")),
         vec![Button { action: Action::ForgetHistory, text: tr("Forget", "Dimentica"), enabled: true }],
     ));
+    v.push(header(tr("Aliases", "Alias"), None));
+    v.extend(alias_rows(c));
+    v.push(buttons(
+        glyphs::text_shape,
+        tr("Add an alias", "Aggiungi un alias"),
+        Some(tr("A word that opens an app, a link or a folder", "Una parola che apre un'app, un link o una cartella")),
+        // The prompt is the launcher's own field: it needs the launcher shortcut.
+        vec![Button {
+            action: Action::AddLauncherAlias,
+            text: tr("Add\u{2026}", "Aggiungi\u{2026}"),
+            enabled: c.launcher.chord_spec().is_some(),
+        }],
+    ));
     v.push(header(tr("Prefixes", "Prefissi"), None));
     // The defaults in their table order, then the owner's own.
     let own = |k: &&str| !config::LAUNCHER_PREFIXES.iter().any(|(p, _)| p == k);
@@ -1253,6 +1276,47 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         vec![Button { action: Action::EditConfig, text: tr("Edit config", "Modifica"), enabled: true }],
     ));
     v
+}
+
+/// The glyph of an alias's target kind (an entry the launcher refuses shows the info mark).
+fn alias_glyph(target: &str) -> Glyph {
+    use crate::launcher::aliases::{classify, AliasTarget};
+    match classify(target) {
+        Ok(AliasTarget::App(_)) => glyphs::grid_shape,
+        Ok(AliasTarget::Url(_)) => glyphs::globe_shape,
+        Ok(AliasTarget::Settings(_)) => glyphs::gear_shape,
+        Ok(AliasTarget::Path { dir: true, .. }) => glyphs::folder_shape,
+        Ok(AliasTarget::Path { dir: false, .. }) => glyphs::document_shape,
+        Ok(AliasTarget::Command(_)) => glyphs::prompt_shape,
+        Err(_) => glyphs::info_shape,
+    }
+}
+
+/// `s` cut to `max` characters with an ellipsis (a config value can be 1,024 characters long).
+fn ellipsize(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}\u{2026}", s[..i].trim_end()),
+        None => s.to_string(),
+    }
+}
+
+/// One row per alias of `launcher.aliases`, sorted by word (the map's order), the ones the launcher ignores too, so
+/// they can be removed. Remove carries the hash of the word.
+fn alias_rows(c: &Config) -> Vec<Row> {
+    let remove = tr("Remove", "Rimuovi");
+    c.launcher
+        .aliases
+        .iter()
+        .map(|(word, target)| {
+            let action = Action::RemoveLauncherAlias(crate::launcher::aliases::word_hash(word));
+            buttons(
+                alias_glyph(target),
+                &ellipsize(word, 32),
+                Some(&ellipsize(target, 60)),
+                vec![Button { action, text: remove, enabled: true }],
+            )
+        })
+        .collect()
 }
 
 fn screen(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
@@ -1752,6 +1816,123 @@ mod tests {
         let mut cx = ctx(&[], &st);
         cx.powertoys = powertoys;
         rows(Page::Launcher, c, &cx)
+    }
+
+    fn alias_config() -> Config {
+        let mut c = Config::default();
+        c.launcher.chord = "alt+space".into();
+        for (w, t) in [
+            ("web", "https://example.com/"),
+            ("calc", "app:Contoso.Calc_1234!App"),
+            ("proj", "D:\\Projects"),
+            ("steam", "steam://run/1"),
+        ] {
+            c.launcher.aliases.insert(w.into(), t.into());
+        }
+        c
+    }
+
+    fn alias_buttons(r: &[Row]) -> Vec<(String, Option<String>, Action, bool)> {
+        r.iter()
+            .filter_map(|x| match &x.control {
+                Control::Buttons(b) if matches!(b[0].action, Action::RemoveLauncherAlias(_)) => {
+                    Some((x.label.clone(), x.desc.clone(), b[0].action, b[0].enabled))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn launcher_page_lists_aliases() {
+        use crate::launcher::aliases::word_hash;
+        let c = alias_config();
+        let r = launcher_rows(&c, false);
+        // The header comes before the rows, the Add row after them, the prefixes after that.
+        let pos = |f: &dyn Fn(&Row) -> bool| r.iter().position(f).unwrap();
+        let head = pos(&|x| matches!(x.control, Control::Header { .. }) && x.label == "Aliases");
+        let add = pos(&|x| x.label == "Add an alias");
+        let prefixes = pos(&|x| matches!(x.control, Control::Header { .. }) && x.label == "Prefixes");
+        assert!(head < add && add < prefixes);
+        // One row per entry in word order (the ignored "steam:" one too), the word as title, the target as description.
+        let list = alias_buttons(&r);
+        let words: Vec<&str> = list.iter().map(|l| l.0.as_str()).collect();
+        assert_eq!(words, ["calc", "proj", "steam", "web"]);
+        assert_eq!(list[3].1.as_deref(), Some("https://example.com/"));
+        for (w, _, a, enabled) in &list {
+            assert_eq!(*a, Action::RemoveLauncherAlias(word_hash(w)));
+            assert!(enabled);
+        }
+        assert!((head + 1..add).all(|i| matches!(&r[i].control, Control::Buttons(_))));
+        // The kinds have their own glyphs, a refused target the info mark.
+        let is = |t: &str, f: Glyph| std::ptr::fn_addr_eq(alias_glyph(t), f);
+        assert!(is("https://example.com/", glyphs::globe_shape));
+        assert!(is("app:Contoso.Calc_1234!App", glyphs::grid_shape));
+        assert!(is("ms-settings:display", glyphs::gear_shape));
+        assert!(is("C:\\Windows", glyphs::folder_shape));
+        assert!(is("C:\\Windows\\win.ini", glyphs::document_shape));
+        assert!(is("steam://run/1", glyphs::info_shape));
+        // A long target is cut, a long word too.
+        let mut long = Config::default();
+        long.launcher.aliases.insert("x".repeat(100), "y".repeat(900));
+        let l = alias_buttons(&launcher_rows(&long, false));
+        assert_eq!(l[0].0.chars().count(), 33);
+        assert_eq!(l[0].1.as_ref().map(|d| d.chars().count()), Some(61));
+        // Italian texts.
+        let r = crate::i18n::with_italian(true, || launcher_rows(&alias_config(), false));
+        assert!(r.iter().any(|x| x.label == "Aggiungi un alias"));
+        assert!(r.iter().any(|x| matches!(&x.control, Control::Buttons(b) if b[0].text == "Rimuovi")));
+    }
+
+    #[test]
+    fn remove_alias_by_hash_removes_only_that_one() {
+        use crate::launcher::aliases::word_hash;
+        let mut c = alias_config();
+        let r = launcher_rows(&c, false);
+        let row = r.iter().find(|x| x.label == "proj").unwrap();
+        let e = click(row, Some(0), &ctx(&[], &idle()));
+        assert_eq!(e, Effect::Save(Edit::RemoveLauncherAlias(word_hash("proj"))));
+        let Effect::Save(edit) = e else { unreachable!() };
+        apply_edit(&mut c, edit, &[]);
+        let left: Vec<&str> = c.launcher.aliases.keys().map(String::as_str).collect();
+        assert_eq!(left, ["calc", "steam", "web"]);
+        // A refused entry is removable too, and nothing else of the config moves.
+        apply_edit(&mut c, Edit::RemoveLauncherAlias(word_hash("steam")), &[]);
+        assert_eq!(c.launcher.aliases.len(), 2);
+        assert_eq!(c.launcher.chord, "alt+space");
+    }
+
+    #[test]
+    fn remove_alias_unknown_hash_is_noop() {
+        use crate::launcher::aliases::word_hash;
+        let mut c = alias_config();
+        let before = c.clone();
+        apply_edit(&mut c, Edit::RemoveLauncherAlias(word_hash("gone")), &[]);
+        apply_edit(&mut c, Edit::RemoveLauncherAlias(0), &[]);
+        assert_eq!(c, before);
+        // An empty list gives no alias rows, only the Add row.
+        let r = launcher_rows(&Config::default(), false);
+        assert!(alias_buttons(&r).is_empty());
+        assert!(r.iter().any(|x| x.label == "Add an alias"));
+    }
+
+    #[test]
+    fn add_alias_disabled_with_the_chord_off() {
+        let add = |c: &Config| {
+            launcher_rows(c, false).into_iter().find_map(|x| match x.control {
+                Control::Buttons(b) if b[0].action == Action::AddLauncherAlias => Some((b[0].enabled, b[0].text)),
+                _ => None,
+            })
+        };
+        let mut c = Config::default();
+        assert_eq!(c.launcher.chord_spec(), None, "off by default");
+        assert_eq!(add(&c), Some((false, "Add\u{2026}")));
+        let row = launcher_rows(&c, false).into_iter().find(|x| x.label == "Add an alias").unwrap();
+        assert_eq!(click(&row, Some(0), &ctx(&[], &idle())), Effect::None);
+        c.launcher.chord = "alt+space".into();
+        assert_eq!(add(&c), Some((true, "Add\u{2026}")));
+        let row = launcher_rows(&c, false).into_iter().find(|x| x.label == "Add an alias").unwrap();
+        assert_eq!(click(&row, Some(0), &ctx(&[], &idle())), Effect::Run(Action::AddLauncherAlias));
     }
 
     #[test]

@@ -955,6 +955,9 @@ fn run(act: Act) {
 fn run_effect(e: Effect) {
     match e {
         Effect::None => {}
+        // An alias goes out through the launcher's handler (it reads a pending hand edit first and refreshes this window
+        // itself, so it runs outside `with_win`).
+        Effect::Save(Edit::RemoveLauncherAlias(h)) => crate::popup::popup_launcher::remove_alias_by_hash(h),
         Effect::Save(edit) => {
             with_win(|w| w.save(edit));
         }
@@ -1029,6 +1032,8 @@ fn run_action(a: Action) {
             close("exit");
             crate::power::run(crate::power::PowerAction::ExitDock);
         }
+        Action::AddLauncherAlias => crate::popup::popup_launcher::open_alias_prompt(),
+        Action::RemoveLauncherAlias(h) => crate::popup::popup_launcher::remove_alias_by_hash(h),
         Action::ForgetHistory => {
             crate::popup::popup_launcher::forget_history();
             log!("settings: launcher history forgotten");

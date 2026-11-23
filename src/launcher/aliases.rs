@@ -172,6 +172,22 @@ pub fn check_word(word: &str, prefixes: &PrefixTable) -> Result<Box<str>, AliasR
     Ok(folded.into())
 }
 
+/// FNV-1a 64 of a word as configured: what Settings > Launcher's Remove button carries, so a list changed in between
+/// never removes another entry.
+pub fn word_hash(word: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in word.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Takes out the entry whose word hashes to `hash` (the first of two entries sharing a hash); true when one went.
+pub fn remove_by_hash(map: &mut BTreeMap<String, String>, hash: u64) -> bool {
+    let found = map.keys().find(|w| word_hash(w) == hash).cloned();
+    found.is_some_and(|w| map.remove(&w).is_some())
+}
+
 impl AliasTarget {
     /// The target as config.json holds it (`classify` gives this target back).
     pub fn to_config(&self) -> String {
@@ -404,5 +420,20 @@ mod tests {
         }
         let (t, ignored) = AliasTable::build(&map, &p);
         assert_eq!(t.len() + ignored, map.len());
+    }
+
+    #[test]
+    fn word_hash_is_fnv1a_and_removal_takes_one_entry() {
+        assert_eq!(word_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(word_hash("a"), 0xaf63_dc4c_8601_ec8c);
+        let mut m = BTreeMap::new();
+        m.insert("gh".to_string(), "https://example.com/".to_string());
+        m.insert("docs".to_string(), "D:\\Projects".to_string());
+        assert!(!remove_by_hash(&mut m, word_hash("GH")), "the hash is of the word as configured");
+        assert_eq!(m.len(), 2);
+        assert!(remove_by_hash(&mut m, word_hash("gh")));
+        assert_eq!(m.keys().map(String::as_str).collect::<Vec<_>>(), ["docs"]);
+        assert!(!remove_by_hash(&mut m, word_hash("gh")), "gone: nothing else goes");
+        assert_eq!(m.len(), 1);
     }
 }
