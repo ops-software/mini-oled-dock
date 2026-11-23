@@ -604,7 +604,7 @@ fn write_state(state: u32) -> Result<(), String> {
 
 /// saves the original state ONLY if the file is missing or unreadable.
 /// Returns true if a valid state exists on file after the call.
-/// `pre` is the state already read (and stabilized) by `init`; `None` = reads it here.
+/// `pre` is the state already read (and stabilized) by `init`, or read by `hide_again`; `None` = reads it here.
 fn ensure_state_saved(pre: Option<u32>) -> bool {
     if let Some(s) = read_state() {
         log!("taskbar: original state {s} (state file)");
@@ -815,7 +815,9 @@ fn after_outside_restore(exiting: bool, stop_requested: bool, hide_wanted: bool,
 /// Hides the taskbar again after the watchdog's hang restore (`HIDE_AGAIN`; `on_safety_timer` only, UI thread).
 /// Its `TIMER_SECOND` tick comes after a heartbeat, so the watchdog has left its hang state and needs another 6.6 s of
 /// silence to restore again. The restore set Explorer to the saved original and removed the marks, so the state saved
-/// again here is the user's.
+/// again here is the user's: read with `try_get_state`, since the restore deleted the file and `get_state` makes a
+/// failed read 0 (a timed-out read gets no fallback on the UI thread), which would be saved as the original and set in
+/// Explorer's saved setting by the next restore. A failed read does not hide.
 fn hide_again() {
     if RESTORING.load(Relaxed) || crate::watchdog::stop_requested() || !config::effective_hide_native_taskbar() {
         log!("taskbar: not hiding again (exit or stop request)");
@@ -825,16 +827,20 @@ fn hide_again() {
         log!("taskbar: not hiding again (no watchdog)");
         return;
     }
-    if native_taskbars().is_empty() {
+    let Some(&tray) = native_taskbars().first() else {
         HIDE_AGAIN.store(true, Relaxed); // Explorer restarting: the next tick tries again
         return;
-    }
+    };
     // The host the watchdog's yield ended, and its forwarder, are stopped first: `tray_sync` below then starts one host
     // and one forwarder. `stop` waits, so not under the popup's mouse hook.
     let hook = crate::popup::suspend_mouse_hook();
     crate::tray_host::stop();
     crate::popup::resume_mouse_hook(hook);
-    if !ensure_state_saved(None) {
+    let Some(state) = try_get_state(tray).0 else {
+        log!("taskbar: state unreadable after the watchdog's restore, not hiding");
+        return;
+    };
+    if !ensure_state_saved(Some(state)) {
         log!("taskbar: state not saveable after the watchdog's restore, not hiding");
         return;
     }
