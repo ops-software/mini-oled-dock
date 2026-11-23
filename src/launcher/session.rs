@@ -683,6 +683,24 @@ impl Session {
         self.edit(Edit::Insert(text), cx)
     }
 
+    /// `chars` for one typed character without the query that follows a change (the replay's); whether the text
+    /// changed.
+    fn insert_unqueried(&mut self, c: char, cx: &Context) -> bool {
+        self.keyed();
+        if c.is_control() {
+            return false;
+        }
+        self.actions = None;
+        let mut buf = [0u8; 4];
+        match self.field.apply(Edit::Insert(String::from(&*c.encode_utf8(&mut buf)))) {
+            FieldOut::Changed => {
+                self.take_chip(cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The clipboard's text (after `Effect::Paste`): line breaks and tabs become spaces, cut at 256 characters;
     /// control and bidi characters are kept and drawn as markers.
     pub fn paste(&mut self, text: &str, cx: &Context) -> Vec<Effect> {
@@ -696,19 +714,32 @@ impl Session {
     pub fn replay(&mut self, keys: &[ReplayKey], cx: &Context) -> Vec<Effect> {
         self.replaying = true;
         let mut out = Vec::new();
+        // A run of typed characters edits the field one by one (the mode chip is taken where typing one by one takes
+        // it) but asks the providers once: before the next key that is not text, so its Enter acts on this run's rows,
+        // and at the end. The rows are those of typing the keys one at a time; the work is one query per run.
+        let mut dirty = false;
         for k in keys {
             let fx = match *k {
                 ReplayKey::Text(c) => {
-                    let mut buf = [0u8; 4];
-                    self.chars(c.encode_utf8(&mut buf), cx)
+                    dirty |= self.insert_unqueried(c, cx);
+                    continue;
                 }
-                ReplayKey::Key(ev) => self.key(ev, None, cx),
+                ReplayKey::Key(ev) => {
+                    if std::mem::take(&mut dirty) {
+                        out.extend(self.requery(cx));
+                    }
+                    self.key(ev, None, cx)
+                }
             };
             let closes = fx.iter().any(|e| matches!(e, Effect::Hide { .. }));
             out.extend(fx);
             if closes {
+                dirty = false;
                 break;
             }
+        }
+        if dirty {
+            out.extend(self.requery(cx));
         }
         self.replaying = false;
         let relayout = out.contains(&Effect::Relayout);
@@ -1877,22 +1908,64 @@ mod tests {
         keys.push(ReplayKey::Key(k(VK_RETURN, Mods::NONE)));
         keys.push(ReplayKey::Text('z'));
         let out = s.replay(&keys, &fx.cx());
-        // "cal" asked files and "calc" (a run row) withdrew the request before the launch: no helper starts (D4).
-        let cal = Req { gen: 3, text: "cal".into(), quiet_ms: 150, cap: 3 };
-        assert_eq!(
-            out,
-            [
-                Effect::RequestFiles(Some(cal)),
-                Effect::RequestFiles(None),
-                Effect::Hide { restore: false },
-                Effect::Launch(LaunchReq::App(CALC_ID.into()))
-            ]
-        );
+        // The four letters are one query ("calc" is a run row: no file request, no helper starts, D4).
+        assert_eq!(out, [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App(CALC_ID.into()))]);
         assert_eq!(s.query_text(), "calc", "keys after the close are not replayed");
         // The repaints of a replay come once, at its end.
         let mut s = open(&fx);
         let out = s.replay(&[ReplayKey::Text('s'), ReplayKey::Text('t')], &fx.cx());
         assert_eq!(out, [Effect::Relayout]);
+    }
+
+    /// A replay asks the providers once per run of text, and the session ends as if the keys were replayed one at a time.
+    #[test]
+    fn a_replay_merges_text_runs_and_ends_as_one_by_one() {
+        let fx = Fx::new();
+        let text = |t: &str| t.chars().map(ReplayKey::Text).collect::<Vec<_>>();
+        let key = |vk| ReplayKey::Key(k(vk, Mods::NONE));
+        let cases: Vec<Vec<ReplayKey>> = vec![
+            [text("sh"), vec![key(VK_DOWN)], text("ut"), vec![key(VK_RETURN)]].concat(),
+            [text("calc"), vec![key(VK_RETURN)], text("z")].concat(),
+            [text("no"), vec![key(VK_DOWN), key(VK_DOWN)], text("t"), vec![key(VK_UP)], text("pad")].concat(),
+            [text("<"), text("fo"), vec![key(VK_DOWN)]].concat(),
+            [text("=3+"), text("4"), vec![key(VK_RETURN)]].concat(),
+            text("e\u{e8}x\ty"),
+        ];
+        for keys in cases {
+            let mut merged = open(&fx);
+            let out = merged.replay(&keys, &fx.cx());
+            let mut single = open(&fx);
+            let mut out_single = Vec::new();
+            for key in &keys {
+                out_single.extend(single.replay(std::slice::from_ref(key), &fx.cx()));
+                if out_single.iter().any(|e| matches!(e, Effect::Hide { .. })) {
+                    break;
+                }
+            }
+            let shown = |s: &Session| s.rows().iter().map(|r| (r.title.clone(), r.score)).collect::<Vec<_>>();
+            assert_eq!(shown(&merged), shown(&single), "{keys:?}");
+            assert_eq!(sel_title(&merged), sel_title(&single), "{keys:?}");
+            assert_eq!(
+                (merged.query_text(), merged.last_query()),
+                (single.query_text(), single.last_query()),
+                "{keys:?}"
+            );
+            let acts = |v: &[Effect]| {
+                let skip = |e: &&Effect| {
+                    matches!(
+                        e,
+                        Effect::Relayout | Effect::Redraw | Effect::RequestFiles(_) | Effect::RequestRewrite { .. }
+                    )
+                };
+                v.iter().filter(|e| !skip(e)).cloned().collect::<Vec<_>>()
+            };
+            assert_eq!(acts(&out), acts(&out_single), "{keys:?}");
+        }
+        // One query per run: five keys of text are one generation, not five.
+        let mut s = open(&fx);
+        let g = s.gen;
+        s.replay(&text("hello"), &fx.cx());
+        assert_eq!(s.gen, g + 1);
     }
 
     #[test]
