@@ -52,6 +52,10 @@ static SESSION_END: AtomicBool = AtomicBool::new(false);
 /// Set by `restored_externally` when the restore from outside was the watchdog's hang restore
 /// (`after_outside_restore`): the next safety check hides the taskbar again (`hide_again`). UI thread.
 static HIDE_AGAIN: AtomicBool = AtomicBool::new(false);
+/// Set by `hide_again` when Explorer did not answer its read, cleared by `restored_externally` at each watchdog's
+/// restore: the "state unreadable" line is logged once per restore, not at every retry (`after_rehide_read`).
+/// UI thread.
+static HIDE_AGAIN_UNREAD: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "TaskbarCreated" message (0 = not registered yet).
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// true while the taskbar wants the raw WinEvents that `apps::winevent_proc` hands to `on_raw_event` (set by
@@ -783,6 +787,7 @@ fn restored_externally() -> bool {
         }
         Outside::HideAgain => {
             HIDE_AGAIN.store(true, Relaxed);
+            HIDE_AGAIN_UNREAD.store(false, Relaxed);
             log!(
                 "taskbar: state file gone, restored by the watchdog (no stop request): hiding it again at the next \
                  safety check"
@@ -817,7 +822,8 @@ fn after_outside_restore(exiting: bool, stop_requested: bool, hide_wanted: bool,
 /// silence to restore again. The restore set Explorer to the saved original and removed the marks, so the state saved
 /// again here is the user's: read with `try_get_state`, since the restore deleted the file and `get_state` makes a
 /// failed read 0 (a timed-out read gets no fallback on the UI thread), which would be saved as the original and set in
-/// Explorer's saved setting by the next restore. A failed read does not hide.
+/// Explorer's saved setting by the next restore. A read Explorer does not answer saves nothing and does not hide: the
+/// next safety check reads again (`after_rehide_read`), until Explorer answers or the first checks below end it.
 fn hide_again() {
     if RESTORING.load(Relaxed) || crate::watchdog::stop_requested() || !config::effective_hide_native_taskbar() {
         log!("taskbar: not hiding again (exit or stop request)");
@@ -836,9 +842,16 @@ fn hide_again() {
     let hook = crate::popup::suspend_mouse_hook();
     crate::tray_host::stop();
     crate::popup::resume_mouse_hook(hook);
-    let Some(state) = try_get_state(tray).0 else {
-        log!("taskbar: state unreadable after the watchdog's restore, not hiding");
-        return;
+    let state = match after_rehide_read(try_get_state(tray).0, HIDE_AGAIN_UNREAD.load(Relaxed)) {
+        Reread::Hide(s) => s,
+        Reread::Retry { first } => {
+            HIDE_AGAIN.store(true, Relaxed); // Explorer slow: the next tick reads again
+            HIDE_AGAIN_UNREAD.store(true, Relaxed);
+            if first {
+                log!("taskbar: state unreadable after the watchdog's restore, not hiding yet, trying again");
+            }
+            return;
+        }
     };
     if !ensure_state_saved(Some(state)) {
         log!("taskbar: state not saveable after the watchdog's restore, not hiding");
@@ -848,6 +861,25 @@ fn hide_again() {
     hide_all();
     crate::ui::tray_sync(); // starts the host and announces it when show_tray
     log!("taskbar: hidden again after the watchdog's restore");
+}
+
+/// What `hide_again` does with its read of Explorer's state.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Reread {
+    /// Explorer answered: this state is saved as the original (`ensure_state_saved`) and the taskbar hidden.
+    Hide(u32),
+    /// Explorer did not answer: nothing saved, the next safety check reads again; `first`: the first unanswered read
+    /// since the watchdog's restore, the only one logged.
+    Retry { first: bool },
+}
+
+/// Pure: `read` is `try_get_state`'s (`None` = unanswered), `failed_before` whether an earlier read since the
+/// watchdog's restore went unanswered. A failed read is never saved as the original.
+fn after_rehide_read(read: Option<u32>, failed_before: bool) -> Reread {
+    match read {
+        Some(s) => Reread::Hide(s),
+        None => Reread::Retry { first: !failed_before },
+    }
 }
 
 /// Stops asking for the raw events (the apps hook stays). Idempotent. UI thread.
@@ -1798,6 +1830,16 @@ mod tests {
         }
         assert_eq!(undone, 1, "one row of 16");
         assert_eq!(after_outside_restore(false, false, true, false), Outside::StopHiding, "no watchdog: never again");
+    }
+
+    /// r151 N1: the re-hide hides only with a state Explorer answered; an unanswered read is never saved as the
+    /// original and is tried again at the next safety check, its line logged only for the first one after a restore.
+    #[test]
+    fn an_unanswered_read_is_tried_again() {
+        assert_eq!(after_rehide_read(Some(ABS_AUTOHIDE), false), Reread::Hide(ABS_AUTOHIDE));
+        assert_eq!(after_rehide_read(Some(0), true), Reread::Hide(0), "a 0 Explorer answered is the user's");
+        assert_eq!(after_rehide_read(None, false), Reread::Retry { first: true });
+        assert_eq!(after_rehide_read(None, true), Reread::Retry { first: false }, "not logged every 3 s");
     }
 
     /// wsC Q7: the safety check's line is logged for the first 20 hits of a process, not every 3 s.
