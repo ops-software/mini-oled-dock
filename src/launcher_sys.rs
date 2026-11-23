@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
@@ -208,7 +208,9 @@ fn set_clipboard_text(text: &str) {
 }
 
 /// The clipboard's `CF_UNICODETEXT` for a paste, at most 64 KiB of it (up to its first NUL); `Private` when the app
-/// that copied it marked it private (`clipboard_marks`), and then the text is never read.
+/// that copied it marked it private (`clipboard_marks`), and then the text is never read. Nothing is read from an owner
+/// that does not answer (`ui::answers`, lint 18): it renders a delay-rendered format when it is read (WM_RENDERFORMAT),
+/// and the read waits for its thread.
 fn clipboard_text() -> Pasted {
     const MAX_UNITS: usize = 32 * 1024;
     // SAFETY: the clipboard is opened and closed here, on this thread; the block the clipboard owns is read only while
@@ -217,7 +219,11 @@ fn clipboard_text() -> Pasted {
         if OpenClipboard(Some(crate::hwnd())).is_err() {
             return Pasted::Empty;
         }
-        let text = if paste_refused(clipboard_marks()) {
+        // The owner cannot change while the clipboard is open here.
+        let text = if GetClipboardOwner().is_ok_and(|o| !crate::ui::answers(o)) {
+            log!("launcher: the clipboard's owner does not answer, the paste reads nothing");
+            Pasted::Empty
+        } else if paste_refused(clipboard_marks()) {
             Pasted::Private
         } else {
             (|| {

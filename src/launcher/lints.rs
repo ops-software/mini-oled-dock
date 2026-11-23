@@ -1305,6 +1305,53 @@ fn calls_that_wait_for_a_window_live_in_one_guarded_place() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- lint 18: a paste asks the clipboard's owner first --------------------------------------------------------------
+
+/// A delay-rendered clipboard format is rendered by its owner when it is read (WM_RENDERFORMAT, a send that waits for the
+/// owner's thread, without bound when it hangs): `clipboard_text`, the paste, which reads the marks too, asks the owner
+/// with `ui::answers` before its first read.
+fn paste_owner_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != "src/launcher_sys.rs" {
+        return v;
+    }
+    let Some((b, e)) = fn_body(text, "fn clipboard_text(", 0) else {
+        v.push(format!("{path}: fn clipboard_text(..) is missing"));
+        return v;
+    };
+    let code = code_of(text.get(b..e).unwrap_or(""));
+    let ask = code.find("ui::answers(");
+    let read = ["clipboard_marks(", "GetClipboardData("].iter().filter_map(|r| code.find(r)).min();
+    if read.is_some_and(|r| ask.is_none_or(|a| r < a)) {
+        v.push(format!("{path}:{}: fn clipboard_text(..) reads before it asks the owner", line_of(text, b)));
+    }
+    v
+}
+
+#[test]
+fn a_paste_asks_the_clipboards_owner_first() {
+    let p = "src/launcher_sys.rs";
+    let good = "fn clipboard_text() -> Pasted {\n    // the owner renders delayed formats\n\
+                \x20   let silent = GetClipboardOwner().is_ok_and(|o| !crate::ui::answers(o));\n\
+                \x20   if silent { Pasted::Empty } else if paste_refused(clipboard_marks()) { Pasted::Private } else {\n\
+                \x20       GetClipboardData(13);\n    }\n}\n";
+    assert!(paste_owner_violations(p, good).is_empty());
+    // 1.5.0's paste: the marks and the text read with no question to the owner.
+    let unasked =
+        "fn clipboard_text() -> Pasted {\n    if paste_refused(clipboard_marks()) {}\n    GetClipboardData(13);\n}\n";
+    let line = "src/launcher_sys.rs:1: fn clipboard_text(..) reads before it asks the owner";
+    assert_eq!(paste_owner_violations(p, unasked), [line]);
+    let late = "fn clipboard_text() {\n    GetClipboardData(13);\n    crate::ui::answers(o);\n}\n";
+    assert_eq!(paste_owner_violations(p, late).len(), 1);
+    // A comment is not the question.
+    let comment = "fn clipboard_text() {\n    // crate::ui::answers(o)\n    GetClipboardData(13);\n}\n";
+    assert_eq!(paste_owner_violations(p, comment).len(), 1);
+    assert_eq!(paste_owner_violations(p, "fn paste() {}"), ["src/launcher_sys.rs: fn clipboard_text(..) is missing"]);
+    assert!(paste_owner_violations("src/ui.rs", unasked).is_empty());
+    let all = scan_tree(paste_owner_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
