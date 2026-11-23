@@ -1793,6 +1793,7 @@ mod tests {
             name_folded: "sharex".into(),
             title: Some("ShareX".into()),
             hung: false,
+            in_catalogue: false,
         });
         let mut s = typed(&fx, "sh");
         let titles: Vec<&str> = s.rows().iter().map(|r| &*r.title).collect();

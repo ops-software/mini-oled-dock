@@ -2170,6 +2170,7 @@ pub(crate) fn on_catalog(apps: Arc<Arena>) {
     let now = RealSys.now_ms();
     if with_ctrl(|c| {
         c.apps = apps;
+        crate::launcher::providers::mark_in_catalogue(&mut c.windows, &c.apps.view());
         c.listed_at_ms = now.max(1);
         c.listing_since = None;
     })
@@ -2361,6 +2362,7 @@ pub(crate) fn prepare_open() {
     let windows = crate::launcher_sys::window_rows();
     let (state, listed) = with_ctrl(|c| {
         c.windows = windows;
+        crate::launcher::providers::mark_in_catalogue(&mut c.windows, &c.apps.view());
         c.failed_query = None;
         let state = (!std::mem::replace(&mut c.state_loaded, true)).then_some(c.learn);
         (state, c.apps.is_empty() && c.listing_since.is_none())
@@ -3767,10 +3769,11 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
             name_folded: folded.into(),
             title: Some(title.into()),
             hung: false,
+            in_catalogue: false,
         }
     };
     let notepad_key = "c:\\windows\\system32\\notepad.exe";
-    let windows = vec![
+    let mut windows = vec![
         window(0x1001, notepad_key, notepad, tr("Untitled - Notepad", "Senza titolo - Blocco note")),
         window(0x2002, "c:\\tools\\footool.exe", "FooTool", "FooTool - main"),
         window(0x3003, "c:\\program files\\firefox\\firefox.exe", "Firefox", "Dock releases - Mozilla Firefox"),
@@ -3784,6 +3787,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         format!("bar:{}", windows.get(2).map_or("", |w| &w.group_key)),
         crate::preview::mock_icon('F', 0xE66000, 64),
     ));
+    crate::launcher::providers::mark_in_catalogue(&mut windows, &apps_arena.view());
     let history: Vec<Box<str>> = vec!["ping 1.1.1.1".into()];
     let mut opts = LauncherOpts::default();
     // Invented aliases (plan L2-A2): an app and a web address.
@@ -5416,6 +5420,7 @@ mod tests {
             name_folded: name.to_lowercase().into(),
             title: None,
             hung: false,
+            in_catalogue: false,
         }
     }
 

@@ -111,6 +111,11 @@ fn keep_best<'a, T>(best: &mut Vec<(Score, &'a str, T)>, cap: usize, score: Scor
     best.insert(at, (score, title, what));
 }
 
+/// Whether `keep_best` would keep a row of this score and title: so the work that only a kept row needs is not done.
+fn would_enter<T>(best: &[(Score, &str, T)], cap: usize, score: &Score, title: &str) -> bool {
+    best.len() < cap || best.last().is_some_and(|w| by_rank((score, title), (&w.0, w.1)) == Ordering::Less)
+}
+
 impl TopK {
     pub fn new(rows: u8) -> TopK {
         let cap = 3 * usize::from(rows);
@@ -639,8 +644,24 @@ fn datetime_item(r: datetime::Row, score: Score) -> Item {
 
 // ---- apps and the open windows merged into them
 
+#[cfg(test)]
+thread_local! {
+    /// Calls of `same_program`, which decodes an arena record each (pinned by `comparisons_are_linear`).
+    pub(crate) static SAME_PROGRAM_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets each row's `in_catalogue` (some catalogue app is its program): once per open and again when the catalogue
+/// arrives, so a query never scans the apps for a window.
+pub fn mark_in_catalogue(rows: &mut [WindowRow], apps: &CatalogView) {
+    for w in rows {
+        w.in_catalogue = (0..apps.len()).any(|i| same_program(apps, i, w));
+    }
+}
+
 /// The bar's group of this catalogue app: the same AUMID (ignoring case) or the same folded name as the bar's.
 fn same_program(apps: &CatalogView, i: usize, w: &WindowRow) -> bool {
+    #[cfg(test)]
+    SAME_PROGRAM_CALLS.with(|n| n.set(n.get() + 1));
     w.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(apps.id(i))) || *w.name_folded == *apps.cand(i).folded
 }
 
@@ -706,7 +727,8 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         let score_of = |running: bool| rank::score_hidden(&c, tier, running, KIND_APP, hid);
         // Look for the running window only when the row could stay: running is the better of the two scores.
         let learned = learned_boost(cx, ProviderId::Apps, cx.apps.id(i));
-        if !top.accepts(&Score { learned, ..score_of(true) }) {
+        let best_possible = Score { learned, ..score_of(true) };
+        if !top.accepts(&best_possible) || !would_enter(&best, top.cap, &best_possible, cx.apps.name(i)) {
             continue;
         }
         let win = cx.windows.iter().position(|w| same_program(&cx.apps, i, w));
@@ -733,7 +755,7 @@ fn apps(q: &Query, cx: &Context, fuzzy: bool, top: &mut TopK, s: &mut Scratch) -
         let Some(tier) = tier_of(&c, text, fuzzy).filter(|t| *t <= max_tier) else { continue };
         hits += 1;
         let score = c.score(tier, true, KIND_WINDOW);
-        if !top.accepts(&score) || (0..cx.apps.len()).any(|i| same_program(&cx.apps, i, w)) {
+        if w.in_catalogue || !top.accepts(&score) || !would_enter(&best, top.cap, &score, &w.name) {
             continue;
         }
         keep_best(&mut best, top.cap, score, &w.name, w);
@@ -1536,6 +1558,7 @@ pub(crate) mod tests {
                 name_folded: folded.into(),
                 title: Some(title.into()),
                 hung: false,
+                in_catalogue: false,
             }
         };
         let windows = vec![
@@ -1567,10 +1590,13 @@ pub(crate) mod tests {
             // is short) for every context, so they always match the rows.
             let apps: &'static Arena = Box::leak(Box::new(arena::of_apps(&self.apps)));
             let settings: &'static Arena = Box::leak(Box::new(arena::of_settings(&self.settings)));
+            let mut windows = self.windows.clone();
+            mark_in_catalogue(&mut windows, &apps.view());
+            let windows: &'static [WindowRow] = Box::leak(windows.into_boxed_slice());
             Context {
                 apps: apps.view(),
                 settings: settings.view(),
-                windows: &self.windows,
+                windows,
                 history: &self.history,
                 opts: &self.opts,
                 num: NUM_IT,
@@ -2556,7 +2582,7 @@ mod bench {
                 })
                 .collect();
             let mut r = XorShift::new(0xB0B + 2);
-            let windows = (0..60 * scale)
+            let windows: Vec<WindowRow> = (0..60 * scale)
                 .map(|i| {
                     let n = name(&mut r);
                     let mut folded = String::new();
@@ -2569,6 +2595,7 @@ mod bench {
                         name_folded: folded.into(),
                         title: None,
                         hung: false,
+                        in_catalogue: false,
                     }
                 })
                 .collect();
@@ -2582,6 +2609,8 @@ mod bench {
                 learned.pick(ItemKey::of(ProviderId::Settings, &row.name), 1_780_000_000, false);
             }
             let (apps_arena, settings_arena) = (arena::of_apps(&apps), arena::of_settings(&settings));
+            let mut windows = windows;
+            mark_in_catalogue(&mut windows, &apps_arena.view());
             Big { apps, settings, windows, history, apps_arena, settings_arena, opts: LauncherOpts::default(), learned }
         }
 
@@ -2801,6 +2830,10 @@ mod bench {
         assert!(two <= MAX_ALLOCATIONS, "twice the candidates took a query to {two} allocations (from {one})");
     }
 
+    /// The bound on `same_program` calls of one query (each decodes an arena record): the apps that can enter the kept
+    /// rows look for their window (at most the windows each), and a window outside the catalogue reads a flag.
+    const SAME_PROGRAM_MAX: u64 = 20_000;
+
     #[test]
     fn comparisons_are_linear() {
         let big = Big::new(1);
@@ -2809,9 +2842,12 @@ mod bench {
         for raw in &queries() {
             let q = query::parse_query(raw, &big.opts.prefixes, NUM, 1);
             let before = TIER_CHECKS.with(std::cell::Cell::get);
+            let same_before = SAME_PROGRAM_CALLS.with(std::cell::Cell::get);
             let _ = query_all(&q, &cx, &mut Budget::default());
             let checks = TIER_CHECKS.with(std::cell::Cell::get) - before;
             assert!(checks <= 6 * candidates, "{raw:?}: {checks} tier checks for {candidates} candidates");
+            let calls = SAME_PROGRAM_CALLS.with(std::cell::Cell::get) - same_before;
+            assert!(calls <= SAME_PROGRAM_MAX, "{raw:?}: {calls} program comparisons, the bound is {SAME_PROGRAM_MAX}");
         }
     }
 

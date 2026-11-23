@@ -430,6 +430,9 @@ pub struct WindowRow {
     pub name_folded: Box<str>,
     pub title: Option<Box<str>>,
     pub hung: bool,
+    /// Some catalogue app is this window's program (set by `providers::mark_in_catalogue`); such a window is shown
+    /// as its app, never as a row of its own.
+    pub in_catalogue: bool,
 }
 
 /// One Windows setting with its folded name (built from `start_search::settings()`, L1a-16).

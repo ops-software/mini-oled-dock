@@ -906,6 +906,7 @@ pub(crate) fn window_rows() -> Vec<WindowRow> {
                 name_folded: folded.as_str().into(),
                 title: None,
                 hung,
+                in_catalogue: false,
             });
         }
     }
