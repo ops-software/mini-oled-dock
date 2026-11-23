@@ -46,13 +46,13 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, FindWindowExW, GetAncestor, GetClassNameW,
-    GetDesktopWindow, GetForegroundWindow, GetPropW, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync,
-    SwitchToThisWindow, ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER, GET_WINDOW_CMD, GWL_EXSTYLE,
-    OBJID_WINDOW, SC_MINIMIZE, SC_RESTORE, SMTO_ABORTIFHUNG, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDesktopWindow,
+    GetForegroundWindow, GetPropW, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync, SwitchToThisWindow,
+    ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER, GET_WINDOW_CMD, GWL_EXSTYLE, OBJID_WINDOW, SC_MINIMIZE,
+    SC_RESTORE, SMTO_ABORTIFHUNG, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE,
+    WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::log;
@@ -1014,8 +1014,12 @@ pub fn close_group(key: &str) {
     }
 }
 
-/// Sends `WM_SYSCOMMAND` with a timeout (does not block the UI on hung apps). `true` if delivered.
+/// Sends `WM_SYSCOMMAND` with a timeout (does not block the UI on hung apps). `true` if delivered. A window whose
+/// thread does not answer the ping (`ui::answers`, 50 ms at most) is not sent it: the caller's ShowWindowAsync does it.
 fn sys_command(h: isize, cmd: u32) -> bool {
+    if !crate::ui::answers(hw(h)) {
+        return false;
+    }
     let mut res = 0usize;
     // SAFETY: arbitrary HWND allowed; `res` is valid for writing; SMTO_ABORTIFHUNG +
     // a 300 ms timeout limit the wait if the target thread does not respond.
@@ -1053,7 +1057,8 @@ pub(crate) fn activate_window(h: isize) {
         // Allows any process (including the target app) to take the foreground.
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         let ok = SetForegroundWindow(w).as_bool();
-        let _ = BringWindowToTop(w);
+        // Posted to the app's thread: raised in place, a hung app would hold the UI thread.
+        crate::ui::raise(w);
         if !ok || !is_foreground(h) {
             // Foreground lock: `SwitchToThisWindow` bypasses it and is
             // the same call used by Alt+Tab; it also restores if still minimized.
