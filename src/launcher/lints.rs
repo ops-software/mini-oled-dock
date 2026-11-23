@@ -30,9 +30,20 @@ fn tokens(text: &str, token: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Offset of the first `#[cfg(test)]` (everything after it counts as test code); the text length when there is none.
+/// Offset of the test module: the first `#[cfg(test)]` that, past any other attributes, starts a `mod` (everything
+/// after it counts as test code; a `#[cfg(test)]` import, helper or thread-local above it does not); the text length
+/// when there is none.
 fn test_start(text: &str) -> usize {
-    text.find("#[cfg(test)]").unwrap_or(text.len())
+    for (at, cfg) in text.match_indices("#[cfg(test)]") {
+        let mut rest = text.get(at + cfg.len()..).unwrap_or("").trim_start();
+        while rest.starts_with("#[") {
+            rest = rest.get(rest.find(']').map_or(rest.len(), |i| i + 1)..).unwrap_or("").trim_start();
+        }
+        if rest.starts_with("mod ") {
+            return at;
+        }
+    }
+    text.len()
 }
 
 fn line_of(text: &str, at: usize) -> usize {
@@ -118,13 +129,15 @@ fn runas_is_built_only_where_allowed() {
     assert_eq!(runas_violations("src/ui.rs", bad).len(), 1);
     assert!(runas_violations("src/launcher/gesture.rs", bad).is_empty());
     assert!(runas_violations("src/popup_launcher.rs", bad).is_empty());
-    // hook.rs: only after the first #[cfg(test)]
+    // hook.rs: only in its test module
     assert_eq!(runas_violations("src/hook.rs", bad).len(), 1);
     let hook = "fn f() {}\n#[cfg(test)]\nmod t { fn g() { Gesture::from_key(2); } }";
     assert!(runas_violations("src/hook.rs", hook).is_empty());
-    // for_test: only in test code of its own file
+    // for_test: only in the test module of its own file (a #[cfg(test)] item above that module counts as code)
     assert_eq!(runas_violations("src/launcher/gesture.rs", "fn f() { Gesture::for_test(1); }").len(), 1);
-    assert!(runas_violations("src/launcher/gesture.rs", "#[cfg(test)]\nfn f() { Gesture::for_test(1); }").is_empty());
+    let in_mod = "#[cfg(test)]\nmod t { fn f() { Gesture::for_test(1); } }";
+    assert!(runas_violations("src/launcher/gesture.rs", in_mod).is_empty());
+    assert_eq!(runas_violations("src/launcher/gesture.rs", "#[cfg(test)]\nfn f() { Gesture::for_test(1); }").len(), 1);
     // request kinds
     let st = "ShellRequest::RunAsTyped { x }";
     assert_eq!(runas_violations("src/ui.rs", st).len(), 1);
@@ -287,24 +300,9 @@ const CLIP_FNS: [&str; 3] = ["fn clipboard_text(", "fn clipboard_marks(", "fn se
 /// The ones of `CLIP_FNS` that read the clipboard, at the user's paste only.
 const CLIP_READERS: [&str; 2] = ["fn clipboard_text(", "fn clipboard_marks("];
 
-/// Offset of the test module: the first `#[cfg(test)]` that, past any other attributes, starts a `mod` (a `#[cfg(test)]`
-/// import above it does not count); the text length when there is none.
-fn test_mod_start(text: &str) -> usize {
-    for (at, cfg) in text.match_indices("#[cfg(test)]") {
-        let mut rest = text.get(at + cfg.len()..).unwrap_or("").trim_start();
-        while rest.starts_with("#[") {
-            rest = rest.get(rest.find(']').map_or(rest.len(), |i| i + 1)..).unwrap_or("").trim_start();
-        }
-        if rest.starts_with("mod ") {
-            return at;
-        }
-    }
-    text.len()
-}
-
 fn clip_violations(path: &str, text: &str) -> Vec<String> {
     let mut v = Vec::new();
-    let code = text.get(..test_mod_start(text)).unwrap_or(text);
+    let code = text.get(..test_start(text)).unwrap_or(text);
     let mut readers = Vec::new();
     if path == "src/launcher_sys.rs" {
         for sig in CLIP_FNS {
@@ -932,6 +930,9 @@ fn injected_keys_carry_the_tag() {
     assert_eq!(tag_violations("src/ui.rs", bare), ["src/ui.rs:1: an injected event without INJECT_TAG (0)"]);
     // Tests build hook structs with any extra info.
     assert!(tag_violations("src/hook.rs", &format!("#[cfg(test)]\nmod tests {{\n{bare}\n}}")).is_empty());
+    // A test-only import above the code is not the test module (src/launcher_sys.rs has one before `RealSys::inject`).
+    let import = "#[cfg(test)]\nuse a::b;\nfn f() { KEYBDINPUT { dwExtraInfo: 0 } }";
+    assert_eq!(tag_violations("src/launcher_sys.rs", import).len(), 1);
     let all = scan_tree(tag_violations);
     assert!(all.is_empty(), "{all:#?}");
 }
