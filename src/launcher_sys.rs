@@ -34,12 +34,13 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_NOEXPAND,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
-use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
+use windows::Win32::System::SystemInformation::{GetSystemWindowsDirectoryW, GetTickCount, GetTickCount64};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, RegisterWaitForSingleObject, UnregisterWaitEx,
     WaitForSingleObject, INFINITE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -735,11 +736,15 @@ pub(crate) fn same_text(a: &[u16], b: &[u16]) -> bool {
 const MAX_ACCOUNTS: u32 = 4_096;
 
 /// The profile folder of every account Windows lists (`ProfileImagePath` of each key under HKLM's ProfileList, which
-/// only an administrator can change, expanded), the user's own included: `files::root_of` keeps every root out of the
-/// others, those kept outside the profiles folder too. None when the list cannot be read whole (no key, more than 4,096
-/// entries, a path over 260 units or not UTF-16): then no known or listed folder becomes a root. The files helper calls
-/// it too, so it logs nothing.
+/// only an administrator can change, read unexpanded and expanded by `expand_system`), the user's own included:
+/// `files::root_of` keeps every root out of the others, those kept outside the profiles folder too. None when the list
+/// cannot be read whole (no key, more than 4,096 entries, a path over 260 units or not UTF-16, a `%` left): then no
+/// known or listed folder becomes a root. The files helper calls it too, so it logs nothing.
 pub(crate) fn profile_folders() -> Option<Vec<String>> {
+    let mut windows = [0u16; crate::launcher::files::ROOT_UNITS + 1];
+    // SAFETY: `windows` holds its length in writable units.
+    let n = unsafe { GetSystemWindowsDirectoryW(Some(&mut windows)) } as usize;
+    let windows = String::from_utf16(windows.get(..n)?).ok()?;
     let list = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
     let mut key = HKEY::default();
     // SAFETY: a static NUL-terminated key name; `key` is a writable HKEY, closed below.
@@ -758,14 +763,18 @@ pub(crate) fn profile_folders() -> Option<Vec<String>> {
         }
         let mut bytes = std::mem::size_of_val(&path) as u32;
         let (value, buf) = (w!("ProfileImagePath"), path.as_mut_ptr().cast());
-        // SAFETY: `name` is the NUL-terminated subkey name; `buf` holds `bytes` writable bytes; RRF_RT_REG_SZ expands a
-        // REG_EXPAND_SZ and ends the string with a NUL.
+        // SAFETY: `name` is the NUL-terminated subkey name; `buf` holds `bytes` writable bytes; the call ends the string
+        // with a NUL, and RRF_NOEXPAND leaves a REG_EXPAND_SZ as stored.
         let r = (r == ERROR_SUCCESS).then(|| unsafe {
-            RegGetValueW(key, PCWSTR(name.as_ptr()), value, RRF_RT_REG_SZ, None, Some(buf), Some(&mut bytes))
+            let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+            RegGetValueW(key, PCWSTR(name.as_ptr()), value, flags, None, Some(buf), Some(&mut bytes))
         });
         let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
         match (r, path.get(..len).map(String::from_utf16)) {
-            (Some(ERROR_SUCCESS), Some(Ok(p))) => all.push(p),
+            (Some(ERROR_SUCCESS), Some(Ok(p))) => match expand_system(&p, &windows) {
+                Some(p) => all.push(p),
+                None => break,
+            },
             (Some(ERROR_FILE_NOT_FOUND), _) => {}
             _ => break,
         }
@@ -773,6 +782,24 @@ pub(crate) fn profile_folders() -> Option<Vec<String>> {
     // SAFETY: the key opened above, closed once.
     let _ = unsafe { RegCloseKey(key) };
     whole.then_some(all)
+}
+
+/// A ProfileImagePath as ProfileList stores it, with each `%SystemDrive%` and `%SystemRoot%` (any case) taken from
+/// `windows`, the system's Windows folder (GetSystemWindowsDirectoryW), never from the dock's environment, where a user
+/// variable can shadow a system one. None when any other `%` is left.
+fn expand_system(raw: &str, windows: &str) -> Option<String> {
+    let drive = windows.get(..2).filter(|d| d.ends_with(':'))?;
+    let mut parts = raw.split('%');
+    let mut out = parts.next()?.to_string();
+    while let Some(name) = parts.next() {
+        out.push_str(match name {
+            n if n.eq_ignore_ascii_case("SystemDrive") => drive,
+            n if n.eq_ignore_ascii_case("SystemRoot") => windows,
+            _ => return None,
+        });
+        out.push_str(parts.next()?);
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------- PowerToys (L1b-5, SPEC 5.7)
@@ -1254,6 +1281,27 @@ mod tests {
     /// user's own profile among the entries, and a folder of that profile accepted as a root with the dock's fences.
     /// Every known and listed folder is refused when `profile_folders` gives None, and the helper logs nothing, so
     /// this is the one place a failed read shows. Relations only: no name of the machine is written down.
+    /// A ProfileImagePath gets %SystemDrive% and %SystemRoot% from the system's Windows folder (injected here: a system
+    /// on E:), whatever the environment says, and no other variable: a user's variable can shadow a system one.
+    #[test]
+    fn a_profile_path_expands_only_from_the_system() {
+        let win = "E:\\Win";
+        for (raw, path) in [
+            ("%SystemDrive%\\Users\\a", "E:\\Users\\a"),
+            ("%SYSTEMDRIVE%\\Users\\b.domain", "E:\\Users\\b.domain"),
+            ("%systemroot%\\system32\\config\\systemprofile", "E:\\Win\\system32\\config\\systemprofile"),
+            ("D:\\Profiles\\c", "D:\\Profiles\\c"),
+        ] {
+            assert_eq!(expand_system(raw, win).as_deref(), Some(path), "{raw:?}");
+        }
+        for raw in
+            ["%USERPROFILE%\\..\\b", "%HOMEDRIVE%\\Users\\a", "%SystemDrive", "C:\\Users\\100%", "%%\\a", "%Path%"]
+        {
+            assert_eq!(expand_system(raw, win), None, "{raw:?}");
+        }
+        assert_eq!(expand_system("%SystemDrive%\\Users\\a", ""), None, "no Windows folder");
+    }
+
     #[test]
     fn profile_folders_reads_this_machine() {
         let accounts = profile_folders().expect("ProfileList read whole");
