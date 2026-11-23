@@ -228,7 +228,7 @@ impl AliasTable {
             }
         }
         // Stable: of two equal folded words the first of the map stays first, and `dedup_by` keeps it.
-        list.sort_by(|a, b| a.folded.cmp(&b.folded));
+        crate::tinysort::sort_by(&mut list, |a, b| a.folded.cmp(&b.folded));
         let before = list.len();
         list.dedup_by(|later, first| later.folded == first.folded);
         ignored += before - list.len();
