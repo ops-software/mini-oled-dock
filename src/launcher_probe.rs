@@ -243,7 +243,7 @@ pub fn won_foreground(hwnd: HWND) {
 /// cannot judge KEY-1's 4 ms): the keyboard hook's (`key_seen`) and this one.
 pub fn work_start() -> Option<(Instant, u32)> {
     with_open(|_| ())?;
-    let queued = qpc_us(qpc().wrapping_sub(LAST_KEY.load(Relaxed)));
+    let queued = queue_us(qpc(), LAST_KEY.load(Relaxed), qpc_freq());
     Some((Instant::now(), queued))
 }
 
@@ -257,19 +257,26 @@ fn qpc() -> i64 {
     t
 }
 
-/// `ticks` of the counter in microseconds (0 for a stamp that was never set or a clock that does not answer).
-fn qpc_us(ticks: i64) -> u32 {
+/// The counter's frequency (ticks per second; 0 when the clock does not answer).
+fn qpc_freq() -> i64 {
     static FREQ: OnceLock<i64> = OnceLock::new();
-    let f = *FREQ.get_or_init(|| {
+    *FREQ.get_or_init(|| {
         let mut f = 0i64;
         // SAFETY: `f` is writable.
         let _ = unsafe { QueryPerformanceFrequency(&mut f) };
         f
-    });
-    ticks_to_us(ticks, f)
+    })
 }
 
-/// The pure part of `qpc_us`: a stamp that was never set (the wait would be the whole uptime) or a bad frequency reads 0.
+/// The wait in microseconds between the key stamp and `now` (0 when no key was stamped yet, 0 for a bad frequency).
+fn queue_us(now: i64, stamp: i64, freq: i64) -> u32 {
+    if stamp <= 0 {
+        return 0;
+    }
+    ticks_to_us(now.wrapping_sub(stamp), freq)
+}
+
+/// `ticks` of the counter in microseconds (0 for a bad frequency or a negative count).
 fn ticks_to_us(ticks: i64, freq: i64) -> u32 {
     if freq <= 0 || ticks <= 0 {
         return 0;
@@ -291,7 +298,9 @@ pub fn work_end(start: Option<(Instant, u32)>) {
     with_open(|p| {
         p.keys += 1;
         p.work.push(us);
-        p.queue.push(queued);
+        if queued > 0 {
+            p.queue.push(queued); // 0 = no stamp (the hook has not seen a key yet): no sample
+        }
     });
 }
 
@@ -548,10 +557,17 @@ mod tests {
     fn counter_ticks_read_in_microseconds() {
         assert_eq!(ticks_to_us(10_000_000, 10_000_000), 1_000_000);
         assert_eq!(ticks_to_us(2_500, 10_000_000), 250, "a 4 ms budget is judged to the microsecond");
-        assert_eq!(ticks_to_us(0, 10_000_000), 0, "no stamp yet");
+        assert_eq!(ticks_to_us(0, 10_000_000), 0);
         assert_eq!(ticks_to_us(-5, 10_000_000), 0);
         assert_eq!(ticks_to_us(5, 0), 0, "no clock");
         assert_eq!(ticks_to_us(i64::MAX, 1), u32::MAX);
+    }
+
+    #[test]
+    fn an_unset_key_stamp_gives_no_wait() {
+        assert_eq!(queue_us(9_000_000_000, 0, 10_000_000), 0, "never the whole uptime");
+        assert_eq!(queue_us(1_002_500, 1_000_000, 10_000_000), 250);
+        assert_eq!(queue_us(5, 0, 10_000_000), 0);
     }
 
     #[test]
