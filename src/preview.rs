@@ -1139,7 +1139,9 @@ pub fn run(dir: &str) -> i32 {
         // With the chord set and four invented aliases, one of them a kind the launcher ignores.
         let mut c = c;
         c.launcher.chord = "alt+space".into();
-        for (w, t) in [("web", "https://example.com/"), ("notes", "app:Contoso.Notes_1234!App"), ("proj", "D:\\Projects")] {
+        for (w, t) in
+            [("web", "https://example.com/"), ("notes", "app:Contoso.Notes_1234!App"), ("proj", "D:\\Projects")]
+        {
             c.launcher.aliases.insert(w.into(), t.into());
         }
         c.launcher.aliases.insert("game".into(), "steam://run/1".into());
