@@ -296,8 +296,35 @@ fn log_violations(path: &str, text: &str) -> Vec<String> {
             }
         }
     }
+    // The shared launch functions take the caller: every log line they write goes through a line builder that gets `by`
+    // (a launcher pick is never named in dock.log), never a format string of its own.
+    if path == "src/shell_thread.rs" && LAUNCH_LOG_FNS.iter().any(|s| text.contains(s)) {
+        let code = text.get(..test_start(text)).unwrap_or(text);
+        for sig in LAUNCH_LOG_FNS {
+            let Some((b, e)) = fn_body(code, sig, 0) else {
+                v.push(format!("{path}: {sig}..) is missing"));
+                continue;
+            };
+            for (at, call) in log_calls(code.get(b..e).unwrap_or("")) {
+                let ok = call.strip_prefix("log!(\"{}\", ").is_some_and(|rest| {
+                    LAUNCH_LINE_FNS.iter().any(|f| rest.strip_prefix(f).is_some_and(|r| r.starts_with("(by,")))
+                });
+                if !ok {
+                    v.push(format!(
+                        "{path}:{}: a log line of {sig}..) must be log!(\"{{}}\", <line builder>(by, ..))",
+                        line_of(code, b + at)
+                    ));
+                }
+            }
+        }
+    }
     v
 }
+
+/// The launch functions of shell_thread.rs that serve both the shared requests and the launcher's, and the builders
+/// whose text depends on the caller (`LaunchBy`).
+const LAUNCH_LOG_FNS: [&str; 3] = ["fn launch_with(", "fn launch_app_admin(", "fn reveal_app_with("];
+const LAUNCH_LINE_FNS: [&str; 4] = ["launch_line", "launch_refused_line", "app_admin_line", "reveal_line"];
 
 /// The functions of launcher_sys.rs that hold what the user copies (plan L2 CLIP-1): their log lines name an error at
 /// most (no text, no length), and they are the only callers of the clipboard reader in the dock.
@@ -371,6 +398,24 @@ fn launcher_logs_carry_no_text() {
     assert_eq!(log_violations("src/shell_thread.rs", half).len(), 1);
     let swapped = "// launcher requests: end\n// launcher requests: begin\n";
     assert_eq!(log_violations("src/shell_thread.rs", swapped).len(), 1);
+    // the shared launch functions: log through a caller-aware builder only
+    let launch = |a: &str, b: &str, c: &str| {
+        format!(
+            "fn launch_with(t: &str, by: LaunchBy) {{ {a} }}\nfn launch_app_admin(i: &str, by: LaunchBy) {{ {b} }}\n\
+             fn reveal_app_with(i: &str, by: LaunchBy) {{ {c} }}\n"
+        )
+    };
+    let l1 = "log!(\"{}\", launch_line(by, t, None, \"\"));";
+    let l2 = "log!(\"{}\", app_admin_line(by, &t, Ok(())));";
+    let l3 = "log!(\"{}\", reveal_line(by, i, None, \"\"));";
+    assert!(log_violations("src/shell_thread.rs", &launch(l1, l2, l3)).is_empty());
+    assert_eq!(log_violations("src/shell_thread.rs", &launch("log!(\"shell: Launch '{target}'\");", l2, l3)).len(), 1);
+    assert_eq!(
+        log_violations("src/shell_thread.rs", &launch(l1, &l2.replace("(by,", "(LaunchBy::Shared,"), l3)).len(),
+        1
+    );
+    assert_eq!(log_violations("src/shell_thread.rs", &launch(l1, l2, "log!(\"{}\", id);")).len(), 1);
+    assert_eq!(log_violations("src/shell_thread.rs", "fn launch_with() {}").len(), 2, "a renamed one fails");
     let all = scan_tree(log_violations);
     assert!(all.is_empty(), "{all:#?}");
     // the clipboard functions (CLIP-1): an error at most, and the clipboard is read nowhere else
@@ -395,6 +440,61 @@ fn launcher_logs_carry_no_text() {
     assert!(clip_violations("src/ui.rs", tests).is_empty(), "test code may read it");
     assert_eq!(clip_violations("src/ui.rs", &tests.replace("fn f() {}", "fn f() { GetClipboardData(1); }")).len(), 1);
     let all = scan_tree(clip_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+/// `on_config` ends with the edge of `launcher.learn` (true to false forgets the history files), outside every arm of the
+/// chord match: before the match the delete would be queued ahead of the save `chord_off` queues, and that save would put
+/// the files back; inside an arm it would not run with the chord in the other state.
+fn learn_edge_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path != "src/popup_launcher.rs" {
+        return v;
+    }
+    let code = text.get(..test_start(text)).unwrap_or(text);
+    let Some((b, e)) = fn_body(code, "pub(crate) fn on_config(", 0) else {
+        v.push(format!("{path}: on_config is missing"));
+        return v;
+    };
+    let body = code.get(b..e).unwrap_or("");
+    let tail = fn_body(body, "match (was, chord.is_some())", 0).and_then(|(_, me)| body.get(me + 1..)).map(code_of);
+    let ok = tail.is_some_and(|t| {
+        let edge = "if learn_switched_off(cfg.launcher.learn) {";
+        t.find(edge).is_some_and(|i| {
+            let before = t.get(..i).unwrap_or("");
+            before.matches('{').count() == before.matches('}').count()
+                && t.get(i..).is_some_and(|r| r.contains("forget_history()"))
+        })
+    });
+    if !ok {
+        v.push(format!(
+            "{path}: on_config must end, after the chord match and outside its arms, with `if learn_switched_off(cfg.launcher.learn) {{ forget_history(); }}`"
+        ));
+    }
+    v
+}
+
+#[test]
+fn learn_switch_off_is_wired_after_the_chord_match() {
+    let m = "match (was, chord.is_some()) { (true, false) => { save(); } _ => {} }";
+    let edge = "if learn_switched_off(cfg.launcher.learn) { forget_history(); }";
+    let f = |head: &str, mid: &str, tail: &str| format!("pub(crate) fn on_config() {{ {head} {m} {mid} {tail} }}\n");
+    let p = "src/popup_launcher.rs";
+    assert!(learn_edge_violations(p, &f("", "", edge)).is_empty());
+    assert!(learn_edge_violations(p, &f("", "log!(\"x\");", edge)).is_empty());
+    assert_eq!(learn_edge_violations(p, &f(edge, "", "")).len(), 1, "before the match the save puts the files back");
+    let arm = m.replace("save();", edge);
+    assert_eq!(learn_edge_violations(p, &format!("pub(crate) fn on_config() {{ {arm} }}")).len(), 1, "inside an arm");
+    assert_eq!(learn_edge_violations(p, &f("", "", "")).len(), 1, "absent");
+    assert_eq!(
+        learn_edge_violations(p, &f("", "", "// if learn_switched_off(cfg.launcher.learn) { forget_history(); }"))
+            .len(),
+        1
+    );
+    assert_eq!(learn_edge_violations(p, &f("", "", "if learn_switched_off(cfg.launcher.learn) { }")).len(), 1);
+    assert_eq!(learn_edge_violations(p, "fn other() {}").len(), 1, "a renamed one fails");
+    assert!(learn_edge_violations("src/ui.rs", "fn other() {}").is_empty());
+    let all = scan_tree(learn_edge_violations);
     assert!(all.is_empty(), "{all:#?}");
 }
 
