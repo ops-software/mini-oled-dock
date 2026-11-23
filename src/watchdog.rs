@@ -5,16 +5,17 @@
 //!  * Heartbeat event: name `Local\DockHeartbeat-<pid>` (auto-reset), created by the dock with
 //!    `CreateEventW`; the dock signals it every 1 s (`TIMER_SECOND` -> `heartbeat()`).
 //!  * The watchdog opens the dock process (`SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`) and
-//!    the event, then waits (`WaitForMultipleObjects`) on the process and the event with a ~1.1 s timeout.
-//!    If 6 consecutive heartbeats are missed it runs `taskbar::restore_force()` but stays alive as long as
-//!    the dock lives (a stuck dock can recover; the dock itself stops hiding the taskbar
-//!    if it finds the state file deleted). If the process ends with exit code != 0 (including
-//!    abort/crash) it restores and exits; with code 0 it exits doing nothing (the dock has already
-//!    restored). It does NOT relaunch the dock. Before restoring it waits up to 30 s for a
+//!    the event, then waits (`WaitForMultipleObjects`) on the process and the event with a 3.3 s timeout
+//!    (sized for a heartbeat period of up to 3 s; with a 1 s beat each wait returns at the beat). 2 timeouts
+//!    in a row (6.6 s without a beat) are a hang; before the first beat, 10 (33 s). On a hang it runs
+//!    `taskbar::restore_force()` but stays alive as long as the dock lives (a stuck dock can recover; the
+//!    dock itself stops hiding the taskbar if it finds the state file deleted). If the process ends with
+//!    exit code != 0 (including abort/crash) it restores and exits; with code 0 it exits doing nothing (the
+//!    dock has already restored). It does NOT relaunch the dock. Before restoring it waits up to 30 s for a
 //!    `Shell_TrayWnd` (Explorer restarting).
 //!  * Startup heartbeat event: `Local\DockHeartbeat-<pid>-startup` (auto-reset), signaled by
 //!    `taskbar::init` while waiting for `Shell_TrayWnd`: it resets the count but does NOT move the
-//!    watchdog from the startup tolerance (30) to the steady-state one (6), which starts at the first
+//!    watchdog from the startup tolerance (10) to the steady-state one (2), which starts at the first
 //!    real heartbeat from `TIMER_SECOND`.
 //!  * Single instance: named mutex `Local\DockInstance`, taken by `main` right after parsing the
 //!    arguments, before the data folder (`datadir::init`), the logger and anything else. The watchdog,
@@ -50,8 +51,9 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use crate::log;
 use crate::msg::WM_DOCK_QUIT_REQUEST;
 
-/// Number of consecutive missed heartbeats after which the watchdog restores.
-pub const MAX_MISSED_HEARTBEATS: u32 = 6;
+/// Number of consecutive wait timeouts (`WAIT_MS` each) without a heartbeat after which the watchdog
+/// restores: 6.6 s of silence.
+pub const MAX_MISSED_HEARTBEATS: u32 = 2;
 /// Name of the stop event (manual-reset) shared by the dock and `--restore`.
 pub const STOP_EVENT_NAME: &str = "Local\\DockStop";
 /// Name of the dock's single-instance mutex.
@@ -59,11 +61,11 @@ const INSTANCE_MUTEX_NAME: &str = "Local\\DockInstance";
 /// Maximum wait for `Shell_TrayWnd` before a restore by the watchdog.
 pub(crate) const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Timeout of each watchdog wait (slightly above the heartbeat period).
-const WAIT_MS: u32 = 1100;
+/// Timeout of each watchdog wait: 10 % above the longest heartbeat period it is sized for (3 s).
+const WAIT_MS: u32 = 3300;
 /// Before the FIRST heartbeat the dock may still be starting (waiting for Shell_TrayWnd, ...):
-/// a much wider tolerance (~33 s).
-const MAX_MISSED_BEFORE_FIRST: u32 = 30;
+/// a much wider tolerance (10 timeouts, 33 s).
+const MAX_MISSED_BEFORE_FIRST: u32 = 10;
 /// SYNCHRONIZE access right (waiting on kernel objects).
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
@@ -462,8 +464,7 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
             missed = 0;
         } else if r == WAIT_TIMEOUT {
             missed += 1;
-            let limit = if seen_beat { MAX_MISSED_HEARTBEATS } else { MAX_MISSED_BEFORE_FIRST };
-            if missed >= limit && !stalled {
+            if restore_due(missed, seen_beat) && !stalled {
                 log!("watchdog: {missed} missed heartbeats, restoring the taskbar (still waiting for the dock)");
                 // Before restoring, the dock tray host must yield to Explorer. If it does not
                 // respond (hung host) the dock must be terminated BEFORE the restore: a hung host
@@ -541,6 +542,12 @@ fn terminate_dock(pid: u32) {
     }
 }
 
+/// true when `missed` consecutive wait timeouts without a heartbeat call for a hang restore: the
+/// steady-state limit once a real heartbeat was seen, the startup limit before it.
+fn restore_due(missed: u32, seen_beat: bool) -> bool {
+    missed >= if seen_beat { MAX_MISSED_HEARTBEATS } else { MAX_MISSED_BEFORE_FIRST }
+}
+
 /// Post-exit decision of `run_watchdog`: restore unless the dock exited cleanly AND left no state file.
 /// `exit_code` is `None` when `GetExitCodeProcess` failed. A clean exit with Explorer absent keeps the file.
 fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
@@ -553,6 +560,33 @@ fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Silence before a hang restore: one wait timeout times the number of timeouts in a row.
+    fn silence_ms(seen_beat: bool) -> u32 {
+        WAIT_MS * if seen_beat { MAX_MISSED_HEARTBEATS } else { MAX_MISSED_BEFORE_FIRST }
+    }
+
+    /// A heartbeat period fits one wait when the wait is at least 10 % longer than the period.
+    fn beat_fits(period_ms: u32, wait_ms: u32) -> bool {
+        u64::from(period_ms) * 11 <= u64::from(wait_ms) * 10
+    }
+
+    #[test]
+    fn hang_silence_is_unchanged() {
+        assert!(!restore_due(1, true));
+        assert!(restore_due(2, true), "2 timeouts in a row after a beat are a hang");
+        assert!(!restore_due(9, false));
+        assert!(restore_due(10, false), "10 timeouts in a row before the first beat are a hang");
+        assert_eq!(silence_ms(true), 6600, "6.6 s without a beat, as with 6 waits of 1.1 s");
+        assert_eq!(silence_ms(false), 33_000, "33 s before the first beat, as with 30 waits of 1.1 s");
+    }
+
+    #[test]
+    fn a_3_s_beat_lands_inside_one_wait() {
+        assert!(beat_fits(3000, WAIT_MS), "the idle keepalive of 3 s");
+        assert!(beat_fits(1000, WAIT_MS), "the 1 s beat of today");
+        assert!(!beat_fits(3100, WAIT_MS));
+    }
 
     #[test]
     fn watchdog_restores_whenever_the_state_file_is_left() {

@@ -996,8 +996,7 @@ pub fn stop() {
 }
 
 fn stop_forwarder(fwd: Option<JoinHandle<()>>) {
-    FWD_STOP.store(true, Relaxed);
-    FWD_CV.notify_all();
+    signal_stop(&FWD_QUEUE, &FWD_CV, &FWD_STOP);
     if let Some(h) = fwd {
         let t = Instant::now();
         while !h.is_finished() && t.elapsed() < Duration::from_millis(500) {
@@ -2710,23 +2709,34 @@ fn enqueue_forward(wp: usize, bytes: &[u8]) {
     FWD_CV.notify_one();
 }
 
+/// Blocks until an item is queued (Some) or the stop flag is set (None). No timeout:
+/// `signal_stop` sets the flag under the queue's lock, so a stop cannot slip between
+/// the check and the wait.
+fn next_item<T>(q: &Mutex<VecDeque<T>>, cv: &Condvar, stop: &AtomicBool) -> Option<T> {
+    let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if stop.load(Relaxed) {
+            return None;
+        }
+        if let Some(it) = g.pop_front() {
+            return Some(it);
+        }
+        g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Sets the stop flag while holding the queue's lock, then wakes every waiter.
+fn signal_stop<T>(q: &Mutex<VecDeque<T>>, cv: &Condvar, stop: &AtomicBool) {
+    {
+        let _g = q.lock().unwrap_or_else(|e| e.into_inner());
+        stop.store(true, Relaxed);
+    }
+    cv.notify_all();
+}
+
 fn forward_main() {
     loop {
-        let item = {
-            let mut q = FWD_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                if FWD_STOP.load(Relaxed) {
-                    return;
-                }
-                if let Some(it) = q.pop_front() {
-                    break it;
-                }
-                q = match FWD_CV.wait_timeout(q, Duration::from_millis(500)) {
-                    Ok((g, _)) => g,
-                    Err(e) => e.into_inner().0,
-                };
-            }
-        };
+        let Some(item) = next_item(&FWD_QUEUE, &FWD_CV, &FWD_STOP) else { return };
         if !crate::taskbar::is_hidden() || YIELDED.load(Relaxed) {
             continue;
         }
@@ -2758,6 +2768,44 @@ fn forward_main() {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::DUPLICATE_HANDLE_OPTIONS;
+
+    #[test]
+    fn stop_wakes_a_waiting_forwarder() {
+        let q = Arc::new((Mutex::new(VecDeque::<u32>::new()), Condvar::new(), AtomicBool::new(false)));
+        let q2 = q.clone();
+        let (tx, rx) = mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let _ = tx.send(next_item(&q2.0, &q2.1, &q2.2));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        signal_stop(&q.0, &q.1, &q.2);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(None));
+        let _ = h.join();
+    }
+
+    #[test]
+    fn an_item_wakes_the_forwarder() {
+        let q = Arc::new((Mutex::new(VecDeque::<u32>::new()), Condvar::new(), AtomicBool::new(false)));
+        let q2 = q.clone();
+        let (tx, rx) = mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let _ = tx.send(next_item(&q2.0, &q2.1, &q2.2));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        q.0.lock().unwrap().push_back(7);
+        q.1.notify_one();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(Some(7)));
+        let _ = h.join();
+    }
+
+    #[test]
+    fn a_stop_before_the_wait_is_not_lost() {
+        let q = Mutex::new(VecDeque::<u32>::new());
+        let cv = Condvar::new();
+        let stop = AtomicBool::new(false);
+        signal_stop(&q, &cv, &stop);
+        assert_eq!(next_item(&q, &cv, &stop), None);
+    }
 
     #[test]
     fn placement_events_are_filtered_before_any_window_call() {
