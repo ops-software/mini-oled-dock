@@ -859,7 +859,14 @@ fn hide_again() {
     }
     HIDDEN.store(true, Relaxed);
     hide_all();
-    crate::ui::tray_sync(); // starts the host and announces it when show_tray
+    if crate::shell_thread::desktop_registered() {
+        crate::ui::tray_sync(); // starts the host and announces it when show_tray
+    } else {
+        // A new Explorer is starting (the watchdog's restore waited for its taskbar): our host waits for its desktop,
+        // as after `explorer_gone`, and `on_reannounce_timer` starts it.
+        HOST_PAUSED_AT.store(now_ms(), Relaxed);
+        arm_reannounce(1000);
+    }
     log!("taskbar: hidden again after the watchdog's restore");
 }
 
