@@ -1505,8 +1505,9 @@ pub fn start_watch(ui: windows::Win32::Foundation::HWND) -> bool {
     true
 }
 
-/// Ends the watch: waits for a running callback, then closes the notification. Idempotent.
-pub fn stop_watch() {
+/// Ends the watch: waits for a running callback, then closes the notification. Idempotent; true when a notification
+/// handle was closed (the watch was still held).
+pub fn stop_watch() -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::FindCloseChangeNotification;
@@ -1526,6 +1527,7 @@ pub fn stop_watch() {
         // SAFETY: the handle came from FindFirstChangeNotificationW and is closed once (the swap above).
         let _ = unsafe { FindCloseChangeNotification(HANDLE(change as *mut core::ffi::c_void)) };
     }
+    change != 0
 }
 
 /// Thread-pool callback of the folder notification (wait thread): re-arms the handle first, then posts one message
@@ -1543,7 +1545,13 @@ unsafe extern "system" fn on_folder_change(_context: *mut core::ffi::c_void, _ti
     }
     // SAFETY: the handle stays open until `stop_watch`, which first waits for this callback to return.
     if unsafe { FindNextChangeNotification(HANDLE(change as *mut core::ffi::c_void)) }.is_err() {
-        // wParam 1 = the watch is broken: the UI thread falls back to the 2 s poll.
+        // wParam 1 = the watch is broken: the UI thread falls back to the 2 s poll. First end the wait (non-blocking
+        // form, allowed in the callback) so a still-signaled handle cannot re-fire this callback in a loop.
+        let w = WATCH_WAIT.swap(0, SeqCst);
+        if w != 0 {
+            // SAFETY: `w` came from RegisterWaitForSingleObject and is unregistered once (the swap above).
+            let _ = unsafe { windows::Win32::System::Threading::UnregisterWaitEx(HANDLE(w as *mut core::ffi::c_void), None) };
+        }
         // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
         let _ = unsafe { PostMessageW(Some(ui), crate::msg::WM_DOCK_CONFIG_CHANGED, WPARAM(1), LPARAM(0)) };
         return;

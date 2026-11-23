@@ -139,7 +139,7 @@ pub const TIMER_RAM: usize = 3;
 /// window, the shell hook's messages excepted) and in the loop (other windows, thread messages), at most once a second.
 /// Handled by `main`.
 pub const TIMER_SECOND: usize = 4;
-/// 5 s: window list reconciliation (`ui::on_reconcile`). Handled by `ui`.
+/// 5 s while the bar is shown: window list reconciliation (`ui::on_reconcile`). Handled by `ui`.
 pub const TIMER_RECONCILE: usize = 5;
 /// 100 ms one-shot: debounce after `WM_DOCK_APPS_DIRTY`. Handled by `ui`.
 pub const TIMER_APPS_DEBOUNCE: usize = 6;

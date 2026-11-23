@@ -1219,6 +1219,8 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Ui, WM_DOCK_APP_MENU_CMD) => "WM_DOCK_APP_MENU_CMD",
         (Th::Ui, WM_POPUP_OUTSIDE) => "WM_POPUP_OUTSIDE",
         (Th::Ui, WM_DOCK_CONFIG_APPLY) => "WM_DOCK_CONFIG_APPLY",
+        (Th::Ui, WM_DOCK_CONFIG_CHANGED) => "WM_DOCK_CONFIG_CHANGED",
+        (Th::Ui, WM_DOCK_TRIM_KICK) => "WM_DOCK_TRIM_KICK",
         (Th::Ui, WM_DOCK_START_MENU) => "WM_DOCK_START_MENU",
         (Th::Ui, WM_DOCK_OPEN_SETTINGS) => "WM_DOCK_OPEN_SETTINGS",
         (Th::Ui, WM_DOCK_UPDATE) => "WM_DOCK_UPDATE",
@@ -1273,6 +1275,8 @@ fn timer_name(th: Th, id: u32, thread_timer: bool) -> String {
         (Th::Ui, TIMER_RAM) => "TIMER_RAM",
         (Th::Ui, TIMER_SECOND) => "TIMER_SECOND",
         (Th::Ui, TIMER_RECONCILE) => "TIMER_RECONCILE",
+        (Th::Ui, TIMER_TRIM) => "TIMER_TRIM",
+        (Th::Ui, TIMER_CONFIG_COALESCE) => "TIMER_CONFIG_COALESCE",
         (Th::Ui, TIMER_APPS_DEBOUNCE) => "TIMER_APPS_DEBOUNCE",
         (Th::Ui, TIMER_ANIM) => "TIMER_ANIM",
         (Th::Ui, TIMER_CLOCK) => "TIMER_CLOCK",
@@ -1715,6 +1719,10 @@ mod tests {
         assert_eq!(msg_name(Th::Shell, 0x0113), "WM_TIMER");
         assert_eq!(msg_name(Th::Ui, 0x0401), "0x0401");
         assert_eq!(timer_name(Th::Ui, 1, false), "TIMER_POLL");
+        assert_eq!(timer_name(Th::Ui, crate::msg::TIMER_TRIM as u32, false), "TIMER_TRIM");
+        assert_eq!(timer_name(Th::Ui, crate::msg::TIMER_CONFIG_COALESCE as u32, false), "TIMER_CONFIG_COALESCE");
+        assert_eq!(msg_name(Th::Ui, crate::msg::WM_DOCK_CONFIG_CHANGED), "WM_DOCK_CONFIG_CHANGED");
+        assert_eq!(msg_name(Th::Ui, crate::msg::WM_DOCK_TRIM_KICK), "WM_DOCK_TRIM_KICK");
         assert_eq!(timer_name(Th::Tray, 1, false), "TIMER_ZORDER");
         assert_eq!(timer_name(Th::Shell, 0x7FFF, true), "thread_timer#7FFF");
         assert_eq!(timer_name(Th::Hook, 0x7FFE, true), "REINSTALL_TICK");

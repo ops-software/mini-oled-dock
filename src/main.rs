@@ -504,6 +504,16 @@ fn reset_hidden_period(s: &mut TrimState, now: Instant) {
     s.last_activity = Some(now);
 }
 
+/// Delay of `TIMER_TRIM`: the earlier of the hidden trim still to come and the planned second COM pass; none while the
+/// bar is shown or when there is neither.
+fn trim_timer_ms(visible: bool, retry: Option<u32>, pass: Option<Duration>) -> Option<u32> {
+    if visible {
+        return None;
+    }
+    let pass = pass.map(|d| d.as_millis().clamp(250, u128::from(u32::MAX)) as u32);
+    retry.into_iter().chain(pass).min()
+}
+
 /// (Re)arms the one-shot `TIMER_TRIM` while the bar is hidden: for the hidden trim still to come and for the planned
 /// second COM pass, whichever is earlier; killed when there is neither (and while the bar is shown).
 fn arm_trim_timer(h: HWND) {
@@ -513,8 +523,7 @@ fn arm_trim_timer(h: HWND) {
     } else {
         let popup = popup::is_open() || settings_window::is_open();
         let retry = TRIM.with(|s| hidden_trim_retry_ms(&s.borrow(), now, popup, false));
-        let pass = mem::second_pass_in(now).map(|d| d.as_millis().clamp(250, u128::from(u32::MAX)) as u32);
-        retry.into_iter().chain(pass).min()
+        trim_timer_ms(false, retry, mem::second_pass_in(now))
     };
     match ms {
         Some(ms) => set_timer(h, TIMER_TRIM, ms),
@@ -595,7 +604,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_TIMER => match wp.0 {
             TIMER_HOUSEKEEPING => {
                 if !config::watching() {
-                    apply_config_change();
+                    apply_config_change(h);
                 }
                 trim_tick();
                 if update::auto_install_pending() {
@@ -622,7 +631,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 // One-shot: it kills itself before running.
                 // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
                 let _ = unsafe { KillTimer(Some(h), TIMER_CONFIG_COALESCE) };
-                apply_config_change();
+                apply_config_change(h);
                 LRESULT(0)
             }
             TIMER_UPDATE_CHECK => {
@@ -714,8 +723,11 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_CONFIG_CHANGED => {
             if wp.0 == 1 {
-                config::stop_watch();
-                log!("config: change watch broken, polling every 2 s");
+                if config::stop_watch() {
+                    log!("config: change watch broken, polling every 2 s");
+                }
+                // The watch is gone: the 2 s poll must run even while the bar is hidden.
+                housekeeping_sync(h);
             } else {
                 // Re-armed by every notification: an editor's several writes become one read.
                 set_timer(h, TIMER_CONFIG_COALESCE, 250);
@@ -725,6 +737,8 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_DOCK_CONFIG_APPLY => {
             ui::on_config_changed();
             update::sync_timer(h);
+            // `update_auto_install` may have just made a staged install pending.
+            housekeeping_sync(h);
             LRESULT(0)
         }
         WM_DOCK_OPEN_SETTINGS => {
@@ -900,9 +914,10 @@ fn message_loop() {
 }
 
 /// Loads a hand edit of `config.json` (if its mtime differs from the remembered one) and lets the UI rebuild.
-fn apply_config_change() {
+fn apply_config_change(h: HWND) {
     if config::poll_changed() {
         ui::config_reloaded();
+        housekeeping_sync(h);
     }
 }
 
@@ -1604,6 +1619,16 @@ mod tests {
         // Never below 250 ms.
         let s = TrimState { hidden_since: Some(at(0)), last_trim: None, ..TrimState::default() };
         assert_eq!(hidden_trim_retry_ms(&s, at(4), false, false), Some(250));
+    }
+
+    #[test]
+    fn the_trim_timer_follows_the_earlier_of_retry_and_second_pass() {
+        let s = Duration::from_secs;
+        assert_eq!(trim_timer_ms(false, None, Some(s(600))), Some(600_000));
+        assert_eq!(trim_timer_ms(false, Some(4000), Some(s(1))), Some(1000));
+        assert_eq!(trim_timer_ms(false, None, Some(Duration::ZERO)), Some(250));
+        assert_eq!(trim_timer_ms(true, Some(4000), Some(s(1))), None);
+        assert_eq!(trim_timer_ms(false, None, None), None);
     }
 
     #[test]
