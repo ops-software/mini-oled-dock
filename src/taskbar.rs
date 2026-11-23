@@ -699,7 +699,7 @@ pub fn init() -> Result<bool, String> {
             return Err("Shell_TrayWnd did not appear within 30 s".into());
         }
         // The watchdog must not mistake this wait for a hang. "Startup" heartbeat: keeps
-        // the watchdog alive without making it switch to the short tolerance before TIMER_SECOND.
+        // the watchdog alive without making it switch to the short tolerance before the message loop runs.
         if last_beat.elapsed() >= Duration::from_millis(500) {
             crate::watchdog::startup_heartbeat();
             last_beat = Instant::now();

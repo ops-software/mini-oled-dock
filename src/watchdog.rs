@@ -18,7 +18,8 @@
 //!  * Startup heartbeat event: `Local\DockHeartbeat-<pid>-startup` (auto-reset), signaled by
 //!    `taskbar::init` while waiting for `Shell_TrayWnd`: it resets the count but does NOT move the
 //!    watchdog from the startup tolerance (10) to the steady-state one (2), which starts at the first
-//!    real heartbeat (`heartbeat`).
+//!    real heartbeat (`heartbeat`): the dock beats only once its message loop runs, so window creation and
+//!    setup keep the startup tolerance.
 //!  * Single instance: named mutex `Local\DockInstance`, taken by `main` right after parsing the
 //!    arguments, before the data folder (`datadir::init`), the logger and anything else. The watchdog,
 //!    `--restore` and `--install` never take it; `--restore` polls it (`instance_running`) to wait

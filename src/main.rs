@@ -484,10 +484,14 @@ fn auto_install_busy(popup: bool, settings: bool, fullscreen: bool) -> bool {
 
 // ------------------------------------------------------------ window proc
 
-/// Whether a message to the dock window beats (`watchdog::beat_if_due`): all but the shell hook's (`shell_msg`, 0 while
-/// no shell hook is registered).
-fn beats_for(m: u32, shell_msg: u32) -> bool {
-    shell_msg == 0 || m != shell_msg
+/// Set by `message_loop` as its first statement (UI thread); `wnd_proc` beats only from then on (`beats_for`).
+static LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Whether a message to the dock window beats (`watchdog::beat_if_due`): none before the message loop runs
+/// (`loop_running`), so window creation and setup keep the watchdog's 33 s startup tolerance; then all but the shell
+/// hook's (`shell_msg`, 0 while no shell hook is registered).
+fn beats_for(m: u32, shell_msg: u32, loop_running: bool) -> bool {
+    loop_running && (shell_msg == 0 || m != shell_msg)
 }
 
 /// "Core" messages handled here (exit, keyboard hook, service timers, taskbar, session);
@@ -495,8 +499,9 @@ fn beats_for(m: u32, shell_msg: u32) -> bool {
 unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // The heartbeat at the start of every message to the dock window, posted or sent, at most once a second (wsC Q7): a
     // stall begins inside a message, so at most 1 s after a beat. Not for the shell hook's message: its handler cannot
-    // stall, and its HSHELL_REDRAW alone would beat about once a second.
-    let beat = beats_for(m, ui::shell_hook_msg()) && watchdog::beat_if_due();
+    // stall, and its HSHELL_REDRAW alone would beat about once a second. Not before the message loop runs: this
+    // procedure already runs inside CreateWindowExW, and the first real beat ends the watchdog's startup tolerance.
+    let beat = beats_for(m, ui::shell_hook_msg(), LOOP_RUNNING.load(Relaxed)) && watchdog::beat_if_due();
     match m {
         WM_TIMER => match wp.0 {
             TIMER_HOUSEKEEPING => {
@@ -743,6 +748,8 @@ fn create_window(inst: HINSTANCE, g: &ui::Geom) -> Option<HWND> {
 }
 
 fn message_loop() {
+    // From here on `wnd_proc` beats (`beats_for`), in the probe's loop too.
+    LOOP_RUNNING.store(true, Relaxed);
     // Wake probe on (DOCK_WAKE_PROBE=1 or wakeprobe.on): its instrumented loop; off, the release loop below.
     #[cfg(feature = "wake-probe")]
     if probe::ui_loop() {
@@ -1410,10 +1417,19 @@ mod tests {
     #[test]
     fn shell_hook_messages_do_not_beat() {
         const SHELL: u32 = 0xC123;
-        assert!(!beats_for(SHELL, SHELL), "the shell hook's message never beats");
-        assert!(beats_for(WM_TIMER, SHELL));
-        assert!(beats_for(WM_TIMER, 0));
-        assert!(beats_for(0, 0), "no shell hook registered: every message beats");
+        assert!(!beats_for(SHELL, SHELL, true), "the shell hook's message never beats");
+        assert!(beats_for(WM_TIMER, SHELL, true));
+        assert!(beats_for(WM_TIMER, 0, true));
+        assert!(beats_for(0, 0, true), "no shell hook registered: every message beats");
+    }
+
+    /// Review of 7ed2043: `wnd_proc` already runs inside `CreateWindowExW`, with the heartbeat event in place. Its beat
+    /// waits for the message loop, so the setup keeps the watchdog's 33 s startup tolerance, as in 1.5.0.
+    #[test]
+    fn no_beat_before_the_message_loop() {
+        assert!(!beats_for(WM_TIMER, 0, false), "window creation and setup: no beat");
+        assert!(!beats_for(WM_TIMER, 0xC123, false), "nor with a shell hook registered");
+        assert!(beats_for(WM_TIMER, 0xC123, true), "the loop runs: the dock window's messages beat");
     }
 
     #[test]
