@@ -31,8 +31,8 @@
 //!    bar) and WM_DOCK_LAUNCHER posted with the next sequence number and kb.time. Its repeats and its release go
 //!    the way its down went. The UI opens nothing for a stale, superseded or failed-open post (`post_verdict`).
 //!  * Type-ahead: a chord that will open the launcher opens a window of TYPEAHEAD_MS in which every other key down
-//!    (modifiers, Win, the system's keys of `never_kept`, keys pressed with Win and the repeats of a key Windows
-//!    already holds excepted) is swallowed
+//!    (modifiers, Win, the system's keys of `never_kept` and chords of `system_chord`, keys pressed with Win and the
+//!    repeats of a key Windows already holds excepted) is swallowed
 //!    into a ring of RING_CAP keys tagged with the post's sequence. The UI takes the ring of the sequence it opened and replays it, or ends it when nothing
 //!    opens; the hook expires it at the first key after the deadline. An up is swallowed only when its down was.
 //!  * The ring's control word (sequence, OPEN, ENDED, length) is changed by both threads only by compare-exchange,
@@ -976,6 +976,18 @@ const fn never_kept(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0x14..=0x1A | 0x1C..=0x1F | 0x2C | 0x5B | 0x5C | 0x5F | 0x90 | 0x91 | 0xA0..=0xB7)
 }
 
+/// The system's chords on keys a type-ahead window keeps, which it passes too: Alt+Tab (with Shift or Ctrl as well),
+/// Alt+Esc, Ctrl+Esc and Ctrl+Shift+Esc (the task switcher, the window cycle, Start, Task Manager). The launcher acts
+/// on a plain Tab or Esc only, so a replay would drop them.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn system_chord(mods: Mods, vk: u32) -> bool {
+    match vk {
+        0x09 => mods.has(Mods::ALT),
+        0x1B => mods.has(Mods::ALT) || mods.has(Mods::CTRL),
+        _ => false,
+    }
+}
+
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 impl ChordState {
     /// The vk's down was swallowed into the ring.
@@ -1086,13 +1098,13 @@ pub(crate) fn resolve_launcher(s: &ChordState, ev: KeyEv) -> Option<Verdict> {
             (SpaceState::Idle, _) => {}
         }
     }
-    // 3. Type-ahead: inside a live window every key but modifiers, Win, the system's keys, Win chords and the repeats of
-    //    a key Windows already holds goes to the ring; an up is swallowed only when its down was.
+    // 3. Type-ahead: inside a live window every key but modifiers, Win, the system's keys and chords, Win chords and the
+    //    repeats of a key Windows already holds goes to the ring; an up is swallowed only when its down was.
     if s.live(ev.time) {
         if !ev.down {
             return s.buffered(ev.vk).then_some(Verdict::SwallowSilent);
         }
-        if never_kept(ev.vk) || s.win_down || ev.held {
+        if never_kept(ev.vk) || system_chord(s.mods, ev.vk) || s.win_down || ev.held {
             return None;
         }
         return Some(Verdict::Buffer);
@@ -1584,6 +1596,8 @@ mod tests {
     const KEY_A: u32 = 0x41;
     const KEY_C: u32 = 0x43;
     const KEY_E: u32 = 0x45;
+    const TAB: u32 = 0x09;
+    const ESC: u32 = 0x1B;
     const ALT_SPACE: ChordSpec = ChordSpec { vk: 0x20, mods: Mods::ALT };
     const ALT_SHIFT: Mods = Mods(Mods::ALT.0 | Mods::SHIFT.0);
     const CTRL_SHIFT_: Mods = Mods(Mods::CTRL.0 | Mods::SHIFT.0);
@@ -1959,7 +1973,8 @@ mod tests {
 
     /// The system's keys the launcher does not own pass inside a type-ahead window, down and up: Windows toggles the
     /// locks, takes the screenshot, changes the volume and switches the IME (a replay would drop them: they type
-    /// nothing). Esc, the menu key and the keys around them are still kept.
+    /// nothing), and so do their chords on Tab and Esc (`system_chord`). A plain Tab or Esc, the menu key and the keys
+    /// around them are still kept.
     #[test]
     fn system_keys_never_buffered() {
         let system = [0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F, 0x2C, 0x5F, 0x90, 0x91];
@@ -1973,7 +1988,28 @@ mod tests {
         k.tap(KEY_C, 10_450);
         assert_eq!(k.take(1), [KEY_A, KEY_C], "the text around them is kept, in order");
         assert!(balanced(&k.seen));
-        for vk in [0x13, 0x1B, 0x2D, 0x5D, 0x5E, 0x8F, 0x92, 0xB8, 0xBA] {
+        // The system's chords on Tab and Esc reach the task switcher, Start and Task Manager; a plain Tab or Esc is
+        // the launcher's.
+        let mut c = Kbd::new();
+        c.chord(10_000);
+        c.key(LALT, true, 10_040);
+        assert_eq!(c.tap(TAB, 10_050), (None, None), "Alt+Tab");
+        c.key(LSHIFT, true, 10_060);
+        assert_eq!(c.tap(TAB, 10_070), (None, None), "Alt+Shift+Tab");
+        c.key(LSHIFT, false, 10_080);
+        assert_eq!(c.tap(ESC, 10_090), (None, None), "Alt+Esc");
+        c.key(LALT, false, 10_100);
+        c.key(LCTRL, true, 10_110);
+        assert_eq!(c.tap(ESC, 10_120), (None, None), "Ctrl+Esc");
+        c.key(LSHIFT, true, 10_130);
+        assert_eq!(c.tap(ESC, 10_140), (None, None), "Ctrl+Shift+Esc");
+        c.key(LSHIFT, false, 10_150);
+        c.key(LCTRL, false, 10_160);
+        assert_eq!(c.tap(TAB, 10_170), (Some(true), Some(true)), "a plain Tab is kept");
+        assert_eq!(c.tap(ESC, 10_180), (Some(true), Some(true)), "a plain Esc is kept");
+        assert_eq!(c.take(1), [TAB, ESC]);
+        assert!(balanced(&c.seen));
+        for vk in [TAB, 0x13, ESC, 0x2D, 0x5D, 0x5E, 0x8F, 0x92, 0xB8, 0xBA] {
             let mut s = st();
             s.ring = RingCtl::opened(1);
             s.post_time = 10_000;
