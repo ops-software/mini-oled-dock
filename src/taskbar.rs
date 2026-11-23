@@ -1280,6 +1280,11 @@ pub fn restore_force() {
             }
         }
     }
+    // Explorer keeps a restored "not auto-hide" only until its next start: its saved setting is set back as well, also
+    // when the file is kept for the next sign-in. After the shows above, so the registry I/O comes last.
+    if wants_registry_fix(delivered, state, saved.or(legacy).is_some()) {
+        persist_not_autohide(first);
+    }
     broadcast_taskbar_created();
     log!("taskbar: restored (state {state})");
 }
@@ -1292,6 +1297,187 @@ pub fn restore_force_waiting(max: Duration) {
         std::thread::sleep(Duration::from_millis(200));
     }
     restore_force();
+}
+
+// ------------------------------------------------- Explorer's saved setting (StuckRects3)
+
+/// Explorer's saved taskbar setting, value "Settings", under `HKEY_USERS\<sid>`: Explorer saves ABM_SETSTATE's
+/// auto-hide there and never a restored "not auto-hide", so after a restore its next start (an Explorer restart, the
+/// next sign-in, a session without the dock) would come up auto-hide.
+const STUCKRECTS3: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3";
+/// Bit of byte 8 of the "Settings" blob that holds auto-hide.
+const STUCKRECTS_AUTOHIDE: u8 = 0x01;
+
+/// What `saved_autohide_off` found in the "Settings" blob.
+#[derive(Debug, PartialEq, Eq)]
+enum SavedAutohide {
+    /// Auto-hide saved: the blob with only that bit cleared, to write back.
+    Clear(Vec<u8>),
+    /// Already saved without auto-hide: nothing to write.
+    AlreadyOff,
+    /// Not the layout known (the blob starts with its own length as a u32, and has at least 12 bytes): left alone.
+    Unknown,
+}
+
+/// The "Settings" blob with the auto-hide bit of byte 8 cleared. Pure, never panics.
+fn saved_autohide_off(blob: &[u8]) -> SavedAutohide {
+    let size = blob.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes);
+    if blob.len() < 12 || size != u32::try_from(blob.len()).ok() {
+        return SavedAutohide::Unknown;
+    }
+    let mut out = blob.to_vec();
+    match out.get_mut(8) {
+        Some(b) if *b & STUCKRECTS_AUTOHIDE != 0 => {
+            *b &= !STUCKRECTS_AUTOHIDE;
+            SavedAutohide::Clear(out)
+        }
+        Some(_) => SavedAutohide::AlreadyOff,
+        None => SavedAutohide::Unknown,
+    }
+}
+
+/// Whether `restore_force` sets Explorer's saved setting back: only after a delivered restore to a state without
+/// auto-hide that came from the state file (or the legacy one). The `ABS_ALWAYSONTOP` default of a restore without a
+/// file is a guess, and writing it would overwrite an auto-hide the user saved. Pure.
+fn wants_registry_fix(delivered: bool, state: u32, from_file: bool) -> bool {
+    delivered && from_file && state & ABS_AUTOHIDE == 0
+}
+
+/// `<sid>\...\StuckRects3`, the key under `HKEY_USERS`. Pure.
+fn stuckrects_subkey(sid: &str) -> String {
+    format!(r"{sid}\{STUCKRECTS3}")
+}
+
+/// The SID of the user whose process owns window `h` (Explorer's taskbar): the token user, so under Administrator
+/// protection it names the person at the keyboard, not the account the elevated dock runs as. The sequence of
+/// `shell_thread::shell_user_sid`, from a given window.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn window_user_sid(h: HWND) -> Result<String, String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale window only yields 0.
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    if pid == 0 {
+        return Err("no taskbar process".into());
+    }
+    // SAFETY: a query-only open of that pid; the handle is owned (and closed) by `_process`.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|e| format!("OpenProcess: {e}"))?;
+    // SAFETY: fresh valid handle, owned from here on.
+    let _process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is valid; `token` is writable.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.map_err(|e| format!("OpenProcessToken: {e}"))?;
+    // SAFETY: fresh valid token handle, owned from here on.
+    let _token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut len = 0u32;
+    // SAFETY: size query; `len` is writable. The expected "buffer too small" error is ignored.
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
+    if (len as usize) < std::mem::size_of::<TOKEN_USER>() {
+        return Err("TokenUser: no size".into());
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `len` writable, pointer-aligned bytes.
+    unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) }
+        .map_err(|e| format!("TokenUser: {e}"))?;
+    // SAFETY: the buffer starts with a TOKEN_USER whose SID points inside `buf`, alive until the end.
+    let tu = unsafe { std::ptr::read(buf.as_ptr().cast::<TOKEN_USER>()) };
+    let mut s = PWSTR::null();
+    // SAFETY: `tu.User.Sid` points to a valid SID inside `buf`; `s` receives a LocalAlloc'd string.
+    unsafe { ConvertSidToStringSidW(tu.User.Sid, &mut s) }.map_err(|e| format!("ConvertSidToStringSidW: {e}"))?;
+    // SAFETY: `s` is the NUL-terminated string returned above.
+    let out = unsafe { s.to_string() };
+    // SAFETY: allocated by ConvertSidToStringSidW with LocalAlloc; not used afterwards.
+    unsafe { LocalFree(Some(HLOCAL(s.0.cast()))) };
+    drop(buf);
+    out.map_err(|e| format!("SID string: {e}"))
+}
+
+/// Sets Explorer's saved setting back to "not auto-hide" (`restore_force`, after a delivered restore from the state
+/// file): StuckRects3 "Settings" of the user who owns `first`, opened under `HKEY_USERS` (never `HKEY_CURRENT_USER`,
+/// never created), with only the auto-hide bit cleared. Writes nothing on any failure or an unknown layout. Any thread
+/// and process.
+fn persist_not_autohide(first: HWND) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_USERS, KEY_QUERY_VALUE, KEY_SET_VALUE,
+    };
+
+    let sid = match window_user_sid(first) {
+        Ok(s) => s,
+        Err(e) => {
+            log!("taskbar: StuckRects3 not updated: {e}");
+            return;
+        }
+    };
+    let mut key = HKEY::default();
+    // SAFETY: the subkey is a NUL-terminated HSTRING for the call; `key` is a writable HKEY.
+    let r = unsafe {
+        RegOpenKeyExW(
+            HKEY_USERS,
+            &HSTRING::from(stuckrects_subkey(&sid)),
+            None,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut key,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        log!("taskbar: StuckRects3 not updated: opening the key: {}", windows::core::Error::from(r.to_hresult()));
+        return;
+    }
+    let outcome = rewrite_saved_autohide(key);
+    // SAFETY: `key` was opened above and is closed once, on every path.
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    match outcome {
+        Ok(Some(line)) => log!("{line}"),
+        Ok(None) => {}
+        Err(e) => log!("taskbar: StuckRects3 not updated: {e}"),
+    }
+}
+
+/// Reads "Settings" from the open StuckRects3 `key` and writes it back without auto-hide. `Ok(Some(line))` is the
+/// line to log, `Ok(None)` nothing to do (already off), `Err` a failed read or write.
+fn rewrite_saved_autohide(key: windows::Win32::System::Registry::HKEY) -> Result<Option<String>, String> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegQueryValueExW, RegSetValueExW, REG_BINARY, REG_VALUE_TYPE};
+
+    let mut buf = [0u8; 256];
+    let mut len = buf.len() as u32;
+    let mut kind = REG_VALUE_TYPE::default();
+    // SAFETY: `key` is open with KEY_QUERY_VALUE; `buf` holds `len` writable bytes; `kind` and `len` are writable.
+    let r =
+        unsafe { RegQueryValueExW(key, w!("Settings"), None, Some(&mut kind), Some(buf.as_mut_ptr()), Some(&mut len)) };
+    if r != ERROR_SUCCESS {
+        return Err(format!("reading Settings: {}", windows::core::Error::from(r.to_hresult())));
+    }
+    let blob = buf.get(..len as usize).unwrap_or_default();
+    let unexpected =
+        || Ok(Some(format!("taskbar: StuckRects3 has an unexpected layout ({} bytes), left alone", blob.len())));
+    if kind != REG_BINARY {
+        return unexpected();
+    }
+    match saved_autohide_off(blob) {
+        SavedAutohide::AlreadyOff => Ok(None),
+        SavedAutohide::Unknown => unexpected(),
+        SavedAutohide::Clear(data) => {
+            // SAFETY: `key` is open with KEY_SET_VALUE; the name is a static NUL-terminated literal and `data` lives
+            // for the call.
+            let r = unsafe { RegSetValueExW(key, w!("Settings"), None, REG_BINARY, Some(&data)) };
+            if r != ERROR_SUCCESS {
+                return Err(format!("writing Settings: {}", windows::core::Error::from(r.to_hresult())));
+            }
+            Ok(Some("taskbar: Explorer's saved setting set back to not auto-hide (StuckRects3)".into()))
+        }
+    }
 }
 
 // ------------------------------------------------------- tray host
@@ -1455,6 +1641,55 @@ mod tests {
         assert!(restore_needed(true, true, true));
         assert!(!restore_needed(false, true, true), "the file kept for the next sign-in stays");
         assert!(!restore_needed(false, false, true));
+    }
+
+    /// wsD D2: Explorer's saved StuckRects3 blob with the auto-hide bit (byte 8, 0x01) cleared and nothing else; a blob
+    /// of another layout (its first u32 is not its length, or under 12 bytes) is never touched.
+    #[test]
+    fn stuckrects_autohide_bit_cleared() {
+        use SavedAutohide::*;
+        let p1: [u8; 48] = [
+            0x30, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x90, 0x00,
+            0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x34, 0x08, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00,
+            0x70, 0x08, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut want = p1;
+        want[8] = 0x02;
+        assert_eq!(saved_autohide_off(&p1), Clear(want.to_vec()), "only byte 8 changes, 0x03 to 0x02");
+        assert_eq!(saved_autohide_off(&want), AlreadyOff);
+        let mut one = p1;
+        one[8] = 0x01;
+        let mut zero = p1;
+        zero[8] = 0x00;
+        assert_eq!(saved_autohide_off(&one), Clear(zero.to_vec()));
+        assert_eq!(saved_autohide_off(&p1[..47]), Unknown, "47 bytes whose first u32 says 48");
+        let mut other = p1;
+        other[0] = 0x2C;
+        assert_eq!(saved_autohide_off(&other), Unknown, "first u32 differs from the length");
+        assert_eq!(saved_autohide_off(&[0x0B, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0]), Unknown, "11 bytes");
+        assert_eq!(saved_autohide_off(&[]), Unknown);
+    }
+
+    /// wsD D2: the saved setting is set back only after a delivered restore to a state without auto-hide that came
+    /// from the state file (or the legacy one), never from the ALWAYSONTOP default of a restore without a file.
+    #[test]
+    fn registry_fix_only_after_a_delivered_not_autohide_restore_from_the_file() {
+        assert!(wants_registry_fix(true, 0, true));
+        assert!(wants_registry_fix(true, 2, true));
+        for (delivered, state, from_file) in
+            [(true, 1, true), (true, 3, true), (false, 0, true), (false, 2, true), (true, 2, false), (true, 0, false)]
+        {
+            assert!(!wants_registry_fix(delivered, state, from_file), "({delivered}, {state}, {from_file})");
+        }
+    }
+
+    /// wsD D2: StuckRects3 is opened under HKEY_USERS by the SID of Explorer's user, never under HKEY_CURRENT_USER.
+    #[test]
+    fn stuckrects_subkey_is_under_the_sid() {
+        assert_eq!(
+            stuckrects_subkey("S-1-5-21-1-2-3-1001"),
+            r"S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3"
+        );
     }
 
     /// wsC Q7: the safety check's line is logged for the first 20 hits of a process, not every 3 s.
