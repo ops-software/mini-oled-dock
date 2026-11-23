@@ -40,7 +40,9 @@
 //!    With `config.monitor == "pointer"` the Win key brings the bar to the display under the pointer
 //!    (`follow_pointer`), and a double tap opens the dock's Start menu there (`open_start_menu`, `popup_startmenu`).
 //!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
-//!    false = always visible.
+//!    false = always visible. The edge poll runs every 50 ms while the bar is shown, while a dwell or an
+//!    icon request is pending, and for 1 s after the pointer last moved; otherwise raw input waits for the
+//!    next motion (see "edge watch": `WM_INPUT`, `RIDEV_INPUTSINK`).
 //!
 //! REENTRANCY: `SetWindowPos`/`UpdateLayeredWindow` can re-enter (WM_DPICHANGED), so
 //! no `borrow` of `UI` is held across calls that pump messages (`SetWindowPos`, `present`).
@@ -375,8 +377,8 @@ thread_local! {
     static TRAY_HIDDEN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     /// true if some items have no ResolveApp request because the shell thread was not ready yet.
     static NEED_REQUESTS: Cell<bool> = const { Cell::new(false) };
-    /// Edge watch (see "edge watch"): true while `TIMER_POLL` is armed.
-    static POLL_ON: Cell<bool> = const { Cell::new(true) };
+    /// Edge watch (see "edge watch"): true while `TIMER_POLL` is armed (no timer is armed when the UI thread starts).
+    static POLL_ON: Cell<bool> = const { Cell::new(false) };
     /// Edge watch: true while the raw input registration is in place.
     static RAW_ON: Cell<bool> = const { Cell::new(false) };
     /// Edge watch: false after a failed registration, until the next show (the poll then stays on).
@@ -454,8 +456,8 @@ pub fn attach(h: HWND) -> Result<(), String> {
     tray_host::set_icon_px((sizes.tray_px(metrics)).max(metrics.px(16)) as u32);
     refresh_tray_state();
     apps::refresh(h);
-    rebuild_entries();
     STILL_SINCE.set(now_ms());
+    rebuild_entries();
     poll_sync();
     reconcile_sync(h);
     arm_clock(h);
@@ -4149,6 +4151,12 @@ mod tests {
 
     fn wi(visible: bool, still_ms: u64) -> WatchInputs {
         WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms }
+    }
+
+    #[test]
+    fn the_edge_watch_starts_with_nothing_armed() {
+        assert!(!POLL_ON.get());
+        assert!(!RAW_ON.get());
     }
 
     #[test]
