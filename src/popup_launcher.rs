@@ -480,6 +480,9 @@ pub(crate) struct Launcher {
     bar_ticks: Cell<u8>,
     /// The sequence of the chord post that opened it (`hook::LAUNCHER_SEQ`): its type-ahead window is ended at the close.
     open_seq: u32,
+    /// This open's number (`Ctrl::opens`; a reopen and the alias prompt keep the last `open_seq`, this never repeats):
+    /// its files requests carry it and its pump tags every post with it, so a late post of an earlier open is dropped.
+    open_no: u32,
     /// The first activation took the type-ahead ring (once per open).
     taken: bool,
     /// The session's effects that run after the close, in order.
@@ -526,6 +529,7 @@ impl Launcher {
             hold_shrink: false,
             bar_ticks: Cell::new(0),
             open_seq: 0,
+            open_no: 0,
             taken: false,
             queued: Vec::new(),
             fg_at_open: 0,
@@ -628,7 +632,7 @@ impl Launcher {
                 Effect::SaveAlias { word, target } => sys.alias(AliasOp::Save { word, target }),
                 Effect::RemoveAlias(word) => sys.alias(AliasOp::Remove(word)),
                 // Files (plan L2-F3): one channel send to the pump, never a wait.
-                Effect::RequestFiles(r) => sys.files(r),
+                Effect::RequestFiles(r) => sys.files(self.open_no, r),
                 Effect::DismissNotice(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::LaunchAlias(_)
@@ -734,8 +738,12 @@ impl Launcher {
     }
 
     /// `ShellEvent::LauncherFiles`: the pump's post, for the session (a batch of the current generation is merged by the
-    /// stability rule; anything of an older one is dropped).
-    pub(crate) fn files_event(&mut self, ev: crate::launcher::files::FilesEvent, cx: &Context) -> Reply {
+    /// stability rule; anything of an older one is dropped). A post of another open's pump (`open` is not this open's
+    /// number: it came after its close) is dropped whole: generations restart at every open, and Off carries none.
+    pub(crate) fn files_event(&mut self, open: u32, ev: crate::launcher::files::FilesEvent, cx: &Context) -> Reply {
+        if open != self.open_no {
+            return Reply::None;
+        }
         #[cfg(feature = "owner-probe")]
         let probe = match &ev {
             crate::launcher::files::FilesEvent::Batch(b) if b.gen == self.session.gen() => {
@@ -1785,6 +1793,8 @@ fn new_launcher() -> Launcher {
     let made = with_ctrl(|c| {
         let mut l = Launcher::with_session(Session::open(&c.opts, c.last_query.as_deref()));
         l.open_seq = c.open_seq;
+        c.opens = c.opens.wrapping_add(1);
+        l.open_no = c.opens;
         l.fg_at_open = c.fg_at_open;
         l.set_shape(c.width, c.opts.rows);
         // The icons kept between opens, shared with the cache (no pixel is copied): rows that have one never ask again.
@@ -2482,8 +2492,9 @@ pub(crate) trait SysPort {
     /// Holds an alias change for the dock window (one slot, `hold_alias_op`) and posts `WM_DOCK_LAUNCHER_ALIAS` to it:
     /// config.json is written there, never in the key handler.
     fn alias(&mut self, _op: AliasOp) {}
-    /// A requery's files request to the pump (`launcher_files::request`, plan L2-F3): a channel send, never a wait.
-    fn files(&mut self, _r: Option<crate::launcher::files::Req>) {}
+    /// A requery's files request of the open numbered `open` to its pump (`launcher_files::request`, plan L2-F3): a
+    /// channel send, never a wait.
+    fn files(&mut self, _open: u32, _r: Option<crate::launcher::files::Req>) {}
     /// Every close: the files pump ends (`launcher_files::end`).
     fn files_end(&mut self) {}
 }
@@ -2652,6 +2663,8 @@ struct Ctrl {
     /// The sequence of the post being opened and the window in front when its chord came (read by `new`).
     open_seq: u32,
     fg_at_open: isize,
+    /// The opens so far: the number of the newest (`Launcher::open_no`).
+    opens: u32,
     /// That window can take the window menu (`SysPort::window_target`).
     window_ok: bool,
     /// `launcher.monitor`, `launcher.top_percent` and `launcher.over_fullscreen == "pass"`.
@@ -2768,6 +2781,7 @@ impl Ctrl {
         Ctrl {
             open_seq: 0,
             fg_at_open: 0,
+            opens: 0,
             window_ok: false,
             pick: MonitorPick::Pointer,
             top_percent: crate::config::LAUNCHER_TOP_PERCENT.2,
@@ -3413,11 +3427,11 @@ pub(crate) fn on_converted(gen: u64, meant: Option<String>) {
 }
 
 /// `ShellEvent::LauncherFiles` (the files pump's posts, plan L2-F3), timed as KEY-11 bounds it (`UiWork::Files`).
-pub(crate) fn on_files(ev: crate::launcher::files::FilesEvent) {
+pub(crate) fn on_files(open: u32, ev: crate::launcher::files::FilesEvent) {
     #[cfg(feature = "owner-probe")]
     let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Files);
     if ON.with(Cell::get) {
-        super::with_launcher(|l| ctx(|cx| l.files_event(ev, cx)).unwrap_or(Reply::None));
+        super::with_launcher(|l| ctx(|cx| l.files_event(open, ev, cx)).unwrap_or(Reply::None));
     }
 }
 
@@ -4111,7 +4125,7 @@ mod tests {
         fn alias(&mut self, op: AliasOp) {
             self.ops.push(Op::Alias(op));
         }
-        fn files(&mut self, r: Option<crate::launcher::files::Req>) {
+        fn files(&mut self, _open: u32, r: Option<crate::launcher::files::Req>) {
             self.files.push(r.map(|r| r.gen));
         }
         fn files_end(&mut self) {
@@ -4238,8 +4252,10 @@ mod tests {
 
     #[derive(Default)]
     struct EffectSys {
-        /// The generations of the files requests (None: a withdrawal) and the closes of the pump.
+        /// The generations of the files requests (None: a withdrawal), the open numbers they carry and the closes of
+        /// the pump.
         files: Vec<Option<u64>>,
+        files_opens: Vec<u32>,
         files_ends: u32,
         clip: Option<String>,
         /// The app that copied `clip` marked it private: the port never reads it.
@@ -4345,8 +4361,9 @@ mod tests {
         fn alias(&mut self, op: AliasOp) {
             self.ops.push(format!("Alias({op:?})"));
         }
-        fn files(&mut self, r: Option<crate::launcher::files::Req>) {
+        fn files(&mut self, open: u32, r: Option<crate::launcher::files::Req>) {
             self.files.push(r.map(|r| r.gen));
+            self.files_opens.push(open);
         }
         fn files_end(&mut self) {
             self.files_ends += 1;
@@ -5061,7 +5078,7 @@ mod tests {
         }
         // The controller's flow records them too.
         let mut sys = fresh();
-        sys.files(None);
+        sys.files(1, None);
         sys.files_end();
         assert_eq!((sys.files.len(), sys.files_ends), (1, 1));
     }
@@ -5078,13 +5095,40 @@ mod tests {
             FilesEvent::Batch(crate::launcher::model::Batch { gen, from: ProviderId::Files, items, done: true })
         };
         let gen = l.session.gen();
-        assert_eq!(l.files_event(batch(gen - 1), &fx.cx()), Reply::None);
+        let open = l.open_no;
+        assert_eq!(l.files_event(open, batch(gen - 1), &fx.cx()), Reply::None);
         assert!(l.session.rows().iter().all(|r| r.from != ProviderId::Files));
-        assert_eq!(l.files_event(batch(gen), &fx.cx()), Reply::Relayout);
+        assert_eq!(l.files_event(open, batch(gen), &fx.cx()), Reply::Relayout);
         let row = l.session.rows().iter().find(|r| r.from == ProviderId::Files).unwrap();
         assert_eq!((&*row.title, &row.icon), ("zzq.txt", &crate::launcher::model::IconRef::Glyph(GlyphId::Document)));
-        assert_eq!(l.files_event(FilesEvent::Slow(gen - 1), &fx.cx()), Reply::None);
-        assert_eq!(l.files_event(FilesEvent::Slow(gen), &fx.cx()), Reply::Redraw);
+        assert_eq!(l.files_event(open, FilesEvent::Slow(gen - 1), &fx.cx()), Reply::None);
+        assert_eq!(l.files_event(open, FilesEvent::Slow(gen), &fx.cx()), Reply::Redraw);
+    }
+
+    #[test]
+    fn files_event_of_an_earlier_open_is_dropped() {
+        use crate::launcher::files::{self, FileHit, FilesEvent, Why};
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // Open 1's pump posts after its close (its kill's reap took long); open 2 is at the same generation by now.
+        let mut l = typed(&fx, "file zzq");
+        l.open_no = 2;
+        let gen = l.session.gen();
+        let hit = FileHit { path: "C:\\u\\zzq.txt".into(), name: "zzq.txt".into(), folder: "u".into(), dir: false };
+        let items = files::items(vec![hit], &["zzq"], 20);
+        let batch = FilesEvent::Batch(Batch { gen, from: ProviderId::Files, items, done: true });
+        for ev in [FilesEvent::Off(Why::Stalled), FilesEvent::Stalled(gen), FilesEvent::Slow(gen), batch] {
+            assert_eq!(l.files_event(1, ev, &fx.cx()), Reply::None);
+        }
+        assert!(l.session.rows().iter().all(|r| r.from != ProviderId::Files), "no row of open 1");
+        assert!(!l.session.files_busy());
+        // Files stay on in open 2: the next key's request goes out, with open 2's number.
+        let mut sys = EffectSys::default();
+        let effects = l.session.chars("x", &fx.cx());
+        l.run(effects, &fx.cx(), &mut sys);
+        assert_eq!((sys.files, sys.files_opens), (vec![Some(l.session.gen())], vec![2]));
+        // Its own pump's Off is taken.
+        assert_eq!(l.files_event(2, FilesEvent::Off(Why::Stalled), &fx.cx()), Reply::Relayout);
     }
 
     #[test]

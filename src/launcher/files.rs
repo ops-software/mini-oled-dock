@@ -678,7 +678,8 @@ fn earliest(at: Option<u64>, t: u64) -> Option<u64> {
 /// The policy of D2 and D3 for one open, over the caller's clock (ms): one helper at a time, spawned only when a
 /// request is due; one request in flight, written only after state 0; the newest request waiting its quiet time; the
 /// kills; files off after the third counted kill, a failed start or a broken output. Anything from a helper it killed or
-/// retired is ignored. Pure: it returns acts and never waits.
+/// retired is ignored. Pure: it returns acts and never waits. A list's posts come before its kill or retire, whose wait
+/// on the pump thread can last 2 s: the launcher hears of a stall at once.
 #[derive(Debug)]
 pub struct Pump {
     limits: Limits,
@@ -741,10 +742,11 @@ impl Pump {
     /// request it had in flight is given up.
     pub fn exited(&mut self, spawn: u32) -> Vec<Act> {
         let Some(h) = self.helper.take_if(|h| h.spawn == spawn) else { return Vec::new() };
-        let mut acts = vec![Act::Retire];
+        let mut acts = Vec::new();
         if let Some(gen) = h.flight.map(|f| f.req.gen).filter(|g| Some(*g) == self.newest) {
             acts.push(Act::Post(FilesEvent::Stalled(gen)));
         }
+        acts.push(Act::Retire);
         acts
     }
 
@@ -804,14 +806,16 @@ impl Pump {
                     Due::Deadline(gen) => (KillWhy::Deadline, Some(gen).filter(|g| Some(*g) == self.newest)),
                     _ => (KillWhy::SpawnDeadline, self.newest),
                 };
-                acts.push(Act::Kill(why));
                 if let Some(gen) = gen {
                     acts.push(Act::Post(FilesEvent::Stalled(gen)));
                 }
                 self.kills = self.kills.saturating_add(1);
                 if self.kills >= MAX_KILLS {
-                    return self.turn_off(Why::Stalled, acts);
+                    let mut acts = self.turn_off(Why::Stalled, acts);
+                    acts.push(Act::Kill(why));
+                    return acts;
                 }
+                acts.push(Act::Kill(why));
             }
         }
         let is_due =
@@ -876,7 +880,9 @@ impl Pump {
 
     fn broken(&mut self, e: FrameError) -> Vec<Act> {
         self.helper = None;
-        self.turn_off(Why::Broken, vec![Act::Kill(KillWhy::Broken(e))])
+        let mut acts = self.turn_off(Why::Broken, Vec::new());
+        acts.push(Act::Kill(KillWhy::Broken(e)));
+        acts
     }
 
     fn state(&mut self, s: u32, now: u64) -> Vec<Act> {
@@ -892,7 +898,9 @@ impl Pump {
             STATE_SID_DIFFERS => Why::SidDiffers,
             _ => Why::Unavailable,
         };
-        self.turn_off(why, vec![Act::Retire])
+        let mut acts = self.turn_off(why, Vec::new());
+        acts.push(Act::Retire);
+        acts
     }
 
     /// The rows of the request in flight: posted only while it is the newest request, built here (re-sorted, capped),
@@ -1415,7 +1423,7 @@ mod tests {
         let mut p = written(1, 0);
         assert_eq!(p.tick(300), [Act::Post(FilesEvent::Slow(1))]);
         assert_eq!(p.next_wake(300), Some(700));
-        assert_eq!(p.tick(1_000), [Act::Kill(KillWhy::Deadline), Act::Post(FilesEvent::Stalled(1))]);
+        assert_eq!(p.tick(1_000), [Act::Post(FilesEvent::Stalled(1)), Act::Kill(KillWhy::Deadline)]);
         assert!(!p.is_off());
         assert!(p.tick(5_000).is_empty(), "the stalled request is not sent again");
         assert_eq!(p.request(Some(req(2, 0)), 6_000), [Act::Spawn(2)], "respawned at the next request");
@@ -1424,19 +1432,19 @@ mod tests {
     #[test]
     fn three_kills_turn_files_off_for_the_open() {
         let mut p = written(1, 0);
-        assert_eq!(p.tick(1_000)[0], Act::Kill(KillWhy::Deadline));
+        assert_eq!(p.tick(1_000), [Act::Post(FilesEvent::Stalled(1)), Act::Kill(KillWhy::Deadline)]);
         // A spawn deadline counts as well.
         assert_eq!(p.request(Some(req(2, 0)), 2_000), [Act::Spawn(2)]);
         p.spawned(2, true, 2_000);
         assert_eq!(
             p.tick(4_000),
-            [Act::Kill(KillWhy::SpawnDeadline), Act::Post(FilesEvent::Stalled(2)), Act::Spawn(3)]
+            [Act::Post(FilesEvent::Stalled(2)), Act::Kill(KillWhy::SpawnDeadline), Act::Spawn(3)]
         );
         ready(&mut p, 3, 4_100);
         let acts = p.tick(5_100);
         assert_eq!(
             acts,
-            [Act::Kill(KillWhy::Deadline), Act::Post(FilesEvent::Stalled(2)), Act::Post(FilesEvent::Off(Why::Stalled))]
+            [Act::Post(FilesEvent::Stalled(2)), Act::Post(FilesEvent::Off(Why::Stalled)), Act::Kill(KillWhy::Deadline)]
         );
         assert!(p.is_off());
         assert!(p.request(Some(req(3, 0)), 6_000).is_empty(), "off for the rest of the open");
@@ -1454,7 +1462,7 @@ mod tests {
         assert!(p.tick(2_024).is_empty());
         assert_eq!(
             p.tick(2_025),
-            [Act::Kill(KillWhy::SpawnDeadline), Act::Post(FilesEvent::Stalled(1)), Act::Spawn(2)]
+            [Act::Post(FilesEvent::Stalled(1)), Act::Kill(KillWhy::SpawnDeadline), Act::Spawn(2)]
         );
         // A helper that cannot start leaves files off.
         let mut p = Pump::new(LIMITS);
@@ -1469,7 +1477,7 @@ mod tests {
             let mut p = Pump::new(LIMITS);
             p.request(Some(req(1, 0)), 0);
             p.spawned(1, true, 0);
-            assert_eq!(p.frame(1, Ok(Some(Frame::State(s))), 5), [Act::Retire, Act::Post(FilesEvent::Off(why))]);
+            assert_eq!(p.frame(1, Ok(Some(Frame::State(s))), 5), [Act::Post(FilesEvent::Off(why)), Act::Retire]);
             assert!(p.frame(1, Ok(None), 6).is_empty(), "its exit that follows is ignored");
         }
     }
@@ -1478,7 +1486,7 @@ mod tests {
     fn broken_frame_ends_files() {
         let mut p = written(1, 0);
         let acts = p.frame(1, Err(FrameError::Utf8), 10);
-        assert_eq!(acts, [Act::Kill(KillWhy::Broken(FrameError::Utf8)), Act::Post(FilesEvent::Off(Why::Broken))]);
+        assert_eq!(acts, [Act::Post(FilesEvent::Off(Why::Broken)), Act::Kill(KillWhy::Broken(FrameError::Utf8))]);
         assert!(p.request(Some(req(2, 0)), 20).is_empty());
     }
 
@@ -1486,13 +1494,13 @@ mod tests {
     fn pump_checks_the_generation() {
         let mut p = written(5, 0);
         let acts = p.frame(1, rows_of(6, &["a.txt"]), 10);
-        assert_eq!(acts, [Act::Kill(KillWhy::Broken(FrameError::WrongGen)), Act::Post(FilesEvent::Off(Why::Broken))]);
+        assert_eq!(acts, [Act::Post(FilesEvent::Off(Why::Broken)), Act::Kill(KillWhy::Broken(FrameError::WrongGen))]);
         let mut p = Pump::new(LIMITS);
         p.request(Some(req(1, 0)), 0);
         ready(&mut p, 1, 0);
         p.frame(1, rows_of(1, &[]), 1);
         assert_eq!(
-            p.frame(1, rows_of(1, &[]), 2)[0],
+            p.frame(1, rows_of(1, &[]), 2)[1],
             Act::Kill(KillWhy::Broken(FrameError::WrongGen)),
             "no request in flight"
         );
@@ -1509,7 +1517,7 @@ mod tests {
         assert!(!p.is_off());
         // The live helper's EOF at a frame boundary is its exit: reaped, respawned at the next request, never Broken.
         ready(&mut p, 2, 310);
-        assert_eq!(p.frame(2, Ok(None), 320), [Act::Retire, Act::Post(FilesEvent::Stalled(2))]);
+        assert_eq!(p.frame(2, Ok(None), 320), [Act::Post(FilesEvent::Stalled(2)), Act::Retire]);
         assert!(!p.is_off());
         assert_eq!(p.request(Some(req(3, 0)), 400), [Act::Spawn(3)]);
     }

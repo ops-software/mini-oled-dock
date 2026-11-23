@@ -314,9 +314,9 @@ pub enum ShellEvent {
     /// What Windows Search reads the query of generation `gen` as (reply to `LauncherConvert`);
     /// `None` = no rewrite.
     LauncherConverted { gen: u64, meant: Option<String> },
-    /// The launcher's files pump (`launcher_files`, plan L2-F3): rows of a generation, the busy mark, or why files do not
-    /// answer. Pushed from the pump thread, never from this thread.
-    LauncherFiles(crate::launcher::files::FilesEvent),
+    /// The launcher's files pump (`launcher_files`, plan L2-F3), tagged with the number of the open it belongs to: rows
+    /// of a generation, the busy mark, or why files do not answer. Pushed from the pump thread, never from this thread.
+    LauncherFiles(u32, crate::launcher::files::FilesEvent),
     /// The shell user's SID and the launcher's history files (reply to `LauncherStateLoad`); `None`
     /// for what could not be found or read.
     #[allow(dead_code)] // `sid` is not read yet

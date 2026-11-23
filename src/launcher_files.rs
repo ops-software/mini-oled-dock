@@ -1,11 +1,13 @@
 //! The launcher's file search in the dock (plan L2-F3): the pump thread between the session and the files helper child
 //! (`dock.exe --launcher-files`). The UI thread only sends: a requery's request (`request`, a channel send; the first
-//! request of an open starts the thread) and the close (`end`). The thread runs `files::Pump`'s policy on its own clock
-//! and does its acts: it spawns the helper (the dock's exe, token and job; stdin and stdout piped, stderr null, no
-//! window), writes one request line at a time, kills and reaps it, and posts the rows, built here (re-sorted and capped),
-//! to the UI as `ShellEvent::LauncherFiles`. One reader thread per helper decodes its stdout with `files::FrameReader`.
-//! Never on the UI thread: a spawn, a write, a read, a decode, a sort or a wait. While the launcher is closed no thread
-//! and no helper exist (D2). This file makes no Win32 call of its own; its logs carry kinds, generations and counts only.
+//! request of an open starts the thread) and the close (`end`). Each pump belongs to one open and tags its posts with
+//! that open's number, so what it posts after its close (a kill's reap can take 2 s) never reaches a later open. The
+//! thread runs `files::Pump`'s policy on its own clock and does its acts: it spawns the helper (the dock's exe, token
+//! and job; stdin and stdout piped, stderr null, no window), writes one request line at a time, kills and reaps it, and
+//! posts the rows, built here (re-sorted and capped), to the UI as `ShellEvent::LauncherFiles`. One reader thread per
+//! helper decodes its stdout with `files::FrameReader`. Never on the UI thread: a spawn, a write, a read, a decode, a
+//! sort or a wait. While the launcher is closed no thread and no helper exist (D2). This file makes no Win32 call of
+//! its own; its logs carry kinds, generations and counts only.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use crate::launcher::files::{self, Act, FilesEvent, Frame, FrameError, FrameReader, KillWhy, Limits, Pump, Req};
@@ -69,8 +71,8 @@ impl Inbox {
 }
 
 thread_local! {
-    /// The open's pump while its thread runs (the UI thread's only).
-    static PUMP: RefCell<Option<Arc<Inbox>>> = const { RefCell::new(None) };
+    /// The open's pump while its thread runs, with the open's number (the UI thread's only).
+    static PUMP: RefCell<Option<(u32, Arc<Inbox>)>> = const { RefCell::new(None) };
 }
 
 const PUMP_STACK: usize = 128 * 1024;
@@ -88,14 +90,20 @@ fn ms_since(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// A requery's files request (`Effect::RequestFiles`), on the UI thread: with no pump, None does nothing and Some starts
-/// the thread; otherwise one channel send. Never waits. `ui` is the window the pump's posts go to.
-pub(crate) fn request(r: Option<Req>, ui: isize) {
+/// A requery's files request (`Effect::RequestFiles`) of open `open`, on the UI thread: with no pump of that open, None
+/// does nothing and Some starts the thread (a pump of another open, whose close never came, is ended first); otherwise
+/// one channel send. Never waits. `ui` is the window the pump's posts go to.
+pub(crate) fn request(open: u32, r: Option<Req>, ui: isize) {
     PUMP.with(|p| {
         let Ok(mut p) = p.try_borrow_mut() else { return };
         match p.as_ref() {
-            Some(inbox) => inbox.push(Msg::Request(r)),
-            None => *p = r.and_then(|r| start(r, ui)),
+            Some((id, inbox)) if *id == open => inbox.push(Msg::Request(r)),
+            _ => {
+                if let Some((_, old)) = p.take() {
+                    old.push(Msg::Close);
+                }
+                *p = r.and_then(|r| start(open, r, ui)).map(|inbox| (open, inbox));
+            }
         }
     });
 }
@@ -103,19 +111,19 @@ pub(crate) fn request(r: Option<Req>, ui: isize) {
 /// The launcher closed (every close, `SysPort::files_end`): the pump retires its helper and ends. Never waits.
 pub(crate) fn end() {
     PUMP.with(|p| {
-        if let Some(inbox) = p.try_borrow_mut().ok().and_then(|mut p| p.take()) {
+        if let Some((_, inbox)) = p.try_borrow_mut().ok().and_then(|mut p| p.take()) {
             inbox.push(Msg::Close);
         }
     });
 }
 
-/// The pump thread of an open, with its first request queued.
-fn start(r: Req, ui: isize) -> Option<Arc<Inbox>> {
+/// The pump thread of open `open`, with its first request queued.
+fn start(open: u32, r: Req, ui: isize) -> Option<Arc<Inbox>> {
     let inbox = Arc::new(Inbox::default());
     inbox.push(Msg::Request(Some(r)));
     let own = inbox.clone();
     let body = move || {
-        let mut post = |ev| crate::shell_thread::push_event(ui, ShellEvent::LauncherFiles(ev));
+        let mut post = |ev| crate::shell_thread::push_event(ui, ShellEvent::LauncherFiles(open, ev));
         run_pump(&own, &mut RealSpawner, &mut post, files::LIMITS);
         crate::mem::rearm();
     };
@@ -126,7 +134,8 @@ fn start(r: Req, ui: isize) -> Option<Arc<Inbox>> {
             if first(&WARNED) {
                 log!("launcher files: the files thread did not start ({e}); files are off for this open");
             }
-            crate::shell_thread::push_event(ui, ShellEvent::LauncherFiles(FilesEvent::Off(files::Why::Unavailable)));
+            let off = FilesEvent::Off(files::Why::Unavailable);
+            crate::shell_thread::push_event(ui, ShellEvent::LauncherFiles(open, off));
             None
         }
     }
@@ -685,7 +694,7 @@ mod tests {
 
     #[test]
     fn no_pump_no_thread() {
-        request(None, 0);
+        request(1, None, 0);
         end();
         assert!(PUMP.with(|p| p.borrow().is_none()), "a withdrawal with no pump starts nothing");
     }

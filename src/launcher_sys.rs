@@ -659,8 +659,8 @@ impl SysPort for RealSys {
         }
     }
 
-    fn files(&mut self, r: Option<crate::launcher::files::Req>) {
-        crate::launcher_files::request(r, crate::hwnd().0 as isize);
+    fn files(&mut self, open: u32, r: Option<crate::launcher::files::Req>) {
+        crate::launcher_files::request(open, r, crate::hwnd().0 as isize);
     }
 
     fn files_end(&mut self) {
