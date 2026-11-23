@@ -2849,7 +2849,7 @@ impl Ctrl {
         }
         self.pt.configure(c.with_powertoys == "take", c.powertoys_done);
         if self.learn != c.learn {
-            // Off: what was learned is forgotten and the files are deleted at the next open; on: they are read again.
+            // Off: what was learned is forgotten and the files are deleted by on_config; on: they are read again.
             self.learn = c.learn;
             self.history.clear();
             self.frecency.clear();
@@ -2911,6 +2911,14 @@ thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     /// The dock window receives the session notifications (registered once, at the first chord).
     static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    /// The last `launcher.learn` on_config saw (`None` before the first call): the switch-off is an edge to detect
+    /// whether or not a chord is set, and 2 bytes are all it keeps.
+    static LEARN_WAS: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Records `learn` and tells whether it was just switched off (true before, false now; the first call never is).
+fn learn_switched_off(learn: bool) -> bool {
+    LEARN_WAS.with(|w| w.replace(Some(learn))) == Some(true) && !learn
 }
 
 /// The config changed (and once at start): the hook's chord, and with a chord the options the next open uses. With no
@@ -2981,6 +2989,11 @@ pub(crate) fn on_config() {
                 }
             }
         }
+    }
+    // "Learn from what I pick" switched off, chord or not (Settings or a hand edit): the files go now, after any save
+    // chord_off queued above.
+    if learn_switched_off(cfg.launcher.learn) {
+        forget_history();
     }
 }
 
@@ -5324,6 +5337,20 @@ mod tests {
         foreground_flow(&mut hook, &FakeSys { d3d: true, ..FakeSys::default() });
         assert_eq!(hook.passes.last(), Some(&PassFlags::FULLSCREEN), "exclusive D3D passes anyway");
         with_ctrl(|c| c.over_fullscreen_pass = true);
+    }
+
+    #[test]
+    fn learn_switch_off_is_an_edge_with_or_without_a_chord() {
+        // The first on_config (the dock's start) never deletes, whatever the value.
+        assert!(!learn_switched_off(false));
+        assert!(!learn_switched_off(true));
+        // true -> false requests the delete (forget_history: nothing in memory with no chord, only the files).
+        assert!(learn_switched_off(false));
+        // Staying off, and off -> on, request nothing.
+        assert!(!learn_switched_off(false));
+        assert!(!learn_switched_off(true));
+        assert!(!learn_switched_off(true));
+        assert!(learn_switched_off(false));
     }
 
     #[test]
