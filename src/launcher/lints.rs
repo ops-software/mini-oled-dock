@@ -1543,9 +1543,11 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// to another dock's tray host. Those longer than the 50 ms ping also remove the popup's low-level mouse hook for the
 /// wait (suspend_mouse_hook): Windows calls the hook through a message to the UI thread, which SMTO_BLOCK does not serve,
 /// so every mouse event would wait for the send and Windows drops a hook that misses LowLevelHooksTimeout (at most 1 s)
-/// without notice. The others feed no heartbeat: the tray host's forwards to Explorer (its thread keeps
-/// serving the icons apps send it meanwhile), the tray-fwd thread (no window, nothing to dispatch) and the shell
-/// thread's WM_GETICON (none of the dock's windows). A new SendMessageTimeoutW is listed here first.
+/// without notice. The others do not block: the tray host's forwards to Explorer (its thread keeps serving the icons
+/// apps send it meanwhile, each of which starts the forward's 3 s again; the UI thread waits on them only through
+/// SHAppBarMessage, the fallback of a refused direct AppBar send, as taskbar::takes_fallback skips it after a timeout),
+/// the tray-fwd thread (no window, nothing to dispatch) and the shell thread's WM_GETICON (none of the dock's windows).
+/// A new SendMessageTimeoutW is listed here first.
 const TIMED_SENDS: [(&str, &str, bool, bool); 8] = [
     ("src/ui.rs", "fn answers(", true, false),
     ("src/apps.rs", "fn sys_command(", true, true),

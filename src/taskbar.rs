@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, ERROR_TIMEOUT, HANDLE, HWND, LPARAM, RECT, WIN32_ERROR, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -214,8 +214,9 @@ const _: () = assert!(std::mem::size_of::<AppBarData32>() == 0x28 && std::mem::s
 
 /// DIRECT send of an AppBar message without a shared block to Explorer's `Shell_TrayWnd`
 /// (`hwnd`), so it does not depend on which `Shell_TrayWnd` is first in the Z-order (our tray
-/// host is first). `Some(result)` if the message was delivered, `None` otherwise.
-fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Option<usize> {
+/// host is first). `Ok(result)` if the message was delivered, otherwise the send's error (`ERROR_TIMEOUT`: Explorer is
+/// slow or hung).
+fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Result<usize, WIN32_ERROR> {
     appbar_direct_at(msg, hwnd, 0, [0; 4], lparam, APPBAR_TIMEOUT_MS)
 }
 
@@ -227,7 +228,14 @@ fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Option<usize> {
 /// fallback would run, as for a slow Explorer. Nor does the wait serve the popup's low-level mouse hook, which Windows
 /// calls through a message to the UI thread: the hook is removed for the wait (`popup::suspend_mouse_hook`, UI thread
 /// only), or every mouse event would wait for Explorer and Windows would drop the hook.
-fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, timeout_ms: u32) -> Option<usize> {
+fn appbar_direct_at(
+    msg: u32,
+    hwnd: HWND,
+    edge: u32,
+    rc: [i32; 4],
+    lparam: u32,
+    timeout_ms: u32,
+) -> Result<usize, WIN32_ERROR> {
     let mut m = AppBarMsg {
         abd: AppBarData32 { cb_size: 0x28, hwnd: hwnd.0 as usize as u32, callback: 0, edge, rc, lparam: lparam as i64 },
         message: msg,
@@ -256,22 +264,41 @@ fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, 
             Some(&mut res),
         )
     };
+    // SAFETY: no preconditions; read right after the send, before the hook's reinstall can set it.
+    let err = unsafe { GetLastError() };
     crate::popup::resume_mouse_hook(hook);
-    (r.0 != 0).then_some(res)
+    (r.0 != 0).then_some(res).ok_or(err)
 }
 
 /// AppBar message to Explorer: first a direct send, then `SHAppBarMessage` (which goes through the tray
-/// host, which forwards it). Returns the raw value.
+/// host, which forwards it) where `takes_fallback` allows it, else 0. Returns the raw value.
 fn appbar(msg: u32, hwnd: HWND, lparam: u32) -> usize {
-    if let Some(v) = appbar_direct(msg, hwnd, lparam) {
-        return v;
-    }
-    log!("taskbar: direct AppBar {msg} send failed, falling back to SHAppBarMessage");
-    appbar_shell(msg, hwnd, lparam)
+    appbar_direct(msg, hwnd, lparam).unwrap_or_else(|e| appbar_fallback(msg, hwnd, lparam, e).unwrap_or(0))
 }
 
-/// AppBar message through `SHAppBarMessage` (tray host -> Explorer): the fallback of `appbar()`
-/// and `set_state()` when the direct send fails. Returns the raw value.
+/// Whether a direct AppBar send that failed with `err` falls back to `SHAppBarMessage`. Not on the UI thread after a
+/// timeout: the fallback goes to the first `Shell_TrayWnd`, while the taskbar is hidden normally the dock's own tray
+/// host, which forwards ABM_GETSTATE and ABM_SETSTATE to the same slow Explorer (`tray_host::forward_sync`, 3 s, no
+/// SMTO_BLOCK, so each icon apps send the host meanwhile starts its wait again, as in live check V-14), and the UI
+/// thread waits through it. Explorer still gets a timed-out send once it pumps again; only the answer is lost. A
+/// refused send (a window gone) and the other threads (watchdog, `--restore`) keep the fallback. Pure.
+fn takes_fallback(err: WIN32_ERROR, ui_thread: bool) -> bool {
+    err != ERROR_TIMEOUT || !ui_thread
+}
+
+/// `SHAppBarMessage` after a direct send that failed with `err`, where `takes_fallback` allows it: its raw value, or
+/// `None` when skipped.
+fn appbar_fallback(msg: u32, hwnd: HWND, lparam: u32, err: WIN32_ERROR) -> Option<usize> {
+    if !takes_fallback(err, crate::on_ui_thread()) {
+        log!("taskbar: direct AppBar {msg} send timed out, no SHAppBarMessage fallback on the UI thread");
+        return None;
+    }
+    log!("taskbar: direct AppBar {msg} send failed, falling back to SHAppBarMessage");
+    Some(appbar_shell(msg, hwnd, lparam))
+}
+
+/// AppBar message through `SHAppBarMessage` (tray host -> Explorer): the fallback of a direct send that failed
+/// (`appbar_fallback`). Returns the raw value.
 fn appbar_shell(msg: u32, hwnd: HWND, lparam: u32) -> usize {
     let mut d = APPBARDATA {
         cbSize: std::mem::size_of::<APPBARDATA>() as u32,
@@ -288,15 +315,16 @@ fn get_state(tray: HWND) -> u32 {
 }
 
 /// `ABM_GETSTATE` like `get_state` (direct send, then `SHAppBarMessage`), but `None` when the read failed: the
-/// direct send was not delivered and the fallback answered 0, which is also what a failed forward returns.
-/// The flag is true when the direct send answered: false means Explorer is slow right now.
+/// direct send was not delivered and the fallback answered 0, which is also what a failed forward returns, or was
+/// skipped (`takes_fallback`). The flag is true when the direct send answered: false means Explorer is slow right now.
 fn try_get_state(tray: HWND) -> (Option<u32>, bool) {
-    if let Some(v) = appbar_direct(ABM_GETSTATE, tray, 0) {
-        return (Some(v as u32 & ABS_MASK), true);
+    match appbar_direct(ABM_GETSTATE, tray, 0) {
+        Ok(v) => (Some(v as u32 & ABS_MASK), true),
+        Err(e) => {
+            let v = appbar_fallback(ABM_GETSTATE, tray, 0, e).unwrap_or(0);
+            ((v != 0).then_some(v as u32 & ABS_MASK), false)
+        }
     }
-    log!("taskbar: direct AppBar {ABM_GETSTATE} send failed, falling back to SHAppBarMessage");
-    let v = appbar_shell(ABM_GETSTATE, tray, 0);
-    ((v != 0).then_some(v as u32 & ABS_MASK), false)
 }
 
 /// The log line for a new state read by `hide_all` (`None` = the read failed) after `prev` (a `LAST_STATE`
@@ -415,7 +443,7 @@ fn autohide_edge_owner(tray: HWND) -> (EdgeOwner, Result<(u32, RECT), String>) {
         Err(why) => return (EdgeOwner::Free, Err(why)),
     };
     let rc = [mon.left, mon.top, mon.right, mon.bottom];
-    let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge, rc, 0, EDGE_QUERY_TIMEOUT_MS);
+    let reply = appbar_direct_at(ABM_GETAUTOHIDEBAREX, tray, edge, rc, 0, EDGE_QUERY_TIMEOUT_MS).ok();
     // SAFETY: IsWindow has no preconditions; for a handle that is no longer a window it returns false.
     let owner =
         edge_owner_from_reply(reply, tray.0 as isize, |h| unsafe { IsWindow(Some(HWND(h as *mut c_void))) }.as_bool());
@@ -488,15 +516,16 @@ fn autohide_action(state: u32, owner: EdgeOwner) -> AutoHideAction {
 
 /// `ABM_SETSTATE`; true if the message reached Explorer. A delivered direct send is enough;
 /// if it fails we fall back to `SHAppBarMessage` (which always returns TRUE, so it tells us nothing) and
-/// confirm by re-reading the state with a direct send.
+/// confirm by re-reading the state with a direct send. On the UI thread a send that timed out has no fallback
+/// (`takes_fallback`): false, so `restore_force` keeps the state file for the watchdog, which restores once the dock
+/// has exited.
 fn set_state(tray: HWND, state: u32) -> bool {
     let state = state & ABS_MASK;
-    if appbar_direct(ABM_SETSTATE, tray, state).is_some() {
-        return true;
+    let Err(e) = appbar_direct(ABM_SETSTATE, tray, state) else { return true };
+    if appbar_fallback(ABM_SETSTATE, tray, state, e).is_none() {
+        return false;
     }
-    log!("taskbar: direct ABM_SETSTATE send failed, falling back to SHAppBarMessage");
-    appbar_shell(ABM_SETSTATE, tray, state);
-    matches!(appbar_direct(ABM_GETSTATE, tray, 0), Some(v) if state_reads_as(v as u32, state))
+    matches!(appbar_direct(ABM_GETSTATE, tray, 0), Ok(v) if state_reads_as(v as u32, state))
 }
 
 /// True when a read-back state matches the wanted one on the auto-hide bit only: ABM_GETSTATE never
@@ -911,7 +940,7 @@ pub fn hide_all() {
         }
         AutoHideAction::Send => {
             // A restore can have run while the messages above waited for Explorer: nested in this very call (the
-            // direct sends block, but SHAppBarMessage, the fallback of a failed read, can handle incoming sent
+            // direct sends block, but SHAppBarMessage, the fallback of a refused read, can handle incoming sent
             // messages while it waits, so WM_ENDSESSION can run begin_exit + restore inside it), or from the
             // watchdog, which deletes the state file. Auto-hide sent after that restore stays on in Explorer and
             // becomes the "original" at the next start.
@@ -924,12 +953,11 @@ pub fn hide_all() {
             // The direct send waits up to APPBAR_TIMEOUT_MS, so the same race is checked again before the
             // fallback: a restore run during that wait (the watchdog's) has already sent the original state, and the
             // fallback would put auto-hide back on after it.
-            if appbar_direct(ABM_SETSTATE, first, ABS_AUTOHIDE).is_none() {
+            if let Err(e) = appbar_direct(ABM_SETSTATE, first, ABS_AUTOHIDE) {
                 if RESTORING.load(Relaxed) || restored_externally() {
                     return;
                 }
-                log!("taskbar: direct AppBar {ABM_SETSTATE} send failed, falling back to SHAppBarMessage");
-                appbar_shell(ABM_SETSTATE, first, ABS_AUTOHIDE);
+                appbar_fallback(ABM_SETSTATE, first, ABS_AUTOHIDE, e);
             }
         }
     }
@@ -1333,6 +1361,71 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a timed-out direct send on the UI thread skips SHAppBarMessage (review of 7232226: its forward through the
+    /// dock's tray host restarts its 3 s at each icon apps send the host); a refused send and other threads keep it.
+    #[test]
+    fn a_timed_out_appbar_send_has_no_fallback_on_the_ui_thread() {
+        use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_WINDOW_HANDLE};
+        assert!(!takes_fallback(ERROR_TIMEOUT, true));
+        assert!(takes_fallback(ERROR_TIMEOUT, false), "the watchdog and --restore keep it");
+        for refused in [ERROR_INVALID_WINDOW_HANDLE, ERROR_ACCESS_DENIED, WIN32_ERROR(0)] {
+            assert!(takes_fallback(refused, true) && takes_fallback(refused, false), "{refused:?}");
+        }
+        assert!(!crate::on_ui_thread(), "a test thread is not the dock's");
+    }
+
+    /// The direct send tells a timeout from a refusal, which `takes_fallback` reads: a second thread's message-only
+    /// window that never pumps times out (well under 1 s for a 50 ms timeout, SMTO_BLOCK), a destroyed window refuses.
+    /// Headless: message-only windows are never shown and never take the focus.
+    #[test]
+    fn a_direct_appbar_send_reports_its_timeout() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+        let message_only = || {
+            // SAFETY: a message-only STATIC window of the calling thread, which destroys it before it ends.
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!(""),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("a message-only window")
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done, wait_done) = std::sync::mpsc::channel::<()>();
+        let silent = std::thread::spawn(move || {
+            let h = message_only();
+            tx.send(h.0 as isize).expect("the test thread waits");
+            let _ = wait_done.recv_timeout(Duration::from_secs(4));
+            // SAFETY: the window of this thread.
+            let _ = unsafe { DestroyWindow(h) };
+        });
+        let target = HWND(rx.recv().expect("the silent thread starts") as *mut c_void);
+        let t = Instant::now();
+        let slow = appbar_direct_at(ABM_GETSTATE, target, 0, [0; 4], 0, 50);
+        let waited = t.elapsed();
+        let _ = done.send(());
+        silent.join().expect("the silent thread ends");
+        assert_eq!(slow, Err(ERROR_TIMEOUT));
+        assert!(waited < Duration::from_secs(1), "the 50 ms send took {} ms", waited.as_millis());
+        let gone = message_only();
+        // SAFETY: the window of this thread.
+        unsafe { DestroyWindow(gone) }.expect("the window is destroyed");
+        let refused = appbar_direct(ABM_GETSTATE, gone, 0).expect_err("a destroyed window answers nothing");
+        assert!(takes_fallback(refused, true), "{refused:?}");
+    }
 
     #[test]
     fn raw_taskbar_events_filtered_as_before() {
