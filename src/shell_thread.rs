@@ -1491,8 +1491,12 @@ const ICON_FRAME_HEAD: usize = 12;
 /// A job older than this plus `ICON_JOB_PER_ID` per id is a hung child (about 7 ms per icon measured).
 const ICON_JOB_BASE: Duration = Duration::from_secs(2);
 const ICON_JOB_PER_ID: Duration = Duration::from_millis(50);
-/// The read buffer of a job's reader thread (several frames at the dock's sizes), and the child's write buffer.
+/// The child's write buffer (several frames at the dock's sizes).
 const ICON_IO_BUF: usize = 64 * 1024;
+/// The read buffer of a job's reader thread in the dock: the child flushes each frame, so a read rarely returns more than
+/// one (3.6 KB at the launcher's 30 px, 9.2 KB at 48 px); a frame larger than the buffer is read through it (`read_full`).
+/// 16 KiB instead of 64 KiB: 48 KiB less while each job runs (L3 MEM-3).
+const ICON_READ_BUF: usize = 16 * 1024;
 /// The stack of a job's reader thread.
 const ICON_READER_STACK: usize = 128 * 1024;
 /// How long the shell thread waits for a killed child to be gone: one held in the kernel past it is left to the dock's
@@ -1800,7 +1804,7 @@ impl IconReader {
     /// Decodes the output and delivers the frames: when the first batch went out, and how the output ended.
     fn read(&self, output: std::io::PipeReader) -> (Option<Duration>, IconEnd) {
         let n = self.ids.len();
-        let mut r = std::io::BufReader::with_capacity(ICON_IO_BUF, output);
+        let mut r = std::io::BufReader::with_capacity(ICON_READ_BUF, output);
         if let Err(why) = read_icon_header(&mut r) {
             return (None, IconEnd::NoHeader(why));
         }
@@ -3844,6 +3848,26 @@ mod tests {
         }
         v.resize(v.len() + pixels * 4, 0);
         v
+    }
+
+    #[test]
+    fn icon_frames_through_the_reader_buffer() {
+        // L3 MEM-3: the dock's reader buffer (16 KiB) is smaller than a 72 px frame (20,748 B): frames of every size the
+        // launcher and Start ask for still come through it whole, in order.
+        for px in [24u32, 30, 48, 72] {
+            let icon = IconBitmap {
+                width: px,
+                height: px,
+                pixels: (0..px * px).map(|i| i.wrapping_mul(0x0103_0507)).collect(),
+            };
+            let out =
+                [ICONS_HEADER.to_vec(), encode_icon_frame(0, Some(&icon)), encode_icon_frame(1, Some(&icon))].concat();
+            let mut r = std::io::BufReader::with_capacity(ICON_READ_BUF, &out[..]);
+            read_icon_header(&mut r).unwrap();
+            assert_eq!(read_icon_frame(&mut r, 2, px, None).unwrap(), Some((0, Some(icon.clone()))), "{px} px");
+            assert_eq!(read_icon_frame(&mut r, 2, px, Some(0)).unwrap(), Some((1, Some(icon))), "{px} px");
+            assert_eq!(read_icon_frame(&mut r, 2, px, Some(1)).unwrap(), None);
+        }
     }
 
     #[test]
