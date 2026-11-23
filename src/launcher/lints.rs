@@ -1150,6 +1150,46 @@ fn search_stays_in_the_files_helper() {
     assert!(all.is_empty(), "{all:#?}");
 }
 
+// ---- lint 16: the files helper's query asks Windows ---------------------------------------------------------------
+
+/// The files helper's live query hands Windows' own check (`dangerous_type`, which asks AssocIsDangerous) to `collect`.
+/// Every test of `collect` passes it a closure, so a stub such as `&mut |_| false` there would take Windows' word off
+/// every file row (5.4.6) with the suite green.
+fn helper_asks_windows_violations(path: &str, text: &str) -> Vec<String> {
+    if path != FILES_HELPER {
+        return Vec::new();
+    }
+    let code = text.get(..test_start(text)).unwrap_or(text);
+    let asks = fn_body(code, "fn query(", 0).is_some_and(|(b, e)| {
+        let body: String = code_of(code.get(b..e).unwrap_or("")).split_whitespace().collect();
+        body.contains("collect(&mutrows,&self.roots,&mutdangerous_type)")
+    });
+    if asks {
+        Vec::new()
+    } else {
+        vec![format!("{path}: fn query must call collect(&mut rows, &self.roots, &mut dangerous_type)")]
+    }
+}
+
+#[test]
+fn the_files_helper_asks_windows() {
+    let live = |ask: &str| {
+        let call = format!("Some(collect(&mut rows, &self.roots, {ask}))");
+        format!("impl Search {{\n    fn query(&self, t: &str) -> Answer {{\n        {call}\n    }}\n}}\n")
+    };
+    assert!(helper_asks_windows_violations(FILES_HELPER, &live("&mut dangerous_type")).is_empty());
+    assert_eq!(helper_asks_windows_violations(FILES_HELPER, &live("&mut |_| false")).len(), 1);
+    // A comment, or the test module, never satisfies it.
+    let note = "        // collect(&mut rows, &self.roots, &mut dangerous_type)\n        Some(";
+    let commented = live("&mut |_| false").replace("        Some(", note);
+    assert_eq!(helper_asks_windows_violations(FILES_HELPER, &commented).len(), 1);
+    let in_tests = format!("fn other() {{}}\n#[cfg(test)]\nmod tests {{\n{}}}\n", live("&mut dangerous_type"));
+    assert_eq!(helper_asks_windows_violations(FILES_HELPER, &in_tests).len(), 1);
+    assert!(helper_asks_windows_violations("src/ui.rs", &live("&mut |_| false")).is_empty());
+    let all = scan_tree(helper_asks_windows_violations);
+    assert!(all.is_empty(), "{all:#?}");
+}
+
 // ---- the tree walk --------------------------------------------------------------------------------------------------
 
 fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
