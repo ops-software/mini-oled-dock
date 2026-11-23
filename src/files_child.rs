@@ -1,10 +1,10 @@
 //! `dock.exe --launcher-files` (plan L2-F2): the launcher's file search, in a short-lived child of the dock, so the
 //! search client (OLE DB and the Windows Search DLLs, which stay loaded once used) never enters the dock (D1). The dock
 //! starts it when the first files request of an open is due and ends it at the close (launcher_files.rs). It checks once
-//! that it can answer (its user against the shell's, the WSearch service, the shell user's three roots, the index) and
+//! that it can answer (its user against the shell's, the WSearch service, the shell user's two roots, the index) and
 //! says so in its state frame; then it answers each request line on stdin with one rows frame on stdout, until stdin
 //! ends (Appendix A of the plan). It runs with the dock's token and reads index columns only: it never opens a listed
-//! file, and a row outside its three roots is skipped here, never sent. It has no logger and writes nothing but its
+//! file, and a row outside its two roots is skipped here, never sent. It has no logger and writes nothing but its
 //! frames (lint `search_stays_in_the_files_helper`): the words it gets are typed text, given to Windows Search only.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -31,9 +31,7 @@ use windows::Win32::System::Services::{
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::{
-    FOLDERID_CommonPrograms, FOLDERID_Profile, FOLDERID_Programs, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
-};
+use windows::Win32::UI::Shell::{FOLDERID_CommonPrograms, FOLDERID_Profile, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
 /// Exit codes: 0 stdin ended (or a state other than 0 was sent), 2 a request line the helper refuses, 3 stdout failed.
@@ -95,7 +93,7 @@ fn path_of_url(url: &str) -> Option<String> {
 }
 
 /// A row the dock may be sent: its URL names a file-system path, every check of the dock's reader
-/// (`files::check_hit`) passes, and the path lies under one of the helper's three roots (the SQL Windows builds around
+/// (`files::check_hit`) passes, and the path lies under one of the helper's two roots (the SQL Windows builds around
 /// the typed text is the only other fence). None: it is skipped, and only counted.
 fn row_of(raw: RawRow, roots: &[String]) -> Option<FileHit> {
     let (Cell::Text(url), Cell::Text(name)) = (raw.url, raw.name) else { return None };
@@ -270,15 +268,26 @@ fn search_running() -> bool {
     }
 }
 
-/// The shell user's profile and both Start Menu Programs folders, resolved with the shell's token (SPEC 5.4.6).
+/// The helper's roots (SPEC 5.4.6): the shell user's profile, then the common Start Menu Programs folder unless it holds
+/// the profile. Both paths come from HKLM, which only an administrator can change. The user's own Programs folder is not
+/// a root: it lies under the profile by default, and its path comes from HKCU, which any process of the user can point
+/// at C:\Users or C:\, where the helper's elevated token would let the index list other accounts' files.
+fn roots_of(profile: String, common: String) -> Vec<String> {
+    if under(&profile, &common) {
+        vec![profile]
+    } else {
+        vec![profile, common]
+    }
+}
+
+/// The roots of `roots_of`, resolved with the shell's token.
 fn shell_roots(token: &Handle) -> Option<Vec<String>> {
-    let mut out = Vec::with_capacity(3);
-    for id in [&FOLDERID_Profile, &FOLDERID_Programs, &FOLDERID_CommonPrograms] {
+    let path = |id: &windows::core::GUID| {
         // SAFETY: a valid folder id and token; the string is freed by take_cotask.
         let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, Some(token.0)) }.ok()?;
-        out.push(take_cotask(p)?);
-    }
-    Some(out)
+        take_cotask(p)
+    };
+    Some(roots_of(path(&FOLDERID_Profile)?, path(&FOLDERID_CommonPrograms)?))
 }
 
 /// The checks of the state frame, in order: the SIDs, the service, the roots, the index.
@@ -505,13 +514,7 @@ mod tests {
     }
 
     fn roots() -> Vec<String> {
-        [
-            "C:\\Users\\a",
-            "C:\\Users\\a\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs",
-            "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\",
-        ]
-        .map(String::from)
-        .to_vec()
+        roots_of("C:\\Users\\a".into(), "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\".into())
     }
 
     #[test]
@@ -569,6 +572,29 @@ mod tests {
         let mut fake = Fake(many.into_iter());
         let (hits, skipped) = collect(&mut fake, &roots());
         assert_eq!((hits.len(), skipped, fake.0.len()), (50, 0, 30));
+    }
+
+    #[test]
+    fn no_root_holds_another_profile() {
+        let profile = "C:\\Users\\a";
+        assert_eq!(roots().len(), 2, "the profile and the common Programs folder");
+        // A common Programs folder that holds the profile is refused (any case, a trailing separator or none).
+        for common in ["C:\\Users", "c:\\users\\", "C:\\", "C:"] {
+            assert_eq!(roots_of(profile.into(), common.into()), [profile], "{common:?}");
+        }
+        let rows = || {
+            vec![
+                raw("C:\\Users\\b\\quokka.txt", "quokka.txt", text("b"), "x"),
+                raw("C:\\Users\\a\\quokka.txt", "quokka.txt", text("a"), "x"),
+            ]
+        };
+        let (hits, skipped) = collect(&mut Fake(rows().into_iter()), &roots_of(profile.into(), "C:\\Users".into()));
+        assert_eq!((hits.len(), &*hits[0].path, skipped), (1, "C:\\Users\\a\\quokka.txt", 1), "another account's row");
+        // The user's own Start Menu Programs folder lies under the profile: its rows pass as the profile's.
+        let start = "C:\\Users\\a\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Tool.lnk";
+        let (hits, skipped) =
+            collect(&mut Fake(vec![raw(start, "Tool.lnk", text("Programs"), "x")].into_iter()), &roots());
+        assert_eq!((hits.len(), skipped), (1, 0));
     }
 
     #[test]
