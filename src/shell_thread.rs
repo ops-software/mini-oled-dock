@@ -1739,13 +1739,10 @@ fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> R
     let progress = Arc::new(IconProgress::default());
     let started = Instant::now();
     let reader = IconReader { ui, client, px, ids: Arc::clone(&ids), progress: Arc::clone(&progress), started };
-    let spawned = std::thread::Builder::new()
-        .name("icons".into())
-        .stack_size(ICON_READER_STACK)
-        .spawn(move || {
-            probe!(crate::probe::bump(crate::probe::C::Spawned));
-            reader.run(input, output)
-        });
+    let spawned = std::thread::Builder::new().name("icons".into()).stack_size(ICON_READER_STACK).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
+        reader.run(input, output)
+    });
     if let Err(e) = spawned {
         let _ = child.kill();
         let _ = child.wait();

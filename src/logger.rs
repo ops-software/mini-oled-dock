@@ -225,7 +225,16 @@ mod tests {
     use super::*;
 
     fn st(y: u16, mo: u16, d: u16, h: u16, mi: u16, s: u16, ms: u16) -> SYSTEMTIME {
-        SYSTEMTIME { wYear: y, wMonth: mo, wDayOfWeek: 0, wDay: d, wHour: h, wMinute: mi, wSecond: s, wMilliseconds: ms }
+        SYSTEMTIME {
+            wYear: y,
+            wMonth: mo,
+            wDayOfWeek: 0,
+            wDay: d,
+            wHour: h,
+            wMinute: mi,
+            wSecond: s,
+            wMilliseconds: ms,
+        }
     }
 
     #[test]

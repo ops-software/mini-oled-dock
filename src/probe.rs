@@ -40,7 +40,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use std::sync::atomic::{
+    AtomicIsize, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering::Acquire, Ordering::Relaxed, Ordering::Release,
+};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -475,11 +477,7 @@ fn resolve_name(p: &Probe, pid: u32) -> u8 {
 /// Lowercase ASCII file name of a path (non-ASCII as '?'), at most NAME_MAX bytes.
 fn image_file_name(path: &[u16]) -> Vec<u8> {
     let start = path.iter().rposition(|&c| c == u16::from(b'\\') || c == u16::from(b'/')).map_or(0, |i| i + 1);
-    path[start..]
-        .iter()
-        .take(NAME_MAX)
-        .map(|&c| if c < 0x80 { (c as u8).to_ascii_lowercase() } else { b'?' })
-        .collect()
+    path[start..].iter().take(NAME_MAX).map(|&c| if c < 0x80 { (c as u8).to_ascii_lowercase() } else { b'?' }).collect()
 }
 
 // ------------------------------------------------------------------ start / stop
@@ -766,7 +764,10 @@ pub fn ui_loop() -> bool {
         // SAFETY: no handles; wakes for any message, sent message, input or event, as GetMessageW would.
         let r = unsafe { MsgWaitForMultipleObjectsEx(None, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
         if r == WAIT_FAILED {
-            log!("wake probe: MsgWaitForMultipleObjectsEx failed ({:?}): release loop", windows::core::Error::from_thread());
+            log!(
+                "wake probe: MsgWaitForMultipleObjectsEx failed ({:?}): release loop",
+                windows::core::Error::from_thread()
+            );
             break false;
         }
         p.add(C::UiWakes, 1);
@@ -1284,11 +1285,12 @@ fn hshell_name(code: u32) -> String {
 }
 
 fn cause_name(mask: u32) -> String {
-    let parts: Vec<&str> = [(CAUSE_POSTED, "posted"), (CAUSE_WINEVENT, "winevent"), (CAUSE_SENT, "sent"), (CAUSE_MOUSE, "mouse_ll")]
-        .iter()
-        .filter(|(b, _)| mask & u32::from(*b) != 0)
-        .map(|(_, n)| *n)
-        .collect();
+    let parts: Vec<&str> =
+        [(CAUSE_POSTED, "posted"), (CAUSE_WINEVENT, "winevent"), (CAUSE_SENT, "sent"), (CAUSE_MOUSE, "mouse_ll")]
+            .iter()
+            .filter(|(b, _)| mask & u32::from(*b) != 0)
+            .map(|(_, n)| *n)
+            .collect();
     if parts.is_empty() {
         "none".into()
     } else {
@@ -1736,7 +1738,9 @@ mod tests {
     #[test]
     fn msgwait_wakes_for_each_out_of_context_winevent() {
         use windows::Win32::UI::Accessibility::{NotifyWinEvent, SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINEVENT_OUTOFCONTEXT, WS_POPUP};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WINEVENT_OUTOFCONTEXT, WS_POPUP,
+        };
         const EV: u32 = 0xA0F1; // application range: nothing else raises it
         static HITS: AtomicU32 = AtomicU32::new(0);
         unsafe extern "system" fn cb(_h: HWINEVENTHOOK, ev: u32, _w: HWND, _o: i32, _c: i32, _t: u32, _ms: u32) {
