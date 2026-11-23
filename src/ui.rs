@@ -1629,6 +1629,10 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::popup_launcher::on_converted(gen, meant);
             return false;
         }
+        ShellEvent::LauncherFiles(ev) => {
+            popup::popup_launcher::on_files(ev);
+            return false;
+        }
         ShellEvent::LauncherIcons { icon_px, icons } => {
             popup::popup_launcher::on_icons(icon_px, icons);
             return false;
@@ -1683,6 +1687,7 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             | ShellEvent::LaunchFailed { .. }
             | ShellEvent::LauncherIcons { .. }
             | ShellEvent::LauncherConverted { .. }
+            | ShellEvent::LauncherFiles(_)
             | ShellEvent::LauncherState { .. } => false,
         }
     })

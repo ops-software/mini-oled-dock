@@ -1178,6 +1178,15 @@ impl Results {
         self.rows.iter().any(|r| r.kind != Kind::Notice && r.key != web_search_key())
     }
 
+    /// Whether the rows hold an answer, a run line, a typed path or a typed address (D4: Mixed mode asks no files then).
+    pub fn has_answer_or_implicit(&self) -> bool {
+        self.rows.iter().any(|r| {
+            r.kind == Kind::Answer
+                || r.from == ProviderId::Run
+                || (r.from == ProviderId::Web && r.key != web_search_key())
+        })
+    }
+
     /// Where the web row goes among `n` other rows: after them, but never below the last visible row.
     fn web_slot(&self, n: usize) -> usize {
         n.min(self.visible.saturating_sub(1))

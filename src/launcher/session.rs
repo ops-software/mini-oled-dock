@@ -6,6 +6,7 @@
 
 use super::aliases::{self, AliasRefusal, AliasTarget, MAX_ALIASES};
 use super::field::{Edit, FieldOut, KeyEvent, Motion, TextField};
+use super::files::{self, FilesEvent, Req, Why};
 use super::gesture::{self, Gesture, Refusal};
 use super::model::{
     Batch, Choice, CommandId, FileClass, GlyphId, IconRef, Item, ItemKey, Kind, Mode, Mods, Payload, ProviderId,
@@ -59,9 +60,9 @@ pub enum Effect {
     RemoveAlias(Box<str>),
     /// An alias row's launch: run as `Launch` is, but never recorded in the run history, and never elevated.
     LaunchAlias(LaunchReq),
-    /// Ask the files provider for this generation (L2).
-    #[allow(dead_code)] // L2-2 builds it
-    RequestFiles(u64),
+    /// The files request of this requery (plan L2-F3): Some asks files for its generation; None withdraws a request still
+    /// waiting its quiet time. Emitted by every requery once one was asked in this open.
+    RequestFiles(Option<Req>),
     /// Nothing matched: ask Windows' typo rewrite for this generation (T_REWRITE, L1a-15d).
     RequestRewrite {
         gen: u64,
@@ -217,6 +218,21 @@ pub struct Session {
     alias_edit: Option<AliasEdit>,
     /// The last key left the alias prompt by Esc: the next Esc closes.
     esc_closes: bool,
+    /// The files provider in this open (plan L2-F3).
+    files: FilesState,
+}
+
+/// What the session knows of the files provider in one open.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct FilesState {
+    /// A request was asked since the last withdrawal: the next requery that asks nothing withdraws it.
+    asked: bool,
+    /// The generation whose request is taking long (the busy mark in the field).
+    busy: Option<u64>,
+    /// Why files do not answer: `Stalled` for the generation that stalled, any reason after `FilesEvent::Off` for the rest
+    /// of the open.
+    why: Option<Why>,
+    off: bool,
 }
 
 /// One entry of the action list: a verb of the row, a notice's choice, or the notice's own "Don't show again".
@@ -441,6 +457,7 @@ impl Session {
             actions: None,
             alias_edit: None,
             esc_closes: false,
+            files: FilesState::default(),
         }
     }
 
@@ -545,6 +562,82 @@ impl Session {
     /// Runs the query again as a new generation: the rows of a kept query at open.
     pub fn refresh(&mut self, cx: &Context) -> Vec<Effect> {
         self.requery(cx)
+    }
+
+    /// The pump's post (plan L2-F3): a batch is a late batch of its generation (the stability rule holds); Slow sets the
+    /// busy mark; Stalled and Off say why files do not answer, a row in "file " mode only.
+    pub fn files_event(&mut self, ev: FilesEvent, cx: &Context) -> Vec<Effect> {
+        match ev {
+            FilesEvent::Batch(b) => {
+                if b.gen != self.gen {
+                    return Vec::new();
+                }
+                self.files.busy = None;
+                if self.late(b, cx) {
+                    vec![Effect::Relayout]
+                } else {
+                    Vec::new()
+                }
+            }
+            FilesEvent::Slow(gen) if gen == self.gen && self.files.busy != Some(gen) => {
+                self.files.busy = Some(gen);
+                vec![Effect::Redraw]
+            }
+            FilesEvent::Slow(_) => Vec::new(),
+            FilesEvent::Stalled(gen) => {
+                let redraw = self.files.busy.take().is_some();
+                if !self.files.off {
+                    self.files.why = Some(Why::Stalled);
+                }
+                self.state_row(gen).unwrap_or(if redraw { vec![Effect::Redraw] } else { Vec::new() })
+            }
+            FilesEvent::Off(why) => {
+                let redraw = self.files.busy.take().is_some();
+                (self.files.off, self.files.why) = (true, Some(why));
+                self.state_row(self.gen).unwrap_or(if redraw { vec![Effect::Redraw] } else { Vec::new() })
+            }
+        }
+    }
+
+    /// The busy mark: the newest files request is taking long (`FilesEvent::Slow`).
+    #[allow(dead_code)] // L2-F4 draws it
+    pub fn files_busy(&self) -> bool {
+        self.files.busy.is_some_and(|g| g == self.gen)
+    }
+
+    /// The files state row of "file " mode, added below the rows of generation `gen` when it is the current one.
+    fn state_row(&mut self, gen: u64) -> Option<Vec<Effect>> {
+        let file_mode = self.mode == Mode::Only(ProviderId::Files);
+        let row = self.files.why.and_then(|why| files::state_row(why, file_mode))?;
+        let took = gen == self.gen
+            && self.results.late(Batch { gen, from: ProviderId::Files, items: vec![row], done: true }, gen);
+        took.then(|| vec![Effect::Relayout])
+    }
+
+    /// This requery's files request (D4): what `files::wanted` asks, with a text the helper may get; never once files are
+    /// off for the open. Its text is the request's one allocation.
+    fn files_request(&self, q: &super::model::Query, cx: &Context) -> Option<Req> {
+        if self.files.off {
+            return None;
+        }
+        let (quiet_ms, cap) = files::wanted(q, cx.opts.mask, self.results.has_answer_or_implicit())?;
+        let text = q.text.trim();
+        files::sendable(text).then(|| Req { gen: q.gen, text: text.into(), quiet_ms, cap })
+    }
+
+    /// The files effect of a requery: Some when asked, else None while a request may still wait.
+    fn files_effect(&mut self, req: Option<Req>) -> Option<Effect> {
+        match req {
+            Some(r) => {
+                self.files.asked = true;
+                Some(Effect::RequestFiles(Some(r)))
+            }
+            None if self.files.asked => {
+                self.files.asked = false;
+                Some(Effect::RequestFiles(None))
+            }
+            None => None,
+        }
     }
 
     /// A late batch (files, the typo rewrite): false when it belongs to another generation.
@@ -808,13 +901,20 @@ impl Session {
         self.gen += 1;
         self.picked = false;
         self.actions = None;
+        self.files.busy = None;
+        if !self.files.off {
+            self.files.why = None;
+        }
         if let Some(edit) = &self.alias_edit {
-            // The prompt runs no provider and asks nothing of the rewrite or the files: its one row.
+            // The prompt runs no provider and asks nothing of the rewrite or the files (a waiting request is withdrawn):
+            // its one row.
             let row = prompt_row(edit, self.field.text(), cx);
             self.results.only(row, self.gen);
             self.mode = Mode::Mixed;
             self.folded.clear();
-            return vec![Effect::Relayout];
+            let mut fx = vec![Effect::Relayout];
+            fx.extend(self.files_effect(None));
+            return fx;
         }
         let raw = self.last_query();
         let q = query::parse_query(&raw, &cx.opts.prefixes, cx.num, self.gen);
@@ -822,12 +922,17 @@ impl Session {
         self.results.sync(&q, top, usize::from(cx.opts.rows));
         self.mode = q.mode;
         self.folded.clone_from(&q.folded);
-        let mut fx = vec![Effect::Relayout];
+        let mut fx = Vec::with_capacity(3);
+        fx.push(Effect::Relayout);
         let nothing = q.mode == Mode::Mixed && !q.folded.is_empty() && !self.results.has_matches();
         if nothing && self.rewrite_asked != Some(self.gen) {
             self.rewrite_asked = Some(self.gen);
             fx.push(Effect::RequestRewrite { gen: self.gen });
         }
+        let req = self.files_request(&q, cx);
+        fx.extend(self.files_effect(req));
+        // Files that do not answer say so in "file " mode, below this keystroke's rows.
+        let _ = self.state_row(self.gen);
         fx
     }
 
@@ -1740,7 +1845,17 @@ mod tests {
         keys.push(ReplayKey::Key(k(VK_RETURN, Mods::NONE)));
         keys.push(ReplayKey::Text('z'));
         let out = s.replay(&keys, &fx.cx());
-        assert_eq!(out, [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::App(CALC_ID.into()))]);
+        // "cal" asked files and "calc" (a run row) withdrew the request before the launch: no helper starts (D4).
+        let cal = Req { gen: 3, text: "cal".into(), quiet_ms: 150, cap: 3 };
+        assert_eq!(
+            out,
+            [
+                Effect::RequestFiles(Some(cal)),
+                Effect::RequestFiles(None),
+                Effect::Hide { restore: false },
+                Effect::Launch(LaunchReq::App(CALC_ID.into()))
+            ]
+        );
         assert_eq!(s.query_text(), "calc", "keys after the close are not replayed");
         // The repaints of a replay come once, at its end.
         let mut s = open(&fx);
@@ -1860,6 +1975,133 @@ mod tests {
         let b = batch(&s, vec![exe]);
         assert!(s.late(b, &fx.cx()));
         assert_eq!(s.selected(), None, "the executable alone: nothing");
+    }
+
+    fn files_of(fx: &[Effect]) -> Vec<Option<Req>> {
+        fx.iter().filter_map(|e| if let Effect::RequestFiles(r) = e { Some(r.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn requests_files_by_mode() {
+        let fx = Fx::new();
+        let cx = fx.cx();
+        let mut s = open(&fx);
+        assert!(files_of(&s.chars("q", &cx)).is_empty());
+        assert!(files_of(&s.chars("u", &cx)).is_empty(), "2 characters ask nothing, and there is nothing to withdraw");
+        let got = files_of(&s.chars("o", &cx));
+        assert_eq!(
+            got,
+            [Some(Req { gen: s.gen(), text: "quo".into(), quiet_ms: 150, cap: 3 })],
+            "Mixed: 150 ms, 3 rows"
+        );
+        assert_eq!(files_of(&press(&mut s, &fx, VK_BACK, Mods::NONE)), [None], "below 3 characters it is withdrawn");
+        assert!(files_of(&press(&mut s, &fx, VK_BACK, Mods::NONE)).is_empty(), "once");
+        // "cal" asks; "calc" has a run row and withdraws it, so "calc" + Enter typed at speed starts no helper.
+        let mut s = open(&fx);
+        s.chars("ca", &cx);
+        assert!(matches!(&files_of(&s.chars("l", &cx))[..], [Some(r)] if &*r.text == "cal"));
+        assert_eq!(files_of(&s.chars("c", &cx)), [None]);
+        // "file " mode: from 1 character, 50 ms, 20 rows, the text without the prefix.
+        let mut s = open(&fx);
+        assert!(files_of(&s.chars("file ", &cx)).is_empty());
+        let got = files_of(&s.chars("q", &cx));
+        assert_eq!(got, [Some(Req { gen: s.gen(), text: "q".into(), quiet_ms: 50, cap: 20 })]);
+        // The calculator's mode, an answer, and a text the helper may not get ask nothing.
+        let mut s = open(&fx);
+        for c in ["=", "2", "+", "2"] {
+            assert!(files_of(&s.chars(c, &cx)).is_empty(), "{c}");
+        }
+        let mut s = open(&fx);
+        assert!(files_of(&s.chars("2+2", &cx)).is_empty());
+        let mut s = open(&fx);
+        assert!(files_of(&s.paste("quokka \u{202E}txt", &cx)).is_empty(), "a bidi mark never goes to the helper");
+        // The provider off: never.
+        let mut off = Fx::new();
+        off.opts.mask = off.opts.mask.with(ProviderId::Files, false);
+        let mut s = open(&off);
+        assert!(files_of(&s.chars("quokka", &off.cx())).is_empty());
+    }
+
+    #[test]
+    fn files_request_allocates_once() {
+        use crate::launcher::testkit::allocations_during;
+        let on = Fx::new();
+        let mut off = Fx::new();
+        off.opts.mask = off.opts.mask.with(ProviderId::Files, false);
+        let measure = |fx: &Fx| {
+            let cx = fx.cx();
+            let mut s = open(fx);
+            s.chars("quokk", &cx);
+            allocations_during(|| s.chars("a", &cx))
+        };
+        let (with, n_on) = measure(&on);
+        let (without, n_off) = measure(&off);
+        assert!(matches!(&files_of(&with)[..], [Some(r)] if &*r.text == "quokka"));
+        assert!(files_of(&without).is_empty());
+        assert_eq!(n_on, n_off + 1, "the request's text, and nothing per candidate (FILES-2)");
+    }
+
+    #[test]
+    fn late_batch_keeps_the_selection() {
+        let fx = Fx::new();
+        let mut s = typed(&fx, "st");
+        press(&mut s, &fx, VK_DOWN, Mods::NONE);
+        let sel = s.selected().unwrap().key;
+        let batch = |gen, path: &str| {
+            let items = files::items(vec![file_hit(path)], &["st"], 3);
+            FilesEvent::Batch(Batch { gen, from: ProviderId::Files, items, done: true })
+        };
+        assert_eq!(s.files_event(batch(s.gen(), "C:\\u\\stack.txt"), &fx.cx()), [Effect::Relayout]);
+        assert_eq!(s.selected().unwrap().key, sel, "the selection stays");
+        assert!(s.rows().iter().any(|r| &*r.title == "stack.txt"));
+        assert!(s.files_event(batch(s.gen() - 1, "C:\\u\\stx.txt"), &fx.cx()).is_empty(), "an older generation");
+        assert!(s.rows().iter().all(|r| &*r.title != "stx.txt"));
+        // The busy mark: once per generation, ended by its rows and by the next keystroke.
+        assert!(!s.files_busy());
+        assert_eq!(s.files_event(FilesEvent::Slow(s.gen()), &fx.cx()), [Effect::Redraw]);
+        assert!(s.files_busy());
+        assert!(s.files_event(FilesEvent::Slow(s.gen()), &fx.cx()).is_empty());
+        assert!(s.files_event(FilesEvent::Slow(s.gen() - 1), &fx.cx()).is_empty());
+        s.files_event(batch(s.gen(), "C:\\u\\stem.txt"), &fx.cx());
+        assert!(!s.files_busy());
+        s.files_event(FilesEvent::Slow(s.gen()), &fx.cx());
+        s.chars("e", &fx.cx());
+        assert!(!s.files_busy());
+    }
+
+    #[test]
+    fn off_row_only_in_file_mode() {
+        let fx = Fx::new();
+        let cx = fx.cx();
+        let state = |s: &Session| s.rows().iter().find(|r| r.key == files::state_key()).map(|r| r.title.to_string());
+        // Mixed mode: nothing shows, and nothing more is asked in this open.
+        let mut s = typed(&fx, "quokka");
+        let n = s.rows().len();
+        assert!(s.files_event(FilesEvent::Off(Why::SearchOff), &cx).is_empty());
+        assert_eq!((s.rows().len(), state(&s)), (n, None));
+        assert_eq!(files_of(&s.chars("x", &cx)), [None], "the request asked before is withdrawn");
+        assert!(files_of(&s.chars("y", &cx)).is_empty());
+        // "file " mode: the row, and Enter opens Indexing Options (de-elevated, through the shell thread).
+        let mut s = typed(&fx, "file quokka");
+        assert_eq!(s.files_event(FilesEvent::Off(Why::SearchOff), &cx), [Effect::Relayout]);
+        assert_eq!(state(&s).as_deref(), Some("Windows Search is off"));
+        assert_eq!(s.selected().map(|r| r.key), Some(files::state_key()), "the only row");
+        assert_eq!(
+            press(&mut s, &fx, VK_RETURN, Mods::NONE),
+            [Effect::Hide { restore: false }, Effect::Launch(LaunchReq::IndexingOptions)]
+        );
+        // Off stays for the open, at every keystroke; a stall shows for its own generation only.
+        let mut s = typed(&fx, "file quokka");
+        s.files_event(FilesEvent::Off(Why::Stalled), &cx);
+        assert!(files_of(&s.chars("s", &cx)).iter().all(Option::is_none));
+        assert_eq!(state(&s).as_deref(), Some("File search isn't answering"));
+        assert!(s.selected().is_none(), "a row without an action is never the default");
+        let mut s = typed(&fx, "file quokka");
+        assert_eq!(s.files_event(FilesEvent::Stalled(s.gen()), &cx), [Effect::Relayout]);
+        assert_eq!(state(&s).as_deref(), Some("File search isn't answering"));
+        assert!(matches!(&files_of(&s.chars("s", &cx))[..], [Some(_)]), "files are still on");
+        assert_eq!(state(&s), None);
+        assert!(s.files_event(FilesEvent::Stalled(s.gen() - 1), &cx).is_empty(), "an older generation's stall");
     }
 
     #[test]
@@ -2291,7 +2533,8 @@ mod tests {
         let mut s = typed(&fx, "blocco");
         open_list(&mut s, &fx);
         press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
-        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout]);
+        let cleared = press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
+        assert_eq!(cleared, [Effect::Relayout, Effect::RequestFiles(None)], "and the files request is withdrawn");
         assert_eq!(s.query_text(), "");
     }
 
@@ -2798,7 +3041,8 @@ mod tests {
         s.alias_prompt(&fx.cx());
         press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
         press(&mut s, &fx, VK_END, Mods::NONE);
-        assert_eq!(press(&mut s, &fx, VK_ESCAPE, Mods::NONE), [Effect::Relayout], "the query is cleared first");
+        let cleared = press(&mut s, &fx, VK_ESCAPE, Mods::NONE);
+        assert_eq!(cleared, [Effect::Relayout, Effect::RequestFiles(None)], "the query is cleared first");
     }
 
     #[test]

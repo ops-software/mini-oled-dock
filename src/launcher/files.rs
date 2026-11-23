@@ -120,6 +120,12 @@ pub struct Req {
     pub cap: u8,
 }
 
+/// A text the helper may get: 1-256 characters, none of them a control, bidi or format character, not blank. Allocates
+/// nothing (the session asks it at every requery that wants files).
+pub fn sendable(text: &str) -> bool {
+    text_ok(text) && !text.trim().is_empty()
+}
+
 /// 1-256 characters, none of them a control, bidi or format character.
 fn text_ok(text: &str) -> bool {
     (1..=MAX_TEXT_CHARS).contains(&text.chars().count()) && !text.chars().any(is_hidden)
@@ -128,7 +134,7 @@ fn text_ok(text: &str) -> bool {
 /// The line the dock writes for `r`: `<gen> <text>\n`. None for a text the helper may not get (empty or blank, over
 /// 256 characters, or holding a control, bidi or format character).
 pub fn request_line(r: &Req) -> Option<String> {
-    (text_ok(&r.text) && !r.text.trim().is_empty()).then(|| format!("{} {}\n", r.gen, r.text))
+    sendable(&r.text).then(|| format!("{} {}\n", r.gen, r.text))
 }
 
 /// Why the helper refused a request line (it exits with code 2).
@@ -211,6 +217,9 @@ pub enum FrameError {
     PathForm,
     /// The name is not the path's last component.
     NameMismatch,
+    /// A frame the dock did not ask for: more frames than the state frame and one per request line written (the
+    /// reader's count, so a flood is never queued).
+    Unasked,
 }
 
 /// The state frame.
@@ -437,15 +446,15 @@ fn folded(s: &str) -> String {
 /// does, then the rest, each group in the helper's order (its rank); a path listed twice is kept once.
 pub fn resort(hits: &mut Vec<FileHit>, folded_words: &[&str]) {
     let first = folded_words.first().copied().unwrap_or("");
-    let mut seen: Vec<Box<str>> = Vec::with_capacity(hits.len());
-    hits.retain(|h| {
-        let dup = seen.iter().any(|p| p.eq_ignore_ascii_case(&h.path));
-        if !dup {
-            seen.push(h.path.clone());
+    let mut keyed: Vec<(u8, FileHit)> = Vec::with_capacity(hits.len());
+    for h in hits.drain(..) {
+        if !keyed.iter().any(|(_, k)| k.path.eq_ignore_ascii_case(&h.path)) {
+            keyed.push((match_of(&folded(&h.name), first), h));
         }
-        !dup
-    });
-    hits.sort_by_cached_key(|h| match_of(&folded(&h.name), first));
+    }
+    // At most 50 rows: the small stable sort (`tinysort`) is enough, and the standard one would add its code.
+    crate::tinysort::sort_by_key(&mut keyed, |k| k.0);
+    hits.extend(keyed.into_iter().map(|(_, h)| h));
 }
 
 /// The glyph of a listed item by its class (D6: a file row never asks for its own icon).
@@ -749,6 +758,7 @@ impl Pump {
     }
 
     /// Files are off for the rest of the open.
+    #[cfg(test)]
     pub fn is_off(&self) -> bool {
         self.off
     }

@@ -658,6 +658,14 @@ impl SysPort for RealSys {
             log!("launcher: posting the alias change failed: {e}");
         }
     }
+
+    fn files(&mut self, r: Option<crate::launcher::files::Req>) {
+        crate::launcher_files::request(r, crate::hwnd().0 as isize);
+    }
+
+    fn files_end(&mut self) {
+        crate::launcher_files::end();
+    }
 }
 
 // ---------------------------------------------------------------- PowerToys (L1b-5, SPEC 5.7)

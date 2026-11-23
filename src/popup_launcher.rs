@@ -627,8 +627,9 @@ impl Launcher {
                 // handler (`on_alias_message`), which then runs the query again.
                 Effect::SaveAlias { word, target } => sys.alias(AliasOp::Save { word, target }),
                 Effect::RemoveAlias(word) => sys.alias(AliasOp::Remove(word)),
-                // Files (L2).
-                Effect::DismissNotice(_) | Effect::RequestFiles(_) => {}
+                // Files (plan L2-F3): one channel send to the pump, never a wait.
+                Effect::RequestFiles(r) => sys.files(r),
+                Effect::DismissNotice(_) => {}
                 e @ (Effect::Launch(_)
                 | Effect::LaunchAlias(_)
                 | Effect::Copy(_)
@@ -732,6 +733,30 @@ impl Launcher {
         }
     }
 
+    /// `ShellEvent::LauncherFiles`: the pump's post, for the session (a batch of the current generation is merged by the
+    /// stability rule; anything of an older one is dropped).
+    pub(crate) fn files_event(&mut self, ev: crate::launcher::files::FilesEvent, cx: &Context) -> Reply {
+        #[cfg(feature = "owner-probe")]
+        let probe = match &ev {
+            crate::launcher::files::FilesEvent::Batch(b) if b.gen == self.session.gen() => {
+                Some((b.gen, b.items.len(), self.session.selected().map(|r| r.key)))
+            }
+            _ => None,
+        };
+        let fx = self.session.files_event(ev, cx);
+        #[cfg(feature = "owner-probe")]
+        if let Some((gen, n, before)) = probe {
+            let moved = before != self.session.selected().map(|r| r.key);
+            #[cfg(feature = "owner-probe")]
+            crate::launcher_probe::late_batch(gen, n, moved);
+        }
+        fx.iter().fold(Reply::None, |r, e| match e {
+            Effect::Relayout => r.merge(Reply::Relayout),
+            Effect::Redraw => r.merge(Reply::Redraw),
+            _ => r,
+        })
+    }
+
     /// The forgotten run lines leave the controller's history (outside the context's borrow).
     fn forget_runs(&mut self) {
         if self.forgotten.is_empty() && self.unlearn.is_empty() {
@@ -759,6 +784,8 @@ impl Launcher {
     /// the user came from gets the foreground back; then the queued effects. So a copy lands where the user came from,
     /// and launches leave the foreground to Explorer's grant.
     fn finish(&mut self, hook: &mut dyn HookPort, sys: &mut dyn SysPort) {
+        // The files pump ends with the open (D2): its helper is retired on the pump thread.
+        sys.files_end();
         hook.shown(false);
         hook.end(self.open_seq);
         #[cfg(feature = "owner-probe")]
@@ -2440,6 +2467,10 @@ pub(crate) trait SysPort {
     /// Holds an alias change for the dock window (one slot, `hold_alias_op`) and posts `WM_DOCK_LAUNCHER_ALIAS` to it:
     /// config.json is written there, never in the key handler.
     fn alias(&mut self, _op: AliasOp) {}
+    /// A requery's files request to the pump (`launcher_files::request`, plan L2-F3): a channel send, never a wait.
+    fn files(&mut self, _r: Option<crate::launcher::files::Req>) {}
+    /// Every close: the files pump ends (`launcher_files::end`).
+    fn files_end(&mut self) {}
 }
 
 /// The proof of a person's Ctrl+Shift+Enter (SPEC 5.4.9), built only for that key: the hook's evidence is consumed by
@@ -3366,6 +3397,15 @@ pub(crate) fn on_converted(gen: u64, meant: Option<String>) {
     }
 }
 
+/// `ShellEvent::LauncherFiles` (the files pump's posts, plan L2-F3), timed as KEY-11 bounds it (`UiWork::Files`).
+pub(crate) fn on_files(ev: crate::launcher::files::FilesEvent) {
+    #[cfg(feature = "owner-probe")]
+    let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::Files);
+    if ON.with(Cell::get) {
+        super::with_launcher(|l| ctx(|cx| l.files_event(ev, cx)).unwrap_or(Reply::None));
+    }
+}
+
 /// Runs `f` on the controller's state; None (logged) on a re-entry, never a panic.
 fn with_ctrl<R>(f: impl FnOnce(&mut Ctrl) -> R) -> Option<R> {
     CTRL.with(|c| match c.try_borrow_mut() {
@@ -3894,6 +3934,9 @@ mod tests {
         file: Option<(std::path::PathBuf, String)>,
         maps: u32,
         ensures: Vec<bool>,
+        /// The files requests' generations and the pump's closes.
+        files: Vec<Option<u64>>,
+        files_ends: u32,
     }
 
     impl SysPort for FakeSys {
@@ -3996,6 +4039,12 @@ mod tests {
         }
         fn alias(&mut self, op: AliasOp) {
             self.ops.push(Op::Alias(op));
+        }
+        fn files(&mut self, r: Option<crate::launcher::files::Req>) {
+            self.files.push(r.map(|r| r.gen));
+        }
+        fn files_end(&mut self) {
+            self.files_ends += 1;
         }
     }
 
@@ -4118,6 +4167,9 @@ mod tests {
 
     #[derive(Default)]
     struct EffectSys {
+        /// The generations of the files requests (None: a withdrawal) and the closes of the pump.
+        files: Vec<Option<u64>>,
+        files_ends: u32,
         clip: Option<String>,
         /// The app that copied `clip` marked it private: the port never reads it.
         private: bool,
@@ -4221,6 +4273,12 @@ mod tests {
         }
         fn alias(&mut self, op: AliasOp) {
             self.ops.push(format!("Alias({op:?})"));
+        }
+        fn files(&mut self, r: Option<crate::launcher::files::Req>) {
+            self.files.push(r.map(|r| r.gen));
+        }
+        fn files_end(&mut self) {
+            self.files_ends += 1;
         }
     }
 
@@ -4899,6 +4957,63 @@ mod tests {
         let old = l.session.gen();
         l.session.chars("w", &fx.cx());
         assert_eq!(l.converted(old, "calc", &fx.cx()), Reply::None);
+    }
+
+    #[test]
+    fn close_ends_the_files_pump() {
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        // The request goes to the pump at the key; every close (Esc, a launch, a focus loss: each ends in the host's
+        // close) ends the pump once, at `finish`.
+        const ESC: u16 = 0x1B;
+        for (how, typed_first, last) in [("esc", "zzq", "x"), ("launch", "blocc", "o"), ("focus", "zzq", "x")] {
+            let mut l = typed(&fx, typed_first);
+            let mut sys = EffectSys::default();
+            let effects = l.session.chars(last, &fx.cx());
+            l.run(effects, &fx.cx(), &mut sys);
+            assert_eq!(sys.files, [Some(l.session.gen())], "{how}");
+            let mut hook = FakeHook::default();
+            match how {
+                "esc" => {
+                    key(&mut l, &fx, &mut sys, ESC, Mods::NONE);
+                    assert_eq!(sys.files.last(), Some(&None), "clearing the query withdrew the request");
+                    assert_eq!(key(&mut l, &fx, &mut sys, ESC, Mods::NONE), Reply::Close);
+                }
+                "launch" => assert_eq!(key(&mut l, &fx, &mut sys, VK_RETURN, Mods::SHIFT), Reply::Close),
+                _ => {
+                    l.on_focus(false, &fx.cx(), &mut hook, &mut sys);
+                }
+            }
+            assert_eq!(sys.files_ends, 0, "{how}: nothing ends inside the key handler");
+            host_close(&mut l, &mut hook, &mut sys);
+            assert_eq!(sys.files_ends, 1, "{how}");
+        }
+        // The controller's flow records them too.
+        let mut sys = fresh();
+        sys.files(None);
+        sys.files_end();
+        assert_eq!((sys.files.len(), sys.files_ends), (1, 1));
+    }
+
+    #[test]
+    fn files_event_of_an_old_generation_is_dropped() {
+        use crate::launcher::files::{self, FileHit, FilesEvent};
+        use crate::launcher::providers::tests::Fx;
+        let fx = Fx::new();
+        let mut l = typed(&fx, "zzq");
+        let hit = FileHit { path: "C:\\u\\zzq.txt".into(), name: "zzq.txt".into(), folder: "u".into(), dir: false };
+        let batch = |gen| {
+            let items = files::items(vec![hit.clone()], &["zzq"], 3);
+            FilesEvent::Batch(crate::launcher::model::Batch { gen, from: ProviderId::Files, items, done: true })
+        };
+        let gen = l.session.gen();
+        assert_eq!(l.files_event(batch(gen - 1), &fx.cx()), Reply::None);
+        assert!(l.session.rows().iter().all(|r| r.from != ProviderId::Files));
+        assert_eq!(l.files_event(batch(gen), &fx.cx()), Reply::Relayout);
+        let row = l.session.rows().iter().find(|r| r.from == ProviderId::Files).unwrap();
+        assert_eq!((&*row.title, &row.icon), ("zzq.txt", &crate::launcher::model::IconRef::Glyph(GlyphId::Document)));
+        assert_eq!(l.files_event(FilesEvent::Slow(gen - 1), &fx.cx()), Reply::None);
+        assert_eq!(l.files_event(FilesEvent::Slow(gen), &fx.cx()), Reply::Redraw);
     }
 
     #[test]

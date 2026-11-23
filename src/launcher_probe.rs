@@ -43,8 +43,8 @@ pub fn force_yield() -> bool {
     switch(&ON, "DOCK_LAUNCHER_FORCE_YIELD")
 }
 
-/// `DOCK_LAUNCHER_MOTW_TEST=1`: executable files may be opened (`motw_ok` of `verbs_for`), for live check 6 only.
-#[allow(dead_code)] // the files provider passes it to verbs_for with its file rows (L2-1)
+/// `DOCK_LAUNCHER_MOTW_TEST=1`: executable files may be opened (`motw_ok` of `verbs_for`), for live check 6 only: the
+/// files pump gives it to the verbs of its file rows (`launcher_files::probe_verbs`).
 pub fn motw_test() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     switch(&ON, "DOCK_LAUNCHER_MOTW_TEST")
@@ -413,6 +413,8 @@ pub enum UiWork {
     SettingsReady,
     PrepareOpen,
     Icons,
+    /// A files post merged (`popup_launcher::on_files`, FILES-2).
+    Files,
 }
 
 /// KEY-11: 2 ms.
@@ -446,6 +448,7 @@ impl Drop for UiTimer {
             UiWork::SettingsReady => log!("launcher probe: ui work on_settings_ready {us} us"),
             UiWork::PrepareOpen => log!("launcher probe: ui work prepare_open {us} us"),
             UiWork::Icons => log!("launcher probe: ui work on_icons {us} us"),
+            UiWork::Files => log!("launcher probe: ui work on_files {us} us"),
         }
     }
 }
@@ -694,4 +697,73 @@ mod tests {
         record_hook_us(Duration::from_nanos(5_900));
         assert_eq!(HOOK_US[5].load(Relaxed), b + 1);
     }
+}
+
+// ---------------------------------------------------------------- files (plan L2-F3)
+
+/// `DOCK_LAUNCHER_FILES_STALL_MS=<ms>`: the files helper sleeps that long before each query (`--stall`, live check V-4).
+/// Read once.
+pub fn files_stall_ms() -> Option<u32> {
+    static MS: OnceLock<Option<u32>> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("DOCK_LAUNCHER_FILES_STALL_MS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The pump wrote the request of `gen`, `ms` after it came (its quiet time and any wait for the helper).
+pub fn files_written(gen: u64, ms: u64) {
+    if probe_on() {
+        log!("launcher probe: files request gen {gen} written after {ms} ms quiet");
+    }
+}
+
+/// A helper's state frame said 0, `ms` after its spawn; its private bytes then (FILES-4).
+pub fn files_state(ms: u64, private: Option<usize>) {
+    if probe_on() {
+        log!("launcher probe: files spawn to state {ms} ms");
+        if let Some(bytes) = private {
+            log!("launcher probe: files helper private {bytes} B at state 0");
+        }
+    }
+}
+
+/// The rows frame of `gen`: `n` rows `ms` after the write, `m` the helper's spawn-to-state time when this was its first
+/// request (else 0), and its private bytes after its first rows (FILES-1, FILES-4). Logged for dropped generations too.
+pub fn files_rows(gen: u64, n: usize, ms: u64, m: u64, private: Option<usize>) {
+    if probe_on() {
+        log!("launcher probe: files gen {gen} rows {n} after {ms} ms, spawn {m} ms");
+        if let Some(bytes) = private {
+            log!("launcher probe: files helper private {bytes} B after rows");
+        }
+    }
+}
+
+/// Whether a late batch moved the selection (the stability rule says it never does).
+#[derive(Debug)]
+enum Selection {
+    Unchanged,
+    Moved,
+}
+
+/// A files batch of the current generation was merged (V-2).
+pub fn late_batch(gen: u64, n: usize, moved: bool) {
+    if probe_on() {
+        let kind = if moved { Selection::Moved } else { Selection::Unchanged };
+        log!("launcher probe: late batch gen {gen} rows {n} selection {kind:?}");
+    }
+}
+
+/// The private bytes of a process the dock started (the files helper), read from its handle.
+pub fn process_private(h: std::os::windows::io::RawHandle) -> Option<usize> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `h` is the helper's process handle (full access, open while the helper is held); `c` is writable and `cb`
+    // is its size; the EX counters start with the plain ones.
+    unsafe { GetProcessMemoryInfo(HANDLE(h), std::ptr::from_mut(&mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb) }
+        .ok()?;
+    Some(c.PrivateUsage)
 }

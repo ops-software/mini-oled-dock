@@ -8,8 +8,6 @@ pub mod catalog;
 pub mod commands;
 pub mod datetime;
 pub mod field;
-// The helper child (L2-F2) and the pump (L2-F3) are its callers.
-#[allow(dead_code)]
 pub mod files;
 pub mod frecency;
 pub mod gesture;

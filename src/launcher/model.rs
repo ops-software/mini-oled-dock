@@ -192,7 +192,6 @@ pub enum CommandId {
     WindowMenu,
     ClipboardHistory,
     /// Indexing Options (the files state row's action, plan L2-F1): not in the searchable `COMMANDS` table.
-    #[allow(dead_code)] // L2-F3 shows the state row
     IndexingOptions,
 }
 
@@ -260,9 +259,7 @@ pub enum GlyphId {
     Prompt,
     Window,
     Document,
-    #[allow(dead_code)] // L2-3: file rows
     Image,
-    #[allow(dead_code)] // L2-3: file rows
     Archive,
     Executable,
     Copy,
