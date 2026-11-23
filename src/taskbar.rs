@@ -30,8 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsWindowVisible, KillTimer, PostMessageW, RegisterWindowMessageW, RemovePropW,
     SendMessageTimeoutW, SendNotifyMessageW, SetPropW, SetTimer, SetWindowPos, ShowWindowAsync, EVENT_OBJECT_CREATE,
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW, HWND_BOTTOM, HWND_BROADCAST, HWND_NOTOPMOST, HWND_TOPMOST, MSGFLT_ALLOW,
-    OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOWNA, WM_COPYDATA,
+    OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WM_COPYDATA,
 };
 
 use crate::config;
@@ -220,7 +220,11 @@ fn appbar_direct(msg: u32, hwnd: HWND, lparam: u32) -> Option<usize> {
 }
 
 /// `appbar_direct` with the APPBARDATA `uEdge` and `rc` filled in (`ABM_GETAUTOHIDEBAREX` needs both) and
-/// a timeout of its own (ms).
+/// a timeout of its own (ms). SMTO_BLOCK makes the timeout a true bound on the UI thread: without it the thread
+/// dispatches the messages other processes send the dock while Explorer is slow, each one starts the timeout again
+/// (live check V-14), and the heartbeat starves. Explorer has nothing to send the dock while it answers (the dock
+/// registers no AppBar, so it gets no ABN_ notification); were it to, the send would end at its timeout and the
+/// fallback would run, as for a slow Explorer.
 fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, timeout_ms: u32) -> Option<usize> {
     let mut m = AppBarMsg {
         abd: AppBarData32 { cb_size: 0x28, hwnd: hwnd.0 as usize as u32, callback: 0, edge, rc, lparam: lparam as i64 },
@@ -237,14 +241,14 @@ fn appbar_direct_at(msg: u32, hwnd: HWND, edge: u32, rc: [i32; 4], lparam: u32, 
     };
     let mut res = 0usize;
     // SAFETY: `cds` and `m` live for the whole call, which copies the data to Explorer; `res` is
-    // writable; SMTO_ABORTIFHUNG avoids waits on a hung Explorer.
+    // writable; SMTO_ABORTIFHUNG avoids waits on a hung Explorer, SMTO_BLOCK keeps the timeout whole.
     let r = unsafe {
         SendMessageTimeoutW(
             hwnd,
             WM_COPYDATA,
             WPARAM(hwnd.0 as usize),
             LPARAM(&cds as *const COPYDATASTRUCT as isize),
-            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            SMTO_BLOCK | SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
             timeout_ms,
             Some(&mut res),
         )
@@ -902,10 +906,11 @@ pub fn hide_all() {
             }
         }
         AutoHideAction::Send => {
-            // A restore can have run while the messages above waited for Explorer: nested in this very call
-            // (SendMessageTimeoutW without SMTO_BLOCK handles incoming sent messages, so WM_ENDSESSION can run
-            // begin_exit + restore inside the query), or from the watchdog, which deletes the state file. Auto-hide
-            // sent after that restore stays on in Explorer and becomes the "original" at the next start.
+            // A restore can have run while the messages above waited for Explorer: nested in this very call (the
+            // direct sends block, but SHAppBarMessage, the fallback of a failed read, can handle incoming sent
+            // messages while it waits, so WM_ENDSESSION can run begin_exit + restore inside it), or from the
+            // watchdog, which deletes the state file. Auto-hide sent after that restore stays on in Explorer and
+            // becomes the "original" at the next start.
             if RESTORING.load(Relaxed) || restored_externally() {
                 return;
             }
@@ -913,8 +918,8 @@ pub fn hide_all() {
             log!("taskbar: {}{}, sending ABM_SETSTATE", autohide_off_text(read), edge_check_text(owner, &asked));
             // Send without verification: we are on the UI thread here and the confirmation re-read is not needed.
             // The direct send waits up to APPBAR_TIMEOUT_MS, so the same race is checked again before the
-            // fallback: a restore nested in that wait has already sent the original state, and the fallback
-            // would put auto-hide back on after it.
+            // fallback: a restore run during that wait (the watchdog's) has already sent the original state, and the
+            // fallback would put auto-hide back on after it.
             if appbar_direct(ABM_SETSTATE, first, ABS_AUTOHIDE).is_none() {
                 if RESTORING.load(Relaxed) || restored_externally() {
                     return;

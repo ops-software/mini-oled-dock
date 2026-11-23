@@ -51,8 +51,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync, SwitchToThisWindow,
     ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER, GET_WINDOW_CMD, GWL_EXSTYLE, OBJID_WINDOW, SC_MINIMIZE,
-    SC_RESTORE, SMTO_ABORTIFHUNG, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE,
-    WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SC_RESTORE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_CLOSE, WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::log;
@@ -1016,20 +1016,23 @@ pub fn close_group(key: &str) {
 
 /// Sends `WM_SYSCOMMAND` with a timeout (does not block the UI on hung apps). `true` if delivered. A window whose
 /// thread does not answer the ping (`ui::answers`, 50 ms at most) is not sent it: the caller's ShowWindowAsync does it.
+/// SMTO_BLOCK keeps the 300 ms a true bound for an app that stops answering after the ping: without it the UI thread
+/// dispatches the messages other processes send the dock while it waits, and each one starts the timeout again (live
+/// check V-14). A send that times out is reported as not delivered, so the caller's ShowWindowAsync acts.
 fn sys_command(h: isize, cmd: u32) -> bool {
     if !crate::ui::answers(hw(h)) {
         return false;
     }
     let mut res = 0usize;
-    // SAFETY: arbitrary HWND allowed; `res` is valid for writing; SMTO_ABORTIFHUNG +
-    // a 300 ms timeout limit the wait if the target thread does not respond.
+    // SAFETY: arbitrary HWND allowed; `res` is valid for writing; SMTO_BLOCK, SMTO_ABORTIFHUNG and
+    // a 300 ms timeout bound the wait if the target thread does not respond.
     let r = unsafe {
         SendMessageTimeoutW(
             hw(h),
             WM_SYSCOMMAND,
             WPARAM(cmd as usize),
             LPARAM(0),
-            SMTO_ABORTIFHUNG,
+            SMTO_BLOCK | SMTO_ABORTIFHUNG,
             SYSCMD_TIMEOUT_MS,
             Some(&mut res),
         )

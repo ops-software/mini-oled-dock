@@ -57,12 +57,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, PostMessageW, PostQuitMessage,
     RegisterClassExW, RegisterWindowMessageW, SendMessageTimeoutW, SendNotifyMessageW, SetPropW, SetTimer,
     SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, ASFW_ANY, CS_DBLCLKS, GWL_STYLE, HICON, HWND_BOTTOM,
-    HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WINDOWPOS, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_USER, WM_WINDOWPOSCHANGED, WNDCLASSEXW,
-    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WINDOWPOS, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_USER, WM_WINDOWPOSCHANGED,
+    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::icons::{self, IconBitmap};
@@ -1549,7 +1549,8 @@ pub fn yield_now() {
 }
 
 /// For processes that do NOT own the host (watchdog, `--restore`): finds every window with
-/// `PROP_DOCK_TRAY_HOST` and sends it `DockTrayYield` (`SendMessageTimeoutW`, `SMTO_ABORTIFHUNG`, 500 ms);
+/// `PROP_DOCK_TRAY_HOST` and sends it `DockTrayYield` (`SendMessageTimeoutW`, `SMTO_BLOCK | SMTO_ABORTIFHUNG`, 500 ms,
+/// a true bound also when the dock's UI thread restores);
 /// if it does not respond, `SetWindowPos(HWND_BOTTOM, SWP_ASYNCWINDOWPOS)` as best effort. Returns true if
 /// at least one host was left unresponsive (the watchdog decides the policy).
 pub fn yield_foreign_hosts() -> bool {
@@ -1571,8 +1572,10 @@ pub fn yield_foreign_hosts() -> bool {
             continue;
         }
         let mut res = 0usize;
-        // SAFETY: registered message without pointers; `res` valid; SMTO_ABORTIFHUNG avoids waiting on hung hosts.
-        let r = unsafe { SendMessageTimeoutW(h, msg, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 500, Some(&mut res)) };
+        // SAFETY: registered message without pointers; `res` valid; SMTO_ABORTIFHUNG avoids waiting on hung hosts,
+        // SMTO_BLOCK keeps the 500 ms whole.
+        let flags = SMTO_BLOCK | SMTO_ABORTIFHUNG;
+        let r = unsafe { SendMessageTimeoutW(h, msg, WPARAM(0), LPARAM(0), flags, 500, Some(&mut res)) };
         if r.0 == 0 {
             log!("tray: host {:?} did not respond to DockTrayYield, sending it to the bottom", h.0);
             unanswered = true;
