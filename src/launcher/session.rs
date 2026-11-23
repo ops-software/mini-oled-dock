@@ -4,7 +4,7 @@
 //! holds the foreground and hides after; a launch hides first so Explorer gets the foreground grant; a copy hides with
 //! the restore so the text lands where the user came from.
 
-use super::aliases::{self, AliasRefusal, AliasTarget, MAX_ALIASES};
+use super::aliases::{self, AliasRefusal, AliasTarget};
 use super::field::{Edit, FieldOut, KeyEvent, Motion, TextField};
 use super::files::{self, FilesEvent, Req, Why};
 use super::gesture::{self, Gesture, Refusal};
@@ -347,7 +347,8 @@ fn prompt_check(edit: &AliasEdit, text: &str, cx: &Context) -> Result<(Box<str>,
     };
     let folded = aliases::check_word(word, &cx.opts.prefixes)?;
     let target = target?;
-    if cx.opts.aliases.len() >= MAX_ALIASES && cx.opts.aliases.find(&folded).is_none() {
+    // The handler's count (config.json's entries that stay, the ignored ones included).
+    if cx.opts.aliases.cap_reached(&folded) {
         return Err(AliasRefusal::Full);
     }
     Ok((word.into(), target))

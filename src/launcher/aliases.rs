@@ -210,9 +210,18 @@ pub struct Alias {
 }
 
 /// The aliases the launcher serves, sorted by folded word: built once per config change, read by one binary search per
-/// key. At most 64 of at most 16 + 512 characters.
+/// key. At most 64 of at most 16 + 512 characters. It also remembers how many entries config.json holds and the folded
+/// words of the valid ones it does not serve, so the cap on saving a word is one count (`cap_reached`) for the prompt and
+/// for the handler that writes.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct AliasTable(Vec<Alias>);
+pub struct AliasTable {
+    list: Vec<Alias>,
+    /// Every entry of the map the table was built from, the ignored ones included.
+    entries: usize,
+    /// The folded words of the valid entries that are not in `list` (the second of two equal folds, those past the 64th),
+    /// sorted. Usually empty.
+    unserved: Vec<Box<str>>,
+}
 
 impl AliasTable {
     /// The table of config.json's `launcher.aliases`, and how many of its entries it ignores: a word or a target it
@@ -229,34 +238,59 @@ impl AliasTable {
         }
         // Stable: of two equal folded words the first of the map stays first, and `dedup_by` keeps it.
         crate::tinysort::sort_by(&mut list, |a, b| a.folded.cmp(&b.folded));
+        let mut unserved: Vec<Box<str>> = Vec::new();
         let before = list.len();
-        list.dedup_by(|later, first| later.folded == first.folded);
+        list.dedup_by(|later, first| {
+            let same = later.folded == first.folded;
+            if same {
+                unserved.push(later.folded.clone());
+            }
+            same
+        });
         ignored += before - list.len();
         if list.len() > MAX_ALIASES {
             ignored += list.len() - MAX_ALIASES;
+            unserved.extend(list.iter().skip(MAX_ALIASES).map(|a| a.folded.clone()));
             list.truncate(MAX_ALIASES);
         }
         list.shrink_to_fit();
-        (AliasTable(list), ignored)
+        unserved.sort_unstable();
+        unserved.shrink_to_fit();
+        (AliasTable { list, entries: map.len(), unserved }, ignored)
     }
 
     /// The alias of a folded query typed whole: one binary search, no allocation.
     pub fn find(&self, folded: &str) -> Option<&Alias> {
-        self.0.binary_search_by(|a| (*a.folded).cmp(folded)).ok().and_then(|i| self.0.get(i))
+        self.list.binary_search_by(|a| (*a.folded).cmp(folded)).ok().and_then(|i| self.list.get(i))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // the prompt counts through `cap_reached`
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.list.len()
+    }
+
+    /// How many entries config.json keeps when the word folded as `folded` is saved: all of them, ignored ones included,
+    /// except the valid entries the word replaces (those with its folded form, served or not).
+    pub fn stays_beside(&self, folded: &str) -> usize {
+        let others = self.unserved.iter().filter(|u| ***u == *folded).count();
+        let replaced = usize::from(self.find(folded).is_some()).saturating_add(others);
+        self.entries.saturating_sub(replaced)
+    }
+
+    /// Saving the word folded as `folded` would leave more than `MAX_ALIASES` entries in config.json: the one count of
+    /// the alias prompt and of the handler that writes the change.
+    pub fn cap_reached(&self, folded: &str) -> bool {
+        self.stays_beside(folded) >= MAX_ALIASES
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // clippy's len_without_is_empty
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.list.is_empty()
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // L2-A3: Settings lists them
     pub fn iter(&self) -> impl Iterator<Item = &Alias> {
-        self.0.iter()
+        self.list.iter()
     }
 }
 

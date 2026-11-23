@@ -22,7 +22,7 @@ use crate::config::LauncherConfig;
 use crate::glyphs;
 use crate::hook::{self, KeyRec, PassFlags, PostAction, RING_CAP};
 use crate::icons::IconBitmap;
-use crate::launcher::aliases::{AliasTable, MAX_ALIASES};
+use crate::launcher::aliases::AliasTable;
 use crate::launcher::arena::{self, Arena, Caps, CatalogView, Kind as ArenaKind, SettingIn};
 use crate::launcher::catalog::{self, IconCache};
 use crate::launcher::datetime::TimeStyle;
@@ -3161,10 +3161,11 @@ fn keeps_beside(w: &str, t: &str, f: &str, p: &PrefixTable) -> bool {
     fold_word(w) != f || check_word(w, p).is_err() || classify(t).is_err()
 }
 
-/// Saving `word` would leave more than `MAX_ALIASES` entries in config.json (the entries it replaces do not count).
+/// Saving `word` would leave more than `MAX_ALIASES` entries in config.json (the entries it replaces do not count, the
+/// ignored ones do). The count is `AliasTable::cap_reached`'s, the one the alias prompt asks too.
 fn alias_cap_reached(l: &LauncherConfig, word: &str) -> bool {
-    let (f, p) = (fold_word(word), PrefixTable::from_pairs(&l.prefixes));
-    l.aliases.iter().filter(|(w, t)| keeps_beside(w, t, &f, &p)).count() >= MAX_ALIASES
+    let table = AliasTable::build(&l.aliases, &PrefixTable::from_pairs(&l.prefixes)).0;
+    table.cap_reached(&fold_word(word))
 }
 
 /// The change on `launcher.aliases`. A saved word replaces an entry the table serves whose word is equal to it once
@@ -4006,6 +4007,7 @@ impl Content for FieldPair {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::launcher::aliases::MAX_ALIASES;
 
     // ---- the controller's ports, recorded
 
@@ -7013,6 +7015,62 @@ mod tests {
             strings::alias_refusal(crate::launcher::aliases::AliasRefusal::Full)
         );
         assert_eq!(alias_failed_row(AliasFail::Write).title.as_ref(), strings::alias_not_saved());
+    }
+
+    /// One count of the alias cap: config.json's entries that stay, the ignored ones included. The prompt used the served
+    /// table's size and offered a save the handler then refused (live review note).
+    #[test]
+    fn the_prompt_and_the_handler_count_the_alias_cap_alike() {
+        use crate::launcher::aliases::AliasRefusal;
+        let mut l = LauncherConfig::default();
+        // 60 served entries, 4 ignored (a word with a space, a custom scheme, an equal fold of a served word): 64 in
+        // the file, 60 in the table.
+        for i in 0..60 {
+            l.aliases.insert(format!("w{i:02}"), "https://example.com/".into());
+        }
+        l.aliases.insert("bad word".into(), "https://example.com/".into());
+        l.aliases.insert("game".into(), "steam://run/1".into());
+        l.aliases.insert("W00".into(), "https://example.com/dup".into());
+        l.aliases.insert("1x".into(), "https://example.com/".into());
+        assert_eq!(l.aliases.len(), 64);
+        let p = PrefixTable::from_pairs(&l.prefixes);
+        let (table, ignored) = AliasTable::build(&l.aliases, &p);
+        assert_eq!((table.len(), ignored), (60, 4));
+        // What the alias prompt says to "<word> <target>" with this table (what the open launcher holds).
+        let prompt_for = |table: &AliasTable, word: &str| {
+            let mut fx = alias_fx();
+            fx.opts.aliases = table.clone();
+            let mut l = opened(9);
+            let mut sys = EffectSys::default();
+            let out = l.session.alias_prompt(&fx.cx());
+            l.run(out, &fx.cx(), &mut sys);
+            l.session.chars(&format!("{word} https://example.com/x"), &fx.cx());
+            &*l.session.rows()[0].title == strings::alias_refusal(AliasRefusal::Full)
+        };
+        let prompt = |word: &str| prompt_for(&table, word);
+        // A new word: 64 entries stay, so both refuse (before, the prompt said yes and the handler no).
+        assert!(alias_cap_reached(&l, "extra"));
+        assert!(prompt("extra"));
+        // A served word, and both spellings of an equal fold, replace entries: both allow.
+        for w in ["w05", "W05", "w00"] {
+            assert_eq!(alias_cap_reached(&l, w), prompt(w), "{w}");
+        }
+        assert!(!alias_cap_reached(&l, "w05") && !prompt("w05"));
+        // A word that replaces nothing the table serves ("game"'s entry is ignored and stays): both refuse.
+        assert!(alias_cap_reached(&l, "game") && prompt("game"));
+        // The same count at every size of the file.
+        for n in [0usize, 10, 63, 64, 70] {
+            let mut m = LauncherConfig::default();
+            for i in 0..n {
+                let target = if i % 3 == 0 { "steam://x" } else { "https://example.com/" };
+                m.aliases.insert(format!("k{i:02}"), target.into());
+            }
+            let t = AliasTable::build(&m.aliases, &PrefixTable::from_pairs(&m.prefixes)).0;
+            for w in ["new", "k00", "K01"] {
+                let full = prompt_for(&t, w);
+                assert_eq!(full, alias_cap_reached(&m, w), "{n} {w}");
+            }
+        }
     }
 
     /// A post to the dock window that fails drops the change the user typed at once and says so; the launcher stays.
