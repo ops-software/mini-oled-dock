@@ -49,10 +49,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDesktopWindow,
     GetForegroundWindow, GetPropW, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync, SwitchToThisWindow,
-    ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER, GET_WINDOW_CMD, GWL_EXSTYLE, OBJID_WINDOW, SC_MINIMIZE,
-    SC_RESTORE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CLOSE, WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    ASFW_ANY, CHILDID_SELF, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOT, GA_ROOTOWNER,
+    GET_WINDOW_CMD, GWL_EXSTYLE, OBJID_WINDOW, SC_MINIMIZE, SC_RESTORE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SW_MINIMIZE,
+    SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_SYSCOMMAND, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::log;
@@ -219,8 +220,58 @@ pub fn remove_winevent_hook() {
     log!("apps: WinEventHooks removed");
 }
 
-/// WinEvent callback (UI thread, during the message loop). Filters child-control noise and
-/// posts `WM_DOCK_APPS_DIRTY`. Does not touch `STATE`: no risk of reentrancy on a `RefCell`.
+/// The window styles that decide whether a window could be in the bar (the four style checks that open
+/// `is_taskbar_window`).
+#[derive(Clone, Copy)]
+struct Styles {
+    visible: bool,
+    tool: bool,
+    noactivate: bool,
+    app: bool,
+    owned: bool,
+}
+
+/// Reads the styles of `h` (no message is sent to the window).
+fn styles_of(h: HWND) -> Styles {
+    // SAFETY: all the APIs below accept arbitrary HWNDs and fail without UB if the window disappears.
+    unsafe {
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        Styles {
+            visible: IsWindowVisible(h).as_bool(),
+            tool: ex & WS_EX_TOOLWINDOW.0 != 0,
+            noactivate: ex & WS_EX_NOACTIVATE.0 != 0,
+            app: ex & WS_EX_APPWINDOW.0 != 0,
+            owned: !GetWindow(h, GW_OWNER).unwrap_or_default().0.is_null(),
+        }
+    }
+}
+
+/// True when a window with these styles passes the first filter of `is_taskbar_window`.
+fn could_be_listed(s: Styles) -> bool {
+    s.visible && !s.tool && (!s.noactivate || s.app) && (!s.owned || s.app)
+}
+
+/// Whether `h` is in the list the bar shows (the cache); None when the cache is borrowed (unknown).
+fn listed(h: isize) -> Option<bool> {
+    STATE.with(|s| s.try_borrow().ok().map(|st| st.cache.contains_key(&h)))
+}
+
+/// Whether a window event can change the bar and so must post `WM_DOCK_APPS_DIRTY`. DESTROY, HIDE and CLOAKED
+/// matter only for a listed window; CREATE, SHOW and UNCLOAKED for a listed one or one that could be listed
+/// now; FOREGROUND always. Unknown listing: post (fail open). `styles` runs only when it decides.
+fn post_wanted(event: u32, listed: Option<bool>, styles: impl FnOnce() -> Styles) -> bool {
+    if event == EVENT_SYSTEM_FOREGROUND || listed != Some(false) {
+        return true;
+    }
+    match event {
+        EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED => false,
+        EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => could_be_listed(styles()),
+        _ => true,
+    }
+}
+
+/// WinEvent callback (UI thread, during the message loop). Filters child-control noise and windows that cannot
+/// change the bar, and posts `WM_DOCK_APPS_DIRTY`. Reads `STATE` only with `try_borrow` (no reentrancy panic).
 unsafe extern "system" fn winevent_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -245,13 +296,18 @@ unsafe extern "system" fn winevent_proc(
         if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 {
             return;
         }
-        // Discard child windows: the parent of top-levels (and owned windows) is the desktop.
-        // For DESTROY the parent may no longer be readable (null): in that case we post.
-        // SAFETY: GetAncestor/GetDesktopWindow accept arbitrary HWNDs and have no side effects.
-        let (parent, desktop) = unsafe { (GetAncestor(hwnd, GA_PARENT), GetDesktopWindow()) };
-        if !parent.0.is_null() && parent != desktop {
-            return;
+        // Discard child windows: the parent of top-levels (and owned windows) is the desktop. DESTROY, HIDE and
+        // CLOAKED matter only for a listed window, which is top-level: the listing check below decides alone.
+        if !matches!(event, EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED) {
+            // SAFETY: GetAncestor/GetDesktopWindow accept arbitrary HWNDs and have no side effects.
+            let (parent, desktop) = unsafe { (GetAncestor(hwnd, GA_PARENT), GetDesktopWindow()) };
+            if !parent.0.is_null() && parent != desktop {
+                return;
+            }
         }
+    }
+    if !post_wanted(event, listed(hwnd.0 as isize), || styles_of(hwnd)) {
+        return;
     }
     let ui = crate::hwnd();
     if ui.0.is_null() {
@@ -1116,19 +1172,8 @@ pub fn is_taskbar_window(h: HWND, own: HWND) -> bool {
     }
     // SAFETY: all the APIs below accept arbitrary HWNDs and fail without UB if the window disappears.
     unsafe {
-        if !IsWindowVisible(h).as_bool() {
-            return false;
-        }
-        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
-        if ex & WS_EX_TOOLWINDOW.0 != 0 {
-            return false;
-        }
-        if ex & WS_EX_NOACTIVATE.0 != 0 && ex & WS_EX_APPWINDOW.0 == 0 {
-            return false;
-        }
-        // Owned windows (dialogs etc.) excluded except WS_EX_APPWINDOW, like Alt+Tab.
-        let owner = GetWindow(h, GW_OWNER).unwrap_or_default();
-        if !owner.0.is_null() && ex & WS_EX_APPWINDOW.0 == 0 {
+        // Visible, not a tool window, no NOACTIVATE or owned window without APPWINDOW (like Alt+Tab).
+        if !could_be_listed(styles_of(h)) {
             return false;
         }
         let mut cloaked: u32 = 0;
@@ -1181,6 +1226,76 @@ fn excluded_class(class: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain() -> Styles {
+        Styles { visible: true, tool: false, noactivate: false, app: false, owned: false }
+    }
+
+    #[test]
+    fn could_be_listed_mirrors_the_taskbar_filter() {
+        assert!(could_be_listed(plain()));
+        assert!(!could_be_listed(Styles { tool: true, ..plain() }));
+        assert!(!could_be_listed(Styles { tool: true, app: true, ..plain() }));
+        assert!(!could_be_listed(Styles { noactivate: true, ..plain() }));
+        assert!(could_be_listed(Styles { noactivate: true, app: true, ..plain() }));
+        assert!(!could_be_listed(Styles { owned: true, ..plain() }));
+        assert!(could_be_listed(Styles { owned: true, app: true, ..plain() }));
+        assert!(!could_be_listed(Styles { visible: false, ..plain() }));
+    }
+
+    const EVENTS: [u32; 7] = [
+        EVENT_OBJECT_CREATE,
+        EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_DESTROY,
+        EVENT_OBJECT_CLOAKED,
+        EVENT_OBJECT_UNCLOAKED,
+        EVENT_SYSTEM_FOREGROUND,
+    ];
+
+    #[test]
+    fn tool_window_events_never_post() {
+        let tool = || Styles { tool: true, ..plain() };
+        for e in [EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT_DESTROY] {
+            assert!(!post_wanted(e, Some(false), tool), "event {e:#x}");
+        }
+    }
+
+    #[test]
+    fn an_unlisted_destroy_never_posts() {
+        for e in [EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_CLOAKED] {
+            assert!(!post_wanted(e, Some(false), || panic!("styles are not read for {e:#x}")));
+        }
+    }
+
+    #[test]
+    fn a_listed_window_always_posts() {
+        for e in EVENTS {
+            assert!(post_wanted(e, Some(true), || panic!("styles are not read for a listed window")));
+        }
+    }
+
+    #[test]
+    fn a_shown_candidate_posts() {
+        for e in [EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED] {
+            assert!(post_wanted(e, Some(false), plain));
+            assert!(!post_wanted(e, Some(false), || Styles { visible: false, ..plain() }));
+        }
+    }
+
+    #[test]
+    fn foreground_always_posts() {
+        for l in [None, Some(false), Some(true)] {
+            assert!(post_wanted(EVENT_SYSTEM_FOREGROUND, l, || panic!("styles are not read for FOREGROUND")));
+        }
+    }
+
+    #[test]
+    fn an_unknown_listing_posts() {
+        for e in EVENTS {
+            assert!(post_wanted(e, None, || panic!("styles are not read when the listing is unknown")));
+        }
+    }
 
     #[test]
     fn settings_window_is_not_an_app() {

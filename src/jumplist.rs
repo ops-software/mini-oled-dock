@@ -15,6 +15,10 @@
 //! only on a click, through `ShellRequest::Launch` (the desktop shell, at the user's own rights):
 //! exactly what the program that wrote the file could already do by itself.
 //!
+//! START MENU SHORTCUTS: the same parser reads the `.lnk` files of the user's own Start menu folder
+//! for the Start menu index and the Start import (`read_lnk`, `parse_lnk`), which any program of the
+//! user can write too: the target path only, never handed to the shell link loader.
+//!
 //! NOT READ: the automatic lists (Recent / Frequent, `AutomaticDestinations`), items that are not
 //! shell links, and links without a local file target.
 //!
@@ -42,6 +46,12 @@ pub(crate) const MAX_OTHER: usize = 5;
 /// Longest title (characters) and arguments (bytes) accepted.
 const MAX_TITLE: usize = 80;
 const MAX_ARGS: usize = 2048;
+/// Largest `.lnk` file read (`read_lnk`).
+const MAX_LNK_FILE: u64 = 128 * 1024;
+/// EnvironmentVariableDataBlock ([MS-SHLLINK] 2.5.4): its signature and its only valid size (size,
+/// signature, TargetAnsi of 260 bytes, TargetUnicode of 520 bytes).
+const ENV_BLOCK: u32 = 0xA000_0001;
+const ENV_BLOCK_SIZE: usize = 0x314;
 
 /// CLSID_ShellLink {00021401-0000-0000-C000-000000000046}, as stored before each link.
 const CLSID_LINK: [u8; 16] = [0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
@@ -65,6 +75,27 @@ pub enum Entry {
 pub struct Group {
     pub name: String,
     pub entries: Vec<Entry>,
+}
+
+/// What the Start menu index and the Start import take from a `.lnk` file (`parse_lnk`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LnkFacts {
+    /// A local `X:\...` path, or `%NAME%\...` from the environment block, not expanded here.
+    pub(crate) target: String,
+    /// The link passes arguments to its target.
+    pub(crate) has_args: bool,
+}
+
+/// The fields of one serialized shell link that this module uses (`parse_link_raw`), unchecked.
+struct RawLink {
+    /// LinkInfo's local path.
+    info_path: Option<String>,
+    /// The environment block's target (HasExpString set).
+    env_path: Option<String>,
+    name: String,
+    args: String,
+    title: Option<String>,
+    separator: bool,
 }
 
 // ------------------------------------------------------------------ app id -> file
@@ -268,6 +299,23 @@ fn parse_category(b: &[u8], o: &mut usize) -> Option<Option<Group>> {
 /// link that is well formed but not shown (no title, no local file target, odd characters);
 /// `None` when the data is not a shell link.
 fn parse_link(b: &[u8], pos: &mut usize) -> Option<Option<Entry>> {
+    let RawLink { info_path, name, args, title, separator, .. } = parse_link_raw(b, pos, false)?;
+    if separator {
+        return Some(Some(Entry::Separator));
+    }
+    let entry = (|| {
+        let title = clean(title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or(&name), MAX_TITLE)?;
+        let target = info_path.filter(|t| is_local_file_path(t))?;
+        let args = args.trim().to_string();
+        (args.len() <= MAX_ARGS && !args.chars().any(char::is_control)).then_some(Entry::Link { title, target, args })
+    })();
+    Some(entry)
+}
+
+/// The fields of the shell link at `*pos`, which is moved past it; `None` when the data is not a
+/// shell link. `honour_force_no_link_info`: a link with ForceNoLinkInfo has no LinkInfo path, as
+/// the shell reads it (`.lnk` files; jump lists keep their reading).
+fn parse_link_raw(b: &[u8], pos: &mut usize, honour_force_no_link_info: bool) -> Option<RawLink> {
     let mut o = *pos;
     span(b, o, 0x4C)?;
     if u32_at(b, o)? != 0x4C {
@@ -281,13 +329,16 @@ fn parse_link(b: &[u8], pos: &mut usize) -> Option<Option<Entry>> {
         span(b, o, 2 + n)?;
         o += 2 + n;
     }
-    let mut target = None;
+    let mut info_path = None;
     if flags & 0x02 != 0 {
         let n = u32_at(b, o)? as usize;
         if n < 0x1C {
             return None;
         }
-        target = link_info_path(span(b, o, n)?);
+        let info = span(b, o, n)?;
+        if !(honour_force_no_link_info && flags & 0x100 != 0) {
+            info_path = link_info_path(info);
+        }
         o += n;
     }
     // StringData: NAME, RELATIVE_PATH, WORKING_DIR, ARGUMENTS, ICON_LOCATION, each counted.
@@ -309,8 +360,9 @@ fn parse_link(b: &[u8], pos: &mut usize) -> Option<Option<Entry>> {
             }
         }
     }
-    // ExtraData: blocks until a size below 4. The property store holds the title.
-    let (mut title, mut separator) = (None, false);
+    // ExtraData: blocks until a size below 4. The property store holds the title; the environment
+    // block (read only with HasExpString, as the shell does) holds the unexpanded target.
+    let (mut title, mut separator, mut env_path) = (None, false, None);
     loop {
         let n = u32_at(b, o)? as usize;
         if n < 4 {
@@ -320,20 +372,43 @@ fn parse_link(b: &[u8], pos: &mut usize) -> Option<Option<Entry>> {
         let block = span(b, o, n)?;
         if n >= 8 && u32_at(block, 4)? == 0xA000_0009 {
             let _ = properties(&block[8..], &mut title, &mut separator);
+        } else if n == ENV_BLOCK_SIZE && flags & 0x200 != 0 && u32_at(block, 4)? == ENV_BLOCK {
+            env_path = env_block_path(block);
         }
         o += n;
     }
     *pos = o;
-    if separator {
-        return Some(Some(Entry::Separator));
+    Some(RawLink { info_path, env_path, name, args, title, separator })
+}
+
+/// The target of an EnvironmentVariableDataBlock: TargetUnicode, else TargetAnsi.
+fn env_block_path(block: &[u8]) -> Option<String> {
+    let wide = utf16(span(block, 8 + 260, 520)?);
+    let text = if wide.is_empty() { ansi(span(block, 8, 260)?) } else { wide };
+    (!text.is_empty()).then_some(text)
+}
+
+/// The target of a `.lnk` file, parsed in safe Rust (the structure of a jump list link, without
+/// the CLSID in front): LinkInfo's local path unless ForceNoLinkInfo is set, else the environment
+/// block's target, left unexpanded (the caller expands it with `shell_thread::expand_env` and checks
+/// the result with `is_local_file_path`). `None` for a link with only an id list, a network or
+/// odd path, or damaged data. Never panics.
+pub(crate) fn parse_lnk(b: &[u8]) -> Option<LnkFacts> {
+    if span(b, 4, 16)? != CLSID_LINK {
+        return None;
     }
-    let entry = (|| {
-        let title = clean(title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or(&name), MAX_TITLE)?;
-        let target = target.filter(|t| is_local_file_path(t))?;
-        let args = args.trim().to_string();
-        (args.len() <= MAX_ARGS && !args.chars().any(char::is_control)).then_some(Entry::Link { title, target, args })
-    })();
-    Some(entry)
+    let raw = parse_link_raw(b, &mut 0, true)?;
+    let target = raw
+        .info_path
+        .filter(|t| is_local_file_path(t))
+        .or_else(|| raw.env_path.filter(|t| is_local_file_path(t) || is_env_file_path(t)))?;
+    Some(LnkFacts { target, has_args: !raw.args.is_empty() })
+}
+
+/// `parse_lnk` of the file `path`, read through `datadir::read_file` (no reparse point, a single
+/// link, at most `MAX_LNK_FILE` bytes).
+pub(crate) fn read_lnk(path: &Path) -> Option<LnkFacts> {
+    crate::datadir::read_file(path, MAX_LNK_FILE, true).ok().and_then(|b| parse_lnk(&b))
 }
 
 /// The local path of a LinkInfo structure (`LocalBasePath` + `CommonPathSuffix`), if it has one.
@@ -401,7 +476,7 @@ fn clean(s: &str, max: usize) -> Option<String> {
 }
 
 /// `X:\...` without characters a file path cannot have.
-fn is_local_file_path(p: &str) -> bool {
+pub(crate) fn is_local_file_path(p: &str) -> bool {
     let b = p.as_bytes();
     b.len() > 3
         && b.len() <= 1024
@@ -411,8 +486,18 @@ fn is_local_file_path(p: &str) -> bool {
         && !p[2..].chars().any(|c| c.is_control() || "\"<>|?*:".contains(c))
 }
 
+/// `%NAME%\...`: an environment block target before expansion, a plain variable name, then a path
+/// with the characters `is_local_file_path` accepts.
+fn is_env_file_path(p: &str) -> bool {
+    let Some((name, rest)) = p.strip_prefix('%').and_then(|r| r.split_once('%')) else { return false };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "_()".contains(c))
+        && rest.starts_with('\\')
+        && is_local_file_path(&format!("C:{rest}"))
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn wide(s: &str) -> Vec<u8> {
@@ -628,6 +713,252 @@ mod tests {
         // Several task categories in one file are one group under the same limit.
         let split = tidy((0..16).map(|_| Group { name: String::new(), entries: many(9) }).collect());
         assert_eq!((split.len(), split[0].entries.len()), (1, MAX_TASKS));
+    }
+
+    /// A `.lnk` file: header, an id list, LinkInfo (header 0x24) with `info` as its ANSI and Unicode
+    /// local path, the arguments, and an environment block with `env` (HasExpString). `flags` are
+    /// added to the header's.
+    pub(crate) fn lnk(info: Option<&str>, env: Option<&str>, args: Option<&str>, flags: u32) -> Vec<u8> {
+        let mut flags = 0x81 | flags;
+        let mut body = Vec::new();
+        body.extend(6u16.to_le_bytes());
+        body.extend([4, 0, 0x1F, 0x50, 0, 0]);
+        if let Some(t) = info {
+            flags |= 0x02;
+            let narrow: Vec<u8> = t.chars().map(|c| if c.is_ascii() { c as u8 } else { b'?' }).collect();
+            let (ansi_at, wide_at) = (0x24usize, 0x24 + narrow.len() + 2);
+            let mut data = narrow;
+            data.extend([0, 0]);
+            data.extend(wide(t));
+            data.extend([0, 0, 0, 0]);
+            let mut info = Vec::new();
+            info.extend(((0x24 + data.len()) as u32).to_le_bytes());
+            info.extend(0x24u32.to_le_bytes());
+            info.extend(1u32.to_le_bytes());
+            info.extend(0u32.to_le_bytes());
+            info.extend((ansi_at as u32).to_le_bytes());
+            info.extend(0u32.to_le_bytes());
+            info.extend(((wide_at - 1) as u32).to_le_bytes());
+            info.extend((wide_at as u32).to_le_bytes());
+            info.extend(((wide_at + 2 * t.encode_utf16().count()) as u32).to_le_bytes());
+            info.extend(data);
+            body.extend(info);
+        }
+        if let Some(a) = args {
+            flags |= 0x20;
+            body.extend((a.encode_utf16().count() as u16).to_le_bytes());
+            body.extend(wide(a));
+        }
+        if let Some(e) = env {
+            flags |= 0x200;
+            body.extend((ENV_BLOCK_SIZE as u32).to_le_bytes());
+            body.extend(ENV_BLOCK.to_le_bytes());
+            let (mut narrow, mut w) = (vec![0u8; 260], vec![0u8; 520]);
+            narrow[..e.len()].copy_from_slice(e.as_bytes());
+            w[..2 * e.encode_utf16().count()].copy_from_slice(&wide(e));
+            body.extend(narrow);
+            body.extend(w);
+        }
+        body.extend(0u32.to_le_bytes());
+        let mut out = vec![0u8; 0x4C];
+        out[..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        out[4..20].copy_from_slice(&CLSID_LINK);
+        out[20..24].copy_from_slice(&flags.to_le_bytes());
+        out.extend(body);
+        out
+    }
+
+    /// Writes `lnk(Some(target), ..)` as `<temp>\dock_lnk_<tag>_<pid>\Programs\Sub\Shortcut name.lnk`;
+    /// returns the folder to remove, the `Programs` folder and the file.
+    pub(crate) fn lnk_file(tag: &str, target: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("dock_lnk_{tag}_{}", std::process::id()));
+        let root = base.join("Programs");
+        let path = root.join("Sub").join("Shortcut name.lnk");
+        std::fs::create_dir_all(root.join("Sub")).expect("test folder");
+        std::fs::write(&path, lnk(Some(target), None, None, 0)).expect("test link");
+        (base, root, path)
+    }
+
+    fn facts(target: &str, has_args: bool) -> Option<LnkFacts> {
+        Some(LnkFacts { target: target.into(), has_args })
+    }
+
+    const APP: &str = r"C:\Program Files\Vendor\app.exe";
+    const ENV_APP: &str = r"%ProgramFiles%\Vendor\app.exe";
+
+    #[test]
+    fn lnk_file_target_and_args() {
+        assert_eq!(parse_lnk(&lnk(Some(APP), None, None, 0)), facts(APP, false));
+        assert_eq!(parse_lnk(&lnk(Some(APP), None, Some("--x"), 0)), facts(APP, true));
+        assert_eq!(parse_lnk(&lnk(Some(APP), None, Some(""), 0)), facts(APP, false), "empty arguments are none");
+        let unicode = "C:\\Programmi\\Citt\u{e0} \u{65e5}\\app.exe";
+        assert_eq!(parse_lnk(&lnk(Some(unicode), None, None, 0)), facts(unicode, false), "the Unicode path wins");
+        // A jump list link is a .lnk too (ANSI LinkInfo, a property store).
+        let jump = link(Some(STEAM), None, Some("-n"), Some("Title"), false);
+        assert_eq!(parse_lnk(&jump), facts(STEAM, true));
+        assert_eq!(parse_lnk(&lnk(None, None, None, 0)), None, "an id list only is not resolved");
+        let mut clsid = lnk(Some(APP), None, None, 0);
+        clsid[4] ^= 1;
+        assert_eq!(parse_lnk(&clsid), None, "not a shell link");
+        assert_eq!(parse_lnk(&[]), None);
+    }
+
+    #[test]
+    fn lnk_env_block_target() {
+        assert_eq!(parse_lnk(&lnk(None, Some(ENV_APP), None, 0)), facts(ENV_APP, false), "left unexpanded");
+        let sys = parse_lnk(&lnk(None, Some(r"%SystemRoot%\System32\notepad.exe"), None, 0)).expect("env target");
+        let expanded = crate::shell_thread::expand_env(&sys.target);
+        assert!(is_local_file_path(&expanded), "{expanded}");
+        assert!(expanded.to_lowercase().ends_with(r"\system32\notepad.exe"), "{expanded}");
+        assert_eq!(parse_lnk(&lnk(Some(APP), Some(ENV_APP), None, 0)), facts(APP, false), "LinkInfo first");
+        // TargetUnicode empty: TargetAnsi.
+        let mut narrow = lnk(None, Some(ENV_APP), None, 0);
+        let at = narrow.len() - 4 - 520;
+        narrow[at..at + 520].fill(0);
+        assert_eq!(parse_lnk(&narrow), facts(ENV_APP, false));
+        // Without HasExpString the block is not read, as by the shell.
+        let mut no_flag = lnk(None, Some(ENV_APP), None, 0);
+        no_flag[21] &= !0x02;
+        assert_eq!(parse_lnk(&no_flag), None);
+        assert_eq!(parse_lnk(&lnk(None, Some("C:\\Tools\\t.exe"), None, 0)), facts("C:\\Tools\\t.exe", false));
+    }
+
+    #[test]
+    fn lnk_rejects_non_local_targets() {
+        let long = format!("C:\\{}", "a".repeat(1_097));
+        let hostile = [
+            r"\\server\share\a.exe",
+            r"\\?\C:\a.exe",
+            r"\\.\pipe\a",
+            long.as_str(),
+            r"C:\a.exe:stream",
+            "C:\\a\u{7}b.exe",
+            "C:\\a\nb.exe",
+            "a.exe",
+            r"C:a.exe",
+            r"%SystemRoot%",
+            r"%%\a.exe",
+            r"%A B%\a.exe",
+            r"%SystemRoot%\a|b.exe",
+        ];
+        for p in hostile {
+            assert_eq!(parse_lnk(&lnk(Some(p), None, None, 0)), None, "LinkInfo {p}");
+            if p.len() < 260 && p.is_ascii() {
+                assert_eq!(parse_lnk(&lnk(None, Some(p), None, 0)), None, "environment block {p}");
+            }
+        }
+        // A refused LinkInfo path leaves the environment block's.
+        assert_eq!(parse_lnk(&lnk(Some(r"\\server\a.exe"), Some(ENV_APP), None, 0)), facts(ENV_APP, false));
+    }
+
+    /// Three samples: LinkInfo with arguments, the environment block with ForceNoLinkInfo, a jump list link.
+    fn lnk_samples() -> [Vec<u8>; 3] {
+        [
+            lnk(Some(APP), None, Some("--flag"), 0),
+            lnk(Some(r"C:\Old\old.exe"), Some(ENV_APP), None, 0x100),
+            link(Some(STEAM), Some("Steam"), None, Some("Steam"), false),
+        ]
+    }
+
+    #[test]
+    fn lnk_truncations_never_panic() {
+        for s in lnk_samples() {
+            assert!(parse_lnk(&s).is_some());
+            for n in 0..s.len() {
+                assert_eq!(parse_lnk(&s[..n]), None, "cut at {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn lnk_mutations_never_panic() {
+        let samples = lnk_samples();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let started = std::time::Instant::now();
+        let mut found = 0usize;
+        for _ in 0..100_000 {
+            let mut b = samples[(next() % 3) as usize].clone();
+            for _ in 0..1 + next() % 3 {
+                let len = b.len().max(1) as u64;
+                let at = (next() % len) as usize;
+                match next() % 6 {
+                    0 => {
+                        if let Some(v) = b.get_mut(at) {
+                            *v ^= 1 << (next() % 8);
+                        }
+                    }
+                    k @ 1..=3 => {
+                        let v = [0, u32::MAX, b.len() as u32][(k - 1) as usize];
+                        if let Some(w) = b.get_mut(at..at + 4) {
+                            w.copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    4 => b.truncate(at),
+                    _ => {
+                        let end = (at + (next() % 64) as usize).min(b.len());
+                        let piece = b[at.min(end)..end].to_vec();
+                        let to = (next() % len) as usize;
+                        b.splice(to.min(b.len())..to.min(b.len()), piece);
+                    }
+                }
+            }
+            if let Some(f) = parse_lnk(&b) {
+                found += 1;
+                assert!(is_local_file_path(&f.target) || is_env_file_path(&f.target), "{:?}", f.target);
+            }
+        }
+        assert!(found > 0, "some mutations keep a valid link");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn lnk_force_no_link_info_flag() {
+        let both = lnk(Some(r"C:\Old\old.exe"), Some(ENV_APP), None, 0x100);
+        assert_eq!(parse_lnk(&both), facts(ENV_APP, false), "the LinkInfo is ignored");
+        assert_eq!(parse_lnk(&lnk(Some(APP), None, None, 0x100)), None);
+        // Jump lists keep their reading: the LinkInfo path, whatever the flag.
+        let mut jump = link(Some(STEAM), None, None, Some("Store"), false);
+        jump[21] |= 0x01;
+        let groups = parse(&file(&[category(2, "", &[jump])]));
+        assert_eq!(groups, vec![Group { name: String::new(), entries: vec![item("Store", STEAM, "")] }]);
+    }
+
+    #[test]
+    fn lnk_linkinfo_without_local_base_path() {
+        // LinkInfo at 0x4C + 8 (after the id list): flags at +8, LocalBasePathOffset(Unicode) at +16 / +28.
+        let info = 0x4C + 8;
+        let mut network = lnk(Some(APP), None, None, 0);
+        network[info + 8] = 0x02;
+        assert_eq!(parse_lnk(&network), None, "no VolumeIDAndLocalBasePath");
+        let mut zero = lnk(Some(APP), None, None, 0);
+        zero[info + 16..info + 20].fill(0);
+        zero[info + 28..info + 32].fill(0);
+        assert_eq!(parse_lnk(&zero), None, "offsets 0");
+        let mut outside = lnk(Some(APP), Some(ENV_APP), None, 0);
+        outside[info + 16..info + 20].copy_from_slice(&0xFFFFu32.to_le_bytes());
+        outside[info + 28..info + 32].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert_eq!(parse_lnk(&outside), facts(ENV_APP, false), "offsets outside the structure");
+    }
+
+    #[test]
+    fn read_lnk_reads_a_capped_single_file() {
+        let (base, _, path) = lnk_file("read", APP);
+        let got = read_lnk(&path);
+        let big = base.join("big.lnk");
+        let mut bytes = lnk(Some(APP), None, None, 0);
+        bytes.resize(MAX_LNK_FILE as usize + 1, 0);
+        std::fs::write(&big, bytes).expect("big link");
+        let refused = read_lnk(&big);
+        let missing = read_lnk(&base.join("missing.lnk"));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(got, facts(APP, false));
+        assert_eq!((refused, missing), (None, None), "above MAX_LNK_FILE, or missing");
     }
 
     /// Reads the REAL jump lists of this machine (run by hand:

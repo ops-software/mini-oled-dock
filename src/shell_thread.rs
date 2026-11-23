@@ -438,9 +438,16 @@ pub(crate) fn push_event(ui: isize, ev: ShellEvent) {
 
 // ------------------------------------------------------------------ constants
 
-/// Period of the thread timer used as a safety net: if a `WM_SHELL_WAKE` were
-/// swallowed by a nested COM message loop, the mpsc queue is still drained within 1 s.
+/// Period of the thread timer that runs only while an icons child exists: `reap_icon_jobs` (at the start of
+/// every `pump`) is the only place that reaps an ended child and kills one past its deadline, and nothing
+/// posts a message when a normal child ends. With no job there is no timer and no wake (a `WM_SHELL_WAKE`
+/// swallowed by a nested COM loop leaves nothing behind: `pump` drains the channel after every message).
 const SAFETY_TIMER_MS: u32 = 1000;
+
+/// True while the thread needs its timer: a Start menu or a launcher icons child is running.
+fn timer_wanted(start_job: bool, launcher_job: bool) -> bool {
+    start_job || launcher_job
+}
 /// Side (px) requested from high-resolution icon sources.
 const SRC_ICON_PX: i32 = 256;
 /// `WM_GETICON` timeout towards other apps' windows.
@@ -508,9 +515,9 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         icons_child_off: false,
     };
 
-    // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
-    // WM_TIMER in the thread queue. Cancelled at the end.
-    let timer = unsafe { SetTimer(None, 0, SAFETY_TIMER_MS, None) };
+    // The thread timer (null hwnd, system-chosen id, no callback: it arrives as WM_TIMER in the thread queue)
+    // exists only while an icons child does; 0 = none. Cancelled at the end.
+    let mut timer: usize = 0;
     #[cfg(feature = "wake-probe")]
     let probe_hook = crate::probe::install_send_hook(crate::probe::Th::Shell);
 
@@ -539,11 +546,20 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             }
         }
         shell.pump(&rx);
+        let wanted = timer_wanted(shell.start_job.is_some(), shell.launcher_job.is_some());
+        if wanted && timer == 0 {
+            // SAFETY: thread timer on this thread, see above.
+            timer = unsafe { SetTimer(None, 0, SAFETY_TIMER_MS, None) };
+        } else if !wanted && timer != 0 {
+            // SAFETY: `timer` is the id returned by SetTimer on this thread.
+            let _ = unsafe { KillTimer(None, timer) };
+            timer = 0;
+        }
     }
     #[cfg(feature = "wake-probe")]
     crate::probe::remove_send_hook(probe_hook);
     if timer != 0 {
-        // SAFETY: `timer` is the id returned by SetTimer on the same thread.
+        // SAFETY: `timer` is the id returned by SetTimer on this thread.
         let _ = unsafe { KillTimer(None, timer) };
     }
     // No icons child outlives the thread that started it.
@@ -1077,6 +1093,48 @@ fn pretty_stem(stem: &str) -> String {
 const INDEX_MAX_AGE: Duration = Duration::from_secs(600);
 /// Maximum folder depth scanned under each Start Menu root.
 const INDEX_MAX_DEPTH: u32 = 6;
+/// Most `.lnk` files indexed under each Start Menu root.
+const INDEX_MAX_FILES: usize = 4096;
+
+/// A `.lnk` of the Start Menu index. `per_user`: under the user's own Programs folder, which any
+/// program of the user can write, so its bytes are parsed in Rust (`jumplist::read_lnk`) and never
+/// reach the shell link loader; the all-users folder is writable by administrators only.
+///
+/// RESIDUAL (accepted for 1.5.1): `enum_apps_folder` (and the `--start-apps` child, `APPS_FLAG`, as
+/// elevated as the dock), `appsfolder_name`, `app_target_path` and the AppsFolder icon factories
+/// (`start_icon`, `icon_from_appsfolder`, and `icons::appsfolder_icon` for the notification icons)
+/// still have the shell resolve per-user shortcuts in an elevated process; `FileInfo::read` (version
+/// strings) and the exe icon extractors (`icon_from_jumbo_list`, `icon_from_def_extract`) still have
+/// the shell read user-writable exes; a subfolder of the all-users Start menu that an installer left
+/// writable is treated as admin-writable.
+struct StartLnk {
+    path: std::path::PathBuf,
+    per_user: bool,
+}
+
+/// Per-user shortcuts refused by a COM wrapper (`com_guard`) of the index or the Start import; the
+/// routing (`index_links`, `start_import::target_for`) never sends one there, so it stays 0.
+pub(crate) static PER_USER_VIA_COM: AtomicUsize = AtomicUsize::new(0);
+
+/// The fail-closed guard at the top of every COM wrapper that loads a Start menu shortcut: true
+/// (refused, counted in `PER_USER_VIA_COM`) for a per-user one.
+pub(crate) fn com_guard(per_user: bool) -> bool {
+    if per_user {
+        PER_USER_VIA_COM.fetch_add(1, Relaxed);
+    }
+    per_user
+}
+
+/// Counts of one index build, for its log line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct IndexStats {
+    /// Per-user links whose target the Rust parser read, or could not read (or that start a Windows
+    /// program, left out of the index, see `index_links`).
+    rust_parsed: usize,
+    rust_unresolved: usize,
+    /// All-users links given to the shell link loader.
+    com_common: usize,
+}
 
 #[derive(Default)]
 struct StartIndex {
@@ -1130,17 +1188,22 @@ fn known_folder(id: &GUID) -> Option<std::path::PathBuf> {
     take_pwstr(p).map(std::path::PathBuf::from)
 }
 
-fn collect_lnk(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+/// The `.lnk` files under `dir`, at most `INDEX_MAX_DEPTH` folders deep and `*left` files in all.
+fn collect_lnk(dir: &Path, depth: u32, per_user: bool, left: &mut usize, out: &mut Vec<StartLnk>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
+        if *left == 0 {
+            return;
+        }
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
             if depth < INDEX_MAX_DEPTH {
-                collect_lnk(&p, depth + 1, out);
+                collect_lnk(&p, depth + 1, per_user, left, out);
             }
         } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
-            out.push(p);
+            *left -= 1;
+            out.push(StartLnk { path: p, per_user });
         }
     }
 }
@@ -1178,11 +1241,14 @@ fn lnk_display_name(lnk: &Path) -> Option<String> {
 }
 
 /// Scans the common and per-user Start Menu `.lnk` files; keeps only `exe path -> name` pairs.
+/// The all-users links go to the shell (target and localized name), the per-user ones to the Rust
+/// parser (target; the name is the file's), see `StartLnk`.
 fn build_start_index() -> HashMap<String, String> {
     let mut files = Vec::new();
-    for id in [FOLDERID_CommonPrograms, FOLDERID_Programs] {
+    for (id, per_user) in [(FOLDERID_CommonPrograms, false), (FOLDERID_Programs, true)] {
         if let Some(dir) = known_folder(&id) {
-            collect_lnk(&dir, 0, &mut files);
+            let mut left = INDEX_MAX_FILES;
+            collect_lnk(&dir, 0, per_user, &mut left, &mut files);
         }
     }
     // SAFETY: COM STA initialized on this thread; ShellLink CLSID with the requested interface.
@@ -1190,23 +1256,84 @@ fn build_start_index() -> HashMap<String, String> {
         return HashMap::new();
     };
     let Ok(file) = link.cast::<IPersistFile>() else { return HashMap::new() };
+    let mut rust_target = |l: &StartLnk| {
+        // Rejected with arguments, as `lnk_target` does.
+        let target = expand_env(&crate::jumplist::read_lnk(&l.path).filter(|f| !f.has_args)?.target);
+        crate::jumplist::is_local_file_path(&target).then_some(target)
+    };
+    let mut com_target = |l: &StartLnk| {
+        let refused = com_guard(l.per_user);
+        debug_assert!(!refused, "a per-user shortcut reached the shell link loader");
+        if refused {
+            None
+        } else {
+            lnk_target(&link, &file, &l.path)
+        }
+    };
+    let mut com_display = |l: &StartLnk| {
+        let refused = com_guard(l.per_user);
+        debug_assert!(!refused, "a per-user shortcut reached the shell's display name");
+        if refused {
+            None
+        } else {
+            lnk_display_name(&l.path)
+        }
+    };
+    let (mut map, stats) = index_links(&files, &mut rust_target, &mut com_target, &mut com_display);
+    map.shrink_to_fit();
+    log!(
+        "shell: Start Menu index: {} shortcuts scanned, {} exe targets, per-user parsed in Rust: {}, unresolved: {}, per-user via COM: {}",
+        files.len(),
+        map.len(),
+        stats.rust_parsed,
+        stats.rust_unresolved,
+        PER_USER_VIA_COM.load(Relaxed)
+    );
+    map
+}
+
+/// The loop of `build_start_index` (pure): `exe path -> name` pairs of `files`, ambiguous targets
+/// dropped. A per-user link is read by `rust_target` only and named after its file; an all-users
+/// one by `com_target` and `com_display`. A per-user link to a program under `%SystemRoot%` is left
+/// out: Windows' own shortcuts there are renamed through `desktop.ini`, which only the shell reads,
+/// so `natural_name` gives the program its localized FileDescription, not the English file name.
+fn index_links(
+    files: &[StartLnk],
+    rust_target: &mut dyn FnMut(&StartLnk) -> Option<String>,
+    com_target: &mut dyn FnMut(&StartLnk) -> Option<String>,
+    com_display: &mut dyn FnMut(&StartLnk) -> Option<String>,
+) -> (HashMap<String, String>, IndexStats) {
+    let mut stats = IndexStats::default();
     let mut map: HashMap<String, String> = HashMap::new();
     let mut ambiguous: Vec<String> = Vec::new();
-    for lnk in &files {
-        let Some(target) = lnk_target(&link, &file, lnk) else { continue };
+    for lnk in files {
+        let target = if lnk.per_user {
+            let t = rust_target(lnk).filter(|t| !in_windows_dir(&expand_env(t)));
+            if t.is_some() {
+                stats.rust_parsed += 1;
+            } else {
+                stats.rust_unresolved += 1;
+            }
+            t
+        } else {
+            stats.com_common += 1;
+            com_target(lnk)
+        };
+        let Some(target) = target else { continue };
         let target = if target.contains('%') { expand_env(&target) } else { target };
         if !target.to_lowercase().ends_with(".exe") {
             continue;
         }
-        let Some(stem) = lnk.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+        let Some(stem) = lnk.path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
         let lower = stem.to_lowercase();
         if lower.contains("uninstall") || lower.contains("readme") {
             continue;
         }
         // The name the shell shows (Windows' own shortcuts are localized through `desktop.ini`:
         // "Remote Desktop Connection.lnk" is "Connessione Desktop remoto" in Italian, as in the
-        // Start menu), else the file name.
-        let name = strip_paren_suffix(&lnk_display_name(lnk).unwrap_or(stem));
+        // Start menu), else the file name; per-user links always use the file name.
+        let shown = if lnk.per_user { None } else { com_display(lnk) };
+        let name = strip_paren_suffix(&shown.unwrap_or(stem));
         if name.is_empty() {
             continue;
         }
@@ -1222,9 +1349,7 @@ fn build_start_index() -> HashMap<String, String> {
     for k in ambiguous {
         map.remove(&k);
     }
-    map.shrink_to_fit();
-    log!("shell: Start Menu index: {} shortcuts scanned, {} exe targets", files.len(), map.len());
-    map
+    (map, stats)
 }
 
 /// `%NAME%` variables of the process environment expanded; unknown ones are kept as written.
@@ -3448,6 +3573,122 @@ mod tests {
         assert_eq!(find_notif_app(&apps, "", ""), None);
     }
 
+    /// The index routes every per-user link to the Rust parser and every all-users one to the shell.
+    #[test]
+    fn per_user_links_never_reach_the_shell_loader() {
+        let l = |p: &str, per_user: bool| StartLnk { path: p.into(), per_user };
+        let files = [
+            l(r"C:\All\Tool.lnk", false),
+            l(r"C:\Me\Mine.lnk", true),
+            l(r"C:\All\Other (x64).lnk", false),
+            l(r"C:\Me\Broken.lnk", true),
+            l(r"C:\All\Uninstall Tool.lnk", false),
+            l(r"C:\Me\Magnify.lnk", true),
+        ];
+        let mut rust_calls = Vec::new();
+        let mut rust = |s: &StartLnk| {
+            rust_calls.push(s.path.clone());
+            // A Windows program of the per-user folder, renamed there by its `desktop.ini`.
+            if s.path.ends_with("Magnify.lnk") {
+                return Some(r"%SystemRoot%\System32\x.exe".to_string());
+            }
+            s.path.ends_with("Mine.lnk").then(|| r"C:\Me\mine.exe".to_string())
+        };
+        let mut com_target = |s: &StartLnk| {
+            assert!(!s.per_user, "{:?} reached the shell link loader", s.path);
+            Some(format!(r"C:\All\{}.exe", s.path.file_stem()?.to_string_lossy()))
+        };
+        let mut com_display = |s: &StartLnk| {
+            assert!(!s.per_user, "{:?} reached the shell's display name", s.path);
+            s.path.ends_with("Tool.lnk").then(|| "Strumento".to_string())
+        };
+        let (map, stats) = index_links(&files, &mut rust, &mut com_target, &mut com_display);
+        let me = |p: &str| std::path::PathBuf::from(p);
+        assert_eq!(rust_calls, [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Broken.lnk"), me(r"C:\Me\Magnify.lnk")]);
+        assert_eq!(stats, IndexStats { rust_parsed: 1, rust_unresolved: 2, com_common: 3 });
+        let windows_exe = norm_path(&expand_env(r"%SystemRoot%\System32\x.exe"));
+        assert!(!map.contains_key(&windows_exe), "a per-user Windows program keeps its FileDescription: {map:?}");
+        assert_eq!(map.get(r"c:\me\mine.exe").map(String::as_str), Some("Mine"), "per-user: the file name");
+        assert_eq!(map.get(r"c:\all\tool.exe").map(String::as_str), Some("Strumento"), "the shell's name");
+        assert_eq!(map.get(r"c:\all\other (x64).exe").map(String::as_str), Some("Other"));
+        assert_eq!(map.len(), 3, "the uninstaller is left out: {map:?}");
+    }
+
+    #[test]
+    fn com_wrapper_refuses_per_user() {
+        let before = PER_USER_VIA_COM.load(Relaxed);
+        assert!(com_guard(true), "a per-user shortcut is refused");
+        assert!(PER_USER_VIA_COM.load(Relaxed) > before, "and counted");
+        assert!(!com_guard(false), "an all-users shortcut passes");
+    }
+
+    /// Compares the Rust parser with the shell link loader on a corpus of shortcuts, sub-folder by
+    /// sub-folder (live check L6, unelevated: `DOCK_LNK_CORPUS=<dir> cargo test -- --ignored
+    /// --nocapture lnk_matches_ishelllink`). A mismatch is printed as `<lnk> | rust=<a> | com=<b>`.
+    #[test]
+    #[ignore]
+    fn lnk_matches_ishelllink() {
+        let corpus = std::path::PathBuf::from(std::env::var_os("DOCK_LNK_CORPUS").expect("DOCK_LNK_CORPUS"));
+        let profile = std::env::var("USERPROFILE").unwrap_or_default();
+        let shown = |s: &str| match s.get(..profile.len()) {
+            Some(head) if !profile.is_empty() && head.eq_ignore_ascii_case(&profile) => {
+                format!("%USERPROFILE%{}", &s[profile.len()..])
+            }
+            _ => s.to_string(),
+        };
+        // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        // SAFETY: COM STA initialized above; ShellLink CLSID with the requested interface.
+        let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.expect("ShellLink");
+        let file = link.cast::<IPersistFile>().expect("IPersistFile");
+        let mut dirs: Vec<_> = std::fs::read_dir(&corpus)
+            .expect("corpus folder")
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+        let (mut mismatches, mut total) = (0, 0);
+        for dir in &dirs {
+            let mut files = Vec::new();
+            let mut left = usize::MAX;
+            collect_lnk(dir, 0, false, &mut left, &mut files);
+            if files.is_empty() {
+                continue;
+            }
+            total += files.len();
+            let (mut matched, mut parser_none, mut mismatch) = (0, 0, 0);
+            for l in &files {
+                let rust = crate::jumplist::read_lnk(&l.path)
+                    .filter(|f| !f.has_args)
+                    .map(|f| expand_env(&f.target))
+                    .filter(|t| crate::jumplist::is_local_file_path(t));
+                let com = lnk_target(&link, &file, &l.path).map(|t| expand_env(&t));
+                match (&rust, &com) {
+                    (Some(a), Some(b)) if a.to_lowercase() == b.to_lowercase() => matched += 1,
+                    (None, None) => matched += 1,
+                    (None, Some(_)) => parser_none += 1,
+                    _ => {
+                        mismatch += 1;
+                        let (a, b) = (rust.as_deref().unwrap_or("-"), com.as_deref().unwrap_or("-"));
+                        println!("{} | rust={} | com={}", shown(&l.path.to_string_lossy()), shown(a), shown(b));
+                    }
+                }
+            }
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let n = files.len();
+            println!("{name}: matched {matched}, parser-none {parser_none}, mismatch {mismatch}, total {n}");
+            mismatches += mismatch;
+        }
+        drop((file, link));
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above; the COM objects are dropped.
+            unsafe { CoUninitialize() };
+        }
+        assert!(total > 0, "no shortcut in the sub-folders of {}", corpus.display());
+        assert_eq!(mismatches, 0);
+    }
+
     /// Reads the REAL Start Menu shortcuts of this machine: the bar name of a Windows program is the
     /// one the Start menu shows (localized), not the `.lnk` file name.
     #[test]
@@ -4087,6 +4328,61 @@ mod tests {
         assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIconsFor { ids, .. }) if ids == ["b"]));
         assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIcons { .. })));
         assert!(next_request(&mut pending).is_none());
+    }
+
+    #[test]
+    fn one_pump_drains_every_request() {
+        let mut pending: VecDeque<ShellRequest> = VecDeque::new();
+        let ids = |s: &str| vec![s.to_string()];
+        let resolve = ResolveApp {
+            key: "k".into(),
+            exe_path: "x.exe".into(),
+            aumid: None,
+            hwnd: 0,
+            icon_px: 24,
+            custom_icon: None,
+        };
+        enqueue(&mut pending, ShellRequest::ResolveApp(resolve));
+        enqueue(&mut pending, ShellRequest::VolumeAdjust { delta_percent: 2 });
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
+        enqueue(&mut pending, ShellRequest::Launch { target: "x.exe".into(), args: None });
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 1, query: "q".into() });
+        enqueue(&mut pending, ShellRequest::VolumeRefresh);
+        enqueue(&mut pending, ShellRequest::StartIcons { icon_px: 48, ids: ids("s") });
+        let mut taken = 0;
+        let (mut seen_resolve, mut seen_icons) = (false, false);
+        while let Some(r) = next_request(&mut pending) {
+            taken += 1;
+            let resolve = matches!(r, ShellRequest::ResolveApp(_));
+            let low = matches!(r, ShellRequest::StartIcons { .. });
+            assert!(!seen_icons || low, "a normal request came after a Start batch");
+            assert!(!seen_resolve || resolve || low, "a normal request came after a ResolveApp");
+            seen_resolve |= resolve;
+            seen_icons |= low;
+        }
+        assert!(seen_resolve, "the ResolveApp came out");
+        assert_eq!(taken, 7, "every request comes out exactly once");
+        // Newer ones replace older ones; the launcher's close drops a pending icon request.
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("a") });
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("b") });
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 1, query: "q".into() });
+        enqueue(&mut pending, ShellRequest::LauncherConvert { gen: 2, query: "qq".into() });
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::StartIconsFor { ids, .. }) if ids == ["b"]));
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::LauncherConvert { gen: 2, .. })));
+        assert!(next_request(&mut pending).is_none());
+        enqueue(&mut pending, ShellRequest::StartIconsFor { icon_px: 24, ids: ids("c") });
+        enqueue(&mut pending, ShellRequest::LauncherClosed);
+        assert!(matches!(next_request(&mut pending), Some(ShellRequest::LauncherClosed)));
+        assert!(next_request(&mut pending).is_none());
+    }
+
+    #[test]
+    fn the_safety_timer_follows_the_icon_jobs() {
+        assert!(!timer_wanted(false, false));
+        assert!(timer_wanted(true, false));
+        assert!(timer_wanted(false, true));
+        assert!(timer_wanted(true, true));
     }
 
     #[test]
