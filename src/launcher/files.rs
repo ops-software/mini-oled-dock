@@ -290,12 +290,13 @@ pub fn check_hit(path: &str, name: &str, folder: &str) -> Result<(), FrameError>
     Ok(())
 }
 
-/// A drive path (`C:\...`) or a UNC path (`\\server\...`); never one with a device or long-path prefix.
+/// A drive path (`C:\...`) or a UNC path (`\\server\...`); never one with a device or long-path prefix, nor a colon
+/// past a drive's: no NTFS or SMB name holds one, and `C:\u\tool.exe::$DATA` (a stream) would hide the extension.
 fn path_form_ok(p: &str) -> bool {
     let b = p.as_bytes();
     let drive = b.first().is_some_and(u8::is_ascii_alphabetic) && b.get(1) == Some(&b':') && b.get(2) == Some(&b'\\');
     let unc = b.starts_with(b"\\\\") && b.get(2).is_some_and(|c| !matches!(c, b'\\' | b'/' | b'?' | b'.'));
-    drive || unc
+    (drive || unc) && !b.get(if drive { 2 } else { 0 }..).unwrap_or_default().contains(&b':')
 }
 
 /// How far a read filled its buffer.
@@ -1167,6 +1168,10 @@ mod tests {
             ("long prefix", after_state(row(b"\\\\?\\C:\\a.txt", b"a.txt")), FrameError::PathForm),
             ("device", after_state(row(b"\\\\.\\pipe\\a", b"a")), FrameError::PathForm),
             ("slashes", after_state(row(b"C:/u/a.txt", b"C:/u/a.txt")), FrameError::PathForm),
+            ("stream", after_state(row(&ok(b"evil.exe::$DATA"), b"evil.exe::$DATA")), FrameError::PathForm),
+            ("named stream", after_state(row(&ok(b"a.txt:evil.exe"), b"a.txt:evil.exe")), FrameError::PathForm),
+            ("unc colon", after_state(row(b"\\\\srv\\s\\a:b.exe", b"a:b.exe")), FrameError::PathForm),
+            ("drive twice", after_state(row(b"C:\\C:\\a.txt", b"a.txt")), FrameError::PathForm),
             ("not the last part", after_state(row(&ok(b"a.txt"), b"b.txt")), FrameError::NameMismatch),
         ];
         let mut seen = Vec::new();

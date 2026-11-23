@@ -142,12 +142,12 @@ pub fn classify(target: &str) -> Result<AliasTarget, AliasRefusal> {
         if t.contains('"') {
             return Err(AliasRefusal::Address);
         }
-        let dir = names_folder(t);
-        if !dir && file_class(t) == FileClass::Executable {
+        // An executable's name wins over the folder syntax (`setup.exe\`, `tool.exe::$DATA`): the quoted command.
+        if file_class(t) == FileClass::Executable {
             let quoted = format!("\"{t}\"");
             return runline::classify(&quoted).map(AliasTarget::Command).ok_or(AliasRefusal::NoTarget);
         }
-        return Ok(AliasTarget::Path { path: t.into(), dir });
+        return Ok(AliasTarget::Path { path: t.into(), dir: names_folder(t) });
     }
     if has_scheme(t) {
         return Err(AliasRefusal::Scheme);
@@ -321,6 +321,14 @@ mod tests {
             let T::Command(r) = &got else { panic!("{t:?}: {got:?}") };
             assert_eq!(&*r.line, format!("\"{t}\""), "{t:?}");
         }
+        // A trailing separator or a stream hides no program either, and the command reads back as itself.
+        for t in ["C:\\Tools\\x.exe\\", "C:\\Tools\\x.exe/", "C:\\Tools\\x.exe::$DATA", "C:\\Tools\\x.exe:s"] {
+            let got = classify(t).unwrap();
+            let T::Command(r) = &got else { panic!("{t:?}: {got:?}") };
+            assert_eq!((&*r.line, r.file.clone()), (&*format!("\"{t}\""), 1..t.len() + 1), "{t:?}");
+            assert_eq!(classify(&got.to_config()), Ok(got.clone()), "{t:?}");
+        }
+        assert_eq!(classify("C:\\Windows\\"), Ok(T::Path { path: "C:\\Windows\\".into(), dir: true }));
         // %VAR% stays as typed: the shell gets the line the user wrote.
         let line = "notepad %USERPROFILE%\\x.txt";
         assert_eq!(classify(line), Ok(T::Command(runline::classify(line).unwrap())));

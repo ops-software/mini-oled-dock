@@ -950,12 +950,37 @@ pub fn extension(path: &str) -> Option<&str> {
     name.get(dot + 1..).filter(|ext| !ext.is_empty())
 }
 
-/// The class of a path by its extension alone (`extension`: the text after the last dot in any case, the trailing dots
-/// and spaces Windows drops dropped here, so no caller can forget them; 5.4.6): it picks a row's glyph, and an
-/// executable is never the default in Mixed mode. Executable: the spec's twelve, then the other types that run code
-/// when Explorer opens them (the Attachment Manager's high-risk list), held back as well until live check V-7, and a
-/// class id (`{...}`): Explorer hides such an extension and may hand the file to that class's handler.
+/// The class of a path by its extension alone (5.4.6), the same for file rows, typed paths and alias targets: it picks a
+/// row's glyph, and an executable is never the default in Mixed mode. Its last name is read as Windows reads it, so no
+/// caller can forget a step: the trailing separators, dots and spaces dropped (`setup.exe\`, `setup.exe. .`), and each
+/// part between colons classed (`ext_class`), an executable part making the whole one (`tool.exe::$DATA` and
+/// `tool.exe:s` name streams of tool.exe); otherwise the first part with a class gives it.
 pub fn file_class(path: &str) -> FileClass {
+    let mut class = FileClass::Other;
+    for part in last_name(path).split(':') {
+        match ext_class(part) {
+            FileClass::Executable => return FileClass::Executable,
+            c if class == FileClass::Other => class = c,
+            _ => {}
+        }
+    }
+    class
+}
+
+/// The last name of a path: the trailing separators, dots and spaces dropped, then the text after the last separator.
+fn last_name(path: &str) -> &str {
+    // Cut at ASCII bytes only, as `extension`.
+    let b = path.as_bytes();
+    let end = b.iter().rposition(|c| !matches!(c, b'\\' | b'/' | b'.' | b' ')).map_or(0, |i| i + 1);
+    let start = b.get(..end).and_then(|h| h.iter().rposition(|c| matches!(c, b'\\' | b'/'))).map_or(0, |i| i + 1);
+    path.get(start..end).unwrap_or_default()
+}
+
+/// The class of one name by its `extension` (the text after the last dot, in any case). Executable: the spec's twelve,
+/// then the other types that run code when Explorer opens them (the Attachment Manager's high-risk list), held back as
+/// well until live check V-7, and a class id (`{...}`): Explorer hides such an extension and may hand the file to that
+/// class's handler.
+fn ext_class(name: &str) -> FileClass {
     const CLASSES: [(FileClass, &[&str]); 5] = [
         (
             FileClass::Executable,
@@ -977,7 +1002,7 @@ pub fn file_class(path: &str) -> FileClass {
         (FileClass::Image, &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "ico", "svg", "heic"]),
         (FileClass::Archive, &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "cab", "iso"]),
     ];
-    let Some(ext) = extension(path) else { return FileClass::Other };
+    let Some(ext) = extension(name) else { return FileClass::Other };
     // `invoice.pdf.{3050F4D8-...}`: no ordinary document has a class id for its extension.
     if ext.starts_with('{') {
         return FileClass::Executable;
@@ -1050,8 +1075,10 @@ fn run(q: &Query, cx: &Context, top: &mut TopK) {
             }
         }
         Some(Implicit::Path) => {
-            let dir = names_folder(text);
-            let (kind, class, glyph) = match (dir, file_class(text)) {
+            // An executable's name wins over the folder syntax: `setup.exe\` and `tool.exe::$DATA` are no folders.
+            let class = file_class(text);
+            let dir = class != FileClass::Executable && names_folder(text);
+            let (kind, class, glyph) = match (dir, class) {
                 (true, _) => (Kind::Folder, FileClass::Other, GlyphId::Folder),
                 (false, FileClass::Executable) => (Kind::File, FileClass::Executable, GlyphId::Executable),
                 (false, class) => (Kind::File, class, GlyphId::Document),
@@ -1774,6 +1801,18 @@ pub(crate) mod tests {
             ("C:\\a\\invoice.pdf.{3050f4d8-98b5-11cf-bb82-00aa00bdce0b}. ", Executable),
             ("C:\\a\\notes.{draft}.txt", Document),
             ("C:\\a\\{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}", Other),
+            // A trailing separator, and a stream after a colon, hide no extension (typed paths, alias targets).
+            ("C:\\a\\setup.exe\\", Executable),
+            ("C:\\a\\setup.exe/", Executable),
+            ("C:\\a\\setup.exe\\. ", Executable),
+            ("C:\\a\\tool.exe::$DATA", Executable),
+            ("C:\\a\\tool.EXE:s", Executable),
+            ("C:\\a\\notes.txt:tool.exe", Executable),
+            ("C:\\a\\notes.txt:Zone.Identifier", Document),
+            ("C:\\a\\b.png::$DATA", Image),
+            ("C:\\Windows\\", Other),
+            ("shell:startup", Other),
+            ("ms-settings:display", Other),
         ];
         for (path, want) in cases {
             assert_eq!(file_class(path), want, "{path}");
@@ -1816,7 +1855,12 @@ pub(crate) mod tests {
         assert_eq!(res.selected(), None, "an executable file row is never the default in Mixed mode");
         // The trailing dots and spaces Windows drops hide no executable (file_class drops them).
         let guid = "C:\\tools\\invoice.pdf.{3050F4D8-98B5-11CF-BB82-00AA00BDCE0B}";
-        for typed in ["C:\\tools\\setup.exe.", "C:\\tools\\setup.exe . .", "C:\\tools\\run.CMD..", guid] {
+        // Nor do a trailing separator or a stream: an executable's name wins over the folder syntax.
+        let odd =
+            ["C:\\tools\\setup.exe\\", "C:\\tools\\setup.exe/", "C:\\tools\\tool.exe::$DATA", "C:\\tools\\tool.exe:s"];
+        for typed in
+            ["C:\\tools\\setup.exe.", "C:\\tools\\setup.exe . .", "C:\\tools\\run.CMD..", guid].iter().chain(&odd)
+        {
             fx.sync(&mut res, typed, 3);
             assert!(is_executable_file(&res.rows()[0]), "{typed}");
             assert!(!res.rows()[0].verbs.has(Verb::Open), "{typed}");
@@ -2245,7 +2289,7 @@ pub(crate) mod tests {
         assert!(!exe.verbs.has(Verb::Open), "executables open only after live check 6");
         assert_eq!(fx.rows("C:\\tools\\")[0].kind, Kind::Folder);
         // A typed folder has no dot in its last part: the folder glyph, by syntax alone (5.4.9).
-        for typed in ["C:\\Windows", "\\\\srv\\share", "shell:startup"] {
+        for typed in ["C:\\Windows", "C:\\Windows\\", "\\\\srv\\share", "shell:startup"] {
             let row = &fx.rows(typed)[0];
             assert_eq!((row.kind, &row.icon), (Kind::Folder, &IconRef::Glyph(GlyphId::Folder)), "{typed}");
             assert!(matches!(&row.payload, Payload::Path { dir: true, .. }), "{typed}");
