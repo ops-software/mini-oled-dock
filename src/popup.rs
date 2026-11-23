@@ -417,7 +417,7 @@ struct Open {
     /// true once the popup has been seen as the foreground window.
     was_active: bool,
     wheel_acc: i32,
-    /// Foreground retries still allowed (`TIMER_POPUP_FOCUS`) while the popup is not foreground.
+    /// Foreground retries still allowed (`TIMER_POPUP_FOCUS`) while the popup is not foreground; 0 once none is armed.
     focus_tries: u8,
     /// Set for a centred popup (the launcher): placed on that work area instead of next to `anchor`.
     centred: Option<Centred>,
@@ -1170,13 +1170,13 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     if with(|st| st.open.as_ref().map(|o| o.hwnd)).flatten() != Some(hwnd) {
         return true;
     }
+    // The foreground can be refused (lock, elevated app in front, a transient null foreground):
+    // visible but without the keyboard, the Start menu search box would not receive typing.
+    if outcome == Retry::Again {
+        arm_retry(hwnd);
+    }
     // SAFETY: `hwnd` is our window; the callbacks are in its wnd_proc.
     unsafe {
-        // The foreground can be refused (lock, elevated app in front, a transient null foreground):
-        // visible but without the keyboard, the Start menu search box would not receive typing.
-        if outcome == Retry::Again && SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) == 0 {
-            log!("popup: SetTimer(focus) failed");
-        }
         if initial_alpha(kind) < 255 && SetTimer(Some(hwnd), TIMER_POPUP_ANIM, ANIM_STEP_MS, None) == 0 {
             log!("popup: SetTimer(anim) failed");
         }
@@ -1943,8 +1943,8 @@ fn retry_outcome(tries_left: u8, focused: bool, focus_lost_closes: bool) -> Retr
 
 /// `TIMER_POPUP_FOCUS`: the popup is open but did not get the foreground in `open`. Retries while
 /// the foreground is still the window that was in front at open time (or null, or ours): if the
-/// user has meanwhile moved to another window, the popup is not pushed in front of it (the tick
-/// safety net closes it). A content that `focus_lost_closes` closes when the last try fails.
+/// user has meanwhile moved to another window, the popup is not pushed in front of it, and a content
+/// that `focus_lost_closes` closes then, or when the last try fails (`retry_gate`).
 fn on_focus_retry(hwnd: HWND) {
     // SAFETY: timer of our window.
     let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_FOCUS) };
@@ -1956,31 +1956,61 @@ fn on_focus_retry(hwnd: HWND) {
     }
     let go = with(|st| {
         let o = st.open.as_mut()?;
-        if o.focus_tries == 0 {
-            return None;
+        let kept =
+            fg.0.is_null() || fg == o.fg_at_open || crate::ui::is_own_window(fg) || crate::ui::fs_bounce_grace(fg);
+        let closes = o.content.focus_lost_closes();
+        let gate = retry_gate(o.focus_tries, kept, closes);
+        if gate.is_none() {
+            o.focus_tries -= 1;
         }
-        let own = crate::ui::is_own_window(fg);
-        if !(fg.0.is_null() || fg == o.fg_at_open || own || crate::ui::fs_bounce_grace(fg)) {
-            return None;
-        }
-        o.focus_tries -= 1;
-        Some((o.focus_tries, o.content.focus_lost_closes()))
+        Some((gate, o.focus_tries, closes))
     })
     .flatten();
-    let Some((left, closes)) = go else { return };
-    let ok = crate::ui::force_foreground(hwnd);
-    log!("popup: foreground retry ({left} left) -> {ok}");
-    match retry_outcome(left, ok, closes) {
-        Retry::Again => {
-            // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
-            if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
-                log!("popup: SetTimer(focus) failed");
-            }
-        }
+    let Some((gate, left, closes)) = go else { return };
+    let outcome = gate.unwrap_or_else(|| {
+        let ok = crate::ui::force_foreground(hwnd);
+        log!("popup: foreground retry ({left} left) -> {ok}");
+        retry_outcome(left, ok, closes)
+    });
+    match outcome {
+        Retry::Again => arm_retry(hwnd),
         Retry::Focused => became_foreground(),
         Retry::Stop => {}
         Retry::Close => close_inner("no foreground"),
     }
+}
+
+/// Before a foreground retry: None makes the attempt, Some ends the retries without one. `kept`: the foreground is
+/// still the window in front at open time, null, ours or a fullscreen bounce. A content that `focus_lost_closes`
+/// closes at once when the user went elsewhere: back in the window of the open before the tick, they would find it
+/// shown, topmost and without the keyboard, its type-ahead kept for a later click to replay.
+fn retry_gate(tries_left: u8, kept: bool, closes: bool) -> Option<Retry> {
+    if tries_left > 0 && kept {
+        None
+    } else {
+        Some(retry_outcome(0, false, closes))
+    }
+}
+
+/// Arms the next foreground retry. A timer Windows refuses ends the retries (`focus_tries` 0: the tick's safety net
+/// knows none will come).
+fn arm_retry(hwnd: HWND) {
+    // SAFETY: `hwnd` is our window; the callback is in its wnd_proc.
+    if unsafe { SetTimer(Some(hwnd), TIMER_POPUP_FOCUS, FOCUS_RETRY_MS, None) } == 0 {
+        log!("popup: SetTimer(focus) failed");
+        with(|st| {
+            if let Some(o) = st.open.as_mut() {
+                o.focus_tries = 0;
+            }
+        });
+    }
+}
+
+/// The tick's safety net for a popup never seen in front, which no WA_INACTIVE will close: true closes it. `moved`:
+/// the foreground is another window than the one in front at open time (and no fullscreen bounce). A content that
+/// `focus_lost_closes` also closes once no retry is left to come.
+fn unseen_tick_closes(moved: bool, tries_left: u8, closes: bool) -> bool {
+    moved || (closes && tries_left == 0)
 }
 
 fn on_tick(hwnd: HWND) {
@@ -1991,10 +2021,10 @@ fn on_tick(hwnd: HWND) {
     }
     let r = with(|st| {
         let o = st.open.as_mut()?;
-        Some((o.content.tick(), o.was_active, o.fg_at_open))
+        Some((o.content.tick(), o.was_active, o.fg_at_open, o.focus_tries, o.content.focus_lost_closes()))
     })
     .flatten();
-    let Some((reply, was_active, fg_at_open)) = r else { return };
+    let Some((reply, was_active, fg_at_open, tries, closes)) = r else { return };
     if was_active {
         // Activation was seen: if the foreground is now another window, WA_INACTIVE was missed.
         // SAFETY: no preconditions.
@@ -2009,7 +2039,7 @@ fn on_tick(hwnd: HWND) {
         let fg = unsafe { GetForegroundWindow() };
         if fg == hwnd {
             became_foreground();
-        } else if fg != fg_at_open && !crate::ui::fs_bounce_grace(fg) {
+        } else if unseen_tick_closes(fg != fg_at_open && !crate::ui::fs_bounce_grace(fg), tries, closes) {
             close_inner("foreground changed");
             return;
         }
@@ -2257,6 +2287,24 @@ mod tests {
         assert_eq!(retry_outcome(0, false, false), Retry::Stop, "another kind stays (the tick safety net remains)");
         assert!(popup_launcher::new().focus_lost_closes());
         assert!(!popup_start::new().focus_lost_closes());
+    }
+
+    /// A launcher never seen in front never stays shown without the keyboard: a user who moved to another window
+    /// during the retries (and may come back to the window of the open before the tick) gets no attempt and the
+    /// launcher closes at once; the tick closes one whose retries are over. Another kind keeps its rules.
+    #[test]
+    fn an_unfocused_launcher_never_stays() {
+        assert_eq!(retry_gate(3, true, true), None, "still the window of the open: the attempt");
+        assert_eq!(retry_gate(3, true, false), None);
+        assert_eq!(retry_gate(3, false, true), Some(Retry::Close), "the user went elsewhere: the launcher closes now");
+        assert_eq!(retry_gate(3, false, false), Some(Retry::Stop), "another kind is not pushed in front, and stays");
+        assert_eq!(retry_gate(0, true, true), Some(Retry::Close), "no try left");
+        assert_eq!(retry_gate(0, true, false), Some(Retry::Stop));
+        assert!(unseen_tick_closes(true, 3, false), "the foreground moved: every kind closes");
+        assert!(unseen_tick_closes(true, 0, true));
+        assert!(unseen_tick_closes(false, 0, true), "back in the window of the open, no retry to come: it closes");
+        assert!(!unseen_tick_closes(false, 2, true), "retries still to come: they decide");
+        assert!(!unseen_tick_closes(false, 0, false), "another kind stays");
     }
 
     #[test]
