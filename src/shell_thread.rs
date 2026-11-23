@@ -2577,12 +2577,22 @@ fn plain_open(verb: Verb, elevation: Option<bool>) -> bool {
     verb == Verb::Open && elevation == Some(false)
 }
 
-/// The real `Exec`: the desktop shell (Explorer, medium integrity) unless `plain_open` (an open by a
-/// dock known not to be elevated); `runas` always goes there (Explorer asks UAC), as in `launch_admin`.
-/// If the desktop shell is unavailable the request is refused; the dock's token is never used.
+/// Whether one launcher launch of `kind` may run in the dock's own process: `plain_open`, except for a path or a
+/// command line (`OpenPath`, `LaunchCommand`), which leave through the desktop shell whether or not the dock is
+/// elevated. The in-process call carries SEE_MASK_FLAG_NO_UI, which may hide the prompt Windows raises before it runs
+/// a downloaded file, and that prompt is the second gate for typed paths and alias targets (5.4.6).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn shell_exec(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> Result<(), String> {
-    if plain_open(verb, elevation()) {
+fn in_process_exec(kind: LaunchKind, verb: Verb, elevation: Option<bool>) -> bool {
+    !matches!(kind, LaunchKind::Path | LaunchKind::Command) && plain_open(verb, elevation)
+}
+
+/// The real `Exec` of a launcher launch of `kind`: the desktop shell (Explorer, medium integrity) unless
+/// `in_process_exec` (an open by a dock known not to be elevated, never of a path or a command line); `runas` always
+/// goes there (Explorer asks UAC), as in `launch_admin`. If the desktop shell is unavailable the request is refused;
+/// the dock's token is never used.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn shell_exec(kind: LaunchKind, file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> Result<(), String> {
+    if in_process_exec(kind, verb, elevation()) {
         return shell_execute(file, args, dir);
     }
     desktop_shell_execute(file, args, dir, verb, SW_SHOWNORMAL.0).map_err(|e| format!("desktop shell: {e}"))
@@ -2616,7 +2626,8 @@ fn failure_event(kind: LaunchKind, r: &Result<(), Fail>) -> Option<ShellEvent> {
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn launcher_launch(ui: isize, req: ShellRequest) {
     let Some(kind) = launch_kind(&req) else { return };
-    let mut exec = shell_exec;
+    let mut exec =
+        |file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb| shell_exec(kind, file, args, dir, verb);
     let r = match req {
         ShellRequest::OpenPath { path } => {
             let r = open_path_with(&path, &mut exec);
@@ -3604,6 +3615,22 @@ mod tests {
         let (line, file) = run_line("notepad");
         assert!(run_as_typed_with(&line, file, &Gesture::for_test(1), &mut recorder(&mut calls, true)).is_ok());
         assert!(!plain_open(calls[0].3, Some(false)), "runas always goes through the desktop shell");
+    }
+
+    #[test]
+    fn launcher_paths_and_command_lines_always_leave_through_the_desktop_shell() {
+        // Windows' prompt before it runs a downloaded file is the second gate for typed paths and alias targets
+        // (5.4.6); the in-process call's SEE_MASK_FLAG_NO_UI may hide it, so these never run in the dock's process.
+        for kind in [LaunchKind::Path, LaunchKind::Command] {
+            for elevation in [Some(false), Some(true), None] {
+                assert!(!in_process_exec(kind, Verb::Open, elevation), "{kind:?} {elevation:?}");
+            }
+        }
+        // The launcher's other opens keep `plain_open`'s rule (runas: `plain_shell_execute_only_when_known_unelevated`).
+        for kind in [LaunchKind::Reveal, LaunchKind::Url] {
+            assert!(in_process_exec(kind, Verb::Open, Some(false)), "{kind:?}");
+            assert!(!in_process_exec(kind, Verb::Open, Some(true)) && !in_process_exec(kind, Verb::Open, None));
+        }
     }
 
     #[test]
