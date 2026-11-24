@@ -7,9 +7,10 @@
 //! watchdog of it runs (C7), between `MIN_ALIVE` and `MAX_WAIT` after the start, the guard ends it, writes
 //! `update\<tag>\rolled-back` (the automatic
 //! install never retries that release), installs itself back with its own `--install` and starts the old dock. The
-//! judge is the old binary because the build under judgement cannot be trusted to judge itself. The guard makes no
-//! taskbar call: the ended dock's own watchdog gives the taskbar back, and `copy_self` waits for that watchdog to
-//! leave.
+//! judge is the old binary because the build under judgement cannot be trusted to judge itself. The ended dock's own
+//! watchdog gives the taskbar back, and `copy_self` waits for that watchdog to leave; when none of it runs, or the dock
+//! ended with code 0 (which its watchdog takes for a dock that restored), the guard restores the taskbar itself before
+//! the reinstall (`guard_restores`), so a failed reinstall cannot leave it hidden.
 //!
 //! Contracts later releases keep (pinned by the tests below):
 //! - C1: the dock's top-level window class is `DockWindow`, owned by its UI thread, which pumps within 30 s of the
@@ -128,6 +129,16 @@ pub(crate) fn health(
     } else {
         Health::Wait
     }
+}
+
+/// Whether the guard restores the taskbar itself once the new dock it judged failed is gone: `exit` = its exit code
+/// before the guard ended it (None: ended by the guard, with code 1), `guarded` = a live watchdog of it ran just
+/// before (`watchdog::runs_for`; one still restoring after the dock died is still its child and still runs). A watchdog
+/// restores after a code other than 0 and does nothing after 0, so the guard restores when no watchdog runs or the code
+/// was 0. Its restore does nothing when nothing was hidden, and with no restoring watchdog there is no restore to race.
+/// Pure.
+pub(crate) fn guard_restores(exit: Option<u32>, guarded: bool) -> bool {
+    !guarded || exit == Some(0)
 }
 
 /// What the guard does once the new release's installer has returned.
@@ -314,13 +325,20 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
                 return EXIT_COMMITTED;
             }
             Health::Failed(why) => {
+                // Asked before the kill, so the answer is about the watchdog that restores after it.
+                let guarded = watchdog::runs_for(HANDLE(h.as_raw_handle()));
                 if exit.is_none() {
                     log!("update-guard: {tag} terminated pid {pid} ({why})");
-                    // SAFETY: `h` is the new dock's process handle, owned here; its watchdog gives the taskbar back.
+                    // SAFETY: `h` is the new dock's process handle, owned here; a live watchdog gives the taskbar
+                    // back after this code 1, otherwise `guard_restores` below does.
                     if let Err(e) = unsafe { TerminateProcess(HANDLE(h.as_raw_handle()), 1) } {
                         log!("update-guard: TerminateProcess failed: {e}");
                     }
                     let _ = exit_of(&h, KILL_WAIT_MS);
+                }
+                if guard_restores(exit, guarded) {
+                    log!("update-guard: no watchdog of pid {pid} restores the taskbar: the guard restores it");
+                    crate::taskbar::restore_force_waiting(Duration::from_secs(5));
                 }
                 return rollback(tag, &why, &old, &dest);
             }
@@ -330,7 +348,7 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
 
 /// Puts this (old) version back over `dest` and starts it. `autostart::run_install_cli` runs in this process: its
 /// `copy_self` waits up to 35 s for the ended dock's watchdog to give the taskbar back and leave, and leaves
-/// `dock.prev.exe` as it is (not an upgrade). No taskbar call here.
+/// `dock.prev.exe` as it is (not an upgrade). No taskbar call here (the caller's `guard_restores`).
 fn rollback(tag: &str, why: &str, old: &[u8; 32], dest: &Path) -> i32 {
     let current = Version::current();
     log!("update-guard: {tag} {why}: rolling back to {current}");
@@ -461,6 +479,21 @@ mod tests {
         assert_eq!(health(s(45), None, true, true, false), Health::Healthy, "its new watchdog runs (T3a)");
         assert!(failed(health(s(60), None, false, true, false), "did not answer"), "a watchdog alone is not enough");
         assert_eq!(health(s(30), None, false, true, false), Health::Wait);
+    }
+
+    /// A failed new dock that no watchdog guards is restored by the guard before the reinstall: a reinstall that fails
+    /// starts no dock, and nothing else would give the taskbar back.
+    #[test]
+    fn the_guard_restores_when_no_watchdog_will() {
+        let s = Duration::from_secs;
+        // The verdict of T3b: it answers, but no watchdog of it runs by the deadline; the guard ends it.
+        assert!(matches!(health(s(60), None, true, false, false), Health::Failed(_)));
+        assert!(guard_restores(None, false), "ended by the guard with no watchdog: nobody else restores");
+        assert!(!guard_restores(None, true), "ended by the guard (code 1): its watchdog restores");
+        assert!(!guard_restores(Some(0xC000_0005), true), "a crash: its watchdog restores");
+        assert!(guard_restores(Some(1), false), "a crash with no watchdog left");
+        assert!(guard_restores(Some(0), true), "code 0: its watchdog takes it for a dock that restored");
+        assert!(guard_restores(Some(0), false));
     }
 
     #[test]
