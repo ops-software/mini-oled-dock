@@ -392,6 +392,14 @@ static LAST_RAISE_MS: AtomicU64 = AtomicU64::new(0);
 static DISPLACED_MS: AtomicU64 = AtomicU64::new(0);
 static DISPLACED_WND: AtomicIsize = AtomicIsize::new(0);
 static WITNESS_LOGGED: AtomicU32 = AtomicU32::new(0);
+/// The Explorer `Shell_TrayWnd` the "TaskbandHWND missing" line was last logged for (0 = none): every foreground change
+/// raises the host (`copy_taskband`), so the line is logged once per Explorer window.
+static TASKBAND_MISSING_LOGGED: AtomicIsize = AtomicIsize::new(0);
+
+/// true when `last` did not already hold `ex` (it holds it from now on): one line per window in a row.
+fn first_for(last: &AtomicIsize, ex: isize) -> bool {
+    last.swap(ex, Relaxed) != ex
+}
 
 fn yield_msg_id() -> u32 {
     let cur = YIELD_MSG.load(Relaxed);
@@ -1879,7 +1887,9 @@ fn copy_taskband(host: HWND) {
     // SAFETY: static property name; invalid handle = property absent.
     let v = unsafe { GetPropW(ex, w!("TaskbandHWND")) };
     if v.is_invalid() {
-        log!("tray: TaskbandHWND missing on Explorer (no progress on the dock)");
+        if first_for(&TASKBAND_MISSING_LOGGED, ex.0 as isize) {
+            log!("tray: TaskbandHWND missing on Explorer (no progress on the dock)");
+        }
         return;
     }
     // SAFETY: `host` is our window; the value is an opaque handle copied from Explorer.
@@ -2993,6 +3003,15 @@ mod tests {
         assert!(witness_due(1000, 500));
         assert!(witness_due(1000, 0));
         assert!(!witness_due(0, 0));
+    }
+
+    #[test]
+    fn the_taskband_line_is_logged_once_per_explorer_window() {
+        let last = AtomicIsize::new(0);
+        assert!(first_for(&last, 0x10));
+        assert!(!first_for(&last, 0x10), "the next raises on the same Explorer log nothing");
+        assert!(first_for(&last, 0x20), "a new Explorer logs again");
+        assert!(first_for(&last, 0x10));
     }
 
     #[test]
