@@ -282,7 +282,7 @@ fn target_for(
 
 /// The target of the per-user shortcut `link`, read and parsed in Rust, environment variables expanded.
 fn rust_target(link: &str) -> Option<String> {
-    let target = crate::shell_thread::expand_env(&crate::jumplist::read_lnk(Path::new(link))?.target);
+    let target = crate::shell_thread::expand_env(&crate::jumplist::read_lnk(Path::new(link)).ok()?.target);
     crate::jumplist::is_local_file_path(&target).then_some(target)
 }
 

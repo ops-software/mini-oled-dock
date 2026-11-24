@@ -69,6 +69,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
+use crate::jumplist::LnkMiss;
 use crate::launcher::arena::{Arena, Caps, Kind as ArenaKind};
 use crate::launcher::catalog;
 use crate::launcher::gesture::{is_marker, is_network_file, Gesture};
@@ -1125,15 +1126,32 @@ pub(crate) fn com_guard(per_user: bool) -> bool {
     per_user
 }
 
-/// Counts of one index build, for its log line.
+/// Counts of one index build, for its log line (`index_line`).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct IndexStats {
-    /// Per-user links whose target the Rust parser read, or could not read (or that start a Windows
-    /// program, left out of the index, see `index_links`).
+    /// Per-user links whose target the Rust parser read, and those it could not read, by kind (in the
+    /// order of `LnkMiss::ALL`).
     rust_parsed: usize,
-    rust_unresolved: usize,
+    rust_unresolved: [usize; LnkMiss::ALL.len()],
     /// All-users links given to the shell link loader.
     com_common: usize,
+}
+
+/// The Start Menu index log line: counts only, never a name or a path. "unresolved: 8 (arguments: 5,
+/// shell item: 3)", the kinds in the order of `LnkMiss::ALL`, the empty ones left out.
+fn index_line(scanned: usize, exe_targets: usize, stats: &IndexStats, via_com: usize) -> String {
+    let total: usize = stats.rust_unresolved.iter().sum();
+    let kinds: Vec<String> = LnkMiss::ALL
+        .iter()
+        .zip(stats.rust_unresolved)
+        .filter(|(_, n)| *n > 0)
+        .map(|(k, n)| format!("{}: {n}", k.label()))
+        .collect();
+    let unresolved = if kinds.is_empty() { total.to_string() } else { format!("{total} ({})", kinds.join(", ")) };
+    format!(
+        "{scanned} shortcuts scanned, {exe_targets} exe targets, per-user parsed in Rust: {}, unresolved: {unresolved}, per-user via COM: {via_com}",
+        stats.rust_parsed
+    )
 }
 
 #[derive(Default)]
@@ -1242,8 +1260,16 @@ fn lnk_display_name(lnk: &Path) -> Option<String> {
 
 /// Scans the common and per-user Start Menu `.lnk` files; keeps only `exe path -> name` pairs.
 /// The all-users links go to the shell (target and localized name), the per-user ones to the Rust
-/// parser (target; the name is the file's), see `StartLnk`.
+/// parser (target; the name is the one their folder's `desktop.ini` gives them, else the file's),
+/// see `StartLnk`.
 fn build_start_index() -> HashMap<String, String> {
+    let (map, line) = start_index();
+    log!("shell: Start Menu index: {line}");
+    map
+}
+
+/// `build_start_index` without the log: the map and the counts of its log line.
+fn start_index() -> (HashMap<String, String>, String) {
     let mut files = Vec::new();
     for (id, per_user) in [(FOLDERID_CommonPrograms, false), (FOLDERID_Programs, true)] {
         if let Some(dir) = known_folder(&id) {
@@ -1253,14 +1279,27 @@ fn build_start_index() -> HashMap<String, String> {
     }
     // SAFETY: COM STA initialized on this thread; ShellLink CLSID with the requested interface.
     let Ok(link) = (unsafe { CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) }) else {
-        return HashMap::new();
+        return (HashMap::new(), "the shell link object is not available".into());
     };
-    let Ok(file) = link.cast::<IPersistFile>() else { return HashMap::new() };
+    let Ok(file) = link.cast::<IPersistFile>() else {
+        return (HashMap::new(), "the shell link object is not available".into());
+    };
     let mut rust_target = |l: &StartLnk| {
+        let facts = crate::jumplist::read_lnk(&l.path)?;
         // Rejected with arguments, as `lnk_target` does.
-        let target = expand_env(&crate::jumplist::read_lnk(&l.path).filter(|f| !f.has_args)?.target);
-        crate::jumplist::is_local_file_path(&target).then_some(target)
+        if facts.has_args {
+            return Err(LnkMiss::Arguments);
+        }
+        let target = expand_env(&facts.target);
+        if crate::jumplist::is_local_file_path(&target) {
+            Ok(target)
+        } else {
+            Err(LnkMiss::Refused)
+        }
     };
+    // Each folder's `desktop.ini`, read once for this build.
+    let mut inis: HashMap<std::path::PathBuf, Option<Vec<u8>>> = HashMap::new();
+    let mut rust_display = |l: &StartLnk| localized_lnk_name(&l.path, &mut inis);
     let mut com_target = |l: &StartLnk| {
         let refused = com_guard(l.per_user);
         debug_assert!(!refused, "a per-user shortcut reached the shell link loader");
@@ -1279,27 +1318,56 @@ fn build_start_index() -> HashMap<String, String> {
             lnk_display_name(&l.path)
         }
     };
-    let (mut map, stats) = index_links(&files, &mut rust_target, &mut com_target, &mut com_display);
+    let (mut map, stats) = index_links(&files, &mut rust_target, &mut rust_display, &mut com_target, &mut com_display);
     map.shrink_to_fit();
-    log!(
-        "shell: Start Menu index: {} shortcuts scanned, {} exe targets, per-user parsed in Rust: {}, unresolved: {}, per-user via COM: {}",
-        files.len(),
-        map.len(),
-        stats.rust_parsed,
-        stats.rust_unresolved,
-        PER_USER_VIA_COM.load(Relaxed)
-    );
-    map
+    let line = index_line(files.len(), map.len(), &stats, PER_USER_VIA_COM.load(Relaxed));
+    (map, line)
+}
+
+/// The name the folder's `desktop.ini` gives the per-user shortcut `lnk`, as the shell shows it
+/// (Windows' own shortcuts of the per-user folder, "Command Prompt.lnk" and the accessibility tools,
+/// are localized this way): read through `datadir::read_file` (capped, no reparse point), and only a
+/// string of a DLL of the system directory (`jumplist::localized_name_ref`, `system_string`).
+/// `inis` keeps each folder's file for one index build.
+fn localized_lnk_name(lnk: &Path, inis: &mut HashMap<std::path::PathBuf, Option<Vec<u8>>>) -> Option<String> {
+    let dir = lnk.parent()?;
+    let ini = inis.entry(dir.to_path_buf()).or_insert_with(|| {
+        crate::datadir::read_file(&dir.join("desktop.ini"), crate::jumplist::MAX_DESKTOP_INI, true).ok()
+    });
+    let file_name = lnk.file_name()?.to_string_lossy();
+    let (module, id) = crate::jumplist::localized_name_ref(ini.as_deref()?, &file_name)?;
+    system_string(&module, id)
+}
+
+/// String `id` of the DLL `module` (a plain file name) of the system directory (`system_dir`, never
+/// the environment), in the display language. The DLL is mapped as an image resource, so none of
+/// its code runs, and released at once.
+fn system_string(module: &str, id: u16) -> Option<String> {
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_AS_DATAFILE, LOAD_LIBRARY_AS_IMAGE_RESOURCE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::LoadStringW;
+    let path = HSTRING::from(system_dir()?.join(module).as_os_str());
+    // SAFETY: `path` is NUL-terminated and lives for the call; the file is mapped as data, never run.
+    let lib = unsafe { LoadLibraryExW(&path, None, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE) }.ok()?;
+    let mut buf = [0u16; 260];
+    // SAFETY: `lib` is the module mapped above; `buf` is writable for the length passed.
+    let n = unsafe { LoadStringW(Some(lib.into()), u32::from(id), PWSTR(buf.as_mut_ptr()), buf.len() as i32) };
+    // SAFETY: handle from LoadLibraryExW above, freed once; nothing from it is kept.
+    let _ = unsafe { FreeLibrary(lib) };
+    let name = String::from_utf16_lossy(&buf[..usize::try_from(n).unwrap_or(0).min(buf.len())]);
+    let name = name.trim();
+    (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_string())
 }
 
 /// The loop of `build_start_index` (pure): `exe path -> name` pairs of `files`, ambiguous targets
-/// dropped. A per-user link is read by `rust_target` only and named after its file; an all-users
-/// one by `com_target` and `com_display`. A per-user link to a program under `%SystemRoot%` is left
-/// out: Windows' own shortcuts there are renamed through `desktop.ini`, which only the shell reads,
-/// so `natural_name` gives the program its localized FileDescription, not the English file name.
+/// dropped. A per-user link is read by `rust_target` and `rust_display` only (its `desktop.ini`
+/// name, else the file's); an all-users one by `com_target` and `com_display`.
 fn index_links(
     files: &[StartLnk],
-    rust_target: &mut dyn FnMut(&StartLnk) -> Option<String>,
+    rust_target: &mut dyn FnMut(&StartLnk) -> Result<String, LnkMiss>,
+    rust_display: &mut dyn FnMut(&StartLnk) -> Option<String>,
     com_target: &mut dyn FnMut(&StartLnk) -> Option<String>,
     com_display: &mut dyn FnMut(&StartLnk) -> Option<String>,
 ) -> (HashMap<String, String>, IndexStats) {
@@ -1308,13 +1376,18 @@ fn index_links(
     let mut ambiguous: Vec<String> = Vec::new();
     for lnk in files {
         let target = if lnk.per_user {
-            let t = rust_target(lnk).filter(|t| !in_windows_dir(&expand_env(t)));
-            if t.is_some() {
-                stats.rust_parsed += 1;
-            } else {
-                stats.rust_unresolved += 1;
+            match rust_target(lnk) {
+                Ok(t) => {
+                    stats.rust_parsed += 1;
+                    Some(t)
+                }
+                Err(miss) => {
+                    if let Some(i) = LnkMiss::ALL.iter().position(|&k| k == miss) {
+                        stats.rust_unresolved[i] += 1;
+                    }
+                    None
+                }
             }
-            t
         } else {
             stats.com_common += 1;
             com_target(lnk)
@@ -1331,8 +1404,8 @@ fn index_links(
         }
         // The name the shell shows (Windows' own shortcuts are localized through `desktop.ini`:
         // "Remote Desktop Connection.lnk" is "Connessione Desktop remoto" in Italian, as in the
-        // Start menu), else the file name; per-user links always use the file name.
-        let shown = if lnk.per_user { None } else { com_display(lnk) };
+        // Start menu), else the file name.
+        let shown = if lnk.per_user { rust_display(lnk) } else { com_display(lnk) };
         let name = strip_paren_suffix(&shown.unwrap_or(stem));
         if name.is_empty() {
             continue;
@@ -3584,15 +3657,27 @@ mod tests {
             l(r"C:\Me\Broken.lnk", true),
             l(r"C:\All\Uninstall Tool.lnk", false),
             l(r"C:\Me\Magnify.lnk", true),
+            l(r"C:\Me\Args.lnk", true),
         ];
         let mut rust_calls = Vec::new();
         let mut rust = |s: &StartLnk| {
             rust_calls.push(s.path.clone());
             // A Windows program of the per-user folder, renamed there by its `desktop.ini`.
             if s.path.ends_with("Magnify.lnk") {
-                return Some(r"%SystemRoot%\System32\x.exe".to_string());
+                return Ok(r"%SystemRoot%\System32\x.exe".to_string());
             }
-            s.path.ends_with("Mine.lnk").then(|| r"C:\Me\mine.exe".to_string())
+            if s.path.ends_with("Broken.lnk") {
+                return Err(LnkMiss::ShellItem);
+            }
+            if s.path.ends_with("Args.lnk") {
+                return Err(LnkMiss::Arguments);
+            }
+            Ok(r"C:\Me\mine.exe".to_string())
+        };
+        let mut rust_names = Vec::new();
+        let mut rust_display = |s: &StartLnk| {
+            rust_names.push(s.path.clone());
+            s.path.ends_with("Magnify.lnk").then(|| "Lente".to_string())
         };
         let mut com_target = |s: &StartLnk| {
             assert!(!s.per_user, "{:?} reached the shell link loader", s.path);
@@ -3602,16 +3687,77 @@ mod tests {
             assert!(!s.per_user, "{:?} reached the shell's display name", s.path);
             s.path.ends_with("Tool.lnk").then(|| "Strumento".to_string())
         };
-        let (map, stats) = index_links(&files, &mut rust, &mut com_target, &mut com_display);
+        let (map, stats) = index_links(&files, &mut rust, &mut rust_display, &mut com_target, &mut com_display);
         let me = |p: &str| std::path::PathBuf::from(p);
-        assert_eq!(rust_calls, [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Broken.lnk"), me(r"C:\Me\Magnify.lnk")]);
-        assert_eq!(stats, IndexStats { rust_parsed: 1, rust_unresolved: 2, com_common: 3 });
+        let per_user =
+            [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Broken.lnk"), me(r"C:\Me\Magnify.lnk"), me(r"C:\Me\Args.lnk")];
+        assert_eq!(rust_calls, per_user);
+        assert_eq!(rust_names, [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Magnify.lnk")], "named only when indexed");
+        assert_eq!(stats, IndexStats { rust_parsed: 2, rust_unresolved: [1, 1, 0, 0, 0, 0], com_common: 3 });
         let windows_exe = norm_path(&expand_env(r"%SystemRoot%\System32\x.exe"));
-        assert!(!map.contains_key(&windows_exe), "a per-user Windows program keeps its FileDescription: {map:?}");
-        assert_eq!(map.get(r"c:\me\mine.exe").map(String::as_str), Some("Mine"), "per-user: the file name");
+        assert_eq!(map.get(&windows_exe).map(String::as_str), Some("Lente"), "its desktop.ini name: {map:?}");
+        assert_eq!(map.get(r"c:\me\mine.exe").map(String::as_str), Some("Mine"), "per-user: else the file name");
         assert_eq!(map.get(r"c:\all\tool.exe").map(String::as_str), Some("Strumento"), "the shell's name");
         assert_eq!(map.get(r"c:\all\other (x64).exe").map(String::as_str), Some("Other"));
-        assert_eq!(map.len(), 3, "the uninstaller is left out: {map:?}");
+        assert_eq!(map.len(), 4, "the uninstaller is left out: {map:?}");
+    }
+
+    /// The `desktop.ini` name of a per-user shortcut: a string of a system DLL, read once per folder.
+    #[test]
+    fn localized_names_come_from_system_dlls_only() {
+        let dir = std::env::temp_dir().join(format!("dock_ini_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test folder");
+        // The reference Windows writes for "Command Prompt.lnk" in its own per-user folder.
+        let text = "[LocalizedFileNames]\r\nA.lnk=@%SystemRoot%\\system32\\shell32.dll,-22022\r\n\
+                    B.lnk=@C:\\Somewhere\\shell32.dll,-22022\r\nC.lnk=@%SystemRoot%\\system32\\no-such-dll.dll,-1\r\n";
+        let mut ini = vec![0xFF, 0xFE];
+        ini.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(dir.join("desktop.ini"), ini).expect("desktop.ini");
+        let mut inis = HashMap::new();
+        let name = |f: &str, inis: &mut HashMap<_, _>| localized_lnk_name(&dir.join(f), inis);
+        let a = name("A.lnk", &mut inis);
+        let others = [name("B.lnk", &mut inis), name("C.lnk", &mut inis), name("D.lnk", &mut inis)];
+        let cached = inis.len();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(a.as_deref().is_some_and(|n| !n.is_empty() && !n.contains('@')), "{a:?}");
+        assert_eq!(others, [None, None, None], "another folder, a missing DLL, no entry");
+        assert_eq!(cached, 1, "one read per folder");
+    }
+
+    #[test]
+    fn index_line_counts_by_kind() {
+        let mut stats = IndexStats { rust_parsed: 47, rust_unresolved: [0; LnkMiss::ALL.len()], com_common: 146 };
+        let line = |s: &IndexStats| index_line(201, 112, s, 0);
+        assert_eq!(
+            line(&stats),
+            "201 shortcuts scanned, 112 exe targets, per-user parsed in Rust: 47, unresolved: 0, per-user via COM: 0"
+        );
+        stats.rust_unresolved = [5, 3, 0, 0, 0, 1];
+        assert_eq!(
+            line(&stats),
+            "201 shortcuts scanned, 112 exe targets, per-user parsed in Rust: 47, \
+             unresolved: 9 (arguments: 5, shell item: 3, damaged: 1), per-user via COM: 0"
+        );
+        stats.rust_unresolved = [1; LnkMiss::ALL.len()];
+        assert!(line(&stats).contains(
+            "unresolved: 6 (arguments: 1, shell item: 1, advertised: 1, network: 1, refused path: 1, damaged: 1)"
+        ));
+    }
+
+    /// The index of this machine's REAL Start menu, unelevated (run by hand: `cargo test -- --ignored
+    /// --nocapture start_index_counts`): prints the counts of the dock's log line, no name or path.
+    #[test]
+    #[ignore]
+    fn start_index_counts() {
+        // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let (_, line) = start_index();
+        println!("{line}");
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+        assert!(line.contains("per-user via COM: 0"), "{line}");
     }
 
     #[test]
@@ -3660,6 +3806,7 @@ mod tests {
             let (mut matched, mut parser_none, mut mismatch) = (0, 0, 0);
             for l in &files {
                 let rust = crate::jumplist::read_lnk(&l.path)
+                    .ok()
                     .filter(|f| !f.has_args)
                     .map(|f| expand_env(&f.target))
                     .filter(|t| crate::jumplist::is_local_file_path(t));
