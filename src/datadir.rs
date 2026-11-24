@@ -306,11 +306,6 @@ pub fn user_cache_dir(sid: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// `<root>\icons` (the user's custom PNGs), only if verified.
-pub fn icons_dir() -> Option<PathBuf> {
-    root_ref().filter(|r| r.icons_final.is_some()).map(|r| r.path.join(ICONS_NAME))
-}
-
 /// `<root>\dock.log`, only in a writable root.
 pub fn log_path() -> Option<PathBuf> {
     root_ref().filter(|r| r.writable).map(|r| r.path.join("dock.log"))

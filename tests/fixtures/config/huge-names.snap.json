@@ -216,6 +216,7 @@
   "show_date": true,
   "show_volume_percent": true,
   "show_tray": true,
+  "tray_show_all": false,
   "show_notifications": true,
   "show_volume": true,
   "show_network": true,

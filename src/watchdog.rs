@@ -28,33 +28,46 @@
 //!    `stop-watch` thread waits on it and, if it fires, posts `WM_DOCK_QUIT_REQUEST` to the window.
 //!    `--restore` signals it with `signal_stop_to_instance()`.
 //!
-//! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `shutdown`, `end_for_session_end` from the
-//! main/UI thread;
+//!  * Liveness of the watchdog (1.5.2 T3a): once the dock window exists, `watch_exit` puts a thread-pool wait on the
+//!    watchdog's process handle (no timer, no thread of ours); its callback posts `WM_DOCK_WATCHDOG_EXITED` once. The UI
+//!    thread (`on_exited`) then knows the old watchdog is dead and starts a new one through the same `launch_watchdog`
+//!    as at start, with the same arguments (same heartbeat, same restore duty): each at once, at most `MAX_RESTARTS`
+//!    in a row (`after_exit`). No wait between them: during one the taskbar would stay hidden with no watchdog. Each
+//!    start follows the death of the one before, so a watchdog that dies at once costs `MAX_RESTARTS` starts. Past
+//!    them the dock gives the taskbar back (`taskbar::restore`; while the session ends, `restore_at_session_end`, which
+//!    keeps the state file for the next sign-in: `give_up_restore`) and runs on without hiding it. One log line per
+//!    event.
+//!    Nothing while the dock exits, after a stop request or after the session end ended the watchdog.
+//!
+//! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `watch_exit`, `on_exited`, `shutdown`,
+//! `end_for_session_end` from the main/UI thread;
 //! `run_watchdog` is the main of the watchdog process (no window, no hook, no COM).
 
 use std::ffi::c_void;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_ACCESSDENIED, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_ACCESSDENIED, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
-use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::ProcessStatus::{EmptyWorkingSet, EnumProcesses};
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenEventW, OpenMutexW,
-    OpenProcess, ProcessMemoryPriority, ResetEvent, SetEvent, SetProcessInformation, TerminateProcess,
-    WaitForMultipleObjects, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, EVENT_MODIFY_STATE,
-    INFINITE, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_VERY_LOW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    CreateEventW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenEventW,
+    OpenMutexW, OpenProcess, ProcessMemoryPriority, RegisterWaitForSingleObject, ResetEvent, SetEvent,
+    SetProcessInformation, TerminateProcess, UnregisterWaitEx, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, EVENT_MODIFY_STATE, INFINITE, MEMORY_PRIORITY_INFORMATION,
+    MEMORY_PRIORITY_VERY_LOW, PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE,
+    WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, PostMessageW, SM_SHUTTINGDOWN};
 
 use crate::log;
-use crate::msg::WM_DOCK_QUIT_REQUEST;
+use crate::msg::{WM_DOCK_QUIT_REQUEST, WM_DOCK_WATCHDOG_EXITED};
 
 /// Number of consecutive wait timeouts (`WAIT_MS` each) without a heartbeat after which the watchdog
 /// restores: 6.6 s of silence.
@@ -78,6 +91,13 @@ pub(crate) const BEAT_MIN_GAP_MS: u64 = 1000;
 const MAX_MISSED_BEFORE_FIRST: u32 = 10;
 /// SYNCHRONIZE access right (waiting on kernel objects).
 const SYNCHRONIZE: u32 = 0x0010_0000;
+/// New watchdogs the dock starts in a row after one that exited while the dock runs (T3a), each at once; past them it
+/// gives the taskbar back and runs on without hiding it. This bound keeps a watchdog that dies at once from making the
+/// dock spin: each start waits only for the death of the one before (`on_exited`). No backoff wait: during one the
+/// taskbar would stay hidden with no watchdog to give it back if the dock died or hung.
+const MAX_RESTARTS: u32 = 3;
+/// A watchdog that ran this long did not die of its start: the count of restarts in a row begins again.
+const STABLE_MS: u64 = 60_000;
 
 /// Raw handles (isize, 0 = absent) of the dock-side kernel objects.
 static HEARTBEAT_EVENT: AtomicIsize = AtomicIsize::new(0);
@@ -89,6 +109,13 @@ static SHUTDOWN_EVENT: AtomicIsize = AtomicIsize::new(0);
 static WATCHDOG_PROCESS: AtomicIsize = AtomicIsize::new(0);
 /// `GetTickCount64` of the last heartbeat signalled (0 = none yet). UI thread.
 static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
+/// The thread-pool wait on the watchdog process (`watch_exit`; 0 = none): its callback posts `WM_DOCK_WATCHDOG_EXITED`
+/// once. Always ended (`end_exit_wait`) before the process handle is closed. UI thread.
+static EXIT_WAIT: AtomicIsize = AtomicIsize::new(0);
+/// `GetTickCount64` when the current watchdog was started (`spawn`, `restart`). UI thread.
+static STARTED_MS: AtomicU64 = AtomicU64::new(0);
+/// New watchdogs started in a row, each after one that ran less than `STABLE_MS` (`after_exit`). UI thread.
+static RESTARTS: AtomicU32 = AtomicU32::new(0);
 
 /// Name of the heartbeat event for the dock with `pid`: `Local\DockHeartbeat-<pid>`.
 pub fn heartbeat_event_name(pid: u32) -> String {
@@ -197,6 +224,8 @@ pub fn spawn() -> Result<(), String> {
         close_slot(&WATCHDOG_PROCESS);
         return Err(e);
     }
+    // SAFETY: no preconditions.
+    STARTED_MS.store(unsafe { GetTickCount64() }, Relaxed);
     log!("watchdog: started (event {ev_name})");
     Ok(())
 }
@@ -205,9 +234,15 @@ pub fn spawn() -> Result<(), String> {
 fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     // The process handle is kept for `end_for_session_end`; `shutdown` closes it.
-    let process = spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}"))?;
+    let process = spawn_breakaway(&exe, &watchdog_args(pid, ev_name))?;
     WATCHDOG_PROCESS.store(process.into_raw_handle() as isize, Relaxed);
     Ok(())
+}
+
+/// The watchdog's arguments after the exe path. Contract C7 of the update guard (`update::guard`): an older guard knows a
+/// newer dock's watchdog by its command line `"<exe>" --watchdog <pid> ...` (`is_watchdog_command`).
+pub(crate) fn watchdog_args(pid: u32, ev_name: &str) -> String {
+    format!("--watchdog {pid} {ev_name}")
 }
 
 /// `CreateProcessW` of `"<exe>" <args>` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW`, falling
@@ -380,6 +415,7 @@ pub fn shutdown(stop_watcher: Option<JoinHandle<()>>) {
             log!("watchdog: stop-watch thread terminated with a panic");
         }
     }
+    end_exit_wait();
     close_slot(&SHUTDOWN_EVENT);
     close_slot(&STOP_EVENT);
     close_slot(&HEARTBEAT_EVENT);
@@ -396,11 +432,173 @@ pub fn stop_requested() -> bool {
 }
 
 /// true only while the watchdog process this dock started runs: false without one (not started, ended for the
-/// session end, closed by `shutdown`) and once it has exited (its wait-failed branch restores and exits). UI thread
-/// (the slot is emptied and closed on it).
+/// session end, closed by `shutdown`, exited and not started again yet) and once it has exited (its wait-failed branch
+/// restores and exits). UI thread (the slot is emptied and closed on it).
 pub(crate) fn alive() -> bool {
     let raw = WATCHDOG_PROCESS.load(Relaxed);
     raw != 0 && unsignalled(to_handle(raw))
+}
+
+/// Watches the watchdog process for its exit (UI thread: once the dock window exists, and after each new start): a
+/// thread-pool wait on its handle whose callback posts `WM_DOCK_WATCHDOG_EXITED` once. No-op without a watchdog or
+/// with a wait already in place. A watchdog that exited before the call is reported at once.
+pub fn watch_exit() {
+    let raw = WATCHDOG_PROCESS.load(Relaxed);
+    if raw == 0 || EXIT_WAIT.load(Relaxed) != 0 {
+        return;
+    }
+    let mut wait = HANDLE::default();
+    // SAFETY: `wait` is writable; the process handle stays open until the wait is unregistered (`end_exit_wait` runs
+    // before every close of the slot); the callback only posts a message, so it may run in the wait thread.
+    let r = unsafe {
+        RegisterWaitForSingleObject(
+            &mut wait,
+            to_handle(raw),
+            Some(on_watchdog_exit),
+            None,
+            INFINITE,
+            WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD,
+        )
+    };
+    match r {
+        Ok(()) => EXIT_WAIT.store(wait.0 as isize, Relaxed),
+        Err(e) => log!("watchdog: its exit is not watched (RegisterWaitForSingleObject: {e})"),
+    }
+}
+
+/// Thread-pool callback of the watchdog's exit: one post to the dock window, nothing else (no log, no wait).
+unsafe extern "system" fn on_watchdog_exit(_context: *mut c_void, _timed_out: bool) {
+    let h = crate::hwnd();
+    if !h.0.is_null() {
+        // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
+        let _ = unsafe { PostMessageW(Some(h), WM_DOCK_WATCHDOG_EXITED, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// Ends the exit wait, blocking until a running callback (a single post) has returned, so the process handle is no
+/// longer in use. Idempotent; UI thread, never inside the callback.
+fn end_exit_wait() {
+    let wait = EXIT_WAIT.swap(0, Relaxed);
+    if wait != 0 {
+        // SAFETY: `wait` came from RegisterWaitForSingleObject and is unregistered once (the swap above);
+        // INVALID_HANDLE_VALUE waits for a callback in progress.
+        if let Err(e) = unsafe { UnregisterWaitEx(to_handle(wait), Some(INVALID_HANDLE_VALUE)) } {
+            log!("watchdog: UnregisterWaitEx failed: {e}");
+        }
+    }
+}
+
+/// `WM_DOCK_WATCHDOG_EXITED` (UI thread): the watchdog process exited while the dock runs. Its handle is signalled, so
+/// the old watchdog is known dead before a new one starts (never two for one dock). Nothing more while the dock exits,
+/// after a stop request, or with the slot empty (ended for the session end, `shutdown`); otherwise `after_exit`
+/// decides, with one log line.
+pub fn on_exited() {
+    let raw = WATCHDOG_PROCESS.load(Relaxed);
+    if raw != 0 && unsignalled(to_handle(raw)) {
+        return; // still running: its wait stays in place
+    }
+    end_exit_wait();
+    if raw == 0 || crate::taskbar::exiting() || stop_requested() {
+        return;
+    }
+    let mut code = 0u32;
+    // SAFETY: the slot's process handle (full access, from CreateProcessW), open until `close_slot` below.
+    let code = match unsafe { GetExitCodeProcess(to_handle(raw), &mut code) } {
+        Ok(()) => format!("0x{code:X}"),
+        Err(_) => "unknown".to_string(),
+    };
+    close_slot(&WATCHDOG_PROCESS);
+    // SAFETY: no preconditions.
+    let lived = unsafe { GetTickCount64() }.saturating_sub(STARTED_MS.load(Relaxed));
+    next_after_exit(lived, &format!("the watchdog process exited (code {code}, after {} s)", lived / 1000));
+}
+
+/// The step after a watchdog's exit, or after a new one failed to start (`lived_ms` 0): `after_exit`'s, logged in one
+/// line that begins with `what`. A failed start comes back here at once, so at most `MAX_RESTARTS` starts run in a
+/// row before the give-up.
+fn next_after_exit(lived_ms: u64, what: &str) {
+    match after_exit(RESTARTS.load(Relaxed), lived_ms) {
+        AfterExit::Restart { attempt } => {
+            RESTARTS.store(attempt, Relaxed);
+            log!("watchdog: {what}; starting a new one (attempt {attempt} of {MAX_RESTARTS})");
+            restart();
+        }
+        AfterExit::GiveUp => {
+            log!(
+                "watchdog: {what}; no new one after {MAX_RESTARTS} attempts: the Windows taskbar is given back and the \
+                 dock runs on without hiding it"
+            );
+            // The exit's own restore: it also stops any later hide in this process (no watchdog, no hidden taskbar).
+            // SAFETY: GetSystemMetrics has no preconditions.
+            match give_up_restore(unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0) {
+                GiveUpRestore::Exit => crate::taskbar::restore(),
+                GiveUpRestore::SessionEnd => crate::taskbar::restore_at_session_end(),
+            }
+        }
+    }
+}
+
+/// How the give-up gives the taskbar back.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum GiveUpRestore {
+    /// `taskbar::restore`, as on an exit: the state file has done its job.
+    Exit,
+    /// `taskbar::restore_at_session_end`: the state file is kept for the next sign-in, so the session end's own
+    /// restore, which then has nothing left to do, does not lose it.
+    SessionEnd,
+}
+
+/// Pure: `session_ending` = `SM_SHUTTINGDOWN`, the signal the update guard reads. Between `WM_QUERYENDSESSION` and
+/// the dock's `WM_ENDSESSION` the session end can end the watchdogs first; the give-up then must not delete the state
+/// file the session-end restore keeps. A Restart Manager close does not set it.
+fn give_up_restore(session_ending: bool) -> GiveUpRestore {
+    if session_ending {
+        GiveUpRestore::SessionEnd
+    } else {
+        GiveUpRestore::Exit
+    }
+}
+
+/// Starts a new watchdog through the same `launch_watchdog` as `spawn` (same heartbeat event, same arguments) and
+/// watches it. Never beside another one: the slot is empty only once the old one is known dead (`on_exited`). A start
+/// that fails counts as a watchdog that died at once (`next_after_exit` with `lived_ms` 0).
+fn restart() {
+    if WATCHDOG_PROCESS.load(Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: no preconditions.
+    let pid = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+    match launch_watchdog(pid, &heartbeat_event_name(pid)) {
+        Ok(()) => {
+            // SAFETY: no preconditions.
+            STARTED_MS.store(unsafe { GetTickCount64() }, Relaxed);
+            // SAFETY: the process handle `launch_watchdog` just stored; 0 on failure.
+            let new = unsafe { GetProcessId(to_handle(WATCHDOG_PROCESS.load(Relaxed))) };
+            log!("watchdog: a new watchdog started (pid {new})");
+            watch_exit();
+        }
+        Err(e) => next_after_exit(0, &format!("a new watchdog did not start ({e})")),
+    }
+}
+
+/// What the dock does once its watchdog has exited, or a new one failed to start, while the dock runs.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum AfterExit {
+    /// Start a new watchdog now: `attempt` of `MAX_RESTARTS` in a row.
+    Restart { attempt: u32 },
+    /// No new watchdog: the dock gives the taskbar back and runs on without hiding it.
+    GiveUp,
+}
+
+/// Pure: `restarts` = new watchdogs started in a row so far, `lived_ms` = how long the one that exited ran (0 for a
+/// start that failed). One that ran `STABLE_MS` or more begins a new count.
+fn after_exit(restarts: u32, lived_ms: u64) -> AfterExit {
+    let done = if lived_ms >= STABLE_MS { 0 } else { restarts };
+    if done < MAX_RESTARTS {
+        AfterExit::Restart { attempt: done + 1 }
+    } else {
+        AfterExit::GiveUp
+    }
 }
 
 /// true when `h` (an event, a process) is signalled now; a failed wait reads as false. Never blocks.
@@ -419,6 +617,8 @@ fn unsignalled(h: HANDLE) -> bool {
 /// restore, so it cannot restore again after the dock exits and delete the state file kept for the next sign-in.
 /// No-op without a watchdog (never started, or already ended).
 pub(crate) fn end_for_session_end() {
+    // Its exit is not news: the wait ends first, so the TerminateProcess below posts nothing.
+    end_exit_wait();
     let raw = WATCHDOG_PROCESS.swap(0, Relaxed);
     if raw == 0 {
         return;
@@ -431,6 +631,74 @@ pub(crate) fn end_for_session_end() {
     }
     // SAFETY: the same handle, closed once (the slot was emptied by the swap).
     let _ = unsafe { CloseHandle(h) };
+}
+
+// ------------------------------------------------------ update guard side
+
+/// The update guard's check (1.5.2 T3b, contract C7): true when a live watchdog of the dock process `dock` runs. It comes
+/// from the process list, like the guard's other checks (no named object, nothing the dock says of itself): a process
+/// whose parent is `dock`'s pid, created after it (so not the child of an older process that had the pid), still
+/// running, from the same image file, whose command line is the watchdog's for that pid (`is_watchdog_command`). The
+/// dock's other children from its image (the files helper, the Start index children) have other arguments.
+pub(crate) fn runs_for(dock: HANDLE) -> bool {
+    // SAFETY: `dock` is a process handle the caller owns for the call; 0 on failure.
+    let pid = unsafe { GetProcessId(dock) };
+    let (Some(born), Some(image)) = (crate::apps::creation_time(dock), crate::apps::query_exe_path(dock)) else {
+        return false;
+    };
+    pid != 0 && process_ids().into_iter().any(|child| is_watchdog_of(child, pid, born, &image))
+}
+
+/// `runs_for`'s test of the process `child` against the dock `pid`, created at `born` from `image`.
+fn is_watchdog_of(child: u32, pid: u32, born: u64, image: &str) -> bool {
+    let access = PROCESS_ACCESS_RIGHTS(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION.0);
+    // SAFETY: OpenProcess has no preconditions; the handle is closed below.
+    let Ok(h) = (unsafe { OpenProcess(access, false, child) }) else {
+        return false;
+    };
+    let found = crate::apps::parent_pid(h) == Some(pid)
+        && unsignalled(h)
+        && crate::apps::creation_time(h).is_some_and(|t| t >= born)
+        && crate::apps::query_exe_path(h).is_some_and(|p| p.eq_ignore_ascii_case(image))
+        && crate::apps::command_line(h).is_some_and(|c| is_watchdog_command(&c, pid));
+    // SAFETY: opened above, closed once.
+    let _ = unsafe { CloseHandle(h) };
+    found
+}
+
+/// The ids of the running processes (`EnumProcesses`, the list grown up to a bound; empty when it fails).
+fn process_ids() -> Vec<u32> {
+    let mut pids = vec![0u32; 1024];
+    loop {
+        let cap = (pids.len() * std::mem::size_of::<u32>()) as u32;
+        let mut bytes = 0u32;
+        // SAFETY: `pids` has `cap` writable bytes; `bytes` receives the number of bytes written.
+        if unsafe { EnumProcesses(pids.as_mut_ptr(), cap, &mut bytes) }.is_err() {
+            return Vec::new();
+        }
+        if bytes < cap || pids.len() >= 1 << 16 {
+            pids.truncate(bytes as usize / std::mem::size_of::<u32>());
+            return pids;
+        }
+        pids.resize(pids.len() * 2, 0); // the list may be cut: grow and ask again
+    }
+}
+
+/// true when `cmd`, a process's command line, is the one `spawn_breakaway` writes for the watchdog of the dock `pid`:
+/// the exe (quoted, as `spawn_breakaway` writes it, or bare), then `--watchdog <pid>` (`watchdog_args`). Pure; any
+/// other text, a pid with another spelling included, is false.
+fn is_watchdog_command(cmd: &str, pid: u32) -> bool {
+    let cmd = cmd.trim_start();
+    let rest = match cmd.strip_prefix('"') {
+        // The exe ends at the closing quote, which a space must follow.
+        Some(quoted) => match quoted.split_once('"') {
+            Some((_, r)) if r.starts_with(char::is_whitespace) => r,
+            _ => return false,
+        },
+        None => cmd.split_once(char::is_whitespace).map_or("", |(_, r)| r),
+    };
+    let mut args = rest.split_whitespace();
+    args.next() == Some("--watchdog") && args.next() == Some(pid.to_string().as_str())
 }
 
 // ------------------------------------------------------ `--restore` side
@@ -756,6 +1024,80 @@ mod tests {
         assert!(!is_set(HANDLE::default()));
         // SAFETY: the event created above, closed once.
         let _ = unsafe { CloseHandle(h) };
+    }
+
+    /// 1.5.2 T3a: a watchdog that exits while the dock runs is started again at once, at most `MAX_RESTARTS` times in a
+    /// row; then the dock gives the taskbar back. One that ran `STABLE_MS` begins a new count.
+    #[test]
+    fn a_dead_watchdog_is_started_again_a_bounded_number_of_times() {
+        let r = |attempt| AfterExit::Restart { attempt };
+        assert_eq!(after_exit(0, 0), r(1), "the first exit: a new one at once");
+        assert_eq!(after_exit(0, 5_000), r(1));
+        assert_eq!(after_exit(1, 5_000), r(2), "it died again soon: at once too, no wait with the taskbar unguarded");
+        assert_eq!(after_exit(2, 0), r(3), "a start that failed counts as a death at once");
+        assert_eq!(after_exit(3, 5_000), AfterExit::GiveUp);
+        assert_eq!(after_exit(3, 0), AfterExit::GiveUp);
+        assert_eq!(after_exit(u32::MAX, 0), AfterExit::GiveUp);
+        assert_eq!(after_exit(3, STABLE_MS - 1), AfterExit::GiveUp);
+        assert_eq!(after_exit(3, STABLE_MS), r(1), "one that ran a minute begins a new count");
+        assert_eq!(after_exit(2, u64::MAX), r(1));
+    }
+
+    /// The give-up during a session end keeps the state file for the next sign-in (watchdogs ended by the session end
+    /// before the dock's WM_ENDSESSION); otherwise it is the exit's restore.
+    #[test]
+    fn a_give_up_at_the_session_end_keeps_the_state_file() {
+        assert_eq!(give_up_restore(true), GiveUpRestore::SessionEnd);
+        assert_eq!(give_up_restore(false), GiveUpRestore::Exit);
+    }
+
+    /// A watchdog that dies at once, or a start that keeps failing, cannot make the dock spin: the count goes up by one
+    /// per start and ends in the give-up after `MAX_RESTARTS` starts.
+    #[test]
+    fn a_watchdog_that_dies_at_once_cannot_spin() {
+        let (mut restarts, mut starts) = (0, 0);
+        while let AfterExit::Restart { attempt } = after_exit(restarts, 0) {
+            assert_eq!(attempt, restarts + 1, "one more per start");
+            restarts = attempt;
+            starts += 1;
+            assert!(starts <= MAX_RESTARTS);
+        }
+        assert_eq!(starts, MAX_RESTARTS);
+    }
+
+    /// 1.5.2 T3b, contract C7: the update guard knows the dock's watchdog by its command line, the one `launch_watchdog`
+    /// gives `spawn_breakaway` (`"<exe>" <args>`); the dock's other children from its image are not it.
+    #[test]
+    fn the_guard_knows_the_watchdog_by_its_command_line() {
+        let args = watchdog_args(4242, &heartbeat_event_name(4242));
+        assert_eq!(args, "--watchdog 4242 Local\\DockHeartbeat-4242", "C7: older guards read these arguments");
+        let line = |exe: &str, args: &str| format!("\"{exe}\" {args}");
+        let exe = r"C:\Program Files\Some Dock\dock.exe";
+        assert!(is_watchdog_command(&line(exe, &args), 4242));
+        assert!(!is_watchdog_command(&line(exe, &args), 424), "another dock's watchdog");
+        assert!(!is_watchdog_command(&line(exe, &args), 42420));
+        assert!(is_watchdog_command(&format!("dock.exe {args}"), 4242), "a bare exe");
+        assert!(is_watchdog_command(&format!("  {}  ", line(exe, &args)), 4242));
+        let others = ["--launcher-files --root x", "--start-apps", "--start-icons", "--update-fetch", "", "--watchdog"];
+        for other in others {
+            assert!(!is_watchdog_command(&line(exe, other), 4242), "{other:?}");
+        }
+        assert!(!is_watchdog_command(&line(exe, "--watchdog 04242 ev"), 4242), "another spelling of the pid");
+        assert!(!is_watchdog_command(&line(exe, "--watchdog +4242 ev"), 4242));
+        assert!(!is_watchdog_command(&line(exe, "x --watchdog 4242 ev"), 4242), "not the first argument");
+        assert!(!is_watchdog_command(r#""C:\--watchdog 4242\dock.exe" --start-apps"#, 4242), "inside the exe path");
+        assert!(!is_watchdog_command(r#""C:\dock.exe"--watchdog 4242 ev"#, 4242), "no space after the quote");
+        assert!(!is_watchdog_command(r#""C:\dock.exe --watchdog 4242 ev"#, 4242), "an unclosed quote");
+        assert!(!is_watchdog_command("dock.exe", 4242));
+    }
+
+    /// The process-list check on this test's own process: a test exe has no watchdog child.
+    #[test]
+    fn a_process_without_a_watchdog_child_has_none() {
+        assert!(process_ids().len() > 1, "the process list is read");
+        // SAFETY: the pseudo-handle of the current process.
+        assert!(!runs_for(unsafe { GetCurrentProcess() }));
+        assert!(!runs_for(HANDLE::default()), "no process");
     }
 
     #[test]

@@ -1301,7 +1301,8 @@ fn restore_needed(was_hidden: bool, state_left: bool, session_ending: bool) -> b
     was_hidden || (state_left && !session_ending)
 }
 
-/// The session-end restore (`WM_ENDSESSION` with wParam != 0, UI thread): ends the watchdog first, so it cannot
+/// The session-end restore (`WM_ENDSESSION` with wParam != 0, and the watchdog give-up while the session ends: UI
+/// thread): ends the watchdog first, so it cannot
 /// restore again after the dock and delete the state file, then marks the session end (`restore_force` keeps the
 /// file for the next sign-in's `init`) and restores. A restore that is not delivered keeps the file as always.
 pub fn restore_at_session_end() {

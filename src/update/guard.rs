@@ -3,12 +3,14 @@
 //! Every update is judged by the version that ran before it. The updater copies its own (old) image to
 //! `update\<tag>\dock-guard.exe` and starts it with `--update-guard <tag>`. The guard checks the stage again, runs
 //! the new release's `--install --quiet --no-relaunch`, starts the new dock and keeps its process handle. If that
-//! process exits (an exit at a session end gets no verdict), or its `DockWindow` does not answer `WM_NULL` between
-//! `MIN_ALIVE` and `MAX_WAIT` after the start, the guard ends it, writes `update\<tag>\rolled-back` (the automatic
+//! process exits (an exit at a session end gets no verdict), or its `DockWindow` does not answer `WM_NULL`, or no live
+//! watchdog of it runs (C7), between `MIN_ALIVE` and `MAX_WAIT` after the start, the guard ends it, writes
+//! `update\<tag>\rolled-back` (the automatic
 //! install never retries that release), installs itself back with its own `--install` and starts the old dock. The
-//! judge is the old binary because the build under judgement cannot be trusted to judge itself. The guard makes no
-//! taskbar call: the ended dock's own watchdog gives the taskbar back, and `copy_self` waits for that watchdog to
-//! leave.
+//! judge is the old binary because the build under judgement cannot be trusted to judge itself. The ended dock's own
+//! watchdog gives the taskbar back, and `copy_self` waits for that watchdog to leave; when none of it runs, or the dock
+//! ended with code 0 (which its watchdog takes for a dock that restored), the guard restores the taskbar itself before
+//! the reinstall (`guard_restores`), so a failed reinstall cannot leave it hidden.
 //!
 //! Contracts later releases keep (pinned by the tests below):
 //! - C1: the dock's top-level window class is `DockWindow`, owned by its UI thread, which pumps within 30 s of the
@@ -19,6 +21,9 @@
 //! - C5: the stage `update\<tag>\` holds `dock.exe`, `dock.exe.sha256`, `dock-guard.exe` and `rolled-back`; releases
 //!   before `FIRST_RELEASE_WITH_MARKS` do not read `rolled-back`, and `--rollback` to one of them says so.
 //! - C6: the exit codes `EXIT_COMMITTED` to `EXIT_ROLLBACK_FAILED` (0 to 4).
+//! - C7: the dock starts its watchdog as a child process of its own image with the command line
+//!   `"<exe>" --watchdog <pid> <event>` (`watchdog::watchdog_args`), and keeps one running: an older guard finds it
+//!   in the process list (`watchdog::runs_for`), not through a named object or anything the new dock reports.
 //!
 //! `--rollback` installs `dock.prev.exe` again through that binary's own `--install`.
 //!
@@ -101,21 +106,39 @@ pub(crate) enum Health {
     SessionEnd,
 }
 
-/// `elapsed` since the new dock started, its exit code if it ended, whether its window answered, whether the session
-/// is ending. An exit fails (even with code 0) unless the session is ending; an answer counts from `MIN_ALIVE` on; no
-/// answer by `MAX_WAIT` fails. Pure.
-pub(crate) fn health(elapsed: Duration, exit: Option<u32>, answered: bool, session_ending: bool) -> Health {
+/// `elapsed` since the new dock started, its exit code if it ended, whether its window answered, whether a live watchdog
+/// of it runs (C7), whether the session is ending. An exit fails (even with code 0) unless the session is ending; an
+/// answer with a live watchdog counts from `MIN_ALIVE` on; no answer, or no watchdog, by `MAX_WAIT` fails. Pure.
+pub(crate) fn health(
+    elapsed: Duration,
+    exit: Option<u32>,
+    answered: bool,
+    watchdog: bool,
+    session_ending: bool,
+) -> Health {
     if exit.is_some() && session_ending {
         Health::SessionEnd
     } else if let Some(c) = exit {
         Health::Failed(format!("exited with code 0x{c:X} after {} s", elapsed.as_secs()))
-    } else if answered && elapsed >= MIN_ALIVE {
+    } else if answered && watchdog && elapsed >= MIN_ALIVE {
         Health::Healthy
-    } else if elapsed >= MAX_WAIT {
+    } else if elapsed >= MAX_WAIT && !answered {
         Health::Failed(format!("its window did not answer within {} s", MAX_WAIT.as_secs()))
+    } else if elapsed >= MAX_WAIT {
+        Health::Failed(format!("it ran without a live watchdog for {} s", MAX_WAIT.as_secs()))
     } else {
         Health::Wait
     }
+}
+
+/// Whether the guard restores the taskbar itself once the new dock it judged failed is gone: `exit` = its exit code
+/// before the guard ended it (None: ended by the guard, with code 1), `guarded` = a live watchdog of it ran just
+/// before (`watchdog::runs_for`; one still restoring after the dock died is still its child and still runs). A watchdog
+/// restores after a code other than 0 and does nothing after 0, so the guard restores when no watchdog runs or the code
+/// was 0. Its restore does nothing when nothing was hidden, and with no restoring watchdog there is no restore to race.
+/// Pure.
+pub(crate) fn guard_restores(exit: Option<u32>, guarded: bool) -> bool {
+    !guarded || exit == Some(0)
 }
 
 /// What the guard does once the new release's installer has returned.
@@ -289,7 +312,9 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
         let exit = exit_of(&h, POLL_MS);
         let elapsed = t0.elapsed();
         let answered = exit.is_none() && elapsed >= MIN_ALIVE && window_answers(pid);
-        match health(elapsed, exit, answered, exit.is_some() && session_ending()) {
+        // The new dock must not be called good while it runs without its watchdog (C7): asked only once it answers.
+        let watchdog = answered && watchdog::runs_for(HANDLE(h.as_raw_handle()));
+        match health(elapsed, exit, answered, watchdog, exit.is_some() && session_ending()) {
             Health::Wait => {}
             Health::SessionEnd => {
                 log!("update-guard: {tag} exited with the session end (pid {pid}): no verdict, it stays installed");
@@ -300,13 +325,20 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
                 return EXIT_COMMITTED;
             }
             Health::Failed(why) => {
+                // Asked before the kill, so the answer is about the watchdog that restores after it.
+                let guarded = watchdog::runs_for(HANDLE(h.as_raw_handle()));
                 if exit.is_none() {
                     log!("update-guard: {tag} terminated pid {pid} ({why})");
-                    // SAFETY: `h` is the new dock's process handle, owned here; its watchdog gives the taskbar back.
+                    // SAFETY: `h` is the new dock's process handle, owned here; a live watchdog gives the taskbar
+                    // back after this code 1, otherwise `guard_restores` below does.
                     if let Err(e) = unsafe { TerminateProcess(HANDLE(h.as_raw_handle()), 1) } {
                         log!("update-guard: TerminateProcess failed: {e}");
                     }
                     let _ = exit_of(&h, KILL_WAIT_MS);
+                }
+                if guard_restores(exit, guarded) {
+                    log!("update-guard: no watchdog of pid {pid} restores the taskbar: the guard restores it");
+                    crate::taskbar::restore_force_waiting(Duration::from_secs(5));
                 }
                 return rollback(tag, &why, &old, &dest);
             }
@@ -316,7 +348,7 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
 
 /// Puts this (old) version back over `dest` and starts it. `autostart::run_install_cli` runs in this process: its
 /// `copy_self` waits up to 35 s for the ended dock's watchdog to give the taskbar back and leave, and leaves
-/// `dock.prev.exe` as it is (not an upgrade). No taskbar call here.
+/// `dock.prev.exe` as it is (not an upgrade). No taskbar call here (the caller's `guard_restores`).
 fn rollback(tag: &str, why: &str, old: &[u8; 32], dest: &Path) -> i32 {
     let current = Version::current();
     log!("update-guard: {tag} {why}: rolling back to {current}");
@@ -422,24 +454,56 @@ mod tests {
     fn health_verdicts() {
         let s = Duration::from_secs;
         let failed = |h: Health, part: &str| matches!(h, Health::Failed(w) if w.contains(part));
-        assert_eq!(health(s(0), None, false, false), Health::Wait);
-        assert!(failed(health(s(5), Some(1), false, false), "0x1"));
-        assert_eq!(health(s(29), None, true, false), Health::Wait);
-        assert_eq!(health(s(30), None, true, false), Health::Healthy);
-        assert_eq!(health(s(45), None, false, false), Health::Wait);
-        assert!(failed(health(s(60), None, false, false), "did not answer"));
-        assert_eq!(health(s(60), None, true, false), Health::Healthy);
-        assert!(failed(health(s(31), Some(0), true, false), "0x0"), "an exit wins over an answer, even code 0");
+        assert_eq!(health(s(0), None, false, false, false), Health::Wait);
+        assert!(failed(health(s(5), Some(1), false, false, false), "0x1"));
+        assert_eq!(health(s(29), None, true, true, false), Health::Wait);
+        assert_eq!(health(s(30), None, true, true, false), Health::Healthy);
+        assert_eq!(health(s(45), None, false, false, false), Health::Wait);
+        assert!(failed(health(s(60), None, false, false, false), "did not answer"));
+        assert_eq!(health(s(60), None, true, true, false), Health::Healthy);
+        assert!(failed(health(s(31), Some(0), true, true, false), "0x0"), "an exit wins over an answer, even code 0");
+        // 1.5.2 T3c: a Restart Manager close (ENDSESSION_CLOSEAPP) is not a session end. `session_ending` reads
+        // SM_SHUTTINGDOWN, which it does not set: the new dock's exit is judged like any other.
+        assert!(failed(health(s(40), Some(0), true, true, false), "0x0"));
+    }
+
+    /// 1.5.2 T3b: the new dock is not called good while it runs without its watchdog; the same deadline, then the
+    /// rollback.
+    #[test]
+    fn a_dock_without_its_watchdog_is_not_healthy() {
+        let s = Duration::from_secs;
+        let failed = |h: Health, part: &str| matches!(h, Health::Failed(w) if w.contains(part));
+        assert_eq!(health(s(30), None, true, false, false), Health::Wait, "it answers but no watchdog runs yet");
+        assert_eq!(health(s(59), None, true, false, false), Health::Wait);
+        assert!(failed(health(s(60), None, true, false, false), "without a live watchdog"));
+        assert_eq!(health(s(45), None, true, true, false), Health::Healthy, "its new watchdog runs (T3a)");
+        assert!(failed(health(s(60), None, false, true, false), "did not answer"), "a watchdog alone is not enough");
+        assert_eq!(health(s(30), None, false, true, false), Health::Wait);
+    }
+
+    /// A failed new dock that no watchdog guards is restored by the guard before the reinstall: a reinstall that fails
+    /// starts no dock, and nothing else would give the taskbar back.
+    #[test]
+    fn the_guard_restores_when_no_watchdog_will() {
+        let s = Duration::from_secs;
+        // The verdict of T3b: it answers, but no watchdog of it runs by the deadline; the guard ends it.
+        assert!(matches!(health(s(60), None, true, false, false), Health::Failed(_)));
+        assert!(guard_restores(None, false), "ended by the guard with no watchdog: nobody else restores");
+        assert!(!guard_restores(None, true), "ended by the guard (code 1): its watchdog restores");
+        assert!(!guard_restores(Some(0xC000_0005), true), "a crash: its watchdog restores");
+        assert!(guard_restores(Some(1), false), "a crash with no watchdog left");
+        assert!(guard_restores(Some(0), true), "code 0: its watchdog takes it for a dock that restored");
+        assert!(guard_restores(Some(0), false));
     }
 
     #[test]
     fn an_exit_at_the_session_end_has_no_verdict() {
         let s = Duration::from_secs;
-        assert_eq!(health(s(5), Some(0), false, true), Health::SessionEnd);
-        assert_eq!(health(s(61), Some(1), true, true), Health::SessionEnd);
-        assert_eq!(health(s(5), None, false, true), Health::Wait, "no exit: the session end changes nothing");
-        assert_eq!(health(s(30), None, true, true), Health::Healthy);
-        assert!(matches!(health(s(60), None, false, true), Health::Failed(_)));
+        assert_eq!(health(s(5), Some(0), false, false, true), Health::SessionEnd);
+        assert_eq!(health(s(61), Some(1), true, true, true), Health::SessionEnd);
+        assert_eq!(health(s(5), None, false, false, true), Health::Wait, "no exit: the session end changes nothing");
+        assert_eq!(health(s(30), None, true, true, true), Health::Healthy);
+        assert!(matches!(health(s(60), None, false, false, true), Health::Failed(_)));
     }
 
     #[test]

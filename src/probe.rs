@@ -1226,6 +1226,7 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Ui, WM_DOCK_START_MENU) => "WM_DOCK_START_MENU",
         (Th::Ui, WM_DOCK_OPEN_SETTINGS) => "WM_DOCK_OPEN_SETTINGS",
         (Th::Ui, WM_DOCK_UPDATE) => "WM_DOCK_UPDATE",
+        (Th::Ui, WM_DOCK_WATCHDOG_EXITED) => "WM_DOCK_WATCHDOG_EXITED",
         // Labels without the launcher's probe-name prefix: launcher lint 14 rejects it in any string literal.
         (Th::Ui, WM_DOCK_LAUNCHER) => "launcher",
         (Th::Ui, WM_DOCK_LAUNCHER_YIELDED) => "launcher_yielded",

@@ -163,7 +163,8 @@ fn serve(state: u32, input: &mut impl BufRead, out: &mut impl Write, query: &mut
         }
         let Ok((gen, text)) = files::parse_request_line(&line) else { return EXIT_BAD_LINE };
         let words = files::words_of(text);
-        let answer = if words.is_empty() { Some((Vec::new(), 0)) } else { query(&words.join(" ")) };
+        let text = files::aqs_of(&words);
+        let answer = if text.is_empty() { Some((Vec::new(), 0)) } else { query(&text) };
         frame.clear();
         match answer {
             Some((hits, skipped)) => files::encode_rows(gen, files::STATUS_OK, skipped, &hits, &mut frame),
@@ -881,7 +882,7 @@ mod tests {
         };
         let mut asked = Vec::new();
         let mut out = Vec::new();
-        let input = b"1 quokka\n2   ext:pdf  plan \n3 fail\n4  \n";
+        let input = b"1 quokka\n2   ext:pdf  plan \n3 fail\n4  \n5 my-notes\n6 -\n";
         let code = serve(0, &mut &input[..], &mut out, &mut |t| {
             asked.push(t.to_string());
             (t != "fail").then(|| (vec![hit.clone()], 2))
@@ -889,8 +890,8 @@ mod tests {
         assert_eq!(code, 0, "stdin ended");
         assert_eq!(
             asked,
-            ["quokka", "ext:pdf plan", "fail"],
-            "the words, one space between; a blank line asks nothing"
+            ["quokka", "ext:pdf plan", "fail", "my notes"],
+            "the words, one space between, no mark of the query syntax; a blank line or marks alone ask nothing"
         );
         let rows = |gen, status, skipped, hits: &[FileHit]| Frame::Rows { gen, status, skipped, hits: hits.to_vec() };
         assert_eq!(
@@ -900,7 +901,9 @@ mod tests {
                 rows(1, 0, 2, std::slice::from_ref(&hit)),
                 rows(2, 0, 2, std::slice::from_ref(&hit)),
                 rows(3, 1, 0, &[]),
-                rows(4, 0, 0, &[])
+                rows(4, 0, 0, &[]),
+                rows(5, 0, 2, std::slice::from_ref(&hit)),
+                rows(6, 0, 0, &[])
             ]
         );
         // A bad line ends it with 2, after the lines before it were answered.

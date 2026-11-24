@@ -173,6 +173,10 @@ fn hex16(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Failure text of an export that left its `.json.err` file. It names the kind of file, never the file: its path holds
+/// the profile folder's name and `dock.log` is readable by every account.
+const EXPORT_FAILED: &str = "the export failed (its .json.err file exists)";
+
 fn layout_file_name(id: &[u8; 16]) -> String {
     format!("start-layout-{}.json", hex16(id))
 }
@@ -282,7 +286,7 @@ fn target_for(
 
 /// The target of the per-user shortcut `link`, read and parsed in Rust, environment variables expanded.
 fn rust_target(link: &str) -> Option<String> {
-    let target = crate::shell_thread::expand_env(&crate::jumplist::read_lnk(Path::new(link))?.target);
+    let target = crate::shell_thread::expand_env(&crate::jumplist::read_lnk(Path::new(link)).ok()?.target);
     crate::jumplist::is_local_file_path(&target).then_some(target)
 }
 
@@ -334,7 +338,7 @@ fn job() -> Result<usize, JobError> {
                 std::thread::sleep(Duration::from_millis(POLL_MS));
             }
             Poll::Ready => break,
-            Poll::Failed => return Err(JobError::Failed(format!("the export failed ({} exists)", err.display()))),
+            Poll::Failed => return Err(JobError::Failed(EXPORT_FAILED.into())),
             Poll::TimedOut => return Err(JobError::TimedOut),
         }
     }
@@ -461,7 +465,10 @@ pub(crate) fn map_layout(
         } else if let Some(link) = entry.get("desktopAppLink").and_then(|x| x.as_str()) {
             let link = crate::shell_thread::expand_env(link);
             if !link_allowed(&link, roots) {
-                log!("start import: shortcut outside the Start menu folders skipped: {link}");
+                log!(
+                    "start import: a shortcut outside the Start menu folders skipped ({} chars)",
+                    link.chars().count()
+                );
                 continue;
             }
             let apps = loaded.get_or_insert_with(&mut *catalog);
@@ -475,11 +482,11 @@ pub(crate) fn map_layout(
                 apps.iter().find(|(a, _)| a.name.eq_ignore_ascii_case(s)).map(|(a, _)| a.id.clone())
             });
             if found.is_none() {
-                log!("start import: no app for the shortcut {link}");
+                log!("start import: no app for a shortcut ({} chars)", link.chars().count());
             }
             found
         } else {
-            log!("start import: entry skipped: {entry}");
+            log!("start import: an entry of no known kind skipped");
             None
         };
         if let Some(id) = id {
@@ -715,6 +722,13 @@ mod tests {
         assert_eq!(decode(IDLE), Status::Idle);
         assert_eq!(decode(TIMEDOUT), Status::TimedOut, "the TIMEDOUT arm precedes the Imported catch-all");
         assert_eq!(decode(DONE + 7), Status::Imported(7));
+    }
+
+    #[test]
+    fn export_failure_text_names_no_path_or_id() {
+        assert!(EXPORT_FAILED.contains(".json.err"));
+        assert!(!EXPORT_FAILED.contains(['\\', '/', ':']));
+        assert!(!EXPORT_FAILED.contains("start-layout"));
     }
 
     #[test]

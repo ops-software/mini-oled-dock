@@ -603,7 +603,7 @@ thread_local! {
     static ROOT_CACHE: RefCell<HashMap<u32, (u64, String)>> = RefCell::new(HashMap::new());
 }
 
-fn parent_pid(proc: HANDLE) -> Option<u32> {
+pub(crate) fn parent_pid(proc: HANDLE) -> Option<u32> {
     let mut pbi = ProcessBasicInformation {
         exit_status: 0,
         peb_base: std::ptr::null_mut(),
@@ -630,8 +630,61 @@ fn parent_pid(proc: HANDLE) -> Option<u32> {
     u32::try_from(pbi.parent_pid).ok().filter(|&p| p != 0)
 }
 
+/// `ProcessCommandLineInformation`: a UNICODE_STRING whose text follows it in the caller's buffer.
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+/// The buffer `command_line` reads into, in bytes: a longer command line is not read.
+const COMMAND_LINE_MAX: usize = 8192;
+
+/// The command line of the process `proc` (a handle with PROCESS_QUERY_LIMITED_INFORMATION), or None when it cannot be
+/// read or does not fit `COMMAND_LINE_MAX` bytes. Another process wrote it: the text is taken only from inside the
+/// bytes the call filled (`text_span`), never through the returned pointer.
+pub(crate) fn command_line(proc: HANDLE) -> Option<String> {
+    /// `UNICODE_STRING`.
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+    // u64 words: the buffer is aligned for the header.
+    let mut buf = vec![0u64; COMMAND_LINE_MAX / 8];
+    let cap = buf.len() * 8;
+    let mut filled = 0u32;
+    // SAFETY: `buf` has `cap` writable bytes; `proc` is a handle with PROCESS_QUERY_LIMITED_INFORMATION, enough for
+    // this class; `filled` receives the bytes written.
+    let st = unsafe {
+        NtQueryInformationProcess(
+            proc,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            cap as u32,
+            &mut filled,
+        )
+    };
+    if st < 0 {
+        return None; // a command line longer than the buffer too
+    }
+    // SAFETY: `buf` is 8-aligned and longer than the header, which the call wrote; any bytes read as integers and a
+    // pointer that is only compared, never followed.
+    let head = unsafe { std::ptr::read(buf.as_ptr().cast::<UnicodeString>()) };
+    let offset = (head.buffer as usize).checked_sub(buf.as_ptr() as usize)?;
+    let filled = (filled as usize).min(cap);
+    let span = text_span(offset, usize::from(head.length), std::mem::size_of::<UnicodeString>(), filled)?;
+    // SAFETY: the same `cap` bytes of `buf`, read as u16 (cap is even, the alignment 8).
+    let words = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u16>(), cap / 2) };
+    Some(String::from_utf16_lossy(words.get(span)?))
+}
+
+/// The u16 range of a command line's text in `command_line`'s buffer, from the byte `offset` and `len` the call gave:
+/// after the `header`, even, and inside the `filled` bytes; None otherwise. Pure.
+fn text_span(offset: usize, len: usize, header: usize, filled: usize) -> Option<std::ops::Range<usize>> {
+    let end = offset.checked_add(len)?;
+    (offset >= header && offset.is_multiple_of(2) && len.is_multiple_of(2) && end <= filled)
+        .then_some(offset / 2..end / 2)
+}
+
 /// Process creation time (100 ns ticks since 1601).
-fn creation_time(proc: HANDLE) -> Option<u64> {
+pub(crate) fn creation_time(proc: HANDLE) -> Option<u64> {
     let (mut c, mut e, mut k, mut u) =
         (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
     // SAFETY: all four out-parameters are valid local FILETIMEs; `proc` is a valid process handle.
@@ -784,7 +837,7 @@ pub(crate) fn exe_path_of_pid(pid: u32) -> Option<String> {
     query_exe_path(proc.0)
 }
 
-fn query_exe_path(proc: HANDLE) -> Option<String> {
+pub(crate) fn query_exe_path(proc: HANDLE) -> Option<String> {
     // Common case: stack buffer, no heap allocation.
     let mut small = [0u16; 512];
     let mut len = small.len() as u32;
@@ -1066,7 +1119,7 @@ pub fn windows_in_order(key: &str) -> Vec<isize> {
 pub fn close_group(key: &str) {
     let wins: Vec<isize> =
         STATE.with(|s| s.borrow().groups.iter().find(|g| g.key == key).map(|g| g.windows.clone()).unwrap_or_default());
-    log!("apps::close_group({key}): {} windows", wins.len());
+    log!("apps::close_group: {} windows", wins.len());
     for h in wins {
         // SAFETY: PostMessageW accepts arbitrary HWNDs; it does not block and fails if the window is gone.
         let _ = unsafe { PostMessageW(Some(hw(h)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
@@ -1229,6 +1282,22 @@ mod tests {
 
     fn plain() -> Styles {
         Styles { visible: true, tool: false, noactivate: false, app: false, owned: false }
+    }
+
+    /// 1.5.2 T3b: another process's command line is read only from inside the bytes the call filled, after the header.
+    #[test]
+    fn a_command_line_is_read_only_inside_the_buffer() {
+        assert_eq!(text_span(16, 10, 16, 64), Some(8..13));
+        assert_eq!(text_span(16, 0, 16, 16), Some(8..8), "an empty line");
+        assert_eq!(text_span(8, 10, 16, 64), None, "over the header");
+        assert_eq!(text_span(17, 10, 16, 64), None, "odd offset");
+        assert_eq!(text_span(16, 11, 16, 64), None, "odd length");
+        assert_eq!(text_span(16, 50, 16, 64), None, "past the filled bytes");
+        assert_eq!(text_span(usize::MAX - 1, 4, 16, usize::MAX), None, "overflow");
+        // This test's own process: the real call, read the same way.
+        // SAFETY: the pseudo-handle of the current process, with full access.
+        let own = command_line(unsafe { windows::Win32::System::Threading::GetCurrentProcess() });
+        assert!(own.is_some_and(|c| c.to_ascii_lowercase().contains("dock")), "the test exe's own command line");
     }
 
     #[test]

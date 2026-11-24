@@ -112,6 +112,24 @@ pub fn words_of(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The query text Windows' parser gets for these words. A plain word goes through unchanged, and so does an AQS filter
+/// (a word with a colon, such as `ext:pdf`). Any other word is cut at its ASCII punctuation (hyphen, quote, percent,
+/// underscore, brackets, apostrophe, ...; not the dot) into plain fragments: the parser reads a hyphen as "not" and treats the other
+/// marks as syntax, while the index holds the fragments as separate words. The marks are never sent, so a name such as
+/// `my-notes` is searched as `my notes`. A word made only of marks adds nothing.
+pub fn aqs_of(words: &[&str]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for w in words {
+        if w.contains(':') {
+            out.push(w);
+        } else {
+            let mark = |c: char| (c.is_ascii_punctuation() && c != '.') || c.is_control();
+            out.extend(w.split(mark).filter(|p| !p.is_empty()));
+        }
+    }
+    out.join(" ")
+}
+
 // ---------------------------------------------------------------- the roots (SPEC 5.4.6)
 
 /// `launcher.file_folders`: at most this many folders of the user's own join the roots; later entries are ignored.
@@ -1463,6 +1481,24 @@ mod tests {
         assert_eq!(words_of(&w), [&*"é".repeat(64)]);
         assert!(words_of("   ").is_empty());
         assert_eq!(words_of("ext:pdf report"), ["ext:pdf", "report"], "AQS filters pass through");
+    }
+
+    #[test]
+    fn the_query_text_is_literal() {
+        let q = |t: &str| aqs_of(&words_of(t));
+        assert_eq!(q("quokka plan"), "quokka plan", "plain words are sent as they are");
+        assert_eq!(q("é1 ü"), "é1 ü");
+        assert_eq!(q("my-notes"), "my notes", "a hyphen is no NOT");
+        assert_eq!(q("-notes"), "notes");
+        assert_eq!(q("a_b"), "a b");
+        assert_eq!(q("report.pdf v1.5"), "report.pdf v1.5", "a dot is no mark: plain words stay whole");
+        assert_eq!(q("my-report.pdf"), "my report.pdf");
+        assert_eq!(q("50% off"), "50 off");
+        assert_eq!(q("it's"), "it s");
+        assert_eq!(q("a[1] (b)"), "a 1 b");
+        assert_eq!(q("say \"hi\""), "say hi");
+        assert_eq!(q("- -- \""), "", "marks alone add nothing");
+        assert_eq!(q("ext:pdf my-report"), "ext:pdf my report", "a filter passes through");
     }
 
     #[test]

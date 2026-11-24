@@ -1133,8 +1133,14 @@ fn view_of(t: &TrayItem, key: String, user_hidden: bool) -> TrayView {
     TrayView { id: t.id, bitmap: t.bitmap.clone(), key, name: display_name(t), user_hidden }
 }
 
+/// Whether icon `key` is on the bar: always with `show_all` (`tray_hidden` is then ignored, not edited), else unless
+/// the user hid it. The one decision every caller uses (bar, chevron rule, overflow popup, settings list).
+pub fn shown_in_bar(show_all: bool, hidden: &[String], key: &str) -> bool {
+    show_all || !hidden.iter().any(|h| h.eq_ignore_ascii_case(key))
+}
+
 fn user_hidden_in(cfg: &crate::config::Config, key: &str) -> bool {
-    cfg.tray_hidden.iter().any(|h| h.eq_ignore_ascii_case(key))
+    !shown_in_bar(cfg.tray_show_all, &cfg.tray_hidden, key)
 }
 
 /// All icons with a bitmap (excluding only the system ones in `tray_hidden_guids`), including those
@@ -1147,7 +1153,7 @@ pub fn snapshot_all() -> Vec<TrayView> {
 /// "hidden icons" chevron for it). Same filters as `collect`; allocates (keys), so call it on state changes, not per frame.
 pub fn any_user_hidden() -> bool {
     let cfg = crate::config::get();
-    if cfg.tray_hidden.is_empty() {
+    if cfg.tray_hidden.is_empty() || cfg.tray_show_all {
         return false;
     }
     let st = state();
@@ -1203,17 +1209,26 @@ pub fn snapshot() -> Vec<TrayView> {
 /// `WM_DOCK_TRAY_CHANGED` to the UI (the bar updates immediately). Callable from the UI thread: a
 /// small file write.
 pub fn set_user_hidden(key: &str, hidden: bool) {
-    let r = crate::config::modify(|c| {
-        c.tray_hidden.retain(|h| !h.eq_ignore_ascii_case(key));
-        if hidden {
-            c.tray_hidden.push(key.to_string());
-        }
-    });
+    if crate::config::get().tray_show_all {
+        return; // Show all is on: `tray_hidden` is never rewritten from a switch that does nothing on screen.
+    }
+    let r = crate::config::modify(|c| edit_user_hidden(c, key, hidden));
     if let Err(e) = r {
         log!("tray: saving tray_hidden failed: {e}");
         return;
     }
     post_ui(2);
+}
+
+/// The edit of `tray_hidden` behind `set_user_hidden`; a no-op while `tray_show_all` is on.
+fn edit_user_hidden(c: &mut crate::config::Config, key: &str, hidden: bool) {
+    if c.tray_show_all {
+        return;
+    }
+    c.tray_hidden.retain(|h| !h.eq_ignore_ascii_case(key));
+    if hidden {
+        c.tray_hidden.push(key.to_string());
+    }
 }
 
 /// Side (physical px) to scale the bitmaps to (`Metrics::px(16)`); on change the host thread rescales from the
@@ -2983,6 +2998,42 @@ fn forward_main() {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::DUPLICATE_HANDLE_OPTIONS;
+
+    #[test]
+    fn show_all_overrides_the_hidden_set_without_editing_it() {
+        let hidden = vec!["Slack.exe|0".to_string(), "7820ae73-23e3-4229-82c1-e41cb67d5b9c".to_string()];
+        // Off: the user's choices hold, keys compared without case.
+        assert!(!shown_in_bar(false, &hidden, "slack.exe|0"));
+        assert!(!shown_in_bar(false, &hidden, "7820AE73-23e3-4229-82c1-e41cb67d5b9c"));
+        assert!(shown_in_bar(false, &hidden, "teams.exe|0"));
+        assert!(shown_in_bar(false, &[], "slack.exe|0"));
+        // On: everything is shown, listed or not, new icons included.
+        assert!(shown_in_bar(true, &hidden, "slack.exe|0"));
+        assert!(shown_in_bar(true, &hidden, "later.exe|0"));
+        assert!(shown_in_bar(true, &[], ""));
+        // The set itself is only read.
+        assert_eq!(hidden.len(), 2);
+    }
+
+    #[test]
+    fn show_all_leaves_no_user_hidden_icon_and_no_chevron_cause() {
+        let mut c = crate::config::Config { tray_hidden: vec!["slack.exe|0".into()], ..Default::default() };
+        assert!(user_hidden_in(&c, "slack.exe|0"));
+        c.tray_show_all = true;
+        assert!(!user_hidden_in(&c, "slack.exe|0"));
+        assert_eq!(c.tray_hidden, vec!["slack.exe|0".to_string()]);
+    }
+
+    #[test]
+    fn user_hidden_edits_are_ignored_while_show_all_is_on() {
+        let mut c = crate::config::Config { tray_hidden: vec!["slack.exe|0".into()], ..Default::default() };
+        edit_user_hidden(&mut c, "later.exe|0", true);
+        assert_eq!(c.tray_hidden.len(), 2);
+        c.tray_show_all = true;
+        edit_user_hidden(&mut c, "slack.exe|0", false);
+        edit_user_hidden(&mut c, "other.exe|0", true);
+        assert_eq!(c.tray_hidden, vec!["slack.exe|0".to_string(), "later.exe|0".to_string()]);
+    }
 
     #[test]
     fn the_dead_sweep_runs_only_while_shown() {

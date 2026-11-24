@@ -17,7 +17,9 @@
 //!
 //! START MENU SHORTCUTS: the same parser reads the `.lnk` files of the user's own Start menu folder
 //! for the Start menu index and the Start import (`read_lnk`, `parse_lnk`), which any program of the
-//! user can write too: the target path only, never handed to the shell link loader.
+//! user can write too: the target path only (from LinkInfo, the environment block or a drive path id
+//! list), never handed to the shell link loader; and the localized name the folder's `desktop.ini`
+//! gives a shortcut, as a reference to a string of a system DLL only (`localized_name_ref`).
 //!
 //! NOT READ: the automatic lists (Recent / Frequent, `AutomaticDestinations`), items that are not
 //! shell links, and links without a local file target.
@@ -53,6 +55,12 @@ const MAX_LNK_FILE: u64 = 128 * 1024;
 const ENV_BLOCK: u32 = 0xA000_0001;
 const ENV_BLOCK_SIZE: usize = 0x314;
 
+/// Largest `desktop.ini` read for the localized names of a Start menu folder (`localized_name_ref`).
+pub(crate) const MAX_DESKTOP_INI: u64 = 16 * 1024;
+/// CLSID of "This PC" {20D04FE0-3AEA-1069-A2D8-08002B30309D}, as stored in the root item of an id list.
+const CLSID_MY_COMPUTER: [u8; 16] =
+    [0xE0, 0x4F, 0xD0, 0x20, 0xEA, 0x3A, 0x69, 0x10, 0xA2, 0xD8, 0x08, 0x00, 0x2B, 0x30, 0x30, 0x9D];
+
 /// CLSID_ShellLink {00021401-0000-0000-C000-000000000046}, as stored before each link.
 const CLSID_LINK: [u8; 16] = [0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
 /// End of a category.
@@ -86,10 +94,59 @@ pub(crate) struct LnkFacts {
     pub(crate) has_args: bool,
 }
 
+/// Why a `.lnk` file gives no target (`parse_lnk`), for the counts of the Start menu index log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LnkMiss {
+    /// The link passes arguments, so it names something other than its exe (refused by the callers).
+    Arguments,
+    /// An id list that names a shell object, not a drive path: Control Panel, Run, This PC, a shell
+    /// folder this parser does not walk.
+    ShellItem,
+    /// A Windows Installer (advertised) shortcut: only Windows Installer knows its target.
+    Advertised,
+    /// A network (UNC) target.
+    Network,
+    /// A path this parser refuses: relative, too long, with characters a file path cannot have.
+    Refused,
+    /// Not a shell link, cut short, malformed, or not readable (missing, too big, a reparse point).
+    Damaged,
+}
+
+impl LnkMiss {
+    /// Every kind, in the order of the log line.
+    pub(crate) const ALL: [LnkMiss; 6] = [
+        LnkMiss::Arguments,
+        LnkMiss::ShellItem,
+        LnkMiss::Advertised,
+        LnkMiss::Network,
+        LnkMiss::Refused,
+        LnkMiss::Damaged,
+    ];
+
+    /// Its name in the log line.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            LnkMiss::Arguments => "arguments",
+            LnkMiss::ShellItem => "shell item",
+            LnkMiss::Advertised => "advertised",
+            LnkMiss::Network => "network",
+            LnkMiss::Refused => "refused path",
+            LnkMiss::Damaged => "damaged",
+        }
+    }
+}
+
 /// The fields of one serialized shell link that this module uses (`parse_link_raw`), unchecked.
 struct RawLink {
     /// LinkInfo's local path.
     info_path: Option<String>,
+    /// A LinkInfo was read (`info_path` may still be none), and it has a network part.
+    has_info: bool,
+    info_network: bool,
+    /// HasDarwinID: a Windows Installer (advertised) shortcut.
+    darwin: bool,
+    /// Where the items of the id list are, if there is one.
+    id_list: Option<std::ops::Range<usize>>,
     /// The environment block's target (HasExpString set).
     env_path: Option<String>,
     name: String,
@@ -323,13 +380,15 @@ fn parse_link_raw(b: &[u8], pos: &mut usize, honour_force_no_link_info: bool) ->
     }
     let flags = u32_at(b, o + 20)?;
     o += 0x4C;
-    // LinkTargetIDList: skipped (the target is taken from LinkInfo).
+    // LinkTargetIDList: only where it is (`id_list_path` reads it for a `.lnk` without a LinkInfo path).
+    let mut id_list = None;
     if flags & 0x01 != 0 {
         let n = usize::from(u16_at(b, o)?);
         span(b, o, 2 + n)?;
+        id_list = Some(o + 2..o + 2 + n);
         o += 2 + n;
     }
-    let mut info_path = None;
+    let (mut info_path, mut has_info, mut info_network) = (None, false, false);
     if flags & 0x02 != 0 {
         let n = u32_at(b, o)? as usize;
         if n < 0x1C {
@@ -338,6 +397,9 @@ fn parse_link_raw(b: &[u8], pos: &mut usize, honour_force_no_link_info: bool) ->
         let info = span(b, o, n)?;
         if !(honour_force_no_link_info && flags & 0x100 != 0) {
             info_path = link_info_path(info);
+            has_info = true;
+            // LinkInfoFlags: CommonNetworkRelativeLinkAndPathSuffix.
+            info_network = u32_at(info, 8)? & 0x02 != 0;
         }
         o += n;
     }
@@ -378,7 +440,8 @@ fn parse_link_raw(b: &[u8], pos: &mut usize, honour_force_no_link_info: bool) ->
         o += n;
     }
     *pos = o;
-    Some(RawLink { info_path, env_path, name, args, title, separator })
+    let darwin = flags & 0x1000 != 0;
+    Some(RawLink { info_path, has_info, info_network, darwin, id_list, env_path, name, args, title, separator })
 }
 
 /// The target of an EnvironmentVariableDataBlock: TargetUnicode, else TargetAnsi.
@@ -389,26 +452,169 @@ fn env_block_path(block: &[u8]) -> Option<String> {
 }
 
 /// The target of a `.lnk` file, parsed in safe Rust (the structure of a jump list link, without
-/// the CLSID in front): LinkInfo's local path unless ForceNoLinkInfo is set, else the environment
-/// block's target, left unexpanded (the caller expands it with `shell_thread::expand_env` and checks
-/// the result with `is_local_file_path`). `None` for a link with only an id list, a network or
-/// odd path, or damaged data. Never panics.
-pub(crate) fn parse_lnk(b: &[u8]) -> Option<LnkFacts> {
-    if span(b, 4, 16)? != CLSID_LINK {
-        return None;
+/// the CLSID in front), in this order: LinkInfo's local path unless ForceNoLinkInfo is set, the
+/// environment block's target, left unexpanded (the caller expands it with `shell_thread::expand_env`
+/// and checks the result with `is_local_file_path`), then the drive path of the id list
+/// (`id_list_path`). An advertised shortcut is never resolved. Never panics.
+pub(crate) fn parse_lnk(b: &[u8]) -> Result<LnkFacts, LnkMiss> {
+    if span(b, 4, 16) != Some(&CLSID_LINK[..]) {
+        return Err(LnkMiss::Damaged);
     }
-    let raw = parse_link_raw(b, &mut 0, true)?;
-    let target = raw
-        .info_path
-        .filter(|t| is_local_file_path(t))
-        .or_else(|| raw.env_path.filter(|t| is_local_file_path(t) || is_env_file_path(t)))?;
-    Some(LnkFacts { target, has_args: !raw.args.is_empty() })
+    let raw = parse_link_raw(b, &mut 0, true).ok_or(LnkMiss::Damaged)?;
+    if raw.darwin {
+        return Err(LnkMiss::Advertised);
+    }
+    let has_args = !raw.args.is_empty();
+    let paths = raw.has_info || raw.env_path.is_some();
+    if let Some(target) = raw.info_path.filter(|t| is_local_file_path(t)) {
+        return Ok(LnkFacts { target, has_args });
+    }
+    if let Some(target) = raw.env_path.filter(|t| is_local_file_path(t) || is_env_file_path(t)) {
+        return Ok(LnkFacts { target, has_args });
+    }
+    let id_path = raw.id_list.and_then(|r| b.get(r)).map(id_list_path);
+    match id_path {
+        Some(Ok(target)) if is_local_file_path(&target) => Ok(LnkFacts { target, has_args }),
+        _ if raw.info_network => Err(LnkMiss::Network),
+        Some(Ok(_)) => Err(LnkMiss::Refused),
+        _ if paths => Err(LnkMiss::Refused),
+        Some(Err(miss)) => Err(miss),
+        None => Err(LnkMiss::Refused),
+    }
 }
 
 /// `parse_lnk` of the file `path`, read through `datadir::read_file` (no reparse point, a single
 /// link, at most `MAX_LNK_FILE` bytes).
-pub(crate) fn read_lnk(path: &Path) -> Option<LnkFacts> {
-    crate::datadir::read_file(path, MAX_LNK_FILE, true).ok().and_then(|b| parse_lnk(&b))
+pub(crate) fn read_lnk(path: &Path) -> Result<LnkFacts, LnkMiss> {
+    let bytes = crate::datadir::read_file(path, MAX_LNK_FILE, true).map_err(|_| LnkMiss::Damaged)?;
+    parse_lnk(&bytes)
+}
+
+/// The path an id list names, if it is a drive path as Windows writes it: the root item "This PC",
+/// a volume item `X:\`, then one file entry item per folder and for the file, each with its long name
+/// in a 0xBEEF0004 extension block (the layout of the items is not in [MS-SHLLINK]; it follows the
+/// public descriptions of the Windows shell item format). `ShellItem` for any other list,
+/// `Refused` for a name that is no single path component, `Damaged` for items that do not fit.
+fn id_list_path(list: &[u8]) -> Result<String, LnkMiss> {
+    let mut path = String::new();
+    let (mut o, mut n) = (0usize, 0usize);
+    loop {
+        let size = usize::from(u16_at(list, o).ok_or(LnkMiss::Damaged)?);
+        if size == 0 {
+            break;
+        }
+        let item = span(list, o, size).filter(|_| size >= 3).ok_or(LnkMiss::Damaged)?;
+        let kind = item[2];
+        match n {
+            0 if kind == 0x1F && span(item, 4, 16) == Some(&CLSID_MY_COMPUTER[..]) => {}
+            1 if kind & 0x70 == 0x20 => {
+                let drive = item.get(3..7).ok_or(LnkMiss::ShellItem)?;
+                if !(drive[0].is_ascii_alphabetic() && drive[1..] == *b":\\\0") {
+                    return Err(LnkMiss::ShellItem);
+                }
+                path.push(char::from(drive[0]));
+                path.push_str(":\\");
+            }
+            _ if n >= 2 && kind & 0x70 == 0x30 => {
+                let name = long_name(item).ok_or(LnkMiss::Refused)?;
+                if name.is_empty() || name == "." || name == ".." || name.contains(['\\', '/']) {
+                    return Err(LnkMiss::Refused);
+                }
+                if n > 2 {
+                    path.push('\\');
+                }
+                path.push_str(&name);
+                if path.len() > 1024 {
+                    return Err(LnkMiss::Refused);
+                }
+            }
+            _ => return Err(LnkMiss::ShellItem),
+        }
+        o += size;
+        n += 1;
+    }
+    if n < 3 {
+        return Err(LnkMiss::ShellItem);
+    }
+    Ok(path)
+}
+
+/// The long name of a file entry shell item: after the header (14 bytes) and the primary name (ANSI,
+/// padded to an even length, or UTF-16 when the type has 0x04), the extension blocks; the 0xBEEF0004
+/// one holds the name, NUL-terminated, at an offset that depends on its version (3, 7, 8 or 9).
+fn long_name(item: &[u8]) -> Option<String> {
+    let rest = item.get(14..)?;
+    let name = if item[2] & 0x04 != 0 {
+        2 * (rest.chunks_exact(2).position(|c| c == [0, 0])? + 1)
+    } else {
+        rest.iter().position(|&c| c == 0)? + 1
+    };
+    let mut o = 14 + name;
+    o += o & 1;
+    loop {
+        let size = usize::from(u16_at(item, o)?);
+        let block = span(item, o, size).filter(|_| size >= 8)?;
+        if u32_at(block, 4)? == 0xBEEF_0004 {
+            let at = match u16_at(block, 2)? {
+                3 => 20,
+                7 => 38,
+                8 => 42,
+                9 => 46,
+                _ => return None,
+            };
+            // The name, then its NUL, then the u16 that ends every block.
+            let units: Vec<u16> = block
+                .get(at..size.checked_sub(2)?)?
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let end = units.iter().position(|&u| u == 0)?;
+            return String::from_utf16(&units[..end]).ok();
+        }
+        o += size;
+    }
+}
+
+/// The localized name `desktop.ini` (`ini`, UTF-16 with its byte order mark, else the system code
+/// page) gives the file `file_name` of its folder, as the shell reads it: `[LocalizedFileNames]`,
+/// `<file>=@%SystemRoot%\system32\<name>.dll,-<id>` (or `%windir%`). Returns the DLL's file name,
+/// lowercase, and the string id; the caller loads the DLL from `GetSystemDirectoryW`, never from the
+/// environment. Any other value (another folder, a path, no id) gives `None`.
+pub(crate) fn localized_name_ref(ini: &[u8], file_name: &str) -> Option<(String, u16)> {
+    let text = match ini {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest),
+        _ => ansi(ini),
+    };
+    let wanted = file_name.to_lowercase();
+    let mut names = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            names = section.trim().eq_ignore_ascii_case("LocalizedFileNames");
+        } else if let Some((key, value)) = line.split_once('=').filter(|_| names) {
+            if key.trim().to_lowercase() == wanted {
+                return system_string_ref(value.trim());
+            }
+        }
+    }
+    None
+}
+
+/// `@%SystemRoot%\system32\<name>.dll,-<id>` -> (`<name>.dll` lowercase, id), for a plain file name
+/// (letters, digits, `.`, `_`, `-`) and an id of 1 to 65535.
+fn system_string_ref(value: &str) -> Option<(String, u16)> {
+    let (module, id) = value.strip_prefix('@')?.rsplit_once(",-")?;
+    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let id = id.parse::<u16>().ok().filter(|&id| id != 0)?;
+    let module = module.to_ascii_lowercase();
+    let name = ["%systemroot%\\system32\\", "%windir%\\system32\\"].iter().find_map(|p| module.strip_prefix(p))?;
+    let plain = name.len() > 4
+        && name.len() <= 64
+        && name.ends_with(".dll")
+        && !name.starts_with('.')
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c));
+    plain.then(|| (name.to_string(), id))
 }
 
 /// The local path of a LinkInfo structure (`LocalBasePath` + `CommonPathSuffix`), if it has one.
@@ -715,14 +921,19 @@ pub(crate) mod tests {
         assert_eq!((split.len(), split[0].entries.len()), (1, MAX_TASKS));
     }
 
-    /// A `.lnk` file: header, an id list, LinkInfo (header 0x24) with `info` as its ANSI and Unicode
-    /// local path, the arguments, and an environment block with `env` (HasExpString). `flags` are
-    /// added to the header's.
+    /// A `.lnk` file: header, an id list that names no file, LinkInfo (header 0x24) with `info` as its
+    /// ANSI and Unicode local path, the arguments, and an environment block with `env` (HasExpString).
+    /// `flags` are added to the header's.
     pub(crate) fn lnk(info: Option<&str>, env: Option<&str>, args: Option<&str>, flags: u32) -> Vec<u8> {
+        lnk_with_ids(&[4, 0, 0x1F, 0x50, 0, 0], info, env, args, flags)
+    }
+
+    /// `lnk` with the id list `ids` (its items and the terminal 0, `id_list`).
+    fn lnk_with_ids(ids: &[u8], info: Option<&str>, env: Option<&str>, args: Option<&str>, flags: u32) -> Vec<u8> {
         let mut flags = 0x81 | flags;
         let mut body = Vec::new();
-        body.extend(6u16.to_le_bytes());
-        body.extend([4, 0, 0x1F, 0x50, 0, 0]);
+        body.extend((ids.len() as u16).to_le_bytes());
+        body.extend(ids);
         if let Some(t) = info {
             flags |= 0x02;
             let narrow: Vec<u8> = t.chars().map(|c| if c.is_ascii() { c as u8 } else { b'?' }).collect();
@@ -768,6 +979,21 @@ pub(crate) mod tests {
         out
     }
 
+    /// A `.lnk` file with neither an id list nor a LinkInfo: the header and the Unicode RELATIVE_PATH
+    /// and WORKING_DIR strings. `flags` are added to the header's.
+    fn lnk_relative(relative: &str, dir: &str, flags: u32) -> Vec<u8> {
+        let mut out = vec![0u8; 0x4C];
+        out[..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        out[4..20].copy_from_slice(&CLSID_LINK);
+        out[20..24].copy_from_slice(&(0x98 | flags).to_le_bytes());
+        for s in [relative, dir] {
+            out.extend((s.encode_utf16().count() as u16).to_le_bytes());
+            out.extend(wide(s));
+        }
+        out.extend(0u32.to_le_bytes());
+        out
+    }
+
     /// Writes `lnk(Some(target), ..)` as `<temp>\dock_lnk_<tag>_<pid>\Programs\Sub\Shortcut name.lnk`;
     /// returns the folder to remove, the `Programs` folder and the file.
     pub(crate) fn lnk_file(tag: &str, target: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -779,9 +1005,80 @@ pub(crate) mod tests {
         (base, root, path)
     }
 
-    fn facts(target: &str, has_args: bool) -> Option<LnkFacts> {
-        Some(LnkFacts { target: target.into(), has_args })
+    fn facts(target: &str, has_args: bool) -> Result<LnkFacts, LnkMiss> {
+        Ok(LnkFacts { target: target.into(), has_args })
     }
+
+    /// The root shell item of an id list: "This PC", or another shell folder of `clsid`.
+    fn root_item(clsid: &[u8; 16]) -> Vec<u8> {
+        let mut item = 20u16.to_le_bytes().to_vec();
+        item.extend([0x1F, 0x50]);
+        item.extend(clsid);
+        item
+    }
+
+    /// The volume shell item of a drive (`C:\`), as Windows writes it (type 0x2F, 25 bytes).
+    fn drive_item(drive: &str) -> Vec<u8> {
+        let mut item = 25u16.to_le_bytes().to_vec();
+        item.push(0x2F);
+        item.extend(drive.as_bytes());
+        item.resize(25, 0);
+        item
+    }
+
+    /// A file entry shell item (`kind` 0x31 folder, 0x32 file): a short name (the letters and digits of
+    /// `name`, at most 8, padded to an even length), then the long `name` in a 0xBEEF0004 block of
+    /// `version` (3, 7, 8 or 9: where the name sits moves).
+    fn file_item(kind: u8, name: &str, version: u16) -> Vec<u8> {
+        let mut item = vec![0, 0, kind, 0];
+        item.extend([0u8; 10]);
+        item.extend(name.bytes().filter(u8::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).take(8));
+        item.push(0);
+        if item.len() % 2 == 1 {
+            item.push(0);
+        }
+        let at = match version {
+            3 => 20,
+            7 => 38,
+            8 => 42,
+            _ => 46,
+        };
+        let mut ext = vec![0u8; at];
+        ext[2..4].copy_from_slice(&version.to_le_bytes());
+        ext[4..8].copy_from_slice(&0xBEEF_0004u32.to_le_bytes());
+        ext[16..18].copy_from_slice(&(at as u16).to_le_bytes());
+        ext.extend(wide(name));
+        ext.extend([0, 0]);
+        ext.extend((item.len() as u16).to_le_bytes());
+        let n = ext.len() as u16;
+        ext[0..2].copy_from_slice(&n.to_le_bytes());
+        item.extend(ext);
+        let n = item.len() as u16;
+        item[0..2].copy_from_slice(&n.to_le_bytes());
+        item
+    }
+
+    /// An id list of `items` with its terminal 0.
+    fn id_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut out: Vec<u8> = items.concat();
+        out.extend([0, 0]);
+        out
+    }
+
+    /// The id list of `C:\Vendor Dir\app.exe` as Windows writes it, its long names in blocks of `version`.
+    fn drive_path(version: u16) -> Vec<u8> {
+        id_list(&[
+            root_item(&CLSID_MY_COMPUTER),
+            drive_item("C:\\"),
+            file_item(0x31, "Vendor Dir", version),
+            file_item(0x32, "app.exe", version),
+        ])
+    }
+
+    const ID_APP: &str = r"C:\Vendor Dir\app.exe";
+    /// The CLSID of a shell folder that is not a file (Control Panel's, as Windows stores it).
+    const CONTROL_PANEL: [u8; 16] =
+        [0x20, 0x20, 0xEC, 0x21, 0xEA, 0x3A, 0x10, 0x69, 0xA2, 0xDD, 0x08, 0x00, 0x2B, 0x30, 0x30, 0x9D];
 
     const APP: &str = r"C:\Program Files\Vendor\app.exe";
     const ENV_APP: &str = r"%ProgramFiles%\Vendor\app.exe";
@@ -796,11 +1093,11 @@ pub(crate) mod tests {
         // A jump list link is a .lnk too (ANSI LinkInfo, a property store).
         let jump = link(Some(STEAM), None, Some("-n"), Some("Title"), false);
         assert_eq!(parse_lnk(&jump), facts(STEAM, true));
-        assert_eq!(parse_lnk(&lnk(None, None, None, 0)), None, "an id list only is not resolved");
+        assert_eq!(parse_lnk(&lnk(None, None, None, 0)), Err(LnkMiss::ShellItem), "an id list that names no file");
         let mut clsid = lnk(Some(APP), None, None, 0);
         clsid[4] ^= 1;
-        assert_eq!(parse_lnk(&clsid), None, "not a shell link");
-        assert_eq!(parse_lnk(&[]), None);
+        assert_eq!(parse_lnk(&clsid), Err(LnkMiss::Damaged), "not a shell link");
+        assert_eq!(parse_lnk(&[]), Err(LnkMiss::Damaged));
     }
 
     #[test]
@@ -819,7 +1116,7 @@ pub(crate) mod tests {
         // Without HasExpString the block is not read, as by the shell.
         let mut no_flag = lnk(None, Some(ENV_APP), None, 0);
         no_flag[21] &= !0x02;
-        assert_eq!(parse_lnk(&no_flag), None);
+        assert_eq!(parse_lnk(&no_flag), Err(LnkMiss::ShellItem));
         assert_eq!(parse_lnk(&lnk(None, Some("C:\\Tools\\t.exe"), None, 0)), facts("C:\\Tools\\t.exe", false));
     }
 
@@ -842,30 +1139,39 @@ pub(crate) mod tests {
             r"%SystemRoot%\a|b.exe",
         ];
         for p in hostile {
-            assert_eq!(parse_lnk(&lnk(Some(p), None, None, 0)), None, "LinkInfo {p}");
+            assert_eq!(parse_lnk(&lnk(Some(p), None, None, 0)), Err(LnkMiss::Refused), "LinkInfo {p}");
             if p.len() < 260 && p.is_ascii() {
-                assert_eq!(parse_lnk(&lnk(None, Some(p), None, 0)), None, "environment block {p}");
+                assert_eq!(parse_lnk(&lnk(None, Some(p), None, 0)), Err(LnkMiss::Refused), "environment block {p}");
             }
         }
         // A refused LinkInfo path leaves the environment block's.
         assert_eq!(parse_lnk(&lnk(Some(r"\\server\a.exe"), Some(ENV_APP), None, 0)), facts(ENV_APP, false));
     }
 
-    /// Three samples: LinkInfo with arguments, the environment block with ForceNoLinkInfo, a jump list link.
-    fn lnk_samples() -> [Vec<u8>; 3] {
+    #[test]
+    fn lnk_relative_path_only_is_refused() {
+        // No id list, no LinkInfo, no environment block: only a relative path and a working directory,
+        // which this parser does not resolve.
+        assert_eq!(parse_lnk(&lnk_relative(r"..\app.exe", r"C:\Vendor", 0)), Err(LnkMiss::Refused));
+    }
+
+    /// Four samples: LinkInfo with arguments, the environment block with ForceNoLinkInfo, a jump list
+    /// link, an id list only.
+    fn lnk_samples() -> [Vec<u8>; 4] {
         [
             lnk(Some(APP), None, Some("--flag"), 0),
             lnk(Some(r"C:\Old\old.exe"), Some(ENV_APP), None, 0x100),
             link(Some(STEAM), Some("Steam"), None, Some("Steam"), false),
+            lnk_with_ids(&drive_path(9), None, None, None, 0),
         ]
     }
 
     #[test]
     fn lnk_truncations_never_panic() {
         for s in lnk_samples() {
-            assert!(parse_lnk(&s).is_some());
+            assert!(parse_lnk(&s).is_ok());
             for n in 0..s.len() {
-                assert_eq!(parse_lnk(&s[..n]), None, "cut at {n}");
+                assert_eq!(parse_lnk(&s[..n]), Err(LnkMiss::Damaged), "cut at {n}");
             }
         }
     }
@@ -883,7 +1189,7 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let mut found = 0usize;
         for _ in 0..100_000 {
-            let mut b = samples[(next() % 3) as usize].clone();
+            let mut b = samples[(next() % 4) as usize].clone();
             for _ in 0..1 + next() % 3 {
                 let len = b.len().max(1) as u64;
                 let at = (next() % len) as usize;
@@ -908,7 +1214,7 @@ pub(crate) mod tests {
                     }
                 }
             }
-            if let Some(f) = parse_lnk(&b) {
+            if let Ok(f) = parse_lnk(&b) {
                 found += 1;
                 assert!(is_local_file_path(&f.target) || is_env_file_path(&f.target), "{:?}", f.target);
             }
@@ -921,7 +1227,7 @@ pub(crate) mod tests {
     fn lnk_force_no_link_info_flag() {
         let both = lnk(Some(r"C:\Old\old.exe"), Some(ENV_APP), None, 0x100);
         assert_eq!(parse_lnk(&both), facts(ENV_APP, false), "the LinkInfo is ignored");
-        assert_eq!(parse_lnk(&lnk(Some(APP), None, None, 0x100)), None);
+        assert_eq!(parse_lnk(&lnk(Some(APP), None, None, 0x100)), Err(LnkMiss::ShellItem));
         // Jump lists keep their reading: the LinkInfo path, whatever the flag.
         let mut jump = link(Some(STEAM), None, None, Some("Store"), false);
         jump[21] |= 0x01;
@@ -935,11 +1241,11 @@ pub(crate) mod tests {
         let info = 0x4C + 8;
         let mut network = lnk(Some(APP), None, None, 0);
         network[info + 8] = 0x02;
-        assert_eq!(parse_lnk(&network), None, "no VolumeIDAndLocalBasePath");
+        assert_eq!(parse_lnk(&network), Err(LnkMiss::Network), "no VolumeIDAndLocalBasePath, a network part");
         let mut zero = lnk(Some(APP), None, None, 0);
         zero[info + 16..info + 20].fill(0);
         zero[info + 28..info + 32].fill(0);
-        assert_eq!(parse_lnk(&zero), None, "offsets 0");
+        assert_eq!(parse_lnk(&zero), Err(LnkMiss::Refused), "offsets 0");
         let mut outside = lnk(Some(APP), Some(ENV_APP), None, 0);
         outside[info + 16..info + 20].copy_from_slice(&0xFFFFu32.to_le_bytes());
         outside[info + 28..info + 32].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
@@ -958,7 +1264,188 @@ pub(crate) mod tests {
         let missing = read_lnk(&base.join("missing.lnk"));
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(got, facts(APP, false));
-        assert_eq!((refused, missing), (None, None), "above MAX_LNK_FILE, or missing");
+        assert_eq!(
+            (refused, missing),
+            (Err(LnkMiss::Damaged), Err(LnkMiss::Damaged)),
+            "above MAX_LNK_FILE, or missing"
+        );
+    }
+
+    #[test]
+    fn lnk_id_list_target() {
+        // An id list only (no LinkInfo), as some installers write it: This PC, the drive, the folders, the file.
+        let only = |ids: &[u8]| parse_lnk(&lnk_with_ids(ids, None, None, None, 0));
+        for version in [3, 7, 8, 9] {
+            assert_eq!(only(&drive_path(version)), facts(ID_APP, false), "block version {version}");
+        }
+        assert_eq!(parse_lnk(&lnk_with_ids(&drive_path(9), None, None, Some("-x"), 0)), facts(ID_APP, true));
+        // Another drive, a short name of even length (no padding), Unicode long names.
+        let unicode = "Citt\u{e0} \u{65e5}.exe";
+        let ids = id_list(&[
+            root_item(&CLSID_MY_COMPUTER),
+            drive_item("d:\\"),
+            file_item(0x31, "Sub", 9),
+            file_item(0x32, unicode, 9),
+        ]);
+        assert_eq!(only(&ids), facts(&format!("d:\\Sub\\{unicode}"), false));
+        // A Unicode primary name (type flag 0x04) instead of the short one.
+        let mut wide_item = file_item(0x36, "app.exe", 9);
+        let short = 14 + "APPEXE".len() + 1 + 1;
+        let mut primary = wide("APP.EXE");
+        primary.extend([0, 0]);
+        wide_item.splice(14..short, primary);
+        let n = wide_item.len() as u16;
+        wide_item[0..2].copy_from_slice(&n.to_le_bytes());
+        let ids =
+            id_list(&[root_item(&CLSID_MY_COMPUTER), drive_item("C:\\"), file_item(0x31, "Vendor Dir", 9), wide_item]);
+        assert_eq!(only(&ids), facts(ID_APP, false));
+        // The id list comes last: LinkInfo, then the environment block; it stands in for a LinkInfo
+        // that ForceNoLinkInfo hides or whose path is refused.
+        assert_eq!(parse_lnk(&lnk_with_ids(&drive_path(9), Some(APP), None, None, 0)), facts(APP, false));
+        assert_eq!(parse_lnk(&lnk_with_ids(&drive_path(9), None, Some(ENV_APP), None, 0)), facts(ENV_APP, false));
+        let hidden = lnk_with_ids(&drive_path(9), Some(r"C:\Old\old.exe"), None, None, 0x100);
+        assert_eq!(parse_lnk(&hidden), facts(ID_APP, false));
+        let refused = lnk_with_ids(&drive_path(9), Some(r"\\server\a.exe"), None, None, 0);
+        assert_eq!(parse_lnk(&refused), facts(ID_APP, false));
+    }
+
+    #[test]
+    fn lnk_id_list_refusals() {
+        let only = |items: &[Vec<u8>]| parse_lnk(&lnk_with_ids(&id_list(items), None, None, None, 0));
+        let root = || root_item(&CLSID_MY_COMPUTER);
+        let c = || drive_item("C:\\");
+        let dir = || file_item(0x31, "Vendor Dir", 9);
+        let exe = || file_item(0x32, "app.exe", 9);
+        // Shell objects that are no file: a shell folder, This PC alone, a drive alone, an empty list.
+        assert_eq!(only(&[root_item(&CONTROL_PANEL), exe()]), Err(LnkMiss::ShellItem));
+        assert_eq!(only(&[root()]), Err(LnkMiss::ShellItem));
+        assert_eq!(only(&[root(), c()]), Err(LnkMiss::ShellItem));
+        assert_eq!(only(&[]), Err(LnkMiss::ShellItem));
+        // Under This PC something other than a drive letter: a shell folder item, odd volume names.
+        let mut folder = c();
+        folder[2] = 0x2E;
+        folder[3..19].copy_from_slice(&CONTROL_PANEL);
+        assert_eq!(only(&[root(), folder, dir(), exe()]), Err(LnkMiss::ShellItem));
+        for d in ["C:", "CC:\\", "1:\\", "C:\\x", "C:/", ""] {
+            assert_eq!(only(&[root(), drive_item(d), exe()]), Err(LnkMiss::ShellItem), "{d:?}");
+        }
+        // After the drive, an item that is no file entry.
+        assert_eq!(only(&[root(), c(), root(), exe()]), Err(LnkMiss::ShellItem));
+        assert_eq!(only(&[root(), c(), dir(), drive_item("C:\\")]), Err(LnkMiss::ShellItem));
+        // Long names that are no single path component, or that make a path the other targets refuse.
+        for name in ["..", ".", "a\\b", "a/b", "", "a:b", "a\u{7}b", "a|b"] {
+            assert_eq!(only(&[root(), c(), file_item(0x31, name, 9), exe()]), Err(LnkMiss::Refused), "{name:?}");
+        }
+        let long = file_item(0x31, &"a".repeat(255), 9);
+        let deep = [root(), c(), long.clone(), long.clone(), long.clone(), long, exe()];
+        assert_eq!(only(&deep), Err(LnkMiss::Refused), "longer than 1,024 bytes");
+        // No long name: an unknown block version, another block, no block, a name without its NUL.
+        assert_eq!(only(&[root(), c(), file_item(0x31, "Vendor Dir", 10), exe()]), Err(LnkMiss::Refused));
+        let mut other = dir();
+        let sig = other.windows(4).position(|w| w == 0xBEEF_0004u32.to_le_bytes()).expect("signature");
+        other[sig] = 0x05;
+        assert_eq!(only(&[root(), c(), other, exe()]), Err(LnkMiss::Refused));
+        let mut bare = exe();
+        bare.truncate(22);
+        bare[0..2].copy_from_slice(&22u16.to_le_bytes());
+        assert_eq!(only(&[root(), c(), dir(), bare]), Err(LnkMiss::Refused));
+        let mut unended = exe();
+        let end = unended.len() - 4;
+        unended[end..end + 2].copy_from_slice(&wide("x"));
+        assert_eq!(only(&[root(), c(), dir(), unended]), Err(LnkMiss::Refused));
+        // Damaged lists: an item running past the list, a size below 3, no terminal 0.
+        let mut past = id_list(&[root(), c(), dir(), exe()]);
+        let at = past.len() - 2 - exe().len();
+        past[at..at + 2].copy_from_slice(&0x7FFFu16.to_le_bytes());
+        assert_eq!(parse_lnk(&lnk_with_ids(&past, None, None, None, 0)), Err(LnkMiss::Damaged));
+        let tiny = [root(), c(), vec![2, 0]].concat();
+        assert_eq!(
+            parse_lnk(&lnk_with_ids(&[tiny.as_slice(), &[0, 0]].concat(), None, None, None, 0)),
+            Err(LnkMiss::Damaged)
+        );
+        let open = [root(), c(), dir(), exe()].concat();
+        assert_eq!(parse_lnk(&lnk_with_ids(&open, None, None, None, 0)), Err(LnkMiss::Damaged), "no terminal");
+    }
+
+    #[test]
+    fn lnk_advertised_shortcuts_are_not_resolved() {
+        // HasDarwinID: Windows Installer resolves the target; the paths in the file name its cache.
+        let advertised = [
+            lnk(Some(APP), None, None, 0x1000),
+            lnk_with_ids(&drive_path(9), None, Some(ENV_APP), None, 0x1000),
+            lnk_relative(r"..\app.exe", r"C:\Vendor", 0x1000),
+        ];
+        for link in advertised {
+            assert_eq!(parse_lnk(&link), Err(LnkMiss::Advertised));
+        }
+    }
+
+    /// A `desktop.ini` as Windows writes it in the Start menu folders: UTF-16 with a byte order mark.
+    fn ini_utf16(text: &str) -> Vec<u8> {
+        let mut b = vec![0xFF, 0xFE];
+        b.extend(wide(text));
+        b
+    }
+
+    const INI: &str = "\r\n[.ShellClassInfo]\r\nLocalizedResourceName=@%SystemRoot%\\system32\\shell32.dll,-21761\r\n\
+        [LocalizedFileNames]\r\nTool A.lnk=@%SystemRoot%\\system32\\shell32.dll,-22041\r\n \
+        Tool B.lnk = @%windir%\\System32\\Vendor-Res_2.dll,-7 \r\n[Other]\r\nTool C.lnk=@%SystemRoot%\\system32\\shell32.dll,-1\r\n";
+
+    #[test]
+    fn desktop_ini_localized_names() {
+        let ini = ini_utf16(INI);
+        let shell32 = Some(("shell32.dll".to_string(), 22041));
+        assert_eq!(localized_name_ref(&ini, "Tool A.lnk"), shell32);
+        assert_eq!(localized_name_ref(&ini, "TOOL a.LNK"), shell32, "file names compare case-insensitively");
+        assert_eq!(localized_name_ref(INI.as_bytes(), "Tool A.lnk"), shell32, "ANSI");
+        assert_eq!(localized_name_ref(&ini, "Tool B.lnk"), Some(("vendor-res_2.dll".to_string(), 7)));
+        assert_eq!(localized_name_ref(&ini, "Tool C.lnk"), None, "only [LocalizedFileNames] names files");
+        assert_eq!(localized_name_ref(&ini, "LocalizedResourceName"), None);
+        assert_eq!(localized_name_ref(&ini, "Other.lnk"), None);
+        assert_eq!(localized_name_ref(&[], "Tool A.lnk"), None);
+    }
+
+    #[test]
+    fn desktop_ini_names_only_strings_of_system_dlls() {
+        for value in [
+            r"@C:\Users\Someone\name.dll,-1",
+            r"@%APPDATA%\name.dll,-1",
+            r"@%SystemRoot%\name.dll,-1",
+            r"@%SystemRoot%\system32\..\..\Users\name.dll,-1",
+            r"@%SystemRoot%\system32\sub\name.dll,-1",
+            r"@%SystemRoot%\system32\name.exe,-1",
+            r"@%SystemRoot%\system32\.dll,-1",
+            r"@%SystemRoot%\system32\na me.dll,-1",
+            r"@%SystemRoot%\system32\shell32.dll,1",
+            r"@%SystemRoot%\system32\shell32.dll,-0",
+            r"@%SystemRoot%\system32\shell32.dll,-65536",
+            r"@%SystemRoot%\system32\shell32.dll,-+5",
+            r"@%SystemRoot%\system32\shell32.dll,-5,-6",
+            r"@%SystemRoot%\system32\shell32.dll",
+            r"%SystemRoot%\system32\shell32.dll,-5",
+            "A plain name",
+            "",
+        ] {
+            let ini = format!("[LocalizedFileNames]\r\nTool.lnk={value}\r\n");
+            assert_eq!(localized_name_ref(ini.as_bytes(), "Tool.lnk"), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn desktop_ini_damage_never_panics() {
+        let good = ini_utf16(INI);
+        for n in 0..good.len() {
+            let _ = localized_name_ref(&good[..n], "Tool A.lnk");
+        }
+        for i in 0..good.len() {
+            for v in [0x00, 0x0A, 0x2C, 0x3D, 0x40, 0x5B, 0xFF] {
+                let mut bad = good.clone();
+                bad[i] = v;
+                if let Some((module, id)) = localized_name_ref(&bad, "Tool A.lnk") {
+                    assert!(module.ends_with(".dll") && !module.contains('\\') && id > 0, "{module} {id}");
+                }
+            }
+        }
     }
 
     /// Reads the REAL jump lists of this machine (run by hand:
