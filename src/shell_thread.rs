@@ -662,7 +662,7 @@ impl Shell {
             ShellRequest::ResolveApp(r) => self.resolve_app(r),
             ShellRequest::Launch { target, args } => {
                 if let Err(e) = launch(&target, args.as_deref()) {
-                    log!("shell: Launch '{target}' not executed: {e}");
+                    log!("shell: Launch ({} chars) not executed: {e}", target.chars().count());
                 }
             }
             ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
@@ -2677,21 +2677,26 @@ fn launch_with(target: &str, args: Option<&str>, by: LaunchBy) -> Result<(), Str
     }
 }
 
-/// Log text of a launch. A launcher launch names only its kind and the length of its text: `dock.log` inherits the
-/// data root's read ACE for BUILTIN\Users, so what the user picked must not be written there (SPEC anti-goal G).
+/// Log text of a launch. A launch names only its kind and the length of its text (a shared request also the length of
+/// its arguments): `dock.log` inherits the data root's read ACE for BUILTIN\Users, so neither what the user picked
+/// (SPEC anti-goal G) nor a program's path, which holds the profile folder's name, is written there.
 fn launch_line(by: LaunchBy, target: &str, args: Option<&str>, tail: &str) -> String {
+    let n = target.chars().count();
     match by {
-        LaunchBy::Shared => format!("shell: Launch '{target}' args={args:?}{tail}"),
-        LaunchBy::Launcher => format!("shell: Launch ({} chars){tail}", target.chars().count()),
+        LaunchBy::Shared => {
+            format!("shell: Launch ({n} chars, arguments {} chars){tail}", args.map_or(0, |a| a.chars().count()))
+        }
+        LaunchBy::Launcher => format!("shell: Launch ({n} chars){tail}"),
     }
 }
 
 /// Log text of a refused de-elevated launch (see `launch_line`).
 fn launch_refused_line(by: LaunchBy, target: &str, e: &str) -> String {
     match by {
-        LaunchBy::Shared => {
-            format!("shell: de-elevated launch of '{target}' failed ({e}): REFUSED, never launching elevated")
-        }
+        LaunchBy::Shared => format!(
+            "shell: de-elevated launch ({} chars) failed ({e}): REFUSED, never launching elevated",
+            target.chars().count()
+        ),
         LaunchBy::Launcher => format!("shell: de-elevated launch failed ({e}): REFUSED, never launching elevated"),
     }
 }
@@ -2699,18 +2704,16 @@ fn launch_refused_line(by: LaunchBy, target: &str, e: &str) -> String {
 /// Log text of an elevated app launch (see `launch_line`); `outcome` is the error, if any.
 fn app_admin_line(by: LaunchBy, target: &str, outcome: Result<(), &str>) -> String {
     match (by, outcome) {
-        (LaunchBy::Shared, Ok(())) => {
-            format!("shell: LaunchAppAdmin '{target}' via the desktop shell (runas, UAC prompt)")
-        }
-        (LaunchBy::Shared, Err(e)) => {
-            format!("shell: LaunchAppAdmin '{target}' through the desktop shell failed ({e}): REFUSED")
-        }
-        (LaunchBy::Launcher, Ok(())) => {
+        (_, Ok(())) => {
             format!(
                 "shell: LaunchAppAdmin ({} chars) via the desktop shell (runas, UAC prompt)",
                 target.chars().count()
             )
         }
+        (LaunchBy::Shared, Err(e)) => format!(
+            "shell: LaunchAppAdmin ({} chars) through the desktop shell failed ({e}): REFUSED",
+            target.chars().count()
+        ),
         (LaunchBy::Launcher, Err(e)) => {
             format!("shell: LaunchAppAdmin through the desktop shell failed ({e}): REFUSED")
         }
@@ -2720,9 +2723,8 @@ fn app_admin_line(by: LaunchBy, target: &str, outcome: Result<(), &str>) -> Stri
 /// Log text of a reveal that found no file (`path` is `None`, `id` is the app) or did not run (see `launch_line`).
 fn reveal_line(by: LaunchBy, id: &str, path: Option<&str>, e: &str) -> String {
     match (by, path) {
-        (LaunchBy::Shared, None) => format!("shell: RevealApp '{id}': no file to show"),
-        (LaunchBy::Shared, Some(p)) => format!("shell: RevealApp '{p}' not executed: {e}"),
-        (LaunchBy::Launcher, None) => format!("shell: RevealApp ({} chars): no file to show", id.chars().count()),
+        (_, None) => format!("shell: RevealApp ({} chars): no file to show", id.chars().count()),
+        (LaunchBy::Shared, Some(p)) => format!("shell: RevealApp ({} chars) not executed: {e}", p.chars().count()),
         (LaunchBy::Launcher, Some(_)) => format!("shell: RevealApp not executed: {e}"),
     }
 }
@@ -2738,8 +2740,8 @@ fn launch_admin(tool: AdminTool) {
     };
     let target = tool.target(&sys);
     match desktop_shell_execute(&target, None, None, Verb::RunAs, SW_SHOWNORMAL.0) {
-        Ok(()) => log!("shell: LaunchAdmin '{target}' via the desktop shell (runas, UAC prompt)"),
-        Err(e) => log!("shell: LaunchAdmin '{target}' through the desktop shell failed ({e}): REFUSED"),
+        Ok(()) => log!("shell: LaunchAdmin {tool:?} via the desktop shell (runas, UAC prompt)"),
+        Err(e) => log!("shell: LaunchAdmin {tool:?} through the desktop shell failed ({e}): REFUSED"),
     }
 }
 
@@ -3553,27 +3555,30 @@ fn start_release(start_px: &mut u32, sent: &mut HashSet<String>, pending: &mut V
 mod tests {
     use super::*;
 
+    /// Neither a launcher pick nor a shared launch (the bar, Start, notifications, the power popup) writes its target,
+    /// arguments or app id to dock.log: kinds and lengths only.
     #[test]
-    fn launcher_launch_logs_never_name_the_pick() {
+    fn launch_logs_never_name_the_target() {
         let (t, a, id) = ("C:\\Secret\\pickme.exe", "--arg-secret", "Vendor.Secret!App");
-        let lines = [
-            launch_line(LaunchBy::Launcher, t, Some(a), ""),
-            launch_line(LaunchBy::Launcher, t, Some(a), " via the desktop shell (de-elevated)"),
-            launch_refused_line(LaunchBy::Launcher, t, "0x80004005"),
-            app_admin_line(LaunchBy::Launcher, id, Ok(())),
-            app_admin_line(LaunchBy::Launcher, id, Err("0x80004005")),
-            reveal_line(LaunchBy::Launcher, id, None, ""),
-            reveal_line(LaunchBy::Launcher, id, Some(t), "0x80004005"),
-        ];
+        let mut lines = Vec::new();
+        for by in [LaunchBy::Launcher, LaunchBy::Shared] {
+            lines.extend([
+                launch_line(by, t, Some(a), ""),
+                launch_line(by, t, Some(a), " via the desktop shell (de-elevated)"),
+                launch_refused_line(by, t, "0x80004005"),
+                app_admin_line(by, id, Ok(())),
+                app_admin_line(by, id, Err("0x80004005")),
+                reveal_line(by, id, None, ""),
+                reveal_line(by, id, Some(t), "0x80004005"),
+            ]);
+        }
         for l in &lines {
             for n in ["Secret", "pickme", "arg-secret", "Vendor"] {
                 assert!(!l.contains(n), "{l}");
             }
         }
         assert!(lines[0].contains("(20 chars)"), "{}", lines[0]);
-        // The shared requests keep 1.4's text.
-        assert!(launch_line(LaunchBy::Shared, t, None, "").contains("pickme"));
-        assert!(app_admin_line(LaunchBy::Shared, id, Ok(())).contains("Vendor"));
+        assert!(lines[7].contains("(20 chars, arguments 12 chars)"), "{}", lines[7]);
     }
 
     #[test]
