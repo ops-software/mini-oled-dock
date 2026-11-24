@@ -945,11 +945,16 @@ fn icons_thread(ui: isize, rx: Receiver<IconReq>) {
     }
 }
 
+/// Log line of an icon that could not be made: the length of the app id, never the id (it names an application).
+fn no_icon_line(key: &str) -> String {
+    format!("notif-icons: no icon for an app id ({} chars)", key.chars().count())
+}
+
 fn process_icon_req(ui: isize, req: IconReq) {
     let slot = match load_app_icon(&req) {
         Some(b) => IconSlot::Ready(Arc::new(b)),
         None => {
-            log!("notif-icons: no icon for '{}'", req.key);
+            log!("{}", no_icon_line(&req.key));
             IconSlot::Failed
         }
     };
@@ -1018,6 +1023,13 @@ pub(crate) fn preview_set_state(s: NotifState, icons: Vec<(String, Arc<IconBitma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_icon_line_gives_the_length_not_the_id() {
+        let line = no_icon_line("Vendor.SomeApp_8wekyb3d8bbwe!App");
+        assert_eq!(line, "notif-icons: no icon for an app id (32 chars)");
+        assert!(!line.contains("Vendor") && !line.contains("8wekyb3d8bbwe"));
+    }
 
     #[test]
     fn poll_wait_follows_the_bell() {

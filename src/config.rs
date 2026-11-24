@@ -1515,17 +1515,17 @@ fn migrate_legacy() -> Option<Config> {
     }
 }
 
+/// The legacy-folder line names the folders by description, never by path: they hold the profile folder's name.
+const LEGACY_DIR_LINE: &str = "config: the old data folder (%LOCALAPPDATA%\\Dock) is no longer used. Move your custom \
+     icons from its icons subfolder to the icons folder of the data folder, then delete the old folder (no admin \
+     rights needed).";
+
 /// Logs that the legacy folder is no longer used (custom icons must be moved by hand). Never touches it.
 fn report_legacy_dir() {
     let Some(old) = crate::datadir::legacy_dir() else { return };
     // symlink_metadata does not follow a reparse point: this only reports.
     if std::fs::symlink_metadata(&old).is_ok() {
-        let icons = crate::datadir::icons_dir().map(|p| p.display().to_string()).unwrap_or_default();
-        crate::log!(
-            "config: the old data folder {} is no longer used. Move your custom icons from its icons \
-             subfolder to {icons}, then delete the old folder (no admin rights needed).",
-            old.display()
-        );
+        crate::log!("{LEGACY_DIR_LINE}");
     }
 }
 
@@ -2087,6 +2087,13 @@ mod fixtures;
 #[allow(clippy::items_after_test_module)] // clippy: kept as is; moving the items below the tests is churn in a file other streams own
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_dir_line_names_no_profile_path() {
+        assert!(LEGACY_DIR_LINE.starts_with("config: the old data folder (%LOCALAPPDATA%\\Dock) is no longer used."));
+        assert!(!LEGACY_DIR_LINE.contains(":\\"));
+        assert!(!LEGACY_DIR_LINE.contains("Users"));
+    }
 
     #[test]
     fn launcher_defaults_when_missing() {
