@@ -238,6 +238,9 @@ impl Content for TrayPopup {
                 let Some(row) = self.rows.get_mut(idx) else { return Reply::None };
                 // `set_user_hidden` writes the config and notifies the UI (the bar updates right away); here
                 // the row is updated too, then `data(TrayChanged)` realigns the list.
+                if crate::config::get().tray_show_all {
+                    return Reply::None; // Show all is on: the switch does nothing on screen and edits nothing.
+                }
                 tray_host::set_user_hidden(&row.key, row.visible);
                 row.visible = !row.visible;
                 Reply::Redraw

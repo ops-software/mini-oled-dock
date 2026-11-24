@@ -531,12 +531,12 @@ fn layout_row(
     // Clickable parts.
     let ctl = cell.ctl;
     match &row.control {
-        Control::Toggle { enabled, .. } => {
+        Control::Toggle { enabled, .. } | Control::TrayApp { enabled, .. } => {
             if *enabled {
                 hits.push((id(None), rc));
             }
         }
-        Control::Chooser { .. } | Control::TrayApp { .. } => hits.push((id(None), rc)),
+        Control::Chooser { .. } => hits.push((id(None), rc)),
         Control::Choice { options, .. } => {
             let mut x = ctl.left;
             for (j, sw) in seg_widths(s, options).iter().enumerate() {
@@ -680,13 +680,12 @@ fn paint_nav_entry(s: &mut Surface, page: Page, rc: RECT, f: &Frame<'_>) {
 /// True for the rows that react to the pointer as a whole or through their parts.
 fn interactive(c: &Control) -> bool {
     match c {
-        Control::Toggle { enabled, .. } => *enabled,
+        Control::Toggle { enabled, .. } | Control::TrayApp { enabled, .. } => *enabled,
         Control::Choice { .. }
         | Control::Slider { .. }
         | Control::Swatches { .. }
         | Control::Buttons(_)
-        | Control::Chooser { .. }
-        | Control::TrayApp { .. } => true,
+        | Control::Chooser { .. } => true,
         _ => false,
     }
 }
@@ -737,7 +736,8 @@ fn paint_row(s: &mut Surface, g: &Geometry, f: &Frame<'_>, i: usize, row: &Row, 
     }
 
     // Hover plate on the whole row of an interactive one (pressed: only for a whole-row click).
-    let enabled = !matches!(row.control, Control::Toggle { enabled: false, .. });
+    let enabled =
+        !matches!(row.control, Control::Toggle { enabled: false, .. } | Control::TrayApp { enabled: false, .. });
     let lit = row_hot && interactive(&row.control);
     if lit {
         let a = if f.pressed.is_some() && f.pressed == f.hot && f.hot == Some(id(None)) {

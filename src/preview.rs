@@ -1197,6 +1197,13 @@ pub fn run(dir: &str) -> i32 {
             let file = format!("settings_{}{suffix}.png", page.slug());
             failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
         }
+        // The tray chooser open, "Show all" off and on (the on page: every switch reads as on and is dimmed).
+        for (name, on) in [("settings_tray_chooser", false), ("settings_tray_show_all", true)] {
+            let c = Config { tray_show_all: on, ..plan().base_config() };
+            let file = format!("{name}{suffix}.png");
+            let (m, page) = (Metrics { dpi }, crate::settings_pages::Page::Modules);
+            failures += i32::from(!settings_png_with(dir, &file, m, page, &c, (false, true), None, (860, 900)));
+        }
     }
     if !plan().matrix {
         // The whole Modules page, down to the Tray section (elevated-apps switch).

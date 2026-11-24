@@ -1,0 +1,5 @@
+{
+  "tray_show_all": true,
+  "tray_hidden": ["slack.exe|0", "7820ae73-23e3-4229-82c1-e41cb67d5b9c"],
+  "tray_order": ["slack.exe|0"]
+}

@@ -696,6 +696,9 @@ pub struct Config {
     pub show_volume_percent: bool,
     /// hosts the tray icons of other apps in the dock (`tray_host`). false = never started.
     pub show_tray: bool,
+    /// true = every tray icon is shown in the bar and `tray_hidden` is ignored (kept in the file untouched, so
+    /// switching this off brings the earlier choices back). Default: false.
+    pub tray_show_all: bool,
     /// Per-module visibility of the system modules (see `MODULE_NAMES` / `module_visible`).
     /// A hidden module is not laid out and costs nothing: no timer, no polling, nothing loaded.
     pub show_notifications: bool,
@@ -817,6 +820,7 @@ impl Default for Config {
             show_date: true,
             show_volume_percent: true,
             show_tray: true,
+            tray_show_all: false,
             show_notifications: true,
             show_volume: true,
             show_network: true,
@@ -971,7 +975,7 @@ fn parse(text: &str) -> Result<Config, String> {
 /// test pins the list to `serde_json::to_value(Config::default())`) and the legacy `bar_size` (read by
 /// `migrate_bar_size`, never written). A list, because serializing the defaults at run time costs the exe
 /// about 8 KiB. A new top-level field goes here too, or it would be kept as unknown and written twice.
-const KNOWN_KEYS: [&str; 50] = [
+const KNOWN_KEYS: [&str; 51] = [
     "language",
     "position",
     "monitor",
@@ -988,6 +992,7 @@ const KNOWN_KEYS: [&str; 50] = [
     "show_date",
     "show_volume_percent",
     "show_tray",
+    "tray_show_all",
     "show_notifications",
     "show_volume",
     "show_network",
@@ -1200,6 +1205,11 @@ fn render(c: &Config) -> String {
   // the bar widens and narrows dynamically.
   "show_tray": {show_tray},
 
+  // true = show every tray icon in the bar, without choosing them one by one. "tray_hidden" is then ignored
+  // (but kept as it is, so switching this off brings your earlier choices back). Icons that appear later are
+  // shown too.
+  "tray_show_all": {tray_show_all},
+
   // System modules on the right of the bar: true = shown, false = removed from the bar.
   // A hidden module costs nothing (no timer, no polling, no system library loaded).
   // The power button is always shown (it holds the dock's own menu).
@@ -1373,6 +1383,7 @@ fn render(c: &Config) -> String {
         date_format = js(&c.date_format),
         show_volume = c.show_volume_percent,
         show_tray = c.show_tray,
+        tray_show_all = c.tray_show_all,
         show_notif = c.show_notifications,
         show_vol_mod = c.show_volume,
         show_network = c.show_network,
@@ -2271,6 +2282,16 @@ mod tests {
         let r = render(&c);
         assert_eq!(parse(&r).unwrap(), c);
         assert_eq!(render(&parse(&r).unwrap()), r);
+    }
+
+    #[test]
+    fn tray_show_all_defaults_off_and_round_trips() {
+        assert!(!parse("{}").unwrap().tray_show_all);
+        let c = parse("{\"tray_show_all\": true, \"tray_hidden\": [\"a.exe|0\"]}").unwrap();
+        assert!(c.tray_show_all && c.extra.is_empty());
+        let back = parse(&render(&c)).unwrap();
+        assert!(back.tray_show_all);
+        assert_eq!(back.tray_hidden, vec!["a.exe|0".to_string()]);
     }
 
     #[test]

@@ -132,6 +132,8 @@ pub(crate) enum Setting {
     /// Admin-only `HKLM\SOFTWARE\mini-oled-dock\TrustElevatedTrayIcons`, NOT in the config: the state
     /// comes from `Ctx::trust_elevated` and a click gives `Effect::TrustElevated`.
     TrustElevatedTray,
+    /// `config.tray_show_all`: every tray icon in the bar (`tray_hidden` ignored, kept).
+    TrayShowAll,
     /// `launcher.enabled`.
     LauncherOn,
     /// `launcher.chord`: Alt+Space / Alt+Shift+Space / Off.
@@ -228,9 +230,11 @@ pub(crate) enum Control {
         open: bool,
     },
     /// A tray app of the inline chooser, by its `tray_host` key, never by index.
+    /// `enabled` is false while `config.tray_show_all` is on: the switch reads as on and is dimmed.
     TrayApp {
         key: String,
         visible: bool,
+        enabled: bool,
     },
     Status(String),
     Note,
@@ -443,6 +447,7 @@ pub(crate) fn is_on(c: &Config, s: Setting) -> bool {
         Setting::BatteryInside => c.battery_percent_inside,
         Setting::UpdateCheck => c.update_check,
         Setting::UpdateAutoInstall => c.update_auto_install,
+        Setting::TrayShowAll => c.tray_show_all,
         Setting::Module(n) => c.module_visible(n),
         Setting::LauncherOn => c.launcher.enabled,
         Setting::LauncherLearn => c.launcher.learn,
@@ -462,6 +467,7 @@ pub(crate) fn flip(c: &mut Config, s: Setting) {
         Setting::BatteryInside => c.battery_percent_inside = !c.battery_percent_inside,
         Setting::UpdateCheck => c.update_check = !c.update_check,
         Setting::UpdateAutoInstall => c.update_auto_install = !c.update_auto_install,
+        Setting::TrayShowAll => c.tray_show_all = !c.tray_show_all,
         Setting::Module(n) => {
             let on = c.module_visible(n);
             c.set_module_visible(n, !on);
@@ -701,7 +707,7 @@ pub(crate) fn click(row: &Row, part: Option<usize>, ctx: &Ctx<'_>) -> Effect {
         },
         Control::Chooser { .. } => Effect::ToggleChooser,
         // The row carries the app's key; it acts only while that app is still in the live list.
-        Control::TrayApp { key, visible } if ctx.tray.iter().any(|t| t.key == *key) => {
+        Control::TrayApp { key, visible, enabled: true } if ctx.tray.iter().any(|t| t.key == *key) => {
             Effect::TrayVisible { key: key.clone(), hidden: *visible }
         }
         _ => Effect::None,
@@ -814,6 +820,16 @@ fn modules(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             )),
             Control::Toggle { setting: Setting::TrustElevatedTray, on: ctx.trust_elevated, enabled: true },
         ));
+        v.push(toggle(
+            glyphs::eye_icon,
+            tr("Show all", "Mostra tutte"),
+            Some(tr(
+                "Show every tray icon in the bar, including those that start later",
+                "Mostra tutte le icone nella barra, comprese quelle che compaiono dopo",
+            )),
+            c,
+            Setting::TrayShowAll,
+        ));
         v.push(row(
             glyphs::eye_icon,
             tr("Choose visible icons", "Scegli le icone visibili"),
@@ -835,7 +851,11 @@ fn modules(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
                     icon: None,
                     label: t.name.clone(),
                     desc: no_room.then(|| tr("No room in the bar", "Spazio insufficiente nella barra").to_string()),
-                    control: Control::TrayApp { key: t.key.clone(), visible: t.visible },
+                    control: Control::TrayApp {
+                        key: t.key.clone(),
+                        visible: t.visible || c.tray_show_all,
+                        enabled: !c.tray_show_all,
+                    },
                 });
             }
         }
@@ -1440,6 +1460,7 @@ mod tests {
             Setting::BatteryInside,
             Setting::UpdateCheck,
             Setting::UpdateAutoInstall,
+            Setting::TrayShowAll,
             Setting::Module("metrics"),
             Setting::Module("tray"),
         ] {
@@ -1665,9 +1686,10 @@ mod tests {
             let k = find(&r).unwrap();
             assert_eq!(r[k].control, Control::Toggle { setting: Setting::TrustElevatedTray, on, enabled: true });
             assert!(r[k].desc.is_some());
-            // In the Tray section, between the module toggle and the chooser.
+            // In the Tray section, between the module toggle and the "Show all" switch above the chooser.
             assert_eq!(r[k - 1].control, Control::Toggle { setting: Setting::Module("tray"), on: true, enabled: true });
-            assert_eq!(r[k + 1].control, Control::Chooser { open: false });
+            assert_eq!(r[k + 1].control, Control::Toggle { setting: Setting::TrayShowAll, on: false, enabled: true });
+            assert_eq!(r[k + 2].control, Control::Chooser { open: false });
             // The click asks for the HKLM write, never a config edit.
             assert_eq!(click(&r[k], None, &cx), Effect::TrustElevated(!on));
         }
@@ -1691,6 +1713,33 @@ mod tests {
     }
 
     #[test]
+    fn show_all_switch_precedes_the_list_and_disables_the_rows() {
+        let st = idle();
+        let tray = tray_rows();
+        let mut cx = ctx(&[], &st);
+        cx.tray = &tray;
+        cx.chooser_open = true;
+        let mut c = Config::default();
+        let r = rows(Page::Modules, &c, &cx);
+        let sw =
+            r.iter().position(|r| matches!(r.control, Control::Toggle { setting: Setting::TrayShowAll, .. })).unwrap();
+        let ch = r.iter().position(|r| matches!(r.control, Control::Chooser { .. })).unwrap();
+        assert!(sw < ch && r[sw].desc.is_some());
+        assert_eq!(click(&r[sw], None, &cx), Effect::Save(Edit::Flip(Setting::TrayShowAll)));
+        // Teams is hidden; while Show all is on it reads as on, nothing can be clicked, and tray_hidden stays.
+        c.tray_hidden = vec!["teams.exe#1".into()];
+        apply_edit(&mut c, Edit::Flip(Setting::TrayShowAll), &[]);
+        assert!(c.tray_show_all);
+        let r = rows(Page::Modules, &c, &cx);
+        let k = r.iter().position(|r| matches!(r.control, Control::Chooser { .. })).unwrap();
+        assert_eq!(r[k + 3].control, Control::TrayApp { key: "teams.exe#1".into(), visible: true, enabled: false });
+        assert_eq!(click(&r[k + 3], None, &cx), Effect::None);
+        assert_eq!(click(&r[k + 1], None, &cx), Effect::None);
+        apply_edit(&mut c, Edit::Flip(Setting::TrayShowAll), &[]);
+        assert_eq!(c.tray_hidden, vec!["teams.exe#1".to_string()]);
+    }
+
+    #[test]
     fn tray_chooser_rows_are_inline() {
         let st = idle();
         let tray = tray_rows();
@@ -1699,7 +1748,7 @@ mod tests {
         cx.chooser_open = true;
         let r = rows(Page::Modules, &Config::default(), &cx);
         let k = r.iter().position(|r| r.control == Control::Chooser { open: true }).unwrap();
-        assert_eq!(r[k + 1].control, Control::TrayApp { key: "dropbox.exe#1".into(), visible: true });
+        assert_eq!(r[k + 1].control, Control::TrayApp { key: "dropbox.exe#1".into(), visible: true, enabled: true });
         assert_eq!(r[k + 2].label, "Slack");
         assert!(r[k + 2].desc.is_some()); // visible but no room in the bar
         assert_eq!(click(&r[k], None, &cx), Effect::ToggleChooser);

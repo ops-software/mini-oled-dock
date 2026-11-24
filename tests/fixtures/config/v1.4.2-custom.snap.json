@@ -39,6 +39,7 @@
   "show_date": false,
   "show_volume_percent": false,
   "show_tray": false,
+  "tray_show_all": false,
   "show_notifications": false,
   "show_volume": false,
   "show_network": false,
