@@ -1547,8 +1547,9 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// apps send it meanwhile, each of which starts the forward's 3 s again; the UI thread waits on them only through
 /// SHAppBarMessage, the fallback of a refused direct AppBar send, as taskbar::takes_fallback skips it after a timeout),
 /// the tray-fwd thread (no window, nothing to dispatch) and the shell thread's WM_GETICON (none of the dock's windows).
-/// A new SendMessageTimeoutW is listed here first.
-const TIMED_SENDS: [(&str, &str, bool, bool); 8] = [
+/// The update guard's WM_NULL to the new dock's window blocks: the guard has no window, so SMTO_BLOCK only keeps its
+/// 2 s a true bound. A new SendMessageTimeoutW is listed here first.
+const TIMED_SENDS: [(&str, &str, bool, bool); 9] = [
     ("src/ui.rs", "fn answers(", true, false),
     ("src/apps.rs", "fn sys_command(", true, true),
     ("src/taskbar.rs", "fn appbar_direct_at(", true, true),
@@ -1557,6 +1558,7 @@ const TIMED_SENDS: [(&str, &str, bool, bool); 8] = [
     ("src/tray_host.rs", "fn forward_with_shared(", false, false),
     ("src/tray_host.rs", "fn forward_main(", false, false),
     ("src/shell_thread.rs", "fn icon_from_window(", false, false),
+    ("src/update/guard.rs", "fn window_answers(", true, false),
 ];
 
 /// Each SendMessageTimeoutW outside comments, imports and the test module sits in a function `TIMED_SENDS` lists for
@@ -1670,6 +1672,58 @@ fn scan_tree(lint: fn(&str, &str) -> Vec<String>) -> Vec<String> {
         out.extend(lint(&path, &text));
     }
     out
+}
+
+// ---- lint: dock.log carries no tooltip or window title (wsD D4) ----------------------------------------------------
+
+/// A `log!` call that names a tooltip (`.tip`), reads a window title (`window_title(`) or passes an argument called
+/// `title` writes personal text to a file every local account can read. Reported as "path:line".
+fn log_title_violations(path: &str, text: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    if path == "src/launcher/lints.rs" || path == "src/launcher/testkit.rs" {
+        return v;
+    }
+    for (at, call) in log_calls(text) {
+        // The arguments start after the format literal (its end is the first unescaped quote after the opening one).
+        let args = call
+            .find('"')
+            .and_then(|o| {
+                let mut esc = false;
+                call.get(o + 1..).and_then(|r| {
+                    r.char_indices().find_map(|(k, c)| {
+                        let hit = !esc && c == '"';
+                        esc = !esc && c == '\\';
+                        hit.then_some(o + 1 + k + 1)
+                    })
+                })
+            })
+            .and_then(|e| call.get(e..))
+            .unwrap_or("");
+        let title_arg = args.match_indices("title").any(|(i, _)| {
+            let before = args.get(..i).and_then(|t| t.chars().next_back());
+            let after = args.get(i + 5..).and_then(|t| t.chars().next());
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        });
+        if call.contains(".tip") || call.contains("window_title(") || title_arg || call.contains("{title") {
+            v.push(format!("{path}:{}: a log line carries a tooltip or a window title", line_of(text, at)));
+        }
+    }
+    v
+}
+
+#[test]
+fn logs_carry_no_tooltip_or_window_title() {
+    assert!(log_title_violations("src/a.rs", r#"log!("tray: NIM_ADD exe={} ret={}", exe, ret);"#).is_empty());
+    assert!(log_title_violations("src/a.rs", r#"log!("class \"{}\"", window_class(h));"#).is_empty());
+    assert!(log_title_violations("src/a.rs", r#"log!("a title word", n);"#).is_empty());
+    assert_eq!(log_title_violations("src/a.rs", r#"log!("x tip=\"{}\"", utf16_until_nul(&nid.tip));"#).len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", r#"log!("w \"{}\"", window_title(h));"#).len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", "log!(\"fg={}\", title);").len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", "log!(\"fg={}\",\n    title\n);").len(), 1);
+    assert_eq!(log_title_violations("src/a.rs", r#"log!("fg={title}");"#).len(), 1);
+    assert!(log_title_violations("src/launcher/testkit.rs", r#"log!("{}", window_title(h));"#).is_empty());
+    let found = scan_tree(log_title_violations);
+    assert!(found.is_empty(), "tooltips or window titles in dock.log: {found:?}");
 }
 
 #[test]

@@ -6,8 +6,8 @@
 //!    `shutdown`: UI thread ONLY (the taskbar has no WinEvent hook of its own: `apps::winevent_proc` runs on the
 //!    UI thread and hands the raw events to `on_raw_event`, which posts `WM_DOCK_TASKBAR_EVENT`).
 //!  * `restore()` and `restore_force()`: callable from ANY thread/process (panic hook,
-//!    WM_ENDSESSION, watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
-//!    thread-safe Win32 APIs and do not touch thread-local state.
+//!    watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
+//!    thread-safe Win32 APIs and do not touch thread-local state. `restore_at_session_end` (WM_ENDSESSION): UI thread.
 //!  * On-disk state: `%ProgramData%\mini-oled-dock\taskbar-state` (text: the numeric `ABS_*` value),
 //!    admin-only folder, atomic write (`datadir::write_atomic`), read without following reparse
 //!    points. Without a usable data folder the state cannot be saved and the taskbar is never hidden.
@@ -46,6 +46,16 @@ static HIDDEN: AtomicBool = AtomicBool::new(false);
 /// Set at the start of `restore`/`restore_force` and NEVER cleared: a process that has started
 /// restoring must not hide the taskbar again (panic hook / safety timer race).
 static RESTORING: AtomicBool = AtomicBool::new(false);
+/// Set by `restore_at_session_end` and never cleared: `restore_force` keeps the state file for the next sign-in.
+/// Only the dock sets it, so a watchdog restore after a crash still deletes the file.
+static SESSION_END: AtomicBool = AtomicBool::new(false);
+/// Set by `restored_externally` when the restore from outside was the watchdog's hang restore
+/// (`after_outside_restore`): the next safety check hides the taskbar again (`hide_again`). UI thread.
+static HIDE_AGAIN: AtomicBool = AtomicBool::new(false);
+/// Set by `hide_again` when Explorer did not answer its read, cleared by `restored_externally` at each watchdog's
+/// restore: the "state unreadable" line is logged once per restore, not at every retry (`after_rehide_read`).
+/// UI thread.
+static HIDE_AGAIN_UNREAD: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "TaskbarCreated" message (0 = not registered yet).
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 /// true while the taskbar wants the raw WinEvents that `apps::winevent_proc` hands to `on_raw_event` (set by
@@ -67,6 +77,8 @@ static EDGE_HOLDER: AtomicIsize = AtomicIsize::new(0);
 /// Taskbar state (`ABS_*`) of the last `ABM_GETSTATE` read by `hide_all`, or `STATE_UNREAD` / `STATE_UNKNOWN`:
 /// a change is logged once, so the log tells whether Explorer turned auto-hide off by itself or kept it off.
 static LAST_STATE: AtomicU32 = AtomicU32::new(STATE_UNREAD);
+/// Times this process's safety check found a visible taskbar (`on_safety_timer`, `safety_logs`).
+static SAFETY_FINDS: AtomicU32 = AtomicU32::new(0);
 /// Monotonic time reference of the process.
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -596,9 +608,10 @@ fn write_state(state: u32) -> Result<(), String> {
 
 /// saves the original state ONLY if the file is missing or unreadable.
 /// Returns true if a valid state exists on file after the call.
-/// `pre` is the state already read (and stabilized) by `init`; `None` = reads it here.
+/// `pre` is the state already read (and stabilized) by `init`, or read by `hide_again`; `None` = reads it here.
 fn ensure_state_saved(pre: Option<u32>) -> bool {
-    if read_state().is_some() {
+    if let Some(s) = read_state() {
+        log!("taskbar: original state {s} (state file)");
         return true;
     }
     let list = native_taskbars();
@@ -690,7 +703,7 @@ pub fn init() -> Result<bool, String> {
             return Err("Shell_TrayWnd did not appear within 30 s".into());
         }
         // The watchdog must not mistake this wait for a hang. "Startup" heartbeat: keeps
-        // the watchdog alive without making it switch to the short tolerance before TIMER_SECOND.
+        // the watchdog alive without making it switch to the short tolerance before the message loop runs.
         if last_beat.elapsed() >= Duration::from_millis(500) {
             crate::watchdog::startup_heartbeat();
             last_beat = Instant::now();
@@ -750,8 +763,9 @@ fn allow_taskbar_created() {
 
 /// true if, while this process was hiding the taskbar, someone else (watchdog after missed
 /// heartbeats, CLI `--restore` with the dock stuck) restored it: the state file is gone.
-/// In that case it stops hiding it (`HIDDEN` = false): hiding it again would leave the taskbar
-/// hidden with no state file and, possibly, no watchdog.
+/// In that case it stops hiding it (`HIDDEN` = false), for good unless the restore was the watchdog's hang restore
+/// (`after_outside_restore`): then the next safety check hides it again (`hide_again`), which saves the state first
+/// and needs a live watchdog, so the taskbar is never hidden with no state file or no watchdog.
 fn restored_externally() -> bool {
     if !HIDDEN.load(Relaxed) {
         return false;
@@ -760,10 +774,119 @@ fn restored_externally() -> bool {
         return false;
     }
     HIDDEN.store(false, Relaxed);
-    // The tray host yields to Explorer: apps will re-register their icons with it.
-    crate::tray_host::yield_now();
-    log!("taskbar: state file gone (external restore), no longer hiding the taskbar");
+    match after_outside_restore(
+        RESTORING.load(Relaxed),
+        crate::watchdog::stop_requested(),
+        config::effective_hide_native_taskbar(),
+        crate::watchdog::alive(),
+    ) {
+        Outside::StopHiding => {
+            // The tray host yields to Explorer: apps will re-register their icons with it.
+            crate::tray_host::yield_now();
+            log!("taskbar: state file gone (external restore), no longer hiding the taskbar");
+        }
+        Outside::HideAgain => {
+            HIDE_AGAIN.store(true, Relaxed);
+            HIDE_AGAIN_UNREAD.store(false, Relaxed);
+            log!(
+                "taskbar: state file gone, restored by the watchdog (no stop request): hiding it again at the next \
+                 safety check"
+            );
+        }
+    }
     true
+}
+
+/// What the dock does once it finds the taskbar restored from outside (`restored_externally`).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Outside {
+    /// Stop hiding for good: an exit, a stop request, hiding no longer wanted, or no watchdog to guard a new hide.
+    StopHiding,
+    /// The watchdog's hang restore: hide again at the next safety check.
+    HideAgain,
+}
+
+/// Pure: only the watchdog's hang restore is undone. A restore a user starts from outside signals the stop event
+/// before it deletes the state file (`--restore`, `--install`, `--uninstall`), the in-process ones exit, and the
+/// watchdog's wait-failed branch restores and exits; the hang restore does none of these and leaves the dock running.
+fn after_outside_restore(exiting: bool, stop_requested: bool, hide_wanted: bool, watchdog_alive: bool) -> Outside {
+    if !exiting && !stop_requested && hide_wanted && watchdog_alive {
+        Outside::HideAgain
+    } else {
+        Outside::StopHiding
+    }
+}
+
+/// Hides the taskbar again after the watchdog's hang restore (`HIDE_AGAIN`; `on_safety_timer` only, UI thread).
+/// Its `TIMER_SECOND` tick comes after a heartbeat, so the watchdog has left its hang state and needs another 6.6 s of
+/// silence to restore again. The restore set Explorer to the saved original and removed the marks, so the state saved
+/// again here is the user's: read with `try_get_state`, since the restore deleted the file and `get_state` makes a
+/// failed read 0 (a timed-out read gets no fallback on the UI thread), which would be saved as the original and set in
+/// Explorer's saved setting by the next restore. A read Explorer does not answer saves nothing and does not hide: the
+/// next safety check reads again (`after_rehide_read`), until Explorer answers or the first checks below end it.
+fn hide_again() {
+    if RESTORING.load(Relaxed) || crate::watchdog::stop_requested() || !config::effective_hide_native_taskbar() {
+        log!("taskbar: not hiding again (exit or stop request)");
+        return;
+    }
+    if !crate::watchdog::alive() {
+        log!("taskbar: not hiding again (no watchdog)");
+        return;
+    }
+    let Some(&tray) = native_taskbars().first() else {
+        HIDE_AGAIN.store(true, Relaxed); // Explorer restarting: the next tick tries again
+        return;
+    };
+    // The host the watchdog's yield ended, and its forwarder, are stopped first: `tray_sync` below then starts one host
+    // and one forwarder. `stop` waits, so not under the popup's mouse hook.
+    let hook = crate::popup::suspend_mouse_hook();
+    crate::tray_host::stop();
+    crate::popup::resume_mouse_hook(hook);
+    let state = match after_rehide_read(try_get_state(tray).0, HIDE_AGAIN_UNREAD.load(Relaxed)) {
+        Reread::Hide(s) => s,
+        Reread::Retry { first } => {
+            HIDE_AGAIN.store(true, Relaxed); // Explorer slow: the next tick reads again
+            HIDE_AGAIN_UNREAD.store(true, Relaxed);
+            if first {
+                log!("taskbar: state unreadable after the watchdog's restore, not hiding yet, trying again");
+            }
+            return;
+        }
+    };
+    if !ensure_state_saved(Some(state)) {
+        log!("taskbar: state not saveable after the watchdog's restore, not hiding");
+        return;
+    }
+    HIDDEN.store(true, Relaxed);
+    hide_all();
+    if crate::shell_thread::desktop_registered() {
+        crate::ui::tray_sync(); // starts the host and announces it when show_tray
+    } else {
+        // A new Explorer is starting (the watchdog's restore waited for its taskbar): our host waits for its desktop,
+        // as after `explorer_gone`, and `on_reannounce_timer` starts it.
+        HOST_PAUSED_AT.store(now_ms(), Relaxed);
+        arm_reannounce(1000);
+    }
+    log!("taskbar: hidden again after the watchdog's restore");
+}
+
+/// What `hide_again` does with its read of Explorer's state.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Reread {
+    /// Explorer answered: this state is saved as the original (`ensure_state_saved`) and the taskbar hidden.
+    Hide(u32),
+    /// Explorer did not answer: nothing saved, the next safety check reads again; `first`: the first unanswered read
+    /// since the watchdog's restore, the only one logged.
+    Retry { first: bool },
+}
+
+/// Pure: `read` is `try_get_state`'s (`None` = unanswered), `failed_before` whether an earlier read since the
+/// watchdog's restore went unanswered. A failed read is never saved as the original.
+fn after_rehide_read(read: Option<u32>, failed_before: bool) -> Reread {
+    match read {
+        Some(s) => Reread::Hide(s),
+        None => Reread::Retry { first: !failed_before },
+    }
 }
 
 /// Stops asking for the raw events (the apps hook stays). Idempotent. UI thread.
@@ -852,6 +975,7 @@ pub(crate) fn on_raw_event(event: u32, hwnd: HWND, id_object: i32) {
     if ui.0.is_null() {
         return;
     }
+    probe!(crate::probe::winevent_pass(crate::probe::Src::Apps, crate::probe::Stage::TaskbarEvent, event));
     // SAFETY: PostMessageW is thread-safe; if the window no longer exists it just fails.
     let _ = unsafe { PostMessageW(Some(ui), WM_DOCK_TASKBAR_EVENT, WPARAM(event as usize), LPARAM(hwnd.0 as isize)) };
 }
@@ -1027,14 +1151,23 @@ pub fn on_winevent(event: u32, hwnd: HWND) {
     }
     log!("taskbar: event 0x{event:X} on visible taskbar, hiding it again");
     hide_all();
+    crate::tray_host::raise();
 }
 
-/// 1 s safety timer (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
-/// no longer a window (`holder_left`), redoes `hide_all()`.
-/// No-op if `HIDDEN` is false or if the taskbar was restored from outside (see `restored_externally`).
+/// 3 s safety check (`TIMER_SECOND`): if a native taskbar is visible, or the window of the hold-back in effect is
+/// no longer a window (`holder_left`), redoes `hide_all()`. A visible taskbar is logged for the first 20 times
+/// (`safety_logs`): the event path should have hidden it already.
+/// With `HIDDEN` false it only runs a pending re-hide after the watchdog's restore (`hide_again`); no-op if the
+/// taskbar was restored from outside (see `restored_externally`).
 pub fn on_safety_timer() {
     use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-    if !HIDDEN.load(Relaxed) || restored_externally() {
+    if !HIDDEN.load(Relaxed) {
+        if HIDE_AGAIN.swap(false, Relaxed) {
+            hide_again();
+        }
+        return;
+    }
+    if restored_externally() {
         return;
     }
     let holder = EDGE_HOLDER.load(Relaxed);
@@ -1046,8 +1179,18 @@ pub fn on_safety_timer() {
         return;
     }
     if native_taskbars().into_iter().any(is_visible) {
+        let n = SAFETY_FINDS.fetch_add(1, Relaxed);
+        if safety_logs(n) {
+            log!("taskbar: safety check found a visible taskbar ({}), hiding it again", n + 1);
+        }
         hide_all();
     }
+}
+
+/// Whether the safety check's find number `count` (from 0) is logged: the first 20 per process, so a taskbar that
+/// stays visible (Explorer hung) does not log every 3 s.
+fn safety_logs(count: u32) -> bool {
+    count < 20
 }
 
 /// `TaskbarCreated` message (Explorer restarted): redoes self-heal + state saving (only if the
@@ -1114,7 +1257,7 @@ fn explorer_restarted(why: &str) {
     }
     // Explorer's new Shell_TrayWnd is born topmost and would sit in front of ours: it is brought back to the
     // top and, after 300 ms, announced again so apps re-register their icons with us.
-    crate::tray_host::raise();
+    crate::tray_host::raise_after("Explorer restart");
     arm_reannounce(300);
 }
 
@@ -1137,21 +1280,67 @@ pub fn begin_exit() {
 
 /// "Normal" restore by the dock on exit (WM_DESTROY/clean exit, WM_ENDSESSION wParam != 0,
 /// panic hook). Idempotent and guarded: if this process hid nothing (`HIDDEN` false) and
-/// the state file does not exist, it does nothing. Otherwise it runs `restore_force()` and clears `HIDDEN`.
+/// the state file does not exist, it does nothing; after the session end's restore, nothing unless this process hid
+/// the taskbar again (`restore_needed`). Otherwise it runs `restore_force()` and clears `HIDDEN`.
 /// Callable from any thread.
 pub fn restore() {
     RESTORING.store(true, Relaxed);
     let was_hidden = HIDDEN.swap(false, Relaxed);
-    if !was_hidden && !state_file_exists() && read_legacy_state().is_none() {
+    // Read only when this process hid nothing, as before.
+    let state_left = !was_hidden && (state_file_exists() || read_legacy_state().is_some());
+    if !restore_needed(was_hidden, state_left, session_ending()) {
         return;
     }
     restore_force();
 }
 
+/// Whether `restore()` has anything to do: this process hid the taskbar, or (outside a session end) a state file or
+/// a legacy state is left. The session end's restore keeps the file for the next sign-in, so a later call of the same
+/// process (WM_DESTROY, `cleanup`, the end of `main`) does not restore a second time. Pure.
+fn restore_needed(was_hidden: bool, state_left: bool, session_ending: bool) -> bool {
+    was_hidden || (state_left && !session_ending)
+}
+
+/// The session-end restore (`WM_ENDSESSION` with wParam != 0, UI thread): ends the watchdog first, so it cannot
+/// restore again after the dock and delete the state file, then marks the session end (`restore_force` keeps the
+/// file for the next sign-in's `init`) and restores. A restore that is not delivered keeps the file as always.
+pub fn restore_at_session_end() {
+    crate::watchdog::end_for_session_end();
+    SESSION_END.store(true, Relaxed);
+    restore();
+}
+
+/// true once `restore_at_session_end` ran in this process.
+fn session_ending() -> bool {
+    SESSION_END.load(Relaxed)
+}
+
+/// What `restore_force` does with the state file after its `ABM_SETSTATE`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum AfterRestore {
+    /// Delivered: the file has done its job.
+    Delete,
+    /// Not delivered (Explorer hung or shutting down): kept, so the watchdog, the next run or `--restore` finish it.
+    KeepUndelivered,
+    /// Delivered at a session end: kept for the next sign-in's `init`, since Explorer may save its settings before
+    /// this restore and does not keep a restored "not auto-hide".
+    KeepForNextSignIn,
+}
+
+/// Pure decision of `restore_force` on the state file (`session_ending`: `restore_at_session_end` ran).
+fn after_restore(delivered: bool, session_ending: bool) -> AfterRestore {
+    match (delivered, session_ending) {
+        (false, _) => AfterRestore::KeepUndelivered,
+        (true, false) => AfterRestore::Delete,
+        (true, true) => AfterRestore::KeepForNextSignIn,
+    }
+}
+
 /// UNCONDITIONAL restore (watchdog, CLI `--restore`): reads the state from the file (default
 /// `ABS_ALWAYSONTOP`, NEVER autohide), `ABM_SETSTATE`, for each taskbar `RemovePropW` +
 /// `ShowWindowAsync(SW_SHOWNA)` + `SetWindowPos(HWND_TOPMOST, ... ASYNCWINDOWPOS)`, then
-/// deletes the state file and then `SendNotifyMessageW(HWND_BROADCAST, TaskbarCreated)`. Without a file and
+/// deletes the state file (kept at a session end: `after_restore`) and then
+/// `SendNotifyMessageW(HWND_BROADCAST, TaskbarCreated)`. Without a file and
 /// without the `DockHidden` mark it does nothing; without `Shell_TrayWnd` it keeps the file and does nothing.
 /// Callable from any thread and from a process other than the dock.
 pub fn restore_force() {
@@ -1197,19 +1386,29 @@ pub fn restore_force() {
     // the file gone (`restored_externally`) and does not hide the taskbar again. If however ABM_SETSTATE
     // did not reach Explorer (session shutting down, hung) the file stays: the autohide set by
     // us has already been persisted by Explorer and without a file the next run would save it as "original".
-    // This way the watchdog, the next run's self-heal or `--restore` complete the restore.
+    // This way the watchdog, the next run's self-heal or `--restore` complete the restore. At a session end the file
+    // is kept too: the next sign-in's `init` reads it as the original.
     if delivered && legacy.is_some() {
         mark_legacy_consumed();
     }
-    if !delivered {
-        log!("taskbar: ABM_SETSTATE not delivered, state file kept");
-    } else if let Some(p) = state_file_path() {
-        // Deletes the name itself (never a link target), inside the admin-only data folder.
-        if let Err(e) = std::fs::remove_file(p) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log!("taskbar: removing state file failed: {e}");
+    match after_restore(delivered, session_ending()) {
+        AfterRestore::KeepUndelivered => log!("taskbar: ABM_SETSTATE not delivered, state file kept"),
+        AfterRestore::KeepForNextSignIn => log!("taskbar: session ending, state file kept for the next sign-in"),
+        AfterRestore::Delete => {
+            if let Some(p) = state_file_path() {
+                // Deletes the name itself (never a link target), inside the admin-only data folder.
+                if let Err(e) = std::fs::remove_file(p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log!("taskbar: removing state file failed: {e}");
+                    }
+                }
             }
         }
+    }
+    // Explorer keeps a restored "not auto-hide" only until its next start: its saved setting is set back as well, also
+    // when the file is kept for the next sign-in. After the shows above, so the registry I/O comes last.
+    if wants_registry_fix(delivered, state, saved.or(legacy).is_some()) {
+        persist_not_autohide(first);
     }
     broadcast_taskbar_created();
     log!("taskbar: restored (state {state})");
@@ -1223,6 +1422,187 @@ pub fn restore_force_waiting(max: Duration) {
         std::thread::sleep(Duration::from_millis(200));
     }
     restore_force();
+}
+
+// ------------------------------------------------- Explorer's saved setting (StuckRects3)
+
+/// Explorer's saved taskbar setting, value "Settings", under `HKEY_USERS\<sid>`: Explorer saves ABM_SETSTATE's
+/// auto-hide there and never a restored "not auto-hide", so after a restore its next start (an Explorer restart, the
+/// next sign-in, a session without the dock) would come up auto-hide.
+const STUCKRECTS3: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3";
+/// Bit of byte 8 of the "Settings" blob that holds auto-hide.
+const STUCKRECTS_AUTOHIDE: u8 = 0x01;
+
+/// What `saved_autohide_off` found in the "Settings" blob.
+#[derive(Debug, PartialEq, Eq)]
+enum SavedAutohide {
+    /// Auto-hide saved: the blob with only that bit cleared, to write back.
+    Clear(Vec<u8>),
+    /// Already saved without auto-hide: nothing to write.
+    AlreadyOff,
+    /// Not the layout known (the blob starts with its own length as a u32, and has at least 12 bytes): left alone.
+    Unknown,
+}
+
+/// The "Settings" blob with the auto-hide bit of byte 8 cleared. Pure, never panics.
+fn saved_autohide_off(blob: &[u8]) -> SavedAutohide {
+    let size = blob.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes);
+    if blob.len() < 12 || size != u32::try_from(blob.len()).ok() {
+        return SavedAutohide::Unknown;
+    }
+    let mut out = blob.to_vec();
+    match out.get_mut(8) {
+        Some(b) if *b & STUCKRECTS_AUTOHIDE != 0 => {
+            *b &= !STUCKRECTS_AUTOHIDE;
+            SavedAutohide::Clear(out)
+        }
+        Some(_) => SavedAutohide::AlreadyOff,
+        None => SavedAutohide::Unknown,
+    }
+}
+
+/// Whether `restore_force` sets Explorer's saved setting back: only after a delivered restore to a state without
+/// auto-hide that came from the state file (or the legacy one). The `ABS_ALWAYSONTOP` default of a restore without a
+/// file is a guess, and writing it would overwrite an auto-hide the user saved. Pure.
+fn wants_registry_fix(delivered: bool, state: u32, from_file: bool) -> bool {
+    delivered && from_file && state & ABS_AUTOHIDE == 0
+}
+
+/// `<sid>\...\StuckRects3`, the key under `HKEY_USERS`. Pure.
+fn stuckrects_subkey(sid: &str) -> String {
+    format!(r"{sid}\{STUCKRECTS3}")
+}
+
+/// The SID of the user whose process owns window `h` (Explorer's taskbar): the token user, so under Administrator
+/// protection it names the person at the keyboard, not the account the elevated dock runs as. The sequence of
+/// `shell_thread::shell_user_sid`, from a given window.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn window_user_sid(h: HWND) -> Result<String, String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale window only yields 0.
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    if pid == 0 {
+        return Err("no taskbar process".into());
+    }
+    // SAFETY: a query-only open of that pid; the handle is owned (and closed) by `_process`.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|e| format!("OpenProcess: {e}"))?;
+    // SAFETY: fresh valid handle, owned from here on.
+    let _process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is valid; `token` is writable.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.map_err(|e| format!("OpenProcessToken: {e}"))?;
+    // SAFETY: fresh valid token handle, owned from here on.
+    let _token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut len = 0u32;
+    // SAFETY: size query; `len` is writable. The expected "buffer too small" error is ignored.
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
+    if (len as usize) < std::mem::size_of::<TOKEN_USER>() {
+        return Err("TokenUser: no size".into());
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `len` writable, pointer-aligned bytes.
+    unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) }
+        .map_err(|e| format!("TokenUser: {e}"))?;
+    // SAFETY: the buffer starts with a TOKEN_USER whose SID points inside `buf`, alive until the end.
+    let tu = unsafe { std::ptr::read(buf.as_ptr().cast::<TOKEN_USER>()) };
+    let mut s = PWSTR::null();
+    // SAFETY: `tu.User.Sid` points to a valid SID inside `buf`; `s` receives a LocalAlloc'd string.
+    unsafe { ConvertSidToStringSidW(tu.User.Sid, &mut s) }.map_err(|e| format!("ConvertSidToStringSidW: {e}"))?;
+    // SAFETY: `s` is the NUL-terminated string returned above.
+    let out = unsafe { s.to_string() };
+    // SAFETY: allocated by ConvertSidToStringSidW with LocalAlloc; not used afterwards.
+    unsafe { LocalFree(Some(HLOCAL(s.0.cast()))) };
+    drop(buf);
+    out.map_err(|e| format!("SID string: {e}"))
+}
+
+/// Sets Explorer's saved setting back to "not auto-hide" (`restore_force`, after a delivered restore from the state
+/// file): StuckRects3 "Settings" of the user who owns `first`, opened under `HKEY_USERS` (never `HKEY_CURRENT_USER`,
+/// never created), with only the auto-hide bit cleared. Writes nothing on any failure or an unknown layout. Any thread
+/// and process.
+fn persist_not_autohide(first: HWND) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_USERS, KEY_QUERY_VALUE, KEY_SET_VALUE,
+    };
+
+    let sid = match window_user_sid(first) {
+        Ok(s) => s,
+        Err(e) => {
+            log!("taskbar: StuckRects3 not updated: {e}");
+            return;
+        }
+    };
+    let mut key = HKEY::default();
+    // SAFETY: the subkey is a NUL-terminated HSTRING for the call; `key` is a writable HKEY.
+    let r = unsafe {
+        RegOpenKeyExW(
+            HKEY_USERS,
+            &HSTRING::from(stuckrects_subkey(&sid)),
+            None,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut key,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        log!("taskbar: StuckRects3 not updated: opening the key: {}", windows::core::Error::from(r.to_hresult()));
+        return;
+    }
+    let outcome = rewrite_saved_autohide(key);
+    // SAFETY: `key` was opened above and is closed once, on every path.
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    match outcome {
+        Ok(Some(line)) => log!("{line}"),
+        Ok(None) => {}
+        Err(e) => log!("taskbar: StuckRects3 not updated: {e}"),
+    }
+}
+
+/// Reads "Settings" from the open StuckRects3 `key` and writes it back without auto-hide. `Ok(Some(line))` is the
+/// line to log, `Ok(None)` nothing to do (already off), `Err` a failed read or write.
+fn rewrite_saved_autohide(key: windows::Win32::System::Registry::HKEY) -> Result<Option<String>, String> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegQueryValueExW, RegSetValueExW, REG_BINARY, REG_VALUE_TYPE};
+
+    let mut buf = [0u8; 256];
+    let mut len = buf.len() as u32;
+    let mut kind = REG_VALUE_TYPE::default();
+    // SAFETY: `key` is open with KEY_QUERY_VALUE; `buf` holds `len` writable bytes; `kind` and `len` are writable.
+    let r =
+        unsafe { RegQueryValueExW(key, w!("Settings"), None, Some(&mut kind), Some(buf.as_mut_ptr()), Some(&mut len)) };
+    if r != ERROR_SUCCESS {
+        return Err(format!("reading Settings: {}", windows::core::Error::from(r.to_hresult())));
+    }
+    let blob = buf.get(..len as usize).unwrap_or_default();
+    let unexpected =
+        || Ok(Some(format!("taskbar: StuckRects3 has an unexpected layout ({} bytes), left alone", blob.len())));
+    if kind != REG_BINARY {
+        return unexpected();
+    }
+    match saved_autohide_off(blob) {
+        SavedAutohide::AlreadyOff => Ok(None),
+        SavedAutohide::Unknown => unexpected(),
+        SavedAutohide::Clear(data) => {
+            // SAFETY: `key` is open with KEY_SET_VALUE; the name is a static NUL-terminated literal and `data` lives
+            // for the call.
+            let r = unsafe { RegSetValueExW(key, w!("Settings"), None, REG_BINARY, Some(&data)) };
+            if r != ERROR_SUCCESS {
+                return Err(format!("writing Settings: {}", windows::core::Error::from(r.to_hresult())));
+            }
+            Ok(Some("taskbar: Explorer's saved setting set back to not auto-hide (StuckRects3)".into()))
+        }
+    }
 }
 
 // ------------------------------------------------------- tray host
@@ -1361,6 +1741,122 @@ pub fn run_restore_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wsA A6: a delivered restore deletes the state file, except at a session end, which keeps it for the next
+    /// sign-in's `init` (Explorer may save its own setting before the restore); an undelivered one always keeps it.
+    #[test]
+    fn a_session_end_keeps_the_state_for_the_next_sign_in() {
+        use AfterRestore::*;
+        assert_eq!(after_restore(true, false), Delete);
+        assert_eq!(after_restore(true, true), KeepForNextSignIn);
+        assert_eq!(after_restore(false, false), KeepUndelivered);
+        assert_eq!(after_restore(false, true), KeepUndelivered);
+    }
+
+    /// wsA A6: after the session end's restore (file kept) a later `restore()` of the same process (WM_DESTROY, the
+    /// cleanup, the end of `main`) runs only if this process hid the taskbar again; outside a session end, as before.
+    #[test]
+    fn a_restore_after_the_session_end_restore_does_nothing() {
+        //                     hidden left   session end
+        assert!(restore_needed(true, false, false));
+        assert!(restore_needed(true, true, false));
+        assert!(restore_needed(false, true, false), "a state file or a legacy state left: restored, as before");
+        assert!(!restore_needed(false, false, false), "nothing hidden, nothing left: as before");
+        assert!(restore_needed(true, false, true), "the session end's own restore");
+        assert!(restore_needed(true, true, true));
+        assert!(!restore_needed(false, true, true), "the file kept for the next sign-in stays");
+        assert!(!restore_needed(false, false, true));
+    }
+
+    /// wsD D2: Explorer's saved StuckRects3 blob with the auto-hide bit (byte 8, 0x01) cleared and nothing else; a blob
+    /// of another layout (its first u32 is not its length, or under 12 bytes) is never touched.
+    #[test]
+    fn stuckrects_autohide_bit_cleared() {
+        use SavedAutohide::*;
+        let p1: [u8; 48] = [
+            0x30, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x90, 0x00,
+            0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x34, 0x08, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00,
+            0x70, 0x08, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        ];
+        let mut want = p1;
+        want[8] = 0x02;
+        assert_eq!(saved_autohide_off(&p1), Clear(want.to_vec()), "only byte 8 changes, 0x03 to 0x02");
+        assert_eq!(saved_autohide_off(&want), AlreadyOff);
+        let mut one = p1;
+        one[8] = 0x01;
+        let mut zero = p1;
+        zero[8] = 0x00;
+        assert_eq!(saved_autohide_off(&one), Clear(zero.to_vec()));
+        assert_eq!(saved_autohide_off(&p1[..47]), Unknown, "47 bytes whose first u32 says 48");
+        let mut other = p1;
+        other[0] = 0x2C;
+        assert_eq!(saved_autohide_off(&other), Unknown, "first u32 differs from the length");
+        assert_eq!(saved_autohide_off(&[0x0B, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0]), Unknown, "11 bytes");
+        assert_eq!(saved_autohide_off(&[]), Unknown);
+    }
+
+    /// wsD D2: the saved setting is set back only after a delivered restore to a state without auto-hide that came
+    /// from the state file (or the legacy one), never from the ALWAYSONTOP default of a restore without a file.
+    #[test]
+    fn registry_fix_only_after_a_delivered_not_autohide_restore_from_the_file() {
+        assert!(wants_registry_fix(true, 0, true));
+        assert!(wants_registry_fix(true, 2, true));
+        for (delivered, state, from_file) in
+            [(true, 1, true), (true, 3, true), (false, 0, true), (false, 2, true), (true, 2, false), (true, 0, false)]
+        {
+            assert!(!wants_registry_fix(delivered, state, from_file), "({delivered}, {state}, {from_file})");
+        }
+    }
+
+    /// wsD D2: StuckRects3 is opened under HKEY_USERS by the SID of Explorer's user, never under HKEY_CURRENT_USER.
+    #[test]
+    fn stuckrects_subkey_is_under_the_sid() {
+        assert_eq!(
+            stuckrects_subkey("S-1-5-21-1-2-3-1001"),
+            r"S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3"
+        );
+    }
+
+    /// r151 N1: of the restores from outside, only the watchdog's hang restore is undone: not exiting, no stop request
+    /// (--restore, --install, --uninstall), hiding still wanted and the watchdog process still running. All 16 rows.
+    #[test]
+    fn only_the_watchdogs_restore_is_undone() {
+        let mut undone = 0;
+        for row in 0u8..16 {
+            let (exiting, stop, wanted, alive) = (row & 8 != 0, row & 4 != 0, row & 2 != 0, row & 1 != 0);
+            let got = after_outside_restore(exiting, stop, wanted, alive);
+            if (exiting, stop, wanted, alive) == (false, false, true, true) {
+                assert_eq!(got, Outside::HideAgain);
+                undone += 1;
+            } else {
+                assert_eq!(
+                    got,
+                    Outside::StopHiding,
+                    "exiting {exiting}, stop {stop}, wanted {wanted}, watchdog {alive}"
+                );
+            }
+        }
+        assert_eq!(undone, 1, "one row of 16");
+        assert_eq!(after_outside_restore(false, false, true, false), Outside::StopHiding, "no watchdog: never again");
+    }
+
+    /// r151 N1: the re-hide hides only with a state Explorer answered; an unanswered read is never saved as the
+    /// original and is tried again at the next safety check, its line logged only for the first one after a restore.
+    #[test]
+    fn an_unanswered_read_is_tried_again() {
+        assert_eq!(after_rehide_read(Some(ABS_AUTOHIDE), false), Reread::Hide(ABS_AUTOHIDE));
+        assert_eq!(after_rehide_read(Some(0), true), Reread::Hide(0), "a 0 Explorer answered is the user's");
+        assert_eq!(after_rehide_read(None, false), Reread::Retry { first: true });
+        assert_eq!(after_rehide_read(None, true), Reread::Retry { first: false }, "not logged every 3 s");
+    }
+
+    /// wsC Q7: the safety check's line is logged for the first 20 hits of a process, not every 3 s.
+    #[test]
+    fn the_safety_line_is_capped() {
+        assert!(safety_logs(0));
+        assert!(safety_logs(19));
+        assert!(!safety_logs(20));
+    }
 
     /// Only a timed-out direct send on the UI thread skips SHAppBarMessage (review of 7232226: its forward through the
     /// dock's tray host restarts its 3 s at each icon apps send the host); a refused send and other threads keep it.

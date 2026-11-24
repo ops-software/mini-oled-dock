@@ -116,7 +116,7 @@ fn schema_is_valid() {
         };
         let wh = one_of("where", &["CI", "VM", "OWNER"]);
         let st = one_of("status", &["active", "pending"]);
-        one_of("unit", &["bytes", "count", "ms", "us", "ctxsw_per_s", "percent_core"]);
+        one_of("unit", &["bytes", "count", "ms", "us", "ctxsw_per_s", "wakes_per_s", "percent_core"]);
         let gate = one_of("gate", &["max", "ledger", "file", "baseline_plus_15pct"]);
         if gate == "max" {
             assert!(r["value"].is_number(), "{id}: a max row needs a numeric value");
@@ -207,6 +207,12 @@ fn g7_values_are_pinned() {
     assert_eq!(value("wakeups.dock_hidden"), 0.25);
     assert_eq!(value("wakeups.kit_static"), 0.0);
     assert_eq!(value("timers.dock_hidden"), 0.0);
+    assert_eq!(value("wakes.ui_dock_hidden"), 0.40);
+    assert_eq!(value("ctxsw.ui_hidden"), 12.0);
+    assert_eq!(value("ctxsw.process_hidden"), 20.0);
+    assert_eq!(value("cpu.process_hidden_60s"), 30.0);
+    assert_eq!(value("ctxsw.watchdog_hidden"), 0.4);
+    assert_eq!(value("timers.ui_hidden_periodic"), 1.0);
     assert_eq!(value("frame.table_hover"), 0.5);
     assert_eq!(value("frame.table_text_40x4"), 1.5);
     assert_eq!(value("frame.scroll_strip"), 2.0);
@@ -233,6 +239,12 @@ fn every_g7_budget_has_a_row() {
         "private.dock_hidden",
         "wakeups.dock_hidden",
         "timers.dock_hidden",
+        "wakes.ui_dock_hidden",
+        "ctxsw.ui_hidden",
+        "ctxsw.process_hidden",
+        "cpu.process_hidden_60s",
+        "ctxsw.watchdog_hidden",
+        "timers.ui_hidden_periodic",
         "wakeups.kit_static",
         "private.kit_empty",
         "private.tasks_640x560",

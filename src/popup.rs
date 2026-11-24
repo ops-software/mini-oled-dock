@@ -60,6 +60,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub(crate) mod popup_app;
 #[path = "popup_launcher.rs"]
 pub(crate) mod popup_launcher;
+#[path = "popup_scroll.rs"]
+pub(crate) mod popup_scroll;
 #[path = "popup_start.rs"]
 pub(crate) mod popup_start;
 #[path = "popup_startmenu.rs"]
@@ -286,6 +288,11 @@ pub(crate) trait Content {
     /// Largest size (physical px) the popup may take: the work area minus the margins. Contents with a
     /// long list lay themselves out inside it; the others are only clipped by `fit_to_work`.
     fn limit(&mut self, _max: (i32, i32)) {}
+    /// true: the content scrolls inside the room above or below the bar (`limit_for`) instead of being clipped
+    /// by the work area.
+    fn scroll_cap(&self) -> bool {
+        false
+    }
     /// Draws everything (panel included).
     fn paint(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>);
     /// Control under the point.
@@ -342,6 +349,10 @@ pub(crate) trait Content {
     }
     /// The pointer moved to `(x, y)` (client px); called before the hit test.
     fn pointer(&mut self, _x: i32, _y: i32) -> Reply {
+        Reply::None
+    }
+    /// The pointer left the popup window.
+    fn leave(&mut self) -> Reply {
         Reply::None
     }
     /// true: the popup closes when the foreground retries end without the keyboard (the launcher: what the user types
@@ -871,6 +882,7 @@ fn remove_mouse_hook() {
 unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let m = wp.0 as u32;
+        probe!(crate::probe::mouse(m));
         if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN {
             // SAFETY: for HC_ACTION in a WH_MOUSE_LL hook, lparam points to an MSLLHOOKSTRUCT valid
             // for the duration of the callback.
@@ -880,6 +892,7 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
                 let hwnd = STATE
                     .with(|s| s.try_borrow().map(|g| g.open.as_ref().map_or(g.hwnd, |o| o.hwnd)).unwrap_or_default());
                 if !hwnd.0.is_null() {
+                    probe!(crate::probe::post_by(crate::probe::Th::Ui, crate::probe::BY_MOUSE_HOOK, WM_POPUP_OUTSIDE));
                     // SAFETY: posting to our own window; failure is harmless.
                     let _ = unsafe { PostMessageW(Some(hwnd), WM_POPUP_OUTSIDE, WPARAM(0), LPARAM(0)) };
                 }
@@ -1033,10 +1046,27 @@ pub(crate) fn fit_to_work(w: i32, h: i32, work: &RECT, margin: i32) -> (i32, i32
     (w.min(work.right - work.left - 2 * margin).max(1), h.min(work.bottom - work.top - 2 * margin).max(1))
 }
 
-/// Largest popup size for the monitor of `a`.
-pub(crate) fn max_size(a: &Anchor) -> (i32, i32) {
-    let margin = Metrics { dpi: a.dpi }.px(POPUP_SCREEN_MARGIN);
-    fit_to_work(i32::MAX, i32::MAX, &work_area(&a.bar), margin)
+/// Gap (logical px) a scrolling popup keeps from the screen edge on the side away from the bar.
+const POPUP_MAX_MARGIN: i32 = 16;
+
+/// Largest size of a scrolling popup: the work width minus two margins, and the height between the bar (plus
+/// `POPUP_GAP`) and the far margin. `compute_pos` clamps to the same margins, so a popup of this size never
+/// reaches over the bar.
+pub(crate) fn max_popup_size(work: &RECT, bar: &RECT, top: bool, dpi: u32) -> (i32, i32) {
+    let m = Metrics { dpi };
+    let (margin, gap) = (m.px(POPUP_MAX_MARGIN), m.px(POPUP_GAP));
+    let h = if top { work.bottom - margin - (bar.bottom + gap) } else { (bar.top - gap) - (work.top + margin) };
+    ((work.right - work.left - 2 * margin).max(1), h.max(1))
+}
+
+/// The limit `render` hands to a content anchored to a bar: a scrolling content gets `max_popup_size`, every
+/// other one the old work-area bound.
+pub(crate) fn limit_for(scroll_cap: bool, work: &RECT, bar: &RECT, top: bool, dpi: u32) -> (i32, i32) {
+    if scroll_cap {
+        max_popup_size(work, bar, top, dpi)
+    } else {
+        fit_to_work(i32::MAX, i32::MAX, work, Metrics { dpi }.px(POPUP_SCREEN_MARGIN))
+    }
 }
 
 /// Top-left corner position of a `w` x `h` popup (also used by the window picker).
@@ -1268,7 +1298,14 @@ fn render(relayout: bool) -> bool {
                     (w, h, Some((x, y)))
                 }
                 None => {
-                    o.content.limit(max_size(&o.anchor));
+                    let work = work_area(&o.anchor.bar);
+                    o.content.limit(limit_for(
+                        o.content.scroll_cap(),
+                        &work,
+                        &o.anchor.bar,
+                        o.anchor.top,
+                        o.anchor.dpi,
+                    ));
                     let (w, h) = o.content.size(&surf);
                     let margin = Metrics { dpi: o.anchor.dpi }.px(POPUP_SCREEN_MARGIN);
                     let (w, h) = fit_to_work(w, h, &work_area(&o.anchor.bar), margin);
@@ -1673,11 +1710,12 @@ fn on_mouse_leave() {
     let changed = with(|st| {
         let o = st.open.as_mut()?;
         o.tracking = false;
+        let left = o.content.leave();
         if o.pressed.is_none() && o.hot.is_some() {
             o.hot = None;
             return Some(true);
         }
-        Some(false)
+        Some(matches!(left, Reply::Redraw | Reply::Relayout))
     })
     .flatten();
     if changed == Some(true) {
@@ -2144,6 +2182,29 @@ mod tests {
     use super::*;
     use crate::msg::{TIMER_LAUNCHER_PT, TIMER_LAUNCHER_SAVE, TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM};
     use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
+
+    #[test]
+    fn max_popup_size_leaves_the_bar_and_two_margins() {
+        let work = RECT { left: 0, top: 0, right: 1366, bottom: 768 };
+        let top_bar = RECT { left: 0, top: 10, right: 1366, bottom: 60 };
+        let bottom_bar = RECT { left: 0, top: 708, right: 1366, bottom: 758 };
+        for (dpi, want) in [(96, (1334, 686)), (144, (1318, 675)), (192, (1302, 664))] {
+            assert_eq!(max_popup_size(&work, &top_bar, true, dpi), want, "top bar at {dpi}");
+            assert_eq!(max_popup_size(&work, &bottom_bar, false, dpi), want, "bottom bar at {dpi}");
+        }
+        let work = RECT { left: 948, top: 2160, right: 2868, bottom: 2880 };
+        let bar = RECT { left: 948, top: 2170, right: 2868, bottom: 2220 };
+        assert_eq!(max_popup_size(&work, &bar, true, 96), (1888, 638));
+    }
+
+    #[test]
+    fn limit_for_keeps_the_old_margin_for_other_popups() {
+        let work = RECT { left: 0, top: 0, right: 1366, bottom: 768 };
+        let bar = RECT { left: 0, top: 10, right: 1366, bottom: 60 };
+        assert_eq!(limit_for(false, &work, &bar, true, 96), (1366 - 16, 768 - 16));
+        assert_eq!(limit_for(false, &work, &bar, true, 144), (1366 - 24, 768 - 24));
+        assert_eq!(limit_for(true, &work, &bar, true, 96), (1334, 686));
+    }
 
     #[test]
     fn popup_is_clamped_to_the_work_area() {

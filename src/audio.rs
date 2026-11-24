@@ -496,6 +496,7 @@ fn read_spatial(winrt_id: &str) -> Option<SpatialState> {
 /// `WM_SHELL_SPATIAL_CHANGED` to the shell thread and exits.
 pub fn spawn_set_spatial(winrt_id: String, subtype: String) {
     let r = std::thread::Builder::new().name("spatial-set".into()).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         // SAFETY: COM for this short-lived thread, paired with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let res = (|| -> WinResult<SetDefaultSpatialAudioFormatStatus> {
@@ -726,6 +727,7 @@ struct VolumeWatch {
 
 impl IAudioEndpointVolumeCallback_Impl for VolumeWatch_Impl {
     fn OnNotify(&self, pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> WinResult<()> {
+        probe!(crate::probe::bump(crate::probe::C::AudioVolume));
         // SAFETY: WASAPI passes a pointer valid for the duration of the callback (or null,
         // handled by `as_ref`); only scalar fields are read.
         if let Some(d) = unsafe { pnotify.as_ref() } {
@@ -742,6 +744,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeWatch_Impl {
 struct DeviceWatch;
 
 fn wake_shell() {
+    probe!(crate::probe::bump(crate::probe::C::AudioDevice));
     let tid = crate::shell_thread::thread_id();
     if tid != 0 {
         // SAFETY: PostThreadMessageW is thread-safe; it only fails if the thread no longer exists.
@@ -769,6 +772,7 @@ impl IMMNotificationClient_Impl for DeviceWatch_Impl {
         Ok(())
     }
     fn OnPropertyValueChanged(&self, _id: &PCWSTR, _key: &PROPERTYKEY) -> WinResult<()> {
+        probe!(crate::probe::bump(crate::probe::C::AudioDevice));
         Ok(())
     }
 }

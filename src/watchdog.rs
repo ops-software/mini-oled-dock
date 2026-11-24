@@ -3,19 +3,23 @@
 //!
 //! PROTOCOL
 //!  * Heartbeat event: name `Local\DockHeartbeat-<pid>` (auto-reset), created by the dock with
-//!    `CreateEventW`; the dock signals it every 1 s (`TIMER_SECOND` -> `heartbeat()`).
+//!    `CreateEventW`; the dock signals it at most once a second while it handles messages (`beat_if_due`, at the
+//!    start of each message), and every 3 s when idle (`TIMER_SECOND`, `HEARTBEAT_MS`).
 //!  * The watchdog opens the dock process (`SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`) and
-//!    the event, then waits (`WaitForMultipleObjects`) on the process and the event with a ~1.1 s timeout.
-//!    If 6 consecutive heartbeats are missed it runs `taskbar::restore_force()` but stays alive as long as
-//!    the dock lives (a stuck dock can recover; the dock itself stops hiding the taskbar
-//!    if it finds the state file deleted). If the process ends with exit code != 0 (including
-//!    abort/crash) it restores and exits; with code 0 it exits doing nothing (the dock has already
-//!    restored). It does NOT relaunch the dock. Before restoring it waits up to 30 s for a
+//!    the event, then waits (`WaitForMultipleObjects`) on the process and the event with a 3.3 s timeout
+//!    (sized for the 3 s keepalive; while the dock handles messages each wait returns at a beat). 2 timeouts
+//!    in a row (6.6 s without a beat) are a hang; before the first beat, 10 (33 s). On a hang it runs
+//!    `taskbar::restore_force()` but stays alive as long as the dock lives (a stuck dock can recover: the dock hides
+//!    the taskbar again once it handles messages again, unless a stop was requested (`--restore`, `--install`,
+//!    `--uninstall`), see `stop_requested` and `alive`). If the process ends with
+//!    exit code != 0 (including abort/crash) it restores and exits; with code 0 it exits doing nothing (the
+//!    dock has already restored). It does NOT relaunch the dock. Before restoring it waits up to 30 s for a
 //!    `Shell_TrayWnd` (Explorer restarting).
 //!  * Startup heartbeat event: `Local\DockHeartbeat-<pid>-startup` (auto-reset), signaled by
 //!    `taskbar::init` while waiting for `Shell_TrayWnd`: it resets the count but does NOT move the
-//!    watchdog from the startup tolerance (30) to the steady-state one (6), which starts at the first
-//!    real heartbeat from `TIMER_SECOND`.
+//!    watchdog from the startup tolerance (10) to the steady-state one (2), which starts at the first
+//!    real heartbeat (`heartbeat`): the dock beats only once its message loop runs, so window creation and
+//!    setup keep the startup tolerance.
 //!  * Single instance: named mutex `Local\DockInstance`, taken by `main` right after parsing the
 //!    arguments, before the data folder (`datadir::init`), the logger and anything else. The watchdog,
 //!    `--restore` and `--install` never take it; `--restore` polls it (`instance_running`) to wait
@@ -24,20 +28,22 @@
 //!    `stop-watch` thread waits on it and, if it fires, posts `WM_DOCK_QUIT_REQUEST` to the window.
 //!    `--restore` signals it with `signal_stop_to_instance()`.
 //!
-//! THREADING: `spawn`, `heartbeat`, `start_stop_watcher`, `shutdown` from the main/UI thread;
+//! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `shutdown`, `end_for_session_end` from the
+//! main/UI thread;
 //! `run_watchdog` is the main of the watchdog process (no window, no hook, no COM).
 
 use std::ffi::c_void;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_ACCESSDENIED, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenEventW, OpenMutexW,
     OpenProcess, ProcessMemoryPriority, ResetEvent, SetEvent, SetProcessInformation, TerminateProcess,
@@ -50,8 +56,9 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use crate::log;
 use crate::msg::WM_DOCK_QUIT_REQUEST;
 
-/// Number of consecutive missed heartbeats after which the watchdog restores.
-pub const MAX_MISSED_HEARTBEATS: u32 = 6;
+/// Number of consecutive wait timeouts (`WAIT_MS` each) without a heartbeat after which the watchdog
+/// restores: 6.6 s of silence.
+pub const MAX_MISSED_HEARTBEATS: u32 = 2;
 /// Name of the stop event (manual-reset) shared by the dock and `--restore`.
 pub const STOP_EVENT_NAME: &str = "Local\\DockStop";
 /// Name of the dock's single-instance mutex.
@@ -59,11 +66,16 @@ const INSTANCE_MUTEX_NAME: &str = "Local\\DockInstance";
 /// Maximum wait for `Shell_TrayWnd` before a restore by the watchdog.
 pub(crate) const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Timeout of each watchdog wait (slightly above the heartbeat period).
-const WAIT_MS: u32 = 1100;
+/// Timeout of each watchdog wait: 10 % above the longest heartbeat period it is sized for (3 s).
+const WAIT_MS: u32 = 3300;
+/// Period (ms) of `TIMER_SECOND`: the keepalive heartbeat of an idle dock (and the taskbar safety check).
+pub const HEARTBEAT_MS: u32 = 3000;
+/// While the dock handles messages it beats at the start of a message when the last beat is at least this old (ms),
+/// so a stall always begins at most 1 s after a beat: 5.6 s of it are tolerated, as with the old 1 s timer.
+pub(crate) const BEAT_MIN_GAP_MS: u64 = 1000;
 /// Before the FIRST heartbeat the dock may still be starting (waiting for Shell_TrayWnd, ...):
-/// a much wider tolerance (~33 s).
-const MAX_MISSED_BEFORE_FIRST: u32 = 30;
+/// a much wider tolerance (10 timeouts, 33 s).
+const MAX_MISSED_BEFORE_FIRST: u32 = 10;
 /// SYNCHRONIZE access right (waiting on kernel objects).
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
@@ -72,6 +84,11 @@ static HEARTBEAT_EVENT: AtomicIsize = AtomicIsize::new(0);
 static STARTUP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static STOP_EVENT: AtomicIsize = AtomicIsize::new(0);
 static SHUTDOWN_EVENT: AtomicIsize = AtomicIsize::new(0);
+/// The watchdog process (`launch_watchdog`), kept so the dock can end it at a session end (`end_for_session_end`);
+/// closing it does not end the watchdog, which still sees exit code 0 at a normal exit.
+static WATCHDOG_PROCESS: AtomicIsize = AtomicIsize::new(0);
+/// `GetTickCount64` of the last heartbeat signalled (0 = none yet). UI thread.
+static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Name of the heartbeat event for the dock with `pid`: `Local\DockHeartbeat-<pid>`.
 pub fn heartbeat_event_name(pid: u32) -> String {
@@ -111,7 +128,7 @@ fn to_handle(raw: isize) -> HANDLE {
 fn close_slot(slot: &AtomicIsize) {
     let raw = slot.swap(0, Relaxed);
     if raw != 0 {
-        // SAFETY: handle created by CreateEventW in this process; the swap guarantees a single close.
+        // SAFETY: handle opened in this process (CreateEventW, CreateProcessW); the swap guarantees a single close.
         let _ = unsafe { CloseHandle(to_handle(raw)) };
     }
 }
@@ -177,6 +194,7 @@ pub fn spawn() -> Result<(), String> {
         close_slot(&STARTUP_EVENT);
         close_slot(&STOP_EVENT);
         close_slot(&SHUTDOWN_EVENT);
+        close_slot(&WATCHDOG_PROCESS);
         return Err(e);
     }
     log!("watchdog: started (event {ev_name})");
@@ -186,8 +204,10 @@ pub fn spawn() -> Result<(), String> {
 /// `CreateProcessW` of `current_exe --watchdog <pid> <event>`, with a fallback without breakaway.
 fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    // The process handle is not needed by the dock: dropping it closes it.
-    spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}")).map(drop)
+    // The process handle is kept for `end_for_session_end`; `shutdown` closes it.
+    let process = spawn_breakaway(&exe, &format!("--watchdog {pid} {ev_name}"))?;
+    WATCHDOG_PROCESS.store(process.into_raw_handle() as isize, Relaxed);
+    Ok(())
 }
 
 /// `CreateProcessW` of `"<exe>" <args>` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW`, falling
@@ -200,6 +220,7 @@ pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<Owned
     let app = HSTRING::from(exe_str.as_str());
 
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut breakaway_denied = false;
     for (flags, label) in
         [(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, "breakaway"), (CREATE_NO_WINDOW, "without breakaway")]
     {
@@ -230,10 +251,17 @@ pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<Owned
                     let _ = CloseHandle(pi.hThread);
                     OwnedHandle::from_raw_handle(pi.hProcess.0)
                 };
+                if breakaway_denied {
+                    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    log!("spawn: {name} started inside this process's job (breakaway not allowed)");
+                }
                 return Ok(process);
             }
             Err(e) => {
-                log!("spawn: CreateProcessW of {exe_str} ({label}) failed: {e}");
+                match attempt_note(label, &e, &exe_str) {
+                    Some(note) => log!("{note}"),
+                    None => breakaway_denied = true,
+                }
                 if flags == CREATE_NO_WINDOW {
                     return Err(format!("CreateProcessW: {e}"));
                 }
@@ -243,15 +271,52 @@ pub(crate) fn spawn_breakaway(exe: &std::path::Path, args: &str) -> Result<Owned
     Err("CreateProcessW: no attempt succeeded".into())
 }
 
-/// Signals the heartbeat (`SetEvent`). Does not block; no-op if `spawn` did not succeed.
-/// UI thread, `TIMER_SECOND`.
+/// The log line of a failed `CreateProcessW` attempt. A denied breakaway is the normal case inside the Task
+/// Scheduler job (the plain attempt follows), so it is not an error line: `None`.
+fn attempt_note(label: &str, e: &windows::core::Error, exe: &str) -> Option<String> {
+    if label == "breakaway" && e.code() == E_ACCESSDENIED {
+        return None;
+    }
+    Some(format!("spawn: CreateProcessW of {exe} ({label}) failed: {e}"))
+}
+
+/// Signals the heartbeat (`SetEvent`) and remembers when. Does not block; no-op if `spawn` did not succeed.
+/// UI thread: `beat_if_due` and `TIMER_SECOND`.
 pub fn heartbeat() {
     let raw = HEARTBEAT_EVENT.load(Relaxed);
     if raw == 0 {
         return;
     }
+    // SAFETY: no preconditions.
+    LAST_BEAT_MS.store(unsafe { GetTickCount64() }, Relaxed);
     // SAFETY: handle valid until `shutdown` closes it (same UI thread).
     let _ = unsafe { SetEvent(to_handle(raw)) };
+    probe!(crate::probe::bump(crate::probe::C::Heartbeat));
+}
+
+/// true when a beat is due: the last one is at least `BEAT_MIN_GAP_MS` old (a clock read before it is not).
+fn beat_due(now_ms: u64, last_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) >= BEAT_MIN_GAP_MS
+}
+
+/// The heartbeat at the start of a message (UI thread: `wnd_proc`, the message loop): beats when the last beat is at
+/// least 1 s old. true when it called `heartbeat` (which stays a no-op when `spawn` did not succeed).
+pub fn beat_if_due() -> bool {
+    // SAFETY: no preconditions.
+    let now = unsafe { GetTickCount64() };
+    if beat_due(now, LAST_BEAT_MS.load(Relaxed)) {
+        heartbeat();
+        true
+    } else {
+        false
+    }
+}
+
+/// Age (ms) of the last heartbeat, for the wake probe's stall line.
+#[cfg(feature = "wake-probe")]
+pub fn beat_age_ms() -> u64 {
+    // SAFETY: no preconditions.
+    unsafe { GetTickCount64() }.saturating_sub(LAST_BEAT_MS.load(Relaxed))
 }
 
 /// Startup heartbeat (`taskbar::init`, waiting for `Shell_TrayWnd`): resets the watchdog count
@@ -280,6 +345,7 @@ pub fn start_stop_watcher(ui_hwnd: HWND) -> Option<JoinHandle<()>> {
         let handles = [to_handle(stop), to_handle(quit)];
         // SAFETY: the handles stay open until `shutdown` has joined this thread.
         let r = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+        probe!(crate::probe::bump(crate::probe::C::StopWatch));
         if r == WAIT_OBJECT_0 {
             // SAFETY: PostMessageW is thread-safe; if the window is already gone it merely fails.
             let posted =
@@ -318,6 +384,53 @@ pub fn shutdown(stop_watcher: Option<JoinHandle<()>>) {
     close_slot(&STOP_EVENT);
     close_slot(&HEARTBEAT_EVENT);
     close_slot(&STARTUP_EVENT);
+    close_slot(&WATCHDOG_PROCESS);
+}
+
+/// true when a stop was requested: `--restore`, `--install` and `--uninstall` signal `Local\DockStop` (manual-reset,
+/// so it stays set) before they restore. Also true when it cannot be told (no stop event): the dock then stops hiding
+/// after an outside restore, as before. UI thread (`shutdown` closes the event on it).
+pub fn stop_requested() -> bool {
+    let raw = STOP_EVENT.load(Relaxed);
+    raw == 0 || is_set(to_handle(raw))
+}
+
+/// true only while the watchdog process this dock started runs: false without one (not started, ended for the
+/// session end, closed by `shutdown`) and once it has exited (its wait-failed branch restores and exits). UI thread
+/// (the slot is emptied and closed on it).
+pub(crate) fn alive() -> bool {
+    let raw = WATCHDOG_PROCESS.load(Relaxed);
+    raw != 0 && unsignalled(to_handle(raw))
+}
+
+/// true when `h` (an event, a process) is signalled now; a failed wait reads as false. Never blocks.
+fn is_set(h: HANDLE) -> bool {
+    // SAFETY: a zero-timeout wait; an invalid handle only makes it fail.
+    (unsafe { WaitForSingleObject(h, 0) }) == WAIT_OBJECT_0
+}
+
+/// true when `h` is not signalled now (a process that still runs); a failed wait reads as false. Never blocks.
+fn unsignalled(h: HANDLE) -> bool {
+    // SAFETY: a zero-timeout wait; an invalid handle only makes it fail.
+    (unsafe { WaitForSingleObject(h, 0) }) == WAIT_TIMEOUT
+}
+
+/// Session end (`taskbar::restore_at_session_end`, UI thread): ends the watchdog process before the dock's own
+/// restore, so it cannot restore again after the dock exits and delete the state file kept for the next sign-in.
+/// No-op without a watchdog (never started, or already ended).
+pub(crate) fn end_for_session_end() {
+    let raw = WATCHDOG_PROCESS.swap(0, Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let h = to_handle(raw);
+    // SAFETY: the process handle CreateProcessW returned (full access), owned by the slot until the swap above.
+    match unsafe { TerminateProcess(h, 0) } {
+        Ok(()) => log!("watchdog: ended for the session end (the dock restores and keeps the state file)"),
+        Err(e) => log!("watchdog: ending it for the session end failed: {e}"),
+    }
+    // SAFETY: the same handle, closed once (the slot was emptied by the swap).
+    let _ = unsafe { CloseHandle(h) };
 }
 
 // ------------------------------------------------------ `--restore` side
@@ -462,8 +575,7 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
             missed = 0;
         } else if r == WAIT_TIMEOUT {
             missed += 1;
-            let limit = if seen_beat { MAX_MISSED_HEARTBEATS } else { MAX_MISSED_BEFORE_FIRST };
-            if missed >= limit && !stalled {
+            if restore_due(missed, seen_beat) && !stalled {
                 log!("watchdog: {missed} missed heartbeats, restoring the taskbar (still waiting for the dock)");
                 // Before restoring, the dock tray host must yield to Explorer. If it does not
                 // respond (hung host) the dock must be terminated BEFORE the restore: a hung host
@@ -541,6 +653,12 @@ fn terminate_dock(pid: u32) {
     }
 }
 
+/// true when `missed` consecutive wait timeouts without a heartbeat call for a hang restore: the
+/// steady-state limit once a real heartbeat was seen, the startup limit before it.
+fn restore_due(missed: u32, seen_beat: bool) -> bool {
+    missed >= if seen_beat { MAX_MISSED_HEARTBEATS } else { MAX_MISSED_BEFORE_FIRST }
+}
+
 /// Post-exit decision of `run_watchdog`: restore unless the dock exited cleanly AND left no state file.
 /// `exit_code` is `None` when `GetExitCodeProcess` failed. A clean exit with Explorer absent keeps the file.
 fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
@@ -553,6 +671,92 @@ fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Silence before a hang restore: one wait timeout times the number of timeouts in a row.
+    fn silence_ms(seen_beat: bool) -> u32 {
+        WAIT_MS * if seen_beat { MAX_MISSED_HEARTBEATS } else { MAX_MISSED_BEFORE_FIRST }
+    }
+
+    /// A heartbeat period fits one wait when the wait is at least 10 % longer than the period.
+    fn beat_fits(period_ms: u32, wait_ms: u32) -> bool {
+        u64::from(period_ms) * 11 <= u64::from(wait_ms) * 10
+    }
+
+    #[test]
+    fn hang_silence_is_unchanged() {
+        assert!(!restore_due(1, true));
+        assert!(restore_due(2, true), "2 timeouts in a row after a beat are a hang");
+        assert!(!restore_due(9, false));
+        assert!(restore_due(10, false), "10 timeouts in a row before the first beat are a hang");
+        assert_eq!(silence_ms(true), 6600, "6.6 s without a beat, as with 6 waits of 1.1 s");
+        assert_eq!(silence_ms(false), 33_000, "33 s before the first beat, as with 30 waits of 1.1 s");
+    }
+
+    #[test]
+    fn a_3_s_beat_lands_inside_one_wait() {
+        assert!(beat_fits(3000, WAIT_MS), "the idle keepalive of 3 s");
+        assert!(beat_fits(1000, WAIT_MS), "the 1 s beat of today");
+        assert!(!beat_fits(3100, WAIT_MS));
+    }
+
+    /// The stall a hang restore tolerates when it begins `beat_age_ms` after the last beat.
+    fn stall_tolerance_ms(beat_age_ms: u32) -> u32 {
+        silence_ms(true) - beat_age_ms
+    }
+
+    #[test]
+    fn a_beat_at_most_once_a_second() {
+        assert!(beat_due(1000, 0));
+        assert!(!beat_due(999, 0));
+        assert!(!beat_due(5, 10), "a clock read before the last beat");
+        assert!(beat_due(u64::MAX, 0));
+    }
+
+    #[test]
+    fn the_keepalive_fits_the_wait() {
+        assert!(beat_fits(HEARTBEAT_MS, WAIT_MS), "an idle dock's 3 s keepalive lands inside one 3.3 s wait");
+    }
+
+    #[test]
+    fn the_stall_tolerance_is_unchanged() {
+        let gap = u32::try_from(BEAT_MIN_GAP_MS).unwrap();
+        assert_eq!(stall_tolerance_ms(gap), 5600, "a stall begins at most 1 s after a beat: 5.6 s tolerated, as today");
+    }
+
+    #[test]
+    fn breakaway_denial_is_not_an_error() {
+        use windows::Win32::Foundation::E_FAIL;
+        let denied = windows::core::Error::from(E_ACCESSDENIED);
+        let failed = windows::core::Error::from(E_FAIL);
+        assert_eq!(attempt_note("breakaway", &denied, "x.exe"), None);
+        assert_eq!(
+            attempt_note("breakaway", &failed, "x.exe"),
+            Some(format!("spawn: CreateProcessW of x.exe (breakaway) failed: {failed}"))
+        );
+        assert_eq!(
+            attempt_note("without breakaway", &denied, "x.exe"),
+            Some(format!("spawn: CreateProcessW of x.exe (without breakaway) failed: {denied}"))
+        );
+    }
+
+    /// r151 N1: the stop event (manual-reset) reads as set once signalled and stays set; a handle not signalled (a
+    /// running watchdog process) reads as unsignalled, and a failed wait never does.
+    #[test]
+    fn a_set_manual_reset_event_reads_as_set() {
+        // SAFETY: an unnamed manual-reset event of this test, closed below.
+        let h = unsafe { CreateEventW(None, true, false, None) }.expect("CreateEventW");
+        assert!(!is_set(h));
+        assert!(unsignalled(h));
+        // SAFETY: the event created above.
+        unsafe { SetEvent(h) }.expect("SetEvent");
+        assert!(is_set(h));
+        assert!(is_set(h), "a manual-reset event stays set");
+        assert!(!unsignalled(h));
+        assert!(!unsignalled(HANDLE::default()), "a failed wait never reads as a live watchdog");
+        assert!(!is_set(HANDLE::default()));
+        // SAFETY: the event created above, closed once.
+        let _ = unsafe { CloseHandle(h) };
+    }
 
     #[test]
     fn watchdog_restores_whenever_the_state_file_is_left() {

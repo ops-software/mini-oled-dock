@@ -121,3 +121,55 @@ fn launcher_chord_off_by_default() {
         assert_eq!(c.launcher.chord_spec(), None, "{f}");
     }
 }
+
+#[test]
+fn unknown_keys_survive_a_save() {
+    // Keys a newer release wrote are kept at this release's saves, so going back to it and forward again
+    // keeps that release's settings.
+    let first = parse(&read("unknown-keys.json")).unwrap();
+    let want: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"a_key_from_the_future": {"nested": [1, 2, 3]}, "another_future_key": true}"#)
+            .unwrap();
+    assert_eq!(first.extra, want);
+    let r = render(&first);
+    assert_eq!(r.matches("\"a_key_from_the_future\":").count(), 1, "{r}");
+    let again = parse(&r).unwrap();
+    assert_eq!(again.extra, want);
+    assert_eq!(again, first); // every known field too
+    assert_eq!(render(&again), r);
+}
+
+#[test]
+fn known_and_legacy_keys_are_never_extra() {
+    assert!(parse(&read("v1.4.2-custom.json")).unwrap().extra.is_empty());
+    assert!(parse("{\"bar_size\":\"large\"}").unwrap().extra.is_empty());
+    assert!(Config::default().extra.is_empty());
+    // No unknown key: not one byte of the file changes.
+    assert!(render(&Config::default()).ends_with("  \"notif_prompted\": false\n}\n"));
+}
+
+#[test]
+fn rendered_keys_are_known_and_never_extra() {
+    // The known keys are every key serde writes for a `Config`, and the legacy `bar_size`.
+    let serde_keys = match serde_json::to_value(Config::default()).unwrap() {
+        serde_json::Value::Object(m) => m.keys().cloned().collect::<Vec<_>>(),
+        other => panic!("{other}"),
+    };
+    let mut want: Vec<&str> = serde_keys.iter().map(String::as_str).chain(["bar_size"]).collect();
+    let mut have = KNOWN_KEYS.to_vec();
+    want.sort_unstable();
+    have.sort_unstable();
+    assert_eq!(have, want);
+    // A key `render` writes that a later parse took for an unknown one (a future top-level
+    // `skip_serializing_if`, say) would be kept as extra and written twice.
+    let r = strip_comments(&render(&Config::default()));
+    let written: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&r).unwrap();
+    assert!(parse(&r).unwrap().extra.is_empty());
+    for f in fixtures() {
+        if let Ok(c) = parse(&read_utf8_keep_bom(&f)) {
+            for k in c.extra.keys() {
+                assert!(!written.contains_key(k) && k != "bar_size", "{f:?}: {k}");
+            }
+        }
+    }
+}

@@ -8,29 +8,28 @@
 //! renamed to `dock.log.1` (replacing the previous one) and a new file is opened.
 //! If there is no usable data folder (or the file cannot be opened), lines go to the debugger output
 //! (`OutputDebugStringW`, visible with DebugView) besides stdout. The watchdog process uses the same
-//! file with the `wd` tag in its lines.
+//! file with the `wd` tag in its lines, the update guard with the `ug` tag; both write synchronously.
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
 
-use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::Foundation::SYSTEMTIME;
+use windows::Win32::System::SystemInformation::GetLocalTime;
 
 /// Log file rotation threshold.
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Start tick (ms), for relative timestamps.
-static START_TICK: AtomicU64 = AtomicU64::new(0);
 /// Channel to the `log` thread; `None` = shut down. Initialized once by `start`.
 static LOG_TX: OnceLock<Sender<Option<String>>> = OnceLock::new();
 /// true = the `log` thread also writes to stdout (only with an attached console).
 static STDOUT_ON: AtomicBool = AtomicBool::new(false);
-/// Process role tag ("" for the dock, "wd" for the watchdog), prepended to lines.
+/// Process role tag ("" for the dock, "wd" for the watchdog, "ug" for the update guard), prepended to lines.
 static TAG: OnceLock<&'static str> = OnceLock::new();
-/// true = synchronous mode (watchdog): no thread, each line is appended straight to the file.
+/// true = synchronous mode (watchdog, update guard): no thread, each line is appended straight to the file.
 static SYNC: AtomicBool = AtomicBool::new(false);
 
 /// Enables the log copy on stdout (call only after attaching a console).
@@ -68,9 +67,27 @@ pub fn say(msg: &str) {
     let _ = out.flush();
 }
 
-fn now_ms() -> u64 {
-    // SAFETY: GetTickCount64 has no preconditions.
-    unsafe { GetTickCount64() }
+/// Local wall-clock stamp "[YYYY-MM-DD hh:mm:ss.mmm]" (integer formatting only).
+fn stamp(t: &SYSTEMTIME) -> String {
+    format!(
+        "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}]",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
+/// "<stamp> msg", or "<stamp> [tag] msg" when the process has a role tag.
+fn format_line(stamp: &str, tag: &str, msg: &str) -> String {
+    if tag.is_empty() {
+        format!("{stamp} {msg}")
+    } else {
+        format!("{stamp} [{tag}] {msg}")
+    }
+}
+
+/// The stamp of the current local time (the caller's thread, before any channel).
+fn now_stamp() -> String {
+    // SAFETY: GetLocalTime has no preconditions.
+    stamp(&unsafe { GetLocalTime() })
 }
 
 /// Path of the log file (`<data root>\dock.log`); `None` if the data folder is not usable or not
@@ -82,18 +99,15 @@ pub fn log_path() -> Option<PathBuf> {
 /// Formats and sends the line: `Sender::send` on an unbounded channel never blocks the caller.
 /// Before `start` (or after `stop`) the line is discarded. Use the `log!` macro.
 pub fn log_line(args: std::fmt::Arguments<'_>) {
-    let ms = now_ms().saturating_sub(START_TICK.load(Relaxed));
     let sync = SYNC.load(Relaxed);
     if !sync && LOG_TX.get().is_none() {
         return;
     }
     let tag = TAG.get().copied().unwrap_or("");
-    // Integer timestamp: avoids pulling in the float formatting code.
-    let (s, m) = (ms / 1000, ms % 1000);
-    let line = if tag.is_empty() { format!("[{s:5}.{m:03}] {args}") } else { format!("[{s:5}.{m:03}] [{tag}] {args}") };
+    let line = format_line(&now_stamp(), tag, &args.to_string());
     if sync {
         // Watchdog: rare lines, so open-append-close is cheaper than a dedicated thread.
-        write_sync(&line);
+        append(&line);
     } else if let Some(tx) = LOG_TX.get() {
         // If the log thread already ended the error is ignored.
         let _ = tx.send(Some(line));
@@ -106,9 +120,15 @@ macro_rules! log {
     ($($a:tt)*) => { $crate::logger::log_line(format_args!($($a)*)) };
 }
 
-/// Writes a line to the log file (append) IMMEDIATELY and synchronously, bypassing the channel.
-/// Only for the panic hook (with `panic = "abort"` the `log` thread would not have time to drain).
-pub fn write_sync(line: &str) {
+/// Writes a message to the log file (append) IMMEDIATELY and synchronously, bypassing the channel,
+/// stamped like every other line. Only for the panic hook (with `panic = "abort"` the `log`
+/// thread would not have time to drain).
+pub fn write_sync(msg: &str) {
+    append(&format_line(&now_stamp(), TAG.get().copied().unwrap_or(""), msg));
+}
+
+/// Appends an already formatted line to the log file (open, append, close).
+fn append(line: &str) {
     match log_path().and_then(|p| crate::datadir::open_append(&p)) {
         Some(mut f) => {
             let _ = writeln!(f, "{line}");
@@ -140,14 +160,14 @@ fn rotate(path: &std::path::Path) {
     let _ = std::fs::rename(path, &old);
 }
 
-/// Starts the `log` thread. `tag` = "" for the dock, "wd" for the watchdog. Must be called once,
-/// before any `log!`. Returns the handle to pass to `stop` (`None` in synchronous `wd` mode).
+/// Starts the `log` thread. `tag` = "" for the dock, "wd" for the watchdog, "ug" for the update guard. Must be called
+/// once, before any `log!`. Returns the handle to pass to `stop` (`None` in the synchronous `wd` and `ug` modes).
 pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
-    START_TICK.store(now_ms(), Relaxed);
     let _ = TAG.set(tag);
-    if tag == "wd" {
-        // The watchdog logs a handful of lines: no thread, no channel.
+    if logs_synchronously(tag) {
+        // The watchdog and the update guard log a handful of lines: no thread, no channel.
         SYNC.store(true, Relaxed);
+        start_marker(tag);
         return None;
     }
     let (tx, rx) = mpsc::channel::<Option<String>>();
@@ -157,6 +177,7 @@ pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
         .spawn(move || {
             let mut file = open_log_file();
             while let Ok(Some(line)) = rx.recv() {
+                probe!(crate::probe::bump(crate::probe::C::LogLines));
                 // If stdout is closed or slow we do not want a panic: errors ignored.
                 if STDOUT_ON.load(Relaxed) {
                     let mut out = std::io::stdout().lock();
@@ -181,7 +202,20 @@ pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
         })
         .ok()?;
     LOG_TX.set(tx).ok()?;
+    start_marker(tag);
     Some(handle)
+}
+
+/// true for the roles that log synchronously, each line on disk when `log!` returns (no thread, no channel): the
+/// watchdog ("wd") and the update guard ("ug"), a process that may be ended at any moment.
+fn logs_synchronously(tag: &str) -> bool {
+    matches!(tag, "wd" | "ug")
+}
+
+/// First line of a run: uptime is a line's time minus this line's time.
+fn start_marker(tag: &str) {
+    let who = if tag.is_empty() { "dock" } else { tag };
+    log_line(format_args!("log: {who} {}, pid {}", env!("CARGO_PKG_VERSION"), std::process::id()));
 }
 
 /// Flushes and shuts down the `log` thread (the last thing before exiting).
@@ -189,5 +223,42 @@ pub fn stop(handle: Option<JoinHandle<()>>) {
     if let (Some(tx), Some(h)) = (LOG_TX.get(), handle) {
         let _ = tx.send(None);
         let _ = h.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(y: u16, mo: u16, d: u16, h: u16, mi: u16, s: u16, ms: u16) -> SYSTEMTIME {
+        SYSTEMTIME {
+            wYear: y,
+            wMonth: mo,
+            wDayOfWeek: 0,
+            wDay: d,
+            wHour: h,
+            wMinute: mi,
+            wSecond: s,
+            wMilliseconds: ms,
+        }
+    }
+
+    #[test]
+    fn stamp_is_local_date_and_time() {
+        assert_eq!(stamp(&st(2026, 11, 22, 9, 5, 7, 3)), "[2026-11-22 09:05:07.003]");
+        assert_eq!(stamp(&st(2026, 1, 2, 23, 59, 59, 999)), "[2026-01-02 23:59:59.999]");
+    }
+
+    #[test]
+    fn line_keeps_the_tag() {
+        assert_eq!(format_line("[s]", "", "msg"), "[s] msg");
+        assert_eq!(format_line("[s]", "wd", "msg"), "[s] [wd] msg");
+    }
+
+    #[test]
+    fn the_watchdog_and_the_update_guard_log_synchronously() {
+        assert!(logs_synchronously("wd"));
+        assert!(logs_synchronously("ug"), "a guard ended mid-update leaves its last line on disk");
+        assert!(!logs_synchronously(""), "the dock logs through its log thread");
     }
 }

@@ -22,9 +22,9 @@
 //!    the user can create entries there, custom icons are opened WITHOUT following reparse points,
 //!    must be single-link regular files whose final path is exactly `<icons>\<name>`, and are decoded
 //!    from memory (`read_icon`). The elevated process never writes into `icons\`.
-//!  * `<root>\update\<tag>\`: releases staged by the updater (`dock.exe`, `dock.exe.sha256`),
-//!    admin-only (inherited root DACL). A staged file is read or executed only through the checked
-//!    path (`read_stage_file`, `checked_stage_path`).
+//!  * `<root>\update\<tag>\`: releases staged by the updater (`dock.exe`, `dock.exe.sha256`), the update
+//!    guard's `dock-guard.exe` and its `rolled-back` mark, admin-only (inherited root DACL). A staged file is
+//!    read or executed only through the checked path (`read_stage_file`, `checked_stage_path`).
 //!
 //! MODES: `init()` runs once, in the processes that need persistent data (dock, watchdog,
 //! `--install`/`--uninstall`, `--restore`). Elevated: creates, verifies and repairs the folders.
@@ -64,8 +64,8 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, MoveFileExW,
-    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+    CopyFileW, CreateDirectoryW, CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    MoveFileExW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
     FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -83,8 +83,9 @@ const CACHE_NAME: &str = "cache";
 const ICONS_NAME: &str = "icons";
 /// `<root>\update\<tag>\`: staged releases (admin-only, inherited root DACL).
 const UPDATE_NAME: &str = "update";
-/// The only files a staging folder holds.
-const STAGE_FILES: [&str; 2] = ["dock.exe", "dock.exe.sha256"];
+/// The only files a staging folder holds: the release's two assets, the update guard's copy of the old
+/// exe and the mark of a rolled-back update (`update_release::GUARD_FILE`, `ROLLED_BACK_FILE`).
+const STAGE_FILES: [&str; 4] = ["dock.exe", "dock.exe.sha256", "dock-guard.exe", "rolled-back"];
 
 /// Size caps of the files read into memory.
 pub const CONFIG_MAX_BYTES: u64 = 1024 * 1024;
@@ -670,6 +671,37 @@ pub fn write_stage_file(tag: &str, name: &str, bytes: &[u8]) -> Result<(), Strin
     write_atomic(&dir.join(name), bytes, FileAcl::Inherit)
 }
 
+/// Copies `src` to `<root>\update\<tag>\<name>`: `CopyFileW` creates `<name>.tmp` new (the kernel copies the file, so
+/// the caller's heap never holds it; the copy gets the stage folder's inherited admin-only DACL, as `FileAcl::Inherit`
+/// does), then it is renamed over `<name>`. On an error the temp is deleted.
+pub fn copy_into_stage(tag: &str, name: &str, src: &Path) -> Result<(), String> {
+    writable_root()?;
+    check_stage_names(tag, Some(name))?;
+    let dest = update_stage_dir(tag)?.join(name);
+    let mut tmp_name = dest.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    // A stale temp (crash): deleting a name removes the link itself, never a link target.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("removing {}: {e}", tmp.display())),
+    }
+    let (s, t, d) = (HSTRING::from(src.as_os_str()), HSTRING::from(tmp.as_os_str()), HSTRING::from(dest.as_os_str()));
+    // SAFETY: the strings are NUL-terminated and live for the call; bFailIfExists = TRUE never writes through an
+    // existing name or link.
+    if let Err(e) = unsafe { CopyFileW(&s, &t, true) } {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("copying {} to {}: {e}", src.display(), tmp.display()));
+    }
+    // SAFETY: both strings are NUL-terminated and live for the call.
+    if let Err(e) = unsafe { MoveFileExW(&t, &d, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("replacing {}: {e}", dest.display()));
+    }
+    Ok(())
+}
+
 /// `NotFound` when the stage folder (or `update\` above it) does not exist, i.e. nothing is staged
 /// yet and the caller must download. The admin-only checks would report a missing folder as
 /// PermissionDenied, which `verify_stage` treats as a failed verification: the first update of a
@@ -1206,6 +1238,18 @@ mod tests {
     }
 
     #[test]
+    fn stage_files_are_the_updater_files_only() {
+        for n in ["dock.exe", "dock.exe.sha256", "dock-guard.exe", "rolled-back"] {
+            assert!(check_stage_names("v1.5.1", Some(n)).is_ok(), "{n}");
+        }
+        for n in ["dock-guard.exe.bak", "x.exe", ""] {
+            assert!(check_stage_names("v1.5.1", Some(n)).is_err(), "{n:?}");
+        }
+        assert!(STAGE_FILES.contains(&crate::update_release::GUARD_FILE));
+        assert!(STAGE_FILES.contains(&crate::update_release::ROLLED_BACK_FILE));
+    }
+
+    #[test]
     fn masks_match_the_documented_values() {
         assert_eq!(MASK_READ_EXECUTE, 0x1200a9);
         assert_eq!(MASK_CONFIG_USER, 0x12019f);
@@ -1342,6 +1386,15 @@ mod tests {
         assert!(remove_update_stage("v1.4.0").is_err());
         assert!(remove_update_dir().is_err());
         assert!(purge().is_err());
+    }
+
+    #[test]
+    fn copy_into_stage_refuses_without_a_data_folder() {
+        // Unit tests never call init(): there is no stage folder to copy into, whatever the name.
+        let src = std::env::current_exe().unwrap();
+        assert!(copy_into_stage("v1.5.1", crate::update_release::GUARD_FILE, &src).is_err());
+        assert!(copy_into_stage("v1.5.1", "x.exe", &src).is_err());
+        assert!(update_stage_names().is_empty(), "nothing was created");
     }
 
     #[test]

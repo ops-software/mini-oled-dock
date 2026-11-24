@@ -9,7 +9,8 @@
 //!     `RequestAccessAsync()` (15 s wait), then `config::modify(notif_prompted = true)`; `Denied` ->
 //!     `Denied`, no further listener calls.
 //!  3. Try `NotificationChanged` once; if it fails (0x80070490 expected for an exe without a package)
-//!     poll: every 2 s while the popup is closed (badge only), every 500 ms while it is open.
+//!     poll: every 2 s while the bar is shown (badge only), every 500 ms while the popup is open, never
+//!     while the bar is hidden and the popup closed (one read at each show).
 //!  4. Each read: `GetNotificationsAsync(NotificationKinds::Toast)` -> up to `MAX_ITEMS` entries
 //!     converted into plain `NotifItem`s (app, title, text, time). Never WinRT objects outside the thread.
 //!  5. DND: `ToastNotificationManager::GetDefault()?.NotificationMode()` on every polling cycle;
@@ -25,7 +26,8 @@
 //! (0x80070490); the fallback is the per-app notification history (`history_remove`,
 //! `history_clear_apps`), which does answer for an unpackaged exe.
 //!
-//! UI -> thread commands (`remove`, `clear_all`, `toggle_dnd`, `refresh_now`, `set_popup_open`):
+//! UI -> thread commands (`remove`, `clear_all`, `toggle_dnd`, `refresh_now`, `set_popup_open`,
+//! `set_bar_visible`):
 //! mpsc channel; `recv_timeout` on the channel doubles as the polling wait, so a command wakes
 //! the thread immediately. Never blocking for the caller.
 
@@ -148,6 +150,8 @@ enum Cmd {
     ClearAll,
     ToggleDnd,
     Refresh,
+    /// The bar was shown (`true`) or hidden (`false`).
+    BarVisible(bool),
 }
 
 /// Command channel (None = thread not started).
@@ -173,7 +177,7 @@ fn send_cmd(c: Cmd) {
 
 /// Starts the `notif` thread. Does not block. `ui_hwnd` receives `WM_DOCK_NOTIF`. Called by `main` after
 /// `shell_thread::start`. A spawn error is logged; `snapshot()` stays `Unknown`/empty.
-pub fn start(ui_hwnd: HWND) {
+pub fn start(ui_hwnd: HWND, bar_visible: bool) {
     if lock(&CMD_TX).is_some() {
         log!("notif::start: already started");
         return;
@@ -187,7 +191,7 @@ pub fn start(ui_hwnd: HWND) {
     // first cycle: publish the target window before that thread exists.
     ICON_UI.store(ui, Relaxed);
     let spawned = std::thread::Builder::new().name("notif".into()).spawn(move || {
-        thread_main(ui, rx, tx_thread);
+        thread_main(ui, rx, tx_thread, bar_visible);
         let _ = done_tx.send(());
     });
     match spawned {
@@ -236,6 +240,29 @@ pub fn set_popup_open(open: bool) {
     send_cmd(Cmd::PopupOpen(open));
 }
 
+/// The bar was shown or hidden: the thread reads once at each show, then every 2 s; while the bar is
+/// hidden (and the popup closed) it does not read at all.
+pub fn set_bar_visible(on: bool) {
+    send_cmd(Cmd::BarVisible(on));
+}
+
+/// Wait before the next poll read: `None` = no read is scheduled (the bar is hidden and the popup closed).
+fn poll_wait(bar_visible: bool, popup_open: bool) -> Option<Duration> {
+    if popup_open {
+        Some(POLL_OPEN)
+    } else if bar_visible {
+        Some(POLL_CLOSED)
+    } else {
+        None
+    }
+}
+
+/// true if the command is followed by a read (it changes the list or the DND state, or the bell comes in
+/// view); a hide and a stop are not.
+fn wants_read(c: &Cmd) -> bool {
+    !matches!(c, Cmd::BarVisible(false) | Cmd::PopupOpen(false) | Cmd::Stop)
+}
+
 /// Removes a notification (`RemoveNotification(id)`, else through the app history), then re-reads.
 pub fn remove(id: u32) {
     send_cmd(Cmd::Remove(id));
@@ -266,6 +293,8 @@ struct Worker {
     listener: Option<UserNotificationListener>,
     access: NotifAccess,
     popup_open: bool,
+    /// The bar is shown (the bell and its badge can be seen).
+    bar_visible: bool,
     /// Last published state.
     last: NotifState,
     /// Next cycle must convert every notification (set by Refresh/Remove/ClearAll/PopupOpen).
@@ -290,7 +319,7 @@ struct Reader {
     time_key: Option<TimeKey>,
 }
 
-fn thread_main(ui: isize, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
+fn thread_main(ui: isize, rx: Receiver<Cmd>, tx: Sender<Cmd>, bar_visible: bool) {
     // SAFETY: initializes COM MTA for this thread; paired with CoUninitialize at the end.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_err() {
@@ -304,6 +333,7 @@ fn thread_main(ui: isize, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
         listener: None,
         access: NotifAccess::Unknown,
         popup_open: false,
+        bar_visible,
         last: NotifState::default(),
         force_full: false,
         rd: Reader::default(),
@@ -317,23 +347,36 @@ fn thread_main(ui: isize, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
         if STOPPED.load(Relaxed) {
             break;
         }
-        let timeout = if w.popup_open { POLL_OPEN } else { POLL_CLOSED };
-        match rx.recv_timeout(timeout) {
+        // No read is scheduled while the bar is hidden and the popup closed: the thread sleeps on the channel.
+        let got = match poll_wait(w.bar_visible, w.popup_open) {
+            Some(t) => rx.recv_timeout(t),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let mut read = false;
+        match got {
             Ok(c) => {
+                probe!(crate::probe::bump(crate::probe::C::NotifCmd));
+                read |= wants_read(&c);
                 if !w.handle(c) {
                     break 'outer;
                 }
                 // Drain accumulated commands before re-reading.
                 while let Ok(c) = rx.try_recv() {
+                    read |= wants_read(&c);
                     if !w.handle(c) {
                         break 'outer;
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                probe!(crate::probe::bump(crate::probe::C::NotifTimeout));
+                read = true;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        w.cycle();
+        if read {
+            w.cycle();
+        }
     }
     w.listener = None;
     if hr.is_ok() {
@@ -409,6 +452,7 @@ impl Worker {
             self.access = NotifAccess::Allowed;
             let tx = tx.clone();
             let handler = TypedEventHandler::new(move |_l, _a| {
+                probe!(crate::probe::bump(crate::probe::C::NotifChanged));
                 let _ = tx.send(Cmd::Refresh);
                 Ok(())
             });
@@ -432,6 +476,7 @@ impl Worker {
                 self.force_full |= o;
             }
             Cmd::Refresh => self.force_full = true,
+            Cmd::BarVisible(v) => self.bar_visible = v,
             Cmd::Remove(id) => {
                 self.force_full = true;
                 if let Some(l) = self.listener.as_ref() {
@@ -871,6 +916,7 @@ fn icons_thread(ui: isize, rx: Receiver<IconReq>) {
     if hr.is_err() {
         log!("notif-icons: CoInitializeEx failed: {hr:?}");
     }
+    probe!(crate::probe::bump(crate::probe::C::Spawned));
     loop {
         let req = match rx.recv_timeout(ICON_IDLE) {
             Ok(r) => r,
@@ -887,6 +933,7 @@ fn icons_thread(ui: isize, rx: Receiver<IconReq>) {
                 }
             }
         };
+        probe!(crate::probe::bump(crate::probe::C::IconWakes));
         if STOPPED.load(Relaxed) {
             break;
         }
@@ -966,4 +1013,30 @@ pub(crate) fn preview_set_state(s: NotifState, icons: Vec<(String, Arc<IconBitma
     *lock(&STATE) = Some(s);
     let map: HashMap<String, IconSlot> = icons.into_iter().map(|(k, b)| (k, IconSlot::Ready(b))).collect();
     *lock(&ICONS) = Some(map);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_wait_follows_the_bell() {
+        assert_eq!(poll_wait(false, false), None);
+        assert_eq!(poll_wait(true, false), Some(POLL_CLOSED));
+        assert_eq!(poll_wait(false, true), Some(POLL_OPEN));
+        assert_eq!(poll_wait(true, true), Some(POLL_OPEN));
+    }
+
+    #[test]
+    fn a_hide_takes_no_read_a_show_takes_one() {
+        assert!(wants_read(&Cmd::BarVisible(true)));
+        assert!(!wants_read(&Cmd::BarVisible(false)));
+        assert!(wants_read(&Cmd::PopupOpen(true)));
+        assert!(!wants_read(&Cmd::PopupOpen(false)));
+        assert!(wants_read(&Cmd::Refresh));
+        assert!(wants_read(&Cmd::Remove(7)));
+        assert!(wants_read(&Cmd::ClearAll));
+        assert!(wants_read(&Cmd::ToggleDnd));
+        assert!(!wants_read(&Cmd::Stop));
+    }
 }

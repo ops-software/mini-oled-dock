@@ -62,7 +62,10 @@ pub fn run(action: PowerAction) {
         }
         PowerAction::Sleep | PowerAction::Restart | PowerAction::Shutdown | PowerAction::SignOut => {
             // Throwaway thread: SetSuspendState returns only on wake-up, ExitWindowsEx may wait.
-            let spawned = std::thread::Builder::new().name("power".into()).spawn(move || worker(action));
+            let spawned = std::thread::Builder::new().name("power".into()).spawn(move || {
+                probe!(crate::probe::bump(crate::probe::C::Spawned));
+                worker(action)
+            });
             if let Err(e) = spawned {
                 log!("power: thread spawn failed: {e}");
             }

@@ -740,6 +740,11 @@ fn popup_png(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, 
     }
     let hot = pick_hot(content.as_ref(), w, h, m.px(4).max(2), nth);
     content.paint(&mut surf, hot, None);
+    snapshot_png(dir, file, m, &surf)
+}
+
+/// Writes the popup `surf` (already painted) over the preview wallpaper.
+fn snapshot_png(dir: &Path, file: &str, m: Metrics, surf: &Surface) -> bool {
     let Some((sw, sh, px)) = surf.snapshot_pixels() else {
         eprintln!("preview: no pixels from the popup surface");
         return false;
@@ -749,6 +754,53 @@ fn popup_png(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, 
     let mut bg = wallpaper(cw, ch, ch * 40 / 100);
     composite(&mut bg, cw, ch, &px, sw, sh, pad, pad);
     write_png(dir, file, cw, ch, bg)
+}
+
+/// Mock mixer with every row the popup can show.
+fn mock_sessions_many(n: usize) -> Vec<crate::audio::AppSession> {
+    (0..n)
+        .map(|i| crate::audio::AppSession {
+            pid: 10 + i as u32,
+            system: false,
+            name: format!("Player {}", i + 1),
+            level: (20 + 10 * i as u8).min(100),
+            muted: i % 4 == 3,
+        })
+        .collect()
+}
+
+/// Screens of the short-screen popups: width, height, DPI.
+const SHORT_SCREENS: [(i32, i32, u32); 3] = [(1280, 720, 96), (1366, 768, 144), (1366, 768, 192)];
+
+/// The audio popup with every section open and 8 mixer rows, on a short screen (wsD D8): sized the way
+/// `popup::render` sizes it (`limit_for` under a top bar), at the top and, with `end`, scrolled to the end.
+fn short_png(dir: &Path, file: &str, (sw, sh, dpi): (i32, i32, u32), end: bool) -> bool {
+    use crate::popup::limit_for;
+    let m = Metrics { dpi };
+    let mut surf = match Surface::new(m) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("preview: Surface::new failed: {e}");
+            return false;
+        }
+    };
+    let Some(mut c) = make_popup("popup_audio", m) else { return false };
+    c.data(&DataEvent::AudioSessions(mock_sessions_many(crate::audio::MAX_SESSIONS)));
+    let work = RECT { left: 0, top: 0, right: sw, bottom: sh };
+    let bar = RECT { left: 0, top: 0, right: sw, bottom: m.px(48) };
+    c.limit(limit_for(c.scroll_cap(), &work, &bar, true, dpi));
+    let mut size = c.size(&surf);
+    if end {
+        // A point in the left margin: not over a slider, so the wheel scrolls.
+        c.wheel(-1000, 1, size.1 / 2);
+        size = c.size(&surf);
+    }
+    if let Err(e) = surf.resize(size.0.max(1), size.1.max(1)) {
+        eprintln!("preview: Surface::resize failed: {e}");
+        return false;
+    }
+    c.paint(&mut surf, None, None);
+    snapshot_png(dir, file, m, &surf)
 }
 
 /// Builds the content of popup `name` (mock data).
@@ -1122,6 +1174,21 @@ pub fn run(dir: &str) -> i32 {
                 crate::i18n::set_preview(english_preview(plan()));
             }
             failures += i32::from(!ok);
+        }
+    }
+    // The short-screen audio popups (wsD D8): every screen in the legacy run, in a matrix cell the screens of
+    // its DPI.
+    crate::config::set(plan().base_config());
+    for screen in SHORT_SCREENS.into_iter().filter(|s| !plan().matrix || s.2 == plan().dpi) {
+        for end in [false, true] {
+            let file = format!(
+                "popup_audio_short_{}x{}_{}{}.png",
+                screen.0,
+                screen.1,
+                screen.2,
+                if end { "_end" } else { "" }
+            );
+            failures += i32::from(!short_png(dir, &file, screen, end));
         }
     }
     // Settings window pages, then the same pages in Italian at 144 DPI.

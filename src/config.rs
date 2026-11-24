@@ -743,8 +743,10 @@ pub struct Config {
     /// (they keep being answered and forwarded to Explorer).
     pub tray_hidden_guids: Vec<String>,
     /// Tray icons the user chose as "not in the bar" (they stay in the chevron popup).
-    /// Per-icon key (`tray_host::item_key`): lowercase GUID without braces if the icon has one,
-    /// otherwise `<lowercase exe name>#<uID>` (e.g. "discord.exe#1"). Default: empty.
+    /// Per-icon key (`tray_host::item_keys`): lowercase GUID without braces if the icon has one,
+    /// otherwise `<lowercase exe name>|<n>` (e.g. "discord.exe|0"), n = the icon's 0-based place among that
+    /// exe's icons without a GUID. The `<exe>#<uID>` keys of releases before 1.5.1 are rewritten when the exe's
+    /// icons register (`tray_host::key::migrate`). Default: empty.
     pub tray_hidden: Vec<String>,
     /// Relative order of the app entries that are NOT pinned (their keys). Pinned entries use the
     /// `pinned` array order. Apps missing from the list go last, in the order they were first seen.
@@ -772,6 +774,10 @@ pub struct Config {
     pub update_available: String,
     /// The launcher (Alt+Space style search box); off until a chord is set.
     pub launcher: LauncherConfig,
+    /// Top-level keys this release does not know, kept verbatim so that an older release does not erase
+    /// a newer one's settings; never shown in Settings. Read by `parse`, written last by `render`.
+    #[serde(skip)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -845,6 +851,7 @@ impl Default for Config {
             last_update_check: String::new(),
             update_available: String::new(),
             launcher: LauncherConfig::default(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -950,12 +957,82 @@ fn strip_comments(src: &str) -> String {
 /// Parses the config (JSONC). Tolerates a leading UTF-8 BOM (Notepad). Missing fields = defaults.
 fn parse(text: &str) -> Result<Config, String> {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut c = serde_json::from_str::<Config>(&strip_comments(t)).map_err(|e| e.to_string())?;
+    let t = strip_comments(t);
+    let mut c = serde_json::from_str::<Config>(&t).map_err(|e| e.to_string())?;
+    c.extra = unknown_keys(&t);
     migrate_bar_size(&mut c);
     for msg in c.launcher.sanitize() {
         crate::log!("config error: {msg}");
     }
     Ok(c)
+}
+
+/// The top-level keys this release knows: every key serde writes for a `Config` (what `render` writes; a
+/// test pins the list to `serde_json::to_value(Config::default())`) and the legacy `bar_size` (read by
+/// `migrate_bar_size`, never written). A list, because serializing the defaults at run time costs the exe
+/// about 8 KiB. A new top-level field goes here too, or it would be kept as unknown and written twice.
+const KNOWN_KEYS: [&str; 50] = [
+    "language",
+    "position",
+    "monitor",
+    "autohide",
+    "window_previews",
+    "win_opens_start",
+    "hide_native_taskbar",
+    "pinned",
+    "start_pins",
+    "start_folders",
+    "start_style",
+    "start_grid",
+    "names",
+    "show_date",
+    "show_volume_percent",
+    "show_tray",
+    "show_notifications",
+    "show_volume",
+    "show_network",
+    "show_metrics",
+    "show_battery",
+    "battery_percent",
+    "battery_percent_inside",
+    "show_clock",
+    "show_desktop_button",
+    "show_start_button",
+    "display_mode",
+    "bar_size",
+    "app_icon_size",
+    "app_text_size",
+    "tray_icon_size",
+    "module_size",
+    "background",
+    "bar_opacity",
+    "settings_window_size",
+    "time_format",
+    "show_seconds",
+    "date_format",
+    "tray_hidden_guids",
+    "tray_hidden",
+    "app_order",
+    "tray_order",
+    "modules_order",
+    "audio_layout",
+    "notif_prompted",
+    "update_check",
+    "update_auto_install",
+    "last_update_check",
+    "update_available",
+    "launcher",
+];
+
+/// The top-level keys of `json` that are not `KNOWN_KEYS`. Anything unexpected keeps nothing, as before.
+fn unknown_keys(json: &str) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(serde_json::Value::Object(mut all)) = serde_json::from_str(json) else {
+        return serde_json::Map::new();
+    };
+    for k in KNOWN_KEYS {
+        all.remove(k);
+    }
+    all
 }
 
 /// Converts a legacy `bar_size` (one knob scaling the whole bar: small 7/8, medium 1, large 5/4)
@@ -992,6 +1069,16 @@ fn js<T: Serialize + ?Sized>(v: &T) -> String {
 /// Pretty JSON of a collection, continuation lines indented to sit under a 2-space key.
 fn js_block<T: Serialize + ?Sized>(v: &T) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string()).replace('\n', "\n  ")
+}
+
+/// The `extra` keys as the last lines of the file, one compact line each: "" when there are none, so
+/// such a file is written as before.
+fn render_extra(extra: &serde_json::Map<String, serde_json::Value>) -> String {
+    if extra.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = extra.iter().map(|(k, v)| format!("  {}: {}", js(k), js(v))).collect();
+    format!(",\n\n  // Kept from a newer version of the dock. Leave as is.\n{}", lines.join(",\n"))
 }
 
 /// Serializes `c` as a commented JSONC file: an English guide above every field, current values
@@ -1146,8 +1233,9 @@ fn render(c: &Config) -> String {
   "show_start_button": {show_start},
 
   // Tray icons you chose to keep out of the bar (they stay in the tray popup).
-  // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces)
-  // or "<exe name lowercase>#<icon id>", e.g. "discord.exe#1".
+  // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces),
+  // e.g. "7820ae73-23e3-4229-82c1-e41cb67d5b9c", or for an icon without one
+  // "<exe name lowercase>|<n>", n counting that app's icons from 0, e.g. "discord.exe|0".
   "tray_hidden": {tray_hidden},
 
   // Order of the tray icons in the bar (same keys as "tray_hidden"). Normally managed by
@@ -1263,7 +1351,7 @@ fn render(c: &Config) -> String {
   }},
 
   // Internal: set once the notification-access prompt has been shown. Leave as is.
-  "notif_prompted": {notif}
+  "notif_prompted": {notif}{extra}
 }}
 "#,
         monitor = js(&c.monitor),
@@ -1330,6 +1418,7 @@ fn render(c: &Config) -> String {
         l_web_url = js(&c.launcher.web_url),
         l_offer_done = c.launcher.offer_done,
         l_powertoys_done = c.launcher.powertoys_done,
+        extra = render_extra(&c.extra),
     )
 }
 
@@ -1433,12 +1522,142 @@ fn report_legacy_dir() {
 /// `poll_changed` has not loaded yet). Does not consume the change.
 pub fn external_edit_pending() -> bool {
     let Some(path) = crate::datadir::config_path() else { return false };
-    file_mtime(&path) != *lock_mtime()
+    should_post(file_mtime(&path), *lock_mtime())
+}
+
+/// The change notification of the data folder fires for every write in it (dock.log, the launcher's state file); only
+/// a modification time of `config.json` that differs from the remembered one is worth a message to the UI thread.
+fn should_post(now: Option<SystemTime>, remembered: Option<SystemTime>) -> bool {
+    now != remembered
+}
+
+/// Raw handle of the folder's change notification (`FindFirstChangeNotificationW`), 0 = no watch.
+static WATCH_CHANGE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Raw handle of the thread-pool wait registered on it, 0 = none.
+static WATCH_WAIT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// The UI window the callback posts to.
+static WATCH_UI: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// true while the folder watch runs; when it does not, the housekeeping timer polls the mtime every 2 s instead.
+pub fn watching() -> bool {
+    WATCH_WAIT.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Starts the wait on the data folder's change notification (no timer, no thread of ours: a thread-pool wait runs
+/// `on_folder_change` in its wait thread). Returns false (and logs) when it cannot be set up; the caller then polls.
+pub fn start_watch(ui: windows::Win32::Foundation::HWND) -> bool {
+    use std::sync::atomic::Ordering::{Release, SeqCst};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FindCloseChangeNotification, FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    };
+    use windows::Win32::System::Threading::{RegisterWaitForSingleObject, INFINITE, WT_EXECUTEINWAITTHREAD};
+
+    if watching() {
+        return true;
+    }
+    let fail = |e: String| {
+        crate::log!("config: change watch unavailable ({e}), polling every 2 s");
+        false
+    };
+    let Some(path) = crate::datadir::config_path() else { return fail("no data folder".into()) };
+    let Some(dir) = path.parent() else { return fail("no data folder".into()) };
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(dir.as_os_str()).chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call.
+    let change = match unsafe {
+        FindFirstChangeNotificationW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            false,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => return fail(e.to_string()),
+    };
+    WATCH_CHANGE.store(change.0 as isize, SeqCst);
+    WATCH_UI.store(ui.0 as isize, SeqCst);
+    let mut wait = HANDLE::default();
+    // SAFETY: `change` is a valid notification handle owned by the statics until `stop_watch`; the callback is an
+    // `extern "system"` fn that stays valid for the whole process. WT_EXECUTEINWAITTHREAD: one callback per
+    // notification, never two at once (the callback re-arms the handle before the wait thread waits again).
+    let reg = unsafe {
+        RegisterWaitForSingleObject(&mut wait, change, Some(on_folder_change), None, INFINITE, WT_EXECUTEINWAITTHREAD)
+    };
+    if let Err(e) = reg {
+        WATCH_CHANGE.store(0, SeqCst);
+        // SAFETY: the handle came from FindFirstChangeNotificationW and is closed once.
+        let _ = unsafe { FindCloseChangeNotification(change) };
+        return fail(e.to_string());
+    }
+    WATCH_WAIT.store(wait.0 as isize, Release);
+    true
+}
+
+/// Ends the watch: waits for a running callback, then closes the notification. Idempotent; true when a notification
+/// handle was closed (the watch was still held).
+pub fn stop_watch() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::FindCloseChangeNotification;
+    use windows::Win32::System::Threading::UnregisterWaitEx;
+
+    let wait = WATCH_WAIT.swap(0, SeqCst);
+    if wait != 0 {
+        // SAFETY: `wait` came from RegisterWaitForSingleObject and is unregistered once (the swap above);
+        // INVALID_HANDLE_VALUE waits for a callback in progress, so the notification is idle when it is closed.
+        if let Err(e) = unsafe { UnregisterWaitEx(HANDLE(wait as *mut core::ffi::c_void), Some(INVALID_HANDLE_VALUE)) }
+        {
+            crate::log!("config: UnregisterWaitEx failed: {e}");
+        }
+    }
+    let change = WATCH_CHANGE.swap(0, SeqCst);
+    if change != 0 {
+        // SAFETY: the handle came from FindFirstChangeNotificationW and is closed once (the swap above).
+        let _ = unsafe { FindCloseChangeNotification(HANDLE(change as *mut core::ffi::c_void)) };
+    }
+    change != 0
+}
+
+/// Thread-pool callback of the folder notification (wait thread): re-arms the handle first, then posts one message
+/// only when `config.json` itself changed. Never logs (a log line would signal this callback again).
+unsafe extern "system" fn on_folder_change(_context: *mut core::ffi::c_void, _timed_out: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
+    use windows::Win32::Storage::FileSystem::FindNextChangeNotification;
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    probe!(crate::probe::bump(crate::probe::C::ConfigWatch));
+    let change = WATCH_CHANGE.load(SeqCst);
+    let ui = HWND(WATCH_UI.load(SeqCst) as *mut core::ffi::c_void);
+    if change == 0 || ui.0.is_null() {
+        return;
+    }
+    // SAFETY: the handle stays open until `stop_watch`, which first waits for this callback to return.
+    if unsafe { FindNextChangeNotification(HANDLE(change as *mut core::ffi::c_void)) }.is_err() {
+        // wParam 1 = the watch is broken: the UI thread falls back to the 2 s poll. First end the wait (non-blocking
+        // form, allowed in the callback) so a still-signaled handle cannot re-fire this callback in a loop.
+        let w = WATCH_WAIT.swap(0, SeqCst);
+        if w != 0 {
+            // SAFETY: `w` came from RegisterWaitForSingleObject and is unregistered once (the swap above).
+            let _ = unsafe {
+                windows::Win32::System::Threading::UnregisterWaitEx(HANDLE(w as *mut core::ffi::c_void), None)
+            };
+        }
+        // SAFETY: PostMessageW to the dock window from any thread; if it no longer exists it just fails.
+        let _ = unsafe { PostMessageW(Some(ui), crate::msg::WM_DOCK_CONFIG_CHANGED, WPARAM(1), LPARAM(0)) };
+        return;
+    }
+    if external_edit_pending() {
+        // SAFETY: as above.
+        let _ = unsafe { PostMessageW(Some(ui), crate::msg::WM_DOCK_CONFIG_CHANGED, WPARAM(0), LPARAM(0)) };
+    }
 }
 
 /// Checks the mtime of `config.json`; if it changed, re-reads, updates the global snapshot and
 /// returns `true` (the UI must rebuild its entries). Does not block: one stat + read of a
-/// small file. Called by the UI thread every 2 s (`TIMER_HOUSEKEEPING`).
+/// small file. Called by the UI thread after a change notification of the folder (`start_watch`), or every 2 s
+/// (`TIMER_HOUSEKEEPING`) while that watch is not running.
 ///
 /// If the new content is invalid (half-saved edit or syntax error) the previous
 /// snapshot is kept, a message is logged once and `false` is returned; the file is re-read on the next
@@ -2462,6 +2681,52 @@ mod tests {
         c.pinned.push(PinnedApp { key: "k".into(), name: "N".into(), launch: "L".into(), icon: Some("i.png".into()) });
         c.names.insert("code.exe".into(), "VS Code".into());
         assert_eq!(parse(&serde_json::to_string_pretty(&c).unwrap()).unwrap(), c);
+    }
+
+    #[test]
+    fn only_a_config_mtime_change_posts() {
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(!should_post(Some(t0), Some(t0)));
+        assert!(should_post(Some(t1), Some(t0)));
+        assert!(should_post(None, Some(t0)));
+        assert!(should_post(Some(t0), None));
+        assert!(!should_post(None, None));
+    }
+
+    #[test]
+    fn a_write_in_the_folder_signals_the_notification() {
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::Storage::FileSystem::{
+            FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
+            FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        };
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let dir = std::env::temp_dir().join(format!("dock-cfgwatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(dir.as_os_str()).chain(Some(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        let h: HANDLE = unsafe {
+            FindFirstChangeNotificationW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                false,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+            )
+        }
+        .unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, b"{}").unwrap();
+        // SAFETY: `h` is the notification handle opened above.
+        assert_eq!(unsafe { WaitForSingleObject(h, 2000) }, WAIT_OBJECT_0);
+        // SAFETY: as above: re-arms the handle.
+        unsafe { FindNextChangeNotification(h) }.unwrap();
+        std::fs::write(&file, b"{\"a\":1}").unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { WaitForSingleObject(h, 2000) }, WAIT_OBJECT_0);
+        // SAFETY: closes the handle once.
+        unsafe { FindCloseChangeNotification(h) }.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -105,6 +105,11 @@ pub const SHA_MAX_BYTES: u64 = 1024;
 pub const NOTES_MAX_CHARS: usize = 16 * 1024;
 pub const EXE_ASSET: &str = "dock.exe";
 pub const SHA_ASSET: &str = "dock.exe.sha256";
+/// `update\<tag>\dock-guard.exe`: the old exe that judges the update to `<tag>` (the update guard).
+pub const GUARD_FILE: &str = "dock-guard.exe";
+/// `update\<tag>\rolled-back`: `<tag>` was installed, failed and was rolled back; never installed
+/// automatically again.
+pub const ROLLED_BACK_FILE: &str = "rolled-back";
 pub const FIRST_CHECK_MS: u32 = 60_000;
 pub const CHECK_PERIOD_MS: u32 = 86_400_000;
 pub const RETRY_MS: u32 = 3_600_000;
@@ -113,6 +118,9 @@ pub const RETRY_MS: u32 = 3_600_000;
 pub struct Asset {
     pub url: String,
     pub size: u64,
+    /// The SHA-256 GitHub computed for the uploaded asset (its `"digest": "sha256:<hex>"`), or
+    /// `None` when it sent none or one in another form.
+    pub digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +140,8 @@ struct RawAsset {
     name: Option<String>,
     size: u64,
     browser_download_url: Option<String>,
+    /// Any JSON type, so a digest of an unexpected type is no digest, never a parse error.
+    digest: Option<serde_json::Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -173,6 +183,7 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
         Ok(Asset {
             url: url.to_string(),
             size: a.size,
+            digest: parse_digest(a.digest.as_ref().and_then(|v| v.as_str())),
         })
     };
     let exe = find(EXE_ASSET, EXE_MAX_BYTES)?;
@@ -217,14 +228,32 @@ pub fn parse_sha256_file(bytes: &[u8]) -> Option<[u8; 32]> {
     if tokens.next().is_some() || name.strip_prefix('*').unwrap_or(name) != EXE_ASSET {
         return None;
     }
+    hex32(hex)
+}
+
+/// GitHub's asset digest, `sha256:<64 hex>` (either case). Anything else, such as another algorithm,
+/// is `None`: a digest this release cannot read never blocks an update.
+pub fn parse_digest(s: Option<&str>) -> Option<[u8; 32]> {
+    hex32(s?.strip_prefix("sha256:")?)
+}
+
+/// Exactly 64 hex digits, either case, as 32 bytes.
+fn hex32(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
     for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+        *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
     Some(out)
+}
+
+/// The version in `dock.exe --version`'s output, `mini-oled-dock X.Y.Z` (canonical, surrounding
+/// whitespace ignored); anything else is `None`.
+pub fn parse_version_output(stdout: &[u8]) -> Option<Version> {
+    let rest = std::str::from_utf8(stdout).ok()?.trim().strip_prefix("mini-oled-dock ")?;
+    Version::parse(rest).filter(|v| v.to_string() == rest)
 }
 
 /// `dock.exe --version` prints `mini-oled-dock X.Y.Z`.
@@ -426,21 +455,9 @@ mod tests {
     #[test]
     fn release_json_parses() {
         let r = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap();
-        assert_eq!(
-            (r.tag.as_str(), r.version),
-            ("v1.4.1", Version::parse("1.4.1").unwrap())
-        );
-        assert_eq!(
-            (r.notes.as_str(), r.published.as_str()),
-            ("Fixes", "2026-11-20T10:00:00Z")
-        );
-        assert_eq!(
-            r.exe,
-            Asset {
-                url: asset_url("v1.4.1", EXE_ASSET),
-                size: 720_896
-            }
-        );
+        assert_eq!((r.tag.as_str(), r.version), ("v1.4.1", Version::parse("1.4.1").unwrap()));
+        assert_eq!((r.notes.as_str(), r.published.as_str()), ("Fixes", "2026-11-20T10:00:00Z"));
+        assert_eq!(r.exe, Asset { url: asset_url("v1.4.1", EXE_ASSET), size: 720_896, digest: None });
         assert_eq!(r.sha256.url, asset_url("v1.4.1", SHA_ASSET));
         let nulls = RELEASE_FIXTURE
             .replace("\"body\":\"Fixes\"", "\"body\":null")
@@ -475,6 +492,59 @@ mod tests {
     }
 
     #[test]
+    fn asset_digest_is_read_when_github_sends_it() {
+        let mut abc = [0u8; 32];
+        for (i, b) in abc.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&ABC[2 * i..2 * i + 2], 16).unwrap();
+        }
+        let with = |digest: &str| {
+            let json = RELEASE_FIXTURE.replace(
+                "\"name\":\"dock.exe\",\"size\":720896",
+                &format!("\"name\":\"dock.exe\",\"size\":720896,\"digest\":{digest}"),
+            );
+            assert_ne!(json, RELEASE_FIXTURE);
+            parse_release(json.as_bytes()).map(|r| (r.exe.digest, r.sha256.digest))
+        };
+        assert_eq!(with(&format!("\"sha256:{ABC}\"")), Ok((Some(abc), None)));
+        assert_eq!(with(&format!("\"sha256:{}\"", ABC.to_uppercase())), Ok((Some(abc), None)));
+        // Anything else is no digest, never an error: the release still parses.
+        for odd in [
+            "null".to_string(),
+            "5".to_string(),
+            "{\"x\":1}".to_string(),
+            format!("\"sha512:{ABC}\""),
+            format!("\"sha256:zz{}\"", &ABC[2..]),
+            format!("\"sha256:{}\"", &ABC[1..]),
+            format!("\"{ABC}\""),
+            format!("\"sha256:{ABC} \""),
+        ] {
+            assert_eq!(with(&odd), Ok((None, None)), "{odd}");
+        }
+        assert_eq!(parse_release(RELEASE_FIXTURE.as_bytes()).unwrap().exe.digest, None); // absent
+        assert_eq!(parse_digest(None), None);
+    }
+
+    /// GitHub's real answer for v1.5.0 (`author` and `uploader` removed) and that release's
+    /// `dock.exe.sha256` as published: the digest is read from the live format and agrees with the
+    /// `.sha256` asset.
+    #[test]
+    fn the_published_release_parses_with_its_digest() {
+        const JSON: &[u8] = include_bytes!("../tests/fixtures/update/v1.5.0-release.json");
+        const SHA: &[u8] = include_bytes!("../tests/fixtures/update/v1.5.0-dock.exe.sha256");
+        let rel = parse_release(JSON).unwrap();
+        assert_eq!((rel.tag.as_str(), rel.version), ("v1.5.0", Version::parse("1.5.0").unwrap()));
+        assert_eq!(rel.sha256.size, SHA.len() as u64);
+        let raw: serde_json::Value = serde_json::from_slice(JSON).unwrap();
+        let assets = raw["assets"].as_array().unwrap();
+        let sent = &assets.iter().find(|a| a["name"] == EXE_ASSET).unwrap()["digest"];
+        match sent {
+            serde_json::Value::String(_) => assert_eq!(rel.exe.digest, Some(parse_sha256_file(SHA).unwrap())),
+            serde_json::Value::Null => assert_eq!(rel.exe.digest, None),
+            other => panic!("unexpected digest {other}"),
+        }
+    }
+
+    #[test]
     fn sha256_file_formats() {
         let mut want = [0u8; 32];
         for (i, b) in want.iter_mut().enumerate() {
@@ -504,6 +574,22 @@ mod tests {
             assert_eq!(parse_sha256_file(bad.as_bytes()), None, "{bad}");
         }
         assert_eq!(parse_sha256_file(&[b'a'; 2000]), None);
+    }
+
+    #[test]
+    fn version_output_parses() {
+        assert_eq!(parse_version_output(b"mini-oled-dock 1.5.0\r\n"), Version::parse("1.5.0"));
+        for bad in [
+            &b"mini-oled-dock v1.5.0"[..],
+            b"mini-oled-dock 1.5",
+            b"mini-oled-dock 1.05.0",
+            b"mini-oled-dock 1.5.0 extra",
+            b"1.5.0",
+            b"",
+            b"mini-oled-dock \xff1.5.0",
+        ] {
+            assert_eq!(parse_version_output(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

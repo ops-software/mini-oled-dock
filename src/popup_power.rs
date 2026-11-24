@@ -151,6 +151,7 @@ fn build(forced_badge: Option<u32>) -> Box<dyn Content> {
     // The schtasks.exe query can take hundreds of ms: keep it off the UI thread.
     let a = Arc::clone(&autostart);
     let spawned = std::thread::Builder::new().name("autostart-query".into()).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         a.store(if crate::autostart::is_enabled() { AS_ON } else { AS_OFF }, SeqCst);
     });
     if let Err(e) = spawned {
@@ -303,6 +304,7 @@ impl PowerPopup {
         }
         let a = Arc::clone(&self.autostart);
         let spawned = std::thread::Builder::new().name("autostart-set".into()).spawn(move || {
+            probe!(crate::probe::bump(crate::probe::C::Spawned));
             let r = if want_on {
                 match crate::autostart::enable(false).error {
                     None => Ok(()),

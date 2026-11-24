@@ -15,6 +15,7 @@
 //!     (`tray_host`), only if the native taskbar is hidden and `config.show_tray`.
 //!  8. `notif`: COM MTA, WinRT notification list + "Do not disturb" state (`notif`).
 //!  9. `power`: Sleep/Restart/Shut down (`power`).
+//! 10. `wake-probe`: only with `DOCK_WAKE_PROBE=1` or the `wakeprobe.on` marker (`probe`, diagnostic build).
 //!
 //!  Popups (`popup`) live on the UI thread.
 //!  Plus the watchdog PROCESS (`dock.exe --watchdog <pid> <event>`).
@@ -29,6 +30,16 @@
 //! --install, --uninstall, --preview, errors) attach to the parent process console with
 //! `attach_console`; `--console` does the same for normal runs too (log on stdout and Ctrl+C).
 #![windows_subsystem = "windows"]
+
+/// Statements of the wake probe (`--features wake-probe`, P0-wsC-v2 Q3): they compile to nothing without it.
+macro_rules! probe {
+    ($($t:tt)*) => {
+        #[cfg(feature = "wake-probe")]
+        {
+            $($t)*
+        }
+    };
+}
 
 mod apps;
 mod arp;
@@ -67,6 +78,8 @@ mod popup_power;
 mod popup_tray;
 mod power;
 mod preview;
+#[cfg(feature = "wake-probe")]
+mod probe;
 mod render;
 mod settings_pages;
 mod settings_view;
@@ -85,7 +98,7 @@ mod update_release;
 mod watchdog;
 mod winhttp;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed};
 use std::sync::OnceLock;
@@ -105,23 +118,27 @@ use windows::Win32::System::Diagnostics::Debug::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcess;
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{
+    AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, InternalGetWindowText,
-    KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage,
-    UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MSGFLT_ALLOW, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
-    WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetMessageW, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer,
+    TranslateMessage, UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MSGFLT_ALLOW,
+    WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use msg::{
-    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
-    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_UPDATE_CHECK, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG,
-    WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU,
-    WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
+    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_CONFIG_COALESCE, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER,
+    TIMER_POLL, TIMER_RAM, TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_TRIM, TIMER_UPDATE_CHECK,
+    WM_DOCK_CONFIG_APPLY, WM_DOCK_CONFIG_CHANGED, WM_DOCK_DIAG, WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS,
+    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE,
+    WM_DOCK_TRAY_CHANGED, WM_DOCK_TRIM_KICK, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -229,6 +246,11 @@ pub struct Args {
     pub roots: Vec<String>,
     /// `--update-install <tag>`: install the staged release `<tag>`.
     pub update_install: Option<String>,
+    /// `--update-guard <tag>`: the old binary judges the staged release (started only by the updater as
+    /// `update\<tag>\dock-guard.exe`); combines with nothing.
+    pub update_guard: Option<String>,
+    /// `--rollback` (alone or with `--quiet`): install `dock.prev.exe` again.
+    pub rollback: bool,
     /// `--settings`: ask the running dock to open its Settings window and exit.
     pub settings: bool,
 }
@@ -293,6 +315,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             }
             "--settings" => a.settings = true,
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
+            "--update-guard" => a.update_guard = Some(it.next().ok_or("--update-guard requires <tag>")?),
+            "--rollback" => a.rollback = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -318,11 +342,17 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if a.launcher_files && flags > 1 + usize::from(a.stall.is_some()) + a.roots.len() {
         return Err("--launcher-files cannot be combined with other arguments".into());
     }
+    if a.update_guard.is_some() && flags > 1 {
+        return Err("--update-guard cannot be combined with other arguments".into());
+    }
+    if a.rollback && flags > 1 + usize::from(a.quiet) {
+        return Err("--rollback combines only with --quiet".into());
+    }
     if a.install && a.uninstall {
         return Err("--install and --uninstall cannot be combined".into());
     }
-    if a.quiet && !(a.install || a.uninstall) {
-        return Err("--quiet requires --install or --uninstall".into());
+    if a.quiet && !(a.install || a.uninstall || a.rollback) {
+        return Err("--quiet requires --install, --uninstall or --rollback".into());
     }
     if a.no_relaunch && !a.install {
         return Err("--no-relaunch requires --install".into());
@@ -354,6 +384,17 @@ enum CliReport {
     MessageBox,
     /// `--quiet`: log file only, the exit code carries the result.
     LogOnly,
+}
+
+/// `--rollback` run from the installed `dock.exe` must leave at once, as the older installer it starts replaces that
+/// file (`update::guard::run_rollback_cli`): a message box becomes the log only (that installer shows its own result);
+/// a console still gets the lines. Pure.
+fn rollback_report(report: CliReport, from_installed: bool) -> CliReport {
+    if from_installed && report == CliReport::MessageBox {
+        CliReport::LogOnly
+    } else {
+        report
+    }
 }
 
 fn cli_report(quiet: bool, has_console: bool) -> CliReport {
@@ -424,6 +465,128 @@ fn trim_step(s: &mut TrimState, now: Instant, visible: bool, popup: bool, rearm:
     go
 }
 
+/// Milliseconds until the next hidden trim is worth trying, or None when there is nothing to wait for. None once the
+/// current hidden period has trimmed (unless `rearm`: data was freed since); 4 s while a popup or the Settings window
+/// is open (the trim never runs under the user's hands; a close kicks it sooner); else the time left to 4 s after
+/// `hidden_since` or to 60 s after `last_trim`, whichever is later, at least 250 ms.
+fn hidden_trim_retry_ms(s: &TrimState, now: Instant, popup: bool, rearm: bool) -> Option<u32> {
+    if popup {
+        return Some(TRIM_HIDDEN_DELAY.as_millis() as u32);
+    }
+    if s.trimmed && !rearm {
+        return None;
+    }
+    let since = s.hidden_since.unwrap_or(now) + TRIM_HIDDEN_DELAY;
+    let due = s.last_trim.map_or(since, |t| since.max(t + TRIM_MIN_GAP));
+    let left = due.saturating_duration_since(now).as_millis();
+    Some(left.clamp(250, u128::from(u32::MAX)) as u32)
+}
+
+/// Whether `TIMER_HOUSEKEEPING` has work: the visible-idle trim and the bar's own upkeep while shown, an automatic
+/// install waiting for an idle moment, the config poll while the folder watch is down.
+fn housekeeping_wanted(visible: bool, install_pending: bool, config_watch: bool) -> bool {
+    visible || install_pending || !config_watch
+}
+
+thread_local! {
+    /// Armed state of `TIMER_HOUSEKEEPING` and `TIMER_RAM` (UI thread): SetTimer only on a transition, since arming
+    /// again would restart the period.
+    static HOUSEKEEPING_ARMED: Cell<bool> = const { Cell::new(false) };
+    static RAM_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn timer_transition(h: HWND, id: usize, ms: u32, armed: &'static std::thread::LocalKey<Cell<bool>>, want: bool) {
+    if armed.with(|a| a.replace(want)) != want {
+        if want {
+            set_timer(h, id, ms);
+        } else {
+            // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+            let _ = unsafe { KillTimer(Some(h), id) };
+        }
+    }
+}
+
+/// Arms or kills `TIMER_HOUSEKEEPING` by `housekeeping_wanted`.
+fn housekeeping_sync(h: HWND) {
+    let want = housekeeping_wanted(ui::is_visible(), update::auto_install_pending(), config::watching());
+    timer_transition(h, TIMER_HOUSEKEEPING, 2000, &HOUSEKEEPING_ARMED, want);
+}
+
+/// Arms or kills `TIMER_RAM`: the 30 s RAM line only while the bar is shown.
+fn ram_sync(h: HWND) {
+    timer_transition(h, TIMER_RAM, 30_000, &RAM_ARMED, ui::is_visible());
+}
+
+/// Starts a new hidden period for the trim (a popup or Settings close, a data release, a show).
+fn trim_period_reset(now: Instant) {
+    TRIM.with(|s| reset_hidden_period(&mut s.borrow_mut(), now));
+}
+
+fn reset_hidden_period(s: &mut TrimState, now: Instant) {
+    s.hidden_since = None;
+    s.trimmed = false;
+    s.last_activity = Some(now);
+}
+
+/// Delay of `TIMER_TRIM`: the earlier of the hidden trim still to come and the planned second COM pass; none while the
+/// bar is shown or when there is neither.
+fn trim_timer_ms(visible: bool, retry: Option<u32>, pass: Option<Duration>) -> Option<u32> {
+    if visible {
+        return None;
+    }
+    let pass = pass.map(|d| d.as_millis().clamp(250, u128::from(u32::MAX)) as u32);
+    retry.into_iter().chain(pass).min()
+}
+
+/// (Re)arms the one-shot `TIMER_TRIM` while the bar is hidden: for the hidden trim still to come and for the planned
+/// second COM pass, whichever is earlier; killed when there is neither (and while the bar is shown).
+fn arm_trim_timer(h: HWND) {
+    let now = Instant::now();
+    let ms = if ui::is_visible() {
+        None
+    } else {
+        let popup = popup::is_open() || settings_window::is_open();
+        let retry = TRIM.with(|s| hidden_trim_retry_ms(&s.borrow(), now, popup, false));
+        trim_timer_ms(false, retry, mem::second_pass_in(now))
+    };
+    match ms {
+        Some(ms) => set_timer(h, TIMER_TRIM, ms),
+        // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+        None => drop(unsafe { KillTimer(Some(h), TIMER_TRIM) }),
+    }
+}
+
+/// A new hidden period starts now (a popup or the Settings window closed, data was released): with the bar hidden,
+/// the trim runs 4 s from now (at most once per 60 s) and the timer follows. Nothing while the bar is shown.
+/// UI thread only.
+pub(crate) fn trim_kick(h: HWND) {
+    if h.0.is_null() || ui::is_visible() {
+        return;
+    }
+    trim_period_reset(Instant::now());
+    trim_tick();
+    arm_trim_timer(h);
+}
+
+/// The bar was shown or hidden (`ui::on_visibility`): the RAM line and housekeeping follow, the hidden trim starts
+/// 4 s after a hide and is cancelled by a show.
+pub(crate) fn on_bar_visibility(visible: bool) {
+    let h = hwnd();
+    if h.0.is_null() {
+        return;
+    }
+    ram_sync(h);
+    housekeeping_sync(h);
+    if visible {
+        trim_period_reset(Instant::now());
+        arm_trim_timer(h);
+    } else {
+        // `trim_tick` records `hidden_since`; the timer then fires when the delay is over.
+        trim_tick();
+        arm_trim_timer(h);
+    }
+}
+
 /// Decides whether to trim memory now; never during show/hide animations (4 s hidden delay).
 fn trim_tick() {
     mem::second_pass_tick(Instant::now());
@@ -433,6 +596,10 @@ fn trim_tick() {
     let go = TRIM.with(|s| trim_step(&mut s.borrow_mut(), Instant::now(), visible, popup, mem::take_rearm()));
     if let Some(reason) = go {
         mem::trim(reason);
+        if reason == "hidden" {
+            // The hidden bar has no 30 s RAM line: one line per hidden trim instead.
+            mem::log_memory();
+        }
     }
 }
 
@@ -444,20 +611,29 @@ fn auto_install_busy(popup: bool, settings: bool, fullscreen: bool) -> bool {
 
 // ------------------------------------------------------------ window proc
 
+/// Set by `message_loop` as its first statement (UI thread); `wnd_proc` beats only from then on (`beats_for`).
+static LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Whether a message to the dock window beats (`watchdog::beat_if_due`): none before the message loop runs
+/// (`loop_running`), so window creation and setup keep the watchdog's 33 s startup tolerance; then all but the shell
+/// hook's (`shell_msg`, 0 while no shell hook is registered).
+fn beats_for(m: u32, shell_msg: u32, loop_running: bool) -> bool {
+    loop_running && (shell_msg == 0 || m != shell_msg)
+}
+
 /// "Core" messages handled here (exit, keyboard hook, service timers, taskbar, session);
 /// everything else goes to `ui::handle_message`, and if the UI does not handle it either, to `DefWindowProcW`.
 unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // The heartbeat at the start of every message to the dock window, posted or sent, at most once a second (wsC Q7): a
+    // stall begins inside a message, so at most 1 s after a beat. Not for the shell hook's message: its handler cannot
+    // stall, and its HSHELL_REDRAW alone would beat about once a second. Not before the message loop runs: this
+    // procedure already runs inside CreateWindowExW, and the first real beat ends the watchdog's startup tolerance.
+    let beat = beats_for(m, ui::shell_hook_msg(), LOOP_RUNNING.load(Relaxed)) && watchdog::beat_if_due();
     match m {
         WM_TIMER => match wp.0 {
             TIMER_HOUSEKEEPING => {
-                // Windows may silently remove the hook after a timeout; the hook thread reinstalls it.
-                HOOK_THREAD.with(|t| {
-                    if let Some(t) = t.borrow().as_ref() {
-                        hook::request_reinstall(t);
-                    }
-                });
-                if config::poll_changed() {
-                    ui::config_reloaded();
+                if !config::watching() {
+                    apply_config_change(h);
                 }
                 trim_tick();
                 if update::auto_install_pending() {
@@ -469,6 +645,22 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                         ui::foreground_is_fullscreen(),
                     ));
                 }
+                housekeeping_sync(h);
+                LRESULT(0)
+            }
+            TIMER_TRIM => {
+                // One-shot: it kills itself before running, then arms itself again if there is more to wait for.
+                // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+                let _ = unsafe { KillTimer(Some(h), TIMER_TRIM) };
+                trim_tick();
+                arm_trim_timer(h);
+                LRESULT(0)
+            }
+            TIMER_CONFIG_COALESCE => {
+                // One-shot: it kills itself before running.
+                // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+                let _ = unsafe { KillTimer(Some(h), TIMER_CONFIG_COALESCE) };
+                apply_config_change(h);
                 LRESULT(0)
             }
             TIMER_UPDATE_CHECK => {
@@ -480,7 +672,10 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 LRESULT(0)
             }
             TIMER_SECOND => {
-                watchdog::heartbeat();
+                // The idle keepalive: the line above has beaten for this tick unless a beat came less than 1 s before.
+                if !beat {
+                    watchdog::heartbeat();
+                }
                 taskbar::on_safety_timer();
                 LRESULT(0)
             }
@@ -518,12 +713,9 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             }
             let w = wp.0;
             let fg = HWND(lp.0 as *mut c_void);
-            let mut buf = [0u16; 64];
-            // SAFETY: `buf` is writable; InternalGetWindowText does not send messages to the window.
-            let n = unsafe { InternalGetWindowText(fg, &mut buf) }.max(0) as usize;
-            let title = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+            let class = crate::ui::window_class(fg);
             log!(
-                "  [diag] WIN {}{} inj={} lowil={} swallowed={} ourtag={} ext={} rwin={} scan=0x{:X} latency={}ms fg=\"{}\"",
+                "  [diag] WIN {}{} inj={} lowil={} swallowed={} ourtag={} ext={} rwin={} scan=0x{:X} latency={}ms fg_class=\"{}\"",
                 if w & 1 != 0 { "DOWN" } else { "" },
                 if w & 2 != 0 { "UP" } else { "" },
                 (w >> 2) & 1,
@@ -534,7 +726,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 (w >> 7) & 1,
                 (w >> 8) & 0xFFFF,
                 (w >> 24) & 0xFFFF,
-                title
+                class
             );
             LRESULT(0)
         }
@@ -551,11 +743,31 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_POPUP_CLOSED => {
             ui::on_popup_closed();
+            trim_kick(h);
+            LRESULT(0)
+        }
+        WM_DOCK_TRIM_KICK => {
+            trim_kick(h);
+            LRESULT(0)
+        }
+        WM_DOCK_CONFIG_CHANGED => {
+            if wp.0 == 1 {
+                if config::stop_watch() {
+                    log!("config: change watch broken, polling every 2 s");
+                }
+                // The watch is gone: the 2 s poll must run even while the bar is hidden.
+                housekeeping_sync(h);
+            } else {
+                // Re-armed by every notification: an editor's several writes become one read.
+                set_timer(h, TIMER_CONFIG_COALESCE, 250);
+            }
             LRESULT(0)
         }
         WM_DOCK_CONFIG_APPLY => {
             ui::on_config_changed();
             update::sync_timer(h);
+            // `update_auto_install` may have just made a staged install pending.
+            housekeeping_sync(h);
             LRESULT(0)
         }
         WM_DOCK_OPEN_SETTINGS => {
@@ -568,6 +780,8 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_UPDATE => {
             update::on_changed(h);
+            // An automatic install may just have become pending: housekeeping is its only driver.
+            housekeeping_sync(h);
             settings_window::on_update_changed();
             LRESULT(0)
         }
@@ -605,10 +819,12 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(1)
         }
         WM_ENDSESSION => {
-            // End of session: the taskbar state would survive a reboot, so restore it right away.
+            // End of session: the taskbar state would survive a reboot, so restore it right away. Explorer may save
+            // its settings before this restore: the state file stays for the next sign-in, and the watchdog is ended
+            // first so it cannot restore again and delete it.
             if wp.0 != 0 {
                 taskbar::begin_exit();
-                taskbar::restore();
+                taskbar::restore_at_session_end();
             }
             LRESULT(0)
         }
@@ -697,6 +913,13 @@ fn create_window(inst: HINSTANCE, g: &ui::Geom) -> Option<HWND> {
 }
 
 fn message_loop() {
+    // From here on `wnd_proc` beats (`beats_for`), in the probe's loop too.
+    LOOP_RUNNING.store(true, Relaxed);
+    // Wake probe on (DOCK_WAKE_PROBE=1 or wakeprobe.on): its instrumented loop; off, the release loop below.
+    #[cfg(feature = "wake-probe")]
+    if probe::ui_loop() {
+        return;
+    }
     let mut msg = MSG::default();
     loop {
         // SAFETY: `msg` is valid and writable; filter None = all windows of the thread.
@@ -708,11 +931,24 @@ fn message_loop() {
             log!("GetMessageW error");
             break;
         }
+        // The dock window's messages beat in `wnd_proc`; the others (popups, Settings, thread messages) here, so no
+        // message beats twice.
+        if msg.hwnd != hwnd() {
+            watchdog::beat_if_due();
+        }
         // SAFETY: `msg` was just filled by GetMessageW.
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+/// Loads a hand edit of `config.json` (if its mtime differs from the remembered one) and lets the UI rebuild.
+fn apply_config_change(h: HWND) {
+    if config::poll_changed() {
+        ui::config_reloaded();
+        housekeeping_sync(h);
     }
 }
 
@@ -891,6 +1127,8 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
         TIMER_TRAY_REANNOUNCE,
         TIMER_HOVER_PICKER,
         TIMER_UPDATE_CHECK,
+        TIMER_CONFIG_COALESCE,
+        TIMER_TRIM,
     ] {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), id) };
@@ -920,6 +1158,8 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
     }
     ui::shutdown();
     restore_console_mode();
+    // The config watch's callback posts to the window: it ends first (and waits for a callback in progress).
+    config::stop_watch();
     if !h.0.is_null() {
         // SAFETY: window created by this thread (WM_DESTROY also restores the taskbar: idempotent).
         if let Err(e) = unsafe { DestroyWindow(h) } {
@@ -936,9 +1176,17 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
 fn run(args: &Args) -> Result<(), String> {
     // The manifest already sets PerMonitorV2; the call is a safety net and may fail
     // with "access denied" if the context is already fixed: not an error.
-    // SAFETY: must be called before creating windows; the constant is valid.
-    if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
-        log!("SetProcessDpiAwarenessContext: {e} (probably already set by the manifest)");
+    // It is skipped when the manifest already made the thread PerMonitorV2 (the normal case: no false error line).
+    // SAFETY: GetThreadDpiAwarenessContext and AreDpiAwarenessContextsEqual have no preconditions; the constant is a valid context.
+    let already = unsafe {
+        AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    }
+    .as_bool();
+    if !already {
+        // SAFETY: must be called before creating windows; the constant is valid.
+        if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+            log!("SetProcessDpiAwarenessContext: {e} (probably already set by the manifest)");
+        }
     }
     // COM STA on the UI thread too (needed by SHGetPropertyStoreForWindow in `apps`).
     // SAFETY: paired with CoUninitialize at the end of `run`.
@@ -1022,7 +1270,7 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     }
     // WinRT notifications + "Do not disturb" (`notif` thread, non-blocking).
     if config::get().show_notifications {
-        notif::start(h);
+        notif::start(h, ui::is_visible());
     }
     // Tray host: only with the native taskbar hidden. Order: Explorer already hidden and at
     // the bottom of the Z-order -> host topmost and ready -> TaskbarCreated announcement (apps re-register with us).
@@ -1054,11 +1302,16 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     }
 
     // Service timers (the UI ones are armed by `ui::attach`).
-    set_timer(h, TIMER_HOUSEKEEPING, 2000);
-    set_timer(h, TIMER_RAM, 30_000);
-    set_timer(h, TIMER_SECOND, 1000);
+    set_timer(h, TIMER_SECOND, watchdog::HEARTBEAT_MS);
     update::init(h);
+    // A hand edit of config.json is applied from the folder's change notification; without it, housekeeping polls.
+    config::start_watch(h);
     mem::log_memory();
+    // The service timers by state (the bar's visibility changes keep them in step from here); a bar that starts hidden
+    // trims 4 s from now.
+    housekeeping_sync(h);
+    ram_sync(h);
+    trim_kick(h);
 
     // The window already exists (HWND_RAW set): the callback can post messages to it.
     let t = hook::start()?;
@@ -1108,8 +1361,9 @@ fn usage() {
         e,
         "usage: dock [--top | --bottom] [--no-autohide] [--keep-taskbar] [--diag] [--restore] \
          [--install [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
-         [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] [--console] \
-         [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] [--list-apps]"
+         [--rollback [--quiet]] [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] \
+         [--console] [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] \
+         [--list-apps]"
     );
 }
 
@@ -1192,10 +1446,11 @@ fn main() -> std::process::ExitCode {
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
-    // --install / --uninstall mode: messages via `logger::say`, log to file only.
-    if args.install || args.uninstall {
+    // --install / --uninstall / --rollback mode: messages via `logger::say`, log to file only.
+    if args.install || args.uninstall || args.rollback {
         // Without a console (UAC from a non-elevated terminal, Explorer) the result would be lost: message box.
         let report = cli_report(args.quiet, !args.quiet && attach_console());
+        let report = if args.rollback { rollback_report(report, update::guard::runs_installed()) } else { report };
         if report != CliReport::Console {
             logger::buffer_say();
         }
@@ -1206,8 +1461,10 @@ fn main() -> std::process::ExitCode {
         }
         let mut code = if args.install {
             autostart::run_install_cli(args.no_relaunch)
-        } else {
+        } else if args.uninstall {
             autostart::run_uninstall_cli(args.remove)
+        } else {
+            update::guard::run_rollback_cli(args.quiet)
         };
         if report == CliReport::LogOnly {
             // Keep the messages in the log, then keep buffering whatever is said later (nobody shows it).
@@ -1268,13 +1525,21 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
 
-    // --update-install <tag> mode: hands an already staged, verified release to --install --quiet.
+    // --update-install <tag> mode: hands an already staged, verified release to the update guard.
     if let Some(tag) = &args.update_install {
         if attach_console() {
             logger::enable_stdout();
         }
         let (log_thread, _) = start_logging("");
         let code = update::run_install_cli(tag);
+        logger::stop(log_thread);
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    // --update-guard <tag>: the old binary judges the staged release (`update::guard`). Its lines carry the `ug` tag
+    // and are on disk at once; it never takes `Local\DockInstance`.
+    if let Some(tag) = &args.update_guard {
+        let (log_thread, _) = start_logging("ug");
+        let code = update::guard::run_cli(tag);
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
@@ -1297,7 +1562,11 @@ fn main() -> std::process::ExitCode {
     }
     install_panic_hook();
     disable_power_throttling();
+    #[cfg(feature = "wake-probe")]
+    probe::init();
     let res = run(args);
+    #[cfg(feature = "wake-probe")]
+    probe::stop();
     // Safety net: even if `run` exited early with an error, the taskbar comes back (idempotent).
     taskbar::restore();
     restore_console_mode();
@@ -1321,11 +1590,131 @@ mod tests {
     }
 
     #[test]
+    fn probe_macro_compiles_to_nothing_without_the_feature() {
+        let n = std::cell::Cell::new(0);
+        probe!(n.set(1));
+        assert_eq!(n.get(), if cfg!(feature = "wake-probe") { 1 } else { 0 });
+    }
+
+    #[test]
+    fn shell_hook_messages_do_not_beat() {
+        const SHELL: u32 = 0xC123;
+        assert!(!beats_for(SHELL, SHELL, true), "the shell hook's message never beats");
+        assert!(beats_for(WM_TIMER, SHELL, true));
+        assert!(beats_for(WM_TIMER, 0, true));
+        assert!(beats_for(0, 0, true), "no shell hook registered: every message beats");
+    }
+
+    /// Review of 7ed2043: `wnd_proc` already runs inside `CreateWindowExW`, with the heartbeat event in place. Its beat
+    /// waits for the message loop, so the setup keeps the watchdog's 33 s startup tolerance, as in 1.5.0.
+    #[test]
+    fn no_beat_before_the_message_loop() {
+        assert!(!beats_for(WM_TIMER, 0, false), "window creation and setup: no beat");
+        assert!(!beats_for(WM_TIMER, 0xC123, false), "nor with a shell hook registered");
+        assert!(beats_for(WM_TIMER, 0xC123, true), "the loop runs: the dock window's messages beat");
+    }
+
+    #[test]
     fn no_auto_install_while_settings_is_open() {
         assert!(auto_install_busy(false, true, false), "Settings window open");
         assert!(auto_install_busy(true, false, false), "popup open");
         assert!(auto_install_busy(false, false, true), "fullscreen app");
         assert!(!auto_install_busy(false, false, false));
+    }
+
+    #[test]
+    fn housekeeping_only_where_it_has_work() {
+        for visible in [false, true] {
+            for install in [false, true] {
+                for watch in [false, true] {
+                    assert_eq!(
+                        housekeeping_wanted(visible, install, watch),
+                        visible || install || !watch,
+                        "{visible} {install} {watch}"
+                    );
+                }
+            }
+        }
+        // Hidden, watching, nothing pending: off. A pending automatic install keeps it armed while hidden.
+        assert!(!housekeeping_wanted(false, false, true));
+        assert!(housekeeping_wanted(false, true, true));
+        assert!(housekeeping_wanted(false, false, false));
+    }
+
+    #[test]
+    fn hidden_trim_once_per_hidden_period() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        // The hide's own tick records hidden_since; the timer is due 4 s on.
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(hidden_trim_retry_ms(&s, at(0), false, false), Some(4000));
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        assert_eq!(hidden_trim_retry_ms(&s, at(4), false, false), None);
+        // Data freed since: one more trim, at the end of the 60 s gap.
+        assert_eq!(hidden_trim_retry_ms(&s, at(10), false, true), Some(54_000));
+    }
+
+    #[test]
+    fn the_rate_gap_retries_once() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        // A new hidden period 10 s later: the trim waits for the gap (60 s after the last one), no longer.
+        reset_hidden_period(&mut s, at(10));
+        assert_eq!(trim_step(&mut s, at(10), false, false, false), None);
+        assert_eq!(hidden_trim_retry_ms(&s, at(10), false, false), Some(54_000));
+        assert_eq!(trim_step(&mut s, at(64), false, false, false), Some("hidden"));
+        assert_eq!(hidden_trim_retry_ms(&s, at(64), false, false), None);
+        // Never below 250 ms.
+        let s = TrimState { hidden_since: Some(at(0)), last_trim: None, ..TrimState::default() };
+        assert_eq!(hidden_trim_retry_ms(&s, at(4), false, false), Some(250));
+    }
+
+    #[test]
+    fn the_trim_timer_follows_the_earlier_of_retry_and_second_pass() {
+        let s = Duration::from_secs;
+        assert_eq!(trim_timer_ms(false, None, Some(s(600))), Some(600_000));
+        assert_eq!(trim_timer_ms(false, Some(4000), Some(s(1))), Some(1000));
+        assert_eq!(trim_timer_ms(false, None, Some(Duration::ZERO)), Some(250));
+        assert_eq!(trim_timer_ms(true, Some(4000), Some(s(1))), None);
+        assert_eq!(trim_timer_ms(false, None, None), None);
+    }
+
+    #[test]
+    fn an_open_popup_defers_the_hidden_trim() {
+        let t0 = Instant::now();
+        let mut s = TrimState::default();
+        assert_eq!(hidden_trim_retry_ms(&s, t0, true, false), Some(4000));
+        s.trimmed = true;
+        assert_eq!(hidden_trim_retry_ms(&s, t0, true, false), Some(4000));
+        // No trim while the popup is open, even a long time after the hide.
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, t0, false, true, false), None);
+        assert_eq!(trim_step(&mut s, t0 + Duration::from_secs(30), false, true, false), None);
+    }
+
+    #[test]
+    fn a_close_while_hidden_trims_again() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut s = TrimState::default();
+        assert_eq!(trim_step(&mut s, at(0), false, false, false), None);
+        assert_eq!(trim_step(&mut s, at(4), false, false, false), Some("hidden"));
+        assert_eq!(hidden_trim_retry_ms(&s, at(5), false, false), None);
+        // The kick after a close at 100 s: a new hidden period, the trim 4 s on.
+        reset_hidden_period(&mut s, at(100));
+        assert_eq!(trim_step(&mut s, at(100), false, false, false), None);
+        assert_eq!(s.hidden_since, Some(at(100)));
+        assert!(!s.trimmed);
+        assert_eq!(hidden_trim_retry_ms(&s, at(100), false, false), Some(4000));
+        assert_eq!(trim_step(&mut s, at(104), false, false, false), Some("hidden"));
+        // A close 20 s after a trim: the time left to the 60 s gap.
+        reset_hidden_period(&mut s, at(124));
+        assert_eq!(trim_step(&mut s, at(124), false, false, false), None);
+        assert_eq!(hidden_trim_retry_ms(&s, at(124), false, false), Some(40_000));
     }
 
     #[test]
@@ -1384,7 +1773,14 @@ mod tests {
         for a in all {
             assert!(is_child_mode(&p(a).unwrap()), "{a:?}");
         }
-        for a in [&[][..], &["--preview", "x"], &["--watchdog", "1", "ev"], &["--version"]] {
+        for a in [
+            &[][..],
+            &["--preview", "x"],
+            &["--watchdog", "1", "ev"],
+            &["--version"],
+            &["--rollback"],
+            &["--update-guard", "v1"],
+        ] {
             assert!(!is_child_mode(&p(a).unwrap()), "{a:?}");
         }
     }
@@ -1481,8 +1877,38 @@ mod tests {
     }
 
     #[test]
+    fn cli_update_guard_and_rollback() {
+        assert_eq!(p(&["--update-guard", "v1.5.3"]).unwrap().update_guard.as_deref(), Some("v1.5.3"));
+        let r = p(&["--rollback"]).unwrap();
+        assert!(r.rollback && !r.quiet && !r.install && !r.uninstall && r.update_guard.is_none());
+        let q = p(&["--rollback", "--quiet"]).unwrap();
+        assert!(q.rollback && q.quiet);
+        for bad in [&["--update-guard"][..], &["--rollback", "--install"], &["--rollback", "--uninstall"]] {
+            assert!(matches!(p(bad), Err(e) if !e.is_empty()), "{bad:?}");
+        }
+        // The command lines the guard and --rollback start other releases with (contract C2).
+        let words = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let g = parse_args_from(words(&update::guard::guard_args("v1.5.3")).into_iter()).unwrap();
+        assert_eq!(g.update_guard.as_deref(), Some("v1.5.3"));
+        let n = parse_args_from(words(update::guard::NEW_INSTALL_ARGS).into_iter()).unwrap();
+        assert!(n.install && n.quiet && n.no_relaunch && !n.rollback);
+        for quiet in [true, false] {
+            let i = parse_args_from(words(update::guard::rollback_install_args(quiet)).into_iter()).unwrap();
+            assert!(i.install && i.quiet == quiet && !i.no_relaunch, "{quiet}");
+        }
+    }
+
+    #[test]
+    fn a_rollback_from_the_installed_exe_never_waits_on_a_box() {
+        assert_eq!(rollback_report(CliReport::MessageBox, true), CliReport::LogOnly);
+        assert_eq!(rollback_report(CliReport::Console, true), CliReport::Console);
+        assert_eq!(rollback_report(CliReport::MessageBox, false), CliReport::MessageBox);
+        assert_eq!(rollback_report(CliReport::LogOnly, false), CliReport::LogOnly);
+    }
+
+    #[test]
     fn cli_rejects_bad_combinations() {
-        let bad: [&[&str]; 24] = [
+        let bad: [&[&str]; 28] = [
             &["--quiet"],
             &["--no-relaunch"],
             &["--remove"],
@@ -1507,6 +1933,10 @@ mod tests {
             &["--settings", "--start-icons", "40"],
             &["--start-icons", "40", "--start-apps"],
             &["--start-icons", "40", "--start-icons", "40"],
+            &["--update-guard", "v1.5.3", "--install"],
+            &["--update-guard", "v1.5.3", "--update-fetch"],
+            &["--update-fetch", "--update-guard", "v1.5.3"],
+            &["--rollback", "--update-install", "t"],
         ];
         for b in bad {
             assert!(matches!(p(b), Err(e) if !e.is_empty()), "{b:?}");

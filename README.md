@@ -143,11 +143,15 @@ To start with Windows (or use the toggle in the power popup):
 
 The logon task runs the dock elevated, so the installed copy lives in an admin-only folder (`%ProgramFiles%\mini-oled-dock\dock.exe`, inheriting the Program Files permissions) that normal programs cannot modify. Its data lives in `%ProgramData%\mini-oled-dock` (see [Data folder](#data-folder)).
 
-**Update:** the dock checks GitHub Releases once a day (`update_check`, one request to api.github.com, nothing is downloaded by the check). When a newer version exists, an orange dot with a count on **Settings** in the power popup shows it. Nothing is installed unless you set `update_auto_install` to `true`: then a verified release is installed when no popup is open and no fullscreen app is in front. The installer downloads `dock.exe` and its `.sha256` into the admin-only folder `%ProgramData%\mini-oled-dock\update\<tag>\`, checks the hash, runs the new exe's `--version`, and then runs its `--install --quiet`. No UAC prompt is shown, and the dock restarts from the new copy by itself. Trust rests on HTTPS to github.com and on the hash published with the same release; the exe is not code-signed.
+**Update:** the dock checks GitHub Releases once a day (`update_check`, one request to api.github.com, nothing is downloaded by the check). When a newer version exists, an orange dot with a count on **Settings** in the power popup shows it. Nothing is installed unless you set `update_auto_install` to `true`: then a verified release is installed when no popup is open and no fullscreen app is in front. The installer downloads `dock.exe` and its `.sha256` into the admin-only folder `%ProgramData%\mini-oled-dock\update\<tag>\`, checks the hash against the `.sha256` published with the release and, when GitHub reports one for the file, against the SHA-256 GitHub itself computed for the upload (a mismatch stops the update), runs the new exe's `--version`, and then hands the install to the update guard (below). No UAC prompt is shown, and the dock restarts from the new copy by itself. Trust rests on HTTPS to github.com, on the hash published with the same release and, when GitHub reports one, on its own digest of the file; the exe is not code-signed.
+
+**Update guard.** Each update is judged by the version you had: it installs the new release, starts it, and puts itself back if the new dock does not keep running with a responsive window (30 s, at most 60 s). Settings > Updates then says "Update to X rolled back" ("Aggiornamento a X annullato"). A rolled-back version is not installed automatically again; **Update now** retries it. The first update from 1.5.0 or older to 1.5.1 is not judged, because those versions have no guard.
+
+**Going back by hand.** The previous version stays as `%ProgramFiles%\mini-oled-dock\dock.prev.exe`. To go back, run `dock.exe --rollback` (elevated; the older version's installer then shows the result, or nothing with `--quiet`); if `dock.exe` does not start at all, run `dock.prev.exe --install`. Going back to 1.5.0 or older: switch off Settings > Updates > Install automatically first, because those versions do not know rolled-back releases and install the newer one again at their next daily check. Settings that only the newer version knows are kept in `config.json` when you go back to 1.5.1 or later; going back to 1.5.0 or older resets them to their defaults at that version's first save of the settings. `--uninstall --remove` deletes `dock.prev.exe` with the rest of the install folder.
 
 Going back to 1.4.x: copy `config.json` first, because 1.4.x drops the launcher settings and aliases the first time it writes the file.
 
-Manual updating still works: run `--install` from a downloaded `dock.exe`. Diagnostics: `dock.exe --update-check` makes one check and prints the result (exit `0` when GitHub answered, `1` when it could not be checked); `dock.exe --update-install <tag>` verifies and installs a release already staged in `update\<tag>\`, and accepts no other path.
+Manual updating still works: run `--install` from a downloaded `dock.exe`. Diagnostics: `dock.exe --update-check` makes one check and prints the result (exit `0` when GitHub answered, `1` when it could not be checked); `dock.exe --update-install <tag>` verifies a release already staged in `update\<tag>\` and starts the update guard for it (run it from the installed `dock.exe`; it accepts no other path); `dock.exe --rollback` is described above.
 
 If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
 
@@ -169,7 +173,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
   - **Start:** the Start button, the Start layout, Win key opens Start, and the import of pinned apps from Windows Start.
   - **Modules:** one switch per module, the **Battery** group (show: Auto, On or Off; percentage; percentage inside the icon), the **Tray** group (tray icons, **Icons of apps run as administrator**, see [Tray icons of elevated apps](#configuration)) and the tray icon chooser, inline.
   - **Screen:** which display the bar sits on (**Main**, the display number, or **Pointer**).
-  - **Updates:** installed and available version, last check, **Check now**, **Release notes**, **Update now**, and the switches for the daily check and the automatic install.
+  - **Updates:** installed and available version, last check, **Check now**, **Release notes**, **Update now** (also retries a release that was rolled back), and the switches for the daily check and the automatic install.
   - **About:** version, memory, the data folder and the log, and **Exit the dock** (restores the Windows taskbar).
 
   Sliders follow a drag or a click on the track; the mouse wheel scrolls the page. Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button. The window remembers its size (`settings_window_size`).
@@ -220,11 +224,11 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `update_auto_install` | `false` | Download, verify and install new releases by themselves |
 | `launcher` | `{ "chord": "off", ... }` | The launcher (see Launcher above). `chord`: `"off"`, `"alt+space"` or `"alt+shift+space"`; `enabled`; `with_powertoys` (`"yield"` or `"take"`); `monitor` (`"pointer"`, `"active"`, `"primary"`); `top_percent` 10-50; `width` 560-880; `rows` 4-12; `keep_query`; `over_fullscreen` (`"pass"` or `"open"`); `learn`; `providers` (switch each source on or off); `prefixes`; `aliases`; `file_folders` (up to 8 more folders for file search, e.g. `["D:\\Archive", "E:\\"]`; file search already covers your profile, the Start menu folders and your Desktop, Documents, Downloads, Pictures, Music and Videos folders wherever they are on a local drive (a personal folder set to the top of a drive (`D:\`) only when you list it here), and only what Windows Search has indexed; a whole data drive is allowed, network paths, the Windows and Program Files folders and other accounts' profiles never are, a refused entry is ignored and counted in `dock.log`; the search runs with the dock's administrator rights, so it can show the names of files other accounts keep in a folder listed here); `web_engine` (`"google"`, `"bing"`, `"duckduckgo"`, `"custom"`) and `web_url` for `"custom"` |
 
-`last_update_check` and `update_available` are written by the dock itself.
+`last_update_check` and `update_available` are written by the dock itself. A top-level key this version does not know (one a newer version wrote) is kept as it is when the dock saves the file. Hand edits to `config.json` are applied when the file changes; the dock no longer polls it every 2 seconds (it polls again only if the change watch fails).
 
 The bar height follows the tallest content; the defaults give the original 36 px bar. An old `bar_size` value (`"small"`, `"medium"`, `"large"`) is converted once into the four sizes.
 
-Tray visibility and ordering (`tray_hidden`, `app_order`, `tray_order`, `modules_order`) are written by the dock itself.
+Tray visibility and ordering (`tray_hidden`, `app_order`, `tray_order`, `modules_order`) are written by the dock itself. A tray icon with no GUID is keyed by its program and its place among that program's icons (`name.exe|0`), so a program that picks a new internal id at every start keeps its hidden and ordered position; the keys of 1.5.0 and older (`name.exe#id`) are rewritten the first time the program's icons are seen. 1.5.0 and older do not know the new keys: there, such icons hidden after the change show again and those ordered after it return to the default order. Icons with a GUID are not affected.
 
 **Tray icons of elevated apps.** The dock runs as administrator, so by default it refuses to send click, hover and menu messages to a tray icon whose window belongs to another elevated program (for example MSI Afterburner run as administrator): a tray registration can come from any program and names the window and the message itself, and Windows does not tell the dock which program sent it, so otherwise any normal program could register a fake icon pointing at an elevated window and use the dock to deliver messages Windows would block (a UIPI bypass). To use such icons, turn on **Settings → Modules → Tray → Icons of apps run as administrator**. The switch is not in `config.json` (any program running as you can write that file): it is the admin-only registry value `HKLM\SOFTWARE\mini-oled-dock\TrustElevatedTrayIcons` (DWORD, 1 = on), which the elevated dock writes when you flip the toggle and which takes effect at once. It can also be set by hand from an elevated PowerShell (picked up within about 10 s; `0` or deleting the key turns it off):
 
@@ -245,7 +249,11 @@ Run `dock.exe --list-apps` to see how each open window was named. Command-line f
 
 ## Recovering the taskbar
 
-The dock saves the original taskbar state before hiding it, and a separate watchdog process restores it if the dock crashes or hangs. If something still goes wrong:
+The dock saves the original taskbar state before hiding it, and a separate watchdog process restores it if the dock crashes or hangs.
+
+The watchdog restores the taskbar when the dock stops answering for more than about 6.6 seconds. If the dock answers again, it is meant to hide the taskbar again at its next safety check, as long as its watchdog is still running; it does not do so after `--restore`, `--install`, `--uninstall` or Exit. Explorer's own saved auto-hide setting is set back to off after a restore, so a taskbar that comes back after an uninstall is not left in auto-hide. At a sign-out or shutdown the saved taskbar state is meant to be kept for the next sign-in.
+
+If something still goes wrong:
 
 1. Run `dock.exe --restore` from any terminal. It works even when no dock is running.
 2. If the taskbar is still hidden, restart Explorer:
@@ -260,6 +268,7 @@ Stop-Process -Name explorer -Force; Start-Process explorer
 - The notification list needs Windows notification access (asked once). Windows does not let an unpackaged app activate or dismiss another app's notification directly: a click on a notification brings up the app that sent it (its window, or a launch), and Clear all / X go through each app's notification history. Switching the audio output and Do not disturb use undocumented COM interfaces that a Windows update could break.
 - Tray hosting only works while the native taskbar is hidden.
 - Developed and tested on Windows 11 only.
+- Per-user Start menu shortcuts are parsed by the dock itself, not by the Windows shell link loader. Still, the dock resolves some per-user shortcuts and reads some user-writable programs through the Windows shell in its elevated process (the Start apps list and its child, app names and icons from the Apps folder, version strings and icons of programs); a program running as you could plant a file there. This is a known, accepted residual.
 
 ## Data folder
 
@@ -270,9 +279,9 @@ Everything the dock stores is in `%ProgramData%\mini-oled-dock`:
 | `config.json` (+ `config.json.bak`) | settings | you (edit in place) and administrators; the `.bak` copy is admin-only |
 | `icons\` | your custom PNGs | you can add, replace and delete files |
 | `cache\` | extracted icon cache (PNG); `settings-catalog.bin`, the Windows Settings list that the launcher and Start search read (rebuilt when stale or damaged); `cache\<SID>\` holds one user's launcher history (commands run, picks as hashes), readable by that user and administrators | administrators only |
-| `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), deleted once that version or a newer one runs | administrators only |
-| `dock.log`, `dock.log.1` | log, rotated at 2 MB | administrators only |
-| `taskbar-state` | the original taskbar state, used to restore it | administrators only |
+| `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), `dock-guard.exe` (the copy of the old version that judges the update) and `rolled-back` (written when that release was rolled back); deleted once that version or a newer one runs | administrators only |
+| `dock.log`, `dock.log.1` | log, rotated at 2 MB; one local clock for the dock and its watchdog; it carries no window titles or tooltips (a window is named by its class) | administrators only |
+| `taskbar-state` | the original taskbar state, used to restore it; kept across a sign-out or shutdown and deleted by every other restore | administrators only |
 
 The dock runs elevated, so its data must not live where normal programs can plant links: an elevated write, rename or delete that follows a junction or hard link planted in a user-writable folder (such as the old `%LOCALAPPDATA%\Dock`) can be turned into an arbitrary file write or delete. The folder is therefore created by the elevated dock with its own protected permissions (administrators and SYSTEM full control, users read only); only `config.json` (read and write its content, not delete or rename it) and `icons\` (add files) are opened up for you, and custom icons are read with checks that refuse links and anything outside that folder. If the folder exists but was not created by an administrator (or is a link), the dock renames it away or, failing that, refuses it and runs without saving anything; the log (or DebugView, when there is no log) says to delete it from an elevated prompt.
 
@@ -286,6 +295,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
+| [1.5.1](.github/release-notes/v1.5.1.md) | unreleased | A quieter hidden dock, the updater checks GitHub's digest and puts the old version back when a new one fails, `--rollback`, the taskbar meant to be hidden again after a watchdog restore, no titles in the log |
 | [1.5.0](.github/release-notes/v1.5.0.md) | 2026-11-23 | The launcher (off by default), no freeze on a hung foreground window, taskbar edge fixes, full third-party licence texts |
 | [1.4.3](.github/release-notes/v1.4.3.md) | 2026-11-22 | Taskbar auto-hide: checks whether another bar holds the screen edge first |
 | [1.4.2](.github/release-notes/v1.4.2.md) | 2026-11-12 | Hotfix: the self-updater can download its first update |

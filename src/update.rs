@@ -4,7 +4,8 @@
 //! `update` thread (the UI thread never blocks on the network). Everything the worker learns is
 //! kept in `STATE` and mirrored into `config.json` (`last_update_check`, `update_available`).
 //! `stage()` downloads a release into the admin-only `<data>\update\<tag>\` folder and verifies it
-//! (SHA-256, then `--version`); `install_now()` hands the verified exe to `--install --quiet`.
+//! (SHA-256, then `--version`); `install_now()` hands the verified release to the update guard (`guard`: a copy of
+//! this exe that runs the release's installer, starts the new dock, judges it and puts this version back if it fails).
 //! `init`/`sync_timer`/`on_timer` drive the daily check (`TIMER_UPDATE_CHECK` on the dock window);
 //! `on_idle` installs a staged release when `update_auto_install` is on and nothing is open.
 
@@ -44,6 +45,8 @@ use crate::update_release::{
 };
 use crate::winhttp;
 
+pub(crate) mod guard;
+
 /// What the update worker is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -67,6 +70,9 @@ pub enum Outcome {
     VerifyFailed,
     Ready,
     InstallFailed(i32),
+    /// The available release was installed, failed and was rolled back (`update\<tag>\rolled-back`
+    /// exists): not installed automatically again; Update now retries it.
+    RolledBack,
 }
 
 /// Why a check gave no answer about the latest release.
@@ -149,6 +155,7 @@ impl UpdateStatus {
                 format!("Installation failed (exit code {c})"),
                 format!("Installazione non riuscita (codice {c})"),
             ),
+            Outcome::RolledBack => pick(format!("Update to {v} rolled back"), format!("Aggiornamento a {v} annullato")),
         }
     }
 }
@@ -197,8 +204,15 @@ pub(crate) fn status_from_config(c: &Config, installed: Version) -> UpdateStatus
     UpdateStatus { installed, phase: Phase::Idle, available, last_check, outcome, staged: false }
 }
 
-/// Folds a finished check into the status. A failed check changes only `outcome`.
-pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>, installed: Version, now: u64) {
+/// Folds a finished check into the status. A failed check changes only `outcome`. `rolled_back`: the
+/// newer release found has the rolled-back mark; it stays available and is shown as rolled back.
+pub(crate) fn apply_check(
+    st: &mut UpdateStatus,
+    r: &Result<Release, CheckError>,
+    installed: Version,
+    now: u64,
+    rolled_back: bool,
+) {
     match r {
         Ok(rel) if rel.version > installed => {
             // `staged` only holds for the tag that was verified: a newer tag is not downloaded yet.
@@ -209,7 +223,11 @@ pub(crate) fn apply_check(st: &mut UpdateStatus, r: &Result<Release, CheckError>
                 date: rel.published.get(..10).unwrap_or("").to_string(),
                 notes: rel.notes.clone(),
             });
-            st.outcome = if st.staged { Outcome::Ready } else { Outcome::Available };
+            st.outcome = match (rolled_back, st.staged) {
+                (true, _) => Outcome::RolledBack,
+                (false, true) => Outcome::Ready,
+                (false, false) => Outcome::Available,
+            };
             st.last_check = rfc3339_utc(now);
         }
         Ok(_) => {
@@ -422,6 +440,7 @@ fn spawn_worker(job: impl FnOnce() + Send + 'static) -> bool {
         return false;
     }
     let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         job();
         // A check or a download frees buffers the heap keeps committed: the next hidden period trims again.
         crate::mem::rearm();
@@ -447,11 +466,19 @@ pub fn check_now() -> bool {
     spawn_worker(|| {
         check_once();
         // With `update_auto_install` on, a newer release is downloaded and verified right away, so
-        // the idle gate (`on_idle`) only has to start the installer. With it off nothing is downloaded.
-        if config::get().update_auto_install {
-            if let Some(rel) = latest_target(Version::current()) {
-                let _ = stage(&rel);
+        // the idle gate (`on_idle`) only has to start the installer. With it off nothing is downloaded,
+        // and a rolled-back release is never staged, so `on_idle` never installs it.
+        let latest = LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let skip = |tag: &str| {
+            let rb = rolled_back(tag);
+            if rb {
+                crate::log!("update: {tag} was rolled back, not installed automatically");
             }
+            rb
+        };
+        let auto = config::get().update_auto_install;
+        if let Some(rel) = auto_stage_target(latest.as_ref(), Version::current(), auto, skip) {
+            let _ = stage(&rel);
         }
     })
 }
@@ -462,6 +489,7 @@ fn check_once() {
     notify();
     let installed = Version::current();
     let r = fetch_latest(true);
+    let rb = matches!(&r, Ok(rel) if rel.version > installed && rolled_back(&rel.tag));
     match &r {
         Ok(rel) if rel.version > installed => crate::log!("update: {} available", rel.tag),
         Ok(rel) => crate::log!("update: up to date (latest {})", rel.tag),
@@ -471,7 +499,7 @@ fn check_once() {
         *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = is_newer(&rel.tag, installed).then(|| rel.clone());
     }
     let (last, tag) = with_state(|s| {
-        apply_check(s, &r, installed, now_unix());
+        apply_check(s, &r, installed, now_unix(), rb);
         s.phase = Phase::Idle;
         (s.last_check.clone(), s.available.as_ref().map(|a| a.tag.clone()).unwrap_or_default())
     });
@@ -515,20 +543,32 @@ impl std::fmt::Display for StageError {
     }
 }
 
-/// Largest `--version` output read back from a staged exe.
-const CAPTURE_MAX_BYTES: u64 = 4096;
+/// Largest `--version` output read back from a staged (or installed) exe.
+pub(crate) const CAPTURE_MAX_BYTES: u64 = 4096;
 /// How long a staged exe may take to answer `--version`.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `exe` must hash to the value published in the release's `.sha256` asset.
-pub(crate) fn verify_bytes(exe: &[u8], sha_file: &[u8]) -> Result<(), String> {
+/// `exe` must hash to the value published in the release's `.sha256` asset and, when GitHub sent one,
+/// to `digest`, the SHA-256 GitHub computed for the uploaded asset (served by api.github.com, not by the
+/// host that serves both files). Hashes once and returns the hash.
+pub(crate) fn verify_bytes(exe: &[u8], sha_file: &[u8], digest: Option<[u8; 32]>) -> Result<[u8; 32], String> {
     let want = parse_sha256_file(sha_file).ok_or("unreadable .sha256 file")?;
     let got = crate::sha256::sha256(exe)?;
-    if got == want {
-        Ok(())
-    } else {
-        Err("SHA-256 mismatch".into())
+    if got != want {
+        return Err("SHA-256 mismatch".into());
     }
+    if digest.is_some_and(|d| d != got) {
+        return Err("SHA-256 differs from GitHub's digest of the asset".into());
+    }
+    Ok(got)
+}
+
+/// What a freshly fetched release announces: the sizes of `dock.exe` and `dock.exe.sha256`, and GitHub's
+/// SHA-256 digest of `dock.exe` when it sent one.
+pub(crate) struct Expected {
+    pub exe: u64,
+    pub sha: u64,
+    pub digest: Option<[u8; 32]>,
 }
 
 /// How often `run_capture` looks at its child.
@@ -550,6 +590,7 @@ pub(crate) fn run_capture(exe: &Path, args: &[&str], timeout: Duration, cap: u64
     };
     let (tx, rx) = mpsc::channel();
     let reader = std::thread::Builder::new().name("capture".into()).stack_size(64 * 1024).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         let mut out = Vec::new();
         // One byte over the cap tells "too large" from "exactly the cap".
         let read = stdout.take(cap.saturating_add(1)).read_to_end(&mut out).map(|_| out);
@@ -909,7 +950,7 @@ fn command_line(exe: &Path, args: &[&str]) -> std::io::Result<Vec<u16>> {
 fn download(rel: &Release) -> Result<(), StageError> {
     let fail = StageError::Download;
     for (asset, name, cap) in [(&rel.exe, EXE_ASSET, EXE_MAX_BYTES), (&rel.sha256, SHA_ASSET, SHA_MAX_BYTES)] {
-        let Asset { url, size } = asset;
+        let Asset { url, size, .. } = asset;
         let resp = winhttp::get(url, &[("Accept", "application/octet-stream")], cap)
             .map_err(|e| fail(format!("{name}: {e}")))?;
         if resp.status != 200 {
@@ -929,7 +970,7 @@ fn download(rel: &Release) -> Result<(), StageError> {
 }
 
 /// Checks the staged `<data>\update\<tag>\dock.exe` and returns its path: hash equal to the staged
-/// `.sha256`, then `dock.exe --version` must print exactly `mini-oled-dock <tag version>`.
+/// `.sha256` (and to GitHub's digest, when `expected` has one), then `dock.exe --version` must print exactly `mini-oled-dock <tag version>`.
 ///
 /// Running the staged exe for `--version` is safe: its SHA-256 matched the `.sha256` of the same
 /// release, both fetched over HTTPS from the allowed GitHub hosts; `datadir` has checked that the
@@ -937,13 +978,14 @@ fn download(rel: &Release) -> Result<(), StageError> {
 /// inside it; the folder was created by this elevated process, so no user can swap the file after
 /// the check.
 ///
-/// `expected` = the asset sizes of a freshly fetched release (`None` only for `--update-install`,
-/// which installs what is staged): a stage of another upload of the same tag is deleted and is
-/// `Download`, so the caller fetches the current assets.
+/// `expected` = the asset sizes and GitHub's digest of a freshly fetched release (`None` only for
+/// `--update-install`, which installs what is staged): a stage of another upload of the same tag is
+/// deleted and is `Download`, so the caller fetches the current assets; an exe whose hash differs from
+/// the digest fails verification.
 ///
 /// A missing file is `Download` (the caller downloads); any other failure deletes the folder and
 /// is `Verify`.
-pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<PathBuf, StageError> {
+pub(crate) fn verify_stage(tag: &str, expected: Option<&Expected>) -> Result<PathBuf, StageError> {
     let Some(version) = parse_tag(tag) else {
         return Err(StageError::Verify(format!("{tag:?} is not a canonical tag")));
     };
@@ -963,7 +1005,7 @@ pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<Pa
         (Err(e), _) | (_, Err(e)) => Err(format!("cannot read the staged files: {e}")),
     };
     let checked = files.and_then(|(exe, sha)| {
-        verify_bytes(&exe, &sha)?;
+        verify_bytes(&exe, &sha, expected.and_then(|e| e.digest))?;
         drop(exe);
         let path = datadir::checked_stage_path(tag, EXE_ASSET).map_err(|e| format!("staged exe: {e}"))?;
         let (code, out) = run_capture(&path, &["--version"], VERSION_TIMEOUT, CAPTURE_MAX_BYTES)?;
@@ -984,10 +1026,9 @@ pub(crate) fn verify_stage(tag: &str, expected: Option<(u64, u64)>) -> Result<Pa
     })
 }
 
-/// true when the staged files have the sizes `expected` (exe, sha256) announces, or no sizes are
-/// expected.
-fn stage_sizes_match(exe: &[u8], sha: &[u8], expected: Option<(u64, u64)>) -> bool {
-    expected.is_none_or(|(e, s)| exe.len() as u64 == e && sha.len() as u64 == s)
+/// true when the staged files have the sizes `expected` announces, or no sizes are expected.
+fn stage_sizes_match(exe: &[u8], sha: &[u8], expected: Option<&Expected>) -> bool {
+    expected.is_none_or(|e| exe.len() as u64 == e.exe && sha.len() as u64 == e.sha)
 }
 
 fn set_phase(phase: Phase) {
@@ -1000,13 +1041,16 @@ fn set_phase(phase: Phase) {
 /// `Ready` / `DownloadFailed` / `VerifyFailed` outcomes.
 fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     set_phase(Phase::Verifying);
-    let sizes = Some((rel.exe.size, rel.sha256.size));
-    let mut r = verify_stage(&rel.tag, sizes);
+    let expected = Expected { exe: rel.exe.size, sha: rel.sha256.size, digest: rel.exe.digest };
+    if expected.digest.is_none() {
+        crate::log!("update: GitHub sent no digest for {}/{EXE_ASSET}; checked against {SHA_ASSET} only", rel.tag);
+    }
+    let mut r = verify_stage(&rel.tag, Some(&expected));
     if matches!(r, Err(StageError::Download(_))) {
         set_phase(Phase::Downloading);
         r = download(rel).and_then(|()| {
             set_phase(Phase::Verifying);
-            verify_stage(&rel.tag, sizes)
+            verify_stage(&rel.tag, Some(&expected))
         });
     }
     match &r {
@@ -1026,16 +1070,87 @@ fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     r
 }
 
-/// Arguments the staged exe is started with: it stops this dock through `Local\DockStop`, replaces
-/// the installed exe, re-registers the task, writes the ARP key and relaunches.
-pub(crate) const INSTALL_ARGS: &str = "--install --quiet";
-/// How long the dock (or `--update-install`) waits for the installer child.
+/// How long the dock waits for the update guard, and the guard (or `--rollback`) for the installer it starts.
 const INSTALL_WAIT: Duration = Duration::from_secs(120);
+
+/// Why the update guard was not started (`arm_guard`).
+#[derive(Debug)]
+pub(crate) enum ArmError {
+    /// `CreateProcessW` of the guard failed.
+    Spawn(String),
+    /// This process is not the installed `dock.exe`: the guard must be a copy of the installed old version.
+    NotInstalledCopy,
+    /// The guard's copy in the stage could not be made or checked.
+    Stage(String),
+}
+
+impl ArmError {
+    /// The code `Outcome::InstallFailed` shows: negative, never one of the guard's own exit codes.
+    fn code(&self) -> i32 {
+        match self {
+            ArmError::Spawn(_) => -1,
+            ArmError::NotInstalledCopy => -2,
+            ArmError::Stage(_) => -3,
+        }
+    }
+}
+
+impl std::fmt::Display for ArmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArmError::Spawn(e) => write!(f, "cannot start the update guard: {e}"),
+            ArmError::NotInstalledCopy => write!(f, "this is not the installed dock.exe"),
+            ArmError::Stage(e) => write!(f, "cannot stage the update guard: {e}"),
+        }
+    }
+}
+
+/// Starts the update guard for the verified stage `tag`: a copy of this exe, which must be the installed old version,
+/// as `update\<tag>\dock-guard.exe --update-guard <tag>` (`guard::run_cli`). The kernel copies the file
+/// (`datadir::copy_into_stage`), so this process's heap never holds the image. Started by `spawn_breakaway`, never by
+/// `spawn_in_job`: the guard must outlive this dock, which the release's installer stops.
+fn arm_guard(tag: &str) -> Result<OwnedHandle, ArmError> {
+    let me = std::env::current_exe().map_err(|_| ArmError::NotInstalledCopy)?;
+    if !crate::autostart::installed_exe().is_ok_and(|dest| crate::autostart::same_file(&me, &dest)) {
+        return Err(ArmError::NotInstalledCopy);
+    }
+    let name = update_release::GUARD_FILE;
+    datadir::copy_into_stage(tag, name, &me).map_err(ArmError::Stage)?;
+    let path = datadir::checked_stage_path(tag, name).map_err(|e| ArmError::Stage(e.to_string()))?;
+    let child = crate::watchdog::spawn_breakaway(&path, &guard::guard_args(tag)).map_err(ArmError::Spawn)?;
+    crate::log!("update: {tag}: update guard started");
+    Ok(child)
+}
+
+/// true when an automatic install leaves the release alone: it was rolled back. Update now (`manual`) retries it. Pure.
+fn skip_install(manual: bool, rolled_back: bool) -> bool {
+    !manual && rolled_back
+}
 
 /// The release to install: only a freshly fetched one (`LATEST`), and only if newer than
 /// `installed`. A badge restored from `config.json` alone never installs anything.
 pub(crate) fn install_target(latest: Option<&Release>, installed: Version) -> Option<Release> {
     latest.filter(|r| r.version > installed).cloned()
+}
+
+/// The release a check stages for the automatic install: the freshly fetched newer one, only with
+/// `update_auto_install` on, and never one `rolled_back` says was rolled back. Pure.
+pub(crate) fn auto_stage_target(
+    latest: Option<&Release>,
+    installed: Version,
+    auto_install: bool,
+    rolled_back: impl Fn(&str) -> bool,
+) -> Option<Release> {
+    if !auto_install {
+        return None;
+    }
+    install_target(latest, installed).filter(|r| !rolled_back(&r.tag))
+}
+
+/// true when `update\<tag>\rolled-back` exists in the admin-only stage folder (the update guard rolled
+/// `<tag>` back). Reads the disk: never on the UI thread.
+fn rolled_back(tag: &str) -> bool {
+    datadir::checked_stage_path(tag, update_release::ROLLED_BACK_FILE).is_ok()
 }
 
 fn latest_target(installed: Version) -> Option<Release> {
@@ -1056,12 +1171,23 @@ fn wait_exit(process: &OwnedHandle, timeout: Duration) -> Option<i32> {
     Some(code as i32)
 }
 
-/// Installs the newest release on the worker thread: check if nothing fresh is known, stage (download +
-/// verify), then hand the verified exe to `--install --quiet`. The child stops this dock through its
-/// normal stop path (`WM_DOCK_QUIT_REQUEST`, cleanup, taskbar restored, exit 0). false = an update
+/// Update now (Settings): installs the newest release, a rolled-back one too (`start_install`). false = an update
 /// operation is already running.
 pub fn install_now() -> bool {
-    spawn_worker(|| {
+    start_install(true)
+}
+
+/// The automatic install (`on_idle`): as `install_now`, but never a release that was rolled back.
+fn install_auto() -> bool {
+    start_install(false)
+}
+
+/// Installs the newest release on the worker thread: check if nothing fresh is known, stage (download +
+/// verify), then hand the verified release to the update guard (`arm_guard`). The guard's installer stops this
+/// dock through its normal stop path (`WM_DOCK_QUIT_REQUEST`, cleanup, taskbar restored, exit 0). `manual` = Update
+/// now. false = an update operation is already running.
+fn start_install(manual: bool) -> bool {
+    spawn_worker(move || {
         let installed = Version::current();
         let rel = match latest_target(installed) {
             Some(r) => r,
@@ -1074,6 +1200,10 @@ pub fn install_now() -> bool {
                 }
             }
         };
+        if skip_install(manual, rolled_back(&rel.tag)) {
+            crate::log!("update: {} was rolled back, not installed automatically", rel.tag);
+            return;
+        }
         let Ok(path) = stage(&rel) else { return };
         set_phase(Phase::Installing);
         crate::log!("update: installing {} from {}", rel.tag, path.display());
@@ -1084,24 +1214,24 @@ pub fn install_now() -> bool {
             });
             notify();
         };
-        let child = match crate::watchdog::spawn_breakaway(&path, INSTALL_ARGS) {
+        let child = match arm_guard(&rel.tag) {
             Ok(c) => c,
             Err(e) => {
-                crate::log!("update: cannot start the installer: {e}");
-                return failed(-1);
+                crate::log!("update: {}: {e}", rel.tag);
+                return failed(e.code());
             }
         };
         match wait_exit(&child, INSTALL_WAIT) {
             Some(0) => {
-                crate::log!("update: the installer finished but the dock is still running");
+                crate::log!("update: the update guard finished but the dock is still running");
                 set_phase(Phase::Idle);
             }
             Some(code) => {
-                crate::log!("update: the installer exited with {code}; the stage {} is kept", rel.tag);
+                crate::log!("update: the update guard exited with {code}; the stage {} is kept", rel.tag);
                 failed(code);
             }
             None => {
-                crate::log!("update: the installer did not finish within {} s", INSTALL_WAIT.as_secs());
+                crate::log!("update: the update guard did not finish within {} s", INSTALL_WAIT.as_secs());
                 set_phase(Phase::Idle);
             }
         }
@@ -1124,8 +1254,9 @@ fn cleanup_stages() {
     }
 }
 
-/// `--update-install <tag>`: installs an already staged release. The only input is a canonical tag,
-/// mapped to `<data>\update\<tag>\`; there is no path argument. Returns the installer's exit code.
+/// `--update-install <tag>`: hands an already staged release to the update guard (`arm_guard`). The only input is a
+/// canonical tag, mapped to `<data>\update\<tag>\`; there is no path argument. Runs only from the installed
+/// `dock.exe` (the guard is a copy of it) and exits at once: that image must not stay mapped for the install's swap.
 pub fn run_install_cli(tag: &str) -> i32 {
     let say = crate::logger::say;
     if parse_tag(tag).is_none() {
@@ -1136,44 +1267,24 @@ pub fn run_install_cli(tag: &str) -> i32 {
         say("the data folder is not writable (run elevated)");
         return 1;
     }
-    let path = match verify_stage(tag, None) {
-        Ok(p) => p,
-        Err(e) => {
-            say(&format!("{tag}: {e}"));
-            return 1;
-        }
-    };
-    crate::log!("update: installing {tag} from {}", path.display());
-    let child = match crate::watchdog::spawn_breakaway(&path, INSTALL_ARGS) {
-        Ok(c) => c,
-        Err(e) => {
-            say(&format!("cannot start the installer: {e}"));
-            return 1;
-        }
-    };
-    // Run from the installed dock.exe, waiting would keep that image mapped: the installer's rename
-    // over it fails and `exe_in_use_by_other` counts this process as a holder, so the install could
-    // never succeed. Let it run on its own; it logs its outcome.
-    let from_installed = match (std::env::current_exe(), crate::autostart::installed_exe()) {
-        (Ok(me), Ok(dest)) => crate::autostart::same_file(&me, &dest),
-        _ => false,
-    };
-    if from_installed {
-        drop(child);
-        say("Installer started; see dock.log.");
-        return 0;
+    if let Err(e) = verify_stage(tag, None) {
+        say(&format!("{tag}: {e}"));
+        return 1;
     }
-    match wait_exit(&child, INSTALL_WAIT) {
-        Some(0) => {
-            say(&format!("Installed {tag}."));
+    // Waiting would keep the installed image mapped: the installer's rename over it fails and `exe_in_use_by_other`
+    // counts this process as a holder. The guard runs on its own and logs its outcome.
+    match arm_guard(tag) {
+        Ok(child) => {
+            drop(child);
+            say(&format!("Update guard started for {tag}; see dock.log."));
             0
         }
-        Some(code) => {
-            say(&format!("Installer exited with {code}."));
-            cli_code(code)
+        Err(ArmError::NotInstalledCopy) => {
+            say(r"run the installed dock.exe (%ProgramFiles%\mini-oled-dock\dock.exe)");
+            1
         }
-        None => {
-            say(&format!("The installer did not finish within {} s.", INSTALL_WAIT.as_secs()));
+        Err(e) => {
+            say(&e.to_string());
             1
         }
     }
@@ -1228,7 +1339,24 @@ static AUTO_TRIED: Mutex<String> = Mutex::new(String::new());
 pub fn init(h: HWND) {
     let st = status_from_config(&config::get(), Version::current());
     with_state(|s| *s = st);
-    let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(cleanup_stages);
+    let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(|| {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
+        cleanup_stages();
+        // A release rolled back before this start says so again (its stage, above this version, is kept).
+        let Some(tag) = status().available.map(|a| a.tag).filter(|t| rolled_back(t)) else {
+            return;
+        };
+        let set = with_state(|s| {
+            let idle = s.phase == Phase::Idle && s.available.as_ref().is_some_and(|a| a.tag == tag);
+            if idle {
+                s.outcome = Outcome::RolledBack;
+            }
+            idle
+        });
+        if set {
+            notify();
+        }
+    });
     if let Err(e) = spawned {
         crate::log!("update: cannot start the cleanup thread: {e}");
     }
@@ -1317,7 +1445,7 @@ pub fn on_idle(busy: bool) {
         return;
     }
     let Some(a) = st.available else { return };
-    if install_now() {
+    if install_auto() {
         *AUTO_TRIED.lock().unwrap_or_else(|e| e.into_inner()) = a.tag.clone();
         crate::log!("update: auto-install {}", a.tag);
     }
@@ -1358,15 +1486,15 @@ mod tests {
         let cur = Version::parse("1.4.0").unwrap();
         let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap();
         let mut s = status_from_config(&Config::default(), cur);
-        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_227_696);
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_227_696, false);
         assert_eq!((s.outcome.clone(), s.badge()), (Outcome::Available, 1));
         assert_eq!(s.available.as_ref().unwrap().date, "2026-11-20");
         assert_eq!(s.last_check, "2026-11-09T12:34:56Z");
-        apply_check(&mut s, &Err(CheckError::Http(403)), cur, 1_794_300_000);
+        apply_check(&mut s, &Err(CheckError::Http(403)), cur, 1_794_300_000, false);
         assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::Http(403)));
-        apply_check(&mut s, &Err(CheckError::Network("timeout".into())), cur, 1_794_300_000);
+        apply_check(&mut s, &Err(CheckError::Network("timeout".into())), cur, 1_794_300_000, false);
         assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::NoConnection));
-        apply_check(&mut s, &Err(CheckError::Invalid("no dock.exe asset".into())), cur, 1_794_300_000);
+        apply_check(&mut s, &Err(CheckError::Invalid("no dock.exe asset".into())), cur, 1_794_300_000, false);
         assert_eq!(s.outcome, Outcome::CouldNotCheck(CheckFail::Invalid));
         if !crate::i18n::italian() {
             assert_eq!(s.line(), "Could not check for updates (unexpected answer)");
@@ -1375,30 +1503,84 @@ mod tests {
         assert_eq!((s.badge(), s.last_check.as_str()), (1, "2026-11-09T12:34:56Z"));
         // the staged tag survives a re-check of the same tag, not a newer one
         s.staged = true;
-        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_300_000);
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_300_000, false);
         assert_eq!((s.staged, s.outcome.clone()), (true, Outcome::Ready));
         let newer = Release { tag: "v1.4.9".into(), version: Version::parse("1.4.9").unwrap(), ..rel.clone() };
-        apply_check(&mut s, &Ok(newer), cur, 1_794_300_000);
+        apply_check(&mut s, &Ok(newer), cur, 1_794_300_000, false);
         assert_eq!((s.staged, s.outcome.clone(), s.badge()), (false, Outcome::Available, 1));
         let same = Release { tag: "v1.4.0".into(), version: cur, ..rel };
-        apply_check(&mut s, &Ok(same), cur, 1_794_300_000);
+        apply_check(&mut s, &Ok(same), cur, 1_794_300_000, false);
         assert_eq!((s.outcome.clone(), s.badge()), (Outcome::UpToDate, 0));
+    }
+
+    #[test]
+    fn rolled_back_release_line() {
+        let mut s = status_from_config(&Config::default(), Version::parse("1.5.0").unwrap());
+        let version = Version::parse("1.5.3").unwrap();
+        s.available = Some(Available { tag: version.tag(), version, date: String::new(), notes: String::new() });
+        s.outcome = Outcome::RolledBack;
+        if !crate::i18n::italian() {
+            assert_eq!(s.line(), "Update to 1.5.3 rolled back");
+        }
+    }
+
+    #[test]
+    fn a_check_keeps_a_rolled_back_release_visible() {
+        let cur = Version::parse("1.4.0").unwrap();
+        let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap(); // v1.4.1
+        let mut s = status_from_config(&Config::default(), cur);
+        apply_check(&mut s, &Ok(rel.clone()), cur, 1_794_227_696, true);
+        assert_eq!((s.outcome.clone(), s.badge(), s.staged), (Outcome::RolledBack, 1, false));
+        assert_eq!(s.available.as_ref().map(|a| a.tag.as_str()), Some("v1.4.1"));
+        assert_eq!(s.last_check, "2026-11-09T12:34:56Z");
+        // Nothing newer: up to date, whatever the mark says.
+        let same = Release { tag: "v1.4.0".into(), version: cur, ..rel };
+        apply_check(&mut s, &Ok(same), cur, 1_794_300_000, true);
+        assert_eq!((s.outcome.clone(), s.badge()), (Outcome::UpToDate, 0));
+    }
+
+    #[test]
+    fn auto_stage_skips_a_rolled_back_release() {
+        let cur = Version::parse("1.4.0").unwrap();
+        let rel = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap(); // v1.4.1
+        assert_eq!(auto_stage_target(Some(&rel), cur, true, |t| t == "v1.4.1"), None);
+        assert_eq!(auto_stage_target(Some(&rel), cur, true, |_| false), Some(rel.clone()));
+        assert_eq!(auto_stage_target(Some(&rel), cur, false, |_| false), None);
+        assert_eq!(auto_stage_target(None, cur, true, |_| false), None);
+        assert_eq!(auto_stage_target(Some(&rel), Version::parse("1.4.1").unwrap(), true, |_| false), None);
     }
 
     #[test]
     fn verify_bytes_compares_the_published_hash() {
         let sha = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  dock.exe\r\n";
-        assert!(verify_bytes(b"abc", sha).is_ok());
-        assert!(verify_bytes(b"abd", sha).is_err());
-        assert!(verify_bytes(b"abc", b"not a hash").is_err());
+        assert!(verify_bytes(b"abc", sha, None).is_ok());
+        assert!(verify_bytes(b"abd", sha, None).is_err());
+        assert!(verify_bytes(b"abc", b"not a hash", None).is_err());
+    }
+
+    #[test]
+    fn verify_bytes_checks_the_github_digest() {
+        let sha = b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  dock.exe\r\n";
+        let abc = parse_sha256_file(sha).unwrap();
+        assert_eq!(verify_bytes(b"abc", sha, Some(abc)), Ok(abc));
+        let mut other = abc;
+        other[31] ^= 1;
+        let e = verify_bytes(b"abc", sha, Some(other)).unwrap_err();
+        assert!(e.contains("digest"), "{e}");
+        // No digest: the .sha256 check alone, as before.
+        assert_eq!(verify_bytes(b"abc", sha, None), Ok(abc));
+        assert!(verify_bytes(b"abd", sha, None).unwrap_err().contains("SHA-256 mismatch"));
+        // The .sha256 asset is checked first, whatever the digest says.
+        assert!(verify_bytes(b"abd", sha, Some(abc)).unwrap_err().contains("SHA-256 mismatch"));
     }
 
     #[test]
     fn a_stage_must_match_the_fetched_asset_sizes() {
-        assert!(stage_sizes_match(b"abc", b"0123", Some((3, 4))));
+        let sizes = |exe, sha| Expected { exe, sha, digest: None };
+        assert!(stage_sizes_match(b"abc", b"0123", Some(&sizes(3, 4))));
         assert!(stage_sizes_match(b"abc", b"0123", None)); // --update-install: staged only
-        assert!(!stage_sizes_match(b"abcd", b"0123", Some((3, 4)))); // re-uploaded exe
-        assert!(!stage_sizes_match(b"abc", b"012", Some((3, 4)))); // re-uploaded .sha256
+        assert!(!stage_sizes_match(b"abcd", b"0123", Some(&sizes(3, 4)))); // re-uploaded exe
+        assert!(!stage_sizes_match(b"abc", b"012", Some(&sizes(3, 4)))); // re-uploaded .sha256
     }
 
     fn system32(exe: &str) -> PathBuf {
@@ -1642,6 +1824,21 @@ mod tests {
         assert_eq!(install_target(None, cur), None); // a badge from config.json alone never installs
         assert_eq!(install_target(Some(&rel), cur), Some(rel.clone()));
         assert_eq!(install_target(Some(&rel), Version::parse("1.4.1").unwrap()), None);
-        assert_eq!(INSTALL_ARGS, "--install --quiet");
+        assert_eq!(guard::guard_args("v1.4.1"), "--update-guard v1.4.1");
+    }
+
+    #[test]
+    fn arm_errors_have_distinct_codes() {
+        assert_eq!(ArmError::Spawn("x".into()).code(), -1);
+        assert_eq!(ArmError::NotInstalledCopy.code(), -2);
+        assert_eq!(ArmError::Stage("x".into()).code(), -3);
+    }
+
+    #[test]
+    fn an_automatic_install_skips_a_rolled_back_release() {
+        assert!(skip_install(false, true));
+        assert!(!skip_install(true, true), "Update now retries a rolled-back release");
+        assert!(!skip_install(false, false));
+        assert!(!skip_install(true, false));
     }
 }

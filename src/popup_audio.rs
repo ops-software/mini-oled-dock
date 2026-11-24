@@ -32,6 +32,7 @@ use crate::audio::{self, AppSession, OutputDevice, SpatialState, VolumeState, WH
 use crate::config::{self, AudioLayout, AUDIO_MASTER, AUDIO_MIXER, AUDIO_OUTPUT, AUDIO_SPATIAL};
 use crate::glyphs;
 use crate::i18n::tr;
+use crate::popup::popup_scroll::ScrollArea;
 use crate::popup::{
     center_y, hline, launch, lift, paint_slider, row_plate, slider_value_at, tick_ms, Content, DataEvent, HitMap, PopupKind, Reply,
 };
@@ -41,6 +42,8 @@ use crate::surface::{rect_wh, Font, Surface, PANEL_PAD, TEXT2_ALPHA, TEXT3_ALPHA
 const ID_MUTE: u32 = 1;
 const ID_SLIDER: u32 = 2;
 const ID_MIXER: u32 = 3;
+/// The thin scroll bar (only while the popup scrolls); first in the hit test, never clickable.
+const ID_SCROLLBAR: u32 = 900;
 /// Pencil button: Customize mode on / off.
 /// PREVIEW-HOOK: `preview` clicks it to render the Customize mode.
 pub(crate) const ID_EDIT: u32 = 4;
@@ -159,6 +162,28 @@ pub(crate) struct AudioPopup {
     /// Name column of the mixer rows: x and width.
     app_name_x: i32,
     app_name_w: i32,
+    /// Tallest the popup may be (`Content::limit`); `None` until the popup asked.
+    max_h: Option<i32>,
+    /// Scrolling of everything above the footer (separator, link and pencil) when the popup is too tall.
+    scroll: ScrollArea,
+}
+
+/// What the wheel does at a point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelAction {
+    /// Master volume (the historical behavior).
+    Volume,
+    /// Scroll the list.
+    Scroll,
+}
+
+/// Over a slider the wheel stays the master volume; elsewhere it scrolls when the popup is scrollable.
+fn wheel_action(scrollable: bool, over_slider: bool) -> WheelAction {
+    if scrollable && !over_slider {
+        WheelAction::Scroll
+    } else {
+        WheelAction::Volume
+    }
 }
 
 /// Creates the content (initial state).
@@ -195,6 +220,8 @@ pub(crate) fn new(volume: VolumeState) -> Box<dyn Content> {
         sep2: 0,
         app_name_x: 0,
         app_name_w: 0,
+        max_h: None,
+        scroll: ScrollArea::new(),
     };
     p.sync_loading();
     Box::new(p)
@@ -661,7 +688,18 @@ impl Content for AudioPopup {
         let row = p(ROW);
         let head = p(HEAD);
         let tool = p(TOOL);
-        let mut y = p(TOP);
+        // Too tall for the room: everything above the footer scrolls under a clip, the footer stays whole.
+        let foot = p(6) + p(1) + p(6) + row + inset;
+        let full = popup_height(&p, &self.layout, self.customize, counts);
+        match self.max_h {
+            Some(max) if full > max && max > foot + p(TOP) => {
+                let view = RECT { left: 0, top: p(3), right: self.width, bottom: max - foot };
+                self.scroll.set(m, view, full - foot, tick_ms());
+            }
+            _ => self.scroll.clear(),
+        }
+        let scrolled = self.scroll.scrollable();
+        let mut y = p(TOP) - self.scroll.offset();
         for (i, b) in blocks.iter().copied().enumerate() {
             let sep = if i > 0 {
                 let line = y + p(4);
@@ -730,6 +768,9 @@ impl Content for AudioPopup {
             }
             self.placed.push(Placed { b, sep, head: hrc, content_top, end: y });
         }
+        if scrolled {
+            y = self.scroll.view.bottom;
+        }
         y += p(6);
         self.sep2 = y;
         y += p(1) + p(6);
@@ -737,7 +778,7 @@ impl Content for AudioPopup {
         self.hits.add(ID_MIXER, rect_wh(inset, y, self.width - 2 * inset - row - p(4), row));
         self.hits.add(ID_EDIT, rect_wh(self.width - inset - row, y, row, row));
         y += row + inset;
-        debug_assert_eq!(y, popup_height(&p, &self.layout, self.customize, counts));
+        debug_assert!(scrolled || y == popup_height(&p, &self.layout, self.customize, counts));
         (self.width, y)
     }
 
@@ -748,6 +789,10 @@ impl Content for AudioPopup {
         let text_x0 = m.px(TEXT_COL);
         let text_x1 = self.width - m.px(TEXT_COL);
         let dragged = self.dragging_header().map(|(section, _)| section);
+        let scrolled = self.scroll.scrollable();
+        if scrolled {
+            s.set_clip(Some(self.scroll.view));
+        }
         for pl in &self.placed {
             if let Some(y) = pl.sep {
                 hline(s, text_x0, text_x1, y);
@@ -765,8 +810,11 @@ impl Content for AudioPopup {
             }
         }
 
-        hline(s, text_x0, text_x1, self.sep2);
         self.paint_drop_line(s);
+        if scrolled {
+            s.set_clip(None);
+        }
+        hline(s, text_x0, text_x1, self.sep2);
         if let Some(rc) = self.hits.rect(ID_MIXER) {
             let h = row_plate(s, rc, ID_MIXER, hot, pressed);
             // The hint of a hovered pencil / Customize control replaces the link label meanwhile
@@ -803,10 +851,62 @@ impl Content for AudioPopup {
             let gy = rc.top + ((rc.bottom - rc.top) - icon) / 2;
             s.glyph(gx, gy, icon, lift(base, h), &glyphs::pencil_shape);
         }
+        if scrolled {
+            self.scroll.paint(s, tick_ms());
+        }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
-        self.hits.at(x, y)
+        if !self.scroll.scrollable() {
+            return self.hits.at(x, y);
+        }
+        if self.scroll.in_zone(x, y) {
+            return Some(ID_SCROLLBAR);
+        }
+        let id = self.hits.at(x, y)?;
+        let footer = matches!(id, ID_MIXER | ID_EDIT);
+        // Rows shifted past the view stay under the footer: only the footer answers there.
+        let below = y >= self.scroll.view.bottom;
+        let above = y < self.scroll.view.top;
+        (footer == below && !above).then_some(id)
+    }
+
+    fn clickable(&self, id: u32) -> bool {
+        id != ID_SCROLLBAR
+    }
+
+    fn scroll_cap(&self) -> bool {
+        true
+    }
+
+    fn limit(&mut self, max: (i32, i32)) {
+        self.max_h = Some(max.1);
+    }
+
+    fn pointer(&mut self, x: i32, y: i32) -> Reply {
+        let hot = self.scroll.in_zone(x, y);
+        if hot == self.scroll.hot {
+            return Reply::None;
+        }
+        self.scroll.hot = hot;
+        Reply::Redraw
+    }
+
+    fn leave(&mut self) -> Reply {
+        let was = std::mem::replace(&mut self.scroll.hot, false);
+        if was {
+            Reply::Redraw
+        } else {
+            Reply::None
+        }
+    }
+
+    fn tick(&mut self) -> Reply {
+        if self.scroll.hide_due(tick_ms()) {
+            Reply::Redraw
+        } else {
+            Reply::None
+        }
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -875,6 +975,9 @@ impl Content for AudioPopup {
     fn drag(&mut self, id: u32, x: i32, y: i32) -> Reply {
         // A new press or move: any click to swallow belonged to the previous release.
         self.swallow = None;
+        if id == ID_SCROLLBAR {
+            return if self.scroll.drag_to(y, tick_ms()) { Reply::Relayout } else { Reply::None };
+        }
         if let Some((ID_HEAD, section)) = split(id) {
             return self.drag_header(section, y);
         }
@@ -935,8 +1038,16 @@ impl Content for AudioPopup {
         Reply::None
     }
 
-    fn wheel(&mut self, notches: i32, _x: i32, _y: i32) -> Reply {
-        // Always the master volume, whatever the layout (collapsed or hidden master included).
+    fn wheel(&mut self, notches: i32, x: i32, y: i32) -> Reply {
+        let in_view = y >= self.scroll.view.top && y < self.scroll.view.bottom;
+        let over_slider =
+            in_view && self.hits.at(x, y).is_some_and(|id| id == ID_SLIDER || (ID_APP_SLIDER..ID_END).contains(&id));
+        if wheel_action(self.scroll.scrollable(), over_slider) == WheelAction::Scroll {
+            let moved = self.scroll.by(-notches * self.scroll.step(), tick_ms());
+            return if moved { Reply::Relayout } else { Reply::Redraw };
+        }
+        // Over a slider, or when nothing scrolls: the master volume, whatever the layout (collapsed or hidden
+        // master included).
         let delta = notches * WHEEL_STEP_PERCENT;
         shell_thread::request(ShellRequest::VolumeAdjust { delta_percent: delta });
         self.level = (self.level as i32 + delta).clamp(0, 100) as u8;
@@ -1077,6 +1188,153 @@ mod tests {
         let mut l = AudioLayout::default();
         assert!(l.move_to(AUDIO_MASTER, 3));
         assert_eq!(popup_height(&px, &l, false, c), full);
+    }
+
+    fn loaded(max: Option<i32>, apps: usize) -> AudioPopup {
+        // A popup without the Windows side: only the layout and the geometry are exercised.
+        let mut p = AudioPopup {
+            level: 50,
+            muted: false,
+            available: true,
+            layout: AudioLayout::default(),
+            customize: false,
+            asked: 0,
+            outputs: Some(
+                (0..6)
+                    .map(|i| OutputDevice {
+                        id: format!("d{i}"),
+                        name: format!("Device {i}"),
+                        is_default: i == 0,
+                        kind: audio::DeviceKind::Speaker,
+                    })
+                    .collect(),
+            ),
+            spatial: None,
+            spatial_loaded: true,
+            sessions: Some(
+                (0..apps)
+                    .map(|i| AppSession {
+                        pid: i as u32 + 1,
+                        system: false,
+                        name: format!("App {i}"),
+                        level: 50,
+                        muted: false,
+                    })
+                    .collect(),
+            ),
+            dragging: false,
+            drag_app: None,
+            reorder: None,
+            swallow: None,
+            drag_min: DRAG_MIN,
+            last_set: 0,
+            open_mixer: false,
+            hits: HitMap::default(),
+            placed: Vec::new(),
+            width: 0,
+            pad: 0,
+            slider: RECT::default(),
+            knob_r: 7,
+            pct_right: 0,
+            sep2: 0,
+            app_name_x: 0,
+            app_name_w: 0,
+            max_h: max,
+            scroll: ScrollArea::new(),
+        };
+        p.layout = AudioLayout::default();
+        p
+    }
+
+    fn size_of(p: &mut AudioPopup) -> (i32, i32) {
+        let s = Surface::new(crate::render::Metrics { dpi: 96 }).expect("surface");
+        p.size(&s)
+    }
+
+    #[test]
+    fn fitting_popup_is_unchanged() {
+        let mut free = loaded(None, 3);
+        let (w, h) = size_of(&mut free);
+        let c = free.counts();
+        assert_eq!(h, popup_height(&|v| v, &free.layout, false, c));
+        let mut roomy = loaded(Some(h), 3);
+        assert_eq!(size_of(&mut roomy), (w, h));
+        assert!(!roomy.scroll.scrollable());
+        // The same rectangles with and without a limit that is not reached.
+        for id in [ID_MUTE, ID_SLIDER, ID_MIXER, ID_EDIT, ID_DEVICE, ID_APP_MUTE] {
+            let (a, b) = (free.hits.rect(id), roomy.hits.rect(id));
+            assert_eq!(a.map(|r| (r.left, r.top, r.right, r.bottom)), b.map(|r| (r.left, r.top, r.right, r.bottom)));
+        }
+    }
+
+    #[test]
+    fn many_sessions_scroll_inside_max() {
+        let mut p = loaded(Some(400), audio::MAX_SESSIONS);
+        let (_, h) = size_of(&mut p);
+        assert_eq!(h, 400, "the popup takes the room and no more");
+        assert!(p.scroll.scrollable());
+        let foot = 6 + 1 + 6 + ROW + 8;
+        assert_eq!(p.scroll.view.bottom, 400 - foot);
+        // The footer is whole and inside the popup, at its bottom, before and after the end of the list.
+        let check = |p: &AudioPopup| {
+            let link = p.hits.rect(ID_MIXER).unwrap();
+            let edit = p.hits.rect(ID_EDIT).unwrap();
+            assert_eq!(link.bottom + 8, 400);
+            assert_eq!(edit.bottom + 8, 400);
+            assert!(link.top >= p.scroll.view.bottom);
+            assert_eq!(p.hit(link.left + 2, link.top + 2), Some(ID_MIXER));
+            assert_eq!(p.hit(edit.left + 2, edit.top + 2), Some(ID_EDIT));
+        };
+        check(&p);
+        p.scroll.by(100_000, 0);
+        assert_eq!(size_of(&mut p), (320, 400));
+        check(&p);
+        // At the end the last mixer row is inside the view.
+        let last = p.hits.rect(ID_APP_SLIDER + audio::MAX_SESSIONS as u32 - 1).unwrap();
+        assert!(last.bottom <= p.scroll.view.bottom);
+        // A row scrolled under the footer does not answer there.
+        p.scroll.by(-100_000, 0);
+        size_of(&mut p);
+        let tail = p.hits.rect(ID_APP_SLIDER + audio::MAX_SESSIONS as u32 - 1).unwrap();
+        assert!(tail.top >= p.scroll.view.bottom);
+        assert_eq!(p.hit(tail.left + 2, tail.top + 2), None);
+        // The bar zone wins at the right edge and is not clickable.
+        assert_eq!(p.hit(319, 50), Some(ID_SCROLLBAR));
+        assert!(!p.clickable(ID_SCROLLBAR));
+    }
+
+    #[test]
+    fn leaving_the_popup_clears_the_hot_bar() {
+        let mut p = loaded(Some(400), audio::MAX_SESSIONS);
+        size_of(&mut p);
+        assert!(matches!(p.pointer(319, 50), Reply::Redraw));
+        assert!(p.scroll.hot);
+        assert!(matches!(p.leave(), Reply::Redraw));
+        assert!(!p.scroll.hot);
+        assert!(matches!(p.leave(), Reply::None));
+    }
+
+    #[test]
+    fn wheel_action_table() {
+        assert_eq!(wheel_action(false, false), WheelAction::Volume);
+        assert_eq!(wheel_action(false, true), WheelAction::Volume);
+        assert_eq!(wheel_action(true, true), WheelAction::Volume);
+        assert_eq!(wheel_action(true, false), WheelAction::Scroll);
+    }
+
+    #[test]
+    fn customize_reorder_with_offset() {
+        let mut p = loaded(Some(300), 2);
+        p.customize = true;
+        size_of(&mut p);
+        assert!(p.scroll.scrollable());
+        p.scroll.by(60, 0);
+        size_of(&mut p);
+        // Headers sit at their shifted places: a header released at its own midpoint stays, one released
+        // below the view lands in the last slot.
+        let mids: Vec<i32> = p.placed.iter().map(|pl| (pl.head.top + pl.head.bottom) / 2).collect();
+        assert_eq!(drop_index(mids.iter().copied(), 0, mids[0]), 0);
+        assert_eq!(drop_index(mids.iter().copied(), 0, p.scroll.view.bottom + 10_000), mids.len() - 1);
     }
 
     #[test]

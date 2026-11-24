@@ -145,6 +145,7 @@ fn start(open: u32, r: Req, ui: isize) -> Option<Arc<Inbox>> {
     let own = inbox.clone();
     let folders = FOLDERS.with(|f| f.try_borrow().map(|f| f.clone()).unwrap_or_default());
     let body = move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         let mut post = |ev| crate::shell_thread::push_event(ui, ShellEvent::LauncherFiles(open, ev));
         run_pump(&own, &mut RealSpawner(folders), &mut post, files::LIMITS);
         crate::mem::rearm();
@@ -523,6 +524,7 @@ fn retire(child: &mut dyn Helper) {
 fn reader(n: u32, out: PipeReader, inbox: Arc<Inbox>, asked: Arc<AtomicU32>) {
     let own = inbox.clone();
     let body = move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
         let mut r = std::io::BufReader::new(out);
         let mut frames = FrameReader::default();
         let mut read = 0u32;
