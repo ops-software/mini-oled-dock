@@ -34,7 +34,9 @@
 //!    as at start, with the same arguments (same heartbeat, same restore duty): each at once, at most `MAX_RESTARTS`
 //!    in a row (`after_exit`). No wait between them: during one the taskbar would stay hidden with no watchdog. Each
 //!    start follows the death of the one before, so a watchdog that dies at once costs `MAX_RESTARTS` starts. Past
-//!    them the dock gives the taskbar back (`taskbar::restore`) and runs on without hiding it. One log line per event.
+//!    them the dock gives the taskbar back (`taskbar::restore`; while the session ends, `restore_at_session_end`, which
+//!    keeps the state file for the next sign-in: `give_up_restore`) and runs on without hiding it. One log line per
+//!    event.
 //!    Nothing while the dock exits, after a stop request or after the session end ended the watchdog.
 //!
 //! THREADING: `spawn`, `heartbeat`, `beat_if_due`, `start_stop_watcher`, `watch_exit`, `on_exited`, `shutdown`,
@@ -62,7 +64,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE,
     WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, PostMessageW, SM_SHUTTINGDOWN};
 
 use crate::log;
 use crate::msg::{WM_DOCK_QUIT_REQUEST, WM_DOCK_WATCHDOG_EXITED};
@@ -527,8 +529,33 @@ fn next_after_exit(lived_ms: u64, what: &str) {
                  dock runs on without hiding it"
             );
             // The exit's own restore: it also stops any later hide in this process (no watchdog, no hidden taskbar).
-            crate::taskbar::restore();
+            // SAFETY: GetSystemMetrics has no preconditions.
+            match give_up_restore(unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0) {
+                GiveUpRestore::Exit => crate::taskbar::restore(),
+                GiveUpRestore::SessionEnd => crate::taskbar::restore_at_session_end(),
+            }
         }
+    }
+}
+
+/// How the give-up gives the taskbar back.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum GiveUpRestore {
+    /// `taskbar::restore`, as on an exit: the state file has done its job.
+    Exit,
+    /// `taskbar::restore_at_session_end`: the state file is kept for the next sign-in, so the session end's own
+    /// restore, which then has nothing left to do, does not lose it.
+    SessionEnd,
+}
+
+/// Pure: `session_ending` = `SM_SHUTTINGDOWN`, the signal the update guard reads. Between `WM_QUERYENDSESSION` and
+/// the dock's `WM_ENDSESSION` the session end can end the watchdogs first; the give-up then must not delete the state
+/// file the session-end restore keeps. A Restart Manager close does not set it.
+fn give_up_restore(session_ending: bool) -> GiveUpRestore {
+    if session_ending {
+        GiveUpRestore::SessionEnd
+    } else {
+        GiveUpRestore::Exit
     }
 }
 
@@ -1014,6 +1041,14 @@ mod tests {
         assert_eq!(after_exit(3, STABLE_MS - 1), AfterExit::GiveUp);
         assert_eq!(after_exit(3, STABLE_MS), r(1), "one that ran a minute begins a new count");
         assert_eq!(after_exit(2, u64::MAX), r(1));
+    }
+
+    /// The give-up during a session end keeps the state file for the next sign-in (watchdogs ended by the session end
+    /// before the dock's WM_ENDSESSION); otherwise it is the exit's restore.
+    #[test]
+    fn a_give_up_at_the_session_end_keeps_the_state_file() {
+        assert_eq!(give_up_restore(true), GiveUpRestore::SessionEnd);
+        assert_eq!(give_up_restore(false), GiveUpRestore::Exit);
     }
 
     /// A watchdog that dies at once, or a start that keeps failing, cannot make the dock spin: the count goes up by one
