@@ -817,9 +817,9 @@ impl Shell {
         // A pin whose exe is gone because the app updated itself into a new versioned folder:
         // name, icon and the stored launch target follow it.
         if let Some(now) = crate::apps::updated_exe_path(&r.exe_path) {
-            log!("shell: '{}' moved to '{now}'", r.exe_path);
+            log!("shell: a pin's exe moved ({} chars to {} chars)", r.exe_path.chars().count(), now.chars().count());
             if let Err(e) = crate::config::sync_pinned_launch(&r.key, &now) {
-                log!("shell: cannot update the launch target of '{}': {e}", r.key);
+                log!("shell: cannot update the launch target of a pin: {e}");
             }
             r.exe_path = now;
         }
@@ -828,13 +828,13 @@ impl Shell {
         // (an explicit `names` override is the user's choice, never written into the pin).
         if !overridden {
             if let Err(e) = crate::config::sync_pinned_name(&r.key, &name) {
-                log!("shell: cannot update the stored name of '{}': {e}", r.key);
+                log!("shell: cannot update the stored name of a pin: {e}");
             }
         }
         push_event(self.ui, ShellEvent::AppName { key: r.key.clone(), name });
         let bitmap = resolve_icon(&r);
         if bitmap.is_none() {
-            log!("shell: no icon for '{}'", r.key);
+            log!("shell: no icon for a pin ({} chars)", r.key.chars().count());
         }
         push_event(self.ui, ShellEvent::AppIcon { key: r.key, icon_px: r.icon_px, bitmap });
     }
@@ -849,7 +849,7 @@ impl Shell {
             return (n.clone(), false);
         }
         let (n, step) = natural_name(r);
-        log!("shell: name for '{}' = '{n}' ({step})", r.key);
+        log!("shell: name for a pin ({} chars) = {} chars ({step})", r.key.chars().count(), n.chars().count());
         self.names.insert(r.key.clone(), n.clone());
         (n, false)
     }
@@ -2295,12 +2295,19 @@ fn open_notif_app(aumid: &str, name: &str) {
         Some(i) => {
             let target = format!("shell:AppsFolder\\{}", apps[i].id);
             if let Err(e) = launch(&target, None) {
-                log!("notification: launching '{}' failed: {e}, opening the notification center", apps[i].name);
+                log!(
+                    "notification: launching an app ({} chars) failed: {e}, opening the notification center",
+                    apps[i].name.chars().count()
+                );
                 crate::ui::send_win_n();
             }
         }
         None => {
-            log!("notification: app '{name}' ({aumid}) not in the catalog, opening the notification center");
+            log!(
+                "notification: an app ({} chars, id {} chars) is not in the catalog, opening the notification center",
+                name.chars().count(),
+                aumid.chars().count()
+            );
             crate::ui::send_win_n();
         }
     }

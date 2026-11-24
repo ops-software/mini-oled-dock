@@ -1119,7 +1119,7 @@ pub fn windows_in_order(key: &str) -> Vec<isize> {
 pub fn close_group(key: &str) {
     let wins: Vec<isize> =
         STATE.with(|s| s.borrow().groups.iter().find(|g| g.key == key).map(|g| g.windows.clone()).unwrap_or_default());
-    log!("apps::close_group({key}): {} windows", wins.len());
+    log!("apps::close_group: {} windows", wins.len());
     for h in wins {
         // SAFETY: PostMessageW accepts arbitrary HWNDs; it does not block and fails if the window is gone.
         let _ = unsafe { PostMessageW(Some(hw(h)), WM_CLOSE, WPARAM(0), LPARAM(0)) };

@@ -461,7 +461,10 @@ pub(crate) fn map_layout(
         } else if let Some(link) = entry.get("desktopAppLink").and_then(|x| x.as_str()) {
             let link = crate::shell_thread::expand_env(link);
             if !link_allowed(&link, roots) {
-                log!("start import: shortcut outside the Start menu folders skipped: {link}");
+                log!(
+                    "start import: a shortcut outside the Start menu folders skipped ({} chars)",
+                    link.chars().count()
+                );
                 continue;
             }
             let apps = loaded.get_or_insert_with(&mut *catalog);
@@ -475,11 +478,11 @@ pub(crate) fn map_layout(
                 apps.iter().find(|(a, _)| a.name.eq_ignore_ascii_case(s)).map(|(a, _)| a.id.clone())
             });
             if found.is_none() {
-                log!("start import: no app for the shortcut {link}");
+                log!("start import: no app for a shortcut ({} chars)", link.chars().count());
             }
             found
         } else {
-            log!("start import: entry skipped: {entry}");
+            log!("start import: an entry of no known kind skipped");
             None
         };
         if let Some(id) = id {
