@@ -175,6 +175,10 @@ pub const TIMER_UPDATE_CHECK: usize = 14;
 /// any thread -> dock window: start a new hidden-trim period (`mem::rearm` posts it; `main::trim_kick`). wParam =
 /// lParam = 0. Not `WM_APP + 29` (the launcher's alias message).
 pub const WM_DOCK_TRIM_KICK: u32 = WM_APP + 30;
+/// watchdog (`watchdog::watch_exit`'s thread-pool wait) -> dock window: the watchdog process exited while the dock runs
+/// (1.5.2 T3a). wParam = lParam = 0. `main` calls `watchdog::on_exited()`, which starts a new one (at once, at most
+/// `MAX_RESTARTS` in a row) or gives the taskbar back.
+pub const WM_DOCK_WATCHDOG_EXITED: u32 = WM_APP + 31;
 /// One-shot on the dock window while the bar is hidden: the hidden trim (4 s after a hide, a popup or Settings close
 /// or a data release; `main::trim_kick`) and the planned second COM pass. Kills itself, then `trim_tick`.
 /// Handled by `main`.
@@ -273,7 +277,7 @@ mod tests {
     fn message_and_timer_ids_are_distinct() {
         // WM_APP + n of msg.rs: one window, one id space.
         let msgs = scan(include_str!("msg.rs"), "WM_", "u32", "WM_APP +");
-        assert!(msgs.len() >= 28, "msg.rs scan found only {} WM_APP ids", msgs.len());
+        assert!(msgs.len() >= 29, "msg.rs scan found only {} WM_APP ids", msgs.len());
         assert_distinct("msg.rs WM_APP", &msgs);
 
         // Timer ids of the dock window: msg.rs's TIMER_ consts and ui.rs's private ones.

@@ -22,7 +22,7 @@
 //!
 //! STARTUP ORDER (`run`): config -> watchdog::spawn (before touching the taskbar) -> taskbar::init
 //! -> ui::init (geometry) -> window -> ui::attach (+ apps WinEvent hook) -> popup::init -> shell thread -> notif ->
-//! tray host (+ taskbar::announce_tray) -> taskbar WinEvent hook -> stop-watch ->
+//! tray host (+ taskbar::announce_tray) -> taskbar WinEvent hook -> stop-watch -> watchdog exit wait ->
 //! Ctrl+C/hotkey/timers -> keyboard hook -> message loop. Cleanup runs in reverse order, with the tray host
 //! stopped and the taskbar restored first (host destroyed BEFORE the TaskbarCreated broadcast).
 
@@ -128,9 +128,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
     GetMessageW, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetTimer,
-    TranslateMessage, UnregisterClassW, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, MSGFLT_ALLOW,
-    WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    TranslateMessage, UnregisterClassW, ENDSESSION_CLOSEAPP, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG,
+    MSGFLT_ALLOW, WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use msg::{
@@ -138,7 +138,7 @@ use msg::{
     TIMER_POLL, TIMER_RAM, TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, TIMER_TRIM, TIMER_UPDATE_CHECK,
     WM_DOCK_CONFIG_APPLY, WM_DOCK_CONFIG_CHANGED, WM_DOCK_DIAG, WM_DOCK_NOTIF, WM_DOCK_OPEN_SETTINGS,
     WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE,
-    WM_DOCK_TRAY_CHANGED, WM_DOCK_TRIM_KICK, WM_DOCK_UPDATE, WM_DOCK_WINKEY,
+    WM_DOCK_TRAY_CHANGED, WM_DOCK_TRIM_KICK, WM_DOCK_UPDATE, WM_DOCK_WATCHDOG_EXITED, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -789,6 +789,10 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             taskbar::on_winevent(wp.0 as u32, HWND(lp.0 as *mut c_void));
             LRESULT(0)
         }
+        WM_DOCK_WATCHDOG_EXITED => {
+            watchdog::on_exited();
+            LRESULT(0)
+        }
         WM_DOCK_QUIT_REQUEST => {
             taskbar::begin_exit();
             log!("quit request (stop event: --restore, --install or --uninstall): exiting");
@@ -815,16 +819,32 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_QUERYENDSESSION => {
             // Deliberately no `begin_exit`: another app can still cancel the shutdown, and a surviving dock
             // would be left with `RESTORING` set and its paused tray host never restarted.
-            log!("WM_QUERYENDSESSION: allowing the session end, exit deferred to WM_ENDSESSION");
+            if session_step(m, wp.0, lp.0) == Some(SessionStep::Allow { close_app: true }) {
+                log!("WM_QUERYENDSESSION (Restart Manager close): allowing it, exit deferred to WM_ENDSESSION");
+            } else {
+                log!("WM_QUERYENDSESSION: allowing the session end, exit deferred to WM_ENDSESSION");
+            }
             LRESULT(1)
         }
         WM_ENDSESSION => {
-            // End of session: the taskbar state would survive a reboot, so restore it right away. Explorer may save
-            // its settings before this restore: the state file stays for the next sign-in, and the watchdog is ended
-            // first so it cannot restore again and delete it.
-            if wp.0 != 0 {
-                taskbar::begin_exit();
-                taskbar::restore_at_session_end();
+            match session_step(m, wp.0, lp.0) {
+                // End of session: the taskbar state would survive a reboot, so restore it right away. Explorer may save
+                // its settings before this restore: the state file stays for the next sign-in, and the watchdog is
+                // ended first so it cannot restore again and delete it.
+                Some(SessionStep::SessionEnd) => {
+                    taskbar::begin_exit();
+                    taskbar::restore_at_session_end();
+                }
+                // The Restart Manager closes the dock and the session goes on: the restore of a normal exit right away
+                // (it deletes the state file), then the exit of WM_CLOSE; the watchdog stays until the dock is gone.
+                Some(SessionStep::CloseApp) => {
+                    taskbar::begin_exit();
+                    log!("WM_ENDSESSION (Restart Manager close, the session goes on): restoring the taskbar, exiting");
+                    taskbar::restore();
+                    // SAFETY: no preconditions.
+                    unsafe { PostQuitMessage(0) };
+                }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -837,6 +857,36 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         _ => dispatch_to_ui(h, m, wp, lp),
+    }
+}
+
+/// What a session message asks of the dock (`wnd_proc`).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SessionStep {
+    /// `WM_QUERYENDSESSION`: allowed, and nothing changes before `WM_ENDSESSION` (another app can still cancel).
+    /// `close_app`: the Restart Manager asks (only the log line differs).
+    Allow { close_app: bool },
+    /// `WM_ENDSESSION` with wParam FALSE: the end was cancelled; the dock runs on as it was.
+    Cancelled,
+    /// `WM_ENDSESSION` with wParam TRUE, the session ending (sign-out, shutdown, a critical end): the session-end
+    /// restore, which ends the watchdog and keeps the state file for the next sign-in.
+    SessionEnd,
+    /// `WM_ENDSESSION` with wParam TRUE and `ENDSESSION_CLOSEAPP`: the Restart Manager closes the dock (an installer,
+    /// servicing) and the session goes on, so nothing of the session end: the normal exit's restore at once, then the
+    /// exit. Also with other bits set, since a restore at a real end is harmless: when in doubt, restore.
+    CloseApp,
+}
+
+/// Pure: `m`, `wp`, `lp` of a message to the dock window; None for any other message.
+fn session_step(m: u32, wp: usize, lp: isize) -> Option<SessionStep> {
+    // The ENDSESSION_* flags are the low 32 bits of lParam.
+    let close_app = (lp as u32) & ENDSESSION_CLOSEAPP != 0;
+    match m {
+        WM_QUERYENDSESSION => Some(SessionStep::Allow { close_app }),
+        WM_ENDSESSION if wp == 0 => Some(SessionStep::Cancelled),
+        WM_ENDSESSION if close_app => Some(SessionStep::CloseApp),
+        WM_ENDSESSION => Some(SessionStep::SessionEnd),
+        _ => None,
     }
 }
 
@@ -1286,6 +1336,8 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
         log!("taskbar WinEventHook not installed: {e}");
     }
     STOP_WATCHER.with(|c| *c.borrow_mut() = watchdog::start_stop_watcher(h));
+    // The window exists: the watchdog's exit can be posted to it from here on.
+    watchdog::watch_exit();
 
     // Ctrl+C only with an attached console (`--console`): without one, exit is Ctrl+Alt+Q or the menu.
     if CONSOLE_ATTACHED.load(Relaxed) {
@@ -1594,6 +1646,37 @@ mod tests {
         let n = std::cell::Cell::new(0);
         probe!(n.set(1));
         assert_eq!(n.get(), if cfg!(feature = "wake-probe") { 1 } else { 0 });
+    }
+
+    /// 1.5.2 T3c: only a real session end takes the session-end restore; a Restart Manager close (ENDSESSION_CLOSEAPP,
+    /// the session goes on) is a normal exit, and a cancelled end changes nothing.
+    #[test]
+    fn a_restart_manager_close_is_not_a_session_end() {
+        use windows::Win32::UI::WindowsAndMessaging::{ENDSESSION_CRITICAL, ENDSESSION_LOGOFF};
+        let step = |m, wp, lp: u32| session_step(m, wp, lp as isize);
+        let (logoff, critical, close) = (ENDSESSION_LOGOFF, ENDSESSION_CRITICAL, ENDSESSION_CLOSEAPP);
+        // A real sign-out.
+        assert_eq!(step(WM_QUERYENDSESSION, 0, logoff), Some(SessionStep::Allow { close_app: false }));
+        assert_eq!(step(WM_ENDSESSION, 1, logoff), Some(SessionStep::SessionEnd));
+        // A real shutdown or restart (lParam 0).
+        assert_eq!(step(WM_QUERYENDSESSION, 0, 0), Some(SessionStep::Allow { close_app: false }));
+        assert_eq!(step(WM_ENDSESSION, 1, 0), Some(SessionStep::SessionEnd));
+        // A critical end.
+        assert_eq!(step(WM_QUERYENDSESSION, 0, critical), Some(SessionStep::Allow { close_app: false }));
+        assert_eq!(step(WM_ENDSESSION, 1, critical), Some(SessionStep::SessionEnd));
+        // The Restart Manager: wParam TRUE closes the dock without a session end; FALSE was cancelled.
+        assert_eq!(step(WM_QUERYENDSESSION, 0, close), Some(SessionStep::Allow { close_app: true }));
+        assert_eq!(step(WM_ENDSESSION, 1, close), Some(SessionStep::CloseApp));
+        assert_eq!(step(WM_ENDSESSION, 0, close), Some(SessionStep::Cancelled));
+        assert_eq!(step(WM_ENDSESSION, 1, close | critical), Some(SessionStep::CloseApp), "when in doubt, restore");
+        assert_eq!(step(WM_ENDSESSION, 1, close | logoff), Some(SessionStep::CloseApp));
+        // A cancelled query: the session goes on.
+        assert_eq!(step(WM_ENDSESSION, 0, logoff), Some(SessionStep::Cancelled));
+        assert_eq!(step(WM_ENDSESSION, 0, 0), Some(SessionStep::Cancelled));
+        assert_eq!(step(WM_ENDSESSION, 0, critical), Some(SessionStep::Cancelled));
+        // Any wParam other than 0 is TRUE; other messages are not session messages.
+        assert_eq!(step(WM_ENDSESSION, 2, 0), Some(SessionStep::SessionEnd));
+        assert_eq!(step(WM_CLOSE, 1, close), None);
     }
 
     #[test]

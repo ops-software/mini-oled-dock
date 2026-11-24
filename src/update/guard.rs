@@ -3,8 +3,9 @@
 //! Every update is judged by the version that ran before it. The updater copies its own (old) image to
 //! `update\<tag>\dock-guard.exe` and starts it with `--update-guard <tag>`. The guard checks the stage again, runs
 //! the new release's `--install --quiet --no-relaunch`, starts the new dock and keeps its process handle. If that
-//! process exits (an exit at a session end gets no verdict), or its `DockWindow` does not answer `WM_NULL` between
-//! `MIN_ALIVE` and `MAX_WAIT` after the start, the guard ends it, writes `update\<tag>\rolled-back` (the automatic
+//! process exits (an exit at a session end gets no verdict), or its `DockWindow` does not answer `WM_NULL`, or no live
+//! watchdog of it runs (C7), between `MIN_ALIVE` and `MAX_WAIT` after the start, the guard ends it, writes
+//! `update\<tag>\rolled-back` (the automatic
 //! install never retries that release), installs itself back with its own `--install` and starts the old dock. The
 //! judge is the old binary because the build under judgement cannot be trusted to judge itself. The guard makes no
 //! taskbar call: the ended dock's own watchdog gives the taskbar back, and `copy_self` waits for that watchdog to
@@ -19,6 +20,9 @@
 //! - C5: the stage `update\<tag>\` holds `dock.exe`, `dock.exe.sha256`, `dock-guard.exe` and `rolled-back`; releases
 //!   before `FIRST_RELEASE_WITH_MARKS` do not read `rolled-back`, and `--rollback` to one of them says so.
 //! - C6: the exit codes `EXIT_COMMITTED` to `EXIT_ROLLBACK_FAILED` (0 to 4).
+//! - C7: the dock starts its watchdog as a child process of its own image with the command line
+//!   `"<exe>" --watchdog <pid> <event>` (`watchdog::watchdog_args`), and keeps one running: an older guard finds it
+//!   in the process list (`watchdog::runs_for`), not through a named object or anything the new dock reports.
 //!
 //! `--rollback` installs `dock.prev.exe` again through that binary's own `--install`.
 //!
@@ -101,18 +105,26 @@ pub(crate) enum Health {
     SessionEnd,
 }
 
-/// `elapsed` since the new dock started, its exit code if it ended, whether its window answered, whether the session
-/// is ending. An exit fails (even with code 0) unless the session is ending; an answer counts from `MIN_ALIVE` on; no
-/// answer by `MAX_WAIT` fails. Pure.
-pub(crate) fn health(elapsed: Duration, exit: Option<u32>, answered: bool, session_ending: bool) -> Health {
+/// `elapsed` since the new dock started, its exit code if it ended, whether its window answered, whether a live watchdog
+/// of it runs (C7), whether the session is ending. An exit fails (even with code 0) unless the session is ending; an
+/// answer with a live watchdog counts from `MIN_ALIVE` on; no answer, or no watchdog, by `MAX_WAIT` fails. Pure.
+pub(crate) fn health(
+    elapsed: Duration,
+    exit: Option<u32>,
+    answered: bool,
+    watchdog: bool,
+    session_ending: bool,
+) -> Health {
     if exit.is_some() && session_ending {
         Health::SessionEnd
     } else if let Some(c) = exit {
         Health::Failed(format!("exited with code 0x{c:X} after {} s", elapsed.as_secs()))
-    } else if answered && elapsed >= MIN_ALIVE {
+    } else if answered && watchdog && elapsed >= MIN_ALIVE {
         Health::Healthy
-    } else if elapsed >= MAX_WAIT {
+    } else if elapsed >= MAX_WAIT && !answered {
         Health::Failed(format!("its window did not answer within {} s", MAX_WAIT.as_secs()))
+    } else if elapsed >= MAX_WAIT {
+        Health::Failed(format!("it ran without a live watchdog for {} s", MAX_WAIT.as_secs()))
     } else {
         Health::Wait
     }
@@ -289,7 +301,9 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
         let exit = exit_of(&h, POLL_MS);
         let elapsed = t0.elapsed();
         let answered = exit.is_none() && elapsed >= MIN_ALIVE && window_answers(pid);
-        match health(elapsed, exit, answered, exit.is_some() && session_ending()) {
+        // The new dock must not be called good while it runs without its watchdog (C7): asked only once it answers.
+        let watchdog = answered && watchdog::runs_for(HANDLE(h.as_raw_handle()));
+        match health(elapsed, exit, answered, watchdog, exit.is_some() && session_ending()) {
             Health::Wait => {}
             Health::SessionEnd => {
                 log!("update-guard: {tag} exited with the session end (pid {pid}): no verdict, it stays installed");
@@ -422,24 +436,41 @@ mod tests {
     fn health_verdicts() {
         let s = Duration::from_secs;
         let failed = |h: Health, part: &str| matches!(h, Health::Failed(w) if w.contains(part));
-        assert_eq!(health(s(0), None, false, false), Health::Wait);
-        assert!(failed(health(s(5), Some(1), false, false), "0x1"));
-        assert_eq!(health(s(29), None, true, false), Health::Wait);
-        assert_eq!(health(s(30), None, true, false), Health::Healthy);
-        assert_eq!(health(s(45), None, false, false), Health::Wait);
-        assert!(failed(health(s(60), None, false, false), "did not answer"));
-        assert_eq!(health(s(60), None, true, false), Health::Healthy);
-        assert!(failed(health(s(31), Some(0), true, false), "0x0"), "an exit wins over an answer, even code 0");
+        assert_eq!(health(s(0), None, false, false, false), Health::Wait);
+        assert!(failed(health(s(5), Some(1), false, false, false), "0x1"));
+        assert_eq!(health(s(29), None, true, true, false), Health::Wait);
+        assert_eq!(health(s(30), None, true, true, false), Health::Healthy);
+        assert_eq!(health(s(45), None, false, false, false), Health::Wait);
+        assert!(failed(health(s(60), None, false, false, false), "did not answer"));
+        assert_eq!(health(s(60), None, true, true, false), Health::Healthy);
+        assert!(failed(health(s(31), Some(0), true, true, false), "0x0"), "an exit wins over an answer, even code 0");
+        // 1.5.2 T3c: a Restart Manager close (ENDSESSION_CLOSEAPP) is not a session end. `session_ending` reads
+        // SM_SHUTTINGDOWN, which it does not set: the new dock's exit is judged like any other.
+        assert!(failed(health(s(40), Some(0), true, true, false), "0x0"));
+    }
+
+    /// 1.5.2 T3b: the new dock is not called good while it runs without its watchdog; the same deadline, then the
+    /// rollback.
+    #[test]
+    fn a_dock_without_its_watchdog_is_not_healthy() {
+        let s = Duration::from_secs;
+        let failed = |h: Health, part: &str| matches!(h, Health::Failed(w) if w.contains(part));
+        assert_eq!(health(s(30), None, true, false, false), Health::Wait, "it answers but no watchdog runs yet");
+        assert_eq!(health(s(59), None, true, false, false), Health::Wait);
+        assert!(failed(health(s(60), None, true, false, false), "without a live watchdog"));
+        assert_eq!(health(s(45), None, true, true, false), Health::Healthy, "its new watchdog runs (T3a)");
+        assert!(failed(health(s(60), None, false, true, false), "did not answer"), "a watchdog alone is not enough");
+        assert_eq!(health(s(30), None, false, true, false), Health::Wait);
     }
 
     #[test]
     fn an_exit_at_the_session_end_has_no_verdict() {
         let s = Duration::from_secs;
-        assert_eq!(health(s(5), Some(0), false, true), Health::SessionEnd);
-        assert_eq!(health(s(61), Some(1), true, true), Health::SessionEnd);
-        assert_eq!(health(s(5), None, false, true), Health::Wait, "no exit: the session end changes nothing");
-        assert_eq!(health(s(30), None, true, true), Health::Healthy);
-        assert!(matches!(health(s(60), None, false, true), Health::Failed(_)));
+        assert_eq!(health(s(5), Some(0), false, false, true), Health::SessionEnd);
+        assert_eq!(health(s(61), Some(1), true, true, true), Health::SessionEnd);
+        assert_eq!(health(s(5), None, false, false, true), Health::Wait, "no exit: the session end changes nothing");
+        assert_eq!(health(s(30), None, true, true, true), Health::Healthy);
+        assert!(matches!(health(s(60), None, false, false, true), Health::Failed(_)));
     }
 
     #[test]
