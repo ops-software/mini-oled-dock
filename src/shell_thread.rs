@@ -1297,9 +1297,9 @@ fn start_index() -> (HashMap<String, String>, String) {
             Err(LnkMiss::Refused)
         }
     };
-    // Each folder's `desktop.ini`, read once for this build.
-    let mut inis: HashMap<std::path::PathBuf, Option<Vec<u8>>> = HashMap::new();
-    let mut rust_display = |l: &StartLnk| localized_lnk_name(&l.path, &mut inis);
+    // The `desktop.ini` of the last folder only: `collect_lnk` lists a folder's files mostly together.
+    let mut ini: IniSlot = None;
+    let mut rust_display = |l: &StartLnk| localized_lnk_name(&l.path, &mut ini);
     let mut com_target = |l: &StartLnk| {
         let refused = com_guard(l.per_user);
         debug_assert!(!refused, "a per-user shortcut reached the shell link loader");
@@ -1328,16 +1328,23 @@ fn start_index() -> (HashMap<String, String>, String) {
 /// (Windows' own shortcuts of the per-user folder, "Command Prompt.lnk" and the accessibility tools,
 /// are localized this way): read through `datadir::read_file` (capped, no reparse point), and only a
 /// string of a DLL of the system directory (`jumplist::localized_name_ref`, `system_string`).
-/// `inis` keeps each folder's file for one index build.
-fn localized_lnk_name(lnk: &Path, inis: &mut HashMap<std::path::PathBuf, Option<Vec<u8>>>) -> Option<String> {
+/// `ini` holds the file of the last folder asked, so one index build holds one folder's bytes at most (`MAX_DESKTOP_INI`),
+/// however many folders a per-user tree has; a folder's file is read again after a subfolder's.
+fn localized_lnk_name(lnk: &Path, ini: &mut IniSlot) -> Option<String> {
     let dir = lnk.parent()?;
-    let ini = inis.entry(dir.to_path_buf()).or_insert_with(|| {
-        crate::datadir::read_file(&dir.join("desktop.ini"), crate::jumplist::MAX_DESKTOP_INI, true).ok()
-    });
+    if ini.as_ref().map(|(d, _)| d.as_path()) != Some(dir) {
+        *ini = None; // the last folder's bytes go before the next are read
+        let bytes = crate::datadir::read_file(&dir.join("desktop.ini"), crate::jumplist::MAX_DESKTOP_INI, true).ok();
+        *ini = Some((dir.to_path_buf(), bytes));
+    }
+    let bytes = ini.as_ref()?.1.as_deref()?;
     let file_name = lnk.file_name()?.to_string_lossy();
-    let (module, id) = crate::jumplist::localized_name_ref(ini.as_deref()?, &file_name)?;
+    let (module, id) = crate::jumplist::localized_name_ref(bytes, &file_name)?;
     system_string(&module, id)
 }
+
+/// `localized_lnk_name`'s cache: a folder and its `desktop.ini` (None: none, or not readable).
+type IniSlot = Option<(std::path::PathBuf, Option<Vec<u8>>)>;
 
 /// String `id` of the DLL `module` (a plain file name) of the system directory (`system_dir`, never
 /// the environment), in the display language. The DLL is mapped as an image resource, so none of
@@ -3725,15 +3732,45 @@ mod tests {
         let mut ini = vec![0xFF, 0xFE];
         ini.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
         std::fs::write(dir.join("desktop.ini"), ini).expect("desktop.ini");
-        let mut inis = HashMap::new();
-        let name = |f: &str, inis: &mut HashMap<_, _>| localized_lnk_name(&dir.join(f), inis);
-        let a = name("A.lnk", &mut inis);
-        let others = [name("B.lnk", &mut inis), name("C.lnk", &mut inis), name("D.lnk", &mut inis)];
-        let cached = inis.len();
+        let mut ini = None;
+        let name = |f: &str, ini: &mut IniSlot| localized_lnk_name(&dir.join(f), ini);
+        let a = name("A.lnk", &mut ini);
+        let others = [name("B.lnk", &mut ini), name("C.lnk", &mut ini), name("D.lnk", &mut ini)];
+        let held = ini.as_ref().map(|(d, bytes)| (d.clone(), bytes.is_some()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(a.as_deref().is_some_and(|n| !n.is_empty() && !n.contains('@')), "{a:?}");
         assert_eq!(others, [None, None, None], "another folder, a missing DLL, no entry");
-        assert_eq!(cached, 1, "one read per folder");
+        assert_eq!(held, Some((dir.clone(), true)), "the folder's file, kept for its other shortcuts");
+    }
+
+    /// The `desktop.ini` cache of an index build holds one folder's file at most: a per-user tree of many folders,
+    /// each with its own file, cannot make the elevated dock hold all of them.
+    #[test]
+    fn the_desktop_ini_cache_holds_one_folder() {
+        let root = std::env::temp_dir().join(format!("dock_ini_slot_{}", std::process::id()));
+        let (a, b) = (root.join("A"), root.join("B"));
+        let text = "[LocalizedFileNames]\r\nX.lnk=@%SystemRoot%\\system32\\shell32.dll,-22022\r\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).expect("test folder");
+            std::fs::write(d.join("desktop.ini"), &bytes).expect("desktop.ini");
+        }
+        let mut ini = None;
+        let held = |ini: &IniSlot| ini.as_ref().map(|(d, f)| (d.clone(), f.as_ref().map_or(0, Vec::len)));
+        let first = localized_lnk_name(&a.join("X.lnk"), &mut ini);
+        let after_a = held(&ini);
+        let second = localized_lnk_name(&b.join("X.lnk"), &mut ini);
+        let after_b = held(&ini);
+        let again = localized_lnk_name(&a.join("X.lnk"), &mut ini);
+        let after_again = held(&ini);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(first.as_deref().is_some_and(|n| !n.is_empty()), "{first:?}");
+        assert_eq!([&second, &again], [&first, &first], "the same name from either folder, and after another folder");
+        assert_eq!(after_a, Some((a.clone(), bytes.len())));
+        assert_eq!(after_b, Some((b.clone(), bytes.len())), "the folder before is dropped");
+        assert_eq!(after_again, Some((a.clone(), bytes.len())), "read again after another folder");
+        assert!(bytes.len() as u64 <= crate::jumplist::MAX_DESKTOP_INI);
     }
 
     #[test]
