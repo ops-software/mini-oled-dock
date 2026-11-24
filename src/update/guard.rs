@@ -3,11 +3,12 @@
 //! Every update is judged by the version that ran before it. The updater copies its own (old) image to
 //! `update\<tag>\dock-guard.exe` and starts it with `--update-guard <tag>`. The guard checks the stage again, runs
 //! the new release's `--install --quiet --no-relaunch`, starts the new dock and keeps its process handle. If that
-//! process exits, or its `DockWindow` does not answer `WM_NULL` between `MIN_ALIVE` and `MAX_WAIT` after the start, the
-//! guard ends it, writes `update\<tag>\rolled-back` (the automatic install never retries that release), installs
-//! itself back with its own `--install` and starts the old dock. The judge is the old binary because the build under
-//! judgement cannot be trusted to judge itself. The guard makes no taskbar call: the ended dock's own watchdog gives
-//! the taskbar back, and `copy_self` waits for that watchdog to leave.
+//! process exits (an exit at a session end gets no verdict), or its `DockWindow` does not answer `WM_NULL` between
+//! `MIN_ALIVE` and `MAX_WAIT` after the start, the guard ends it, writes `update\<tag>\rolled-back` (the automatic
+//! install never retries that release), installs itself back with its own `--install` and starts the old dock. The
+//! judge is the old binary because the build under judgement cannot be trusted to judge itself. The guard makes no
+//! taskbar call: the ended dock's own watchdog gives the taskbar back, and `copy_self` waits for that watchdog to
+//! leave.
 //!
 //! Contracts later releases keep (pinned by the tests below):
 //! - C1: the dock's top-level window class is `DockWindow`, owned by its UI thread, which pumps within 30 s of the
@@ -35,7 +36,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{GetProcessId, TerminateProcess};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL,
+    FindWindowExW, GetSystemMetrics, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+    SM_SHUTTINGDOWN, WM_NULL,
 };
 
 use crate::update_release::{
@@ -94,12 +96,18 @@ pub(crate) enum Health {
     Wait,
     Healthy,
     Failed(String),
+    /// It exited while the session ends (sign-out, shutdown), which ends every dock: no verdict, no mark, nothing
+    /// installed or started; it stays installed.
+    SessionEnd,
 }
 
-/// `elapsed` since the new dock started, its exit code if it ended, whether its window answered. An exit always fails
-/// (even with code 0); an answer counts from `MIN_ALIVE` on; no answer by `MAX_WAIT` fails. Pure.
-pub(crate) fn health(elapsed: Duration, exit: Option<u32>, answered: bool) -> Health {
-    if let Some(c) = exit {
+/// `elapsed` since the new dock started, its exit code if it ended, whether its window answered, whether the session
+/// is ending. An exit fails (even with code 0) unless the session is ending; an answer counts from `MIN_ALIVE` on; no
+/// answer by `MAX_WAIT` fails. Pure.
+pub(crate) fn health(elapsed: Duration, exit: Option<u32>, answered: bool, session_ending: bool) -> Health {
+    if exit.is_some() && session_ending {
+        Health::SessionEnd
+    } else if let Some(c) = exit {
         Health::Failed(format!("exited with code 0x{c:X} after {} s", elapsed.as_secs()))
     } else if answered && elapsed >= MIN_ALIVE {
         Health::Healthy
@@ -178,6 +186,12 @@ fn window_answers(pid: u32) -> bool {
         return unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), flags, ANSWER_MS, None) }.0 != 0;
     }
     false
+}
+
+/// true while the session ends (sign-out, shutdown).
+fn session_ending() -> bool {
+    // SAFETY: GetSystemMetrics has no preconditions.
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
 }
 
 /// Writes `update\<tag>\rolled-back` (the reason inside): the automatic install skips `tag` from now on.
@@ -275,8 +289,12 @@ pub(crate) fn run_cli(tag: &str) -> i32 {
         let exit = exit_of(&h, POLL_MS);
         let elapsed = t0.elapsed();
         let answered = exit.is_none() && elapsed >= MIN_ALIVE && window_answers(pid);
-        match health(elapsed, exit, answered) {
+        match health(elapsed, exit, answered, exit.is_some() && session_ending()) {
             Health::Wait => {}
+            Health::SessionEnd => {
+                log!("update-guard: {tag} exited with the session end (pid {pid}): no verdict, it stays installed");
+                return EXIT_COMMITTED;
+            }
             Health::Healthy => {
                 log!("update-guard: {tag} started correctly (pid {pid})");
                 return EXIT_COMMITTED;
@@ -404,14 +422,24 @@ mod tests {
     fn health_verdicts() {
         let s = Duration::from_secs;
         let failed = |h: Health, part: &str| matches!(h, Health::Failed(w) if w.contains(part));
-        assert_eq!(health(s(0), None, false), Health::Wait);
-        assert!(failed(health(s(5), Some(1), false), "0x1"));
-        assert_eq!(health(s(29), None, true), Health::Wait);
-        assert_eq!(health(s(30), None, true), Health::Healthy);
-        assert_eq!(health(s(45), None, false), Health::Wait);
-        assert!(failed(health(s(60), None, false), "did not answer"));
-        assert_eq!(health(s(60), None, true), Health::Healthy);
-        assert!(failed(health(s(31), Some(0), true), "0x0"), "an exit wins over an answer, even code 0");
+        assert_eq!(health(s(0), None, false, false), Health::Wait);
+        assert!(failed(health(s(5), Some(1), false, false), "0x1"));
+        assert_eq!(health(s(29), None, true, false), Health::Wait);
+        assert_eq!(health(s(30), None, true, false), Health::Healthy);
+        assert_eq!(health(s(45), None, false, false), Health::Wait);
+        assert!(failed(health(s(60), None, false, false), "did not answer"));
+        assert_eq!(health(s(60), None, true, false), Health::Healthy);
+        assert!(failed(health(s(31), Some(0), true, false), "0x0"), "an exit wins over an answer, even code 0");
+    }
+
+    #[test]
+    fn an_exit_at_the_session_end_has_no_verdict() {
+        let s = Duration::from_secs;
+        assert_eq!(health(s(5), Some(0), false, true), Health::SessionEnd);
+        assert_eq!(health(s(61), Some(1), true, true), Health::SessionEnd);
+        assert_eq!(health(s(5), None, false, true), Health::Wait, "no exit: the session end changes nothing");
+        assert_eq!(health(s(30), None, true, true), Health::Healthy);
+        assert!(matches!(health(s(60), None, false, true), Health::Failed(_)));
     }
 
     #[test]
