@@ -670,6 +670,9 @@ pub struct Config {
     /// `MONITOR_POINTER` ("pointer") = the Win key brings the bar to the display under the pointer.
     pub monitor: String,
     pub autohide: bool,
+    /// While the bar is visible it reserves its strip of the screen like the Windows taskbar
+    /// (AppBar, `appbar`): windows below are pushed away instead of ending up under it. Default false.
+    pub reserve_space: bool,
     /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
     /// (`picker`). false = no hover timer is armed and no picker window is ever created.
     pub window_previews: bool,
@@ -808,6 +811,7 @@ impl Default for Config {
             position: Position::Bottom,
             monitor: String::new(),
             autohide: true,
+            reserve_space: false,
             window_previews: true,
             win_opens_start: false,
             hide_native_taskbar: true,
@@ -975,11 +979,12 @@ fn parse(text: &str) -> Result<Config, String> {
 /// test pins the list to `serde_json::to_value(Config::default())`) and the legacy `bar_size` (read by
 /// `migrate_bar_size`, never written). A list, because serializing the defaults at run time costs the exe
 /// about 8 KiB. A new top-level field goes here too, or it would be kept as unknown and written twice.
-const KNOWN_KEYS: [&str; 51] = [
+const KNOWN_KEYS: [&str; 52] = [
     "language",
     "position",
     "monitor",
     "autohide",
+    "reserve_space",
     "window_previews",
     "win_opens_start",
     "hide_native_taskbar",
@@ -1156,6 +1161,10 @@ fn render(c: &Config) -> String {
 
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
   "autohide": {autohide},
+
+  // true = while the bar is visible it reserves its screen strip like the Windows taskbar, so
+  // maximized windows are pushed away instead of going under it. false = the bar overlays them.
+  "reserve_space": {reserve_space},
 
   // Resting the pointer on an app with several windows shows a live preview of each one (with its
   // title); click a preview to switch to that window. false = no previews and no extra window.
@@ -1372,6 +1381,7 @@ fn render(c: &Config) -> String {
         tray_size = c.tray_icon_size,
         module_size = c.module_size,
         autohide = c.autohide,
+        reserve_space = c.reserve_space,
         window_previews = c.window_previews,
         win_opens_start = c.win_opens_start,
         start_style = c.start_style.as_str(),
@@ -2306,6 +2316,7 @@ mod tests {
         let c = parse("{\"position\":\"top\",\"pinned\":[{\"key\":\"a\"}]}").unwrap();
         assert_eq!(c.position, Position::Top);
         assert!(c.autohide && c.show_date && c.window_previews);
+        assert!(!c.reserve_space, "a config without the key keeps the AppBar off");
         assert_eq!(c.pinned[0].key, "a");
         assert!(c.pinned[0].icon.is_none());
     }

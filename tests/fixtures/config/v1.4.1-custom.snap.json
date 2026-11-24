@@ -3,6 +3,7 @@
   "position": "top",
   "monitor": "\\\\.\\DISPLAY2",
   "autohide": false,
+  "reserve_space": false,
   "window_previews": false,
   "win_opens_start": true,
   "hide_native_taskbar": false,

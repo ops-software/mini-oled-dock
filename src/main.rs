@@ -41,6 +41,7 @@ macro_rules! probe {
     };
 }
 
+mod appbar;
 mod apps;
 mod arp;
 mod audio;

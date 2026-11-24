@@ -3,6 +3,7 @@
   "position": "bottom",
   "monitor": "",
   "autohide": true,
+  "reserve_space": false,
   "window_previews": true,
   "win_opens_start": false,
   "hide_native_taskbar": true,

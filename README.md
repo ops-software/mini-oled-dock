@@ -199,6 +199,7 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
 | `window_previews` | `true` | Live previews of an app's windows when the pointer rests on an app with two or more |
+| `reserve_space` | `false` | While the dock is visible it reserves its screen strip like the taskbar (AppBar): windows are pushed away |
 | `hide_native_taskbar` | `true` | Hide the Windows taskbar while the dock runs |
 | `show_date` / `date_format` | `true` / `"ddd d MMM"` | Date under the time (Windows date picture) |
 | `time_format` / `show_seconds` | `"HH:mm"` / `false` | Clock format (Windows time picture) |
