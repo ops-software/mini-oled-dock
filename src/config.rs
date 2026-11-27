@@ -131,6 +131,71 @@ impl<'de> Deserialize<'de> for BatteryShow {
     }
 }
 
+/// How the hidden bar is revealed at the screen edge: `Dwell` = rest the pointer there, `Push` = push against
+/// the edge. Written as "dwell" / "push"; an unreadable value is `Dwell` instead of rejecting the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reveal {
+    #[default]
+    Dwell,
+    Push,
+}
+
+impl Serialize for Reveal {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Reveal::Dwell => "dwell",
+            Reveal::Push => "push",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Reveal {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) if s.trim().eq_ignore_ascii_case("push") => Reveal::Push,
+            _ => Reveal::Dwell,
+        })
+    }
+}
+
+/// Which keyboard chords the dock owns (only while the native taskbar is hidden). All on by default.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    /// Win+1..9 and Win+0 (also with Shift and Alt).
+    pub win_numbers: bool,
+    /// Win+T and Win+Shift+T.
+    pub win_t: bool,
+    /// Win+B.
+    pub win_b: bool,
+    /// Digit chips on the bar while Win is held.
+    pub peek: bool,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        KeyboardConfig { win_numbers: true, win_t: true, win_b: true, peek: true }
+    }
+}
+
+/// Range of `Config::hide_delay_ms` (ms).
+pub const HIDE_DELAY_RANGE: (u32, u32) = (0, 5000);
+/// Range of `Config::show_delay_ms` (ms).
+pub const SHOW_DELAY_RANGE: (u32, u32) = (0, 1000);
+/// Range of `Config::push_threshold` (raw counts within one second).
+pub const PUSH_THRESHOLD_RANGE: (u32, u32) = (20, 1000);
+/// Hide delay of a file that has no `hide_delay_ms` key (every file written before 1.6).
+pub const LEGACY_HIDE_DELAY_MS: u32 = 2500;
+/// Hide delay a fresh install writes.
+pub const FRESH_HIDE_DELAY_MS: u32 = 1000;
+const DEFAULT_SHOW_DELAY_MS: u32 = 150;
+const DEFAULT_PUSH_THRESHOLD: u32 = 100;
+
+/// Serde default of `Config::tray_privacy_migrated`: a missing key means the migration still has to run.
+fn no_privacy_migration_yet() -> bool {
+    false
+}
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -670,6 +735,21 @@ pub struct Config {
     /// `MONITOR_POINTER` ("pointer") = the Win key brings the bar to the display under the pointer.
     pub monitor: String,
     pub autohide: bool,
+    /// Auto-hide: ms the pointer may be off the bar before it hides, 0..=5000 (`HIDE_DELAY_RANGE`).
+    /// A missing key reads 2500; a fresh install writes 1000.
+    pub hide_delay_ms: u32,
+    /// Auto-hide: ms the pointer rests at the screen edge before the bar shows, 0..=1000.
+    pub show_delay_ms: u32,
+    /// How the hidden bar is revealed at the edge.
+    pub reveal: Reveal,
+    /// Push reveal: raw pointer counts within one second that count as a push, 20..=1000.
+    pub push_threshold: u32,
+    /// Owned keyboard chords.
+    pub keyboard: KeyboardConfig,
+    /// true once the privacy-indicator migration (`migrate_privacy`) has run for this file. A file without
+    /// the key reads false (so the migration runs); a config built in memory has nothing to migrate.
+    #[serde(default = "no_privacy_migration_yet")]
+    pub tray_privacy_migrated: bool,
     /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
     /// (`picker`). false = no hover timer is armed and no picker window is ever created.
     pub window_previews: bool,
@@ -791,15 +871,52 @@ pub const TRAY_ORDER_CAP: usize = 128;
 pub const DEFAULT_MODULES_ORDER: [&str; 8] =
     ["metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power"];
 
-/// GUIDs of the system tray icons hidden by default: volume, network, power, location,
-/// microphone (the dock draws/duplicates the first three).
-pub const DEFAULT_TRAY_HIDDEN_GUIDS: [&str; 5] = [
+/// The default list of releases before 1.6: volume, network, power, location, microphone. A file whose
+/// list equals it (once, `migrate_privacy`) takes `DEFAULT_TRAY_HIDDEN_GUIDS` instead.
+pub const OLD_DEFAULT_TRAY_HIDDEN_GUIDS: [&str; 5] = [
     "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
     "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
     "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
     "7820ae77-23e3-4229-82c1-e41cb67d5b9c",
     "7820ae82-23e3-4229-82c1-e41cb67d5b9c",
 ];
+
+/// GUIDs of the system tray icons hidden by default: volume, network, power (the dock draws or
+/// duplicates all three). The privacy indicators are not in it.
+pub const DEFAULT_TRAY_HIDDEN_GUIDS: [&str; 3] = [
+    "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
+    "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
+];
+
+/// The tray icons of the system's privacy indicators: location, microphone.
+pub const PRIVACY_GUIDS: [&str; 2] = ["7820ae77-23e3-4229-82c1-e41cb67d5b9c", "7820ae82-23e3-4229-82c1-e41cb67d5b9c"];
+
+/// Whether `key` (a tray icon GUID, any case, no braces) is one of the privacy indicators.
+pub fn is_privacy_guid(key: &str) -> bool {
+    PRIVACY_GUIDS.iter().any(|g| g.eq_ignore_ascii_case(key.trim()))
+}
+
+/// Equal as sets, ASCII case-insensitive, no other entry.
+fn same_set(list: &[String], want: &[&str]) -> bool {
+    list.iter().all(|g| want.iter().any(|w| w.eq_ignore_ascii_case(g)))
+        && want.iter().all(|w| list.iter().any(|g| g.eq_ignore_ascii_case(w)))
+}
+
+/// Once per file (`tray_privacy_migrated`): a hidden-icons list equal to the old default takes the new one,
+/// so the microphone and location indicators show. Any other list is the user's and stays. Returns
+/// whether the list changed.
+fn migrate_privacy(c: &mut Config) -> bool {
+    if c.tray_privacy_migrated {
+        return false;
+    }
+    c.tray_privacy_migrated = true;
+    if !same_set(&c.tray_hidden_guids, &OLD_DEFAULT_TRAY_HIDDEN_GUIDS) {
+        return false;
+    }
+    c.tray_hidden_guids = DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect();
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -808,6 +925,12 @@ impl Default for Config {
             position: Position::Bottom,
             monitor: String::new(),
             autohide: true,
+            hide_delay_ms: LEGACY_HIDE_DELAY_MS,
+            show_delay_ms: DEFAULT_SHOW_DELAY_MS,
+            reveal: Reveal::Dwell,
+            push_threshold: DEFAULT_PUSH_THRESHOLD,
+            keyboard: KeyboardConfig::default(),
+            tray_privacy_migrated: true,
             window_previews: true,
             win_opens_start: false,
             hide_native_taskbar: true,
@@ -960,26 +1083,100 @@ fn strip_comments(src: &str) -> String {
 
 /// Parses the config (JSONC). Tolerates a leading UTF-8 BOM (Notepad). Missing fields = defaults.
 fn parse(text: &str) -> Result<Config, String> {
+    parse_with_notes(text).map(|(c, _)| c)
+}
+
+/// `parse`, and what the load noticed (`LoadNotes`): a `show_battery` value that is none of the accepted ones, and
+/// whether the privacy migration changed the hidden-icons list (the file is then rewritten).
+fn parse_with_notes(text: &str) -> Result<(Config, LoadNotes), String> {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
     let t = strip_comments(t);
-    let mut c = serde_json::from_str::<Config>(&t).map_err(|e| e.to_string())?;
-    c.extra = unknown_keys(&t);
+    let mut value = serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string())?;
+    let new_keys_invalid = sanitize_new_keys(&mut value);
+    // A failure reads the text again, for the error with its line and column.
+    let mut c = Config::deserialize(&value).map_err(|_| match serde_json::from_str::<Config>(&t) {
+        Err(e) => e.to_string(),
+        Ok(_) => "unreadable".to_string(),
+    })?;
+    let (mut notes, extra) = notes_and_unknown(value);
+    notes.new_keys_invalid = new_keys_invalid;
+    c.extra = extra;
     migrate_bar_size(&mut c);
+    clamp_timing(&mut c);
+    notes.privacy_flag_set = !c.tray_privacy_migrated;
+    notes.privacy_migrated = migrate_privacy(&mut c);
     for msg in c.launcher.sanitize() {
         crate::log!("config error: {msg}");
     }
-    Ok(c)
+    Ok((c, notes))
+}
+
+/// The keys of the four keyboard switches (`KeyboardConfig`).
+const KEYBOARD_FLAGS: [&str; 4] = ["win_numbers", "win_t", "win_b", "peek"];
+
+/// Reads the keys added in 1.6 leniently, as `reveal` and `show_battery` are: a value of the wrong type is
+/// dropped (the key then reads its default) instead of refusing the whole file; `"keyboard": true` or
+/// `false` sets all four switches; a number too big for u32 becomes the largest one (the range clamp
+/// follows). Returns whether a value was dropped.
+fn sanitize_new_keys(v: &mut serde_json::Value) -> bool {
+    use serde_json::Value;
+    let Some(o) = v.as_object_mut() else { return false };
+    let mut dropped = false;
+    for k in ["hide_delay_ms", "show_delay_ms", "push_threshold"] {
+        match o.get(k).map(Value::as_u64) {
+            None => {}
+            Some(Some(n)) if n <= u64::from(u32::MAX) => {}
+            Some(Some(_)) => {
+                o.insert(k.to_string(), Value::from(u32::MAX));
+            }
+            Some(None) => {
+                o.remove(k);
+                dropped = true;
+            }
+        }
+    }
+    if o.get("tray_privacy_migrated").is_some_and(|f| !f.is_boolean()) {
+        o.remove("tray_privacy_migrated");
+        dropped = true;
+    }
+    match o.get_mut("keyboard") {
+        None => {}
+        Some(Value::Bool(on)) => {
+            let on = *on;
+            let all = KEYBOARD_FLAGS.iter().map(|f| (f.to_string(), Value::Bool(on))).collect();
+            o.insert("keyboard".to_string(), Value::Object(all));
+        }
+        Some(Value::Object(m)) => {
+            for f in KEYBOARD_FLAGS {
+                if m.get(f).is_some_and(|x| !x.is_boolean()) {
+                    m.remove(f);
+                    dropped = true;
+                }
+            }
+        }
+        Some(_) => {
+            o.remove("keyboard");
+            dropped = true;
+        }
+    }
+    dropped
 }
 
 /// The top-level keys this release knows: every key serde writes for a `Config` (what `render` writes; a
 /// test pins the list to `serde_json::to_value(Config::default())`) and the legacy `bar_size` (read by
 /// `migrate_bar_size`, never written). A list, because serializing the defaults at run time costs the exe
 /// about 8 KiB. A new top-level field goes here too, or it would be kept as unknown and written twice.
-const KNOWN_KEYS: [&str; 51] = [
+const KNOWN_KEYS: [&str; 57] = [
     "language",
     "position",
     "monitor",
     "autohide",
+    "hide_delay_ms",
+    "show_delay_ms",
+    "reveal",
+    "push_threshold",
+    "keyboard",
+    "tray_privacy_migrated",
     "window_previews",
     "win_opens_start",
     "hide_native_taskbar",
@@ -1029,15 +1226,78 @@ const KNOWN_KEYS: [&str; 51] = [
     "launcher",
 ];
 
-/// The top-level keys of `json` that are not `KNOWN_KEYS`. Anything unexpected keeps nothing, as before.
-fn unknown_keys(json: &str) -> serde_json::Map<String, serde_json::Value> {
-    let Ok(serde_json::Value::Object(mut all)) = serde_json::from_str(json) else {
-        return serde_json::Map::new();
+/// What a load noticed about the file, for Settings and the log. `privacy_migrated` is filled by `parse_with_notes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadNotes {
+    /// `show_battery` is present and is neither a boolean nor "auto", "true" or "false": "auto" is used.
+    pub show_battery_invalid: bool,
+    /// The privacy migration changed the hidden-icons list in this load.
+    pub privacy_migrated: bool,
+    /// The file had no valid `tray_privacy_migrated` and this load set it: the file is rewritten so that the flag is
+    /// stored, whether or not the list changed.
+    pub privacy_flag_set: bool,
+    /// A key added in 1.6 (a delay, `push_threshold`, `keyboard`, `tray_privacy_migrated`) held a value of the
+    /// wrong type: it was ignored and the key reads its default.
+    pub new_keys_invalid: bool,
+}
+
+/// The notes of the last successful load (init or a reload), for Settings.
+pub fn load_notes() -> LoadNotes {
+    *NOTES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+static NOTES: Mutex<LoadNotes> = Mutex::new(LoadNotes {
+    show_battery_invalid: false,
+    privacy_migrated: false,
+    privacy_flag_set: false,
+    new_keys_invalid: false,
+});
+
+fn store_notes(n: LoadNotes) {
+    *NOTES.lock().unwrap_or_else(|p| p.into_inner()) = n;
+    if n.show_battery_invalid {
+        crate::log!("config error: show_battery has an unknown value, \"auto\" is used");
+    }
+    if n.new_keys_invalid {
+        crate::log!("config error: a new key has a value of the wrong type, its default is used");
+    }
+}
+
+/// The notes a parsed file leaves (all but `privacy_migrated`, `privacy_flag_set` and `new_keys_invalid`) and its
+/// top-level keys that are not `KNOWN_KEYS`. Anything unexpected keeps nothing, as before.
+fn notes_and_unknown(json: serde_json::Value) -> (LoadNotes, serde_json::Map<String, serde_json::Value>) {
+    let serde_json::Value::Object(mut all) = json else {
+        return (LoadNotes::default(), serde_json::Map::new());
+    };
+    let show_battery_invalid = match all.get("show_battery") {
+        None | Some(serde_json::Value::Bool(_)) => false,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            !(s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false"))
+        }
+        Some(_) => true,
     };
     for k in KNOWN_KEYS {
         all.remove(k);
     }
-    all
+    (LoadNotes { show_battery_invalid, ..LoadNotes::default() }, all)
+}
+
+/// Clamps the three auto-hide numbers into their ranges.
+fn clamp_timing(c: &mut Config) {
+    c.hide_delay_ms = c.hide_delay_ms.clamp(HIDE_DELAY_RANGE.0, HIDE_DELAY_RANGE.1);
+    c.show_delay_ms = c.show_delay_ms.clamp(SHOW_DELAY_RANGE.0, SHOW_DELAY_RANGE.1);
+    c.push_threshold = c.push_threshold.clamp(PUSH_THRESHOLD_RANGE.0, PUSH_THRESHOLD_RANGE.1);
+}
+
+/// The config of a fresh install: today's defaults, a one-second hide delay and nothing left to migrate.
+#[allow(clippy::field_reassign_with_default)]
+fn fresh_config() -> Config {
+    // Assigned after the call, not in a struct update: the update form inlines a second copy of `Config::default`
+    // into the exe (about 1 KiB).
+    let mut c = Config::default();
+    c.hide_delay_ms = FRESH_HIDE_DELAY_MS;
+    c
 }
 
 /// Converts a legacy `bar_size` (one knob scaling the whole bar: small 7/8, medium 1, large 5/4)
@@ -1157,6 +1417,18 @@ fn render(c: &Config) -> String {
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
   "autohide": {autohide},
 
+  // Auto-hide timing (ms): show_delay_ms 0-1000 at the screen edge (default 150),
+  // hide_delay_ms 0-5000 after the pointer leaves the bar (a new install writes 1000; a missing key reads 2500).
+  // {reveal_guide}
+  "show_delay_ms": {show_delay},
+  "hide_delay_ms": {hide_delay},
+  "reveal": {reveal},
+  "push_threshold": {push_threshold},
+
+  // Keyboard: win_numbers = Win+1..9/0 (also with Shift and Alt), win_t = Win+T and Win+Shift+T, win_b = Win+B,
+  // peek = digit chips while Win is held. Owned only while hide_native_taskbar is true.
+  "keyboard": {keyboard},
+
   // Resting the pointer on an app with several windows shows a live preview of each one (with its
   // title); click a preview to switch to that window. false = no previews and no extra window.
   "window_previews": {window_previews},
@@ -1252,8 +1524,11 @@ fn render(c: &Config) -> String {
   // dragging an icon in the bar; icons not listed go last, in the order they registered.
   "tray_order": {tray_order},
 
-  // System tray icons the dock never shows (volume, network, power, location, microphone).
+  // System tray icons the dock never shows (volume, network, power: the dock draws those itself).
   "tray_hidden_guids": {tray_guids},
+
+  // Internal: set once the privacy indicators (microphone, location) were let out of the list above. Leave as is.
+  "tray_privacy_migrated": {tray_privacy_migrated},
 
   // Pinned apps, in order. Normally managed with Pin/Unpin in the app menu. Fields:
   //   "key"    grouping key: the AUMID, or the lowercase exe path
@@ -1372,6 +1647,15 @@ fn render(c: &Config) -> String {
         tray_size = c.tray_icon_size,
         module_size = c.module_size,
         autohide = c.autohide,
+        show_delay = c.show_delay_ms,
+        hide_delay = c.hide_delay_ms,
+        reveal_guide = reveal_guide(crate::ui::PUSH_AVAILABLE),
+        reveal = if c.reveal == Reveal::Push { "\"push\"" } else { "\"dwell\"" },
+        push_threshold = c.push_threshold,
+        keyboard = format_args!(
+            "{{\"win_numbers\":{},\"win_t\":{},\"win_b\":{},\"peek\":{}}}",
+            c.keyboard.win_numbers, c.keyboard.win_t, c.keyboard.win_b, c.keyboard.peek
+        ),
         window_previews = c.window_previews,
         win_opens_start = c.win_opens_start,
         start_style = c.start_style.as_str(),
@@ -1400,6 +1684,7 @@ fn render(c: &Config) -> String {
         modules_order = js_block(&c.modules_order),
         audio_layout = js(&c.audio_layout.encode()),
         tray_guids = js_block(&c.tray_hidden_guids),
+        tray_privacy_migrated = c.tray_privacy_migrated,
         pinned = js_block(&c.pinned),
         start_pins = js_block(&c.start_pins),
         start_folders = js_block(&c.start_folders),
@@ -1433,6 +1718,24 @@ fn render(c: &Config) -> String {
     )
 }
 
+/// The guide line of `reveal` and `push_threshold`: while the Push reveal is not shipped nothing reads the two keys.
+fn reveal_guide(push_available: bool) -> &'static str {
+    if push_available {
+        "reveal: \"dwell\" (rest the pointer at the edge) or \"push\" \
+         (push against the edge, push_threshold 20-1000 counts)."
+    } else {
+        "reveal and push_threshold are not used yet: the bar always shows on a rest at the edge. \
+         The keys stay for a later release."
+    }
+}
+
+/// Whether the start rewrites a file that parsed: it is not in the commented format yet, it still has the legacy
+/// `bar_size`, or its load ran the privacy migration (the flag is stored even when the list did not change, so
+/// a list restored by hand later is not migrated a second time).
+fn needs_rewrite(text: &str, notes: &LoadNotes) -> bool {
+    !text.contains(TEMPLATE_MARK) || text.contains("\"bar_size\"") || notes.privacy_migrated || notes.privacy_flag_set
+}
+
 /// Reads the config from disk; if the file is missing it creates it with the defaults; if it is unreadable/invalid
 /// it logs and uses the defaults WITHOUT overwriting the file. Sets the global snapshot and remembers
 /// the mtime for `poll_changed`. Called once at startup from the main thread.
@@ -1444,12 +1747,17 @@ pub fn init() -> Arc<Config> {
     };
     report_legacy_dir();
     match read_text(&path) {
-        Ok(text) => match parse(&text) {
-            Ok(c) => {
+        Ok(text) => match parse_with_notes(&text) {
+            Ok((c, notes)) => {
                 crate::log!("config: read from {}", path.display());
-                if !text.contains(TEMPLATE_MARK) || text.contains("\"bar_size\"") {
-                    // Legacy plain JSON (or the legacy "bar_size", migrated by `parse`): rewrite
-                    // once with the commented guide.
+                store_notes(notes);
+                let privacy_changed = notes.privacy_migrated;
+                if privacy_changed {
+                    crate::log!("config: privacy indicators no longer hidden by default (list migrated)");
+                }
+                if needs_rewrite(&text, &notes) {
+                    // Legacy plain JSON (or the legacy "bar_size", or the privacy migration, run by `parse`):
+                    // rewrite once with the commented guide.
                     let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                     match write_file(&c) {
                         Ok(()) => crate::log!("config: migrated to the commented format"),
@@ -1464,7 +1772,7 @@ pub fn init() -> Arc<Config> {
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let c = migrate_legacy().unwrap_or_default();
+            let c = migrate_legacy().unwrap_or_else(fresh_config);
             crate::log!("config: missing, creating {}", path.display());
             if let Err(e) = save(&c) {
                 crate::log!("config: creation failed: {e}");
@@ -1695,8 +2003,16 @@ pub fn poll_changed() -> bool {
             return false;
         }
     };
-    match parse(&text) {
-        Ok(c) => {
+    match parse_with_notes(&text) {
+        Ok((c, notes)) => {
+            store_notes(notes);
+            if notes.privacy_flag_set {
+                // A file edited or restored by hand without the flag: store it, so the migration runs once.
+                let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = write_file(&c) {
+                    crate::log!("config: storing the privacy flag failed: {e}");
+                }
+            }
             if c == *get() {
                 return false;
             }
@@ -1763,6 +2079,11 @@ fn write_file(c: &Config) -> Result<(), String> {
     // Never lose unparsed user edits: refuse to write if they cannot be saved aside.
     backup_if_broken(&path)?;
     crate::datadir::write_atomic(&path, json.as_bytes(), crate::datadir::FileAcl::UserEditable)?;
+    // The file just written holds a valid show_battery, so the note about an invalid one is stale.
+    let mut notes = NOTES.lock().unwrap_or_else(|p| p.into_inner());
+    notes.show_battery_invalid = false;
+    notes.new_keys_invalid = false;
+    drop(notes);
     *lock_mtime() = file_mtime(&path);
     Ok(())
 }
@@ -2289,6 +2610,264 @@ mod tests {
         let r = render(&c);
         assert_eq!(parse(&r).unwrap(), c);
         assert_eq!(render(&parse(&r).unwrap()), r);
+    }
+
+    #[test]
+    fn timing_keys_default_and_clamp() {
+        let c = parse("{}").unwrap();
+        assert_eq!((c.hide_delay_ms, c.show_delay_ms, c.reveal, c.push_threshold), (2500, 150, Reveal::Dwell, 100));
+        assert_eq!(parse("{\"hide_delay_ms\": 9000}").unwrap().hide_delay_ms, 5000);
+        assert_eq!(parse("{\"show_delay_ms\": 20000}").unwrap().show_delay_ms, 1000);
+        assert_eq!(parse("{\"push_threshold\": 1}").unwrap().push_threshold, 20);
+        assert_eq!(parse("{\"push_threshold\": 5000}").unwrap().push_threshold, 1000);
+        assert_eq!(parse("{\"hide_delay_ms\": 0}").unwrap().hide_delay_ms, 0);
+        // A number too big for u32 is clamped like any other number out of range.
+        assert_eq!(parse("{\"hide_delay_ms\": 5000000000}").unwrap().hide_delay_ms, 5000);
+        assert_eq!(parse("{\"push_threshold\": 99999999999}").unwrap().push_threshold, 1000);
+    }
+
+    #[test]
+    fn new_keys_of_the_wrong_type_keep_the_default() {
+        // Every natural hand edit with the wrong type: the file still loads, the key reads its default, the rest of
+        // the file survives and the load leaves a note.
+        let wrong = [
+            ("hide_delay_ms", "\"1000\""),
+            ("hide_delay_ms", "1500.5"),
+            ("hide_delay_ms", "-1"),
+            ("hide_delay_ms", "null"),
+            ("hide_delay_ms", "true"),
+            ("show_delay_ms", "\"fast\""),
+            ("show_delay_ms", "[]"),
+            ("push_threshold", "2.5"),
+            ("push_threshold", "-20"),
+            ("keyboard", "null"),
+            ("keyboard", "3"),
+            ("keyboard", "\"off\""),
+            ("tray_privacy_migrated", "\"yes\""),
+            ("tray_privacy_migrated", "1"),
+        ];
+        let want = Config::default();
+        for (key, val) in wrong {
+            let text = format!("{{ \"{key}\": {val}, \"autohide\": false, \"position\": \"top\" }}");
+            let (c, notes) = parse_with_notes(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!(notes.new_keys_invalid, "{text}");
+            assert!(!c.autohide && c.position == Position::Top, "the rest of the file must survive: {text}");
+            assert_eq!(
+                (c.hide_delay_ms, c.show_delay_ms, c.push_threshold, c.keyboard),
+                (want.hide_delay_ms, want.show_delay_ms, want.push_threshold, want.keyboard),
+                "{text}"
+            );
+        }
+        // A wrong flag inside `keyboard` drops only that switch.
+        let (c, notes) = parse_with_notes("{\"keyboard\": {\"win_t\": \"no\", \"win_b\": false}}").unwrap();
+        assert!(notes.new_keys_invalid);
+        assert_eq!(c.keyboard, KeyboardConfig { win_b: false, ..KeyboardConfig::default() });
+        // Right types leave no note, including the keys the file does not have.
+        for ok in ["{}", "{\"hide_delay_ms\": 0, \"show_delay_ms\": 9999, \"keyboard\": {\"peek\": false}}"] {
+            assert!(!parse_with_notes(ok).unwrap().1.new_keys_invalid, "{ok}");
+        }
+        // What is not one of the new keys stays strict: a file that is not an object, or a wrong type elsewhere.
+        assert!(parse("{ \"hide_delay_ms\": ").is_err());
+        assert!(parse("{\"autohide\": \"yes\"}").is_err());
+    }
+
+    #[test]
+    fn keyboard_true_or_false_sets_all_four_switches() {
+        let off = KeyboardConfig { win_numbers: false, win_t: false, win_b: false, peek: false };
+        let (c, notes) = parse_with_notes("{\"keyboard\": false}").unwrap();
+        assert_eq!(c.keyboard, off);
+        assert!(!notes.new_keys_invalid);
+        assert_eq!(parse("{\"keyboard\": true}").unwrap().keyboard, KeyboardConfig::default());
+        // A file that was edited that way is written back as the object.
+        assert_eq!(parse(&render(&parse("{\"keyboard\": false}").unwrap())).unwrap().keyboard, off);
+    }
+
+    #[test]
+    fn wrong_new_key_can_be_written_back_clean() {
+        // After the dock writes the file, the keys hold valid values and a reload leaves no note.
+        let c = parse("{ \"hide_delay_ms\": \"1000\" }").unwrap();
+        assert!(!parse_with_notes(&render(&c)).unwrap().1.new_keys_invalid);
+    }
+
+    #[test]
+    fn reveal_parses_leniently() {
+        for (text, want) in [
+            ("\"push\"", Reveal::Push),
+            ("\"PUSH\"", Reveal::Push),
+            ("\"dwell\"", Reveal::Dwell),
+            ("\"x\"", Reveal::Dwell),
+            ("3", Reveal::Dwell),
+            ("null", Reveal::Dwell),
+        ] {
+            let c = parse(&format!("{{ \"reveal\": {text}, \"autohide\": false }}")).unwrap();
+            assert_eq!(c.reveal, want, "{text}");
+            assert!(!c.autohide, "the rest of the file must survive: {text}");
+        }
+    }
+
+    #[test]
+    fn keyboard_defaults_and_partial() {
+        let all = KeyboardConfig { win_numbers: true, win_t: true, win_b: true, peek: true };
+        assert_eq!(parse("{}").unwrap().keyboard, all);
+        assert_eq!(Config::default().keyboard, all);
+        let c = parse("{\"keyboard\": {\"win_t\": false}}").unwrap();
+        assert_eq!(c.keyboard, KeyboardConfig { win_t: false, ..all });
+    }
+
+    #[test]
+    fn fresh_install_gets_one_second() {
+        assert_eq!(fresh_config().hide_delay_ms, 1000);
+        assert!(fresh_config().tray_privacy_migrated);
+        // A file without the key has not been migrated yet (the parse then runs the migration and sets it).
+        assert!(!serde_json::from_str::<Config>("{}").unwrap().tray_privacy_migrated);
+        assert!(parse("{}").unwrap().tray_privacy_migrated);
+        assert_eq!(Config::default().hide_delay_ms, 2500);
+    }
+
+    #[test]
+    fn the_guide_says_what_the_timing_keys_do() {
+        // Push is not shipped: the guide says the two keys are not used yet, and offers "push" only when it is.
+        assert!(reveal_guide(false).contains("not used yet"));
+        assert!(!reveal_guide(false).contains("\"push\" ("));
+        assert!(reveal_guide(true).contains("\"push\""));
+        assert!(!reveal_guide(true).contains("not used yet"));
+        let r = render(&Config::default());
+        assert!(r.contains(reveal_guide(crate::ui::PUSH_AVAILABLE)), "{r}");
+        // The delay: the fresh-install value and the value of a missing key, in one sentence.
+        assert!(r.contains("a new install writes 1000; a missing key reads 2500"), "{r}");
+        assert_eq!(fresh_config().hide_delay_ms, 1000);
+        assert_eq!(parse("{}").unwrap().hide_delay_ms, 2500);
+    }
+
+    #[test]
+    fn render_roundtrip_new_keys() {
+        let c = Config {
+            hide_delay_ms: 0,
+            show_delay_ms: 700,
+            reveal: Reveal::Push,
+            push_threshold: 640,
+            keyboard: KeyboardConfig { win_numbers: false, win_t: true, win_b: false, peek: false },
+            tray_privacy_migrated: true,
+            ..Config::default()
+        };
+        let r = render(&c);
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(render(&parse(&r).unwrap()), r);
+        assert!(r.contains("\"reveal\": \"push\""), "{r}");
+    }
+
+    fn guids(list: &[&str]) -> Config {
+        Config {
+            tray_hidden_guids: list.iter().map(|s| s.to_string()).collect(),
+            tray_privacy_migrated: false,
+            ..Config::default()
+        }
+    }
+
+    fn new_default() -> Vec<String> {
+        DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn privacy_migration_only_for_the_old_default() {
+        // The old default, in any order and case: the new default, flag set, changed.
+        let mut c = guids(&[
+            "7820AE82-23E3-4229-82C1-E41CB67D5B9C",
+            "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae77-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+        ]);
+        assert!(migrate_privacy(&mut c));
+        assert_eq!(c.tray_hidden_guids, new_default());
+        assert!(c.tray_privacy_migrated);
+        // The old default plus one more: the user's list, kept; the flag is set anyway.
+        let mut c = guids(&[
+            "7820ae73-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae74-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae75-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae77-23e3-4229-82c1-e41cb67d5b9c",
+            "7820ae82-23e3-4229-82c1-e41cb67d5b9c",
+            "00000000-0000-0000-0000-000000000000",
+        ]);
+        let before = c.tray_hidden_guids.clone();
+        assert!(!migrate_privacy(&mut c) && c.tray_hidden_guids == before && c.tray_privacy_migrated);
+        // An empty list, a partial list and the new default stay as they are.
+        for list in [&[][..], &["7820ae77-23e3-4229-82c1-e41cb67d5b9c"][..], &DEFAULT_TRAY_HIDDEN_GUIDS[..]] {
+            let mut c = guids(list);
+            let before = c.tray_hidden_guids.clone();
+            assert!(!migrate_privacy(&mut c) && c.tray_hidden_guids == before && c.tray_privacy_migrated);
+        }
+    }
+
+    #[test]
+    fn privacy_migration_runs_once() {
+        // A user who hides the indicators again (flag set, old list) keeps them hidden.
+        let mut c = guids(&OLD_DEFAULT_TRAY_HIDDEN_GUIDS);
+        c.tray_privacy_migrated = true;
+        assert!(!migrate_privacy(&mut c));
+        assert_eq!(c.tray_hidden_guids.len(), 5);
+        // Through the parser: a file with the old list and no flag migrates, and its rewrite does not again.
+        let old = render(&guids(&OLD_DEFAULT_TRAY_HIDDEN_GUIDS));
+        let (c, notes) = parse_with_notes(&old).unwrap();
+        assert!(notes.privacy_migrated && c.tray_hidden_guids == new_default());
+        let (_, again) = parse_with_notes(&render(&c)).unwrap();
+        assert!(!again.privacy_migrated);
+        // The same list with the flag set is the user's choice.
+        let mut kept = guids(&OLD_DEFAULT_TRAY_HIDDEN_GUIDS);
+        kept.tray_privacy_migrated = true;
+        let (c, notes) = parse_with_notes(&render(&kept)).unwrap();
+        assert!(!notes.privacy_migrated && c.tray_hidden_guids.len() == 5);
+    }
+
+    #[test]
+    fn privacy_flag_is_stored_whenever_a_load_set_it() {
+        // A file with the user's own list and no flag: the list stays, this load sets the flag, so the start
+        // rewrites the file (before, only a changed list did).
+        let list = vec!["00000000-0000-0000-0000-000000000000".to_string()];
+        let own = Config { tray_hidden_guids: list, ..Config::default() };
+        let text = render(&Config { tray_privacy_migrated: false, ..own.clone() });
+        let (c, notes) = parse_with_notes(&text).unwrap();
+        assert!(!notes.privacy_migrated && notes.privacy_flag_set);
+        assert_eq!(c.tray_hidden_guids, own.tray_hidden_guids);
+        assert!(needs_rewrite(&text, &notes));
+        // A key that is missing altogether is the same.
+        let (_, notes) = parse_with_notes("{}").unwrap();
+        assert!(notes.privacy_flag_set);
+        // The rewritten file carries the flag: nothing more to write, and a list restored by hand to the old
+        // default is the user's choice, not migrated a second time.
+        let stored = render(&c);
+        let (_, again) = parse_with_notes(&stored).unwrap();
+        assert!(!again.privacy_flag_set && !needs_rewrite(&stored, &again));
+        let restored = Config { tray_hidden_guids: OLD_DEFAULT_TRAY_HIDDEN_GUIDS.map(String::from).to_vec(), ..c };
+        let (back, notes) = parse_with_notes(&render(&restored)).unwrap();
+        assert!(!notes.privacy_migrated && back.tray_hidden_guids.len() == 5);
+        // A file in the commented format with the flag set and nothing legacy is left alone.
+        let (_, notes) = parse_with_notes(&render(&Config::default())).unwrap();
+        assert!(!needs_rewrite(&render(&Config::default()), &notes));
+    }
+
+    #[test]
+    fn show_battery_note() {
+        let note = |v: &str| parse_with_notes(&format!("{{ \"show_battery\": {v} }}")).unwrap().1.show_battery_invalid;
+        for bad in ["\"yes\"", "1", "null", "{}", "[]", "\"\""] {
+            assert!(note(bad), "{bad}");
+        }
+        for good in ["true", "false", "\"AUTO\"", "\"false\"", "\"True\"", "\" auto \""] {
+            assert!(!note(good), "{good}");
+        }
+        assert!(!parse_with_notes("{}").unwrap().1.show_battery_invalid);
+        // The value itself still reads as "auto".
+        assert_eq!(parse("{\"show_battery\": \"yes\"}").unwrap().show_battery, BatteryShow::Auto);
+    }
+
+    #[test]
+    fn privacy_guids_are_the_indicators() {
+        assert!(is_privacy_guid("7820AE82-23E3-4229-82C1-E41CB67D5B9C"));
+        assert!(is_privacy_guid("7820ae77-23e3-4229-82c1-e41cb67d5b9c"));
+        assert!(!is_privacy_guid("7820ae73-23e3-4229-82c1-e41cb67d5b9c"));
+        assert!(!is_privacy_guid(""));
+        assert!(DEFAULT_TRAY_HIDDEN_GUIDS.iter().all(|g| !is_privacy_guid(g)));
     }
 
     #[test]

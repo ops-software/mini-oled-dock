@@ -191,6 +191,8 @@ fn ledger_target_is_not_behind_cargo() {
 fn g7_values_are_pinned() {
     // Changing one needs this test edited too, which is a change the owner reviews.
     assert_eq!(value("private.dock_hidden"), 12.0 * MIB);
+    assert_eq!(value("private.dock_agent"), 12.0 * MIB);
+    assert_eq!(value("private.dock_suite_sync"), 16.0 * MIB);
     assert_eq!(value("private.kit_empty"), 4.0 * MIB);
     assert_eq!(value("private.tasks_640x560"), 15.0 * MIB);
     assert_eq!(value("private.tasks_3840x2160"), 15.0 * MIB);
@@ -225,6 +227,22 @@ fn g7_values_are_pinned() {
     assert_eq!(value("tasks.cpu_1s"), 0.5);
     assert_eq!(value("exe_size.tasks"), (1.8 * MIB).round());
     assert_eq!(value("exe_size.files"), 2.5 * MIB);
+    assert_eq!(value("files.enum_sort_10k_ci"), 50.0);
+    assert_eq!(value("files.first_batch_p99"), 10_000.0);
+    assert_eq!(value("files.sort_100k"), 50.0);
+    assert_eq!(value("files.natural_sort_100k"), 50.0);
+    assert_eq!(value("files.natural_self_check_ms"), 3.0);
+    assert_eq!(value("files.filter_100k"), 16.0);
+    assert_eq!(value("files.store_100k_bytes"), 8.0 * MIB);
+    assert_eq!(value("files.icons_bin_bytes"), 2.0 * MIB);
+    assert_eq!(value("files.shell_fallback_hang_ms"), 1600.0);
+    assert_eq!(value("files.shell_fallback_crash_ms"), 200.0);
+    assert_eq!(value("files.shell_client_call_p99_us"), 1000.0);
+    assert_eq!(value("private.files_ops_idle"), 8.0 * MIB);
+    assert_eq!(value("private.files_ops_per_op"), MIB);
+    assert_eq!(value("private.files_shell_host"), 15.0 * MIB);
+    assert_eq!(value("wakeups.files_ops_idle"), 0.0);
+    assert_eq!(value("wakeups.files_shell_idle"), 0.0);
     assert_eq!(value("exe_size.tasks_admin"), (0.6 * MIB).round());
     assert_eq!(value("golden.bytes"), 32.0 * MIB);
 }
@@ -237,6 +255,8 @@ fn every_g7_budget_has_a_row() {
         "golden.bytes",
         "tests.floor",
         "private.dock_hidden",
+        "private.dock_agent",
+        "private.dock_suite_sync",
         "wakeups.dock_hidden",
         "timers.dock_hidden",
         "wakes.ui_dock_hidden",
@@ -265,6 +285,22 @@ fn every_g7_budget_has_a_row() {
         "private.launcher_files_helper_delta",
         "exe_size.tasks",
         "exe_size.files",
+        "files.enum_sort_10k_ci",
+        "files.first_batch_p99",
+        "files.sort_100k",
+        "files.natural_sort_100k",
+        "files.natural_self_check_ms",
+        "files.filter_100k",
+        "files.store_100k_bytes",
+        "files.icons_bin_bytes",
+        "files.shell_fallback_hang_ms",
+        "files.shell_fallback_crash_ms",
+        "files.shell_client_call_p99_us",
+        "private.files_ops_idle",
+        "private.files_ops_per_op",
+        "private.files_shell_host",
+        "wakeups.files_ops_idle",
+        "wakeups.files_shell_idle",
         "exe_size.tasks_admin",
         "frame.bar_150",
         "frame.table_hover",
@@ -277,6 +313,13 @@ fn every_g7_budget_has_a_row() {
         "start.first_frame_files",
         "files.list_10k",
         "tasks.cpu_1s",
+        "bench.sysmon_parse_300_us",
+        "bench.tasks_model_tick_us",
+        "tasks.snapshot_p95_us",
+        "tasks.sampler_tick_p95_us",
+        "tasks.path_first_us",
+        "tasks.sampler_hidden_iterations",
+        "private.dock_t0_delta",
         "bench.launcher_query_ratio",
     ];
     let rows = rows();
@@ -308,6 +351,14 @@ fn semver_compares_numerically() {
 fn exe_size_within_ledger() {
     let size = std::fs::metadata(std::env::var("DOCK_EXE").expect("DOCK_EXE")).unwrap().len();
     assert!(size <= limit_of_budgets_json(), "dock.exe is {size} bytes");
+}
+
+#[test]
+#[ignore = "needs a release build: FILES_EXE=<path>"]
+fn files_exe_size_within_budget() {
+    let size = std::fs::metadata(std::env::var("FILES_EXE").expect("FILES_EXE")).unwrap().len();
+    let max = value("exe_size.files") as u64;
+    assert!(size <= max, "files.exe is {size} bytes, budget {max}");
 }
 
 #[test]

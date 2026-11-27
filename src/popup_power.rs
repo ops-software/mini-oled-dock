@@ -8,9 +8,11 @@
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 use std::sync::Arc;
 
+use windows::Win32::Foundation::RECT;
+
 use crate::glyphs;
 use crate::log;
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
@@ -138,8 +140,11 @@ pub(crate) fn paint_badge(s: &mut Surface, right: i32, rc: &windows::Win32::Foun
     let top = rc.top + ((rc.bottom - rc.top) - bh) / 2;
     s.fill_rr(rect_wh(left, top, bw, bh), m.px(8), crate::render::ATTENTION_RGB, 255);
     let ty = center_y(&rect_wh(left, top, bw, bh), s.line_height(Font::Small));
-    s.text(text, left + (bw - tw) / 2, ty, Font::Small, WHITE, TEXT_ALPHA);
+    s.text(text, left + (bw - tw) / 2, ty, Font::Small, BADGE_DIGIT_RGB, 255);
 }
+
+/// Ink of the badge digit: black on the orange (contrast 9:1 or more).
+const BADGE_DIGIT_RGB: (u32, u32, u32) = (0, 0, 0);
 
 /// Creates the content (initial state).
 pub(crate) fn new() -> Box<dyn Content> {
@@ -179,13 +184,13 @@ pub(crate) fn preview_with_badge(count: u32) -> Box<dyn Content> {
 /// Label of item `id` in the dock language.
 pub(crate) fn label(id: u32) -> &'static str {
     match id {
-        ID_SLEEP => tr("Sleep", "Sospendi"),
-        ID_LOCK => tr("Lock", "Blocca"),
-        ID_RESTART => tr("Restart", "Riavvia"),
-        ID_SHUTDOWN => tr("Shut down", "Arresta il sistema"),
-        ID_AUTOSTART => tr("Start with Windows", "Avvia con Windows"),
-        ID_SETTINGS => tr("Settings", "Impostazioni"),
-        _ => tr("Exit dock", "Esci dal dock"),
+        ID_SLEEP => t(k::POWER_SLEEP),
+        ID_LOCK => t(k::POWER_LOCK),
+        ID_RESTART => t(k::POWER_RESTART),
+        ID_SHUTDOWN => t(k::POWER_SHUT_DOWN),
+        ID_AUTOSTART => t(k::POWER_START_WITH_WINDOWS),
+        ID_SETTINGS => t(k::COMMON_SETTINGS),
+        _ => t(k::COMMON_EXIT_DOCK),
     }
 }
 
@@ -270,6 +275,10 @@ impl Content for PowerPopup {
         Reply::None
     }
 
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
+    }
+
     fn click(&mut self, id: u32) -> Reply {
         if id == ID_AUTOSTART {
             return self.toggle_autostart();
@@ -332,6 +341,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn badge_digit_contrast() {
+        let lum = |(r, g, b): (u32, u32, u32)| {
+            let ch = |v: u32| {
+                let c = v as f64 / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+        };
+        assert_eq!(BADGE_DIGIT_RGB, (0, 0, 0));
+        let (a, b) = (lum(crate::render::ATTENTION_RGB), lum(BADGE_DIGIT_RGB));
+        assert!((a + 0.05) / (b + 0.05) >= 9.0);
+    }
+
+    #[test]
     fn settings_closes_the_popup_then_opens_the_window() {
         let mut p = PowerPopup {
             hits: HitMap::default(),
@@ -355,5 +382,24 @@ mod tests {
         assert_eq!(settings_badge(0), None);
         assert_eq!(settings_badge(1).as_deref(), Some("1"));
         assert_eq!(settings_badge(12).as_deref(), Some("9+"));
+    }
+
+    #[test]
+    fn power_keyboard_targets() {
+        let mut p = PowerPopup {
+            hits: HitMap::default(),
+            pending: None,
+            sep_y: 0,
+            pad_text: 0,
+            width: 0,
+            autostart: Arc::new(AtomicU8::new(AS_OFF)),
+            seen: AS_OFF,
+            badge: 0,
+            forced_badge: Some(0),
+        };
+        assert_eq!(
+            crate::popup::target_ids(&mut p),
+            [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN, ID_SETTINGS, ID_AUTOSTART, ID_EXIT]
+        );
     }
 }

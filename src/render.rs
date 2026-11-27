@@ -53,6 +53,7 @@ use crate::net::{NetKind, NetStatus};
 use crate::surface::{
     argb, create_font, delete_font, div255, line_height, over, rect_wh, rr_cov, white, Canvas, Gdi, TEXT_FACES, WHITE,
 };
+pub use oled_ui::gfx::scale::Scale as Metrics;
 
 // ------------------------------------------------------------ logical measures
 
@@ -61,11 +62,11 @@ pub const BAR_HEIGHT: i32 = 36;
 /// Margin from the screen edge (logical px).
 pub const EDGE_MARGIN: i32 = 8;
 /// Bar corner radius (logical px).
-pub const BAR_RADIUS: i32 = 11;
+pub const BAR_RADIUS: i32 = oled_ui::tokens::R_BAR;
 /// Hover plate radius (logical px).
-pub const PLATE_RADIUS: i32 = 7;
+pub const PLATE_RADIUS: i32 = oled_ui::tokens::R_S;
 /// App icon side (logical px).
-pub const ICON_SIZE: i32 = 16;
+pub const ICON_SIZE: i32 = oled_ui::tokens::ICON_S;
 /// Maximum program name length (characters); beyond that: truncated with "…".
 pub const NAME_MAX_CHARS: usize = 20;
 
@@ -100,11 +101,11 @@ const INDICATOR_EDGE: i32 = 2;
 /// Indicator height (logical px).
 const INDICATOR_H: i32 = 2;
 /// Colour of the attention indicator (a window asked for attention): the only colour in the UI.
-pub(crate) const ATTENTION_RGB: (u32, u32, u32) = (255, 140, 0);
+pub(crate) const ATTENTION_RGB: (u32, u32, u32) = oled_ui::tokens::ACCENT_ATTENTION;
 /// Distance of the indicator from the icon's bottom edge with the bar at the top (logical px).
 const INDICATOR_BELOW_ICON: i32 = 2;
 /// Radius of the app icon placeholder (logical px).
-const PLACEHOLDER_RADIUS: i32 = 4;
+const PLACEHOLDER_RADIUS: i32 = oled_ui::tokens::R_XS;
 /// Horizontal padding of every "square" glyph-only item (tray, chevron, bell, volume without
 /// percentage, show desktop, power): same width for all (logical px).
 const TRAY_PAD: i32 = 5;
@@ -124,10 +125,10 @@ const DIM_OPACITY_HOT: u32 = 230;
 
 // Colours (not premultiplied) and alpha. The background colour and alpha come from the config
 // (`background`, `bar_opacity`: `Config::bar_alpha`, 242 by default).
-const BORDER_ALPHA: u32 = 22;
-const TEXT_ALPHA: u32 = 230;
-const TEXT2_ALPHA: u32 = 170;
-const SEP_ALPHA: u32 = 30;
+const BORDER_ALPHA: u32 = oled_ui::tokens::RIM_SURFACE;
+const TEXT_ALPHA: u32 = oled_ui::tokens::FG_PRIMARY;
+const TEXT2_ALPHA: u32 = oled_ui::tokens::FG_SECONDARY;
+const SEP_ALPHA: u32 = oled_ui::tokens::SEPARATOR;
 /// Alpha of the "open" indicator.
 pub(crate) const OPEN_ALPHA: u32 = 120;
 /// Text alpha of a pinned app without windows (230 * 0.7), idle / hover.
@@ -135,32 +136,13 @@ const DIM_TEXT_ALPHA: u32 = 161;
 const DIM_TEXT_ALPHA_HOT: u32 = 215;
 const ICON_ALPHA: u32 = 230;
 /// Alpha of text and glyphs under the mouse (they brighten to the maximum).
-const TEXT_ALPHA_HOT: u32 = 255;
+const TEXT_ALPHA_HOT: u32 = oled_ui::tokens::FG_HOT;
 const ICON_ALPHA_HOT: u32 = 255;
-const TEXT2_ALPHA_HOT: u32 = 215;
+const TEXT2_ALPHA_HOT: u32 = oled_ui::tokens::FG_SECONDARY_HOT;
 /// 1 px inner border of the hover plate (white alpha) and the reference fill alpha it
 /// corresponds to: while the plate fades, the border scales proportionally.
-const PLATE_RIM_ALPHA: u32 = 18;
+const PLATE_RIM_ALPHA: u32 = oled_ui::tokens::RIM_HOVER;
 const PLATE_REF_ALPHA: u32 = 20;
-
-/// DPI scale: converts logical measures to physical pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Metrics {
-    /// Effective DPI of the monitor (96 = 100%).
-    pub dpi: u32,
-}
-
-impl Metrics {
-    /// Scale factor (dpi / 96).
-    pub fn scale(&self) -> f32 {
-        self.dpi as f32 / 96.0
-    }
-
-    /// Logical measure -> physical pixels (rounded).
-    pub fn px(&self, logical: i32) -> i32 {
-        ((logical as f32) * self.scale()).round() as i32
-    }
-}
 
 /// The configured sizes of the bar content (`Config::sizes`), in logical px / percent. The bar is
 /// drawn at the monitor DPI; each part is then sized on its own: app icons (requested from the shell
@@ -246,12 +228,6 @@ fn axis(m: Metrics, h: i32, logical_cy: i32) -> i32 {
     m.px(logical_cy) + (h - m.px(BAR_HEIGHT)) / 2
 }
 
-impl Default for Metrics {
-    fn default() -> Self {
-        Metrics { dpi: 96 }
-    }
-}
-
 // ------------------------------------------------------------------ scene
 
 /// Identifies a clickable bar item.
@@ -285,7 +261,7 @@ pub enum ItemId {
 pub enum Indicator {
     /// Pinned without windows.
     None,
-    /// Has open windows (bar 2 high, alpha 110).
+    /// Has open windows (bar 2 high, alpha 120: `OPEN_ALPHA`).
     Open,
     /// A window is in the foreground (bar 2 high, alpha 255).
     Active,
@@ -381,7 +357,7 @@ const BATT_DIGIT_PX: i32 = 11;
 const BATT_BOLT_BOX: i32 = 30;
 const BATT_BOLT_GAP: i32 = 2;
 /// Fill colour on battery at 10 % and below (critical).
-pub(crate) const BATT_CRITICAL_RGB: (u32, u32, u32) = (255, 69, 58);
+pub(crate) const BATT_CRITICAL_RGB: (u32, u32, u32) = oled_ui::tokens::ACCENT_DANGER;
 
 /// Fill colour of the battery glyph for a tint: white, the attention orange below 20 %, red at 10 % and below.
 pub(crate) fn batt_tint_rgb(t: Tint) -> (u32, u32, u32) {
@@ -525,6 +501,65 @@ pub struct Plate {
     pub alpha: u8,
 }
 
+// ---------------------------------------------------------------- keyboard focus
+//
+// The ring of the keyboard layer (dock-keys Z3): geometry only, painted by DK-PAINT R1 (bar) and by
+// `popup::paint_focus_ring` (popups).
+
+/// RIM_FOCUS (A05 section 7): white alpha of the keyboard ring.
+pub(crate) const RIM_FOCUS: u32 = oled_ui::tokens::RIM_FOCUS;
+/// FOCUS_GAP (ROADMAP 2.3, NEW): logical px between a plate and its ring.
+pub(crate) const FOCUS_GAP: i32 = 2;
+/// Side of a Peek digit chip (logical px).
+const CHIP: i32 = 16;
+/// Corner radius of a digit chip (logical px); equal to PLACEHOLDER_RADIUS.
+const R_XS: i32 = oled_ui::tokens::R_XS;
+/// White alpha of a digit chip.
+const FILL_SELECTED: u32 = oled_ui::tokens::FILL_SELECTED;
+/// Ink of the chip digit: black on the white chip.
+const CHIP_INK: (u32, u32, u32) = (0, 0, 0);
+
+/// The digit chips of Peek: the first ten of `n_apps` apps, as (app position in layout order, digit):
+/// "1".."9", then "0".
+pub(crate) fn chip_digits(n_apps: usize) -> impl Iterator<Item = (usize, char)> {
+    "1234567890".chars().enumerate().take(n_apps)
+}
+
+/// The keyboard ring: stroke `rect` with corner `radius` and `width` px (an inner ring).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FocusRing {
+    pub rect: RECT,
+    pub radius: i32,
+    pub width: i32,
+}
+
+// `RECT` implements PartialEq but not Eq, so the derive of section 3.3 cannot compile; the four fields are plain
+// integers, whose equality is reflexive, so the marker is sound and the type keeps every trait the plan gives it.
+impl Eq for FocusRing {}
+
+/// 1.5 logical px rounded half up: floor((3 * dpi + 96) / 192), at least 1 (2/2/2/3 px at 100/125/150/200 %).
+pub(crate) fn ring_width(m: Metrics) -> i32 {
+    ((3 * m.dpi as i32 + 96) / 192).max(1)
+}
+
+/// The ring around `plate` (physical px) whose corner radius is `plate_radius` (physical px): `rect` = plate inflated by
+/// m.px(FOCUS_GAP) + width on every side, `radius` = plate_radius + m.px(FOCUS_GAP) + width (concentric), drawn with
+/// stroke_rr(rect, radius, width, RIM_FOCUS) (an inner ring of `width` px).
+pub(crate) fn focus_ring(plate: RECT, plate_radius: i32, m: Metrics) -> FocusRing {
+    let width = ring_width(m);
+    let grow = m.px(FOCUS_GAP) + width;
+    FocusRing {
+        rect: RECT {
+            left: plate.left - grow,
+            top: plate.top - grow,
+            right: plate.right + grow,
+            bottom: plate.bottom + grow,
+        },
+        radius: plate_radius + grow,
+        width,
+    }
+}
+
 /// Everything needed to draw a frame.
 #[derive(Clone, Copy, Debug)]
 pub struct Scene<'a> {
@@ -553,6 +588,10 @@ pub struct Scene<'a> {
     /// Maximum bar width in physical pixels (0 = unlimited). Above this value
     /// `layout` shrinks the names / the items (see the module doc).
     pub max_width: i32,
+    /// Item drawn with the keyboard focus ring (`ui` keyboard layer); None = no ring.
+    pub focus: Option<ItemId>,
+    /// Peek: digit chips on the first 10 app items.
+    pub chips: bool,
 }
 
 /// Rectangle of an item, in client coordinates (physical pixels).
@@ -1483,6 +1522,43 @@ fn paint_inner(g: &Gfx, scene: &Scene<'_>, layout: &Layout) {
             }
         }
     }
+    // Keyboard ring around the focused item, then Peek's digit chips on the first ten apps.
+    if let Some(r) = scene.focus.and_then(|id| layout.rect_of(id)) {
+        let ring = focus_ring(plate_rect(r, m), m.px(PLATE_RADIUS), m);
+        cv.stroke_rr(ring.rect, ring.radius, ring.width, RIM_FOCUS);
+    }
+    if scene.chips {
+        let apps: Vec<(usize, RECT)> = layout
+            .items
+            .iter()
+            .filter_map(|i| if let ItemId::App(a) = i.id { Some((a, i.rect)) } else { None })
+            .collect();
+        for (k, digit) in chip_digits(apps.len()) {
+            let Some(&(ai, r)) = apps.get(k) else { break };
+            let text_mode =
+                layout.mode == 0 && dm == DisplayMode::Text && scene.apps.get(ai).is_some_and(|a| !a.name.is_empty());
+            let side = m.px(CHIP);
+            let (x, y) = if text_mode {
+                (r.left + m.px(2), cy - side / 2)
+            } else {
+                (r.left + pad - m.px(6), cy - icon_px / 2 - m.px(5))
+            };
+            let rc = rect_wh(x, y, side, side);
+            cv.fill_rr(rc, m.px(R_XS), WHITE, FILL_SELECTED);
+            let s = digit.to_string();
+            let tw = text_width(g, &s, Txt::Small);
+            g.gdi.text(
+                &mut cv,
+                &s,
+                x + (side - tw) / 2,
+                y + (side - lh_small) / 2,
+                g.fonts.get(Txt::Small),
+                tw,
+                CHIP_INK,
+                255,
+            );
+        }
+    }
     // Clip to the edges of the animated pill: items outside the background are not visible.
     if pw < w {
         for row in 0..h as usize {
@@ -1520,8 +1596,72 @@ pub(crate) fn paint_offscreen(scene: &Scene<'_>) -> Option<(i32, i32, Vec<u32>)>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn render_aliases_equal_their_old_literals() {
+        assert_eq!(BAR_RADIUS, 11);
+        assert_eq!(PLATE_RADIUS, 7);
+        assert_eq!(ICON_SIZE, 16);
+        assert_eq!(ATTENTION_RGB, (255, 140, 0));
+        assert_eq!(PLACEHOLDER_RADIUS, 4);
+        assert_eq!(BORDER_ALPHA, 22);
+        assert_eq!(TEXT_ALPHA, 230);
+        assert_eq!(TEXT2_ALPHA, 170);
+        assert_eq!(SEP_ALPHA, 30);
+        assert_eq!(TEXT_ALPHA_HOT, 255);
+        assert_eq!(TEXT2_ALPHA_HOT, 215);
+        assert_eq!(PLATE_RIM_ALPHA, 18);
+        assert_eq!(BATT_CRITICAL_RGB, (255, 69, 58));
+    }
+
     use super::*;
     use crate::config::{BatteryShow, Config};
+
+    #[test]
+    fn chips_label_the_first_ten_apps() {
+        let d: Vec<(usize, char)> = chip_digits(12).collect();
+        assert_eq!(d.len(), 10);
+        assert_eq!(d.iter().map(|x| x.1).collect::<String>(), "1234567890");
+        assert_eq!(d[9], (9, '0'));
+        assert_eq!(chip_digits(3).collect::<Vec<_>>(), vec![(0, '1'), (1, '2'), (2, '3')]);
+        assert_eq!(chip_digits(0).count(), 0);
+    }
+
+    #[test]
+    fn ring_fits_the_bar_at_default_sizes() {
+        for dpi in [96u32, 120, 144, 168, 192] {
+            let m = Metrics { dpi };
+            let h = m.px(BAR_HEIGHT);
+            // A default app item is as tall as the bar; its plate is narrowed by ITEM_VMARGIN.
+            let item = RECT { left: 100, top: 0, right: 100 + m.px(130), bottom: h };
+            let r = focus_ring(plate_rect(item, m), m.px(PLATE_RADIUS), m);
+            assert!(
+                r.rect.top >= 0 && r.rect.bottom <= h,
+                "dpi {dpi}: ring {}..{} in 0..{h}",
+                r.rect.top,
+                r.rect.bottom
+            );
+        }
+    }
+
+    #[test]
+    fn ring_width_rounds_half_up() {
+        for (dpi, w) in [(96, 2), (120, 2), (144, 2), (168, 3), (192, 3)] {
+            assert_eq!(ring_width(Metrics { dpi }), w, "dpi {dpi}");
+        }
+        assert_eq!(ring_width(Metrics { dpi: 1 }), 1, "never below one pixel");
+    }
+
+    #[test]
+    fn ring_is_concentric_and_outside() {
+        let plate = RECT { left: 10, top: 5, right: 36, bottom: 31 };
+        let r = focus_ring(plate, 7, Metrics { dpi: 96 });
+        assert_eq!((r.rect.left, r.rect.top, r.rect.right, r.rect.bottom), (6, 1, 40, 35));
+        assert_eq!((r.radius, r.width), (11, 2));
+        let plate = RECT { left: 20, top: 10, right: 72, bottom: 62 };
+        let r = focus_ring(plate, 14, Metrics { dpi: 192 });
+        assert_eq!((r.rect.left, r.rect.top, r.rect.right, r.rect.bottom), (13, 3, 79, 69));
+        assert_eq!((r.radius, r.width), (21, 3), "inflated by 4 + 3 = 7");
+    }
 
     #[test]
     fn battery_low_is_orange_and_critical_is_red() {
@@ -1703,6 +1843,8 @@ mod tests {
             lift: None,
             hover: None,
             max_width: 0,
+            focus: None,
+            chips: false,
         }
     }
 

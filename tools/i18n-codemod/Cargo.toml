@@ -1,0 +1,17 @@
+[package]
+name = "i18n-codemod"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+publish = false
+description = "Converts the dock's two-language tr(en, it) calls to keyed strings (plan P1-workspace-v2, W4a). Std only."
+
+# Not a member of the workspace (the root Cargo.toml excludes this folder): it has its own Cargo.lock and is run with
+#   cargo run --locked --manifest-path tools/i18n-codemod/Cargo.toml -- <cmd>
+[workspace]
+
+[lib]
+doctest = false
+
+[dependencies]

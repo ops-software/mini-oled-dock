@@ -169,7 +169,7 @@ impl Content for NotifPopup {
         self.y_header = y;
         self.header_h = p(24);
         if !self.state.items.is_empty() && self.state.access == NotifAccess::Allowed {
-            let tw = s.text_width(crate::i18n::tr("Clear all", "Cancella tutto"), Font::Small);
+            let tw = s.text_width(crate::i18n::t(crate::i18n::k::NOTIF_CLEAR_ALL), Font::Small);
             // Text right-aligned on the column (width - TEXT_COL); the plate sticks out 12 beyond the text.
             let rc = rect_wh(self.width - self.margin - tw - p(24), y, tw + p(24), self.header_h);
             self.hits.add(ID_CLEAR, rc);
@@ -268,12 +268,26 @@ impl Content for NotifPopup {
 
         // Header.
         let head = rect_wh(0, self.y_header, self.width, self.header_h);
-        s.text(crate::i18n::tr("Notifications", "Notifiche"), p(TEXT_COL), center_y(&head, lh_b), Font::Bold, WHITE, TEXT_ALPHA);
+        s.text(
+            crate::i18n::t(crate::i18n::k::COMMON_NOTIFICATIONS),
+            p(TEXT_COL),
+            center_y(&head, lh_b),
+            Font::Bold,
+            WHITE,
+            TEXT_ALPHA,
+        );
         if let Some(rc) = self.hits.rect(ID_CLEAR) {
             row_plate(s, rc, ID_CLEAR, hot, pressed);
             let a = if hot == Some(ID_CLEAR) { TEXT_ALPHA } else { TEXT2_ALPHA };
-            let tw = s.text_width(crate::i18n::tr("Clear all", "Cancella tutto"), Font::Small);
-            s.text(crate::i18n::tr("Clear all", "Cancella tutto"), rc.right - p(12) - tw, center_y(&rc, lh_s), Font::Small, WHITE, a);
+            let tw = s.text_width(crate::i18n::t(crate::i18n::k::NOTIF_CLEAR_ALL), Font::Small);
+            s.text(
+                crate::i18n::t(crate::i18n::k::NOTIF_CLEAR_ALL),
+                rc.right - p(12) - tw,
+                center_y(&rc, lh_s),
+                Font::Small,
+                WHITE,
+                a,
+            );
         }
         hline(s, p(TEXT_COL), self.width - p(TEXT_COL), self.sep1);
 
@@ -281,14 +295,14 @@ impl Content for NotifPopup {
         let msg_rc = rect_wh(0, self.list.top, self.width, self.list.bottom - self.list.top);
         if self.state.access != NotifAccess::Allowed {
             let (txt, font) = if self.state.access == NotifAccess::Unknown {
-                (crate::i18n::tr("Loading\u{2026}", "Caricamento\u{2026}"), Font::Small)
+                (crate::i18n::t(crate::i18n::k::COMMON_LOADING), Font::Small)
             } else {
-                (crate::i18n::tr("List unavailable", "Elenco non disponibile"), Font::Small)
+                (crate::i18n::t(crate::i18n::k::NOTIF_LIST_UNAVAILABLE), Font::Small)
             };
             let tw = s.text_width(txt, font);
             s.text(txt, (self.width - tw) / 2, center_y(&msg_rc, s.line_height(font)), font, WHITE, TEXT3_ALPHA);
         } else if self.cards.is_empty() {
-            let txt = crate::i18n::tr("No notifications", "Nessuna notifica");
+            let txt = crate::i18n::t(crate::i18n::k::NOTIF_NO_NOTIFICATIONS);
             let tw = s.text_width(txt, Font::Normal);
             s.text(txt, (self.width - tw) / 2, center_y(&msg_rc, lh_n), Font::Normal, WHITE, TEXT2_ALPHA);
         } else {
@@ -358,13 +372,20 @@ impl Content for NotifPopup {
         // Do not disturb.
         if let (Some(rc), Some(dnd)) = (self.hits.rect(ID_DND), self.state.dnd) {
             let h = row_plate(s, rc, ID_DND, hot, pressed);
-            s.text(crate::i18n::tr("Do not disturb", "Non disturbare"), rc.left + p(12), center_y(&rc, lh_n), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(
+                crate::i18n::t(crate::i18n::k::NOTIF_DO_NOT_DISTURB),
+                rc.left + p(12),
+                center_y(&rc, lh_n),
+                Font::Normal,
+                WHITE,
+                lift(TEXT_ALPHA, h),
+            );
             let (sw_w, sw_h) = (p(32), p(18));
             toggle_switch(s, rc.right - p(12) - sw_w, rc.top + (rc.bottom - rc.top - sw_h) / 2, dnd);
         }
         for (id, label) in [
-            (ID_OPEN_CENTER, crate::i18n::tr("Open notification center", "Apri centro notifiche")),
-            (ID_SETTINGS, crate::i18n::tr("Notification settings", "Impostazioni notifiche")),
+            (ID_OPEN_CENTER, crate::i18n::t(crate::i18n::k::NOTIF_OPEN_NOTIFICATION_CENTER)),
+            (ID_SETTINGS, crate::i18n::t(crate::i18n::k::NOTIF_NOTIFICATION_SETTINGS)),
         ] {
             let Some(rc) = self.hits.rect(id) else { continue };
             let h = row_plate(s, rc, id, hot, pressed);
@@ -379,6 +400,10 @@ impl Content for NotifPopup {
     fn clickable(&self, _id: u32) -> bool {
         // Cards too: a click opens the app that sent the notification.
         true
+    }
+
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().iter().filter(|(id, _)| *id < ID_X).copied().collect()
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -458,5 +483,53 @@ impl Content for NotifPopup {
             Some(After::OpenApp { aumid, app }) => crate::ui::open_notification_app(&aumid, &app),
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn popup(items: usize, dnd: Option<bool>) -> NotifPopup {
+        let item = |id: u32| notif::NotifItem {
+            id,
+            app: "Example Chat".to_string(),
+            title: format!("Message {id}"),
+            body: "Hello".to_string(),
+            time_ft: 0,
+            time_text: "14:28".to_string(),
+            icon_key: String::new(),
+            aumid: String::new(),
+        };
+        NotifPopup {
+            state: NotifState { access: NotifAccess::Allowed, items: (1..=items as u32).map(item).collect(), dnd },
+            scroll: 0,
+            after: None,
+            hits: HitMap::default(),
+            cards: Vec::new(),
+            width: 0,
+            pad: 0,
+            y_header: 0,
+            header_h: 0,
+            sep1: 0,
+            sep2: 0,
+            list: RECT::default(),
+            total_h: 0,
+            step: 0,
+            margin: 0,
+        }
+    }
+
+    #[test]
+    fn notif_keyboard_targets() {
+        let mut p = popup(3, Some(false));
+        // Clear all, the cards in list order (their close buttons are not targets), Do not disturb, the two links.
+        assert_eq!(
+            crate::popup::target_ids(&mut p),
+            [ID_CLEAR, ID_CARD, ID_CARD + 1, ID_CARD + 2, ID_DND, ID_OPEN_CENTER, ID_SETTINGS]
+        );
+        // Nothing to clear and no Do not disturb state: those two are not shown, so not targets.
+        let mut empty = popup(0, None);
+        assert_eq!(crate::popup::target_ids(&mut empty), [ID_OPEN_CENTER, ID_SETTINGS]);
     }
 }

@@ -1,0 +1,33 @@
+# Coverage-guided fuzz targets of the tasks-admin frames (cargo-fuzz). Its own workspace and its own Cargo.lock: the
+# suite's gates, cargo-deny, the notices test and tests/workspace.rs never see it, and it is never linked into a
+# shipped exe. Built only by the cargo-fuzz-admin job of .github/workflows/fuzz-nightly.yml on a pinned nightly.
+[package]
+name = "oled-trust-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# The rust-fuzz project's crate (github.com/rust-fuzz/libfuzzer), the version cargo-fuzz 0.13.2's template takes.
+libfuzzer-sys = "=0.4.13"
+oled-trust = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "admin_request"
+path = "fuzz_targets/admin_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admin_reply"
+path = "fuzz_targets/admin_reply.rs"
+test = false
+doc = false
+bench = false

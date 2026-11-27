@@ -1,0 +1,53 @@
+[package]
+name = "fs3-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+publish = false
+description = "Spikes FS-3 and FS-6 of the files engine: probes of IFileOperation and of the shell's class icons. Never shipped."
+build = "build.rs"
+
+# Its own, empty workspace: the spike is not a member of the repository's workspace.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "fs3-probe"
+path = "src/bin/fs3_probe.rs"
+
+[[bin]]
+name = "fs6-probe"
+path = "src/bin/fs6_probe.rs"
+
+[dependencies]
+# The implement macro of the progress sink expands to windows_core paths.
+windows-core = "=0.62.2"
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-manifest = "=1.5.1"

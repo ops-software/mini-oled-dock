@@ -10,10 +10,10 @@ A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust
 
 It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), the bar shows program names only (window titles appear in the hover previews), tray icons of other apps are hosted in the bar, and every popup is drawn by hand.
 
-- **Tiny:** the executable is about 1.4 MB and uses roughly 11 MB of RAM (about 18 MB while the Start menu is open, mostly released a minute after it closes), trimmed to under 1 MB while hidden (numbers from the author's machine).
+- **Tiny:** the executable is about 2.0 MB and uses roughly 11 MB of RAM (about 18 MB while the Start menu is open, mostly released a minute after it closes), trimmed to under 1 MB while hidden (numbers from the author's machine).
 - **Pay only for what you use:** a hidden module has no timer, no polling and loads no system library; the network, battery and metrics modules are polled only while the bar is visible.
 - **Safe to try:** a watchdog process always restores the native taskbar, and `dock.exe --restore` works even when no dock is running.
-- **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it.
+- **Nothing changes behind your back:** every new feature is an option, off by default, so an update keeps the dock exactly as you left it. The exceptions of 1.6.0 are the keyboard shortcuts of the bar (on by default, each can be switched off in Settings or `config.json`) and the microphone and location indicators of Windows, which now show in the tray (see `tray_hidden_guids`). A `config.json` written by an older version keeps its 2.5 s hide delay.
 
 ## Screenshots
 
@@ -61,7 +61,9 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 - Background colour from dark presets or any colour through a built-in picker (pure black by default), background opacity from 0 to 100 %.
 - Drag and drop reordering of apps, tray icons and system modules.
 - Window previews: hovering an app with several windows shows live DWM thumbnails with titles; click one to switch.
-- Auto-hide with a slide animation: the bar shows on the Win key or when the pointer touches the screen edge, and hides after 2.5 s.
+- Auto-hide with a slide animation: the bar shows on the Win key, or when the pointer rests on the screen edge for 150 ms (**Show delay**), and hides 1 s after the pointer leaves it (**Hide delay**, 0 to 5 s; a `config.json` written before 1.6 keeps 2.5 s). A show started from the keyboard or the screen edge stays at least 2.5 s, so a hide delay of 0 never hides a bar you have just opened.
+- Keyboard: Win+1...9 and Win+0 act on the first ten apps, Win held for a moment shows their numbers, Win+T, Win+Shift+T and Win+B put the keyboard focus on the bar, and once it is there arrows, Enter, Esc and typing a name work on it (see [Keyboard](#keyboard)).
+- Mouse: Shift and middle-click gestures on apps, the wheel on an app cycles its windows, the wheel on empty space sets the volume, and a right click on empty space opens a small dock menu (see [Mouse](#mouse)).
 - Show desktop button.
 
 ### Win key and Start menu
@@ -107,11 +109,12 @@ An optional search box on a shortcut key, **off until you pick one**: Settings �
 - **Battery** (laptops): an Apple-style battery icon with the fill proportional to the charge, a bolt while charging, and the percentage beside the icon or inside it. Orange fill under 20 %, red at 10 % and below. Shown automatically only when Windows reports a battery, so a desktop sees no change; click for charge, state, time remaining on battery and the power plan.
 - **System metrics** (off by default): CPU and RAM usage; click opens Task Manager.
 - **Calendar**, **power** menu and an **app menu** (new window, pin / unpin, close).
+- **Keyboard in every popup:** the popups of the bar (volume, network, battery, notifications, calendar, power, app menu, dock menu, quick links, tray) take Tab, the arrows, Enter and Esc (see [Keyboard](#keyboard)).
 - **Tray icon hosting**, with an overflow popup and a view to choose which icons stay in the bar.
 
 ### Settings and system
 
-- **Settings window** (power button → **Settings**, Start quick links → **Dock settings**, or `dock.exe --settings`): seven pages (Appearance, Bar, Start, Modules, Screen, Updates, About), every option applied live and saved to the commented `config.json`, which also reloads on its own when edited by hand.
+- **Settings window** (power button → **Settings**, Start quick links → **Dock settings**, or `dock.exe --settings`): eight pages (Appearance, Bar, Start, Launcher, Modules, Screen, Updates, About), every option applied live and saved to the commented `config.json`, which also reloads on its own when edited by hand.
 - **Language:** System (follows Windows), English or Italian, applied at once, clock and calendar included.
 - Autostart without UAC prompts (scheduled task).
 - Watchdog process that always restores the native taskbar.
@@ -159,30 +162,90 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 
 ## Usage
 
-- **Show / hide:** Win key alone, or the screen edge. With Settings → Screen → **Pointer** the Win key brings the bar to the display under the pointer (if the bar is visible on another display it moves there instead of hiding).
+- **Show / hide:** Win key alone, or rest the pointer on the screen edge (a bar at the bottom: the bottom edge; at the top: the top edge) for the show delay. With Settings → Screen → **Pointer** the Win key brings the bar to the display under the pointer (if the bar is visible on another display it moves there instead of hiding).
 - **Start menu:** double tap the Win key (second tap within 300 ms; the first tap is not delayed) or left click the Start button. Type to search, Enter launches the first result, arrows and the wheel scroll, right click opens the menu of an app (pin / unpin, run as administrator, open file location, uninstall), dragging a pinned app reorders it or (Windows 11 layout) groups it into a folder, a click on a letter of "All apps" opens the letter grid, a click on a folder opens it, the **Grid** / **List** button next to "All apps" (Windows 11 layout) switches the view, Esc closes the open menu, then clears the search, then closes. Right click on the Start button still opens the quick-links menu.
 - **Notifications:** click one to switch to its app, X removes it, **Clear all** empties the list and the Windows history.
-- **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu (the app's own jump list as in the Windows taskbar - its tasks and categories, without the Recent / Frequent files - then New window, Pin / Unpin, Close); resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
-- **Volume:** wheel changes it, middle click mutes, left click opens the audio popup (output, spatial sound, per-app mixer). Click a section header to collapse it; the pencil at the bottom enters Customize mode (eye = hide / show, drag a header to reorder).
+- **App entries:** left click activates, minimises or cycles windows; middle click or Shift+click starts a new instance; Shift+middle click closes all windows of the app (like **Close N windows** in its menu; Shift must be down at the press and at the release); the wheel over an app activates its previous (wheel up) or next (wheel down) window, skipping minimised ones, at most about eight steps a second; right click opens the app menu (the app's own jump list as in the Windows taskbar - its tasks and categories, without the Recent / Frequent files - then New window, Pin / Unpin, Close); resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
+- **Volume:** the wheel changes it by 2 % a notch (over the volume icon or over empty space of the bar; wheel down never unmutes, Ctrl+wheel does nothing), middle click mutes, left click opens the audio popup (output, spatial sound, per-app mixer). Click a section header to collapse it; the pencil at the bottom enters Customize mode (eye = hide / show, drag a header to reorder).
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **Battery:** left click opens the battery popup (charge, state, time remaining on battery, power plan, "Power & battery settings"); right click opens Windows' battery saver settings. The wheel is not used.
 - **System metrics:** click opens Task Manager.
 - **Settings window:** power button, then **Settings** (or Start quick links → **Dock settings**, or `dock.exe --settings`). Resizable, with a dark title bar in the bar's colour and a navigation on the left; `Esc` closes, `Tab` moves between the navigation and the page, `Up`/`Down` change page.
   - **Appearance:** a live preview of the bar, the background colour (seven dark presets: Black, Graphite, Slate, Navy, Plum, Wine, Forest, and a custom swatch that opens a colour picker with saturation/value square, hue strip, preview and hex code), the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse), sliders for app icons, app names, tray icons and modules, **Reset sizes**, and the language.
-  - **Bar:** position, display mode, auto-hide, window previews, clock seconds, volume percent.
+  - **Bar:** position, display mode, auto-hide, **Show delay** (0-1000 ms, 50 ms steps) and **Hide delay** (0-5000 ms, 100 ms steps), window previews, clock seconds, volume percent, and **Keyboard shortcuts** (one switch for the four `keyboard` options: on sets all four to on, off sets all four to off; it shows on when any of them is on).
+  - **Launcher:** the shortcut, where it opens, what it searches, prefixes, aliases and history (see [Launcher](#launcher)).
   - **Start:** the Start button, the Start layout, Win key opens Start, and the import of pinned apps from Windows Start.
   - **Modules:** one switch per module, the **Battery** group (show: Auto, On or Off; percentage; percentage inside the icon), the **Tray** group (tray icons, **Icons of apps run as administrator**, see [Tray icons of elevated apps](#configuration)) and the tray icon chooser, inline.
   - **Screen:** which display the bar sits on (**Main**, the display number, or **Pointer**).
   - **Updates:** installed and available version, last check, **Check now**, **Release notes**, **Update now** (also retries a release that was rolled back), and the switches for the daily check and the automatic install.
-  - **About:** version, memory, the data folder and the log, and **Exit the dock** (restores the Windows taskbar).
+  - **About:** version, memory, the data folder and the log, and **Exit dock** (restores the Windows taskbar).
 
   Sliders follow a drag or a click on the track; the mouse wheel scrolls the page. Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button. The window remembers its size (`settings_window_size`).
 - **Updates:** an orange dot on Settings in the power popup means a new release is available.
 - **Exit:** `Ctrl+Alt+Q`, or the power popup, or `dock.exe --restore`.
 
+### Keyboard
+
+The dock owns these Win-key chords **only while it hides the native taskbar** (`hide_native_taskbar` on and no `--keep-taskbar`); otherwise Windows keeps them. Settings → Bar → **Keyboard shortcuts** is one switch for all four options below. To switch one off alone, use `keyboard` in `config.json` (below); `"keyboard": false` switches all four off and `"keyboard": true` all four on.
+
+| Keys | What it does | Option |
+|---|---|---|
+| Win+1 ... Win+9, Win+0 | Acts on the 1st to 10th app of the bar (pinned apps, then open ones), like a left click: start it, bring it up, minimise it, or cycle its windows. Nothing happens when that slot holds no app. | `win_numbers` |
+| Win+Shift+digit | A new instance of that app (like a middle click) | `win_numbers` |
+| Win+Alt+digit | Gives the bar the keyboard and opens that app's menu | `win_numbers` |
+| Win+T | Gives the bar the keyboard, focus on the first app | `win_t` |
+| Win+Shift+T | The same, focus on the last app | `win_t` |
+| Win+B | The same, focus on the first tray icon (the first module when the bar has no tray icons) | `win_b` |
+| Win held for about 0.6 s, alone | **Peek:** shows the bar if it is hidden and draws the digits 1 to 9 and 0 on the first ten apps; releasing Win hides a bar that Peek showed (unless the pointer or the keyboard is on it). Not over a full-screen window; a bar Peek showed hides by itself after 10 s at most. Needs `win_numbers` too. | `peek` |
+
+A tap of Win, a double tap, Win+other keys that are not in the table (Win+E, Win+D, Win+R, ...) and the launcher shortcut behave as before. A chord key is swallowed with its auto-repeat, so a digit held after Win is released never types. If the dock's window does not answer a chord for 1.5 s, the chords pass to Windows again.
+
+While Remote Desktop Connection, the Remote Desktop client of the Windows App or Azure Virtual Desktop, or Hyper-V Virtual Machine Connection is in front, the chords and Peek go to the remote session, as in 1.5.2. The same holds for a UAC prompt shown without the secure desktop and for a window of a program the dock is not allowed to inspect. After a UAC prompt, a lock, sleep or a remote connect or disconnect, the dock forgets a Win, Shift or Alt it could not see released, so a digit, T or B typed right after is typed normally. The dock also notices by itself when its keyboard hook was not served in time (the PC froze for a moment or was overloaded): a keyboard callback that took too long, a key that arrived late, or, while Win is held after a dock shortcut, a short check that came late. It then forgets the Win key it believed held. If Win really is still held at that moment, the next digit is typed once as a plain character; press Win again and it works at once. The short check runs only while Win is held after a dock shortcut.
+
+Limits:
+- If you keep holding Win after a dock shortcut and pause for more than about 1.5 s, the next key that is not a dock shortcut (L, D, E, an arrow) is typed as a plain key instead of working with Win, so Win+L does not lock. Dock shortcuts (digits, T, B) keep working for 10 s after the last one. Release Win and press the whole combination again.
+- If Windows loses the release of Win while the PC is frozen for a moment, keys typed in the next seconds can still be taken as dock shortcuts in two cases the stall check does not cover: a Win press not yet used for a dock shortcut, and a Win press used for a Windows shortcut such as Win+E. The dock clears this by itself, after about 2 s in the second case and about 12 s at most in the first.
+- Win+Shift+T is also the default shortcut of PowerToys Text Extractor, and the dock owns it. Switch `win_t` off, or change the shortcut in PowerToys. The same holds for any other program that uses one of the chords above.
+- A Win press held 0.6 s or longer and then released shows and hides the bar (Peek) and does not toggle the dock; with `win_opens_start` on, Start does not open after such a slow press. If you press slowly, or use Filter Keys, switch `peek` off.
+
+**On the bar.** Win+T, Win+Shift+T, Win+B and Win+Alt+digit show a hidden bar (it stays at least 2.5 s) and give it the keyboard; a ring marks the focused item. Moving the mouse hides the ring. A navigation key pressed on the bar gives it the keyboard too. After a plain tap of Win the bar has the focus but not the keyboard: typing starts no type-ahead, and the bar hides as usual. With no key for 4 s and the pointer away from the bar, the keyboard on the bar ends (with auto-hide off too) and the previous window gets the focus back; time in a popup does not count.
+
+| Key | What it does |
+|---|---|
+| Left / Right | Previous / next item, wrapping around the whole bar |
+| Home / End | First / last item of the current group |
+| Tab / Shift+Tab | The first item of the next / previous group (Start button, apps, tray icons, modules) |
+| Enter or Space | Left click on the item |
+| Shift+Enter | Middle click (a new instance for an app, mute for volume) |
+| Menu key or Shift+F10 | Right click |
+| Up (Down when the bar is at the top) | An app with two or more windows (and `window_previews` on): the window picker; any other app: its menu; the other items: their popup. The popup starts with the keyboard on its first control. |
+| Ctrl+Left / Ctrl+Right | Moves the item one place inside its group and saves the order, like a drag |
+| Letters | Type-ahead (only once the bar has the keyboard on purpose, see above): focus jumps to the next app whose name starts with what you typed (a pause of 1 s starts a new word; pressing the same letter again cycles through the apps that start with it) |
+| Esc | Hides the bar (with auto-hide on), or gives the focus back to the window that had it |
+
+In the window picker opened from the keyboard: the arrows move the selection, Enter switches to that window, Delete closes it, Esc closes the picker. Holding a key repeats only the keys that move (arrows, Home, End, Tab).
+
+**In popups.** Tab / Down and Shift+Tab / Up move between the controls (Home and End jump to the first and last), Enter or Space presses the control, Esc closes the popup. A held Enter or Space acts once; only the keys that move repeat. The key that opened the popup (Up, Down, Menu key, F10) does not repeat inside it until you press it again. In the volume popup Left and Right on a slider change it by 2 % (10 % with Shift). The Start menu and the launcher keep their own keys, described above.
+
+### Mouse
+
+| On | Click | Middle | Right | Shift+click | Shift+middle | Wheel |
+|---|---|---|---|---|---|---|
+| App | Activate, minimise or cycle | New instance | App menu | New instance | Close every window of the app | Up: previous window, down: next |
+| Empty space of the bar | | | Dock menu | | | Volume +2 % / -2 % |
+| Start button | Start menu | | Quick-links menu | as click | | |
+| Volume | Audio popup | Mute | Windows sound settings | as click | as middle | Volume +2 % / -2 % |
+| Network, battery | Popup | | Windows network / battery saver settings | as click | | |
+| Notifications, clock, power, overflow chevron | Popup | | | as click | | |
+| System metrics | Task Manager | | | as click | | |
+| Show desktop | Show desktop | | | as click | | |
+| Tray icon | Left click of the icon | Middle click of the icon | Right click of the icon | as click | as middle | |
+
+Shift changes only apps; on every other part it is the same as without Shift. Shift+middle closes the windows of an app only if Shift is down at the press and at the release. The wheel is ignored with Ctrl held (over the volume icon too) and, while a popup is open, everywhere except the volume item. Wheel down never unmutes; wheel up on a muted PC does. The **dock menu** (right click on empty space of the bar) has a header "Dock" and three rows: **Auto-hide** (a check shows it is on; click to switch it), **Task Manager** and **Settings**.
+
 ## Configuration
 
-`%ProgramData%\mini-oled-dock\config.json` is created on first start as commented JSON (`//` and `/* */` allowed) with a guide above every option. It reloads automatically within about 2 s. Missing fields take their default; on a syntax error the previous settings are kept and the error is logged.
+`%ProgramData%\mini-oled-dock\config.json` is created on first start as commented JSON (`//` and `/* */` allowed) with a guide above every option. It reloads automatically within about 2 s. Missing fields take their default; on a syntax error the previous settings are kept and the error is logged. A wrong type in one of the keys new in 1.6 (`hide_delay_ms`, `show_delay_ms`, `push_threshold`, `keyboard` and its four switches, `tray_privacy_migrated`) is not an error: that key reads its default, the rest loads, and Settings → Bar shows a note at the Auto-hide row until the next save.
 
 **Editing by hand:** open it with Notepad (no admin rights needed). Notepad saves in place, which is allowed; editors that save by writing a new file and renaming it over the old one (many code editors do) cannot save here, so use Notepad or run your editor elevated. If a programmatic save happens while your edit has a syntax error, your version is first copied to `config.json.bak` next to it.
 
@@ -198,6 +261,9 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `background` | `"#000000"` | Background colour of the bar and the popups, `"#RRGGBB"` (the old values `"black"` and `"dark"` are still accepted) |
 | `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
+| `show_delay_ms` | `150` | Auto-hide: how long the pointer must rest on the screen edge before the hidden bar shows, 0-1000 ms (Settings → Bar → **Show delay**). Values outside the range are clamped |
+| `hide_delay_ms` | `1000` in a new file, `2500` when the key is missing | Auto-hide: how long the bar stays after the pointer leaves it, 0-5000 ms (Settings → Bar → **Hide delay**). A file written before 1.6 has no such key and keeps 2.5 s; clamped to the range. A show by keyboard or screen edge lasts at least 2.5 s whatever this value is |
+| `keyboard` | `{ "win_numbers": true, "win_t": true, "win_b": true, "peek": true }` | The Win-key chords the dock owns, see [Keyboard](#keyboard): `win_numbers` Win+1...9/0 (also with Shift and Alt), `win_t` Win+T and Win+Shift+T, `win_b` Win+B, `peek` the digit numbers shown while Win is held (needs `win_numbers`). A key you leave out stays on. `true` or `false` alone (`"keyboard": false`) sets all four. A wrong type in one switch is ignored (it stays on). Settings has one switch for all four. All off while `hide_native_taskbar` is `false`; the chords also go to remote-desktop and VM windows and a UAC prompt |
 | `window_previews` | `true` | Live previews of an app's windows when the pointer rests on an app with two or more |
 | `hide_native_taskbar` | `true` | Hide the Windows taskbar while the dock runs |
 | `show_date` / `date_format` | `true` / `"ddd d MMM"` | Date under the time (Windows date picture) |
@@ -205,12 +271,13 @@ If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Do
 | `show_volume_percent` | `true` | Show `NN%` next to the speaker |
 | `show_tray` | `true` | Host other apps' tray icons (switching it off stops the tray host; the icons go back to Explorer) |
 | `show_network` | `true` | Network module: Wi-Fi bars / ethernet, internet badge, details popup |
-| `show_battery` | `"auto"` | Battery module: `"auto"` (only when the PC has a battery), `true` (always) or `false` (never) |
+| `show_battery` | `"auto"` | Battery module: `"auto"` (only when the PC has a battery), `true` (always) or `false` (never). Any other value is read as `"auto"`, logged, and Settings → Modules says so next to the row until the file holds a valid one |
 | `battery_percent` | `true` | Show the charge percentage with the battery icon |
 | `battery_percent_inside` | `false` | Draw the percentage inside a larger battery icon instead of beside it |
 | `show_metrics` | `false` | CPU / RAM usage module (click opens Task Manager) |
 | `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
 | `show_start_button` | `true` | Start button at the left end of the bar (a fixed item, not a movable module) |
+| `tray_hidden_guids` | the volume, network and power icons | System tray icons (GUIDs, lowercase, no braces) the dock never shows in its bar, because it draws volume, network and power itself. Since 1.6.0 the microphone and location indicators of Windows are not in the list, so they show in the tray (hide one with Settings → Modules → Tray, or add `7820ae82-23e3-4229-82c1-e41cb67d5b9c` (microphone) or `7820ae77-23e3-4229-82c1-e41cb67d5b9c` (location) here). A file that still holds exactly the list of 1.5.x and older (those three plus the two indicators) is switched once to the new list when 1.6.0 first reads it, and rewritten; any other list is yours and is kept. A list restored by hand later is not migrated again. After a rollback to 1.5.x the two indicators show in the tray; hide them again in Settings → Modules → Tray. `tray_privacy_migrated` records that this ran: leave it as it is (setting it to `true` by hand turns the migration off) |
 | `pinned` | `[]` | Pinned apps, in display order |
 | `start_pins` | `[]` | Apps pinned at the top of the dock's Start menu (separate from `pinned`; right click an app in the menu to add or remove it) |
 | `start_folders` | `[]` | Folders of those pins: `[{ "name": "Games", "apps": ["<id>", ...] }]`. Managed by dragging pinned apps in the menu |
@@ -282,6 +349,7 @@ Everything the dock stores is in `%ProgramData%\mini-oled-dock`:
 | `icons\` | your custom PNGs | you can add, replace and delete files |
 | `cache\` | extracted icon cache (PNG); `settings-catalog.bin`, the Windows Settings list that the launcher and Start search read (rebuilt when stale or damaged); `cache\<SID>\` holds one user's launcher history (commands run, picks as hashes), readable by that user and administrators | administrators only |
 | `update\<tag>\` | downloaded update (`dock.exe`, `dock.exe.sha256`), `dock-guard.exe` (the copy of the old version that judges the update) and `rolled-back` (written when that release was rolled back); deleted once that version or a newer one runs | administrators only |
+| `suite\`, `journal\` | two empty folders that an elevated start creates; nothing in 1.6.0 uses them | administrators only |
 | `dock.log`, `dock.log.1` | log, rotated at 2 MB; one local clock for the dock and its watchdog; it carries no window titles or tooltips (a window is named by its class) | administrators only |
 | `taskbar-state` | the original taskbar state, used to restore it; kept across a sign-out or shutdown and deleted by every other restore | administrators only |
 
@@ -297,7 +365,9 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 
 | Version | Date | Highlights |
 |---|---|---|
-| [1.5.1](.github/release-notes/v1.5.1.md) | unreleased | A quieter hidden dock, the updater checks GitHub's digest and puts the old version back when a new one fails, `--rollback`, the taskbar meant to be hidden again after a watchdog restore, no titles in the log |
+| [1.6.0](.github/release-notes/v1.6.0.md) | unreleased | The keyboard: Win+digit chords, Peek, focus and type-ahead on the bar, keys in every popup; Shift gestures, wheel cycle and volume, the dock menu; show and hide delays; the microphone and location indicators show in the tray |
+| [1.5.2](.github/release-notes/v1.5.2.md) | 2026-11-24 | Tray "Show all", more Start menu shortcut names, a dead watchdog is replaced, installer closes restore the taskbar |
+| [1.5.1](.github/release-notes/v1.5.1.md) | 2026-11-24 | A quieter hidden dock, the updater checks GitHub's digest and puts the old version back when a new one fails, `--rollback`, the taskbar meant to be hidden again after a watchdog restore, no titles in the log |
 | [1.5.0](.github/release-notes/v1.5.0.md) | 2026-11-23 | The launcher (off by default), no freeze on a hung foreground window, taskbar edge fixes, full third-party licence texts |
 | [1.4.3](.github/release-notes/v1.4.3.md) | 2026-11-22 | Taskbar auto-hide: checks whether another bar holds the screen edge first |
 | [1.4.2](.github/release-notes/v1.4.2.md) | 2026-11-12 | Hotfix: the self-updater can download its first update |
@@ -319,7 +389,7 @@ Downloads are on the [releases page](https://github.com/ops-software/mini-oled-d
 - Keep the memory budget around 10 MB: load data only when needed, no new permanent timers or threads.
 - If a change touches drawing, render the previews (`dock.exe --preview <folder>`) before and after and compare them.
 
-**Releasing:** bump `version` in `Cargo.toml`, add `.github/release-notes/vX.Y.Z.md`, merge, then push the tag `vX.Y.Z`. The release workflow checks that the tag matches `Cargo.toml`, builds `dock.exe` and publishes it with its SHA256.
+**Releasing:** bump `version` in `Cargo.toml`, add `.github/release-notes/vX.Y.Z.md`, merge, then push the tag `vX.Y.Z`. Before tagging, run `pwsh tools/screenshots.ps1` and commit the refreshed screenshots. The release workflow checks that the tag matches `Cargo.toml`, builds `dock.exe` and publishes it with its SHA256.
 
 ## Credits and license
 

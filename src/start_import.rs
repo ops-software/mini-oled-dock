@@ -51,21 +51,41 @@ const POLL_MS: u64 = 200;
 /// Largest layout file read back.
 const MAX_JSON: u64 = 4 << 20;
 
-/// `STATUS` values; `DONE + n` = n apps imported.
+/// `STATUS` values; `DONE + n` = n apps imported; `FAILED | (reason + 1) << REASON_SHIFT` = failed for that `FailReason`
+/// (the bare `FAILED` of an older word reads as `Export`). The reason sits above any app count, so the two never meet.
 const IDLE: u32 = 0;
 const RUNNING: u32 = 1;
 const FAILED: u32 = 2;
+const REASON_SHIFT: u32 = 24;
 const TIMEDOUT: u32 = 3;
 const DONE: u32 = 4;
 
 static STATUS: AtomicU32 = AtomicU32::new(IDLE);
+
+/// Why an import failed, for the Settings row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailReason {
+    /// The Windows system folder was not found.
+    NoSystemDir,
+    /// The export (or what it needs: Explorer's desktop, the shell user's folder) could not start.
+    CannotStart,
+    /// Windows started the export and it failed.
+    Export,
+    /// The exported layout file could not be read or mapped.
+    Layout,
+}
+
+impl FailReason {
+    pub(crate) const ALL: [FailReason; 4] =
+        [FailReason::NoSystemDir, FailReason::CannotStart, FailReason::Export, FailReason::Layout];
+}
 
 /// State of the import, as shown by the Settings row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
     Idle,
     Running,
-    Failed,
+    Failed(FailReason),
     TimedOut,
     Imported(u32),
 }
@@ -74,9 +94,12 @@ fn decode(v: u32) -> Status {
     match v {
         IDLE => Status::Idle,
         RUNNING => Status::Running,
-        FAILED => Status::Failed,
+        FAILED => Status::Failed(FailReason::Export),
         // Before the catch-all: `TIMEDOUT - DONE` would underflow.
         TIMEDOUT => Status::TimedOut,
+        n if n >> REASON_SHIFT != 0 => {
+            Status::Failed(FailReason::ALL.get((n >> REASON_SHIFT) as usize - 1).copied().unwrap_or(FailReason::Export))
+        }
         n => Status::Imported(n - DONE),
     }
 }
@@ -84,14 +107,20 @@ fn decode(v: u32) -> Status {
 /// Why a job ended without importing.
 #[derive(Debug)]
 enum JobError {
-    Failed(String),
+    Failed(FailReason, String),
     TimedOut,
 }
 
 impl From<String> for JobError {
+    /// A setup step that failed before the export started.
     fn from(e: String) -> Self {
-        JobError::Failed(e)
+        JobError::Failed(FailReason::CannotStart, e)
     }
+}
+
+/// A failure after the export ran: the layout file or its mapping.
+fn layout_err(e: impl Into<String>) -> JobError {
+    JobError::Failed(FailReason::Layout, e.into())
 }
 
 /// Status word for the result of a job.
@@ -99,7 +128,7 @@ fn finish_word(r: &Result<usize, JobError>) -> u32 {
     match r {
         Ok(n) => DONE + *n as u32,
         Err(JobError::TimedOut) => TIMEDOUT,
-        Err(JobError::Failed(_)) => FAILED,
+        Err(JobError::Failed(why, _)) => FAILED | (*why as u32 + 1) << REASON_SHIFT,
     }
 }
 
@@ -131,14 +160,14 @@ pub(crate) fn start() -> bool {
         let r = job();
         match &r {
             Ok(n) => log!("start import: {n} apps imported"),
-            Err(JobError::Failed(e)) => log!("start import: failed: {e}"),
+            Err(JobError::Failed(_, e)) => log!("start import: failed: {e}"),
             Err(JobError::TimedOut) => log!("start import: no layout file after {LAYOUT_TIMEOUT:?} (timeout)"),
         }
         STATUS.store(finish_word(&r), SeqCst);
     });
     if let Err(e) = spawned {
         log!("start import: thread not started: {e}");
-        STATUS.store(FAILED, SeqCst);
+        STATUS.store(FAILED | (FailReason::CannotStart as u32 + 1) << REASON_SHIFT, SeqCst);
     }
     true
 }
@@ -307,7 +336,7 @@ fn job() -> Result<usize, JobError> {
     // SAFETY: initializes COM on this thread; paired with CoUninitialize in `Com::drop`.
     let _com = Com(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
     let pid = crate::shell_thread::explorer_pid().map_err(|e| {
-        JobError::Failed(format!(
+        JobError::Failed(FailReason::CannotStart, format!(
             "Explorer's desktop is not available (Explorer stopped, or restarted and not yet registered with ShellWindows): {e}"
         ))
     })?;
@@ -323,11 +352,11 @@ fn job() -> Result<usize, JobError> {
     err.push(".err");
     let err = PathBuf::from(err);
     let ps = crate::shell_thread::system_dir()
-        .ok_or_else(|| JobError::Failed("no system directory".into()))?
+        .ok_or_else(|| JobError::Failed(FailReason::NoSystemDir, "no system directory".into()))?
         .join(r"WindowsPowerShell\v1.0\powershell.exe");
     let args = export_args(&dir.to_string_lossy(), &file.to_string_lossy());
     crate::shell_thread::desktop_open_hidden(&ps.to_string_lossy(), Some(&args), None)
-        .map_err(|e| JobError::Failed(format!("cannot start the de-elevated export: {e}")))?;
+        .map_err(|e| JobError::Failed(FailReason::CannotStart, format!("cannot start the de-elevated export: {e}")))?;
     let t = Instant::now();
     loop {
         // symlink_metadata never follows a link; only existence is checked, the `.err` is never read.
@@ -338,13 +367,13 @@ fn job() -> Result<usize, JobError> {
                 std::thread::sleep(Duration::from_millis(POLL_MS));
             }
             Poll::Ready => break,
-            Poll::Failed => return Err(JobError::Failed(EXPORT_FAILED.into())),
+            Poll::Failed => return Err(JobError::Failed(FailReason::Export, EXPORT_FAILED.into())),
             Poll::TimedOut => return Err(JobError::TimedOut),
         }
     }
-    let bytes =
-        crate::datadir::read_file(&file, MAX_JSON, true).map_err(|e| format!("reading {}: {e}", file.display()))?;
-    let text = String::from_utf8(bytes).map_err(|e| format!("layout file is not UTF-8: {e}"))?;
+    let bytes = crate::datadir::read_file(&file, MAX_JSON, true)
+        .map_err(|e| layout_err(format!("reading {}: {e}", file.display())))?;
+    let text = String::from_utf8(bytes).map_err(|e| layout_err(format!("layout file is not UTF-8: {e}")))?;
     let mapped = {
         let link = Links::new();
         let mut catalog = || -> Vec<(StartApp, Option<String>)> {
@@ -369,12 +398,12 @@ fn job() -> Result<usize, JobError> {
         };
         map_layout(&text, &mut catalog, &|lnk| target_for(lnk, user_root.as_deref(), &rust_target, &com), &roots)
     };
-    let pins = mapped?;
+    let pins = mapped.map_err(layout_err)?;
     if pins.is_empty() {
-        return Err(String::from("no pinned app could be mapped").into());
+        return Err(layout_err("no pinned app could be mapped"));
     }
     let n = pins.len();
-    crate::config::modify(move |c| c.start_pins = pins)?;
+    crate::config::modify(move |c| c.start_pins = pins).map_err(layout_err)?;
     Ok(n)
 }
 
@@ -670,7 +699,7 @@ mod tests {
         assert_eq!(stem("x/y/Tool"), "Tool");
         assert_eq!(decode(IDLE), Status::Idle);
         assert_eq!(decode(DONE + 7), Status::Imported(7));
-        assert_eq!(decode(FAILED), Status::Failed);
+        assert_eq!(decode(FAILED), Status::Failed(FailReason::Export), "a word from before");
     }
 
     #[test]
@@ -735,11 +764,23 @@ mod tests {
     fn job_results_map_to_status_words() {
         assert_eq!(finish_word(&Ok(7)), DONE + 7);
         assert_eq!(finish_word(&Err(JobError::TimedOut)), TIMEDOUT);
-        assert_eq!(finish_word(&Err(JobError::Failed("x".into()))), FAILED);
+        assert_eq!(finish_word(&Err(JobError::Failed(FailReason::Export, "x".into()))), FAILED | 3 << REASON_SHIFT);
         // A failing setup step (random id, shell user folder, Explorer not reachable) is reported like any
         // other failure: the `String` converts to `Failed`, the Settings window shows "Import failed".
         let setup: Result<usize, JobError> = Err(String::from("BCryptGenRandom failed").into());
-        assert_eq!(finish_word(&setup), FAILED);
+        assert_eq!(decode(finish_word(&setup)), Status::Failed(FailReason::CannotStart));
+    }
+
+    #[test]
+    fn status_word_round_trips_the_reason() {
+        for why in FailReason::ALL {
+            let w = finish_word(&Err(JobError::Failed(why, String::new())));
+            assert_eq!(decode(w), Status::Failed(why));
+            assert_ne!(w, TIMEDOUT);
+        }
+        // No app count reads as a failure.
+        assert_eq!(decode(DONE + 254), Status::Imported(254));
+        assert_eq!(decode(DONE + 100_000), Status::Imported(100_000));
     }
 
     #[test]

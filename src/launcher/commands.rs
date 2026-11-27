@@ -2,7 +2,7 @@
 //! does (power requests, the window menu, the registry editor) is the session's and the shell thread's job.
 
 use super::model::CommandId;
-use crate::i18n::tr;
+use crate::i18n::pick;
 
 /// One command. Keywords are folded (lowercase, no accents) and include both display names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -17,7 +17,7 @@ pub struct Command {
 
 impl Command {
     pub fn name(&self) -> &'static str {
-        tr(self.en, self.it)
+        pick(self.en, self.it)
     }
 }
 

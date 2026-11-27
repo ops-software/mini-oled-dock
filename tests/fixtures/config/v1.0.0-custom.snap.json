@@ -3,6 +3,17 @@
   "position": "top",
   "monitor": "",
   "autohide": false,
+  "hide_delay_ms": 2500,
+  "show_delay_ms": 150,
+  "reveal": "dwell",
+  "push_threshold": 100,
+  "keyboard": {
+    "win_numbers": true,
+    "win_t": true,
+    "win_b": true,
+    "peek": true
+  },
+  "tray_privacy_migrated": true,
   "window_previews": true,
   "win_opens_start": false,
   "hide_native_taskbar": false,

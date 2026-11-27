@@ -3,6 +3,8 @@
 //! de-elevated through the shell thread). Data: `net::NetInfo` (last known on open, then
 //! `DataEvent::Network` from the polls of the visible bar; a fresh `NetworkQuery` is sent on open).
 
+use windows::Win32::Foundation::RECT;
+
 use crate::glyphs;
 use crate::net::{NetInfo, NetKind};
 use crate::popup::{center_y, hline, launch, lift, row_plate, Content, DataEvent, HitMap, PopupKind, Reply};
@@ -51,27 +53,33 @@ impl NetworkPopup {
     /// Detail rows (label, value).
     fn rows(&self) -> Vec<(&'static str, String)> {
         let i = &self.info;
-        let tr = crate::i18n::tr;
+        use crate::i18n::{k, t};
         let on = i.kind != NetKind::None && i.internet;
-        let mut v = vec![("Internet", if on { tr("Connected", "Connesso") } else { tr("No access", "Nessun accesso") }.to_string())];
+        let mut v = vec![("Internet", if on { t(k::NETWORK_CONNECTED) } else { t(k::NETWORK_NO_ACCESS) }.to_string())];
         if i.kind != NetKind::None {
-            v.push((tr("IPv4 address", "Indirizzo IPv4"), if i.ipv4.is_empty() { "\u{2014}".to_string() } else { i.ipv4.clone() }));
+            v.push((
+                t(k::NETWORK_IPV4_ADDRESS),
+                if i.ipv4.is_empty() { "\u{2014}".to_string() } else { i.ipv4.clone() },
+            ));
         }
         if i.kind == NetKind::Wifi {
-            v.push((tr("Signal", "Segnale"), format!("{}%", i.signal)));
+            v.push((t(k::NETWORK_SIGNAL), format!("{}%", i.signal)));
         }
         v
     }
 
     fn title(&self) -> (String, String) {
         let i = &self.info;
-        let tr = crate::i18n::tr;
+        use crate::i18n::{k, t};
         match i.kind {
-            NetKind::None => (tr("Not connected", "Non connesso").to_string(), tr("No network", "Nessuna rete").to_string()),
-            NetKind::Wifi => (if i.name.is_empty() { "Wi-Fi".to_string() } else { i.name.clone() }, "Wi-Fi".to_string()),
-            NetKind::Ethernet => {
-                (if i.name.is_empty() { "Ethernet".to_string() } else { i.name.clone() }, tr("Wired", "Cablata").to_string())
+            NetKind::None => (t(k::NETWORK_NOT_CONNECTED).to_string(), t(k::NETWORK_NO_NETWORK).to_string()),
+            NetKind::Wifi => {
+                (if i.name.is_empty() { "Wi-Fi".to_string() } else { i.name.clone() }, "Wi-Fi".to_string())
             }
+            NetKind::Ethernet => (
+                if i.name.is_empty() { "Ethernet".to_string() } else { i.name.clone() },
+                t(k::NETWORK_WIRED).to_string(),
+            ),
         }
     }
 }
@@ -153,12 +161,23 @@ impl Content for NetworkPopup {
         hline(s, col, self.width - col, self.sep2);
         if let Some(rc) = self.hits.rect(ID_SETTINGS) {
             let h = row_plate(s, rc, ID_SETTINGS, hot, pressed);
-            s.text(crate::i18n::tr("Network settings", "Impostazioni di rete"), rc.left + m.px(12), center_y(&rc, ln), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(
+                crate::i18n::t(crate::i18n::k::NETWORK_NETWORK_SETTINGS),
+                rc.left + m.px(12),
+                center_y(&rc, ln),
+                Font::Normal,
+                WHITE,
+                lift(TEXT_ALPHA, h),
+            );
         }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
         self.hits.at(x, y)
+    }
+
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -188,5 +207,16 @@ impl Content for NetworkPopup {
         if self.open_settings {
             launch("ms-settings:network");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_keyboard_targets() {
+        let mut p = new(NetInfo { kind: NetKind::Ethernet, name: "Ethernet".to_string(), ..Default::default() });
+        assert_eq!(crate::popup::target_ids(&mut *p), [ID_SETTINGS]);
     }
 }

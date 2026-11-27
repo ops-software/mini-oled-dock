@@ -3,6 +3,8 @@
 //! (`ms-settings:batterysaver`, de-elevated through the shell thread). Data: `battery::BatteryStatus`
 //! (last known on open, then `DataEvent::Battery` from the samples of the visible bar).
 
+use windows::Win32::Foundation::RECT;
+
 use crate::battery::{BatteryStatus, ChargeState, PowerMode};
 use crate::glyphs;
 use crate::popup::{center_y, hline, launch, lift, row_plate, Content, DataEvent, HitMap, PopupKind, Reply};
@@ -47,33 +49,33 @@ pub(crate) fn new(status: BatteryStatus, mode: Option<PowerMode>) -> Box<dyn Con
 
 /// Header lines: charge (or "No battery") and what the battery is doing.
 fn title(s: &BatteryStatus) -> (String, String) {
-    let tr = crate::i18n::tr;
+    use crate::i18n::{k, t};
     if !s.present {
-        return (tr("No battery", "Nessuna batteria").to_string(), String::new());
+        return (t(k::BATTERY_NO_BATTERY).to_string(), String::new());
     }
     let state = match s.state() {
-        ChargeState::OnBattery => tr("On battery", "A batteria"),
-        ChargeState::Charging => tr("Charging", "In carica"),
-        ChargeState::Full => tr("Fully charged", "Completamente carica"),
-        ChargeState::PluggedIn => tr("Plugged in", "Collegato alla corrente"),
+        ChargeState::OnBattery => t(k::BATTERY_ON_BATTERY),
+        ChargeState::Charging => t(k::BATTERY_CHARGING),
+        ChargeState::Full => t(k::BATTERY_FULLY_CHARGED),
+        ChargeState::PluggedIn => t(k::BATTERY_PLUGGED_IN),
     };
     (format!("{}%", s.percent), state.to_string())
 }
 
 /// Detail rows (label, value); only what Windows reports.
 fn rows(s: &BatteryStatus, mode: Option<PowerMode>) -> Vec<(&'static str, String)> {
-    let tr = crate::i18n::tr;
+    use crate::i18n::{k, t};
     let mut v = Vec::new();
     if let Some(secs) = s.seconds_left {
-        v.push((tr("Time remaining", "Tempo rimanente"), crate::battery::format_remaining(secs)));
+        v.push((t(k::BATTERY_TIME_REMAINING), crate::battery::format_remaining(secs)));
     }
     if let Some(m) = mode {
         let name = match m {
-            PowerMode::PowerSaver => tr("Power saver", "Risparmio energia"),
-            PowerMode::Balanced => tr("Balanced", "Bilanciato"),
-            PowerMode::HighPerformance => tr("High performance", "Prestazioni elevate"),
+            PowerMode::PowerSaver => t(k::BATTERY_POWER_SAVER),
+            PowerMode::Balanced => t(k::BATTERY_BALANCED),
+            PowerMode::HighPerformance => t(k::BATTERY_HIGH_PERFORMANCE),
         };
-        v.push((tr("Power plan", "Piano di alimentazione"), name.to_string()));
+        v.push((t(k::BATTERY_POWER_PLAN), name.to_string()));
     }
     v
 }
@@ -160,13 +162,17 @@ impl Content for BatteryPopup {
         hline(s, col, self.width - col, self.sep2);
         if let Some(rc) = self.hits.rect(ID_SETTINGS) {
             let h = row_plate(s, rc, ID_SETTINGS, hot, pressed);
-            let label = crate::i18n::tr("Power & battery settings", "Impostazioni alimentazione e batteria");
+            let label = crate::i18n::t(crate::i18n::k::BATTERY_POWER_BATTERY_SETTINGS);
             s.text(label, rc.left + m.px(12), center_y(&rc, ln), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
         }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
         self.hits.at(x, y)
+    }
+
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -224,5 +230,11 @@ mod tests {
         assert_eq!(rows(&charging, Some(PowerMode::Balanced)), [("Power plan", "Balanced".to_string())]);
         assert!(rows(&on, None).iter().all(|(l, _)| *l != "Power plan")); // unknown plan: no row
         assert!(rows(&BatteryStatus::from_raw(0, 1, 64, u32::MAX), None).is_empty()); // nothing known: no rows
+    }
+
+    #[test]
+    fn battery_keyboard_targets() {
+        let mut p = new(BatteryStatus::from_raw(0, 1, 64, 11520), Some(PowerMode::Balanced));
+        assert_eq!(crate::popup::target_ids(&mut *p), [ID_SETTINGS]);
     }
 }

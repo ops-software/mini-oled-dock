@@ -179,6 +179,11 @@ pub const WM_DOCK_TRIM_KICK: u32 = WM_APP + 30;
 /// (1.5.2 T3a). wParam = lParam = 0. `main` calls `watchdog::on_exited()`, which starts a new one (at once, at most
 /// `MAX_RESTARTS` in a row) or gives the taskbar back.
 pub const WM_DOCK_WATCHDOG_EXITED: u32 = WM_APP + 31;
+/// Hook -> UI: an owned dock chord. wParam = `hook::encode_chord`, lParam = `kb.time`. Posted only while a chord table is
+/// set (`hook::set_dock_chords`). Handled by `ui`.
+pub const WM_DOCK_CHORD: u32 = WM_APP + 32;
+/// Hook -> UI: Peek began (wParam 1) or ended (0); lParam = `kb.time`. Handled by `ui`.
+pub const WM_DOCK_PEEK: u32 = WM_APP + 33;
 /// One-shot on the dock window while the bar is hidden: the hidden trim (4 s after a hide, a popup or Settings close
 /// or a data release; `main::trim_kick`) and the planned second COM pass. Kills itself, then `trim_tick`.
 /// Handled by `main`.
@@ -277,7 +282,7 @@ mod tests {
     fn message_and_timer_ids_are_distinct() {
         // WM_APP + n of msg.rs: one window, one id space.
         let msgs = scan(include_str!("msg.rs"), "WM_", "u32", "WM_APP +");
-        assert!(msgs.len() >= 29, "msg.rs scan found only {} WM_APP ids", msgs.len());
+        assert!(msgs.len() >= 31, "msg.rs scan found only {} WM_APP ids", msgs.len());
         assert_distinct("msg.rs WM_APP", &msgs);
 
         // Timer ids of the dock window: msg.rs's TIMER_ consts and ui.rs's private ones.

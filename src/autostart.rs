@@ -302,12 +302,7 @@ fn register_task(exe: &Path) -> Result<(), String> {
     }
 }
 
-pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
-        _ => false,
-    }
-}
+pub(crate) use oled_sys::ident::same_file;
 
 /// Whether `copy_self` keeps retrying the copy, `elapsed` after the stop signal. Pure.
 /// Past `STOP_GRACE`, with neither the instance nor any process running the destination exe left,
@@ -617,6 +612,13 @@ fn relaunch(exe: &Path) {
     }
 }
 
+/// `--install --from <folder>` (I1d): installs the suite from a folder. Not available yet.
+#[allow(dead_code, unused_variables)]
+pub fn run_install_from_cli(no_relaunch: bool, from: &Path) -> i32 {
+    crate::logger::say("--install --from: not available in this build");
+    2
+}
+
 /// `--install`: returns the exit code. Always starts the installed exe at the end (the new copy, or
 /// the old one after a failed copy), unless `no_relaunch` or a dock is still running.
 pub fn run_install_cli(no_relaunch: bool) -> i32 {
@@ -671,7 +673,7 @@ fn retry_for<T, E>(limit: Duration, step: Duration, mut f: impl FnMut() -> Resul
 /// may hold the exe while it restores the taskbar). Unlike `copy_self` there is no early exit:
 /// the files are deleted only once nothing runs them. This process is never counted, so the wait
 /// also ends when the uninstaller is the installed exe itself (started from Add/Remove Programs).
-fn stop_and_wait(exe: &Path) -> Result<(), InstallError> {
+pub(crate) fn stop_and_wait(exe: &Path) -> Result<(), InstallError> {
     let signalled = crate::watchdog::signal_stop_to_instance();
     log!("autostart: stop requested (instance answered: {signalled}), waiting for {}", exe.display());
     let t = Instant::now();

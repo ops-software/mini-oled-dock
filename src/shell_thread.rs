@@ -129,7 +129,7 @@ impl AdminTool {
 /// Verb for `IShellDispatch2::ShellExecute`. Closed on purpose: `RunAs` is built only by `launch_admin`,
 /// `launch_app_admin` and `run_as_typed_with`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Verb {
+pub(crate) enum Verb {
     Open,
     RunAs,
 }
@@ -218,6 +218,10 @@ pub enum ShellRequest {
     /// Sent by the thread of `start_search::load_settings` when the settings catalog is ready
     /// -> `ShellEvent::StartSettings` (this thread is the one that can wake the UI).
     StartSettingsReady,
+    /// Brings the suite's Windows entry points in line with the config (I1b); runs `entry_points::sync` here.
+    /// Constructed by `entry_points::request_sync` once I1b lands.
+    #[allow(dead_code)]
+    SyncEntryPoints,
     /// Click on a notification whose app has no open window: launches the app that sent it, found in
     /// the AppsFolder catalog by AppUserModelID or display name; Win+N if it cannot be found.
     OpenNotifApp { aumid: String, name: String },
@@ -631,7 +635,7 @@ impl Shell {
         let mut rows = audio::group_sessions(&raw);
         for r in rows.iter_mut() {
             if r.system {
-                r.name = crate::i18n::tr("System sounds", "Suoni di sistema").to_string();
+                r.name = crate::i18n::t(crate::i18n::k::SHELL_THREAD_SYSTEM_SOUNDS).to_string();
             } else if r.name.is_empty() {
                 r.name = session_app_name(r.pid);
             }
@@ -778,6 +782,11 @@ impl Shell {
             }
             // SAFETY: plain call on this COM-initialised thread; only DLLs whose DllCanUnloadNow says so are unloaded.
             ShellRequest::ComFree => unsafe { CoFreeUnusedLibraries() },
+            ShellRequest::SyncEntryPoints => {
+                if let Some(dir) = crate::autostart::installed_exe().ok().as_deref().and_then(std::path::Path::parent) {
+                    let _ = crate::entry_points::sync(&crate::config::get(), dir);
+                }
+            }
             ShellRequest::StartIcons { icon_px, ids } => {
                 // A batch queued for a previous size: its ids were forgotten with that size.
                 if icon_px != self.start_px {
@@ -2613,6 +2622,7 @@ fn loads_com(req: &ShellRequest) -> bool {
         | ShellRequest::AudioRelease
         | ShellRequest::StartRelease
         | ShellRequest::ComFree
+        | ShellRequest::SyncEntryPoints
         | ShellRequest::StartSettingsReady
         | ShellRequest::LauncherClosed
         | ShellRequest::LauncherConvert { .. }
@@ -3363,7 +3373,7 @@ pub(crate) fn desktop_registered() -> bool {
 /// (`RunAs`: Explorer asks UAC, not the dock).
 /// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
-fn desktop_shell_execute(
+pub(crate) fn desktop_shell_execute(
     file: &str,
     args: Option<&str>,
     dir: Option<&str>,

@@ -1,0 +1,11 @@
+[package]
+name = "oled-i18n-build"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Build-time generator of the keyed string tables."
+license = "MIT"
+publish = false
+
+[lib]
+doctest = false

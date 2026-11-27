@@ -1,0 +1,21 @@
+[package]
+name = "oled-config"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Configuration engine of the suite: JSONC, descriptors, the options store and the theme file."
+license = "MIT"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+oled-sys = { workspace = true }
+oled-trust = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+windows = { workspace = true, features = ["Win32_System_Performance", "Win32_System_Threading"] }

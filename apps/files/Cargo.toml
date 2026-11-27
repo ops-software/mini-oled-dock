@@ -1,0 +1,71 @@
+[package]
+name = "files"
+version = "1.6.0"
+edition = "2021"
+rust-version = "1.87"
+description = "The files app of the suite: its engine roles (ops host, shell host) and, later, its window."
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "files_engine"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "files"
+path = "src/main.rs"
+
+# The dev-only fault DLL of the shell-host tests: an example of this package, never shipped. Every cargo test that
+# builds the package's examples builds it; a filtered run builds it with `cargo build -p files --examples`.
+[[example]]
+name = "files_faultext"
+path = "examples/files_faultext/lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+
+[dependencies]
+oled-trust = { workspace = true }
+oled-sys = { workspace = true }
+oled-ui = { workspace = true }
+# The features of this package only: the dock's release build selects the root package alone, so none reaches dock.exe.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ErrorReporting",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+embed-manifest = "1.5.1"
+winresource = "0.1.19"

@@ -6,14 +6,14 @@
 //! here and nowhere else (lint 1).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GlobalFree, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
-    HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WIN32_ERROR, WPARAM,
+    CloseHandle, GlobalFree, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS,
+    ERROR_SUCCESS, HANDLE, HGLOBAL, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, WAIT_OBJECT_0, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Globalization::{
     CompareStringOrdinal, GetLocaleInfoEx, CSTR_EQUAL, LOCALE_ITIME, LOCALE_SDECIMAL, LOCALE_SSHORTDATE,
@@ -345,16 +345,30 @@ pub(crate) fn arm_once(id: usize, ms: u32) {
     crate::launcher_probe::timer_armed(id, ms, armed);
 }
 
-/// The dock window receives `WM_WTSSESSION_CHANGE` for this session (once, when a chord is first set).
+thread_local! {
+    /// `watch_sessions` registered the dock window (UI thread).
+    static WATCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The dock window receives `WM_WTSSESSION_CHANGE` for this session: once, when the launcher's chord or a dock chord
+/// row is first set; later calls do nothing.
 pub(crate) fn watch_sessions() {
-    // SAFETY: the dock window exists (popup::init runs after ui::attach) and belongs to this thread.
+    if WATCHING.with(|w| w.replace(true)) {
+        return;
+    }
+    // SAFETY: the dock window exists (popup::init and ui::chords_sync run after it is created) and belongs to this
+    // thread.
     if let Err(e) = unsafe { WTSRegisterSessionNotification(crate::hwnd(), NOTIFY_FOR_THIS_SESSION) } {
         log!("launcher: WTSRegisterSessionNotification failed: {e}");
+        WATCHING.with(|w| w.set(false));
     }
 }
 
-/// Undoes `watch_sessions` before the dock window is destroyed.
+/// Undoes `watch_sessions` before the dock window is destroyed; nothing when it never registered.
 pub(crate) fn unwatch_sessions() {
+    if !WATCHING.with(|w| w.replace(false)) {
+        return;
+    }
     // SAFETY: as above; unregistering a window that is not registered fails harmlessly.
     let _ = unsafe { WTSUnRegisterSessionNotification(crate::hwnd()) };
 }
@@ -430,17 +444,7 @@ impl SysPort for RealSys {
     }
 
     fn remote_foreground(&self) -> bool {
-        // SAFETY: no preconditions.
-        let h = unsafe { GetForegroundWindow() };
-        if h.0.is_null() {
-            return false;
-        }
-        let mut pid = 0u32;
-        // SAFETY: `pid` is writable for the call; a stale window only yields 0.
-        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-        // SAFETY: no preconditions.
-        let me = unsafe { GetCurrentProcessId() };
-        pid != 0 && pid != me && image_matches(pid, powertoys::is_remote_client)
+        foreground_is_remote()
     }
 
     fn launcher_open(&self) -> bool {
@@ -844,19 +848,73 @@ fn image_is_owner(pid: u32) -> bool {
     image_matches(pid, powertoys::is_chord_owner)
 }
 
-/// The full image path of process `pid` passes `test`. Read-only: the process is opened with
-/// PROCESS_QUERY_LIMITED_INFORMATION and closed at once; its path is read into the stack, nothing is allocated (a path
-/// over 512 characters is neither a PowerToys install nor a remote client and is skipped).
+/// The foreground window belongs to a remote-desktop or VM client (`powertoys::is_remote_client` of its process's image,
+/// never the dock's own process): the launcher's REMOTE flag.
+pub(crate) fn foreground_is_remote() -> bool {
+    with_foreground_image(|image| matches!(image, ProcessImage::Path(path) if powertoys::is_remote_client(path)))
+}
+
+/// What a process's image query found (`with_image`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessImage<'a> {
+    /// Nothing to read: no window in front, the dock's own process, a process gone, a path over the buffer, any other
+    /// failure.
+    Unknown,
+    /// The dock may not open the process for limited information (access denied, `refused`).
+    Refused,
+    /// The full image path, as QueryFullProcessImageNameW gives it.
+    Path(&'a [u16]),
+}
+
+/// `f` of the image of the foreground window's process, `Unknown` for no window or the dock's own process: the dock's
+/// chords (`ui::chords_follow_foreground`) and `foreground_is_remote`.
+pub(crate) fn with_foreground_image<R>(f: impl FnOnce(ProcessImage<'_>) -> R) -> R {
+    // SAFETY: no preconditions.
+    let h = unsafe { GetForegroundWindow() };
+    if h.0.is_null() {
+        return f(ProcessImage::Unknown);
+    }
+    let mut pid = 0u32;
+    // SAFETY: `pid` is writable for the call; a stale window only yields 0.
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    // SAFETY: no preconditions.
+    let me = unsafe { GetCurrentProcessId() };
+    if pid == 0 || pid == me {
+        return f(ProcessImage::Unknown);
+    }
+    with_image(pid, f)
+}
+
+/// The full image path of process `pid` passes `test`.
 fn image_matches(pid: u32, test: fn(&[u16]) -> bool) -> bool {
+    with_image(pid, |image| matches!(image, ProcessImage::Path(path) if test(path)))
+}
+
+/// `f` of the image of process `pid`. Read-only: the process is opened with PROCESS_QUERY_LIMITED_INFORMATION and
+/// closed at once; its path is read into the stack, nothing is allocated (a path over 512 characters is neither a
+/// PowerToys install, a remote client nor the UAC prompt, and is `Unknown`). An open denied is `Refused`.
+fn with_image<R>(pid: u32, f: impl FnOnce(ProcessImage<'_>) -> R) -> R {
     // SAFETY: OpenProcess has no preconditions; the handle is closed below.
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return false };
+    let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(process) => process,
+        Err(e) if refused(e.code()) => return f(ProcessImage::Refused),
+        Err(_) => return f(ProcessImage::Unknown),
+    };
     let mut buf = [0u16; 512];
     let mut len = buf.len() as u32;
     // SAFETY: `buf` has `len` writable elements; `len` is in (capacity) and out (length written, no NUL).
     let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) };
     // SAFETY: the handle opened above, closed once.
     let _ = unsafe { CloseHandle(process) };
-    ok.is_ok() && buf.get(..len as usize).is_some_and(test)
+    match buf.get(..len as usize) {
+        Some(path) if ok.is_ok() => f(ProcessImage::Path(path)),
+        _ => f(ProcessImage::Unknown),
+    }
+}
+
+/// An OpenProcess error that says the dock may not look at the process (access denied), not that it is gone.
+fn refused(code: windows::core::HRESULT) -> bool {
+    code == ERROR_ACCESS_DENIED.to_hresult()
 }
 
 /// The process ids of the running chord owners (5.7: by image name; PowerToys.exe alone never counts). One
@@ -1283,6 +1341,22 @@ mod tests {
     use super::*;
     use crate::launcher::gesture::Gesture;
     use crate::launcher::runline;
+
+    /// Only an open denied is a refused image (the dock's chords count it as a window above the dock): a process gone
+    /// (invalid parameter) or any other failure is not.
+    #[test]
+    fn only_access_denied_is_a_refused_image() {
+        use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, E_ACCESSDENIED, S_OK};
+        assert!(refused(E_ACCESSDENIED));
+        assert!(refused(ERROR_ACCESS_DENIED.to_hresult()));
+        assert!(!refused(ERROR_INVALID_PARAMETER.to_hresult()), "a process gone");
+        assert!(!refused(ERROR_FILE_NOT_FOUND.to_hresult()));
+        assert!(!refused(S_OK));
+        // Read-only queries of this process and of a process id that is none: the path, then nothing.
+        let own = with_image(std::process::id(), |image| matches!(image, ProcessImage::Path(p) if !p.is_empty()));
+        assert!(own, "this process's own image is read");
+        assert!(with_image(0, |image| image == ProcessImage::Unknown), "pid 0, the idle process: no refusal");
+    }
 
     #[test]
     fn offset_of_vectors() {

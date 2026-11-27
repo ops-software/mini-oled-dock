@@ -1100,6 +1100,48 @@ pub fn click_group(key: &str) -> ClickOutcome {
     ClickOutcome::Activated(target)
 }
 
+/// The window the wheel cycle moves to. `wins` = (hwnd, seq, minimized) of a group in MRU order, `fg` the group's window
+/// that has the foreground (0 = none). Candidates are the windows that are not minimized when `skip_min`, else all. No
+/// candidate: the most recent window of the group (it is restored). The foreground among the candidates: the next (or
+/// the previous) one by `seq`, wrapping; None when that is the foreground itself (a single candidate). The foreground
+/// outside the candidates: the most recent candidate.
+pub(crate) fn cycle_target(wins: &[(isize, u64, bool)], fg: isize, forward: bool, skip_min: bool) -> Option<isize> {
+    let mut cands: Vec<(isize, u64)> = wins.iter().filter(|w| !(skip_min && w.2)).map(|w| (w.0, w.1)).collect();
+    let Some(first) = cands.first().map(|c| c.0) else {
+        return wins.first().map(|w| w.0);
+    };
+    let Some(pos) = cands.iter().position(|c| c.0 == fg) else { return Some(first) };
+    crate::tinysort::sort_by_key(&mut cands, |c| c.1);
+    let pos = cands.iter().position(|c| c.0 == fg).unwrap_or(pos);
+    let n = cands.len();
+    let next = if forward { (pos + 1) % n } else { (pos + n - 1) % n };
+    cands.get(next).map(|c| c.0).filter(|&h| h != fg)
+}
+
+/// Wheel cycle: activates the window of group `key` that `cycle_target` picks and returns it. UI thread.
+pub fn cycle_group(key: &str, forward: bool, skip_min: bool) -> Option<isize> {
+    // Windows of the group still alive, in MRU order, with their `seq`.
+    let wins: Vec<(isize, u64)> = STATE.with(|s| {
+        let st = s.borrow();
+        st.groups
+            .iter()
+            .find(|g| g.key == key)
+            .map(|g| g.windows.iter().map(|&h| (h, st.cache.get(&h).map(|e| e.seq).unwrap_or(0))).collect())
+            .unwrap_or_default()
+    });
+    // SAFETY: IsWindow and IsIconic accept arbitrary HWNDs.
+    let wins: Vec<(isize, u64, bool)> = wins
+        .into_iter()
+        .filter(|&(h, _)| unsafe { IsWindow(Some(hw(h))) }.as_bool())
+        .map(|(h, seq)| (h, seq, unsafe { IsIconic(hw(h)) }.as_bool()))
+        .collect();
+    let handles: Vec<isize> = wins.iter().map(|w| w.0).collect();
+    let fg = foreground_target_of(crate::ui::effective_foreground(), &handles);
+    let target = cycle_target(&wins, fg, forward, skip_min)?;
+    activate_window(target);
+    Some(target)
+}
+
 /// Windows of group `key` in stable order of appearance (`seq`), for the window picker. UI thread.
 pub fn windows_in_order(key: &str) -> Vec<isize> {
     STATE.with(|s| {
@@ -1279,6 +1321,34 @@ fn excluded_class(class: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_target_table() {
+        // (hwnd, seq, minimized) in MRU order: 30 is the most recent, 10 the oldest by appearance.
+        let wins = [(30, 3, false), (10, 1, false), (20, 2, false)];
+        assert_eq!(cycle_target(&wins, 30, true, true), Some(10), "forward wraps to the first by seq");
+        assert_eq!(cycle_target(&wins, 10, true, true), Some(20));
+        assert_eq!(cycle_target(&wins, 20, true, true), Some(30));
+        assert_eq!(cycle_target(&wins, 10, false, true), Some(30), "back wraps to the last by seq");
+        assert_eq!(cycle_target(&wins, 30, false, true), Some(20));
+        // A minimized window is skipped.
+        let wins = [(30, 3, false), (20, 2, true), (10, 1, false)];
+        assert_eq!(cycle_target(&wins, 10, true, true), Some(30));
+        assert_eq!(cycle_target(&wins, 30, false, true), Some(10));
+        assert_eq!(cycle_target(&wins, 10, true, false), Some(20), "not skipped when skip_min is off");
+        // All minimized: the most recent one is restored.
+        let wins = [(20, 2, true), (10, 1, true)];
+        assert_eq!(cycle_target(&wins, 0, true, true), Some(20));
+        assert_eq!(cycle_target(&wins, 0, false, true), Some(20));
+        // The foreground outside the group (or hidden by the skip): the most recent candidate.
+        let wins = [(30, 3, false), (20, 2, true), (10, 1, false)];
+        assert_eq!(cycle_target(&wins, 0, true, true), Some(30));
+        assert_eq!(cycle_target(&wins, 99, false, true), Some(30));
+        assert_eq!(cycle_target(&wins, 20, true, true), Some(30));
+        // One window that has the foreground: nothing to move to. No windows: nothing.
+        assert_eq!(cycle_target(&[(10, 1, false)], 10, true, true), None);
+        assert_eq!(cycle_target(&[], 0, true, true), None);
+    }
 
     fn plain() -> Styles {
         Styles { visible: true, tool: false, noactivate: false, app: false, owned: false }

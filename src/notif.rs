@@ -107,7 +107,7 @@ pub struct NotifItem {
     pub body: String,
     /// `CreationTime` as a UTC FILETIME (100 ns since 1601).
     pub time_ft: u64,
-    /// Local time already formatted "HH:mm" (or "yesterday HH:mm", "Mon 12 Oct" if not today).
+    /// Local time already formatted "HH:mm" (or "Yesterday HH:mm", "Mon 12 Oct" if not today).
     pub time_text: String,
     /// App icon key for `notif::app_icon` (AUMID, or "name:<app>"); "" = none.
     pub icon_key: String,
@@ -762,7 +762,7 @@ fn local_time(ft: u64) -> Option<SYSTEMTIME> {
 /// One day in 100 ns units.
 const DAY_FT: u64 = 864_000_000_000;
 
-/// "HH:mm" (today), "yesterday HH:mm", otherwise "ddd d MMM" (localized).
+/// "HH:mm" (today), "Yesterday HH:mm", otherwise "ddd d MMM" (localized).
 fn format_time(ft: u64, now: u64) -> String {
     let (Some(t), Some(today)) = (local_time(ft), local_time(now)) else { return String::new() };
     let ymd = |s: &SYSTEMTIME| (s.wYear, s.wMonth, s.wDay);
@@ -771,7 +771,7 @@ fn format_time(ft: u64, now: u64) -> String {
         return hm;
     }
     if local_time(now.saturating_sub(DAY_FT)).is_some_and(|y| ymd(&y) == ymd(&t)) {
-        return format!("{} {hm}", crate::i18n::tr("yesterday", "ieri"));
+        return format!("{} {hm}", crate::i18n::t(crate::i18n::k::NOTIF_YESTERDAY));
     }
     // Day and month names in the dock language (`i18n::locale`).
     let mut buf = [0u16; 48];
@@ -1023,6 +1023,14 @@ pub(crate) fn preview_set_state(s: NotifState, icons: Vec<(String, Arc<IconBitma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yesterday_is_capitalised() {
+        let now: u64 = 133_000_000_000_000_000;
+        let ft = now - DAY_FT;
+        assert!(crate::i18n::with_italian(false, || format_time(ft, now)).starts_with("Yesterday "));
+        assert!(crate::i18n::with_italian(true, || format_time(ft, now)).starts_with("Ieri "));
+    }
 
     #[test]
     fn no_icon_line_gives_the_length_not_the_id() {

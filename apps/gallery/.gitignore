@@ -1,0 +1,2 @@
+# The untracked local golden set of this machine (P2-kit K1a.5): base sets come only from the CI runner.
+tests/golden/local/

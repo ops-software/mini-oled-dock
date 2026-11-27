@@ -1,0 +1,32 @@
+[package]
+name = "oled-sysmon"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Process and system sampling shared by the suite."
+license = "MIT"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+oled-trust = { workspace = true }
+windows = { workspace = true, features = [
+    "Wdk_System_SystemInformation",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+[[example]]
+name = "sp_t1"
+test = true
+[[example]]
+name = "capture"
+test = true

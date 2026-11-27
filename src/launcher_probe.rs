@@ -415,6 +415,8 @@ pub enum UiWork {
     Icons,
     /// A files post merged (`popup_launcher::on_files`, FILES-2).
     Files,
+    /// A key on the focused bar (`ui::on_bar_key`, dock-keys K4b): handled and redrawn within the same 2 ms.
+    BarKey,
 }
 
 /// KEY-11: 2 ms.
@@ -449,6 +451,7 @@ impl Drop for UiTimer {
             UiWork::PrepareOpen => log!("launcher probe: ui work prepare_open {us} us"),
             UiWork::Icons => log!("launcher probe: ui work on_icons {us} us"),
             UiWork::Files => log!("launcher probe: ui work on_files {us} us"),
+            UiWork::BarKey => log!("launcher probe: ui work bar_key {us} us"),
         }
     }
 }
@@ -573,10 +576,53 @@ pub fn freeze_ui_once() {
     }
 }
 
+/// `DOCK_TEST_HOOK_STALL_MS` (100..=5000): the first owned dock chord stalls the keyboard hook's callback this long, after
+/// its post (live check K-3: Windows times out the keys that wait, and a return past the hook's STALL_MS is a cut-off
+/// that reinstalls the hook at once). Read once; `hook::start` reads it before the hook exists, so the callback never
+/// reads the environment.
+pub fn hook_stall_ms() -> Option<u32> {
+    static MS: OnceLock<Option<u32>> = OnceLock::new();
+    *MS.get_or_init(|| parse_hook_stall(std::env::var("DOCK_TEST_HOOK_STALL_MS").ok().as_deref()))
+}
+
+/// The switch's value when it is a whole number of milliseconds in 100..=5000; anything else (or unset) is None.
+fn parse_hook_stall(v: Option<&str>) -> Option<u32> {
+    v?.trim().parse::<u32>().ok().filter(|ms| (100..=5000).contains(ms))
+}
+
+/// The hook's stall, once: the first call that has one consumes it, every later call is None.
+pub fn hook_stall_once() -> Option<u32> {
+    static STALLED: AtomicBool = AtomicBool::new(false);
+    take_once(hook_stall_ms(), &STALLED)
+}
+
+/// `ms` the first time `done` is still false (which it then sets); None otherwise, and for None without consuming.
+fn take_once(ms: Option<u32>, done: &AtomicBool) -> Option<u32> {
+    ms.filter(|_| !done.swap(true, Relaxed))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_stall_parses_bounded() {
+        assert_eq!(parse_hook_stall(Some("1100")), Some(1100));
+        assert_eq!(parse_hook_stall(Some(" 1100 ")), Some(1100));
+        assert_eq!(parse_hook_stall(Some("100")), Some(100));
+        assert_eq!(parse_hook_stall(Some("5000")), Some(5000));
+        for bad in ["99", "5001", "0", "-1100", "1.5", "", "fast", "11000000000"] {
+            assert_eq!(parse_hook_stall(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(parse_hook_stall(None), None, "unset");
+        // Consumed by the first call that returns it; a None consumes nothing.
+        let done = AtomicBool::new(false);
+        assert_eq!(take_once(None, &done), None);
+        assert_eq!(take_once(Some(1100), &done), Some(1100));
+        assert_eq!(take_once(Some(1100), &done), None);
+        assert_eq!(take_once(Some(1100), &done), None);
+    }
 
     #[test]
     fn counter_ticks_read_in_microseconds() {

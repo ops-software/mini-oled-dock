@@ -1227,6 +1227,8 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Ui, WM_DOCK_OPEN_SETTINGS) => "WM_DOCK_OPEN_SETTINGS",
         (Th::Ui, WM_DOCK_UPDATE) => "WM_DOCK_UPDATE",
         (Th::Ui, WM_DOCK_WATCHDOG_EXITED) => "WM_DOCK_WATCHDOG_EXITED",
+        (Th::Ui, WM_DOCK_CHORD) => "WM_DOCK_CHORD",
+        (Th::Ui, WM_DOCK_PEEK) => "WM_DOCK_PEEK",
         // Labels without the launcher's probe-name prefix: launcher lint 14 rejects it in any string literal.
         (Th::Ui, WM_DOCK_LAUNCHER) => "launcher",
         (Th::Ui, WM_DOCK_LAUNCHER_YIELDED) => "launcher_yielded",
@@ -1268,8 +1270,17 @@ fn timer_name(th: Th, id: u32, thread_timer: bool) -> String {
     use crate::msg::*;
     if thread_timer {
         if th == Th::Hook {
-            // The hook thread's only thread timer: the reinstall tick (wsC Q6), its id changes at each arming.
-            return "REINSTALL_TICK".into();
+            // The hook thread's thread timers: the Peek timer and the heartbeat, each counted under one fixed id
+            // (`hook::is_peek_timer`, `hook::is_heartbeat_timer`), and the reinstall tick (wsC Q6), whose id changes at
+            // each arming.
+            let name = if crate::hook::is_peek_timer(id) {
+                "PEEK_TIMER"
+            } else if crate::hook::is_heartbeat_timer(id) {
+                "HEARTBEAT"
+            } else {
+                "REINSTALL_TICK"
+            };
+            return name.into();
         }
         return format!("thread_timer#{id:X}");
     }
@@ -1731,6 +1742,8 @@ mod tests {
         assert_eq!(timer_name(Th::Tray, 1, false), "TIMER_ZORDER");
         assert_eq!(timer_name(Th::Shell, 0x7FFF, true), "thread_timer#7FFF");
         assert_eq!(timer_name(Th::Hook, 0x7FFE, true), "REINSTALL_TICK");
+        assert_eq!(timer_name(Th::Hook, 0xFF_FFFF, true), "PEEK_TIMER");
+        assert_eq!(timer_name(Th::Hook, 0xFF_FFFE, true), "HEARTBEAT");
         assert_eq!(cause_name(0), "none");
         assert_eq!(cause_name(u32::from(CAUSE_POSTED | CAUSE_WINEVENT)), "posted+winevent");
         assert_eq!(copydata_kind(1, 1), "nim_modify");

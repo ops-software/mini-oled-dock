@@ -5,7 +5,7 @@
 
 use super::model::RunLine;
 use super::rank::fold;
-use crate::i18n::tr;
+use crate::i18n::pick;
 
 /// Live check 4 (V-13, live session C): the desktop shell does NOT expand %VAR% in a line it is given (Notepad got the
 /// literal text), so a line with a %VAR% goes through cmd.exe, which expands it in the user's own context (see
@@ -25,7 +25,7 @@ pub struct Known {
 
 impl Known {
     pub fn description(&self) -> &'static str {
-        tr(self.en, self.it)
+        pick(self.en, self.it)
     }
 }
 

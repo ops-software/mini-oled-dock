@@ -39,6 +39,7 @@ foreach ($line in $tree) {
   $pkg, $lic = $line -split '\|', 2
   $lic = ($lic -replace ' \(\*\)$', '').Trim()
   $pkg = ($pkg -replace ' \(\*\)$', '' -replace ' \(proc-macro\)$', '').Trim()
+  if ($pkg -match '^oled-[a-z0-9-]+ v\S+ \(.+\)$') { continue }
   if ($pkg -notmatch '^(?<n>\S+) v(?<v>\S+)$') { throw "unexpected cargo tree line: $line" }
   $key = "$($Matches.n) $($Matches.v)"
   if ($crates.Contains($key)) { continue }

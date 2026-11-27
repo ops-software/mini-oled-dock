@@ -17,20 +17,20 @@ use windows::Win32::Foundation::RECT;
 use crate::audio::VolumeState;
 use crate::config::{Background, Config, Position, BACKGROUND_PRESETS};
 use crate::glyphs;
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::popup::{center_y, lift, paint_slider, toggle_switch, HitMap};
 use crate::popup_tray::TrayRow;
 use crate::render::{self, AppView, BarSizes, BatteryView, Indicator, ItemId, Metrics, Scene, SystemView};
 use crate::settings_pages::{self, hsv_to_rgb, Control, Ctx, Page, Row};
 use crate::surface::{
-    over, rect_wh, white, Font, Surface, HOVER_ALPHA, PANEL_BORDER_ALPHA, PRESS_ALPHA, ROW_RADIUS, SEP_ALPHA,
-    TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE,
+    over, rect_wh, white, Font, Surface, DISABLED_ALPHA, HOVER_ALPHA, PANEL_BORDER_ALPHA, PRESS_ALPHA, ROW_RADIUS,
+    SEP_ALPHA, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE,
 };
 
 /// Width of the navigation column (logical px; physical = `Metrics::px`).
-pub(crate) const NAV_W: i32 = 200;
+pub(crate) const NAV_W: i32 = oled_ui::tokens::NAV_W;
 /// Height of a normal row.
-pub(crate) const ROW_H: i32 = 44;
+pub(crate) const ROW_H: i32 = oled_ui::tokens::ROW_COMFORT;
 /// Height of a group header.
 pub(crate) const HEADER_H: i32 = 32;
 /// Minimum height of a note without icon.
@@ -85,7 +85,7 @@ const SLIDER_W: i32 = 180;
 const SLIDER_MIN_W: i32 = 96;
 const VALUE_W: i32 = 52;
 const SLIDER_BAND_H: i32 = 20;
-const KNOB_R: i32 = 7;
+const KNOB_R: i32 = oled_ui::tokens::SLIDER_KNOB_R;
 /// Swatches: diameter, ring room around each one (its hit square), rim of the swatch.
 const SWATCH_D: i32 = 20;
 const SWATCH_RING: i32 = 3;
@@ -98,7 +98,7 @@ const HEX_ROW_H: i32 = 28;
 pub(crate) const PART_SV: usize = 0;
 pub(crate) const PART_HUE: usize = 1;
 /// Buttons.
-const BTN_H: i32 = 28;
+const BTN_H: i32 = oled_ui::tokens::CONTROL_H;
 const BTN_PAD: i32 = 14;
 const BTN_GAP: i32 = 8;
 const BTN_ALPHA: u32 = 30;
@@ -107,13 +107,12 @@ const BTN_PRESS_ALPHA: u32 = 62;
 const BTN_OFF_ALPHA: u32 = 12;
 const BTN_RIM_ALPHA: u32 = 24;
 /// Glyph size of icons and chevrons.
-const ICON: i32 = 16;
-/// Alpha of the navigation column fill and of the focus ring.
+const ICON: i32 = oled_ui::tokens::ICON_S;
+/// Alpha of the navigation column fill.
 const NAV_FILL_ALPHA: u32 = 8;
-const FOCUS_ALPHA: u32 = 110;
 /// Scroll thumb.
-const THUMB_W: i32 = 3;
-const THUMB_ALPHA: u32 = 50;
+const THUMB_W: i32 = oled_ui::tokens::SCROLLBAR_W;
+const THUMB_ALPHA: u32 = oled_ui::tokens::SCROLLBAR_REST;
 
 /// Where the keyboard focus is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +173,8 @@ pub(crate) struct Frame<'a> {
     pub badge: u32,
     /// Window background (config `background`).
     pub background: Background,
+    /// Keyboard ring on the focused nav row: set by a handled key, cleared by the pointer.
+    pub ring: bool,
 }
 
 /// Where the parts of a row are (physical px, scrolled).
@@ -672,8 +673,9 @@ fn paint_nav_entry(s: &mut Surface, page: Page, rc: RECT, f: &Frame<'_>) {
     }
     let label = s.ellipsize(page.title(), font, room);
     s.text(&label, lx, center_y(&rc, s.line_height(font)), font, WHITE, a);
-    if current && f.focus == Focus::Nav {
-        s.stroke_rr(rc, p(ROW_RADIUS), p(1).max(1), FOCUS_ALPHA);
+    if current && f.focus == Focus::Nav && f.ring {
+        let r = render::focus_ring(rc, p(ROW_RADIUS), m);
+        s.stroke_rr(r.rect, r.radius, r.width, render::RIM_FOCUS);
     }
 }
 
@@ -757,11 +759,11 @@ fn paint_row(s: &mut Surface, g: &Geometry, f: &Frame<'_>, i: usize, row: &Row, 
             s.blit(bmp, ix, iy, icon, 255);
         }
     } else if let Some(shape) = row.icon.filter(|_| !row.label.is_empty()) {
-        let a = if enabled { lift(TEXT2_ALPHA, lit) } else { TEXT3_ALPHA };
+        let a = if enabled { lift(TEXT2_ALPHA, lit) } else { DISABLED_ALPHA };
         s.glyph(ix, iy, icon, a, &shape);
     }
     if !row.label.is_empty() {
-        let a = if enabled { lift(TEXT_ALPHA, lit) } else { TEXT3_ALPHA };
+        let a = if enabled { lift(TEXT_ALPHA, lit) } else { DISABLED_ALPHA };
         let label = s.ellipsize(&row.label, Font::Normal, right - cell.text_x);
         s.text(&label, cell.text_x, cell.text_y, Font::Normal, WHITE, a);
         let mut y = cell.text_y + ln + p(2);
@@ -819,7 +821,7 @@ fn paint_row(s: &mut Surface, g: &Geometry, f: &Frame<'_>, i: usize, row: &Row, 
                 let r = *r;
                 let hid = id(Some(j));
                 let (fill, ta) = if !b.enabled {
-                    (BTN_OFF_ALPHA, TEXT3_ALPHA)
+                    (BTN_OFF_ALPHA, DISABLED_ALPHA)
                 } else if f.hot == Some(hid) {
                     (if f.pressed == Some(hid) { BTN_PRESS_ALPHA } else { BTN_HOT_ALPHA }, lift(TEXT_ALPHA, true))
                 } else {
@@ -949,7 +951,7 @@ pub(crate) fn mini_bar(m: Metrics, c: &Config, max_w: i32) -> Option<BarPixels> 
         active_t: if indicator == Indicator::Active { 1.0 } else { 0.0 },
     };
     let apps = [
-        app(tr("Files", "File"), &icons[0], Indicator::Active, false),
+        app(t(k::COMMON_FILES), &icons[0], Indicator::Active, false),
         app("Browser", &icons[1], Indicator::Open, false),
         app("Mail", &icons[2], Indicator::None, true),
     ];
@@ -967,7 +969,7 @@ pub(crate) fn mini_bar(m: Metrics, c: &Config, max_w: i32) -> Option<BarPixels> 
             volume: VolumeState { level: 60, muted: false, available: true },
             show_volume_percent: c.show_volume_percent,
             time,
-            date: c.show_date.then(|| tr("Fri 23 Oct", "ven 23 ott")),
+            date: c.show_date.then(|| t(k::SETTINGS_VIEW_FRI_23_OCT)),
             bell_badge: false,
             bell_dnd: false,
             net: Default::default(),
@@ -980,6 +982,8 @@ pub(crate) fn mini_bar(m: Metrics, c: &Config, max_w: i32) -> Option<BarPixels> 
         lift: None,
         hover: None,
         max_width: max_w,
+        focus: None,
+        chips: false,
     };
     let (w, h, px) = render::paint_offscreen(&scene)?;
     Some(BarPixels { w, h, px })
@@ -989,11 +993,12 @@ pub(crate) fn mini_bar(m: Metrics, c: &Config, max_w: i32) -> Option<BarPixels> 
 /// 1 px border; navigation focus, nothing hovered.
 #[cfg(test)]
 pub(crate) fn preview_pixels(m: Metrics, page: Page, c: &Config, ctx: &Ctx<'_>) -> Option<(i32, i32, Vec<u32>)> {
-    window_pixels(m, page, c, ctx, None, Focus::Nav, (860, 600))
+    window_pixels(m, page, c, ctx, None, Focus::Nav, false, (860, 600))
 }
 
 /// `preview_pixels` with hit id `hot` under the pointer, the focus on `focus` and a client of
 /// `size` logical px.
+#[allow(clippy::too_many_arguments)] // the signature is frozen by dock-keys 3.6
 pub(crate) fn window_pixels(
     m: Metrics,
     page: Page,
@@ -1001,6 +1006,7 @@ pub(crate) fn window_pixels(
     ctx: &Ctx<'_>,
     hot: Option<u32>,
     focus: Focus,
+    ring: bool,
     size: (i32, i32),
 ) -> Option<(i32, i32, Vec<u32>)> {
     let (w, h, cap) = (m.px(size.0), m.px(size.1), m.px(CAPTION_H));
@@ -1018,6 +1024,7 @@ pub(crate) fn window_pixels(
         bar: None,
         badge: ctx.update.badge(),
         background: c.background,
+        ring,
     };
     let g = layout(&s, (w, h), &f, 0);
     let bar = if g.preview.right > g.preview.left {
@@ -1033,7 +1040,7 @@ pub(crate) fn window_pixels(
     let mut cs = Surface::new(m).ok()?;
     cs.resize(w, cap).ok()?;
     cs.fill_rr(RECT { left: 0, top: 0, right: w, bottom: cap }, 0, c.background.rgb(), 255);
-    let title = tr("Dock settings", "Impostazioni dock");
+    let title = t(k::COMMON_DOCK_SETTINGS);
     cs.text(title, m.px(12), (cap - cs.line_height(Font::Normal)) / 2, Font::Normal, WHITE, TEXT_ALPHA);
     let gs = m.px(ICON);
     cs.glyph(w - m.px(23) - gs / 2, (cap - gs) / 2, gs, TEXT2_ALPHA, &glyphs::close_shape);
@@ -1056,6 +1063,17 @@ pub(crate) fn window_pixels(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_view_aliases_equal_their_old_literals() {
+        assert_eq!(NAV_W, 200);
+        assert_eq!(ROW_H, 44);
+        assert_eq!(KNOB_R, 7);
+        assert_eq!(BTN_H, 28);
+        assert_eq!(ICON, 16);
+        assert_eq!(THUMB_W, 3);
+        assert_eq!(THUMB_ALPHA, 50);
+    }
+
     use super::*;
     use crate::settings_pages::{Memory, Setting};
     use crate::start_import;
@@ -1076,6 +1094,7 @@ mod tests {
             bar: None,
             badge: 0,
             background: Config::default().background,
+            ring: false,
         }
     }
 
@@ -1104,6 +1123,8 @@ mod tests {
             trust_elevated: false,
             powertoys: false,
             chord_held: None,
+            battery_note: false,
+            keys_note: false,
         }
     }
 

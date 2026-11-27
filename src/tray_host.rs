@@ -1115,6 +1115,11 @@ fn seen_of(items: &[TrayItem], exe: &str, alive: &dyn Fn(isize, u32) -> bool) ->
 
 /// Name to show for the icon: FileDescription, then first tooltip line, then exe without extension.
 fn display_name(t: &TrayItem) -> String {
+    // The system's microphone and location indicators carry the owner's file description ("Windows
+    // Shell Experience Host" and the like): name them by what they are.
+    if t.guid.as_ref().is_some_and(|g| crate::config::is_privacy_guid(&guid_string(g))) {
+        return crate::i18n::t(crate::i18n::k::TRAY_HOST_PRIVACY_INDICATOR).to_string();
+    }
     if !t.name.trim().is_empty() {
         return t.name.trim().to_string();
     }
@@ -2998,6 +3003,38 @@ fn forward_main() {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::DUPLICATE_HANDLE_OPTIONS;
+
+    fn plain_item(guid: Option<GUID>, name: &str) -> TrayItem {
+        TrayItem {
+            id: 1,
+            owner: 0,
+            pid: 1,
+            uid: 1,
+            guid,
+            callback: 0,
+            version: 0,
+            hidden: false,
+            tip: String::new(),
+            src: None,
+            bitmap: None,
+            exe: "example.exe".into(),
+            image: String::new(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn privacy_icons_are_labelled() {
+        let label = crate::i18n::t(crate::i18n::k::TRAY_HOST_PRIVACY_INDICATOR);
+        let mic = GUID::from_u128(0x7820ae82_23e3_4229_82c1_e41cb67d5b9c);
+        let loc = GUID::from_u128(0x7820ae77_23e3_4229_82c1_e41cb67d5b9c);
+        let vol = GUID::from_u128(0x7820ae73_23e3_4229_82c1_e41cb67d5b9c);
+        assert_eq!(display_name(&plain_item(Some(mic), "Example Host")), label);
+        assert_eq!(display_name(&plain_item(Some(loc), "")), label);
+        // Another icon keeps its own name, with or without a GUID.
+        assert_eq!(display_name(&plain_item(Some(vol), "Example Host")), "Example Host");
+        assert_eq!(display_name(&plain_item(None, "Example Chat")), "Example Chat");
+    }
 
     #[test]
     fn show_all_overrides_the_hidden_set_without_editing_it() {

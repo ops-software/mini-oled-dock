@@ -1,8 +1,9 @@
 //! Leaving PowerToys (SPEC-launcher 5.7): which running programs hold the chord by their own keyboard hook, and the
-//! policy the launcher follows while one runs; and the remote-desktop and VM clients the chord goes to while one of them
-//! is in front (5.2.13). Pure: the process list, the chord's outcome and the foreground events come from the caller
-//! (launcher_sys.rs finds the processes and waits on their exit, popup_launcher.rs feeds the events); nothing of
-//! PowerToys is read, changed or ended.
+//! policy the launcher follows while one runs; the remote-desktop and VM clients the chord goes to while one of them is
+//! in front (5.2.13); and the UAC prompt, whose keys the dock's hook never sees (the dock's chords only). Pure: the
+//! process list, the chord's outcome and the foreground events come from the caller (launcher_sys.rs finds the
+//! processes and waits on their exit, popup_launcher.rs feeds the events); nothing of PowerToys is read, changed or
+//! ended.
 
 /// The image file names of the programs that answer Alt+Space with a low-level keyboard hook: PowerToys Command Palette
 /// and PowerToys Run. S-PT did not record them on the owner's machine (PowerToys was closed for the L0 session), so these
@@ -42,6 +43,17 @@ pub fn is_chord_owner(path: &[u16]) -> bool {
 /// The image is one of `REMOTE_CLIENTS` (the foreground window's process, at each foreground change).
 pub fn is_remote_client(path: &[u16]) -> bool {
     file_name_in(path, &REMOTE_CLIENTS)
+}
+
+/// The image file names of the UAC prompt. Shown without the secure desktop it is a window of consent.exe on the user's
+/// desktop, running above the elevated dock: no desktop switch comes, and the dock's keyboard hook gets none of the
+/// keys typed while it is in front. Kept apart from `REMOTE_CLIENTS`: the launcher's REMOTE flag does not read it,
+/// only the dock's chords do (`ui::chords_follow_foreground`).
+pub const ELEVATION_PROMPTS: [&str; 1] = ["consent.exe"];
+
+/// The image is one of `ELEVATION_PROMPTS` (the foreground window's process, at each foreground change).
+pub fn is_elevation_prompt(path: &[u16]) -> bool {
+    file_name_in(path, &ELEVATION_PROMPTS)
 }
 
 /// Where the launcher stands with a chord owner (5.7).
@@ -257,6 +269,28 @@ mod tests {
         ];
         for image in local {
             assert!(!is_remote_client(&w(image)), "{image}");
+        }
+    }
+
+    /// The UAC prompt by its image, whatever the case or separator. It is neither a remote client nor a chord owner, so
+    /// the launcher's flags do not change, and a remote client is no prompt.
+    #[test]
+    fn elevation_prompt_from_image_names() {
+        for image in ["C:\\Windows\\System32\\consent.exe", "c:/windows/system32/CONSENT.EXE", "consent.exe"] {
+            assert!(is_elevation_prompt(&w(image)), "{image}");
+            assert!(!is_remote_client(&w(image)), "{image}: the REMOTE flag is unchanged");
+            assert!(!is_chord_owner(&w(image)), "{image}");
+        }
+        let other = [
+            NOTEPAD,
+            "C:\\Windows\\System32\\mstsc.exe",
+            "C:\\x\\consent.exe.bak",
+            "C:\\x\\xconsent.exe",
+            "C:\\consent.exe\\notepad.exe",
+            "",
+        ];
+        for image in other {
+            assert!(!is_elevation_prompt(&w(image)), "{image}");
         }
     }
 
