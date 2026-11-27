@@ -9,18 +9,24 @@
 //! empty strip space, HTMINBUTTON, HTMAXBUTTON for the Snap Layouts flyout, HTCLOSE, else HTCLIENT). The buttons are the
 //! screen's CaptionButtons widget, painted in the screen's paint: their hover follows WM_NCMOUSEMOVE and
 //! WM_NCMOUSELEAVE through the dispatcher, a press is kept from DefWindowProc (which would draw the old buttons), and
-//! the action runs on WM_NCLBUTTONUP over the button that took the press, as WM_SYSCOMMAND. Right-click and Alt+Space
-//! open the system menu through DefWindowProc over HTCAPTION.
+//! the action runs on WM_NCLBUTTONUP over the button that took the press, as WM_SYSCOMMAND. Alt+Space opens the system
+//! menu through DefWindowProc. A right-click on the strip (HTCAPTION) does not: DefWindowProc shows nothing on a window
+//! whose caption WM_NCCALCSIZE removed, so WM_NCRBUTTONUP opens the window's system menu itself (system_menu): the
+//! commands enabled for the window's state, tracked at the click, the pick posted as WM_SYSCOMMAND.
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsZoomed, PostMessageW, SetWindowPos, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP, HTTOPLEFT,
-    HTTOPRIGHT, NCCALCSIZE_PARAMS, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SM_CXPADDEDBORDER, SM_CYFRAME,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SYSCOMMAND,
+    EnableMenuItem, GetSystemMenu, GetWindowLongW, IsIconic, IsZoomed, PostMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, SetWindowPos, TrackPopupMenuEx, GWL_STYLE, HTCAPTION, HTCLIENT, HTCLOSE, HTMAXBUTTON,
+    HTMINBUTTON, HTSYSMENU, HTTOP, HTTOPLEFT, HTTOPRIGHT, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, NCCALCSIZE_PARAMS,
+    SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_CXPADDEDBORDER, SM_CYFRAME, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONUP, WM_NULL, WM_SYSCOMMAND, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_THICKFRAME,
 };
 
 use super::window::{self, Sys, WinHost};
@@ -92,6 +98,119 @@ pub(crate) fn action(ht: u32, maximized: bool) -> Option<u32> {
     }
 }
 
+/// What a right button released over a part of the window opens (pure): the system menu over the empty strip (and the
+/// system-menu corner); the buttons, the resize band and the client (an app's own control in the strip) keep theirs.
+pub(crate) fn opens_system_menu(ht: u32) -> bool {
+    matches!(ht, HTCAPTION | HTSYSMENU)
+}
+
+/// What the wndproc does with a non-client right-button release (pure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NcRoute {
+    /// The kit opens the window's system menu itself.
+    SystemMenu,
+    /// DefWindowProc (or the arm for that message) answers.
+    Default,
+}
+
+/// The route of a non-client message over hit-test code `ht` (pure): a right-button release over the strip opens the menu.
+pub(crate) fn nc_route(msg: u32, ht: u32) -> NcRoute {
+    if msg == WM_NCRBUTTONUP && opens_system_menu(ht) {
+        NcRoute::SystemMenu
+    } else {
+        NcRoute::Default
+    }
+}
+
+/// The window's state as the system menu needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MenuState {
+    pub maximized: bool,
+    pub minimized: bool,
+    pub can_size: bool,
+    pub can_minimize: bool,
+    pub can_maximize: bool,
+}
+
+/// Which system commands the menu enables (pure): Restore when maximised or minimised; Move and Size only on a restored
+/// window (Size also needs a sizing frame); Minimize unless minimised and the window has the box; Maximize unless
+/// maximised and the window has the box; Close always.
+pub(crate) fn menu_enabled(s: MenuState) -> [(u32, bool); 6] {
+    let restored = !s.maximized && !s.minimized;
+    [
+        (SC_RESTORE, s.maximized || s.minimized),
+        (SC_MOVE, restored),
+        (SC_SIZE, restored && s.can_size),
+        (SC_MINIMIZE, s.can_minimize && !s.minimized),
+        (SC_MAXIMIZE, s.can_maximize && !s.maximized),
+        (SC_CLOSE, true),
+    ]
+}
+
+/// The default (bold) item, as Windows' own system menu has it: Close, and Restore only when minimised. A maximised
+/// window shows Close in bold as Alt+Space does, so both ways open the same menu.
+pub(crate) fn menu_default(s: MenuState) -> u32 {
+    if s.minimized {
+        SC_RESTORE
+    } else {
+        SC_CLOSE
+    }
+}
+
+fn menu_state(hwnd: HWND) -> MenuState {
+    // SAFETY: our window; reads its style and state, sends no message.
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    MenuState {
+        maximized: zoomed(hwnd),
+        // SAFETY: as above.
+        minimized: unsafe { IsIconic(hwnd) }.as_bool(),
+        can_size: style & WS_THICKFRAME.0 != 0,
+        can_minimize: style & WS_MINIMIZEBOX.0 != 0,
+        can_maximize: style & WS_MAXIMIZEBOX.0 != 0 && style & WS_THICKFRAME.0 != 0,
+    }
+}
+
+/// WM_NCRBUTTONUP over the strip: the window's system menu at the click (`lp`: screen coordinates, so the right
+/// monitor at any DPI), the commands enabled for the state, and the pick posted as WM_SYSCOMMAND, so the system's own
+/// move, size, minimise, maximise, restore and close run. No window state is borrowed while the menu's loop runs.
+pub(crate) fn system_menu(hwnd: HWND, lp: LPARAM) -> Option<LRESULT> {
+    // The guard is per loop (LoopShared::menu_up), so per UI thread: another thread's window keeps its own menu. The
+    // Rc is taken out under a short borrow; nothing is borrowed while the menu's loop runs.
+    let shared = window::with_host(hwnd, |h| h.lp.clone())?;
+    if shared.menu_up.replace(true) {
+        return Some(LRESULT(0));
+    }
+    let pt = POINT { x: (lp.0 & 0xFFFF) as u16 as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 };
+    let state = menu_state(hwnd);
+    // SAFETY: our window; the menu belongs to it and is not destroyed here (GetSystemMenu with bRevert FALSE).
+    let menu = unsafe { GetSystemMenu(hwnd, false) };
+    if menu.is_invalid() {
+        shared.menu_up.set(false);
+        return None;
+    }
+    for (cmd, on) in menu_enabled(state) {
+        let flag = if on { MF_ENABLED } else { MF_GRAYED };
+        // SAFETY: `menu` is our window's system menu; a command it lacks is simply not found.
+        let _ = unsafe { EnableMenuItem(menu, cmd, MF_BYCOMMAND | flag) };
+    }
+    // SAFETY: as above; the default item is only drawn bold.
+    let _ = unsafe { SetMenuDefaultItem(menu, menu_default(state), 0) };
+    // SAFETY: our window, which the click just made the foreground one when it was not.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN;
+    // SAFETY: a modal loop on this thread; messages for the window arrive in the wndproc, which holds no borrow here.
+    let pick = unsafe { TrackPopupMenuEx(menu, flags.0, pt.x, pt.y, hwnd, None) }.0 as u32;
+    shared.menu_up.set(false);
+    // SAFETY: posting to our own window (the documented WM_NULL after a popup, then the command); no pointers.
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        if pick != 0 {
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(pick as usize), lp);
+        }
+    }
+    Some(LRESULT(0))
+}
+
 fn is_button(ht: u32) -> bool {
     matches!(ht, HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
 }
@@ -138,6 +257,7 @@ pub(crate) fn on_nc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRES
         }
         WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => press(hwnd, wp, lp),
         WM_NCLBUTTONUP => release(hwnd, wp, lp),
+        _ if nc_route(msg, wp.0 as u32) == NcRoute::SystemMenu => system_menu(hwnd, lp),
         _ => None,
     }
 }
@@ -393,6 +513,63 @@ mod tests {
         assert_eq!(effective(Caption::Custom, false), Caption::System, "the fallback: the system caption");
         assert_eq!(effective(Caption::System, true), Caption::System, "a window that asks for the system one keeps it");
         assert_eq!(effective(Caption::Custom, true), Caption::Custom, "on: Custom takes effect");
+    }
+
+    #[test]
+    fn right_button_opens_the_system_menu_over_the_strip_only() {
+        for ht in [HTCAPTION, HTSYSMENU] {
+            assert!(opens_system_menu(ht), "{ht}");
+        }
+        for ht in [HTMINBUTTON, HTMAXBUTTON, HTCLOSE, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTCLIENT] {
+            assert!(!opens_system_menu(ht), "{ht} keeps its own answer");
+        }
+        // Over the strip of the real hit map: the empty space and nothing else.
+        let h = Harness::new(Chrome::new(true), SizeL { w: 640, h: 400 }, 96, Tokens::oled());
+        let s = h.screen();
+        let at = |x: i32, y: i32| nc_hit(PointP { x, y }, 640, resize_band(96), false, s.caption_hit(PointP { x, y }));
+        assert!(opens_system_menu(at(300, 20)), "empty strip");
+        assert!(!opens_system_menu(at(640 - 20, 20)), "close button");
+        assert!(!opens_system_menu(at(300, 60)), "client under the strip");
+    }
+
+    #[test]
+    fn right_button_release_is_routed() {
+        assert_eq!(nc_route(WM_NCRBUTTONUP, HTCAPTION), NcRoute::SystemMenu);
+        for ht in [HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP, HTCLIENT] {
+            assert_eq!(nc_route(WM_NCRBUTTONUP, ht), NcRoute::Default, "{ht}");
+        }
+        assert_eq!(nc_route(WM_NCLBUTTONUP, HTCAPTION), NcRoute::Default, "only the right button");
+    }
+
+    #[test]
+    fn menu_commands_follow_the_window_state() {
+        let on = |s: MenuState, cmd: u32| menu_enabled(s).iter().find(|(c, _)| *c == cmd).map(|(_, e)| *e);
+        let restored =
+            MenuState { maximized: false, minimized: false, can_size: true, can_minimize: true, can_maximize: true };
+        assert_eq!(on(restored, SC_RESTORE), Some(false));
+        assert_eq!(on(restored, SC_MOVE), Some(true));
+        assert_eq!(on(restored, SC_SIZE), Some(true));
+        assert_eq!(on(restored, SC_MINIMIZE), Some(true));
+        assert_eq!(on(restored, SC_MAXIMIZE), Some(true));
+        assert_eq!(on(restored, SC_CLOSE), Some(true));
+        assert_eq!(menu_default(restored), SC_CLOSE);
+        let max = MenuState { maximized: true, ..restored };
+        assert_eq!(
+            [SC_RESTORE, SC_MOVE, SC_SIZE, SC_MINIMIZE, SC_MAXIMIZE].map(|c| on(max, c)),
+            [Some(true), Some(false), Some(false), Some(true), Some(false)]
+        );
+        assert_eq!(menu_default(max), SC_CLOSE, "as Alt+Space's menu: Close is bold on a maximised window");
+        let fixed = MenuState { can_size: false, can_maximize: false, ..restored };
+        assert_eq!(
+            (on(fixed, SC_SIZE), on(fixed, SC_MAXIMIZE), on(fixed, SC_MOVE)),
+            (Some(false), Some(false), Some(true))
+        );
+        let icon = MenuState { minimized: true, ..restored };
+        assert_eq!(menu_default(icon), SC_RESTORE);
+        assert_eq!(
+            (on(icon, SC_RESTORE), on(icon, SC_MINIMIZE), on(icon, SC_MOVE)),
+            (Some(true), Some(false), Some(false))
+        );
     }
 
     #[test]

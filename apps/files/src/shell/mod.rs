@@ -8,6 +8,7 @@ pub mod exec;
 pub mod host;
 pub mod images;
 pub mod menu;
+pub mod pins;
 pub mod sta;
 pub mod supervisor;
 pub mod type_names;

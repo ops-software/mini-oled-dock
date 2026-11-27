@@ -206,6 +206,8 @@ fn host_main() -> i32 {
             }
             Err(e) => {
                 oled_sys::log!("files ops: accept failed: {e}");
+                // A client gone before the accept leaves the instance failing every accept until it is disconnected.
+                server.disconnect();
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }

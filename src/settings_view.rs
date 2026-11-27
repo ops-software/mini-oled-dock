@@ -35,6 +35,8 @@ pub(crate) const ROW_H: i32 = oled_ui::tokens::ROW_COMFORT;
 pub(crate) const HEADER_H: i32 = 32;
 /// Minimum height of a note without icon.
 pub(crate) const NOTE_H: i32 = 32;
+/// Least height of the Safety banner (logical px).
+pub(crate) const BANNER_H: i32 = 44;
 /// Height of a tray app row of the inline chooser.
 pub(crate) const TRAY_ROW_H: i32 = 36;
 /// Height of the preview card (Appearance).
@@ -137,9 +139,12 @@ pub(crate) fn hit_id(h: Hit) -> u32 {
     }
 }
 
+/// How many ids the navigation takes: one per page.
+const NAV_IDS: u32 = Page::ALL.len() as u32;
+
 pub(crate) fn decode(id: u32) -> Option<Hit> {
     match id {
-        1..=8 => Some(Hit::Nav(Page::ALL[(id - 1) as usize])),
+        1..=NAV_IDS => Some(Hit::Nav(Page::ALL[(id - 1) as usize])),
         1000.. => {
             let k = id - 1000;
             let part = k % 16;
@@ -196,6 +201,8 @@ struct Cell {
     status: String,
     /// Lines of a note without icon.
     note: Vec<String>,
+    /// How many of the first `note` lines are a banner's head (drawn in the normal font).
+    note_head: usize,
 }
 
 /// Result of `layout` (physical px, client coordinates).
@@ -298,10 +305,42 @@ fn intersect(a: RECT, b: RECT) -> Option<RECT> {
     (r.left < r.right && r.top < r.bottom).then_some(r)
 }
 
-/// Widths of the buttons of a row (physical px).
-fn button_widths(s: &Surface, buttons: &[settings_pages::Button]) -> Vec<i32> {
+/// Widths of the buttons of a row (physical px); `extra` is the chevron of a disclosure (gap and glyph), else 0.
+fn button_widths(s: &Surface, buttons: &[settings_pages::Button], extra: i32) -> Vec<i32> {
     let pad = s.metrics().px(BTN_PAD);
-    buttons.iter().map(|b| s.text_width(b.text, Font::Normal) + 2 * pad).collect()
+    buttons.iter().map(|b| s.text_width(&b.text, Font::Normal) + extra + 2 * pad).collect()
+}
+
+/// Gap between a disclosure's text and its chevron, and the chevron's size (design px).
+const CHEV_GAP: i32 = 8;
+const CHEV_SIZE: i32 = 10;
+
+/// The chevron part of a disclosure button's width (physical px), 0 for any other row.
+fn chevron_extra(m: Metrics, row: &Row) -> i32 {
+    if matches!(row.control, Control::Disclosure { .. }) {
+        m.px(CHEV_GAP) + m.px(CHEV_SIZE)
+    } else {
+        0
+    }
+}
+
+/// A disclosure row is laid out and painted as a one-button row with a chevron after its text; the action of the
+/// stand-in button is never read, `settings_pages::click` answers from the disclosure itself.
+fn disclosure_as_buttons(row: &Row) -> Option<Row> {
+    let Control::Disclosure { text, enabled, .. } = &row.control else { return None };
+    let button =
+        settings_pages::Button { action: settings_pages::Action::UndoAll, text: text.clone(), enabled: *enabled };
+    Some(Row { control: Control::Buttons(vec![button]), ..row.clone() })
+}
+
+/// The lines of a banner: its head line, then each problem, every one wrapped on its own.
+fn banner_lines(s: &Surface, row: &Row, lines: &[String], width: i32) -> (Vec<String>, usize) {
+    let mut out = wrap(s, &row.label, Font::Normal, width);
+    let head = out.len();
+    for l in lines {
+        out.extend(wrap(s, l, Font::Caption, width));
+    }
+    (out, head)
 }
 
 /// Buttons flowed into lines of at most `max_w`: `(x offset, line)` per button, and the line count.
@@ -406,6 +445,9 @@ fn layout_row(
     let p = |v: i32| m.px(v);
     let right = x0 + w - p(CTL_INSET);
     let id = |part: Option<usize>| hit_id(Hit::Row(i, part));
+    let stand_in = disclosure_as_buttons(row);
+    let chev = chevron_extra(m, row);
+    let row = stand_in.as_ref().unwrap_or(row);
     let mut cell = Cell::default();
     let full = |h: i32| RECT { left: x0, top: y, right: x0 + w, bottom: y + h };
 
@@ -443,6 +485,16 @@ fn layout_row(
             cell.text_y = rc.top + (rc.bottom - rc.top - text_h) / 2;
             return (rc, cell);
         }
+        // Laid out like an icon-less note: the head line and the problems, at least 44 px high.
+        Control::Banner { lines } => {
+            cell.text_x = x0 + p(ICON_X);
+            (cell.note, cell.note_head) = banner_lines(s, row, lines, right - cell.text_x);
+            let text_h =
+                s.line_height(Font::Normal) * cell.note_head as i32 + lc * (cell.note.len() - cell.note_head) as i32;
+            let rc = full((text_h + 2 * p(8)).max(p(BANNER_H)));
+            cell.text_y = rc.top + (rc.bottom - rc.top - text_h) / 2;
+            return (rc, cell);
+        }
         _ => {}
     }
 
@@ -464,7 +516,7 @@ fn layout_row(
             p(SWATCH_D) + 2 * p(SWATCH_RING),
         ),
         Control::Buttons(b) => {
-            let ws = button_widths(s, b);
+            let ws = button_widths(s, b, chev);
             (ws.iter().sum::<i32>() + p(BTN_GAP) * (ws.len() as i32 - 1).max(0), p(BTN_H))
         }
         Control::Chooser { .. } => (p(ICON), p(ICON)),
@@ -500,7 +552,7 @@ fn layout_row(
     } else if no_label {
         // Buttons only, left-aligned on the text column, as many lines as they need.
         let Control::Buttons(b) = &row.control else { unreachable!("only button rows have no label") };
-        let ws = button_widths(s, b);
+        let ws = button_widths(s, b, chev);
         let (pos, lines) = flow(&ws, p(BTN_GAP), right - cell.text_x);
         let block = lines * p(BTN_H) + (lines - 1) * p(BTN_GAP);
         rc = full(base_h.max(block + 2 * p(8)));
@@ -562,7 +614,7 @@ fn layout_row(
         }
         Control::Buttons(b) => {
             let mut x = ctl.right - ctl_w;
-            for (j, bw) in button_widths(s, b).iter().enumerate() {
+            for (j, bw) in button_widths(s, b, chev).iter().enumerate() {
                 let r = rect_wh(x, ctl.top, *bw, p(BTN_H));
                 cell.parts.push(r);
                 if b[j].enabled {
@@ -700,6 +752,12 @@ fn paint_row(s: &mut Surface, g: &Geometry, f: &Frame<'_>, i: usize, row: &Row, 
     let lsm = s.line_height(Font::Small);
     let ln = s.line_height(Font::Normal);
     let right = rc.right - p(CTL_INSET);
+    let stand_in = disclosure_as_buttons(row);
+    let chevron = match row.control {
+        Control::Disclosure { open, .. } => Some(open),
+        _ => None,
+    };
+    let row = stand_in.as_ref().unwrap_or(row);
 
     match &row.control {
         Control::Header { value } => {
@@ -731,6 +789,21 @@ fn paint_row(s: &mut Surface, g: &Geometry, f: &Frame<'_>, i: usize, row: &Row, 
             for line in &cell.note {
                 s.text(line, cell.text_x, y, Font::Caption, WHITE, TEXT2_ALPHA);
                 y += s.line_height(Font::Caption);
+            }
+            return;
+        }
+        // A 1 px danger rim on the page background, no red fill; the text on top.
+        Control::Banner { .. } => {
+            let bw = p(1).max(1);
+            s.fill_rr(rc, p(ROW_RADIUS), crate::launcher::style::ACCENT_DANGER, 255);
+            let inner = RECT { left: rc.left + bw, top: rc.top + bw, right: rc.right - bw, bottom: rc.bottom - bw };
+            s.fill_rr(inner, p(ROW_RADIUS) - bw, f.background.rgb(), 255);
+            let mut y = cell.text_y;
+            for (i, line) in cell.note.iter().enumerate() {
+                let (font, alpha) =
+                    if i < cell.note_head { (Font::Normal, TEXT_ALPHA) } else { (Font::Caption, TEXT2_ALPHA) };
+                s.text(line, cell.text_x, y, font, WHITE, alpha);
+                y += s.line_height(font);
             }
             return;
         }
@@ -830,8 +903,21 @@ fn paint_row(s: &mut Surface, g: &Geometry, f: &Frame<'_>, i: usize, row: &Row, 
                 let rad = (r.bottom - r.top) / 2;
                 s.fill_rr(r, rad, WHITE, fill);
                 s.stroke_rr(r, rad, p(1).max(1), BTN_RIM_ALPHA);
-                let tw = s.text_width(b.text, Font::Normal);
-                s.text(b.text, r.left + (r.right - r.left - tw) / 2, center_y(&r, ln), Font::Normal, WHITE, ta);
+                let tw = s.text_width(&b.text, Font::Normal);
+                match chevron {
+                    None => {
+                        s.text(&b.text, r.left + (r.right - r.left - tw) / 2, center_y(&r, ln), Font::Normal, WHITE, ta)
+                    }
+                    Some(open) => {
+                        // Text, a gap and the chevron (down when closed, up when open), centred together.
+                        let (gap, gs) = (p(CHEV_GAP), p(CHEV_SIZE));
+                        let x = r.left + (r.right - r.left - (tw + gap + gs)) / 2;
+                        s.text(&b.text, x, center_y(&r, ln), Font::Normal, WHITE, ta);
+                        let shape: fn(f32, f32) -> bool =
+                            if open { glyphs::chevron_up_shape } else { glyphs::chevron_down_shape };
+                        s.glyph(x + tw + gap, (r.top + r.bottom) / 2 - gs / 2, gs, ta, &shape);
+                    }
+                }
             }
         }
         Control::Chooser { open } => {
@@ -1125,6 +1211,8 @@ mod tests {
             chord_held: None,
             battery_note: false,
             keys_note: false,
+            suite: Box::leak(Box::default()),
+            safety: Box::leak(Box::default()),
         }
     }
 
@@ -1145,7 +1233,7 @@ mod tests {
         let st = idle_status();
         let rows = settings_pages::rows(Page::Appearance, &Config::default(), &test_ctx(&st));
         let g = layout(&s, (860, 600), &frame(Page::Appearance, &rows), 0);
-        assert_eq!(g.nav.len(), 8);
+        assert_eq!(g.nav.len(), Page::ALL.len());
         let about = g.nav.iter().find(|(p, _)| *p == Page::About).unwrap().1;
         assert_eq!(about.bottom, 600 - 8);
         assert!(g.nav.iter().all(|(_, r)| r.right <= NAV_W));
@@ -1225,6 +1313,138 @@ mod tests {
         let hue = rect_wh(0, 0, 361, 12);
         assert_eq!(hue_at(hue, -5), 0.0);
         assert!((hue_at(hue, 360) - 359.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn nav_ids_round_trip_for_every_page() {
+        assert_eq!(Page::ALL.len(), 10);
+        for p in Page::ALL {
+            assert_eq!(decode(hit_id(Hit::Nav(p))), Some(Hit::Nav(p)));
+        }
+        assert_eq!(decode(Page::ALL.len() as u32), Some(Hit::Nav(Page::About)));
+        assert_eq!(decode(Page::ALL.len() as u32 + 1), None);
+        assert_eq!(decode(999), None);
+    }
+
+    #[test]
+    fn nav_fits_the_minimum_window() {
+        let rows: Vec<Row> = Vec::new();
+        for dpi in [96, 120, 144, 192] {
+            let m = Metrics { dpi };
+            let s = Surface::new(m).expect("surface");
+            let client = (m.px(crate::config::SETTINGS_WINDOW_MIN.0), m.px(crate::config::SETTINGS_WINDOW_MIN.1));
+            let g = layout(&s, client, &frame(Page::Appearance, &rows), 0);
+            let top: Vec<RECT> = g.nav.iter().filter(|(p, _)| !p.at_bottom()).map(|(_, r)| *r).collect();
+            let bottom: Vec<RECT> = g.nav.iter().filter(|(p, _)| p.at_bottom()).map(|(_, r)| *r).collect();
+            assert_eq!(top.len() + bottom.len(), Page::ALL.len());
+            let last_top = top.last().expect("top entries").bottom;
+            let first_bottom = bottom.first().expect("bottom entries").top;
+            assert!(last_top + m.px(NAV_GAP) <= first_bottom, "dpi {dpi}: {last_top} vs {first_bottom}");
+        }
+    }
+
+    fn banner(lines: &[&str]) -> Row {
+        Row {
+            icon: None,
+            label: "Head".into(),
+            desc: None,
+            control: Control::Banner { lines: lines.iter().map(|l| l.to_string()).collect() },
+        }
+    }
+
+    #[test]
+    fn banner_is_laid_out_like_a_note() {
+        let s = Surface::new(M).expect("surface");
+        let h = |row: Row| {
+            let rows = [row];
+            let g = layout(&s, (860, 600), &frame(Page::Safety, &rows), 0);
+            assert!(g.hits.rect(hit_id(Hit::Row(0, None))).is_none(), "a banner has no hit id");
+            g.rows[0].bottom - g.rows[0].top
+        };
+        let one = h(banner(&["One problem"]));
+        let two = h(banner(&["One problem", "Another problem"]));
+        assert!(one >= BANNER_H, "{one}");
+        assert!(two >= one, "{two} vs {one}");
+        let many = h(banner(&["a", "b", "c", "d", "e", "f"]));
+        assert!(many > two, "{many} vs {two}");
+    }
+
+    #[test]
+    fn button_text_is_owned_or_static() {
+        let paint_with = |text: std::borrow::Cow<'static, str>| {
+            let mut s = Surface::new(M).expect("surface");
+            s.resize(860, 300).unwrap();
+            let b = settings_pages::Button { action: settings_pages::Action::ResetSizes, text, enabled: true };
+            let rows = [Row { icon: None, label: "Row".into(), desc: None, control: Control::Buttons(vec![b]) }];
+            let f = frame(Page::Bar, &rows);
+            let g = layout(&s, (860, 300), &f, 0);
+            paint(&mut s, &g, &f);
+            s.snapshot_pixels().unwrap().2
+        };
+        assert_eq!(paint_with("Reset".into()), paint_with(String::from("Reset").into()));
+    }
+
+    fn disclosure_row(open: bool) -> Row {
+        let control = Control::Disclosure {
+            what: settings_pages::safety::Disclose::UndoAll,
+            text: "Details".into(),
+            open,
+            enabled: true,
+        };
+        Row { icon: None, label: "Row".into(), desc: None, control }
+    }
+
+    #[test]
+    fn disclosure_hit_and_width() {
+        let s = Surface::new(M).expect("surface");
+        let rows = [disclosure_row(false)];
+        let g = layout(&s, (860, 300), &frame(Page::Safety, &rows), 0);
+        let r = g.hits.rect(hit_id(Hit::Row(0, Some(0)))).expect("the button is a hit");
+        let w = r.right - r.left;
+        assert_eq!(w, s.text_width("Details", Font::Normal) + M.px(CHEV_GAP) + M.px(CHEV_SIZE) + 2 * M.px(BTN_PAD));
+        assert_eq!(r.bottom - r.top, M.px(BTN_H));
+        // The chevron sits inside the button: the text, the gap and the glyph all fit between its edges.
+        assert!(w > s.text_width("Details", Font::Normal) + M.px(CHEV_GAP) + M.px(CHEV_SIZE));
+    }
+
+    #[test]
+    fn a_disclosure_chevron_flips_when_open() {
+        let paint_with = |open: bool| {
+            let mut s = Surface::new(M).expect("surface");
+            s.resize(860, 300).unwrap();
+            let rows = [disclosure_row(open)];
+            let f = frame(Page::Safety, &rows);
+            let g = layout(&s, (860, 300), &f, 0);
+            paint(&mut s, &g, &f);
+            s.snapshot_pixels().unwrap().2
+        };
+        assert_ne!(paint_with(false), paint_with(true));
+    }
+
+    #[test]
+    fn banner_rim_is_danger() {
+        let mut s = Surface::new(M).expect("surface");
+        s.resize(860, 300).unwrap();
+        let rows = [banner(&["One problem"])];
+        let f = frame(Page::Safety, &rows);
+        let g = layout(&s, (860, 300), &f, 0);
+        paint(&mut s, &g, &f);
+        let (w, _, px) = s.snapshot_pixels().unwrap();
+        let rc = g.rows[0];
+        let at = |x: i32, y: i32| {
+            let v = px[(y as usize) * (w as usize) + x as usize];
+            ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+        };
+        let ym = (rc.top + rc.bottom) / 2;
+        assert_eq!(at(rc.left, ym), crate::launcher::style::ACCENT_DANGER);
+        assert_eq!(at(rc.left + 3, ym), f.background.rgb());
+        // No pixel of the row but the rim and the text is danger: the inside is the background or text shades.
+        let danger = crate::launcher::style::ACCENT_DANGER;
+        for y in rc.top + 3..rc.bottom - 3 {
+            for x in rc.left + 3..rc.right - 3 {
+                assert_ne!(at(x, y), danger, "({x},{y})");
+            }
+        }
     }
 
     #[test]

@@ -14,7 +14,65 @@ use oled_sys::i18n::Lang;
 
 use crate::config::Language;
 
-pub use oled_sys::i18n::{locale, set_preview};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+pub use oled_sys::i18n::locale;
+
+/// True once preview mode was switched on in this process: previews never read the data file.
+static PREVIEW_SEEN: AtomicBool = AtomicBool::new(false);
+/// True once the load of lang\it.lang was tried (once per process).
+static LOAD_TRIED: AtomicBool = AtomicBool::new(false);
+
+/// Preview mode (`--preview`): English labels whatever the config says.
+pub fn set_preview(on: bool) {
+    if on {
+        PREVIEW_SEEN.store(true, Relaxed);
+    }
+    oled_sys::i18n::set_preview(on);
+}
+
+/// Pure: the data file is read only by an Italian UI of the installed dock.exe, never in a preview.
+fn should_load(italian: bool, runs_installed_image: bool, preview: bool) -> bool {
+    italian && runs_installed_image && !preview
+}
+
+/// Why a file is not used, or the checked file. Pure over the bytes and the running version.
+fn check_lang(bytes: Vec<u8>, version: (u16, u16, u16)) -> Result<oled_sys::lang::LangFile, String> {
+    let f = oled_sys::lang::LangFile::parse(bytes).map_err(|e| format!("{e:?}"))?;
+    if f.tag() != "it" {
+        return Err("tag".to_string());
+    }
+    if f.suite_version() != version {
+        return Err("version".to_string());
+    }
+    Ok(f)
+}
+
+/// Reads <install dir>\lang\it.lang the first time the UI is Italian in the installed dock.
+fn load_lang_file() {
+    if LOAD_TRIED.swap(true, Relaxed) {
+        return;
+    }
+    let Some(path) =
+        crate::autostart::installed_exe().ok().and_then(|e| e.parent().map(|d| d.join("lang").join("it.lang")))
+    else {
+        return;
+    };
+    let v = crate::update_release::Version::current();
+    let want = (v.major as u16, v.minor as u16, v.patch as u16);
+    let why = match oled_sys::datadir::read_file(&path, oled_sys::lang::LANG_MAX_BYTES as u64, true) {
+        Ok(bytes) => match check_lang(bytes, want) {
+            Ok(f) => {
+                oled_sys::i18n::set_lang_file(Box::leak(Box::new(f)));
+                return;
+            }
+            Err(w) => w,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => e.to_string(),
+    };
+    crate::log!("i18n: lang\\it.lang not used ({why})");
+}
 
 /// The runtime's name for a config language.
 fn lang_of(l: Language) -> Lang {
@@ -28,6 +86,12 @@ fn lang_of(l: Language) -> Lang {
 /// Sets the language from the config value (called by `config::set`).
 pub fn apply(lang: Language) {
     oled_sys::i18n::apply(lang_of(lang));
+    if !LOAD_TRIED.load(Relaxed)
+        && oled_sys::i18n::italian()
+        && should_load(true, crate::update::guard::runs_installed(), PREVIEW_SEEN.load(Relaxed))
+    {
+        load_lang_file();
+    }
 }
 
 /// True when the dock speaks Italian.
@@ -64,6 +128,14 @@ pub mod strings {
     include!(concat!(env!("OUT_DIR"), "/strings.rs"));
 }
 pub use strings::k;
+
+/// The text of a key of the kit's own table (the suite apps' display names) in the dock language.
+pub fn kit(key: oled_sys::i18n::S) -> &'static str {
+    match (oled_ui::strings::UiLang { italian: italian(), pseudo: false }).kit(key) {
+        std::borrow::Cow::Borrowed(s) => s,
+        std::borrow::Cow::Owned(_) => "",
+    }
+}
 
 /// The text of a key in the dock language.
 pub fn t(key: oled_sys::i18n::S) -> &'static str {
@@ -112,6 +184,29 @@ mod tests {
         let ns = start.elapsed().as_nanos() as f64 / 1_000_000.0;
         println!("t_lookup_cost: {ns:.1} ns per lookup over {} keys ({bytes} bytes)", hashes.len());
         assert!(bytes > 0);
+    }
+
+    #[test]
+    fn should_load_table() {
+        for it in [false, true] {
+            for inst in [false, true] {
+                for pv in [false, true] {
+                    assert_eq!(should_load(it, inst, pv), it && inst && !pv);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_file_keeps_the_compiled_table() {
+        let ok = oled_sys::lang::encode("it", (1, 8, 0), &[(1, "a")]).unwrap();
+        assert!(check_lang(ok.clone(), (1, 8, 0)).is_ok());
+        assert_eq!(check_lang(ok, (1, 8, 1)).err().as_deref(), Some("version"));
+        let en = oled_sys::lang::encode("en", (1, 8, 0), &[(1, "a")]).unwrap();
+        assert_eq!(check_lang(en, (1, 8, 0)).err().as_deref(), Some("tag"));
+        let mut bad = oled_sys::lang::encode("it", (1, 8, 0), &[(1, "a")]).unwrap();
+        bad[0] = b'X';
+        assert_eq!(check_lang(bad, (1, 8, 0)).err().as_deref(), Some("Magic"));
     }
 
     #[test]

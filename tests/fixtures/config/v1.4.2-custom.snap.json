@@ -146,5 +146,8 @@
     "web_url": "",
     "offer_done": false,
     "powertoys_done": false
-  }
+  },
+  "suite_tasks": true,
+  "suite_files": true,
+  "takeover_ctrl_shift_esc": false
 }

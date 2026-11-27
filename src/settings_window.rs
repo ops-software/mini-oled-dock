@@ -55,12 +55,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{self, Background, Config, SETTINGS_WINDOW_MIN};
 use crate::i18n::{k, t};
 use crate::log;
-use crate::msg::{TIMER_SETTINGS_APPLY, TIMER_SETTINGS_BAR, TIMER_SETTINGS_TICK, WM_DOCK_CONFIG_APPLY};
+use crate::msg::{
+    TIMER_SETTINGS_APPLY, TIMER_SETTINGS_BAR, TIMER_SETTINGS_TICK, WM_DOCK_CONFIG_APPLY, WM_SETTINGS_SUITE_DATA,
+};
 use crate::popup_tray::TrayRow;
 use crate::render::Metrics;
+use crate::settings_pages::safety::{self, SafetyView};
+use crate::settings_pages::suite::{self, SuiteEdit, SuiteView};
 use crate::settings_pages::{
-    self, apply_edit, background_of, preset_index, rgb_to_hsv, same_rows, Action, Control, Ctx, Edit,
-    Effect, Memory, Page, Row,
+    self, apply_edit, background_of, preset_index, rgb_to_hsv, same_rows, Action, Control, Ctx, Edit, Effect, Memory,
+    Page, Row,
 };
 use crate::settings_view::{self, decode, hue_at, sv_at, BarPixels, Focus, Frame, Geometry, Hit, PART_HUE, PART_SV};
 use crate::shell_thread::{self, ShellRequest};
@@ -286,6 +290,10 @@ struct Win {
     log_path: Option<String>,
     /// `tray_host::trust_elevated_tray_icons`, re-read when the window opens and after a toggle.
     trust_elevated: bool,
+    /// The Suite page's view, re-read every second (`refresh_live`) and when the page opens.
+    suite: SuiteView,
+    /// The Safety page's view: lives as long as the window; `refresh_live` only updates its live fields.
+    safety: SafetyView,
     pending: Pending,
     bar: Option<MiniBar>,
     /// `tick_ms` of the last mini bar rebuild (see `bar_wait`).
@@ -489,6 +497,8 @@ impl Win {
             chord_held: self.chord_held,
             battery_note: config::load_notes().show_battery_invalid,
             keys_note: config::load_notes().new_keys_invalid,
+            suite: &self.suite,
+            safety: &self.safety,
         }
     }
 
@@ -589,6 +599,8 @@ impl Win {
         let badge = self.update.badge();
         self.update = crate::update::status();
         self.memory = Memory { now: crate::mem::private_bytes(), trimmed: crate::mem::last_hidden_trim() };
+        self.suite = suite::view_now();
+        safety::refresh(&mut self.safety);
         let rows = self.rows_now();
         if !same_rows(&rows, &self.rows) || badge != self.update.badge() {
             self.rows = rows;
@@ -732,6 +744,13 @@ impl Win {
         let bg = config::get().background;
         if page == Page::Launcher {
             crate::popup::popup_launcher::pt_refresh();
+        }
+        if page == Page::Suite {
+            crate::ui::suite_links::refresh();
+            self.suite = suite::view_now();
+        }
+        if page == Page::Safety {
+            safety::start_load(self.hwnd);
         }
         self.page = page;
         self.scroll = 0;
@@ -894,6 +913,8 @@ fn open_window(inst: HINSTANCE) -> Result<(), String> {
         data_dir,
         log_path: crate::datadir::log_path().map(|p| p.display().to_string()),
         trust_elevated: crate::tray_host::trust_elevated_tray_icons(),
+        suite: suite::view_now(),
+        safety: safety::view_now(),
         pending: Pending::default(),
         bar: None,
         bar_built: 0,
@@ -977,6 +998,8 @@ pub fn on_tray_changed() {
 
 /// The update status changed (`WM_DOCK_UPDATE`).
 pub fn on_update_changed() {
+    crate::ui::suite_links::refresh();
+    crate::ui::takeover::refresh_gate();
     with_win(Win::refresh_live);
 }
 
@@ -1033,6 +1056,12 @@ fn run_effect(e: Effect) {
             });
         }
         Effect::Run(a) => run_action(a),
+        Effect::Disclose(d) => {
+            with_win(|w| {
+                safety::toggle(&mut w.safety, d);
+                w.refresh();
+            });
+        }
     }
 }
 
@@ -1078,6 +1107,19 @@ fn run_action(a: Action) {
             log!("settings: launcher history forgotten");
         }
         // `config.json` is the one file the interactive user may write; the shell thread opens it as that user.
+        Action::OpenApp(app) => suite::run(Action::OpenApp(app)),
+        // The chord part goes through the normal toggle path first, so it is saved before the journal worker starts.
+        Action::UndoAll => {
+            with_win(|w| {
+                if config::get().takeover_ctrl_shift_esc {
+                    w.save(Edit::Suite(SuiteEdit::Takeover(false)));
+                }
+                safety::run(Action::UndoAll, &mut w.safety, w.hwnd);
+            });
+        }
+        Action::Rollback => {
+            with_win(|w| safety::run(Action::Rollback, &mut w.safety, w.hwnd));
+        }
         Action::EditConfig => match (crate::datadir::config_path(), notepad_path()) {
             (Some(p), Some(notepad)) => {
                 shell_thread::request(ShellRequest::Launch {
@@ -1357,6 +1399,22 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             }
             LRESULT(0)
         }
+        // The Safety worker finished: its result goes into the window's view.
+        WM_SETTINGS_SUITE_DATA => {
+            with_win(|w| {
+                if let Some(d) = safety::take_data() {
+                    w.safety.journal = d.journal;
+                    if d.report.is_some() {
+                        w.safety.report = d.report;
+                    }
+                    w.safety.update_incidents = d.rolled_back;
+                    w.safety.busy = false;
+                    w.safety.open = None;
+                }
+                w.refresh();
+            });
+            LRESULT(0)
+        }
         WM_TIMER => {
             match wp.0 {
                 TIMER_SETTINGS_TICK => {
@@ -1397,6 +1455,38 @@ mod tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_TAB, VK_UP};
     const FRAME: RECT = RECT { left: -8, top: -31, right: 8, bottom: 8 };
+
+    /// The text of this file above its tests.
+    fn code() -> &'static str {
+        include_str!("settings_window.rs").split("#[cfg(test)]\nmod tests").next().expect("code part")
+    }
+
+    /// The text of the function that starts with `head` (up to the next function of the impl).
+    fn body_of(head: &str) -> &'static str {
+        let src = code();
+        let from = src.find(head).unwrap_or_else(|| panic!("{head} not found"));
+        let rest = &src[from + head.len()..];
+        let end = rest.find("\n    fn ").or_else(|| rest.find("\n    /// ")).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn refresh_live_keeps_the_safety_view() {
+        let b = body_of("fn refresh_live(&mut self)");
+        assert!(b.contains("safety::refresh(&mut self.safety)"), "the tick updates the live fields in place");
+        // A new SafetyView would reset the list to Loading and close the disclosure every second.
+        assert!(!b.contains("self.safety ="), "refresh_live never assigns the safety view");
+        assert!(b.contains("self.suite = suite::view_now()"));
+    }
+
+    #[test]
+    fn goto_suite_refreshes_the_links() {
+        let b = body_of("fn goto(&mut self, page: Page)");
+        let (links, rows) = (b.find("suite_links::refresh()").expect("links"), b.find("self.refresh()").expect("rows"));
+        assert!(links < rows, "the links are refreshed before the rows are built");
+        assert!(b.contains("page == Page::Suite"));
+        assert!(b.contains("safety::start_load(self.hwnd)"));
+    }
 
     #[test]
     fn notepad_comes_from_the_system_directory() {

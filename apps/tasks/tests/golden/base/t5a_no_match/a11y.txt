@@ -1,0 +1,11 @@
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Button "More options (F10)" [focusable]
+SearchInput "Search processes" [focusable] "zz"
+  Button "Clear"
+ColumnHeader "Name, 23 processes" [focusable]
+ColumnHeader "CPU, total 18.0 %" [focusable]
+ColumnHeader "Memory, total 52 %" [focusable]
+ColumnHeader "I/O, total 1.13 MB/s" [focusable]
+Image "Order held while you aim"
+Table "Name" [focusable] 0 of 0

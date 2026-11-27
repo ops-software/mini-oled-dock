@@ -328,7 +328,7 @@ pub fn quote_arg(arg: &[u16]) -> Vec<u16> {
 }
 
 /// This process's current folder as a WidePath.
-fn current_dir() -> Option<WidePath> {
+pub fn current_dir() -> Option<WidePath> {
     let d = std::env::current_dir().ok()?;
     let units: Vec<u16> = d.as_os_str().encode_wide().collect();
     WidePath::new(&units).ok()

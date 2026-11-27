@@ -26,8 +26,8 @@ use crate::msg::{TIMER_UPDATE_CHECK, WM_DOCK_UPDATE};
 use crate::shell_thread::{self, ShellRequest};
 use crate::update_release::{
     self, host_allowed, is_newer, next_check_delay_ms, parse_release, parse_sha256_file, parse_tag, release_page_url,
-    rfc3339_utc, safe_release_url, version_output_matches, Asset, Release, Version, API_MAX_BYTES, CHECK_PERIOD_MS, EXE_ASSET,
-    EXE_MAX_BYTES, FIRST_CHECK_MS, LATEST_API_URL, RETRY_MS, SHA_ASSET, SHA_MAX_BYTES,
+    rfc3339_utc, safe_release_url, tag_api_url, version_output_matches, Asset, Release, Version, API_MAX_BYTES,
+    CHECK_PERIOD_MS, EXE_ASSET, EXE_MAX_BYTES, FIRST_CHECK_MS, LATEST_API_URL, RETRY_MS, SHA_ASSET, SHA_MAX_BYTES,
 };
 use crate::winhttp;
 use oled_sys::i18n::{subst, S};
@@ -218,17 +218,27 @@ pub(crate) fn apply_check(
 const CHECK_HEADERS: [(&str, &str); 2] =
     [("Accept", "application/vnd.github+json"), ("X-GitHub-Api-Version", "2022-11-28")];
 
-/// Asks GitHub for the latest release. `in_child` (the dock's checks): the GET runs in an `--update-fetch`
-/// child, so the WinHTTP, Schannel and crypt32 state it loads (about +100 handles and +0.6 MB, kept for
-/// good) ends with the child (M1 F2); a child that cannot start, times out or prints anything
-/// `decode_fetch` refuses is logged and the GET runs here, as before. A network error the child reports
-/// is the answer, with no second try. The host, status and release checks run here on either path, so
-/// the child's bytes are trusted exactly as much as the network's.
+/// Asks GitHub for the latest release (`fetch_release` without a tag).
 fn fetch_latest(in_child: bool) -> Result<Release, CheckError> {
-    let from_child = if in_child { fetch_in_child() } else { None };
+    fetch_release(None, in_child)
+}
+
+/// Asks GitHub for the latest release, or (`tag`, U1: the suite's own release) for the release of one canonical
+/// tag, which must then be the release that comes back. `in_child` (the dock's checks): the GET runs in an
+/// `--update-fetch` child, so the WinHTTP, Schannel and crypt32 state it loads (about +100 handles and +0.6 MB, kept
+/// for good) ends with the child (M1 F2); a child that cannot start, times out or prints anything `decode_fetch`
+/// refuses is logged and the GET runs here, as before. A network error the child reports is the answer, with no
+/// second try. The host, status and release checks run here on either path, so the child's bytes are trusted
+/// exactly as much as the network's. A suite asset the release parser left out is logged by name.
+pub(crate) fn fetch_release(tag: Option<&str>, in_child: bool) -> Result<Release, CheckError> {
+    let url = match tag {
+        None => LATEST_API_URL.to_string(),
+        Some(t) => tag_api_url(t).ok_or_else(|| CheckError::Invalid("not a canonical tag".into()))?,
+    };
+    let from_child = if in_child { fetch_in_child(tag) } else { None };
     let fetched = match from_child {
         Some(r) => r,
-        None => winhttp::get(LATEST_API_URL, &CHECK_HEADERS, API_MAX_BYTES).map_err(|e| e.to_string()),
+        None => winhttp::get(&url, &CHECK_HEADERS, API_MAX_BYTES).map_err(|e| e.to_string()),
     };
     let resp = fetched.map_err(CheckError::Network)?;
     let host_ok = winhttp::split_https_url(&resp.final_url).is_some_and(|(h, _)| host_allowed(&h));
@@ -239,10 +249,17 @@ fn fetch_latest(in_child: bool) -> Result<Release, CheckError> {
         crate::log!("update: check failed, HTTP {}", resp.status);
         return Err(CheckError::Http(resp.status));
     }
-    parse_release(&resp.body).map_err(CheckError::Invalid)
+    let rel = parse_release(&resp.body).map_err(CheckError::Invalid)?;
+    if tag.is_some_and(|t| t != rel.tag) {
+        return Err(CheckError::Invalid("the release of another tag".into()));
+    }
+    for name in &rel.dropped {
+        crate::log!("update: release asset {name} left out (unexpected URL or size)");
+    }
+    Ok(rel)
 }
 
-/// The flag of the child mode that makes the check's GET (`run_fetch_child`); not combinable.
+/// The flag of the child mode that makes the check's GET (`run_fetch_child_for`); combines only with a tag.
 pub(crate) const FETCH_FLAG: &str = "--update-fetch";
 /// First line of the child's output; the 1 is the format's version.
 const FETCH_HEADER: &[u8] = b"mini-oled-dock update-fetch 1\n";
@@ -261,12 +278,13 @@ const FETCH_EXIT_RESPONSE: i32 = 0;
 /// Exit code of `--update-fetch` with a network error.
 const FETCH_EXIT_ERROR: i32 = 2;
 
-/// The check's GET in an `--update-fetch` child (`run_capture`: no window, the dock's job, output
-/// capped). None = no usable answer, the reason logged once per process (house rule 7 of plan L3):
-/// the caller asks in-process, every time.
-fn fetch_in_child() -> Option<Result<winhttp::Response, String>> {
+/// The check's GET (or, with `tag`, that release's GET) in an `--update-fetch [<tag>]` child (`run_capture`: no
+/// window, the dock's job, output capped). None = no usable answer, the reason logged once per process (house rule
+/// 7 of plan L3): the caller asks in-process, every time.
+fn fetch_in_child(tag: Option<&str>) -> Option<Result<winhttp::Response, String>> {
+    let args: Vec<&str> = std::iter::once(FETCH_FLAG).chain(tag).collect();
     let answer = child_exe()
-        .and_then(|exe| run_capture(&exe, &[FETCH_FLAG], FETCH_TIMEOUT, FETCH_MAX_BYTES))
+        .and_then(|exe| run_capture(&exe, &args, FETCH_TIMEOUT, FETCH_MAX_BYTES))
         .and_then(|(code, out)| decode_fetch(code, out));
     match answer {
         Ok(r) => Some(r),
@@ -280,30 +298,33 @@ fn fetch_in_child() -> Option<Result<winhttp::Response, String>> {
     }
 }
 
-/// `--update-fetch`, in the child `fetch_latest(true)` starts: the check's one GET, framed by
-/// `encode_fetch` on stdout. It touches no data folder, logger, mutex or console, and writes nothing
-/// but stdout. Exit 0 = a response, 2 = a network error, 1 = stdout could not be written.
-pub fn run_fetch_child() -> i32 {
-    use std::io::Write;
-    let (code, out) =
-        encode_fetch(&winhttp::get(LATEST_API_URL, &CHECK_HEADERS, API_MAX_BYTES).map_err(|e| e.to_string()));
+/// `--update-fetch [<tag>]`, in the child `fetch_release(.., true)` starts: one GET, of the latest release (no
+/// tag: the update check) or of the release of a canonical tag (U1b: the suite's own release), framed by
+/// `encode_fetch` on stdout. It touches no data folder, logger, mutex or console, and writes nothing but stdout.
+/// Exit 0 = a response, 2 = a network error or a tag that is not canonical (refused before any GET), 1 = stdout
+/// could not be written.
+pub fn run_fetch_child_for(tag: Option<&str>) -> i32 {
     let mut stdout = std::io::stdout().lock();
-    match stdout.write_all(&out).and_then(|()| stdout.flush()) {
-        Ok(()) => code,
-        Err(_) => 1,
-    }
+    fetch_child(tag, |url| winhttp::get(url, &CHECK_HEADERS, API_MAX_BYTES).map_err(|e| e.to_string()), &mut stdout)
 }
 
-/// `--update-fetch [<tag>]`: `None` is the check's fetch as it is today; a tag (U1b: the suite's per-tag fetch)
-/// is not available yet.
-#[allow(dead_code)]
-pub fn run_fetch_child_for(tag: Option<&str>) -> i32 {
-    match tag {
-        None => run_fetch_child(),
-        Some(_) => {
-            crate::logger::say("--update-fetch <tag>: not available in this build");
-            2
-        }
+/// `run_fetch_child_for` with its GET and its stdout as parameters (tests).
+fn fetch_child(
+    tag: Option<&str>,
+    get: impl FnOnce(&str) -> Result<winhttp::Response, String>,
+    out: &mut dyn std::io::Write,
+) -> i32 {
+    let answer = match tag {
+        None => get(LATEST_API_URL),
+        Some(t) => match tag_api_url(t) {
+            Some(url) => get(&url),
+            None => Err("not a canonical tag".to_string()),
+        },
+    };
+    let (code, bytes) = encode_fetch(&answer);
+    match out.write_all(&bytes).and_then(|()| out.flush()) {
+        Ok(()) => code,
+        Err(_) => 1,
     }
 }
 
@@ -419,6 +440,13 @@ pub fn status() -> UpdateStatus {
     with_state(|s| s.clone())
 }
 
+/// True while an update operation runs on the worker (a check, a download, an install and, from U1e, the suite's
+/// sync): the Safety page reads it before it offers a rollback (P3-dock-suite R2).
+#[allow(dead_code)] // DS-SAFE reads it
+pub(crate) fn busy() -> bool {
+    BUSY.load(Ordering::Acquire)
+}
+
 /// Runs `job` on a thread named `update`. false = another update operation is already running.
 fn spawn_worker(job: impl FnOnce() + Send + 'static) -> bool {
     if BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -446,10 +474,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Starts a check on the worker thread. false = an update operation is already running.
+/// Starts a check on the worker thread, then the suite's sync when the check answered. false = an update operation is
+/// already running.
 pub fn check_now() -> bool {
-    spawn_worker(|| {
-        check_once();
+    check_and_sync(false)
+}
+
+/// `check_now`'s job: one check, the automatic stage, then `--suite-sync --network` (U1e: it also retries the
+/// components still pending), after an answered check or, `sync_anyway` (the start's first timer fire), after any.
+fn check_and_sync(sync_anyway: bool) -> bool {
+    spawn_worker(move || {
+        let answered = check_once();
         // With `update_auto_install` on, a newer release is downloaded and verified right away, so
         // the idle gate (`on_idle`) only has to start the installer. With it off nothing is downloaded,
         // and a rolled-back release is never staged, so `on_idle` never installs it.
@@ -465,11 +500,15 @@ pub fn check_now() -> bool {
         if let Some(rel) = auto_stage_target(latest.as_ref(), Version::current(), auto, skip) {
             let _ = stage(&rel);
         }
+        if answered || sync_anyway {
+            run_suite_sync(true);
+        }
     })
 }
 
-/// One check, on the worker thread: asks GitHub, folds the answer into the status and the config.
-fn check_once() {
+/// One check, on the worker thread: asks GitHub, folds the answer into the status and the config. true = GitHub
+/// answered with a release.
+fn check_once() -> bool {
     with_state(|s| s.phase = Phase::Checking);
     notify();
     let installed = Version::current();
@@ -498,6 +537,7 @@ fn check_once() {
         }
     }
     notify();
+    r.is_ok()
 }
 
 /// Opens the release page (or the latest-release page) de-elevated through the shell thread; any
@@ -589,23 +629,29 @@ pub(crate) fn child_exe() -> Result<PathBuf, String> {
 fn download(rel: &Release) -> Result<(), StageError> {
     let fail = StageError::Download;
     for (asset, name, cap) in [(&rel.exe, EXE_ASSET, EXE_MAX_BYTES), (&rel.sha256, SHA_ASSET, SHA_MAX_BYTES)] {
-        let Asset { url, size, .. } = asset;
-        let resp = winhttp::get(url, &[("Accept", "application/octet-stream")], cap)
-            .map_err(|e| fail(format!("{name}: {e}")))?;
-        if resp.status != 200 {
-            return Err(fail(format!("{name}: HTTP {}", resp.status)));
-        }
-        if !winhttp::split_https_url(&resp.final_url).is_some_and(|(h, _)| host_allowed(&h)) {
-            return Err(fail(format!("{name}: unexpected host")));
-        }
-        if resp.body.len() as u64 != *size {
-            return Err(fail(format!("{name}: {} bytes, expected {size}", resp.body.len())));
-        }
-        datadir::write_stage_file(&rel.tag, name, &resp.body).map_err(|e| fail(format!("{name}: {e}")))?;
-        // `resp` (and its body) is dropped here, before the next asset is fetched.
+        let body = get_asset(asset, cap).map_err(|e| fail(format!("{name}: {e}")))?;
+        datadir::write_stage_file(&rel.tag, name, &body).map_err(|e| fail(format!("{name}: {e}")))?;
+        // `body` is dropped here, before the next asset is fetched.
     }
     crate::log!("update: {} downloaded", rel.tag);
     Ok(())
+}
+
+/// One release asset by GET: it must come back with 200, from an allowed host, at exactly the size the release JSON
+/// announced (at most `cap`). `download` and the suite's downloads (U1e) both fetch through it.
+pub(crate) fn get_asset(asset: &Asset, cap: u64) -> Result<Vec<u8>, String> {
+    let Asset { url, size, .. } = asset;
+    let resp = winhttp::get(url, &[("Accept", "application/octet-stream")], cap).map_err(|e| e.to_string())?;
+    if resp.status != 200 {
+        return Err(format!("HTTP {}", resp.status));
+    }
+    if !winhttp::split_https_url(&resp.final_url).is_some_and(|(h, _)| host_allowed(&h)) {
+        return Err("unexpected host".into());
+    }
+    if resp.body.len() as u64 != *size {
+        return Err(format!("{} bytes, expected {size}", resp.body.len()));
+    }
+    Ok(resp.body)
 }
 
 /// Checks the staged `<data>\update\<tag>\dock.exe` and returns its path: hash equal to the staged
@@ -696,6 +742,9 @@ fn stage(rel: &Release) -> Result<PathBuf, StageError> {
         Ok(p) => crate::log!("update: {} staged at {}", rel.tag, p.display()),
         Err(e) => crate::log!("update: {} not staged ({e})", rel.tag),
     }
+    if r.is_ok() {
+        stage_suite(rel);
+    }
     with_state(|s| {
         s.phase = Phase::Idle;
         s.staged = r.is_ok();
@@ -707,6 +756,20 @@ fn stage(rel: &Release) -> Result<PathBuf, StageError> {
     });
     notify();
     r
+}
+
+/// The release's suite.json and the components whose files differ from the installed ones, staged beside its dock.exe
+/// (U1e), so the sync after the update reads the stage, not the network. A failure only costs that sync a download.
+fn stage_suite(rel: &Release) {
+    let Some(dir) = crate::autostart::installed_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+        return;
+    };
+    let mut at = suite::DataStage { tag: rel.tag.clone() };
+    match suite::stage_components(rel, &dir, &mut suite::RealNet, &mut at) {
+        Ok(0) => {}
+        Ok(n) => crate::log!("update: {}: {n} suite files staged", rel.tag),
+        Err(e) => crate::log!("update: {}: suite files not staged ({e})", rel.tag),
+    }
 }
 
 /// How long the dock waits for the update guard, and the guard (or `--rollback`) for the installer it starts.
@@ -880,17 +943,27 @@ fn start_install(manual: bool) -> bool {
 /// Deletes staging folders of canonical tags at or below the running version (failed installs and
 /// the version now running). Run once at startup on a thread named `update-cleanup`; the installer
 /// that just finished may still run from the current version's folder, so a failure is only logged
-/// and the next start retries.
+/// and the next start retries. The running version's stage stays while it holds a component not yet in the install
+/// folder (U1e): the sync installs it from there and removes the stage after an "ok".
 fn cleanup_stages() {
     if !datadir::writable() {
         return;
     }
-    for tag in update_release::stale_stages(&datadir::update_stage_names(), Version::current()) {
+    let current = Version::current();
+    let stale = update_release::stale_stages(&datadir::update_stage_names(), current);
+    for tag in removable_stages(stale, current, suite::own_stage_pending) {
         match datadir::remove_update_stage(&tag) {
             Ok(()) => crate::log!("update: removed the old stage {tag}"),
             Err(e) => crate::log!("update: cannot remove the old stage {tag}: {e}"),
         }
     }
+}
+
+/// The stale stages `cleanup_stages` deletes: all of them but the running version's while `pending` says it still
+/// holds a component to install (asked only for that one). Pure but for `pending`.
+pub(crate) fn removable_stages(stale: Vec<String>, current: Version, pending: impl Fn(&str) -> bool) -> Vec<String> {
+    let own = current.tag();
+    stale.into_iter().filter(|t| *t != own || !pending(t)).collect()
 }
 
 /// `--update-install <tag>`: hands an already staged release to the update guard (`arm_guard`). The only input is a
@@ -968,6 +1041,9 @@ pub fn run_check_cli() -> i32 {
 
 /// true while `TIMER_UPDATE_CHECK` is armed.
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// true once this start's first suite sync was handed to the worker (U1e): at the first `TIMER_UPDATE_CHECK` fire,
+/// alone or after the check. With `update_check` off the timer then ends.
+static SYNC_STARTED: AtomicBool = AtomicBool::new(false);
 /// true while the check that is running was started by the timer (not by the user).
 static SCHEDULED: AtomicBool = AtomicBool::new(false);
 /// The tag `on_idle` last tried to install: one automatic attempt per release, so a failing
@@ -981,6 +1057,7 @@ pub fn init(h: HWND) {
     let spawned = std::thread::Builder::new().name("update-cleanup".into()).spawn(|| {
         probe!(crate::probe::bump(crate::probe::C::Spawned));
         cleanup_stages();
+        suite::remember_installed();
         // A release rolled back before this start says so again (its stage, above this version, is kept).
         let Some(tag) = status().available.map(|a| a.tag).filter(|t| rolled_back(t)) else {
             return;
@@ -1002,18 +1079,42 @@ pub fn init(h: HWND) {
     sync_timer(h);
 }
 
-/// Arms or kills the check timer according to `update_check`.
+/// Whether `TIMER_UPDATE_CHECK` runs: for the daily check, or until this start's first suite sync was handed to the
+/// worker (U1e), so with `update_check` off the timer fires once, 60 s after the start, then stops. Pure.
+pub(crate) fn timer_wanted(update_check: bool, sync_started: bool) -> bool {
+    update_check || !sync_started
+}
+
+/// What one `TIMER_UPDATE_CHECK` fire does: the check when `update_check` is on and it is due; the suite's sync
+/// (Some(network)) after that check, or alone at the start's first fire, downloading only when `update_check` is on.
+/// Pure.
+pub(crate) fn timer_plan(first_fire: bool, check_due: bool, update_check: bool) -> (bool, Option<bool>) {
+    let check = update_check && check_due;
+    let sync = if check {
+        Some(true)
+    } else if first_fire {
+        Some(update_check)
+    } else {
+        None
+    };
+    (check, sync)
+}
+
+/// Arms or kills the check timer according to `update_check` (and the start's first suite sync, `timer_wanted`).
 pub fn sync_timer(h: HWND) {
     let on = config::get().update_check;
-    if on && !ARMED.load(Ordering::Relaxed) {
+    let wanted = timer_wanted(on, SYNC_STARTED.load(Ordering::Relaxed));
+    if wanted && !ARMED.load(Ordering::Relaxed) {
         // SAFETY: `h` is the dock window, owned by the calling (UI) thread.
         if unsafe { SetTimer(Some(h), TIMER_UPDATE_CHECK, FIRST_CHECK_MS, None) } == 0 {
             crate::log!("update: SetTimer failed");
             return;
         }
         ARMED.store(true, Ordering::Relaxed);
-        crate::log!("update: automatic check on");
-    } else if !on && ARMED.load(Ordering::Relaxed) {
+        if on {
+            crate::log!("update: automatic check on");
+        }
+    } else if !wanted && ARMED.load(Ordering::Relaxed) {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), TIMER_UPDATE_CHECK) };
         ARMED.store(false, Ordering::Relaxed);
@@ -1021,15 +1122,37 @@ pub fn sync_timer(h: HWND) {
     }
 }
 
-/// `TIMER_UPDATE_CHECK`: checks when 24 h have passed since the last check, else waits for the rest.
+/// `TIMER_UPDATE_CHECK`: checks when 24 h have passed since the last check, else waits for the rest; at the start's
+/// first fire the suite's sync runs too (`timer_plan`), after the check or alone, on the worker (under BUSY, so it
+/// never overlaps a check, a download or an install). A sync the busy worker refused is tried again a minute later.
 pub fn on_timer(h: HWND) {
-    let last = update_release::parse_rfc3339_utc(&config::get().last_update_check);
+    let c = config::get();
+    let last = update_release::parse_rfc3339_utc(&c.last_update_check);
     let delay = next_check_delay_ms(now_unix(), last);
-    let next = if delay == 0 {
+    let first = !SYNC_STARTED.load(Ordering::Relaxed);
+    let (check, sync) = timer_plan(first, delay == 0, c.update_check);
+    if check {
         SCHEDULED.store(true, Ordering::Relaxed);
-        if !check_now() {
+        if check_and_sync(first) {
+            SYNC_STARTED.store(true, Ordering::Relaxed);
+        } else {
             SCHEDULED.store(false, Ordering::Relaxed);
         }
+    } else if let Some(network) = sync {
+        if spawn_worker(move || run_suite_sync(network)) {
+            SYNC_STARTED.store(true, Ordering::Relaxed);
+        }
+    }
+    let started = SYNC_STARTED.load(Ordering::Relaxed);
+    if !timer_wanted(c.update_check, started) {
+        // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
+        let _ = unsafe { KillTimer(Some(h), TIMER_UPDATE_CHECK) };
+        ARMED.store(false, Ordering::Relaxed);
+        return;
+    }
+    let next = if !started {
+        FIRST_CHECK_MS
+    } else if delay == 0 {
         CHECK_PERIOD_MS
     } else {
         delay
@@ -1039,6 +1162,25 @@ pub fn on_timer(h: HWND) {
     if unsafe { SetTimer(Some(h), TIMER_UPDATE_CHECK, next, None) } == 0 {
         crate::log!("update: SetTimer failed");
     }
+}
+
+/// The sync child's time limit: three selftests of 15 s, the release's fetch and the downloads fit inside it.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `dock.exe --suite-sync [--network]` (U1e) in the dock's kill-on-close job, on the worker thread: its result line is
+/// logged and kept for `suite::status`, the entry points follow a changed component (I1b), and the UI is told
+/// (P3-dock-suite R3). A dock that exits for an update ends the child; update.jnl's replay finishes its job later.
+fn run_suite_sync(network: bool) {
+    let args: &[&str] = if network { &["--suite-sync", "--network"] } else { &["--suite-sync"] };
+    let line = match child_exe().and_then(|exe| run_capture(&exe, args, SYNC_TIMEOUT, CAPTURE_MAX_BYTES)) {
+        Ok((code, out)) => suite::result_line(code, &out),
+        Err(e) => format!("{}error (the sync process: {e})", suite::RESULT_PREFIX),
+    };
+    crate::log!("{line}");
+    if suite::remember(&line) {
+        crate::entry_points::request_sync();
+    }
+    notify();
 }
 
 /// `WM_DOCK_UPDATE` on the UI thread.
@@ -1330,6 +1472,94 @@ mod tests {
         assert!((509..=512).contains(&text.len()), "{}", text.len());
     }
 
+    /// `--update-fetch <tag>` GETs that tag's release through the same framing; a tag that is not canonical is refused
+    /// with exit 2 before any GET; no tag is the check's latest-release GET as before.
+    #[test]
+    fn fetch_child_takes_a_tag() {
+        let run = |tag: Option<&str>| {
+            let mut urls = Vec::new();
+            let mut out = Vec::new();
+            let code = fetch_child(
+                tag,
+                |url| {
+                    urls.push(url.to_string());
+                    fetched(200, url, b"{}")
+                },
+                &mut out,
+            );
+            (code, urls, out)
+        };
+        let (code, urls, out) = run(Some("v1.8.0"));
+        let want = "https://api.github.com/repos/ops-software/mini-oled-dock/releases/tags/v1.8.0";
+        assert_eq!((code, urls.as_slice()), (0, [want.to_string()].as_slice()));
+        let Ok(r) = decode_fetch(code, out).unwrap() else { panic!("not a response") };
+        assert_eq!((r.status, r.final_url.as_str(), r.body.as_slice()), (200, want, &b"{}"[..]));
+        let (code, urls, _) = run(None);
+        assert_eq!((code, urls.as_slice()), (0, [LATEST_API_URL.to_string()].as_slice()));
+        for bad in ["v1.8", "1.8.0", "v1.8.0/../latest", "latest"] {
+            let (code, urls, out) = run(Some(bad));
+            assert_eq!(code, 2, "{bad}");
+            assert!(urls.is_empty(), "{bad}: no GET");
+            assert!(decode_fetch(code, out).unwrap().is_err(), "{bad}: framed as an error");
+        }
+        // A child whose stdout fails says so with exit 1.
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(fetch_child(Some("v1.8.0"), |url| fetched(200, url, b"{}"), &mut Broken), 1);
+    }
+
+    /// A made-up 1.8.0 release in GitHub's format: dock.exe, its .sha256, suite.json and three components.
+    #[test]
+    fn release_with_suite_parses() {
+        use oled_trust::manifest::suite::ComponentId;
+        const JSON: &[u8] = include_bytes!("../tests/fixtures/update/v1.8.0-release.json");
+        let rel = parse_release(JSON).unwrap();
+        assert_eq!((rel.tag.as_str(), rel.version), ("v1.8.0", Version::parse("1.8.0").unwrap()));
+        let hex = |h: &str| crate::update_release::parse_digest(Some(format!("sha256:{h}").as_str()));
+        let suite = rel.suite.as_ref().expect("suite.json");
+        let suite_url = update_release::asset_url("v1.8.0", "suite.json");
+        assert_eq!((suite.url.as_str(), suite.size), (suite_url.as_str(), 1024));
+        assert_eq!(suite.digest, hex("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"));
+        let got: Vec<(ComponentId, u64, Option<[u8; 32]>)> =
+            rel.component_assets.iter().map(|(c, a)| (*c, a.size, a.digest)).collect();
+        let (h_tasks, h_files, h_lang) = (
+            hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            hex("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"),
+            hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        );
+        assert_eq!(
+            got,
+            [
+                (ComponentId::Tasks, 917_504, h_tasks),
+                (ComponentId::Files, 1_048_576, h_files),
+                (ComponentId::LangIt, 40_960, h_lang)
+            ]
+        );
+        for (c, a) in &rel.component_assets {
+            assert_eq!(a.url, update_release::asset_url("v1.8.0", c.asset()));
+        }
+        assert!(rel.dropped.is_empty());
+        assert_eq!(rel.exe.size, 1_966_080);
+    }
+
+    /// Every release before the suite: no suite.json, no component, nothing dropped, dock.exe as before.
+    #[test]
+    fn release_without_suite_is_unchanged() {
+        const JSON: &[u8] = include_bytes!("../tests/fixtures/update/v1.5.0-release.json");
+        for json in [JSON, RELEASE_FIXTURE.as_bytes()] {
+            let rel = parse_release(json).unwrap();
+            assert_eq!(rel.suite, None);
+            assert!(rel.component_assets.is_empty() && rel.dropped.is_empty());
+        }
+    }
+
     /// Anything but the exact frame is refused, so the dock checks in-process instead of trusting it.
     #[test]
     fn fetch_output_rejected() {
@@ -1377,6 +1607,30 @@ mod tests {
         for (code, out, case) in bad {
             assert!(decode_fetch(code, out).is_err(), "{case}");
         }
+    }
+
+    #[test]
+    fn sync_starts_at_first_check_ms_even_when_the_check_is_not_due() {
+        // (first fire, check due, update_check) -> (check, sync with --network?)
+        assert_eq!(timer_plan(true, false, true), (false, Some(true)), "first fire, checked today: the sync alone");
+        assert_eq!(timer_plan(true, true, true), (true, Some(true)), "first fire, check due: the sync after the check");
+        assert_eq!(timer_plan(true, false, false), (false, Some(false)), "checks off: the sync without the network");
+        assert_eq!(timer_plan(true, true, false), (false, Some(false)), "checks off: never a check");
+        assert_eq!(timer_plan(false, true, true), (true, Some(true)), "a later daily check: the sync after it");
+        assert_eq!(timer_plan(false, false, true), (false, None));
+        assert_eq!(timer_plan(false, false, false), (false, None));
+        assert_eq!(timer_plan(false, true, false), (false, None));
+        // The first fire is FIRST_CHECK_MS after the start: past the update guard's wait for the new dock (60 s).
+        assert_eq!(FIRST_CHECK_MS, 60_000);
+    }
+
+    #[test]
+    fn first_fire_is_armed_with_checks_off() {
+        // (update_check, the start's first sync handed to the worker) -> the timer runs
+        assert!(timer_wanted(false, false), "checks off: armed once, for the start's sync");
+        assert!(!timer_wanted(false, true), "checks off, the sync started: no more wake-ups");
+        assert!(timer_wanted(true, false));
+        assert!(timer_wanted(true, true));
     }
 
     #[test]

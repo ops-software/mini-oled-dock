@@ -53,6 +53,8 @@ struct Inner {
     layout: String,
     /// Reads the layout id now; None: the id never changes (tests).
     layout_fn: Option<fn() -> String>,
+    /// Tree mode's collapsed nodes (row keys), for the session only: never written.
+    tree_collapsed: std::collections::HashSet<u64>,
     /// Changed since the last flush.
     dirty: bool,
     post: Option<Poster>,
@@ -94,6 +96,20 @@ impl StateHandle {
     pub fn set_collapsed(&self, s: Section, on: bool) {
         if let Some(c) = self.lock().collapsed.get_mut(section_index(s)) {
             *c = Some(on);
+        }
+    }
+
+    /// Whether the Tree node of this row key is collapsed (session only).
+    pub fn tree_collapsed(&self, key: u64) -> bool {
+        self.lock().tree_collapsed.contains(&key)
+    }
+
+    pub fn set_tree_collapsed(&self, key: u64, on: bool) {
+        let mut g = self.lock();
+        if on {
+            g.tree_collapsed.insert(key);
+        } else {
+            g.tree_collapsed.remove(&key);
         }
     }
 

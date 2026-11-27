@@ -160,6 +160,11 @@ fn installed_version() -> crate::update_release::Version {
     }
 }
 
+/// True while `run` renders a matrix cell (dates are then shown in UTC so a golden does not depend on the machine).
+pub(crate) fn matrix() -> bool {
+    MATRIX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The version the About row and the mock Updates status show: pinned to 0.0.0 in matrix mode so a release
 /// bump does not change a golden image.
 pub(crate) fn version_text() -> &'static str {
@@ -697,7 +702,24 @@ fn settings_png_with(
     hot: Option<crate::settings_view::Hit>,
     size: (i32, i32),
 ) -> bool {
+    settings_png_view(dir, file, m, page, c, open, hot, size, &crate::settings_pages::safety::preview_view())
+}
+
+/// `settings_png_with` over a given Safety view (the Suite page always shows its preview view).
+#[allow(clippy::too_many_arguments)] // preview helper: one flag per variant
+fn settings_png_view(
+    dir: &Path,
+    file: &str,
+    m: Metrics,
+    page: crate::settings_pages::Page,
+    c: &Config,
+    open: (bool, bool),
+    hot: Option<crate::settings_view::Hit>,
+    size: (i32, i32),
+    safety: &crate::settings_pages::safety::SafetyView,
+) -> bool {
     use crate::settings_pages::{Ctx, Memory};
+    let suite = crate::settings_pages::suite::preview_view();
     use crate::settings_view::{hit_id, window_pixels, Focus};
     let mock = settings_mock(m);
     let ctx = Ctx {
@@ -715,6 +737,8 @@ fn settings_png_with(
         chord_held: None,
         battery_note: false,
         keys_note: false,
+        suite: &suite,
+        safety,
     };
     // The mini bar is drawn by the bar renderer, which reads the global config.
     crate::config::set(c.clone());
@@ -860,6 +884,18 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             c
         }
         "popup_dock_menu" => crate::popup::popup_dock::preview_new(true),
+        "popup_dock_menu_suite" => crate::popup::popup_dock::preview_suite(true, true),
+        "popup_start_suite" => crate::popup::popup_start::preview_suite(true, true),
+        "popup_app_tasks" => crate::popup::popup_app::new(crate::popup::AppMenuInfo {
+            key: "discord".to_string(),
+            name: "Discord".to_string(),
+            pinned: false,
+            windows: 2,
+            can_launch: true,
+            jump: Vec::new(),
+            show_in_tasks: true,
+        }),
+        "popup_metrics_menu" => crate::popup::popup_metrics::preview_new(true),
         "popup_calendar" => crate::popup_calendar::new(),
         "popup_network" => crate::popup_network::new(mock_net()),
         "popup_battery" => crate::popup_battery::new(mock_battery(), Some(PowerMode::Balanced)),
@@ -879,6 +915,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             windows: 2,
             can_launch: true,
             jump: Vec::new(),
+            show_in_tasks: false,
         }),
         "popup_app_jump" => {
             use crate::jumplist::{Entry, Group};
@@ -889,6 +926,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 pinned: true,
                 windows: 1,
                 can_launch: true,
+                show_in_tasks: false,
                 jump: vec![
                     Group { name: "Recent".to_string(), entries: vec![link("Deadlock"), link("The Witcher 3: Wild Hunt")] },
                     Group {
@@ -1180,6 +1218,10 @@ pub fn run(dir: &str) -> i32 {
             ("popup_app_jump", 2),
             ("popup_start", 4),
             ("popup_dock_menu", 1),
+            ("popup_dock_menu_suite", 0),
+            ("popup_start_suite", 12),
+            ("popup_app_tasks", 1),
+            ("popup_metrics_menu", 0),
             ("popup_startmenu", 12),
             ("popup_startmenu_search", 1),
             ("popup_startmenu_offer", 1),
@@ -1262,6 +1304,11 @@ pub fn run(dir: &str) -> i32 {
             let file = format!("settings_{}{suffix}.png", page.slug());
             failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
         }
+        // Safety with two config problems (the banner).
+        let file = format!("settings_safety_problems{suffix}.png");
+        let (m, page) = (Metrics { dpi }, crate::settings_pages::Page::Safety);
+        let (c, problems) = (plan().base_config(), crate::settings_pages::safety::preview_problems());
+        failures += i32::from(!settings_png_view(dir, &file, m, page, &c, (false, false), None, (860, 900), &problems));
         // The keyboard ring on the focused nav row (painted by DK-SET; until then the plain twin).
         RING.with(|r| r.set(true));
         let file = format!("settings_bar_keys{suffix}.png");

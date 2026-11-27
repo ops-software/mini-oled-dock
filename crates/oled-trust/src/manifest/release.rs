@@ -3,9 +3,17 @@
 
 use std::fmt;
 
+use super::suite::{ComponentId, COMPONENT_MAX_BYTES, SUITE_ASSET, SUITE_MAX_BYTES};
+
 pub const REPO: &str = "ops-software/mini-oled-dock";
 pub const LATEST_API_URL: &str =
     "https://api.github.com/repos/ops-software/mini-oled-dock/releases/latest";
+
+/// The API URL of the release of one canonical tag (the suite's fetch of its own release, U1); `None` for any other
+/// tag, so nothing but `vX.Y.Z` ever becomes part of the URL.
+pub fn tag_api_url(tag: &str) -> Option<String> {
+    parse_tag(tag).map(|v| format!("https://api.github.com/repos/{REPO}/releases/tags/{}", v.tag()))
+}
 
 /// A `major.minor.patch` version. Field order is semver order, so the derived
 /// `Ord` compares versions correctly.
@@ -129,6 +137,12 @@ pub struct Release {
     pub published: String,
     pub exe: Asset,
     pub sha256: Asset,
+    /// The release's suite.json (U1) at its canonical URL, or `None` when it has none (every release before 1.8.0).
+    pub suite: Option<Asset>,
+    /// The other components' assets at their canonical URLs, in `ComponentId::ALL` order (dock.exe is `exe`).
+    pub component_assets: Vec<(ComponentId, Asset)>,
+    /// The suite assets left out for an unexpected URL or an unacceptable size: their names, for the log.
+    pub dropped: Vec<&'static str>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -154,7 +168,10 @@ struct RawRelease {
 }
 
 /// Parse the `releases/latest` JSON. Anything that is not a plain, published
-/// release with both assets at their canonical URLs is an error.
+/// release with both assets at their canonical URLs is an error. The suite's
+/// assets (suite.json and the other components) are optional: only their
+/// allow-listed names are read, and one at another URL or of an unacceptable
+/// size is left out (named in `dropped`) without failing the release.
 pub fn parse_release(json: &[u8]) -> Result<Release, String> {
     if json.len() as u64 > API_MAX_BYTES {
         return Err("release JSON too large".into());
@@ -164,12 +181,8 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
     if raw.draft || raw.prerelease {
         return Err("draft or pre-release".into());
     }
-    let find = |name: &str, max: u64| -> Result<Asset, String> {
-        let a = raw
-            .assets
-            .iter()
-            .find(|a| a.name.as_deref() == Some(name))
-            .ok_or_else(|| format!("asset {name} missing"))?;
+    let named = |name: &str| raw.assets.iter().find(|a| a.name.as_deref() == Some(name));
+    let checked = |a: &RawAsset, name: &str, max: u64| -> Result<Asset, String> {
         let url = a.browser_download_url.as_deref().unwrap_or_default();
         if url != asset_url(&raw.tag_name, name) {
             return Err(format!("asset {name} has an unexpected URL"));
@@ -183,8 +196,22 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
             digest: parse_digest(a.digest.as_ref().and_then(|v| v.as_str())),
         })
     };
+    let find = |name: &str, max: u64| -> Result<Asset, String> {
+        checked(named(name).ok_or_else(|| format!("asset {name} missing"))?, name, max)
+    };
     let exe = find(EXE_ASSET, EXE_MAX_BYTES)?;
     let sha256 = find(SHA_ASSET, SHA_MAX_BYTES)?;
+    let mut dropped = Vec::new();
+    let mut optional = |name: &'static str, max: u64| -> Option<Asset> {
+        let a = named(name)?;
+        checked(a, name, max).map_err(|_| dropped.push(name)).ok()
+    };
+    let suite = optional(SUITE_ASSET, SUITE_MAX_BYTES);
+    let component_assets: Vec<(ComponentId, Asset)> = ComponentId::ALL
+        .into_iter()
+        .filter(|c| *c != ComponentId::Dock)
+        .filter_map(|c| optional(c.asset(), COMPONENT_MAX_BYTES).map(|a| (c, a)))
+        .collect();
     let published_at = raw.published_at.unwrap_or_default();
     let published = if parse_rfc3339_utc(&published_at).is_some() {
         published_at
@@ -204,6 +231,9 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
         published,
         exe,
         sha256,
+        suite,
+        component_assets,
+        dropped,
     })
 }
 
@@ -528,6 +558,94 @@ mod tests {
         assert_eq!(parse_digest(None), None);
     }
 
+    /// RELEASE_FIXTURE with the suite's assets of the same tag added (`extra` is appended to the asset list).
+    fn with_assets(extra: &str) -> String {
+        RELEASE_FIXTURE.replace("]}", &format!(",{extra}]}}"))
+    }
+
+    fn asset_json(name: &str, size: u64, url: &str) -> String {
+        format!(r#"{{"name":"{name}","size":{size},"browser_download_url":"{url}"}}"#)
+    }
+
+    #[test]
+    fn release_without_suite_is_unchanged() {
+        let r = parse_release(RELEASE_FIXTURE.as_bytes()).unwrap();
+        assert_eq!(r.suite, None);
+        assert!(r.component_assets.is_empty() && r.dropped.is_empty());
+    }
+
+    #[test]
+    fn hostile_assets() {
+        let at = |name: &str| asset_url("v1.4.1", name);
+        // Names off the allow-list are ignored, whatever their URL; nothing is dropped for them.
+        let json = with_assets(
+            &[
+                asset_json("evil.exe", 10, &at("evil.exe")),
+                asset_json("dock.prev.exe", 10, &at("dock.prev.exe")),
+                asset_json("lang-fr.lang", 10, &at("lang-fr.lang")),
+                asset_json("tasks.exe", 917_504, &at("tasks.exe")),
+            ]
+            .join(","),
+        );
+        let r = parse_release(json.as_bytes()).unwrap();
+        assert_eq!(r.component_assets.len(), 1);
+        assert_eq!(r.component_assets[0].0, ComponentId::Tasks);
+        assert_eq!(r.component_assets[0].1, Asset { url: at("tasks.exe"), size: 917_504, digest: None });
+        assert!(r.dropped.is_empty() && r.suite.is_none());
+        // A component at another tag's URL, on another host, or of an unacceptable size: the release parses, the
+        // asset is dropped and named.
+        let bad = [
+            (asset_json("tasks.exe", 10, &asset_url("v1.4.0", "tasks.exe")), "tasks.exe"),
+            (asset_json("files.exe", 10, "https://evil.example/files.exe"), "files.exe"),
+            (asset_json("files.exe", COMPONENT_MAX_BYTES + 1, &at("files.exe")), "files.exe"),
+            (asset_json("lang-it.lang", 0, &at("lang-it.lang")), "lang-it.lang"),
+            (asset_json("suite.json", SUITE_MAX_BYTES + 1, &at("suite.json")), "suite.json"),
+            (asset_json("suite.json", 100, &at("tasks.exe")), "suite.json"),
+            (r#"{"name":"tasks-admin.exe","size":10}"#.to_string(), "tasks-admin.exe"),
+        ];
+        for (asset, name) in bad {
+            let r = parse_release(with_assets(&asset).as_bytes()).unwrap();
+            assert_eq!(r.dropped, [name], "{asset}");
+            assert!(r.component_assets.is_empty() && r.suite.is_none(), "{asset}");
+            // dock.exe's own rules are untouched by the suite's assets.
+            assert_eq!(r.exe, parse_release(RELEASE_FIXTURE.as_bytes()).unwrap().exe);
+        }
+        // Every allow-listed name at its canonical URL is taken, in ComponentId::ALL order, with its digest.
+        let abc = format!(r#","digest":"sha256:{ABC}"}}"#);
+        let all = with_assets(
+            &[
+                asset_json("lang-it.lang", 40_960, &at("lang-it.lang")),
+                asset_json("files.exe", 1_048_576, &at("files.exe")),
+                asset_json("suite.json", 1_024, &at("suite.json")).replace('}', &abc),
+                asset_json("tasks-admin.exe", 409_600, &at("tasks-admin.exe")),
+                asset_json("tasks.exe", 917_504, &at("tasks.exe")),
+            ]
+            .join(","),
+        );
+        let r = parse_release(all.as_bytes()).unwrap();
+        let ids: Vec<ComponentId> = r.component_assets.iter().map(|(c, _)| *c).collect();
+        assert_eq!(ids, [ComponentId::Tasks, ComponentId::TasksAdmin, ComponentId::Files, ComponentId::LangIt]);
+        let suite = r.suite.unwrap();
+        assert_eq!((suite.url.as_str(), suite.size), (at("suite.json").as_str(), 1_024));
+        assert_eq!(suite.digest, parse_digest(Some(format!("sha256:{ABC}").as_str())));
+        assert!(r.dropped.is_empty());
+        // A dock.exe asset that breaks its own rules still fails the whole release, as before.
+        let broken = all.replace("download/v1.4.1/dock.exe\"", "download/v1.4.0/dock.exe\"");
+        assert_ne!(broken, all);
+        assert!(parse_release(broken.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn fetch_by_tag_url() {
+        let url = tag_api_url("v1.8.0").unwrap();
+        assert_eq!(url, "https://api.github.com/repos/ops-software/mini-oled-dock/releases/tags/v1.8.0");
+        let host = url.strip_prefix("https://").and_then(|rest| rest.split('/').next()).unwrap();
+        assert!(host_allowed(host));
+        for bad in ["v1.8", "1.8.0", "v1.08.0", "v1.8.0/../latest", "v1.8.0?x=1", "", "latest"] {
+            assert_eq!(tag_api_url(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn sha256_file_formats() {
         let mut want = [0u8; 32];
@@ -621,5 +739,118 @@ mod tests {
         assert_eq!(next_check_delay_ms(now, Some(now - 3_600)), 23 * 3_600_000);
         assert_eq!(next_check_delay_ms(now, Some(now - 86_390)), FIRST_CHECK_MS); // floor of 60 s
         assert_eq!(next_check_delay_ms(now, Some(now - 90_000)), 0);
+    }
+
+    // ---------------------------------------------------------------- fuzz
+
+    /// A small seeded generator (xorshift64*), so the random tests repeat.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Whatever the bytes: no panic, and a release that parses holds only canonical, capped assets of its own tag.
+    fn exercise_release(bytes: &[u8]) {
+        let Ok(r) = parse_release(bytes) else { return };
+        assert_eq!(r.exe.url, asset_url(&r.tag, EXE_ASSET));
+        assert!((1..=EXE_MAX_BYTES).contains(&r.exe.size));
+        if let Some(s) = &r.suite {
+            assert_eq!(s.url, asset_url(&r.tag, SUITE_ASSET));
+            assert!((1..=SUITE_MAX_BYTES).contains(&s.size));
+        }
+        let mut last = None;
+        for (c, a) in &r.component_assets {
+            assert!(*c != ComponentId::Dock && last < Some(*c), "{:?}", r.component_assets);
+            last = Some(*c);
+            assert_eq!(a.url, asset_url(&r.tag, c.asset()));
+            assert!((1..=COMPONENT_MAX_BYTES).contains(&a.size));
+        }
+        let allowed: Vec<&str> = ComponentId::ALL.iter().map(|c| c.asset()).chain([SUITE_ASSET]).collect();
+        assert!(r.dropped.iter().all(|n| allowed.contains(n) && *n != EXE_ASSET), "{:?}", r.dropped);
+    }
+
+    const RELEASE_TOKENS: [&str; 12] = [
+        "{",
+        "}",
+        ",",
+        "\"",
+        "\"name\":\"tasks.exe\"",
+        "\"name\":\"suite.json\"",
+        "\"size\":0",
+        "\"size\":33554433",
+        "\"digest\":\"sha256:\"",
+        "https://github.com/ops-software/mini-oled-dock/releases/download/v1.4.1/lang-it.lang",
+        "v1.4.0",
+        "\\u0000",
+    ];
+
+    fn fuzz_release(rounds: u32, seed: u64) {
+        let at = |name: &str| asset_url("v1.4.1", name);
+        let full = with_assets(
+            &ComponentId::ALL
+                .iter()
+                .filter(|c| **c != ComponentId::Dock)
+                .map(|c| c.asset())
+                .chain([SUITE_ASSET])
+                .map(|n| asset_json(n, 1_024, &at(n)))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let seeds = [RELEASE_FIXTURE.as_bytes(), full.as_bytes()];
+        let mut r = Rng(seed);
+        for i in 0..rounds {
+            let mut v: Vec<u8> = if i % 8 == 0 {
+                (0..r.below(400)).map(|_| r.next() as u8).collect()
+            } else {
+                seeds[r.below(seeds.len())].to_vec()
+            };
+            if i % 8 != 0 {
+                for _ in 0..1 + r.below(6) {
+                    if v.is_empty() {
+                        break;
+                    }
+                    let at = r.below(v.len());
+                    match r.below(5) {
+                        0 => v[at] = r.next() as u8,
+                        1 => v.truncate(at),
+                        2 => {
+                            v.remove(at);
+                        }
+                        3 => {
+                            let t = RELEASE_TOKENS[r.below(RELEASE_TOKENS.len())];
+                            v.splice(at..at, t.bytes());
+                        }
+                        _ => {
+                            let end = (at + 1 + r.below(80)).min(v.len());
+                            let piece = v[at..end].to_vec();
+                            let to = r.below(v.len());
+                            v.splice(to..to, piece);
+                        }
+                    }
+                }
+            }
+            exercise_release(&v);
+        }
+    }
+
+    #[test]
+    fn fuzz_release_10k() {
+        fuzz_release(10_000, 0x0E1E_A5E1);
+        exercise_release("[".repeat(60_000).as_bytes());
+        exercise_release(&vec![b' '; API_MAX_BYTES as usize + 1]);
+    }
+
+    #[test]
+    #[ignore = "1,000,000 inputs: run with cargo test --release -- --ignored fuzz_"]
+    fn fuzz_release_1m() {
+        fuzz_release(1_000_000, 0xFEED_0E1E);
     }
 }

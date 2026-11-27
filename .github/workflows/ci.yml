@@ -38,6 +38,12 @@ jobs:
         shell: pwsh
         run: pwsh tools/ci/fmt-changed.ps1 -SelfTest
 
+      # The release writes suite.json with this script (string formatting); its text must equal the dock's encoder byte
+      # for byte: the script's two dummy files against the fixture the parser test reads (P2-plumbing U1f).
+      - name: suite-manifest self-test
+        shell: pwsh
+        run: pwsh tools/ci/suite-manifest.ps1 -SelfTest
+
       - name: Format of the lines this change touches
         shell: pwsh
         run: |
@@ -77,6 +83,13 @@ jobs:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
         run: cargo clippy --locked -p oled-ui -p gallery --all-targets --features oled-ui/a11y -- -D warnings
+
+      # The tasks build with the fault script of the live chord matrix: never shipped, so only these steps compile it.
+      - name: Clippy (tasks fault-inject)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo clippy --locked -p tasks --all-targets --features fault-inject -- -D warnings
 
       # Resolver 2 unifies features across the workspace, so a crate that forgot a windows feature builds inside it
       # and breaks alone (an app built with -p): check every member on its own.
@@ -148,6 +161,13 @@ jobs:
           RATCHET_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: pwsh tools/ci/ratchet.ps1
 
+      # The exec smoke tests of tasks start its testee examples, which cargo test does not build under their own names.
+      - name: Build the tasks examples
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo build -p tasks --examples --locked
+
       # --no-fail-fast: one failing test binary does not hide the result of the binaries after it.
       - name: Tests
         env:
@@ -167,6 +187,12 @@ jobs:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --features wake-probe
+
+      - name: Tests (tasks fault-inject)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked -p tasks --features fault-inject --test fault_t6b --test smoke_instance
 
       # CI-only window smoke tests of the kit (P2-kit 0.4 rule 1): they open windows, so they run here and nowhere else.
       - name: Kit window smoke tests
@@ -228,6 +254,29 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --test budgets -- --ignored exe_size_within_ledger
 
+      # Tasks (P3-tasks-app TC2): its release exe within the exe_size.tasks row; a shipped build holds no fault script (TA-T6b).
+      - name: Tasks size
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p tasks
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $n = (Get-Item target/release/tasks.exe).Length
+          "tasks.exe: $n bytes ($([math]::Round($n / 1024, 1)) KiB)"
+
+      - name: Tasks size budget
+        env:
+          DOCK_NO_MANIFEST: "1"
+          TASKS_EXE: target/release/tasks.exe
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked --test budgets -- --ignored tasks_exe_size_within_budget
+
+      - name: Tasks fault script absent
+        shell: pwsh
+        run: |
+          findstr /C:"fault.txt" target\release\tasks.exe | Out-Null
+          if ($LASTEXITCODE -ne 1) { throw 'tasks.exe names the fault script (findstr must find nothing)' }
+          exit 0      # findstr's 1 (no match) is the pass; the step would otherwise end with it
+
       # The kit's minimal app (K.CI2): what the kit adds to an exe, plain (target) and with the a11y feature (target-a11y).
       - name: Release build (kit_min)
         run: cargo build --release --locked -p gallery --example kit_min
@@ -281,7 +330,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dock-release
-          path: target/release/dock.exe
+          path: |
+            target/release/dock.exe
+            target/release/tasks.exe
           retention-days: 7
 
   # Launcher query cost (LC-3): the operation-count tests run in the test job; this one times the release build against a
@@ -339,6 +390,32 @@ jobs:
           if ($code -ne 0) { exit $code }
           if ($out -match 'running 0 tests') { throw 'model bench: no test ran' }
           if (-not ($out -match 'bench: tasks_model_tick p50 \d+ us')) { throw 'model bench: no bench line printed' }
+
+      - name: Tasks UI bench
+        shell: pwsh
+        env: { DOCK_NO_MANIFEST: "1", CARGO_TARGET_DIR: target-bench, OLED_BENCH_SLACK: "2" }
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = cargo test --release --locked -p tasks --test ui_bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          if ($out -match 'running 0 tests') { throw 'ui bench: no test ran' }
+          if (-not ($out -match 'bench: tasks_ui_tick p50 \d+ us')) { throw 'ui bench: no bench line printed' }
+
+      - name: Tasks search bench
+        shell: pwsh
+        env: { DOCK_NO_MANIFEST: "1", CARGO_TARGET_DIR: target-bench, OLED_BENCH_SLACK: "2" }
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = cargo test --release --locked -p tasks --test search_bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          if ($out -match 'running 0 tests') { throw 'search bench: no test ran' }
+          if (-not ($out -match 'bench: tasks_search_key p50 \d+ us')) { throw 'search bench: no bench line printed' }
 
       # The files engine's benches (release) and serial timings (debug: the fault hooks exist there). Every fn bench_ and
       # fn timing_ under apps/files must print its "bench: files <name> " line; targets without one print "running 0

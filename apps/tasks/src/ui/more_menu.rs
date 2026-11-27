@@ -13,7 +13,7 @@ use super::commands::{
 };
 use super::screen::TasksScreen;
 use super::view::CostMark;
-use crate::app::options::{OpenSort, TasksOptions};
+use crate::app::options::{Density, OpenSort, TasksOptions};
 use crate::app::sampling::{self, Status};
 use crate::engine::cadence::Refresh;
 use crate::strings::{self, k, t};
@@ -51,6 +51,26 @@ pub fn items(lang: UiLang, o: &TasksOptions, cmds: &CommandTable, cost: String) 
                 ),
             ],
         },
+        MenuItem::Submenu {
+            label: t(lang, k::TASKS_MORE_DENSITY),
+            glyph: None,
+            items: vec![
+                custom(
+                    DENSITY_STANDARD,
+                    t(lang, k::TASKS_MORE_STANDARD),
+                    Some(o.density == Density::Standard),
+                    chord_of(cmds, DENSITY_STANDARD, lang),
+                    None,
+                ),
+                custom(
+                    DENSITY_COMPACT,
+                    t(lang, k::TASKS_MORE_COMPACT),
+                    Some(o.density == Density::Compact),
+                    chord_of(cmds, DENSITY_COMPACT, lang),
+                    None,
+                ),
+            ],
+        },
         custom(ALWAYS_ON_TOP, t(lang, k::TASKS_MORE_ON_TOP), Some(o.always_on_top), None, None),
         MenuItem::Submenu {
             label: t(lang, k::TASKS_MORE_SORTED_BY),
@@ -81,6 +101,7 @@ pub fn open(s: &mut TasksScreen, cx: &mut EventCx) {
     let options = s.deps.options.get();
     let items = items(cx.lang(), &options, &s.cmds, cost);
     cx.open_menu(items, Anchor::Below(s.chrome.more_rect()));
+    super::order::note_menu_open(&mut s.p.order);
 }
 
 /// What this process has used: its CPU time, its private bytes, the wall clock and its creation time (100 ns units).
@@ -227,15 +248,50 @@ pub fn on_command(s: &mut TasksScreen, cx: &mut EventCx, id: CommandId) {
             };
             set_option(s, |o| o.open_sorted_by = pin);
         }
-        // The density rows are TA-T5b's.
-        DENSITY_STANDARD | DENSITY_COMPACT => {}
+        DENSITY_STANDARD | DENSITY_COMPACT => {
+            let to = if id == DENSITY_COMPACT { Density::Compact } else { Density::Standard };
+            // Every notch of Ctrl+wheel and every key repeat arrives here: write the file only for a real change.
+            if s.deps.options.get().density != to {
+                set_option(s, |o| o.density = to);
+            }
+            apply_density(s, cx);
+        }
         _ => {}
     }
+}
+
+/// The logical height of a compact row (Standard is the table's own).
+pub const COMPACT_ROW_H: i32 = 24;
+
+/// The logical height of a row at a density, `token` being the table's own (Standard): what a sliding row travels by.
+pub fn row_height(density: Density, token: i32) -> i32 {
+    if density == Density::Compact {
+        COMPACT_ROW_H
+    } else {
+        token
+    }
+}
+
+/// Gives the table the row height of the density option when it does not have it yet. The gauge header and the
+/// toolbar keep their heights. Cheap to call on every event: it does nothing once the table agrees.
+pub fn apply_density(s: &mut TasksScreen, cx: &mut EventCx) {
+    let want = s.deps.options.get().density;
+    if s.p.keys.density == Some(want) {
+        return;
+    }
+    s.p.keys.density = Some(want);
+    s.table.set_row_height(cx, (want == Density::Compact).then_some(COMPACT_ROW_H));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_slides_by_the_height_it_has() {
+        assert_eq!(row_height(Density::Standard, 32), 32, "the token's");
+        assert_eq!(row_height(Density::Compact, 32), COMPACT_ROW_H, "the compact row is shorter");
+    }
 
     #[test]
     fn cost_is_a_share_of_the_whole_processor() {

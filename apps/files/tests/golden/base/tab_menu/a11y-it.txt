@@ -1,0 +1,47 @@
+TabList
+  Tab "documents" [focusable, selected]
+    Button "Chiudi scheda"
+  Tab "invoices" [focusable]
+    Button "Chiudi scheda"
+  Tab "projects" [focusable]
+    Button "Chiudi scheda"
+  Button "Nuova scheda" [focusable]
+Button "Indietro · Alt+←" [disabled]
+Button "Avanti · Alt+→" [disabled]
+Button "Su a made-up · Alt+↑" [focusable]
+Button "Nuovo" [focusable]
+Button "Ordina" [focusable]
+Button "Visualizza" [focusable]
+Button "Altro" [focusable]
+Toolbar "Percorso"
+  Link "C:" [focusable]
+  Button "Sottocartelle"
+  Link "made-up" [focusable]
+  Button "Sottocartelle"
+  Link "documents" [focusable]
+  Button "Sottocartelle"
+  Button "Aggiorna" [focusable]
+Tree
+  Label "Questo PC"
+  TreeItem "System (C:)" [focusable, selected, expandable] level 1
+  TreeItem "Data (D:)" [focusable, expandable] level 1
+  Label "Rete"
+  TreeItem "Share (Z:)" [focusable, expandable] level 1
+  TreeItem "Rete ↗" [focusable] level 1
+  TreeItem "Cestino ↗" [focusable] level 1
+Splitter "Ridimensiona i riquadri" [focusable] 22.222221%
+ColumnHeader "Nome" [focusable]
+ColumnHeader "Ultima modifica" [focusable]
+ColumnHeader "Tipo" [focusable]
+ColumnHeader "Dimensione" [focusable]
+Table "Nome" 1 of 9
+  Row "invoices" [focusable] 1 of 9
+  Row "link-to-projects" [focusable] 2 of 9
+  Row "projects" [focusable] 3 of 9
+  Row "contract-draft-for-the-apartment-on-the-long-street-07.docx" [focusable] 4 of 9
+  Row "notes.txt" [focusable] 5 of 9
+  Row "photos-raw.zip" [focusable] 6 of 9
+  Row "report-final-v2.pdf" [focusable] 7 of 9
+  Row "report-final-v3.pdf" [focusable] 8 of 9
+  Row "setup-tool-1.4.2.exe" [focusable] 9 of 9
+Label "9 elementi"

@@ -1,8 +1,15 @@
-//! The engine's user-visible strings (OP5c): the ops host's shutdown-block reason, in English and Italian. The UI
-//! moves these keys into its own string table later; the language follows the user's UI language.
+//! The engine's user-visible strings (OP5c): the ops host's shutdown-block reason. The texts are the window's own
+//! (files.ops.block_copy, block_move and block_delete in tr's table, F3.6); the language follows the user's UI
+//! language, Italian for every Italian sublanguage, else English.
 
+use std::sync::LazyLock;
+
+use oled_sys::i18n::S;
 use oled_trust::frame::files::OpKind;
+use oled_ui::UiLang;
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
+
+use crate::tr::{self, k};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
@@ -28,14 +35,48 @@ pub fn lang() -> Lang {
     lang_of(unsafe { GetUserDefaultUILanguage() })
 }
 
-/// The table: key, English, Italian. {n} is the number of items.
-pub const STRINGS: [(&str, &str, &str); 3] = [
-    ("files.ops.block.copy", "Copying {n} items", "Copia di {n} elementi in corso"),
-    ("files.ops.block.move", "Moving {n} items", "Spostamento di {n} elementi in corso"),
-    ("files.ops.block.delete", "Deleting {n} items", "Eliminazione di {n} elementi in corso"),
+/// The keys of the block texts, in tr's table.
+const KEYS: [(&str, S); 3] = [
+    ("files.ops.block_copy", k::FILES_OPS_BLOCK_COPY),
+    ("files.ops.block_move", k::FILES_OPS_BLOCK_MOVE),
+    ("files.ops.block_delete", k::FILES_OPS_BLOCK_DELETE),
 ];
 
-/// The text of `key` in `lang`, or the key itself when the table has no such key.
+/// The table as (key, English, Italian), read from tr's generated table once.
+#[derive(Clone, Copy, Debug)]
+pub struct Strings;
+
+type Row = (&'static str, &'static str, &'static str);
+
+static ROWS: LazyLock<[Row; 3]> =
+    LazyLock::new(|| KEYS.map(|(key, s)| (key, tr::gen::TABLE.get(s, false), tr::gen::TABLE.get(s, true))));
+
+impl Strings {
+    pub fn iter(&self) -> std::slice::Iter<'static, Row> {
+        ROWS.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        ROWS.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        ROWS.is_empty()
+    }
+}
+
+impl IntoIterator for Strings {
+    type Item = &'static Row;
+    type IntoIter = std::slice::Iter<'static, Row>;
+    fn into_iter(self) -> Self::IntoIter {
+        ROWS.iter()
+    }
+}
+
+/// The table: key, English, Italian. {n} is the number of items.
+pub static STRINGS: Strings = Strings;
+
+/// The text of the key in the language, or the key itself when the table has no such key.
 pub fn text(lang: Lang, key: &str) -> &str {
     STRINGS.iter().find(|(k, _, _)| *k == key).map_or(key, |(_, en, it)| if lang == Lang::It { it } else { en })
 }
@@ -44,11 +85,12 @@ pub fn text(lang: Lang, key: &str) -> &str {
 /// does, and how many items all of them hold.
 pub fn block_text(lang: Lang, kind: OpKind, n: u64) -> String {
     let key = match kind {
-        OpKind::Move | OpKind::Rename | OpKind::Undo => "files.ops.block.move",
-        OpKind::Recycle | OpKind::DeletePermanent => "files.ops.block.delete",
-        OpKind::Copy | OpKind::Resume | OpKind::NewFolder => "files.ops.block.copy",
+        OpKind::Move | OpKind::Rename | OpKind::Undo => k::FILES_OPS_BLOCK_MOVE,
+        OpKind::Recycle | OpKind::DeletePermanent => k::FILES_OPS_BLOCK_DELETE,
+        OpKind::Copy | OpKind::Resume | OpKind::NewFolder => k::FILES_OPS_BLOCK_COPY,
     };
-    text(lang, key).replace("{n}", &n.to_string())
+    let ui = UiLang { italian: lang == Lang::It, pseudo: false };
+    tr::tf(key, ui, &[("n", &n.to_string())]).into_owned()
 }
 
 #[cfg(test)]
@@ -75,5 +117,24 @@ mod tests {
         for (_, en, it) in STRINGS {
             assert!(en.contains("{n}") && it.contains("{n}"));
         }
+    }
+
+    #[test]
+    fn block_texts_from_the_table() {
+        for (kind, key) in [
+            (OpKind::Copy, k::FILES_OPS_BLOCK_COPY),
+            (OpKind::Move, k::FILES_OPS_BLOCK_MOVE),
+            (OpKind::DeletePermanent, k::FILES_OPS_BLOCK_DELETE),
+        ] {
+            for (lang, italian) in [(Lang::En, false), (Lang::It, true)] {
+                let table = tr::gen::TABLE.get(key, italian).replace("{n}", "7");
+                assert_eq!(block_text(lang, kind, 7), table, "{kind:?} {lang:?}");
+            }
+        }
+        for (key, en, it) in STRINGS.iter() {
+            let s = KEYS.iter().find(|(k, _)| k == key).map(|(_, s)| *s).expect("a known key");
+            assert_eq!((*en, *it), (tr::gen::TABLE.get(s, false), tr::gen::TABLE.get(s, true)));
+        }
+        assert_eq!(text(Lang::It, "files.ops.block_delete"), "Eliminazione di {n} elementi in corso");
     }
 }

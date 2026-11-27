@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "version": "1.8.0",
+  "components": [
+    {"id": "dock", "file": "dock.exe", "version": "1.8.0", "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "size": 3, "stage": "stable"},
+    {"id": "tasks", "file": "tasks.exe", "version": "1.8.0", "sha256": "0f499a0053529cd4f04a74c799c45f0acef8c9348b93dd31fd6b76418aabad40", "size": 19, "stage": "beta"}
+  ]
+}

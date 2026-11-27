@@ -25,9 +25,10 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromRelativeName, COPYENGINE_E_RECYCLE_BIN_NOT_FOUND, FILEOPERATION_FLAGS,
 };
 
+use super::binrec::{bin_record, forget_record, Forgot};
 use super::checks::check_item;
 use super::classify::bin_turned_off;
-use super::consts::{CHUNK_ITEMS, OWNER_ACROSS_PROCESSES, RESTORE_FROM_BIN};
+use super::consts::{CHUNK_ITEMS, DIALOGS_UNDER_SILENT, OWNER_ACROSS_PROCESSES, RESTORE_FROM_BIN};
 use super::flags::op_flags;
 use super::journal::{EndKind, Header, JournalWriter, PathRepr, Pre, Record, St, StagedItems, VERSION};
 use super::preflight::{preflight, skip_present, target_name};
@@ -106,6 +107,10 @@ pub struct RunStats {
     pub performs: AtomicU32,
 }
 
+/// Called with each $I record a restore proved to be its item's own, between the proof and the removal (tests try to
+/// swap the record there).
+pub type RecordHook = Arc<dyn Fn(&WidePath) + Send + Sync>;
+
 /// The HRESULT of a Recycle item left where it is because its volume's bin is turned off (bin_turned_off).
 pub const RECYCLE_BIN_OFF: i32 = COPYENGINE_E_RECYCLE_BIN_NOT_FOUND.0;
 
@@ -126,6 +131,7 @@ pub struct RunCtx {
     pub events: Sender<OpEvt>,
     pub stats: Arc<RunStats>,
     pub hook_post: Option<PostHook>,
+    pub hook_record: Option<RecordHook>,
     /// Debug builds' FILES_TEST_SLOW_POST_MS: a pause after each top-level item, so a test can stop a host mid-way.
     pub slow_post_ms: u32,
     /// Whether an item's volume has its Recycle Bin turned off: classify::bin_turned_off (tests pass their own).
@@ -138,7 +144,7 @@ impl RunCtx {
         RunCtx {
             roots: None,
             test_no_ui: false,
-            dialogs_under_silent: false,
+            dialogs_under_silent: DIALOGS_UNDER_SILENT,
             ui_owner: None,
             host_window: None,
             journal: None,
@@ -147,6 +153,7 @@ impl RunCtx {
             events,
             stats: Arc::new(RunStats::default()),
             hook_post: None,
+            hook_record: None,
             slow_post_ms: 0,
             bin_off: bin_turned_off,
         }
@@ -512,6 +519,26 @@ fn run_chunk(p: &Prepared, ctx: &RunCtx, st: &Rc<RefCell<SinkState>>, out: &mut 
     }
     drop(sink);
     drop(fo);
+    let moved = std::mem::take(&mut st.borrow_mut().from_bin);
+    forget_records(&moved, ctx, st);
+}
+
+/// Removes the bin's $I records of the items a chunk moved out of the Recycle Bin, each only once it is proven to be
+/// that item's own orphan, and through the very handle it was proven by (undo::forget_record): IFileOperation deletes
+/// by name, and a name can be swapped between a check and a delete. The fence comes first, so a record outside it is
+/// never opened. A record that stays is reported as a failed item with the HRESULT; the items stay done.
+fn forget_records(moved: &[(WidePath, Vec<WidePath>)], ctx: &RunCtx, st: &Rc<RefCell<SinkState>>) {
+    let roots = ctx.roots.as_deref();
+    let between = |r: &WidePath| ctx.hook_record.iter().for_each(|h| h(r));
+    for (bin, restored) in moved {
+        let Some(rec) = bin_record(bin) else { continue };
+        if check_item(&rec, OpKind::DeletePermanent, roots).is_err() {
+            continue;
+        }
+        if let Forgot::Failed(hr) = forget_record(bin, &rec, restored, &between) {
+            st.borrow_mut().item_failed(rec, hr);
+        }
+    }
 }
 
 /// Queues one operation per kept item; an item or destination the shell cannot parse fails alone, and so does a
@@ -595,7 +622,7 @@ mod tests {
     fn undo_kinds() {
         assert_eq!(undo_kind(OpKind::Copy), Some(UndoKind::RecycleCopies));
         assert_eq!(undo_kind(OpKind::Move), Some(UndoKind::MoveBack));
-        assert_eq!(undo_kind(OpKind::Recycle), Some(UndoKind::OpenRecycleBin), "RESTORE_FROM_BIN is false");
+        assert_eq!(undo_kind(OpKind::Recycle), Some(UndoKind::RestoreRecycled), "RESTORE_FROM_BIN is true");
         assert_eq!(undo_kind(OpKind::Rename), Some(UndoKind::RenameBack));
         assert_eq!(undo_kind(OpKind::NewFolder), Some(UndoKind::RecycleNewFolder));
         for k in [OpKind::DeletePermanent, OpKind::Undo, OpKind::Resume] {

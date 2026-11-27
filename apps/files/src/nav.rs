@@ -308,6 +308,13 @@ impl NavState {
         self.go(parent, came_from, now_ms)
     }
 
+    /// The name to focus and select when the running listing is done (the start of a window that selects an item).
+    pub fn want_focus(&mut self, name: Box<[u8]>) {
+        if self.loading {
+            self.focus = Some(name);
+        }
+    }
+
     pub fn refresh(&mut self, now_ms: u64) -> Vec<NavEffect> {
         self.navigate(None, None, now_ms)
     }

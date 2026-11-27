@@ -3,18 +3,18 @@
 
 /// FS-3 a: the system's replace/skip dialog appears under FOF_SILENT. False: "Decide each" with collisions runs
 /// without FOF_SILENT (flags.rs).
-pub const DIALOGS_UNDER_SILENT: bool = false;
+pub const DIALOGS_UNDER_SILENT: bool = true;
 /// FS-3 b: a window of the UI process can own the dialogs of the host's operations. False: the host's own hidden
 /// window owns them.
 pub const OWNER_ACROSS_PROCESSES: bool = false;
 /// FS-3 e1: ERROR_CANCELLED from the sink stops PerformOperations within a second. False: chunks of 64 top-level
 /// items, cancel between chunks.
-pub const CANCEL_IN_OP: bool = false;
+pub const CANCEL_IN_OP: bool = true;
 /// FS-3 e2: the sink may block a callback (pause) without a window appearing. False: Pause is refused.
 pub const PAUSE_OK: bool = false;
 /// FS-3 g: a recycled item can be moved back from the bin by its parsing name. False: undo of a Recycle opens the
 /// Recycle Bin.
-pub const RESTORE_FROM_BIN: bool = false;
+pub const RESTORE_FROM_BIN: bool = true;
 
 /// Top-level items per IFileOperation (open point 15): a cancel point between chunks, and the host's memory bound.
 pub const CHUNK_ITEMS: usize = if CANCEL_IN_OP { 256 } else { 64 };
@@ -32,8 +32,8 @@ mod tests {
     #[test]
     fn safe_defaults_until_live_f1() {
         let all = [DIALOGS_UNDER_SILENT, OWNER_ACROSS_PROCESSES, CANCEL_IN_OP, PAUSE_OK, RESTORE_FROM_BIN];
-        assert_eq!(all, [false; 5], "the FS-3 constants change only by the orchestrator's commit after LIVE-F1");
-        assert_eq!(CHUNK_ITEMS, 64);
+        assert_eq!(all, [true, false, true, false, true], "the FS-3 constants as the live session measured them");
+        assert_eq!(CHUNK_ITEMS, 256);
         assert_eq!((STAGE_IN_MEMORY, STAGE_MAX, MAX_RUNNING), (4_096, 1_000_000, 4));
     }
 }

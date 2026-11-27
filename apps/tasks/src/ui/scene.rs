@@ -6,19 +6,23 @@ use std::sync::Arc;
 
 use oled_sysmon::cpu::CpuDelta;
 use oled_sysmon::mem::MemSample;
+use oled_sysmon::percore::CoreTimes;
 use oled_sysmon::{ProcKey, ProcRow, ProcTable, SysmonError};
 use oled_ui::harness::Harness;
 use oled_ui::{Lang, PointL, SizeL, Tokens, UiLang};
 use serde::Deserialize;
 
+use super::grouped::HostEnv;
 use super::screen::{InjectFrame, TasksScreen};
 use crate::app::args::PreviewLang;
 use crate::app::exec::Executor;
 use crate::app::launch::Launcher;
+use crate::app::resolver::{on_done, Answer, ResolverDone};
 use crate::app::Deps;
-use crate::engine::frame::{Frame, WindowFact};
+use crate::engine::frame::{Frame, ServiceEntry, ServiceMap, WindowFact};
 use crate::model::classify::{ImagePath, PathMap};
-use crate::model::view::{ColumnId, ViewMode};
+use crate::model::group::ExeId;
+use crate::model::view::{ColumnId, Section, ViewMode};
 
 /// A scene file may not be larger than this.
 pub const FILE_CAP: usize = 256 * 1024;
@@ -102,6 +106,15 @@ pub struct SceneWindow {
     pub hung: bool,
 }
 
+/// A service a process hosts (the names of the service list).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SceneService {
+    pub pid: u32,
+    pub name: String,
+    pub display: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Scene {
@@ -114,6 +127,11 @@ pub struct Scene {
     pub procs: Vec<SceneProc>,
     #[serde(default)]
     pub windows: Vec<SceneWindow>,
+    #[serde(default)]
+    pub services: Vec<SceneService>,
+    /// Sections that start open or closed (by name: apps, background, windows); true is collapsed.
+    #[serde(default)]
+    pub collapsed: BTreeMap<String, bool>,
     #[serde(default)]
     pub names: BTreeMap<String, String>,
     /// Frames after the first one: 0 is a single unprimed frame.
@@ -196,6 +214,15 @@ impl Scene {
                 ..Frame::default()
             };
             f.sys.logical_cpus = cpus;
+            // One core whose interrupt and driver time is the scene's share of its busy time, tick by tick.
+            let busy = u64::from(i) * u64::from(TICK_MS) * 10_000;
+            f.sys.cores = vec![CoreTimes {
+                idle: 0,
+                kernel: busy,
+                user: 0,
+                dpc: (busy as f64 * f64::from(m.dpc_irq_pct) / 100.0) as u64,
+                interrupt: 0,
+            }];
             f.sys.cpu = Some(CpuDelta { d_idle: (1000.0 - m.cpu_pct * 10.0).max(0.0) as u64, d_total: 1000 });
             f.sys.mem = Some(MemSample {
                 load_pct: m.mem_load,
@@ -204,6 +231,14 @@ impl Scene {
                 commit_total: u64::from(m.commit_pct),
                 commit_limit: 100,
             });
+            let mut services: Vec<ServiceEntry> = self
+                .services
+                .iter()
+                .map(|s| ServiceEntry { pid: s.pid, name: s.name.as_str().into(), display: s.display.as_str().into() })
+                .collect();
+            services.sort_by(|a, b| (a.pid, &a.name).cmp(&(b.pid, &b.name)));
+            f.services = Arc::new(ServiceMap { entries: services });
+            f.services_fresh = true;
             f.windows = self
                 .windows
                 .iter()
@@ -276,6 +311,39 @@ pub fn open_with(
         .pseudo(lang == PreviewLang::Pseudo);
     let names: Vec<(String, String)> = scene.names.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     h.screen_mut().p.names.set_fixture_names(&names);
+    // The windows' identities as the resolver would have answered them, and the programs' names by exe key.
+    let mut answers = Vec::new();
+    for w in &scene.windows {
+        answers.push(Answer::Identity {
+            hwnd: 0x1000 + w.pid as isize,
+            pid: w.pid,
+            key: w.identity.clone(),
+            aumid: None,
+        });
+    }
+    for p in &scene.procs {
+        let Some(path) = p.path.as_deref() else { continue };
+        if let Some(name) = scene.names.get(&oled_shellmodel::identity::key_from_exe_path(path)) {
+            let exe = ExeId(h.screen().v.intern(&path.to_ascii_lowercase()));
+            answers.push(Answer::Name { identity: None, exe_id: Some(exe), name: Some(name.clone()) });
+        }
+    }
+    on_done(&mut h.screen_mut().p.names, ResolverDone(answers));
+    for (name, on) in &scene.collapsed {
+        let section = match name.as_str() {
+            "apps" => Section::Apps,
+            "background" => Section::Background,
+            "windows" => Section::Windows,
+            other => return Err(format!("scene: unknown section {other:?}")),
+        };
+        h.screen_mut().deps.state.set_collapsed(section, *on);
+    }
+    // The shell is the scene's explorer; no process of the scene is this one; the scene's user is session 1.
+    let shell_pid = scene.procs.iter().find(|p| p.image.eq_ignore_ascii_case("explorer.exe")).map(|p| p.pid);
+    let env = HostEnv { shell_pid, own_pid: u32::MAX, session: 1 };
+    h.screen_mut().p.grouped.set_env(env);
+    // The actions' guard is built against the same environment, and the system is never probed for the scene's pids.
+    h.screen_mut().p.actions.set_env(env);
     h.screen_mut().v.set_mode(match scene.mode {
         SceneMode::List => ViewMode::List,
         SceneMode::Grouped => ViewMode::Grouped,
@@ -333,6 +401,19 @@ fn replay(h: &mut Harness<TasksScreen>, line: &str) -> Result<(), String> {
         }
         "advance" => {
             h.advance(rest.trim().parse().map_err(|_| format!("input: {line:?}"))?);
+        }
+        // A routed Updated message that finds a newer file on disk (TS3), and a command as a menu item would send it.
+        "updated" => {
+            h.screen_mut().p.updated.set_fixture_newer();
+            h.app_message(crate::app::updated::updated_message(), 0, 0);
+        }
+        "command" => {
+            let id = match rest.trim() {
+                "about" => crate::ui::commands::ABOUT,
+                "restart" => crate::ui::commands::RESTART_TO_UPDATE,
+                other => return Err(format!("input: unknown command {other:?}")),
+            };
+            h.send(Box::new(super::screen::InjectCommand(id)));
         }
         "active" => {
             h.set_active(rest.trim() == "on");

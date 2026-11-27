@@ -12,10 +12,19 @@ use crate::glyphs;
 use crate::i18n::{k, t};
 use crate::popup_tray::TrayRow;
 use crate::start_import::{self, FailReason};
+use crate::ui::suite_links::App;
 use crate::ui::Screen;
 use crate::update::{Outcome, Phase, UpdateStatus};
 use crate::update_release::{release_page_url, safe_release_url};
 use oled_sys::i18n::S;
+use std::borrow::Cow;
+
+#[path = "settings_safety.rs"]
+pub(crate) mod safety;
+#[path = "settings_suite.rs"]
+pub(crate) mod suite;
+use safety::Disclose;
+use suite::SuiteEdit;
 
 /// A monochrome icon shape: `(u, v)` in a 16 x 16 box -> inside.
 pub(crate) type Glyph = fn(f32, f32) -> bool;
@@ -29,18 +38,22 @@ pub(crate) enum Page {
     Launcher,
     Modules,
     Screen,
+    Suite,
+    Safety,
     Updates,
     About,
 }
 
 impl Page {
-    pub(crate) const ALL: [Page; 8] = [
+    pub(crate) const ALL: [Page; 10] = [
         Page::Appearance,
         Page::Bar,
         Page::Start,
         Page::Launcher,
         Page::Modules,
         Page::Screen,
+        Page::Suite,
+        Page::Safety,
         Page::Updates,
         Page::About,
     ];
@@ -53,6 +66,8 @@ impl Page {
             Page::Launcher => "Launcher",
             Page::Modules => t(k::SETTINGS_PAGES_MODULES),
             Page::Screen => t(k::SETTINGS_PAGES_SCREEN),
+            Page::Suite => t(k::SUITE_TITLE),
+            Page::Safety => t(k::SAFETY_TITLE),
             Page::Updates => t(k::SETTINGS_PAGES_UPDATES),
             Page::About => t(k::SETTINGS_PAGES_ABOUT),
         }
@@ -66,6 +81,8 @@ impl Page {
             Page::Launcher => t(k::SETTINGS_PAGES_FIND_AND_START_ANYTHING_FROM),
             Page::Modules => t(k::SETTINGS_PAGES_WHAT_THE_BAR_SHOWS_ON),
             Page::Screen => t(k::SETTINGS_PAGES_THE_DISPLAY_THE_BAR_SITS),
+            Page::Suite => t(k::SUITE_SUBTITLE),
+            Page::Safety => t(k::SAFETY_SUBTITLE),
             Page::Updates => t(k::SETTINGS_PAGES_NEW_VERSIONS_FROM_GITHUB),
             Page::About => t(k::SETTINGS_PAGES_VERSION_MEMORY_AND_FILES),
         }
@@ -79,6 +96,8 @@ impl Page {
             Page::Launcher => crate::popup::popup_startmenu::magnifier,
             Page::Modules => glyphs::list_shape,
             Page::Screen => glyphs::monitor_shape,
+            Page::Suite => suite::suite_glyph,
+            Page::Safety => safety::shield_glyph,
             Page::Updates => glyphs::refresh_shape,
             Page::About => glyphs::info_shape,
         }
@@ -93,6 +112,8 @@ impl Page {
             Page::Launcher => "launcher",
             Page::Modules => "modules",
             Page::Screen => "screen",
+            Page::Suite => "suite",
+            Page::Safety => "safety",
             Page::Updates => "updates",
             Page::About => "about",
         }
@@ -155,6 +176,12 @@ pub(crate) enum Setting {
     LauncherWeb,
     /// `launcher.learn`: frecency and run history.
     LauncherLearn,
+    /// `config.suite_tasks`: the Tasks entry points are on (the Suite page).
+    SuiteTasks,
+    /// `config.suite_files`: the Folio entry points are on (the Suite page).
+    SuiteFiles,
+    /// `config.takeover_ctrl_shift_esc`: Ctrl+Shift+Esc opens Tasks.
+    TakeoverCtrlShiftEsc,
 }
 
 /// A value set by a slider.
@@ -194,12 +221,18 @@ pub(crate) enum Action {
     AddLauncherAlias,
     /// Settings > Launcher: Remove on an alias row, the `aliases::word_hash` of its word.
     RemoveLauncherAlias(u64),
+    /// Settings > Suite: opens a suite app.
+    OpenApp(App),
+    /// Settings > Safety: undoes every change the suite made to Windows.
+    UndoAll,
+    /// Settings > Safety: rolls the last update back.
+    Rollback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Button {
     pub action: Action,
-    pub text: &'static str,
+    pub text: Cow<'static, str>,
     pub enabled: bool,
 }
 
@@ -247,6 +280,17 @@ pub(crate) enum Control {
     },
     Status(String),
     Note,
+    /// A one-button row that opens or closes a part of the Safety page; its chevron points down, or up when open.
+    Disclosure {
+        what: Disclose,
+        text: Cow<'static, str>,
+        open: bool,
+        enabled: bool,
+    },
+    /// The config-problems banner of Safety: `row.label` is the head line, `lines` the problems. Not interactive.
+    Banner {
+        lines: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +334,10 @@ pub(crate) struct Ctx<'a> {
     pub battery_note: bool,
     /// `config::load_notes().new_keys_invalid`: config.json held a value of the wrong type in a key new in 1.6.
     pub keys_note: bool,
+    /// The Suite page's view (`suite::view_now`).
+    pub suite: &'a suite::SuiteView,
+    /// The Safety page's view, kept by the window.
+    pub safety: &'a safety::SafetyView,
 }
 
 // ------------------------------------------------------------------ helpers moved from the old popup
@@ -474,6 +522,7 @@ pub(crate) fn is_on(c: &Config, s: Setting) -> bool {
         Setting::LauncherOn => c.launcher.enabled,
         Setting::LauncherLearn => c.launcher.learn,
         Setting::LauncherProvider(n) => c.launcher.providers.get(n).copied().unwrap_or(true),
+        Setting::SuiteTasks | Setting::SuiteFiles | Setting::TakeoverCtrlShiftEsc => suite::is_on(c, s),
         _ => false,
     }
 }
@@ -510,6 +559,7 @@ pub(crate) fn flip(c: &mut Config, s: Setting) {
             let on = c.launcher.providers.get(n).copied().unwrap_or(true);
             c.launcher.providers.insert(n.to_string(), !on);
         }
+        Setting::SuiteTasks | Setting::SuiteFiles | Setting::TakeoverCtrlShiftEsc => suite::flip(c, s),
         _ => {}
     }
 }
@@ -699,6 +749,8 @@ pub(crate) enum Edit {
     ResetSizes,
     /// Takes out the alias whose word has this `aliases::word_hash` (a list changed in between never loses another).
     RemoveLauncherAlias(u64),
+    /// A change on the Suite page, applied by `suite::apply`.
+    Suite(SuiteEdit),
 }
 
 pub(crate) fn apply_edit(c: &mut Config, e: Edit, screens: &[Screen]) {
@@ -711,6 +763,7 @@ pub(crate) fn apply_edit(c: &mut Config, e: Edit, screens: &[Screen]) {
         Edit::RemoveLauncherAlias(h) => {
             crate::launcher::aliases::remove_by_hash(&mut c.launcher.aliases, h);
         }
+        Edit::Suite(e) => suite::apply(c, e),
     }
 }
 
@@ -724,6 +777,8 @@ pub(crate) enum Effect {
     TrayVisible { key: String, hidden: bool },
     TrustElevated(bool),
     Run(Action),
+    /// Opens or closes a part of the Safety page.
+    Disclose(Disclose),
 }
 
 /// Effect of a click on part `part` of `row` (a segment, a swatch or a button).
@@ -756,6 +811,7 @@ pub(crate) fn click(row: &Row, part: Option<usize>, ctx: &Ctx<'_>) -> Effect {
             },
             _ => Effect::None,
         },
+        Control::Disclosure { what, enabled: true, .. } => Effect::Disclose(*what),
         Control::Chooser { .. } => Effect::ToggleChooser,
         // The row carries the app's key; it acts only while that app is still in the live list.
         Control::TrayApp { key, visible, enabled: true } if ctx.tray.iter().any(|t| t.key == *key) => {
@@ -823,6 +879,8 @@ pub(crate) fn rows(page: Page, c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         Page::Launcher => launcher(c, ctx),
         Page::Modules => modules(c, ctx),
         Page::Screen => screen(c, ctx),
+        Page::Suite => suite::rows(c, ctx),
+        Page::Safety => safety::rows(c, ctx),
         Page::Updates => updates(c, ctx),
         Page::About => about(ctx),
     }
@@ -949,11 +1007,15 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             "",
             None,
             Control::Buttons(vec![
-                Button { action: Action::CheckUpdates, text: t(k::SETTINGS_PAGES_CHECK_NOW), enabled: idle },
-                Button { action: Action::ReleaseNotes, text: t(k::SETTINGS_PAGES_RELEASE_NOTES), enabled: notes_ok },
+                Button { action: Action::CheckUpdates, text: t(k::SETTINGS_PAGES_CHECK_NOW).into(), enabled: idle },
+                Button {
+                    action: Action::ReleaseNotes,
+                    text: t(k::SETTINGS_PAGES_RELEASE_NOTES).into(),
+                    enabled: notes_ok,
+                },
                 Button {
                     action: Action::InstallUpdate,
-                    text: t(k::SETTINGS_PAGES_UPDATE_NOW),
+                    text: t(k::SETTINGS_PAGES_UPDATE_NOW).into(),
                     enabled: idle && st.available.is_some(),
                 },
             ]),
@@ -983,7 +1045,7 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
 fn about(ctx: &Ctx<'_>) -> Vec<Row> {
     let mem = |b: Option<usize>, none: &str| b.map_or_else(|| none.to_string(), mb);
     let files = |icon: Glyph, label: &str, path: Option<&str>, action| {
-        buttons(icon, label, path, vec![Button { action, text: t(k::COMMON_OPEN), enabled: path.is_some() }])
+        buttons(icon, label, path, vec![Button { action, text: t(k::COMMON_OPEN).into(), enabled: path.is_some() }])
     };
     vec![
         header(t(k::COMMON_DOCK), None),
@@ -1009,13 +1071,6 @@ fn about(ctx: &Ctx<'_>) -> Vec<Row> {
         header(t(k::COMMON_FILES), None),
         files(glyphs::folder_shape, t(k::SETTINGS_PAGES_DATA_FOLDER), ctx.data_dir, Action::OpenDataFolder),
         files(glyphs::log_shape, "Log", ctx.log_path, Action::OpenLog),
-        header(t(k::SETTINGS_PAGES_TASKBAR), None),
-        buttons(
-            glyphs::power_shape,
-            t(k::SETTINGS_PAGES_RESTORE_THE_WINDOWS_TASKBAR),
-            Some(t(k::SETTINGS_PAGES_EXITS_THE_DOCK)),
-            vec![Button { action: Action::ExitDock, text: t(k::COMMON_EXIT_DOCK), enabled: true }],
-        ),
     ]
 }
 
@@ -1048,7 +1103,11 @@ fn appearance(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         glyphs::refresh_shape,
         t(k::SETTINGS_PAGES_RESET_SIZES),
         None,
-        vec![Button { action: Action::ResetSizes, text: t(k::SETTINGS_PAGES_RESET), enabled: !sizes_are_default(c) }],
+        vec![Button {
+            action: Action::ResetSizes,
+            text: t(k::SETTINGS_PAGES_RESET).into(),
+            enabled: !sizes_are_default(c),
+        }],
     ));
     v.push(header(t(k::SETTINGS_PAGES_LANGUAGE), None));
     v.push(choice(glyphs::globe_shape, t(k::SETTINGS_PAGES_LANGUAGE), None, c, Setting::Language, ctx.screens));
@@ -1149,7 +1208,7 @@ fn start(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             Some(&desc),
             vec![Button {
                 action: Action::ImportStart,
-                text: t(k::SETTINGS_PAGES_IMPORT),
+                text: t(k::SETTINGS_PAGES_IMPORT).into(),
                 enabled: ctx.import != start_import::Status::Running,
             }],
         ),
@@ -1290,7 +1349,7 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         glyphs::refresh_shape,
         t(k::SETTINGS_PAGES_FORGET_HISTORY),
         Some(t(k::SETTINGS_PAGES_THE_COMMANDS_YOU_RAN_AND)),
-        vec![Button { action: Action::ForgetHistory, text: t(k::COMMON_FORGET), enabled: true }],
+        vec![Button { action: Action::ForgetHistory, text: t(k::COMMON_FORGET).into(), enabled: true }],
     ));
     v.push(header(t(k::SETTINGS_PAGES_ALIASES), None));
     v.extend(alias_rows(c));
@@ -1301,7 +1360,7 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         // The prompt is the launcher's own field: it needs the launcher shortcut.
         vec![Button {
             action: Action::AddLauncherAlias,
-            text: t(k::SETTINGS_PAGES_ADD),
+            text: t(k::SETTINGS_PAGES_ADD).into(),
             enabled: c.launcher.chord_spec().is_some(),
         }],
     ));
@@ -1322,7 +1381,7 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         glyphs::pencil_shape,
         t(k::SETTINGS_PAGES_CONFIG_FILE),
         Some(t(k::SETTINGS_PAGES_THIS_WINDOW_HAS_NO_TEXT)),
-        vec![Button { action: Action::EditConfig, text: t(k::SETTINGS_PAGES_EDIT_CONFIG), enabled: true }],
+        vec![Button { action: Action::EditConfig, text: t(k::SETTINGS_PAGES_EDIT_CONFIG).into(), enabled: true }],
     ));
     v
 }
@@ -1362,7 +1421,7 @@ fn alias_rows(c: &Config) -> Vec<Row> {
                 alias_glyph(target),
                 &ellipsize(word, 32),
                 Some(&ellipsize(target, 60)),
-                vec![Button { action, text: remove, enabled: true }],
+                vec![Button { action, text: remove.into(), enabled: true }],
             )
         })
         .collect()
@@ -1423,6 +1482,8 @@ mod tests {
             chord_held: None,
             battery_note: false,
             keys_note: false,
+            suite: Box::leak(Box::default()),
+            safety: Box::leak(Box::default()),
         }
     }
 
@@ -1635,6 +1696,66 @@ mod tests {
     }
 
     #[test]
+    fn suite_and_safety_pages_have_titles() {
+        for (p, slug) in [(Page::Suite, "suite"), (Page::Safety, "safety")] {
+            for it in [false, true] {
+                crate::i18n::with_italian(it, || {
+                    assert!(!p.title().is_empty() && !p.subtitle().is_empty());
+                });
+            }
+            assert_eq!(p.slug(), slug);
+            assert!(!p.at_bottom());
+            // The icon is its own: no other page uses the same shape.
+            assert!(Page::ALL.iter().filter(|q| **q != p).all(|q| !std::ptr::fn_addr_eq(q.icon(), p.icon())));
+        }
+        assert!(!std::ptr::fn_addr_eq(Page::Suite.icon(), Page::Safety.icon()));
+        assert_eq!(Page::ALL.iter().position(|p| *p == Page::Suite), Some(6));
+        assert_eq!(Page::ALL.iter().position(|p| *p == Page::Safety), Some(7));
+    }
+
+    #[test]
+    fn suite_glyph_and_shield_glyph_are_closed_shapes() {
+        for shape in [suite::suite_glyph as Glyph, safety::shield_glyph as Glyph] {
+            let (mut n, mut mirrored) = (0, true);
+            for y in 0..16 {
+                for x in 0..16 {
+                    let (u, v) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let on = shape(u, v);
+                    n += usize::from(on);
+                    mirrored &= on == shape(16.0 - u, v);
+                }
+            }
+            assert!((25..=110).contains(&n), "covers {n} of 256");
+            assert!(mirrored, "symmetric about u = 8");
+        }
+    }
+
+    #[test]
+    fn a_disclosure_clicks_to_its_effect_and_a_banner_to_nothing() {
+        let st = idle();
+        let cx = ctx(&[], &st);
+        let row = |control| Row { icon: None, label: String::new(), desc: None, control };
+        let on = row(Control::Disclosure { what: Disclose::Rollback, text: "More".into(), open: false, enabled: true });
+        assert_eq!(click(&on, Some(0), &cx), Effect::Disclose(Disclose::Rollback));
+        let off =
+            row(Control::Disclosure { what: Disclose::Rollback, text: "More".into(), open: false, enabled: false });
+        assert_eq!(click(&off, Some(0), &cx), Effect::None);
+        assert_eq!(click(&row(Control::Banner { lines: vec!["x".into()] }), None, &cx), Effect::None);
+    }
+
+    #[test]
+    fn the_new_pages_delegate_to_their_modules() {
+        let st = idle();
+        let c = Config::default();
+        assert!(!rows(Page::Suite, &c, &ctx(&[], &st)).is_empty());
+        assert!(!rows(Page::Safety, &c, &ctx(&[], &st)).is_empty());
+        let mut c2 = c.clone();
+        apply_edit(&mut c2, Edit::Suite(SuiteEdit::Takeover(true)), &[]);
+        assert!(is_on(&c2, Setting::TakeoverCtrlShiftEsc));
+        assert!(!is_on(&c, Setting::TakeoverCtrlShiftEsc));
+    }
+
+    #[test]
     fn appearance_rows_follow_the_config() {
         let st = idle();
         let mut c = Config::default();
@@ -1720,8 +1841,8 @@ mod tests {
         assert_eq!(click(&sw, Some(0), &cx), Effect::None);
         assert_eq!(click(&sw, Some(1), &cx), Effect::Save(Edit::Background(BACKGROUND_PRESETS[1].1)));
         let b = row(Control::Buttons(vec![
-            Button { action: Action::ResetSizes, text: "Reset", enabled: true },
-            Button { action: Action::OpenLog, text: "Open", enabled: false },
+            Button { action: Action::ResetSizes, text: "Reset".into(), enabled: true },
+            Button { action: Action::OpenLog, text: "Open".into(), enabled: false },
         ]));
         assert_eq!(click(&b, Some(0), &cx), Effect::Save(Edit::ResetSizes));
         assert_eq!(click(&b, Some(1), &cx), Effect::None);
@@ -2013,11 +2134,11 @@ mod tests {
     #[test]
     fn exit_label_matches_the_power_menu() {
         let st = idle();
-        let r = rows(Page::About, &Config::default(), &ctx(&[], &st));
+        let r = rows(Page::Safety, &Config::default(), &ctx(&[], &st));
         let text = r
             .iter()
             .find_map(|r| match &r.control {
-                Control::Buttons(b) if b[0].action == Action::ExitDock => Some(b[0].text),
+                Control::Buttons(b) if b[0].action == Action::ExitDock => Some(b[0].text.clone()),
                 _ => None,
             })
             .unwrap();
@@ -2037,9 +2158,15 @@ mod tests {
             _ => None,
         });
         assert_eq!(open, Some(false));
-        assert!(r
+    }
+
+    #[test]
+    fn about_has_no_exit() {
+        let st = idle();
+        let r = rows(Page::About, &Config::default(), &ctx(&[], &st));
+        assert!(!r
             .iter()
-            .any(|r| matches!(&r.control, Control::Buttons(b) if b[0].action == Action::ExitDock && b[0].enabled)));
+            .any(|r| matches!(&r.control, Control::Buttons(b) if b.iter().any(|b| b.action == Action::ExitDock))));
     }
 
     fn launcher_rows(c: &Config, powertoys: bool) -> Vec<Row> {
@@ -2151,17 +2278,19 @@ mod tests {
     fn add_alias_disabled_with_the_chord_off() {
         let add = |c: &Config| {
             launcher_rows(c, false).into_iter().find_map(|x| match x.control {
-                Control::Buttons(b) if b[0].action == Action::AddLauncherAlias => Some((b[0].enabled, b[0].text)),
+                Control::Buttons(b) if b[0].action == Action::AddLauncherAlias => {
+                    Some((b[0].enabled, b[0].text.to_string()))
+                }
                 _ => None,
             })
         };
         let mut c = Config::default();
         assert_eq!(c.launcher.chord_spec(), None, "off by default");
-        assert_eq!(add(&c), Some((false, "Add\u{2026}")));
+        assert_eq!(add(&c), Some((false, "Add\u{2026}".to_string())));
         let row = launcher_rows(&c, false).into_iter().find(|x| x.label == "Add an alias").unwrap();
         assert_eq!(click(&row, Some(0), &ctx(&[], &idle())), Effect::None);
         c.launcher.chord = "alt+space".into();
-        assert_eq!(add(&c), Some((true, "Add\u{2026}")));
+        assert_eq!(add(&c), Some((true, "Add\u{2026}".to_string())));
         let row = launcher_rows(&c, false).into_iter().find(|x| x.label == "Add an alias").unwrap();
         assert_eq!(click(&row, Some(0), &ctx(&[], &idle())), Effect::Run(Action::AddLauncherAlias));
     }
@@ -2248,7 +2377,7 @@ mod tests {
             Page::ALL.iter().position(|p| *p == Page::Launcher)
                 == Page::ALL.iter().position(|p| *p == Page::Start).map(|i| i + 1)
         );
-        assert_eq!(Page::ALL.len(), 8);
+        assert_eq!(Page::ALL.len(), 10);
     }
 
     #[test]

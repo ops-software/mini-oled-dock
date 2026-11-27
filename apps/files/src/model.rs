@@ -229,6 +229,16 @@ impl IconTable {
         (self.slots.len() - 1) as u32
     }
 
+    /// Frees every per-item icon.
+    fn drop_items(&mut self) {
+        for (_, slot) in self.item.drain() {
+            if let Some(s) = self.slots.get_mut(slot as usize) {
+                *s = None;
+            }
+            self.free.push(slot);
+        }
+    }
+
     /// Drops the oldest per-item icon.
     fn evict_oldest_item(&mut self) {
         let oldest = self
@@ -295,6 +305,8 @@ pub struct FilesTable {
     now: LocalTime,
     gen: u64,
     lang: UiLang,
+    /// Moves every time the per-item icons are dropped.
+    item_epoch: u64,
 }
 
 impl FilesTable {
@@ -306,7 +318,7 @@ impl FilesTable {
         opts: ViewOpts,
         now: LocalTime,
     ) -> FilesTable {
-        FilesTable { listing, fmt, types, opts, icons: IconTable::new(), now, gen: 0, lang: UiLang::EN }
+        FilesTable { listing, fmt, types, opts, icons: IconTable::new(), now, gen: 0, lang: UiLang::EN, item_epoch: 0 }
     }
 
     pub fn listing(&self) -> &dyn Listing {
@@ -319,9 +331,24 @@ impl FilesTable {
         &mut *self.listing
     }
 
-    pub fn replace(&mut self, l: Box<dyn Listing>) {
-        self.listing = l;
+    /// Swaps the listing; the one that was shown is handed back.
+    pub fn replace(&mut self, l: Box<dyn Listing>) -> Box<dyn Listing> {
+        let old = std::mem::replace(&mut self.listing, l);
+        // Entry ids belong to one listing: no per-item icon outlives it.
+        self.drop_item_icons();
+        old
+    }
+
+    /// Frees every per-item icon (their keys are entry ids, which mean something only in the listing they came from).
+    pub fn drop_item_icons(&mut self) {
+        self.icons.drop_items();
+        self.item_epoch = self.item_epoch.wrapping_add(1);
         self.bump();
+    }
+
+    /// Moves every time the per-item icons are dropped.
+    pub fn item_epoch(&self) -> u64 {
+        self.item_epoch
     }
 
     /// Any visible change the listing does not count (types, icons, options, the clock).
@@ -336,6 +363,12 @@ impl FilesTable {
 
     pub fn set_now(&mut self, now: LocalTime) {
         self.now = now;
+        self.bump();
+    }
+
+    /// The number and date formats (a language switch replaces them).
+    pub fn set_fmt(&mut self, fmt: Rc<Fmt>) {
+        self.fmt = fmt;
         self.bump();
     }
 
@@ -443,6 +476,7 @@ impl FilesTable {
             }
         }
         out.icon = self.icon_slot(id, is_dir).map(IconRef);
+        out.dim_icon = e.attrs & (attr::HIDDEN | attr::SYSTEM) != 0;
         out.badge = Self::badge_of(e);
         if out.text.chars().count() > TIP_NAME_CHARS {
             let mut full = String::with_capacity(name.len());
@@ -497,7 +531,7 @@ fn ext_dot(name: &[u8]) -> Option<usize> {
 
 /// Appends WTF-8 as UTF-8: a lone surrogate (three bytes) and any other invalid sequence become U+FFFD, the first
 /// kind keeping its three bytes, so offsets in the source stay valid in the text.
-fn push_wtf8_lossy(out: &mut String, mut s: &[u8]) {
+pub(crate) fn push_wtf8_lossy(out: &mut String, mut s: &[u8]) {
     loop {
         match std::str::from_utf8(s) {
             Ok(v) => {

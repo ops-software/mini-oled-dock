@@ -1,6 +1,7 @@
 //! The ops host's parts (SPEC-files 5.5.1, 5.5.9, 5.4.7): the journal, the flags, the item checks and the recycle
 //! classifier; then the runner, sink, pre-flight, coalescer, constants, undo, request dispatch and session handling.
 
+pub mod binrec;
 pub mod checks;
 pub mod classify;
 pub mod coalesce;

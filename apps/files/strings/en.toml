@@ -43,6 +43,7 @@
 "files.state.gone" = "{name} was moved or deleted."
 "files.state.handoff" = "This location opens in File Explorer"
 "files.state.too_long" = "This path is too long to open here."
+"files.state.bad_path" = "That isn't a valid path"
 "files.state.unsupported" = "This location can't be listed here."
 "files.action.open_explorer" = "Open in File Explorer"
 "files.action.open_explorer_arrow" = "Open ↗"
@@ -164,3 +165,4 @@
 "files.cmd.path_history" = "Recent locations"
 "files.cmd.context_menu" = "Context menu"
 "files.cmd.escape" = "Cancel"
+"files.view.details" = "Details"

@@ -1,0 +1,29 @@
+TabList
+  Tab "none" [focusable, selected]
+    Button "Chiudi scheda"
+  Button "Nuova scheda" [focusable]
+Button "Indietro · Alt+←" [disabled]
+Button "Avanti · Alt+→" [disabled]
+Button "Su a documents · Alt+↑" [focusable]
+Button "Nuovo" [focusable]
+Button "Ordina" [focusable]
+Button "Visualizza" [focusable]
+Button "Altro" [focusable]
+Toolbar "Percorso"
+  Link "C:" [focusable]
+  Button "Sottocartelle"
+  Link "made-up" [focusable]
+  Button "Sottocartelle"
+  Link "documents" [focusable]
+  Button "Sottocartelle"
+  Link "none" [focusable]
+  Button "Sottocartelle"
+  Button "Aggiorna" [focusable]
+ColumnHeader "Nome" [focusable]
+ColumnHeader "Ultima modifica" [focusable]
+ColumnHeader "Tipo" [focusable]
+ColumnHeader "Dimensione" [focusable]
+Table "Nome" [focusable] 0 of 0
+Label "Questa cartella è vuota"
+Label "Ctrl+Maiusc+N nuova cartella"
+Label "0 elementi"

@@ -4,7 +4,7 @@
 mod common;
 mod ops_util;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -161,13 +161,22 @@ fn squatter_refused() {
     let squatter = Arc::new(NamedServer::create(&name, &std::env::current_exe().unwrap(), false).unwrap());
     let (tx, rx) = channel();
     let s = squatter.clone();
-    std::thread::spawn(move || {
-        while let Ok(mut conn) = s.accept() {
-            let got = conn.recv_frame().ok().flatten();
-            let _ = tx.send(got.map(|f| f.len()));
-            s.disconnect();
+    let ready = Arc::new(AtomicBool::new(false));
+    let rdy = ready.clone();
+    std::thread::spawn(move || loop {
+        rdy.store(true, Ordering::SeqCst);
+        // A client that refuses us may be gone before the squatter's accept looks at the pipe (accept then fails
+        // with a closed pipe): that is a client that sent nothing, like one whose read ends without a frame.
+        let got = s.accept().ok().and_then(|mut conn| conn.recv_frame().ok().flatten());
+        s.disconnect();
+        if tx.send(got.map(|f| f.len())).is_err() {
+            break;
         }
     });
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ready.load(Ordering::SeqCst) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let (c, _) = client(&root, hooks);
     let items = three_files(&root);
     let dst = wp(&root.dir("dst"));

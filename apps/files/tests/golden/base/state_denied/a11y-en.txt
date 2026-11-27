@@ -1,0 +1,30 @@
+TabList
+  Tab "locked" [focusable, selected]
+    Button "Close tab"
+  Button "New tab" [focusable]
+Button "Back · Alt+←" [disabled]
+Button "Forward · Alt+→" [disabled]
+Button "Up to documents · Alt+↑" [focusable]
+Button "New" [focusable]
+Button "Sort" [focusable]
+Button "View" [focusable]
+Button "More" [focusable]
+Toolbar "Path"
+  Link "C:" [focusable]
+  Button "Subfolders"
+  Link "made-up" [focusable]
+  Button "Subfolders"
+  Link "documents" [focusable]
+  Button "Subfolders"
+  Link "locked" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+ColumnHeader "Name" [focusable]
+ColumnHeader "Date modified" [focusable]
+ColumnHeader "Type" [focusable]
+ColumnHeader "Size" [focusable]
+Table "Name" [focusable] 0 of 0
+Button "Back" [focusable]
+Button "Open in File Explorer" [focusable]
+Label "You don't have permission to open this folder."
+Label "0 items"

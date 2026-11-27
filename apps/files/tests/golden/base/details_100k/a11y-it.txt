@@ -1,0 +1,74 @@
+TabList
+  Tab "documents" [focusable, selected]
+    Button "Chiudi scheda"
+  Button "Nuova scheda" [focusable]
+Button "Indietro · Alt+←" [disabled]
+Button "Avanti · Alt+→" [disabled]
+Button "Su a made-up · Alt+↑" [focusable]
+Button "Nuovo" [focusable]
+Button "Ordina" [focusable]
+Button "Visualizza" [focusable]
+Button "Altro" [focusable]
+Toolbar "Percorso"
+  Link "C:" [focusable]
+  Button "Sottocartelle"
+  Link "made-up" [focusable]
+  Button "Sottocartelle"
+  Link "documents" [focusable]
+  Button "Sottocartelle"
+  Button "Aggiorna" [focusable]
+Tree
+  Label "Questo PC"
+  TreeItem "System (C:)" [focusable, selected, expandable] level 1
+  TreeItem "Data (D:)" [focusable, expandable] level 1
+  Label "Rete"
+  TreeItem "Share (Z:)" [focusable, expandable] level 1
+  TreeItem "Rete ↗" [focusable] level 1
+  TreeItem "Cestino ↗" [focusable] level 1
+Splitter "Ridimensiona i riquadri" [focusable] 25%
+ColumnHeader "Nome" [focusable]
+ColumnHeader "Ultima modifica" [focusable]
+ColumnHeader "Tipo" [focusable]
+ColumnHeader "Dimensione" [focusable]
+Table "Nome" 50005 of 100000
+  Row "letter-draft-091165.docx" [focusable] 49980 of 100000
+  Row "letter-draft-091414.xlsx" [focusable] 49981 of 100000
+  Row "letter-draft-091461.md" [focusable] 49982 of 100000
+  Row "letter-draft-091514.txt" [focusable] 49983 of 100000
+  Row "letter-draft-091635.pdf" [focusable] 49984 of 100000
+  Row "letter-draft-091685.jpg" [focusable] 49985 of 100000
+  Row "letter-draft-091686.xlsx" [focusable] 49986 of 100000
+  Row "letter-draft-091727.zip" [focusable] 49987 of 100000
+  Row "letter-draft-091743.jpg" [focusable] 49988 of 100000
+  Row "letter-draft-092018.png" [focusable] 49989 of 100000
+  Row "letter-draft-092397.jpg" [focusable] 49990 of 100000
+  Row "letter-draft-092634.png" [focusable] 49991 of 100000
+  Row "letter-draft-092969.jpg" [focusable] 49992 of 100000
+  Row "letter-draft-093375.docx" [focusable] 49993 of 100000
+  Row "letter-draft-093532.xlsx" [focusable] 49994 of 100000
+  Row "letter-draft-093548.docx" [focusable] 49995 of 100000
+  Row "letter-draft-093611.docx" [focusable] 49996 of 100000
+  Row "letter-draft-093839.jpg" [focusable] 49997 of 100000
+  Row "letter-draft-094299.pdf" [focusable] 49998 of 100000
+  Row "letter-draft-094315.xlsx" [focusable] 49999 of 100000
+  Row "letter-draft-094399.txt" [focusable] 50000 of 100000
+  Row "letter-draft-094683.txt" [focusable] 50001 of 100000
+  Row "letter-draft-094773.jpg" [focusable] 50002 of 100000
+  Row "letter-draft-094804.pdf" [focusable] 50003 of 100000
+  Row "letter-draft-095310.xlsx" [focusable] 50004 of 100000
+  Row "letter-draft-095386.xlsx" [focusable, selected] 50005 of 100000
+  Row "letter-draft-095567.xlsx" [focusable] 50006 of 100000
+  Row "letter-draft-095615.jpg" [focusable] 50007 of 100000
+  Row "letter-draft-095616.jpg" [focusable] 50008 of 100000
+  Row "letter-draft-095663.md" [focusable] 50009 of 100000
+  Row "letter-draft-095837.png" [focusable] 50010 of 100000
+  Row "letter-draft-095909.pdf" [focusable] 50011 of 100000
+  Row "letter-draft-095999.jpg" [focusable] 50012 of 100000
+  Row "letter-draft-096284.zip" [focusable] 50013 of 100000
+  Row "letter-draft-096353.txt" [focusable] 50014 of 100000
+  Row "letter-draft-096515.pdf" [focusable] 50015 of 100000
+  Row "letter-draft-096640.txt" [focusable] 50016 of 100000
+  Row "letter-draft-096647.zip" [focusable] 50017 of 100000
+  Row "letter-draft-096690.png" [focusable] 50018 of 100000
+Label "100.000 elementi"
+Label " · 1 selezionato · 62,5 MB"

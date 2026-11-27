@@ -85,6 +85,7 @@
 "tasks.unavailable.denied" = "Windows doesn't let {name} read this"
 "tasks.updated.text" = "{name} was updated. Restart it to use the new version."
 "tasks.updated.action" = "Restart"
+"tasks.updated.failed" = "Could not restart"
 "tasks.about.version" = "Version {v}"
 "tasks.about.beta" = "Beta"
 "tasks.about.legal" = "Part of mini-oled-dock. MIT licence."
@@ -111,3 +112,14 @@
 "tasks.keys.row_19" = "Move between columns and sort"
 "tasks.keys.row_20" = "Close the menu, clear the search, clear the selection, then close the window"
 "tasks.keys.row_21" = "Close the window"
+
+# TA-T5b: what a screen reader says for a row (T5.7)
+"tasks.a11y.row" = "{name}, CPU {cpu}, memory {mem}, I/O {io}"
+"tasks.a11y.row_cpu" = "{name}, CPU {cpu}"
+"tasks.a11y.section" = "{section}, {n} items, {state}"
+"tasks.a11y.expanded" = "expanded"
+"tasks.a11y.collapsed" = "collapsed"
+"tasks.a11y.unmeasured" = "not measured yet"
+"tasks.a11y.header_total" = "{label}, total {total}"
+"tasks.more.options" = "More options"
+"tasks.keys.menu_key" = "Menu key"

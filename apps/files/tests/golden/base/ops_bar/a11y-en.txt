@@ -1,0 +1,47 @@
+TabList
+  Tab "documents" [focusable, selected]
+    Button "Close tab"
+  Button "New tab" [focusable]
+Button "Back · Alt+←" [disabled]
+Button "Forward · Alt+→" [disabled]
+Button "Up to made-up · Alt+↑" [focusable]
+Button "New" [focusable]
+Button "Sort" [focusable]
+Button "View" [focusable]
+Button "More" [focusable]
+Toolbar "Path"
+  Link "C:" [focusable]
+  Button "Subfolders"
+  Link "made-up" [focusable]
+  Button "Subfolders"
+  Link "documents" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Tree
+  Label "This PC"
+  TreeItem "System (C:)" [focusable, selected, expandable] level 1
+  TreeItem "Data (D:)" [focusable, expandable] level 1
+  Label "Network"
+  TreeItem "Share (Z:)" [focusable, expandable] level 1
+  TreeItem "Network ↗" [focusable] level 1
+  TreeItem "Recycle Bin ↗" [focusable] level 1
+Splitter "Resize panes" [focusable] 25%
+ColumnHeader "Name" [focusable]
+ColumnHeader "Date modified" [focusable]
+ColumnHeader "Type" [focusable]
+ColumnHeader "Size" [focusable]
+Table "Name" 7 of 9
+  Row "invoices" [focusable] 1 of 9
+  Row "link-to-projects" [focusable] 2 of 9
+  Row "projects" [focusable] 3 of 9
+  Row "contract-draft-for-the-apartment-on-the-long-street-07.docx" [focusable] 4 of 9
+  Row "notes.txt" [focusable] 5 of 9
+  Row "photos-raw.zip" [focusable] 6 of 9
+  Row "report-final-v2.pdf" [focusable, selected] 7 of 9
+  Row "report-final-v3.pdf" [focusable, selected] 8 of 9
+  Row "setup-tool-1.4.2.exe" [focusable, selected] 9 of 9
+Label "9 items"
+Label " · 3 selected · 77.5 MB"
+Label "These 2 items can't go to the Recycle Bin and will be deleted permanently"
+Button "Delete (Enter)" [focusable]
+Button "Cancel (Esc)" [focusable]

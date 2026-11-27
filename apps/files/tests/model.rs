@@ -250,9 +250,20 @@ fn unknown_row_or_column_is_an_empty_cell() {
 }
 
 #[test]
-#[ignore = "after FK: FC-RENAME sets out.dim_icon and removes this ignore"]
 fn hidden_and_system_dim_icon() {
-    panic!("a hidden or system item dims its icon: CellOut has no dim_icon yet");
+    let mut t = simple(&[
+        ("h.txt", ARCHIVE | HIDDEN, 0, 1, 0),
+        ("sysdir", DIR | SYSTEM, 0, 0, 0),
+        ("plain.txt", ARCHIVE, 0, 1, 0),
+    ]);
+    t.listing_mut().set_visibility(Visibility { hidden: true, protected_system: true });
+    for (name, dim) in [("h.txt", true), ("sysdir", true), ("plain.txt", false)] {
+        let c = cell(&t, name, ColKind::Name);
+        assert_eq!(c.dim_icon, dim, "{name}");
+        assert_eq!(c.text, name);
+        assert_eq!(c.fg, FgRole::Primary, "the text is not dimmed: only the icon");
+    }
+    assert!(!cell(&t, "h.txt", ColKind::Size).dim_icon, "only the Name cell carries an icon");
 }
 
 #[test]

@@ -31,6 +31,13 @@ fn probe_on() -> bool {
     switch(&ON, "DOCK_LAUNCHER_PROBE")
 }
 
+/// The takeover test switch (set to 1): the Ctrl+Shift+Esc takeover may be turned on while Tasks is beta and the
+/// Windows build is not yet verified (`takeover::availability`), for the live session only.
+pub fn takeover_test() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    switch(&ON, "DOCK_TEST_TAKEOVER")
+}
+
 /// `DOCK_LAUNCHER_DROP=1`: the UI acknowledges every chord post and drops it, so nothing opens (S-ALTSPACE).
 fn drop_posts() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

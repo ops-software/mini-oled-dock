@@ -76,6 +76,18 @@
 //!  * Gesture evidence: the whole kb.time of a physical Ctrl+Shift+Enter is kept for the launcher's run as
 //!    administrator; the UI consumes it once (`take_gesture_time`). It never swallows.
 //!
+//! Takeover rules (P3-dock-suite's TakeoverChord), after the launcher's and before the Win branch, only for an Esc event
+//! while the UI owns a takeover bit (`DockChords::takeovers`) or an Esc the takeover swallowed is held; any other key
+//! costs one compare:
+//!  * An Esc down Windows does not hold yet, with exactly Ctrl and Shift (no Alt, no Win, either side), Ctrl+Shift+Esc
+//!    owned, the UI's gate saying Tasks is ready and not in front, the breaker closed or expired, the shell thread
+//!    waiting in GetMessageW, the shell up and no post left unacknowledged for TAKEOVER_ACK_TIMEOUT_MS (failed open:
+//!    Windows gets the chord) is posted to the shell thread (WM_SHELL_TAKEOVER, the next sequence, kb.time) and
+//!    swallowed, the menu-mask key injected while Ctrl and Shift are down; a failed post passes it. Its auto-repeat and
+//!    its up are swallowed too, until its up or REPEAT_WINDOW_MS without an Esc event; the watchdog's repair of a stale
+//!    Win press forgets it.
+//!  * The Win branch sees the dock's rows only (`DockChords::rows`): a takeover owned alone leaves it release 1.5.2's.
+//!
 //! The callback does NO I/O nor heavy work (LL hook timeout ~300 ms):
 //! it only posts messages to the window, which logs and acts.
 //!
@@ -102,8 +114,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SetCoalescableTimer, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetShellWindow, KillTimer, PeekMessageW,
+    PostMessageW, PostThreadMessageW, SetCoalescableTimer, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
     EVENT_SYSTEM_DESKTOPSWITCH, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE,
     PM_QS_SENDMESSAGE, TIMERV_NO_COALESCING, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_KEYDOWN, WM_KEYUP,
     WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
@@ -111,7 +123,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::msg::{
     WM_DOCK_CHORD, WM_DOCK_DIAG, WM_DOCK_LAUNCHER, WM_DOCK_LAUNCHER_PASSED, WM_DOCK_LAUNCHER_YIELDED, WM_DOCK_PEEK,
-    WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY,
+    WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY, WM_SHELL_TAKEOVER,
 };
 use crate::{hwnd, log};
 
@@ -604,6 +616,10 @@ fn reinstall() {
             let mut s = load_win_state();
             let peek_end = clear_for_repair(&mut s);
             store_win_state(&s);
+            // An Esc press the takeover swallowed is forgotten with it: its up may have gone by unseen too.
+            let mut take = load_take_state();
+            clear_take_for_repair(&mut take);
+            store_take_state(&take);
             kill_peek_timer();
             kill_heartbeat();
             if peek_end {
@@ -699,7 +715,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
-/// Returns true if the event must be swallowed.
+/// Returns true if the event must be swallowed. In order: the launcher chord, the takeover (an Esc only), the Win branch.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
     if !accepted(kb.flags.0, kb.dwExtraInfo) {
         return false; // our own re-injected event, or injected by another app: not a physical key
@@ -717,6 +734,29 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         note_gesture(&GESTURE_TIME, kb.flags.0, kb.dwExtraInfo, vk, down, mods, kb.time);
         if let Some(swallow) = launcher_step(kb, down, mods) {
             return swallow;
+        }
+    }
+    // The takeover (Ctrl+Shift+Esc to Tasks): an Esc event while a takeover is owned or an Esc it swallowed is held.
+    if vk == VK_ESCAPE_ && (chords.takeovers() != DockChords::NONE || TAKE_ESC_BIT.load(Relaxed)) {
+        let mut t = load_take_state();
+        match take_decide(&mut t, take_in(kb, down, mods, chords)) {
+            TakeDecision::NotOurs => store_take_state(&t),
+            TakeDecision::SwallowSilent => {
+                store_take_state(&t);
+                return true;
+            }
+            TakeDecision::Candidate(seq) => {
+                if !post_takeover(seq, kb.time) {
+                    // A failed post passes the key: Windows opens its Task Manager, as without the takeover.
+                    store_take_state(&t);
+                    return false;
+                }
+                take_commit(&mut t, seq, kb.time);
+                store_take_state(&t);
+                // While Ctrl and Shift are still down: their release is then no lone Ctrl+Shift (no layout switch).
+                send_mask();
+                return true;
+            }
         }
     }
     win_key(kb, down, mods, chords)
@@ -822,22 +862,16 @@ fn kill_heartbeat() {
 
 /// The Win branch on its statics: loads `WinState`, runs `win_step`, stores the state back, then does what the step
 /// asks. The state is stored before the SendInput, whose tagged events re-enter the callback and pass. `mods` are the
-/// tracked modifiers (Win is the Win state's own), `chords` the owned rows.
+/// tracked modifiers (Win is the Win state's own), `chords` the owned chords, of which the Win branch takes the rows.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn win_key(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods, chords: DockChords) -> bool {
-    let fail_open = chords != DockChords::NONE
-        && chord_fail_open(CHORD_SEQ.load(Relaxed), CHORD_ACKED.load(Acquire), CHORD_OLDEST.load(Relaxed), kb.time);
-    let ev = WinIn {
-        vk: kb.vkCode,
-        down,
-        time: kb.time,
-        mods: Mods(mods.0 & !Mods::WIN.0),
-        chords,
-        fullscreen: DOCK_FS.load(Acquire),
-        fail_open,
-        // `post` drops a post while the dock window does not exist: a chord swallowed then would be lost.
-        ui_ready: !hwnd().0.is_null(),
-    };
+    // The dock's rows only (bits 0-7): the takeover bits are the takeover block's, never the Win branch's.
+    let chords = chords.rows();
+    // `post` drops a post while the dock window does not exist: a chord swallowed then would be lost.
+    let ui_ready = !hwnd().0.is_null();
+    let ev = win_in_of(kb, down, mods, chords, DOCK_FS.load(Acquire), ui_ready, || {
+        chord_fail_open(CHORD_SEQ.load(Relaxed), CHORD_ACKED.load(Acquire), CHORD_OLDEST.load(Relaxed), kb.time)
+    });
     let mut s = load_win_state();
     // SAFETY: GetAsyncKeyState has no preconditions. Inside the callback it reads the state from before this event
     // (LowLevelKeyboardProc's documentation): down means Windows holds the key this up releases.
@@ -885,6 +919,32 @@ fn win_key(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods, chords: DockChords) -> 
         std::thread::sleep(Duration::from_millis(ms.into()));
     }
     swallow
+}
+
+/// The Win branch's event (`WinIn`) from the callback's reads: Win taken out of `mods` (the Win state has its own) and
+/// only the rows of `chords` (`DockChords::rows`), so a takeover bit never reaches `win_step` and a takeover owned alone
+/// leaves release 1.5.2's Win branch. `overdue` (`chord_fail_open` on the statics) is read only while a row is owned.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn win_in_of(
+    kb: &KBDLLHOOKSTRUCT,
+    down: bool,
+    mods: Mods,
+    chords: DockChords,
+    fullscreen: bool,
+    ui_ready: bool,
+    overdue: impl FnOnce() -> bool,
+) -> WinIn {
+    let rows = chords.rows();
+    WinIn {
+        vk: kb.vkCode,
+        down,
+        time: kb.time,
+        mods: Mods(mods.0 & !Mods::WIN.0),
+        chords: rows,
+        fullscreen,
+        fail_open: rows != DockChords::NONE && overdue(),
+        ui_ready,
+    }
 }
 
 /// Hook thread: the Peek timer command of a Win event. Arm: one SetTimer (a timer still armed for an earlier press,
@@ -2234,6 +2294,389 @@ pub fn set_dock_fullscreen(on: bool) {
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn ack_chord(seq: u16) {
     CHORD_ACKED.store(seq, Release);
+}
+
+// ------------------------------------------------------------------ the takeover items (dock-suite DS-0A)
+//
+// The swallow of Ctrl+Shift+Esc (and, reserved, Win+E): the items the UI, the hook and the shell thread share. The
+// behaviour lands in DS-HOOK; the policy that fills the gate in DS-GATE. Every function denies unwrap, expect and
+// indexing: a panic in the callback aborts the dock.
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl DockChords {
+    /// Ctrl+Shift+Esc to Tasks through TakeoverChord (bits 8-15 are the takeovers).
+    pub const CTRL_SHIFT_ESC: DockChords = DockChords(1 << 8);
+    /// Win+E to Folio: reserved for a later release; never set in 1.8.0.
+    #[allow(dead_code)] // read by the Files takeover (reserved)
+    pub const WIN_E: DockChords = DockChords(1 << 9);
+
+    /// The dock's own rows only (bits 0-7): what `win_step` sees.
+    pub const fn rows(self) -> DockChords {
+        DockChords(self.0 & 0x00FF)
+    }
+
+    /// The takeover bits only (8-15).
+    pub const fn takeovers(self) -> DockChords {
+        DockChords(self.0 & 0xFF00)
+    }
+}
+
+/// Which app a swallowed takeover chord opens.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeoverTarget {
+    Tasks = 1,
+    /// Reserved for the Files takeover.
+    Files = 2,
+}
+
+/// What the UI publishes for the hook's swallow decision (the cached conditions of the takeover).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TakeoverGate(pub u32);
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // NONE and with: read by DS-GATE G2
+impl TakeoverGate {
+    pub const NONE: TakeoverGate = TakeoverGate(0);
+    /// `takeover::availability` is Ok and the setting is on (on, installed, enabled, stable or test, build, fallback).
+    pub const TASKS_READY: u32 = 1 << 0;
+    /// The foreground window is a Tasks window: the press passes to Windows.
+    pub const TASKS_IN_FRONT: u32 = 1 << 1;
+    // bits 8-15 reserved for Files
+
+    pub const fn has(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
+
+    pub const fn with(self, bit: u32, on: bool) -> TakeoverGate {
+        if on {
+            TakeoverGate(self.0 | bit)
+        } else {
+            TakeoverGate(self.0 & !bit)
+        }
+    }
+}
+
+/// Unacknowledged takeover posts this old fail open (the same bound as the dock chords').
+pub const TAKEOVER_ACK_TIMEOUT_MS: u32 = CHORD_ACK_TIMEOUT_MS;
+
+/// The UI's takeover gate (`TakeoverGate` bits).
+static TAKEOVER_GATE: AtomicU32 = AtomicU32::new(0);
+/// 0 = closed, else the takeover passes to Windows until `GetTickCount` reaches it.
+static TAKEOVER_BREAKER: AtomicU32 = AtomicU32::new(0);
+/// 0 exactly while the shell thread waits in GetMessageW, else `GetTickCount() | 1`.
+static SHELL_BUSY: AtomicU32 = AtomicU32::new(0);
+/// The sequence of the newest takeover post, and the newest the shell thread acknowledged.
+static TAKEOVER_SEQ: AtomicU16 = AtomicU16::new(0);
+static TAKEOVER_ACKED: AtomicU16 = AtomicU16::new(0);
+/// Tick of the oldest unacknowledged post (0 = none), and `kb.time` of the newest post.
+static TAKEOVER_OLDEST: AtomicU32 = AtomicU32::new(0);
+static TAKEOVER_SENT_TIME: AtomicU32 = AtomicU32::new(0);
+/// The hook's swallow state of the Esc key (press swallowed, its repeats and release follow it) and its last time.
+static TAKE_ESC_BIT: AtomicBool = AtomicBool::new(false);
+static TAKE_ESC_LAST: AtomicU32 = AtomicU32::new(0);
+
+/// UI thread: the takeover gate. One Release store, read by the callback.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // read by DS-GATE G2
+pub fn set_takeover_gate(g: TakeoverGate) {
+    TAKEOVER_GATE.store(g.0, Release);
+}
+
+/// Any thread: the last gate the UI published.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn takeover_gate() -> TakeoverGate {
+    TakeoverGate(TAKEOVER_GATE.load(Acquire))
+}
+
+/// Any thread: the last `set_dock_chords` value.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // read by DS-GATE G2
+pub fn dock_chords() -> DockChords {
+    DockChords(DOCK_CHORDS.load(Acquire))
+}
+
+/// 0 = closed, else pass-through until `GetTickCount` reaches `until_tick`. Written by the shell thread on a trip
+/// and by the UI thread with 0 when the takeover is switched off.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // read by DS-DELIVER D3 (set) and DS-GATE G2 (clear)
+pub fn set_takeover_breaker(until_tick: u32) {
+    TAKEOVER_BREAKER.store(until_tick, Release);
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn takeover_breaker() -> u32 {
+    TAKEOVER_BREAKER.load(Acquire)
+}
+
+/// Shell thread: 0 exactly while it waits in GetMessageW, else `GetTickCount() | 1`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn set_shell_busy(since_tick: u32) {
+    SHELL_BUSY.store(since_tick, Release);
+}
+
+/// The shell thread's busy stamp as the hook reads it.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn shell_busy() -> u32 {
+    SHELL_BUSY.load(Acquire)
+}
+
+/// Shell thread, first statement of the WM_SHELL_TAKEOVER handling: the post of `seq` arrived.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn ack_takeover(seq: u16) {
+    TAKEOVER_ACKED.store(seq, Release);
+}
+
+/// `(seq, kb.time)` of the newest post: the lost-message check.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // read by DS-DELIVER D3
+pub fn takeover_last_sent() -> (u16, u32) {
+    (TAKEOVER_SEQ.load(Acquire), TAKEOVER_SENT_TIME.load(Acquire))
+}
+
+/// wParam of WM_SHELL_TAKEOVER: bits 0-7 target, bits 16-31 seq; lParam = kb.time. `decode(encode(t, s)) == Some((t, s))`;
+/// target 0 or above 2 decodes to None.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn encode_takeover(t: TakeoverTarget, seq: u16) -> usize {
+    (t as usize) | ((seq as usize) << 16)
+}
+
+/// The inverse of `encode_takeover`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // read by DS-DELIVER D1
+pub fn decode_takeover(wparam: usize) -> Option<(TakeoverTarget, u16)> {
+    let t = match wparam & 0xFF {
+        1 => TakeoverTarget::Tasks,
+        2 => TakeoverTarget::Files,
+        _ => return None,
+    };
+    Some((t, ((wparam >> 16) & 0xFFFF) as u16))
+}
+
+/// [Ctrl down, Shift down, Esc down, Esc up, Shift up, Ctrl up], each tagged INJECT_TAG, in one SendInput; true if 6
+/// were accepted. The fallback when Windows opens its Task Manager for a re-injected chord. Shell thread, never the
+/// callback: the tagged keys re-enter the callback and pass (`accepted`), so Windows alone answers them.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(dead_code)] // read by DS-DELIVER D2
+pub fn inject_ctrl_shift_esc() -> bool {
+    let inputs = ctrl_shift_esc_inputs();
+    // SAFETY: slice of 6 initialized INPUTs; cbSize = size_of::<INPUT>() as required.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    sent == 6
+}
+
+/// The six inputs of `inject_ctrl_shift_esc`: Ctrl, Shift and Esc down, then their ups in reverse, each tagged.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn ctrl_shift_esc_inputs() -> [INPUT; 6] {
+    [
+        key_down_input(VK_CONTROL_, 0, false),
+        key_down_input(VK_SHIFT_, 0, false),
+        key_down_input(VK_ESCAPE_, 0, false),
+        key_up_input(VK_ESCAPE_),
+        key_up_input(VK_SHIFT_),
+        key_up_input(VK_CONTROL_),
+    ]
+}
+
+// ------------------------------------------------------------------ the takeover step (dock-suite H1)
+//
+// One pure state machine over the takeover statics, as the Win branch's: the callback loads `TakeState`, runs
+// `take_decide` on an Esc event, posts a candidate to the shell thread and commits it (`take_commit`), then stores the
+// state back. Every function denies unwrap, expect and indexing: a panic in the callback aborts the dock.
+
+/// Esc, the takeover's key, and the modifiers of its re-injection (`inject_ctrl_shift_esc`).
+const VK_ESCAPE_: u32 = 0x1B;
+const VK_CONTROL_: u32 = 0x11;
+const VK_SHIFT_: u32 = 0x10;
+
+/// The takeover's swallow state, loaded from the takeover statics on each Esc event and stored back (hook thread).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TakeState {
+    /// The Esc down of a takeover was swallowed: its auto-repeat and its up are swallowed too.
+    esc_bit: bool,
+    /// `kb.time` of the last Esc event the bit swallowed.
+    esc_last: u32,
+    /// The newest sequence posted on WM_SHELL_TAKEOVER, and the newest the shell thread acknowledged (`ack_takeover`).
+    sent: u16,
+    acked: u16,
+    /// `kb.time` of the oldest post not yet acknowledged: the start of the fail-open window (`takeover_fail_open`).
+    oldest: u32,
+}
+
+/// One key event as the takeover step sees it, with the conditions the UI (`set_dock_chords`, `set_takeover_gate`)
+/// and the shell thread (`set_shell_busy`, `set_takeover_breaker`) publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TakeIn {
+    vk: u32,
+    down: bool,
+    time: u32,
+    /// Shift, Ctrl and Alt as the hook tracks them (`mods_step`), and Win while the Win branch tracks a press.
+    mods: Mods,
+    /// The owned chords, the takeover bits included.
+    chords: DockChords,
+    gate: TakeoverGate,
+    /// `takeover_breaker()`: 0 = closed, else the takeover passes to Windows until the tick count reaches it.
+    breaker_until: u32,
+    /// `shell_busy()`: 0 exactly while the shell thread waits in GetMessageW.
+    shell_busy: u32,
+    /// The shell thread runs and GetShellWindow is not null; read by the caller only for a press that can be the chord.
+    shell_ok: bool,
+    /// Windows already holds Esc down (its async state, read like `shell_ok`): this down is the auto-repeat of a press
+    /// that reached Windows, whose up must reach it too.
+    held: bool,
+}
+
+/// What the callback does with a key event (`take_decide`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeDecision {
+    /// Not the takeover's: the event goes on to the Win branch.
+    NotOurs,
+    /// The auto-repeat or the up of an Esc whose down was swallowed: swallowed, nothing posted.
+    SwallowSilent,
+    /// Ctrl+Shift+Esc under the cached conditions: posted to the shell thread with this sequence, then swallowed and
+    /// committed (`take_commit`); a failed post passes the key to Windows.
+    Candidate(u16),
+}
+
+/// The takeover step, pure: `s` is the state before the event and becomes the state after it. In order: (1) an Esc
+/// whose down was swallowed has its auto-repeat (a down within REPEAT_WINDOW_MS of the last one) and its up swallowed;
+/// a down past that window clears the bit and goes on as a fresh press; (2) an Esc down Windows does not hold yet, with
+/// exactly Ctrl and Shift (no Alt, no Win, either side), the Ctrl+Shift+Esc takeover owned, Tasks ready and not in
+/// front, the breaker closed or expired, the shell thread waiting in GetMessageW, the shell up and no post
+/// unacknowledged for TAKEOVER_ACK_TIMEOUT_MS is a candidate with the next sequence; (3) everything else is not the
+/// takeover's.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn take_decide(s: &mut TakeState, ev: TakeIn) -> TakeDecision {
+    if ev.vk != VK_ESCAPE_ {
+        return TakeDecision::NotOurs;
+    }
+    if s.esc_bit {
+        if !ev.down {
+            s.esc_bit = false;
+            return TakeDecision::SwallowSilent;
+        }
+        if ev.time.wrapping_sub(s.esc_last) <= REPEAT_WINDOW_MS {
+            s.esc_last = ev.time;
+            return TakeDecision::SwallowSilent;
+        }
+        s.esc_bit = false;
+    }
+    let paused = ev.breaker_until != 0 && (ev.time.wrapping_sub(ev.breaker_until) as i32) < 0;
+    let ours = ev.down
+        && !ev.held
+        && ev.mods == CTRL_SHIFT
+        && ev.chords.has(DockChords::CTRL_SHIFT_ESC)
+        && ev.gate.has(TakeoverGate::TASKS_READY)
+        && !ev.gate.has(TakeoverGate::TASKS_IN_FRONT)
+        && !paused
+        && ev.shell_busy == 0
+        && ev.shell_ok
+        && !takeover_fail_open(s.sent, s.acked, s.oldest, ev.time);
+    if ours {
+        TakeDecision::Candidate(s.sent.wrapping_add(1))
+    } else {
+        TakeDecision::NotOurs
+    }
+}
+
+/// A candidate's post succeeded: `seq` is the newest post, the Esc bit is set (its repeats and its up follow it) and,
+/// when no post was pending before it, the fail-open window starts at `time`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn take_commit(s: &mut TakeState, seq: u16, time: u32) {
+    if s.sent == s.acked {
+        s.oldest = time;
+    }
+    s.sent = seq;
+    s.esc_bit = true;
+    s.esc_last = time;
+}
+
+/// A takeover post has stayed unacknowledged for more than TAKEOVER_ACK_TIMEOUT_MS since the oldest pending one
+/// (`oldest`): the shell thread is stuck, so Ctrl+Shift+Esc passes to Windows. Sequences and times compare with wrapping.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn takeover_fail_open(sent: u16, acked: u16, oldest: u32, now: u32) -> bool {
+    (sent.wrapping_sub(acked) as i16) > 0 && now.wrapping_sub(oldest) > TAKEOVER_ACK_TIMEOUT_MS
+}
+
+/// The watchdog's repair of a stale Win press (`Repair::ClearThenGo`) forgets an Esc press the takeover swallowed: its
+/// up may have gone by unseen too. The sequences stay, so a post in flight keeps its fail-open window.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn clear_take_for_repair(s: &mut TakeState) {
+    s.esc_bit = false;
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn load_take_state() -> TakeState {
+    TakeState {
+        esc_bit: TAKE_ESC_BIT.load(Relaxed),
+        esc_last: TAKE_ESC_LAST.load(Relaxed),
+        sent: TAKEOVER_SEQ.load(Relaxed),
+        acked: TAKEOVER_ACKED.load(Acquire),
+        oldest: TAKEOVER_OLDEST.load(Relaxed),
+    }
+}
+
+/// Stores the hook-owned fields back (`acked` is the shell thread's). The sequence goes last, with Release: a shell
+/// thread that reads it (`takeover_last_sent`) reads the post's time too, stored before it by `post_takeover`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn store_take_state(s: &TakeState) {
+    TAKE_ESC_BIT.store(s.esc_bit, Relaxed);
+    TAKE_ESC_LAST.store(s.esc_last, Relaxed);
+    TAKEOVER_OLDEST.store(s.oldest, Relaxed);
+    TAKEOVER_SEQ.store(s.sent, Release);
+}
+
+/// The takeover step's input on the statics. The shell (`shell_ready`: GetShellWindow) and Esc's async state
+/// (`esc_held`) are read only for a press that can be the chord: an Esc down with Ctrl and Shift tracked down and
+/// Ctrl+Shift+Esc owned.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn take_in(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods, chords: DockChords) -> TakeIn {
+    let candidate = down && mods == CTRL_SHIFT && chords.has(DockChords::CTRL_SHIFT_ESC);
+    TakeIn {
+        vk: kb.vkCode,
+        down,
+        time: kb.time,
+        mods,
+        chords,
+        gate: takeover_gate(),
+        breaker_until: takeover_breaker(),
+        shell_busy: shell_busy(),
+        shell_ok: candidate && shell_ready(),
+        held: candidate && esc_held(),
+    }
+}
+
+/// Windows already holds Esc down: an Esc down now is the auto-repeat of a press that reached Windows.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn esc_held() -> bool {
+    // SAFETY: GetAsyncKeyState has no preconditions. Inside the callback it reads the state from before this event
+    // (LowLevelKeyboardProc's documentation), so a down it reads as down is a repeat of a press Windows already has.
+    let state = unsafe { GetAsyncKeyState(VK_ESCAPE_ as i32) };
+    state < 0
+}
+
+/// The shell thread runs and the shell's window exists (Explorer is up): a delivery can start.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn shell_ready() -> bool {
+    // SAFETY: GetShellWindow has no preconditions; it returns null while no shell runs.
+    crate::shell_thread::thread_id() != 0 && !unsafe { GetShellWindow() }.0.is_null()
+}
+
+/// Posts WM_SHELL_TAKEOVER for Tasks with `seq` (lParam = kb.time) to the shell thread; true when it was queued. On
+/// success the post's time is published for the lost-message check (`takeover_last_sent`), before its sequence.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn post_takeover(seq: u16, time: u32) -> bool {
+    let tid = crate::shell_thread::thread_id();
+    if tid == 0 {
+        return false;
+    }
+    let wparam = WPARAM(encode_takeover(TakeoverTarget::Tasks, seq));
+    // SAFETY: PostThreadMessageW is thread-safe; a thread that ended or a full queue makes it fail, and the key passes.
+    let posted = unsafe { PostThreadMessageW(tid, WM_SHELL_TAKEOVER, wparam, LPARAM(time as isize)) }.is_ok();
+    if posted {
+        TAKEOVER_SENT_TIME.store(time, Release);
+    }
+    posted
 }
 
 // ------------------------------------------------------------------ the Win branch (dock-keys H1-H3)
@@ -3742,6 +4185,444 @@ mod tests {
         assert_eq!(decode_chord(1 | (10 << 8)), None, "slot above 9");
     }
 
+    #[test]
+    fn takeover_wparam_round_trips() {
+        for t in [TakeoverTarget::Tasks, TakeoverTarget::Files] {
+            for seq in [0u16, 1, 0x7FFF, 0xFFFF] {
+                assert_eq!(decode_takeover(encode_takeover(t, seq)), Some((t, seq)), "{t:?} seq {seq}");
+            }
+        }
+        assert_eq!(decode_takeover(0), None, "target 0");
+        assert_eq!(decode_takeover(3), None, "target 3");
+        assert_eq!(decode_takeover(0xFF | 0x1234_0000), None);
+    }
+
+    #[test]
+    fn dock_chords_split() {
+        assert_eq!(DockChords(0x01FF).rows(), DockChords(0x00FF));
+        assert_eq!(DockChords(0x01FF).takeovers(), DockChords(0x0100));
+        assert_eq!(DockChords::CTRL_SHIFT_ESC.0, 1 << 8);
+        assert_eq!(DockChords::WIN_E.0, 1 << 9);
+        assert_eq!(DockChords::CTRL_SHIFT_ESC.0 & ALL_ROWS.0, 0, "no DK-0 row shares the bit");
+        assert_eq!(DockChords::WIN_E.0 & ALL_ROWS.0, 0, "no DK-0 row shares the bit");
+        assert_eq!(DockChords::CTRL_SHIFT_ESC.rows(), DockChords::NONE);
+        assert_eq!(DockChords::CTRL_SHIFT_ESC.with(DockChords::WIN_E).takeovers().0, 0x0300);
+    }
+
+    #[test]
+    fn gate_bits() {
+        let g = TakeoverGate::NONE;
+        assert!(!g.has(TakeoverGate::TASKS_READY) && !g.has(TakeoverGate::TASKS_IN_FRONT));
+        let g = g.with(TakeoverGate::TASKS_READY, true);
+        assert!(g.has(TakeoverGate::TASKS_READY) && !g.has(TakeoverGate::TASKS_IN_FRONT));
+        let g = g.with(TakeoverGate::TASKS_IN_FRONT, true);
+        assert!(g.has(TakeoverGate::TASKS_READY) && g.has(TakeoverGate::TASKS_IN_FRONT));
+        let g = g.with(TakeoverGate::TASKS_READY, false);
+        assert!(!g.has(TakeoverGate::TASKS_READY) && g.has(TakeoverGate::TASKS_IN_FRONT));
+        assert_eq!(g.with(TakeoverGate::TASKS_IN_FRONT, false), TakeoverGate::NONE);
+    }
+
+    #[test]
+    fn shell_busy_round_trip() {
+        set_shell_busy(7);
+        assert_eq!(shell_busy(), 7);
+        set_shell_busy(0);
+        assert_eq!(shell_busy(), 0);
+    }
+
+    // ---- the takeover step (dock-suite H1)
+
+    const READY: TakeoverGate = TakeoverGate(TakeoverGate::TASKS_READY);
+    use TakeDecision::{Candidate, NotOurs, SwallowSilent};
+
+    /// A Ctrl+Shift+Esc down at `time` with every condition of the takeover met.
+    fn cse(time: u32) -> TakeIn {
+        TakeIn {
+            vk: ESC,
+            down: true,
+            time,
+            mods: CTRL_SHIFT_,
+            chords: DockChords::CTRL_SHIFT_ESC,
+            gate: READY,
+            breaker_until: 0,
+            shell_busy: 0,
+            shell_ok: true,
+            held: false,
+        }
+    }
+
+    /// An Esc event at `time` with no modifier, nothing owned and no gate: what the Esc bit alone decides.
+    fn esc(down: bool, time: u32) -> TakeIn {
+        TakeIn { down, mods: Mods::NONE, chords: DockChords::NONE, gate: TakeoverGate::NONE, ..cse(time) }
+    }
+
+    /// The state after the Ctrl+Shift+Esc of `time` was posted with sequence 1 and committed.
+    fn taken(time: u32) -> TakeState {
+        let mut s = TakeState::default();
+        assert_eq!(take_decide(&mut s, cse(time)), Candidate(1));
+        take_commit(&mut s, 1, time);
+        s
+    }
+
+    /// Rule 2: every condition false on its own gives NotOurs and changes nothing; all true give the next sequence.
+    #[test]
+    fn take_table() {
+        let t = 10_000;
+        let mut s = TakeState::default();
+        assert_eq!(take_decide(&mut s, cse(t)), Candidate(1), "every condition met");
+        assert_eq!(s, TakeState::default(), "the decision alone commits nothing");
+        let none = TakeState::default();
+        let stuck = TakeState { sent: 1, acked: 0, oldest: t - 2_000, ..none };
+        let rows: [(&str, TakeIn, TakeState); 15] = [
+            ("not Esc", TakeIn { vk: KEY_A, ..cse(t) }, none),
+            ("an Esc up", TakeIn { down: false, ..cse(t) }, none),
+            ("Ctrl alone", TakeIn { mods: Mods::CTRL, ..cse(t) }, none),
+            ("Shift alone", TakeIn { mods: Mods::SHIFT, ..cse(t) }, none),
+            ("no modifier", TakeIn { mods: Mods::NONE, ..cse(t) }, none),
+            ("the takeover not owned", TakeIn { chords: ALL_ROWS, ..cse(t) }, none),
+            ("only Win+E owned", TakeIn { chords: DockChords::WIN_E, ..cse(t) }, none),
+            ("Tasks not ready", TakeIn { gate: TakeoverGate::NONE, ..cse(t) }, none),
+            ("Tasks in front", TakeIn { gate: READY.with(TakeoverGate::TASKS_IN_FRONT, true), ..cse(t) }, none),
+            ("in front, not ready", TakeIn { gate: TakeoverGate(TakeoverGate::TASKS_IN_FRONT), ..cse(t) }, none),
+            ("paused", TakeIn { breaker_until: (t + 600_000) | 1, ..cse(t) }, none),
+            ("the shell thread busy", TakeIn { shell_busy: t | 1, ..cse(t) }, none),
+            ("no shell", TakeIn { shell_ok: false, ..cse(t) }, none),
+            ("a repeat of an Esc that reached Windows", TakeIn { held: true, ..cse(t) }, none),
+            ("a post unacknowledged for 2 s", cse(t), stuck),
+        ];
+        for (what, ev, before) in rows {
+            let mut s = before;
+            assert_eq!(take_decide(&mut s, ev), NotOurs, "{what}");
+            assert_eq!(s, before, "{what}: no state change");
+        }
+        // The sequence follows the last post, wrapping.
+        let mut s = TakeState { sent: 0xFFFF, acked: 0xFFFF, ..none };
+        assert_eq!(take_decide(&mut s, cse(t)), Candidate(0));
+    }
+
+    /// Rule 1: after the swallowed press, its auto-repeat (Ctrl and Shift still held or not) and its up are swallowed
+    /// with nothing posted; the up clears the bit, and the next Esc is evaluated fresh.
+    #[test]
+    fn repeats_and_up_are_swallowed() {
+        let mut s = taken(10_000);
+        assert!(s.esc_bit && s.esc_last == 10_000);
+        for t in [10_033, 10_066, 10_099] {
+            assert_eq!(take_decide(&mut s, cse(t)), SwallowSilent, "the repeat at {t}");
+            assert_eq!(s.esc_last, t);
+        }
+        assert_eq!(take_decide(&mut s, esc(true, 10_132)), SwallowSilent, "a repeat after Ctrl and Shift went up");
+        assert_eq!(take_decide(&mut s, TakeIn { vk: LCTRL, ..esc(false, 10_140) }), NotOurs, "another key");
+        assert!(s.esc_bit, "another key leaves the bit");
+        assert_eq!(take_decide(&mut s, esc(false, 10_150)), SwallowSilent, "the up");
+        assert!(!s.esc_bit, "the up clears the bit");
+        assert_eq!(take_decide(&mut s, esc(false, 10_160)), NotOurs, "a second up passes");
+        assert_eq!(take_decide(&mut s, esc(true, 10_200)), NotOurs, "a plain Esc next passes");
+        assert_eq!(take_decide(&mut s, esc(false, 10_250)), NotOurs, "and so does its up");
+        assert_eq!(take_decide(&mut s, cse(10_300)), Candidate(2), "a new Ctrl+Shift+Esc is a candidate");
+        assert_eq!((s.sent, s.acked, s.oldest), (1, 0, 10_000), "only a commit moves the sequence");
+    }
+
+    /// The Esc bit ages out: a down more than REPEAT_WINDOW_MS after the last Esc event is a fresh press (its up lost).
+    #[test]
+    fn bit_expires() {
+        let mut s = taken(10_000);
+        assert_eq!(take_decide(&mut s, esc(true, 10_000 + REPEAT_WINDOW_MS)), SwallowSilent, "1500 ms: a repeat");
+        let mut s = taken(10_000);
+        assert_eq!(take_decide(&mut s, esc(true, 11_501)), NotOurs, "1501 ms: a fresh plain Esc passes");
+        assert!(!s.esc_bit);
+        assert_eq!(take_decide(&mut s, esc(false, 11_550)), NotOurs, "its up passes as its down did");
+        let mut s = TakeState { acked: 1, ..taken(10_000) };
+        assert_eq!(take_decide(&mut s, cse(11_501)), Candidate(2), "1501 ms: a fresh Ctrl+Shift+Esc (answered)");
+        assert!(!s.esc_bit, "cleared until the commit");
+        let mut s = taken(u32::MAX - 500);
+        assert_eq!(take_decide(&mut s, esc(true, 999)), SwallowSilent, "a repeat across the tick wrap");
+        assert_eq!(take_decide(&mut s, esc(true, 2_500)), NotOurs, "expired across the tick wrap");
+    }
+
+    /// Alt or Win with the chord, or one modifier short: Windows' own chords, never the takeover's.
+    #[test]
+    fn alt_or_win_is_not_ours() {
+        let cs = CTRL_SHIFT_;
+        for (what, mods) in [
+            ("Ctrl+Shift+Alt+Esc", cs.with(Mods::ALT)),
+            ("Ctrl+Shift+Esc with Win held", cs.with(Mods::WIN)),
+            ("Win+Esc", Mods::WIN),
+            ("Ctrl+Esc", Mods::CTRL),
+            ("Shift+Esc", Mods::SHIFT),
+            ("Alt+Esc", Mods::ALT),
+            ("Ctrl+Alt+Esc", Mods::CTRL.with(Mods::ALT)),
+        ] {
+            let mut s = TakeState::default();
+            assert_eq!(take_decide(&mut s, TakeIn { mods, ..cse(10_000) }), NotOurs, "{what}");
+        }
+        // Either side: the tracker folds right Ctrl and left Shift into Ctrl+Shift; Win comes from the Win branch.
+        let mut t = ModTrack::default();
+        track_step(&mut t, 0, 0xA3, true, 10_000, |_| false);
+        track_step(&mut t, 0, LSHIFT, true, 10_010, |_| false);
+        let mut s = TakeState::default();
+        assert_eq!(take_decide(&mut s, TakeIn { mods: t.mods(true), ..cse(10_020) }), NotOurs, "Win held");
+        assert_eq!(take_decide(&mut s, TakeIn { mods: t.mods(false), ..cse(10_020) }), Candidate(1), "right Ctrl");
+    }
+
+    /// The breaker: a pause 10 minutes ahead passes every press until the tick count reaches it, across a wrap too.
+    #[test]
+    fn breaker_and_wrap() {
+        let pause = |at: u32| at.wrapping_add(600_000) | 1;
+        let until = pause(10_000);
+        for t in [10_000, 300_000, until - 1] {
+            let mut s = TakeState::default();
+            assert_eq!(take_decide(&mut s, TakeIn { breaker_until: until, ..cse(t) }), NotOurs, "paused at {t}");
+        }
+        for t in [until, until + 1, until + 3_600_000] {
+            let mut s = TakeState::default();
+            assert_eq!(take_decide(&mut s, TakeIn { breaker_until: until, ..cse(t) }), Candidate(1), "over at {t}");
+        }
+        let trip = u32::MAX - 100;
+        let until = pause(trip);
+        assert!(until < trip, "the pause ends after the wrap");
+        for t in [trip, u32::MAX, 0, until - 1] {
+            let mut s = TakeState::default();
+            assert_eq!(take_decide(&mut s, TakeIn { breaker_until: until, ..cse(t) }), NotOurs, "paused at {t}");
+        }
+        for t in [until, until + 1_000] {
+            let mut s = TakeState::default();
+            assert_eq!(take_decide(&mut s, TakeIn { breaker_until: until, ..cse(t) }), Candidate(1), "over at {t}");
+        }
+    }
+
+    /// Fail-open: a post unacknowledged for more than 1500 ms since the oldest pending one passes the chord to
+    /// Windows; an acknowledgement closes it. The window starts at the oldest pending post.
+    #[test]
+    fn takeover_fail_open_window() {
+        let t = 10_000;
+        assert!(!takeover_fail_open(1, 0, t, t + 1_499), "pending 1499 ms");
+        assert!(!takeover_fail_open(1, 0, t, t + TAKEOVER_ACK_TIMEOUT_MS), "pending 1500 ms");
+        assert!(takeover_fail_open(1, 0, t, t + 1_501), "pending 1501 ms");
+        assert!(!takeover_fail_open(1, 1, t, t + 60_000), "acknowledged");
+        assert!(takeover_fail_open(0, 0xFFFF, t, t + 1_501), "the sequence wrapped");
+        assert!(!takeover_fail_open(0xFFFF, 0, t, t + 1_501), "an acknowledgement ahead is no pending post");
+        assert!(takeover_fail_open(1, 0, u32::MAX - 500, 1_001), "across the tick wrap");
+        assert!(!takeover_fail_open(1, 0, u32::MAX - 500, 999), "inside the window across the wrap");
+        let mut s = taken(t);
+        assert_eq!(take_decide(&mut s, esc(false, t + 50)), SwallowSilent);
+        assert_eq!(take_decide(&mut s, cse(t + 1_000)), Candidate(2), "pending 1000 ms");
+        take_commit(&mut s, 2, t + 1_000);
+        assert_eq!(s.oldest, t, "a second post keeps the first one's window");
+        assert_eq!(take_decide(&mut s, esc(false, t + 1_050)), SwallowSilent);
+        assert_eq!(take_decide(&mut s, cse(t + 1_501)), NotOurs, "failed open");
+        s.acked = 2;
+        assert_eq!(take_decide(&mut s, cse(t + 1_600)), Candidate(3), "the shell thread answered");
+        take_commit(&mut s, 3, t + 1_600);
+        assert_eq!(s.oldest, t + 1_600, "the next window starts at the next post");
+    }
+
+    /// The shell thread is not waiting in GetMessageW (any busy stamp): the press passes to Windows.
+    #[test]
+    fn busy_shell_is_not_ours() {
+        for busy in [1, 7, 10_000 | 1, 0x8000_0001, u32::MAX] {
+            let mut s = TakeState::default();
+            assert_eq!(take_decide(&mut s, TakeIn { shell_busy: busy, ..cse(10_000) }), NotOurs, "busy {busy:#x}");
+        }
+    }
+
+    // ---- the takeover wired into the callback (dock-suite H2)
+
+    /// A key event as the callback receives it, for `win_in_of`.
+    fn kb_at(vk: u32, time: u32) -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT { vkCode: vk, time, ..Default::default() }
+    }
+
+    /// The Win branch takes the rows of the owned chords only. With Ctrl+Shift+Esc owned alone, the event `win_key`
+    /// builds (`win_in_of`) is release 1.5.2's and every legacy sequence gives today's answers; with rows too, the rows
+    /// reach `win_step` and the takeover bit does not. The tracker runs for a takeover alone (it reads Ctrl and Shift).
+    #[test]
+    fn win_branch_sees_only_the_rows() {
+        let alone = |vk: u32, down: bool, time: u32| {
+            win_in_of(&kb_at(vk, time), down, Mods::NONE, DockChords::CTRL_SHIFT_ESC, false, true, || {
+                panic!("no row owned: the fail-open is never read")
+            })
+        };
+        for (what, steps) in &legacy_table() {
+            for &(vk, down, t, _) in steps {
+                assert_eq!(alone(vk, down, t), legacy(vk, down, t), "{what}: the event");
+            }
+            run_steps(what, steps, alone);
+        }
+        let both = DockChords::CTRL_SHIFT_ESC.with(ALL_ROWS);
+        let ev = win_in_of(&kb_at(KEY_3, 10_100), true, CTRL_SHIFT_.with(Mods::WIN), both, true, true, || true);
+        assert_eq!(ev, WinIn { mods: CTRL_SHIFT_, fullscreen: true, fail_open: true, ..owned(KEY_3, true, 10_100) });
+        let ev = win_in_of(&kb_at(KEY_3, 10_100), true, Mods::NONE, both, false, false, || false);
+        assert_eq!(ev, WinIn { ui_ready: false, ..owned(KEY_3, true, 10_100) });
+        assert!(tracks(false, DockChords::CTRL_SHIFT_ESC), "the takeover reads the tracked Ctrl and Shift");
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let key = source_block(src, "fn win_key(");
+        let wires = [
+            ("win_key: the rows taken first", order(&key, "let chords = chords.rows();", "let ev = win_in_of(")),
+            (
+                "win_key: the event of the rows",
+                key.contains("let ev = win_in_of(kb, down, mods, chords, DOCK_FS.load(Acquire),"),
+            ),
+            ("win_key: the step on that event", order(&key, "let ev = win_in_of(", "let out = win_step(&mut s, ev);")),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    /// An Esc the takeover step does not take goes on to the Win branch as today: Win+Esc with the takeover owned and
+    /// ready is not the takeover's, and the Win branch answers it event for event as release 1.5.2's; a plain Esc passes.
+    #[test]
+    fn not_ours_falls_through() {
+        let chords = DockChords::CTRL_SHIFT_ESC;
+        let steps: [(u32, bool, u32, Mods); 4] = [
+            (LWIN, true, 10_000, Mods::NONE),
+            (ESC, true, 10_100, Mods::WIN),
+            (ESC, false, 10_150, Mods::WIN),
+            (LWIN, false, 10_200, Mods::WIN),
+        ];
+        let (mut t, mut s, mut old) = (TakeState::default(), WinState::default(), WinState::default());
+        for (vk, down, time, mods) in steps {
+            if vk == ESC {
+                let ev = TakeIn { vk, down, time, mods: mods.with(CTRL_SHIFT_), ..cse(time) };
+                assert_eq!(take_decide(&mut t, ev), NotOurs, "Ctrl+Shift+Esc with Win held at {time}");
+                assert_eq!(take_decide(&mut t, TakeIn { mods, ..ev }), NotOurs, "Win+Esc at {time}");
+            }
+            let out = win_step(&mut s, win_in_of(&kb_at(vk, time), down, mods, chords, false, true, || false));
+            let want = win_step(&mut old, legacy(vk, down, time));
+            assert_eq!(out, want, "vk {vk:#x} down {down}: as release 1.5.2");
+            if vk == ESC && down {
+                assert_eq!((out.swallow, out.act), (true, WinAct::Inject), "Win+Esc reaches Windows as the pair");
+            }
+        }
+        assert_eq!(t, TakeState::default(), "the takeover step kept nothing");
+        let mut s = WinState::default();
+        assert_eq!(take_decide(&mut t, TakeIn { mods: Mods::NONE, ..cse(20_000) }), NotOurs, "a plain Esc");
+        let out = win_step(&mut s, win_in_of(&kb_at(ESC, 20_000), true, Mods::NONE, chords, false, true, || false));
+        assert_eq!(out, WinOut::PASS, "and the Win branch passes it");
+    }
+
+    /// The callback's takeover block, pinned on the source (a callback cannot run here): after the launcher's block and
+    /// before the Win branch; a NotOurs Esc goes on to the Win branch; a candidate is posted first, a failed post passes
+    /// the key, a posted one is committed, then the menu-mask key goes out under Ctrl and Shift and the key is
+    /// swallowed; the post publishes its time before the state publishes its sequence; the shell is read only for a
+    /// press that can be the chord; the state's load and store cover the hook's fields and leave the shell thread's.
+    #[test]
+    fn mask_after_swallow() {
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let key = source_block(src, "fn handle_key(");
+        let block = source_block(
+            &key,
+            "if vk == VK_ESCAPE_ && (chords.takeovers() != DockChords::NONE || TAKE_ESC_BIT.load(Relaxed))",
+        );
+        let arm = source_block(&block, "TakeDecision::Candidate(seq) =>");
+        let failed = "if !post_takeover(seq, kb.time) { store_take_state(&t); return false; }";
+        let commit = "take_commit(&mut t, seq, kb.time); store_take_state(&t);";
+        let post = source_block(src, "fn post_takeover(seq: u16, time: u32)");
+        let take_in = source_block(src, "fn take_in(");
+        let store = source_block(src, "fn store_take_state(");
+        let load = source_block(src, "fn load_take_state()");
+        let wires = [
+            (
+                "handle_key: the launcher's block first",
+                order(&key, "launcher_step(kb, down, mods)", "if vk == VK_ESCAPE_ &&"),
+            ),
+            (
+                "handle_key: the takeover before the Win branch",
+                order(&key, "take_decide(", "win_key(kb, down, mods, chords)"),
+            ),
+            (
+                "handle_key: the step on the statics",
+                block.contains(
+                    "let mut t = load_take_state(); match take_decide(&mut t, take_in(kb, down, mods, chords)) {",
+                ),
+            ),
+            ("handle_key: a NotOurs Esc goes on", block.contains("TakeDecision::NotOurs => store_take_state(&t),")),
+            (
+                "handle_key: a repeat or an up swallowed",
+                block.contains("TakeDecision::SwallowSilent => { store_take_state(&t); return true; }"),
+            ),
+            ("handle_key: a failed post passes the key", arm.starts_with(&format!("{{ {failed}"))),
+            ("handle_key: the commit after the post", order(&arm, failed, commit)),
+            ("handle_key: the mask after the commit", order(&arm, commit, "send_mask(); return true; }")),
+            (
+                "post_takeover: to the shell thread",
+                post.contains("PostThreadMessageW(tid, WM_SHELL_TAKEOVER, wparam, LPARAM(time as isize))"),
+            ),
+            (
+                "post_takeover: Tasks and the sequence",
+                post.contains("WPARAM(encode_takeover(TakeoverTarget::Tasks, seq))"),
+            ),
+            (
+                "post_takeover: the time on success",
+                post.contains("if posted { TAKEOVER_SENT_TIME.store(time, Release); }"),
+            ),
+            (
+                "store_take_state: the sequence last",
+                order(&store, "TAKEOVER_OLDEST.store(s.oldest, Relaxed);", "TAKEOVER_SEQ.store(s.sent, Release);"),
+            ),
+            ("store_take_state: the acknowledgement left alone", !store.contains("TAKEOVER_ACKED")),
+            ("load_take_state: the acknowledgement read", load.contains("acked: TAKEOVER_ACKED.load(Acquire),")),
+            ("take_in: the shell only for a possible chord", take_in.contains("shell_ok: candidate && shell_ready(),")),
+            ("take_in: the key state only for a possible chord", take_in.contains("held: candidate && esc_held(),")),
+            (
+                "take_in: the chord's press",
+                take_in
+                    .contains("let candidate = down && mods == CTRL_SHIFT && chords.has(DockChords::CTRL_SHIFT_ESC);"),
+            ),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    /// The watchdog's repair of a stale Win press (`Repair::ClearThenGo`) forgets an Esc the takeover swallowed, and
+    /// keeps the sequences: an up that still comes passes, the next Esc is a fresh press, a post in flight keeps its
+    /// fail-open window.
+    #[test]
+    fn clear_for_repair_clears_the_esc_bit() {
+        let mut s = taken(10_000);
+        clear_take_for_repair(&mut s);
+        assert!(!s.esc_bit, "the swallowed press is forgotten");
+        assert_eq!((s.sent, s.acked, s.oldest), (1, 0, 10_000), "the post in flight keeps its window");
+        assert_eq!(take_decide(&mut s, esc(false, 10_100)), NotOurs, "an up that still comes passes");
+        assert_eq!(take_decide(&mut s, esc(true, 10_200)), NotOurs, "a plain Esc passes at once");
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let repair = source_block(src, "Repair::ClearThenGo =>");
+        let cleared = "let mut take = load_take_state(); clear_take_for_repair(&mut take); store_take_state(&take);";
+        assert!(order(&repair, "store_win_state(&s);", cleared), "reinstall's repair clears the Esc bit");
+    }
+
+    /// The re-injected chord (`inject_ctrl_shift_esc`, the fallback when Windows opens its Task Manager for it): six
+    /// tagged keyboard inputs in one SendInput, Ctrl, Shift and Esc down, then the ups in reverse; the hook passes each.
+    #[test]
+    fn reinjected_chord_is_tagged_and_paired() {
+        let keys: Vec<(u16, bool, usize)> = ctrl_shift_esc_inputs()
+            .iter()
+            .map(|i| {
+                assert_eq!(i.r#type, INPUT_KEYBOARD);
+                // SAFETY: a keyboard input (checked above): `ki` is the union's live field.
+                let ki = unsafe { i.Anonymous.ki };
+                (ki.wVk.0, ki.dwFlags.0 & KEYEVENTF_KEYUP.0 != 0, ki.dwExtraInfo)
+            })
+            .collect();
+        let tag = INJECT_TAG;
+        let want = [
+            (0x11, false, tag),
+            (0x10, false, tag),
+            (0x1B, false, tag),
+            (0x1B, true, tag),
+            (0x10, true, tag),
+            (0x11, true, tag),
+        ];
+        assert_eq!(keys, want);
+        assert!(!accepted(LLKHF_INJECTED.0, tag), "the hook passes its own keys");
+        let src = include_str!("hook.rs");
+        let inject = source_block(src, "pub fn inject_ctrl_shift_esc()");
+        let one = "let inputs = ctrl_shift_esc_inputs(); let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) }; sent == 6";
+        assert!(inject.contains(one), "one SendInput of the six");
+    }
+
     // ---- the Win branch (dock-keys H1)
 
     const RWIN: u32 = 0x5C;
@@ -3769,20 +4650,24 @@ mod tests {
         }
     }
 
-    /// Runs `steps` from a fresh state, asserting every answer.
-    fn run_legacy(what: &str, steps: &[Step]) -> WinState {
+    /// Runs `steps` from a fresh state through the events `make` builds, asserting every answer.
+    fn run_steps(what: &str, steps: &[Step], make: impl Fn(u32, bool, u32) -> WinIn) -> WinState {
         let mut s = WinState::default();
         for (i, &(vk, down, t, want)) in steps.iter().enumerate() {
-            let out = win_step(&mut s, legacy(vk, down, t));
+            let out = win_step(&mut s, make(vk, down, t));
             assert_eq!((out.swallow, out.act, out.note), want, "{what}: event {i} (vk {vk:#x}, down {down}, t {t})");
         }
         s
     }
 
-    /// H1: every sequence gives today's swallow, posts and injections, written from the code of release 1.5.2
-    /// (`handle_key` and `other_key_down`).
-    #[test]
-    fn legacy_sequences_are_unchanged() {
+    /// Runs `steps` from a fresh state, asserting every answer.
+    fn run_legacy(what: &str, steps: &[Step]) -> WinState {
+        run_steps(what, steps, legacy)
+    }
+
+    /// The sequences of `legacy_sequences_are_unchanged`: today's swallow, posts and injections, written from the code
+    /// of release 1.5.2 (`handle_key` and `other_key_down`).
+    fn legacy_table() -> Vec<(&'static str, Vec<Step>)> {
         use WinAct::{Inject, StartMenu, Toggle};
         let none = WinAct::None;
         let pass = (false, none, None);
@@ -3790,7 +4675,7 @@ mod tests {
         let press = (true, none, PRESSED);
         let toggle = (true, Toggle, ALONE);
         let combo = (true, Inject, COMBO);
-        let table: Vec<(&str, Vec<Step>)> = vec![
+        vec![
             ("Win tap", vec![(LWIN, true, 10_000, press), (LWIN, false, 10_080, toggle)]),
             (
                 "double tap within 300 ms",
@@ -3920,7 +4805,14 @@ mod tests {
                 "the right Win up does not release a left Win press",
                 vec![(LWIN, true, 10_000, press), (RWIN, false, 10_050, pass), (LWIN, false, 10_100, toggle)],
             ),
-        ];
+        ]
+    }
+
+    /// H1: every sequence gives today's swallow, posts and injections, written from the code of release 1.5.2
+    /// (`handle_key` and `other_key_down`).
+    #[test]
+    fn legacy_sequences_are_unchanged() {
+        let table = legacy_table();
         assert!(table.len() >= 14);
         for (what, steps) in &table {
             run_legacy(what, steps);
@@ -5188,7 +6080,8 @@ mod tests {
             ("chords_follow_foreground: the last look", follow.contains(was)),
             (
                 "chords_follow_foreground: the rows",
-                follow.contains("hook::set_dock_chords(effective_chords(rows, front));"),
+                follow
+                    .contains("hook::set_dock_chords(effective_chords(rows, front).with(takeover::chord_bits_now()));"),
             ),
             ("chords_follow_foreground: the cut-off of the change", follow.contains(changed)),
             ("with_foreground_image: the image of its process", pid.contains("with_image(pid, f)")),

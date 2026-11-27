@@ -153,11 +153,20 @@ pub fn run(dir: &str, scene: Option<&str>, lang: Option<&str>, dpi: Option<u32>)
         let want_lang = |c: &Cell| lang.is_none_or(|l| (l == "it") == (c.lang == Lang::It) && !c.pseudo);
         for c in cells(s.cells).iter().filter(|c| want_lang(c) && dpi.is_none_or(|d| d == c.dpi)) {
             let fakes = Fakes::new();
-            let img = harness(s, c, &fakes).render();
-            let file = out.join(format!("{}-{}.png", s.name, c.tag));
-            if let Err(e) = img.write_png(&file) {
-                oled_sys::log!("files: preview: {}: {e}", file.display());
-                failed += 1;
+            let mut h = harness(s, c, &fakes);
+            let mut images = vec![(format!("{}-{}.png", s.name, c.tag), h.render())];
+            // Each open menu is a popup of its own: its pixels are saved beside the window's.
+            for i in 0..h.menus().len() {
+                if let Some(img) = h.menu_image(i) {
+                    images.push((format!("{}-{}-menu{i}.png", s.name, c.tag), img));
+                }
+            }
+            for (name, img) in images {
+                let file = out.join(name);
+                if let Err(e) = img.write_png(&file) {
+                    oled_sys::log!("files: preview: {}: {e}", file.display());
+                    failed += 1;
+                }
             }
         }
     }

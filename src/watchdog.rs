@@ -230,11 +230,16 @@ pub fn spawn() -> Result<(), String> {
     Ok(())
 }
 
-/// `CreateProcessW` of `current_exe --watchdog <pid> <event>`, with a fallback without breakaway.
+/// `CreateProcessW` of the running image `--watchdog <pid> <event>`, with a fallback without breakaway. Started by the
+/// final path of the image itself, held open until it has started (`autostart::start_image`), never by the path
+/// `current_exe` names: a running exe can be renamed and another file put there by whoever can change its folder, and
+/// the watchdog runs with the dock's token.
 fn launch_watchdog(pid: u32, ev_name: &str) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let image = crate::autostart::start_image()?;
+    let exe = image.start_path().ok_or("the running dock.exe has no path to start it by")?;
     // The process handle is kept for `end_for_session_end`; `shutdown` closes it.
     let process = spawn_breakaway(&exe, &watchdog_args(pid, ev_name))?;
+    drop(image);
     WATCHDOG_PROCESS.store(process.into_raw_handle() as isize, Relaxed);
     Ok(())
 }
@@ -939,6 +944,26 @@ fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC review: the watchdog runs with the dock's token, elevated from the logon task or after a consent prompt. A
+    /// running exe can be renamed and another file put at the path `current_exe` still names, by whoever can change its
+    /// folder (a download folder: every unelevated process of its user); started by that path, that file would run with
+    /// the dock's token and no prompt. The watchdog is started by the final path of the running image itself
+    /// (`autostart::start_image`, held open until it has started), the one `RunningImage::start_path` gives (the
+    /// worker's `held_start_path`, which an autostart test pins); any other file is refused, and a dock without its
+    /// watchdog leaves the taskbar alone (`watchdog_ok` in main).
+    #[test]
+    fn the_watchdog_is_the_running_image() {
+        let src = include_str!("watchdog.rs").replace("\r\n", "\n");
+        let body = &src[src.find(concat!("fn launch_", "watchdog(pid")).unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("current_exe"), "the path current_exe names is never started");
+        let held = body.find("start_image()").expect("the running image is held");
+        let path = body.find("let exe = image.start_path()").expect("started by the path the held image gives");
+        let (started, dropped) = (body.find("spawn_breakaway(&exe,").unwrap(), body.find("drop(image)").unwrap());
+        assert!(held < path && path < started, "the path is taken from the image held, then started");
+        assert!(started < dropped, "held from before the start until after it");
+    }
 
     /// Silence before a hang restore: one wait timeout times the number of timeouts in a row.
     fn silence_ms(seen_beat: bool) -> u32 {

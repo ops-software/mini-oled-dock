@@ -563,8 +563,6 @@ fn apply_routes_through_loop_requests() {
     assert_eq!(send(InstanceCmd::NewWindow(Location::Home)), [main(Location::Home, None)]);
     let select_c = InstanceCmd::Select { dir: c.clone(), item: name(&c) };
     assert_eq!(send(select_c), [main(Location::Fs(c.clone()), Some(name(&c)))], "no window on c: a new one");
-    // OpenTab before the tab strip (tab::open_here is false): a new window.
-    assert_eq!(send(InstanceCmd::OpenTab(Location::Fs(c.clone()))), [main(Location::Fs(c.clone()), None)]);
     assert!(send(InstanceCmd::Probe { path: c.clone() }).is_empty(), "Probe opens nothing");
     assert!(send(InstanceCmd::NewWindow(Location::Options)).is_empty());
     // Select in this window's own folder: it comes to the front, through the loop.
@@ -572,6 +570,8 @@ fn apply_routes_through_loop_requests() {
         send(InstanceCmd::Select { dir: a.clone(), item: name(&a) }),
         [LoopReq::Show { win: 1, how: Show::Front }]
     );
+    // OpenTab opens a tab in this window (the strip exists since F1b) and brings it to the front.
+    assert_eq!(send(InstanceCmd::OpenTab(Location::Fs(c.clone()))), [LoopReq::Show { win: 1, how: Show::Front }]);
     assert!(two.is_empty());
 }
 

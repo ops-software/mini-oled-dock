@@ -1,0 +1,19 @@
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Button "More options (F10)" [focusable]
+SearchInput "Search processes" [focusable] ""
+ColumnHeader "Name, 7 processes" [focusable]
+ColumnHeader "CPU, total 18.0 %" [focusable]
+ColumnHeader "Memory, total 52 %" [focusable]
+ColumnHeader "I/O, total 19.5 KB/s" [focusable]
+Table "Name" [focusable] 0 of 10
+  Row "Apps, 3 items, expanded" [focusable, expandable, expanded] 1 of 10
+  Row "File Explorer, CPU 0.3 %, memory 180 MB, I/O 2.93 KB/s" [focusable] 2 of 10
+  Row "Frozen Notes (2), CPU 0 %, memory 300 MB, I/O 0" [focusable, expandable] 3 of 10
+  Row "Orbit, CPU 1.5 %, memory 150 MB, I/O 8.79 KB/s" [focusable] 4 of 10
+  Row "Background, 1 items, expanded" [focusable, expandable, expanded] 5 of 10
+  Row "Syncer, CPU 0.1 %, memory 45.0 MB, I/O 2.93 KB/s" [focusable] 6 of 10
+  Row "Part of Windows, 1 items, expanded" [focusable, expandable, expanded] 7 of 10
+  Row "Hardware and drivers, CPU 1.4 %" [focusable] 8 of 10
+  Row "System, CPU 0.2 %, memory 205 KB, I/O 4.88 KB/s" [focusable] 9 of 10
+  Row "System Idle Process, CPU 60.0 %, memory 10.2 KB, I/O 0" [focusable] 10 of 10

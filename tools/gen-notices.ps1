@@ -19,13 +19,23 @@ $accepted = @(
   'MIT',
   'MIT OR Apache-2.0',
   '(MIT OR Apache-2.0) AND Unicode-3.0',
-  'Unlicense OR MIT'
+  'Unlicense OR MIT',
+  'Apache-2.0 OR MIT',
+  'Zlib'
 )
+# Crates whose package carries no licence file: the text kept in tools/notices-crates (the repository's licence file of their project).
+$stored = @{ 'accesskit' = 'accesskit-LICENSE-MIT.txt'; 'accesskit_consumer' = 'accesskit-LICENSE-MIT.txt'; 'accesskit_windows' = 'accesskit-LICENSE-MIT.txt' }
 
 Push-Location $root
 try {
-  $tree = & cargo tree --locked --offline -e normal --target x86_64-pc-windows-msvc --prefix none -f '{p}|{l}'
-  if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+  # The dock (the root package) and every app that ships crates of its own, each with its default features.
+  $tree = @()
+  foreach ($pkgArgs in @(@(), @('-p', 'tasks'))) {
+    $one = @(& cargo tree --locked --offline -e normal --target x86_64-pc-windows-msvc --prefix none -f '{p}|{l}' @pkgArgs)
+    if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+    $tree += $one
+    $tree += '' # the root of the next tree is skipped like the first
+  }
   $metaJson = & cargo metadata --locked --offline --format-version 1
   if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
   $meta = ($metaJson | Out-String) | ConvertFrom-Json
@@ -35,6 +45,7 @@ try {
 $crates = [ordered]@{}
 $first = $true
 foreach ($line in $tree) {
+  if ($line -eq '') { $first = $true; continue }
   if ($first) { $first = $false; continue }
   $pkg, $lic = $line -split '\|', 2
   $lic = ($lic -replace ' \(\*\)$', '').Trim()
@@ -60,6 +71,9 @@ foreach ($key in $crates.Keys) {
   $files = @(Get-ChildItem -LiteralPath $dir -File | Where-Object {
       $_.Name -match '^(LICENSE|COPYING)' -and $_.Name -notmatch '^UNLICENSE'
     } | Sort-Object Name)
+  if ($files.Count -eq 0 -and $stored.ContainsKey($c.Name)) {
+    $files = @(Get-Item -LiteralPath (Join-Path $root "tools/notices-crates/$($stored[$c.Name])"))
+  }
   if ($files.Count -eq 0) { Write-Error "crate $key has no LICENSE* or COPYING* file"; exit 1 }
   foreach ($f in $files) {
     $text = [System.IO.File]::ReadAllText($f.FullName, [System.Text.UTF8Encoding]::new($false))
@@ -78,8 +92,8 @@ $head = $head.Substring(0, $at + $marker.Length)
 $fence = '```'
 $sb = [System.Text.StringBuilder]::new()
 [void]$sb.Append($head).Append("`n`n")
-[void]$sb.Append("## Rust crates used to build dock.exe`n`n")
-[void]$sb.Append("Every normal dependency of dock.exe, compile-time macro crates included. Licence texts are copied from each crate's package.`n")
+[void]$sb.Append("## Rust crates used to build dock.exe and tasks.exe`n`n")
+[void]$sb.Append("Every normal dependency of dock.exe and of tasks.exe, compile-time macro crates included. Licence texts are copied from each crate's package.`n")
 
 # Stable order: by the first crate name of each group.
 $ordered = $groups.GetEnumerator() | Sort-Object { ($_.Value | Sort-Object)[0] }, { $_.Key }

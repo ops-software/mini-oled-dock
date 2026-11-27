@@ -919,6 +919,7 @@ impl Runner for RealRunner {
                 events: ev,
                 stats: Arc::new(RunStats::default()),
                 hook_post: None,
+                hook_record: None,
                 slow_post_ms: base.slow_post_ms,
                 bin_off: crate::ops::classify::bin_turned_off,
             };

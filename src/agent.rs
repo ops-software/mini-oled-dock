@@ -1,7 +1,8 @@
 //! The medium agent (P0.7b): `dock.exe --agent <nonce>`. The elevated dock starts it through Explorer, so it runs as
 //! the shell's user at medium integrity, and has it do the shell work that would otherwise run elevated: the Start
 //! catalogue (`--start-apps`'s apps arena), Start's icons (`--start-icons`'s frames), the shortcuts of the user's own
-//! Start menu folder, and the version strings and icon of a program a user can write.
+//! Start menu folder, the version strings and icon of a program a user can write, and the open takeovers of the user
+//! journal (user.jsonl, a file the elevated dock never reads: `journal_ui::user_views`).
 //!
 //! PIPES. The dock creates two named pipes for one agent, `mini-oled-dock.dock.agent.<nonce>` (requests, dock to agent)
 //! and `mini-oled-dock.dock.agent-out.<nonce>` (replies, agent to dock): a pipe `Conn` is used by one thread at a time,
@@ -27,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use oled_sys::pipe::{self, Conn, Integrity, Peer, PeerRule, PipeError, PipeName, Server};
+use oled_trust::journal::{Hive, Journal, Kind, TakeoverId, Target};
 use windows::core::Interface;
 use windows::Win32::Foundation::{FILETIME, HANDLE, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
@@ -42,8 +44,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::agent_proto::{
-    decode_reply, decode_request, encode_reply, encode_request, ExeInfoRec, LinkRec, Reply, Request, AGENT_PROTO,
-    CHUNK_MAX, REC_MAX, REQ_MAX,
+    decode_reply, decode_request, encode_reply, encode_request, ExeInfoRec, JournalRec, LinkRec, Reply, Request,
+    AGENT_PROTO, CHUNK_MAX, REC_MAX, REQ_MAX,
 };
 use crate::icons::IconBitmap;
 use crate::shell_thread::Verb;
@@ -65,6 +67,10 @@ pub(crate) const STATUS_FAILED: u16 = 1;
 pub(crate) const STATUS_CANCELLED: u16 = 2;
 /// The longest version string kept, in UTF-16 units (`ExeInfoRec`'s cap).
 const FACT_UNITS: usize = 260;
+/// The most records one `UserJournal` answer carries.
+pub(crate) const JOURNAL_RECS_MAX: usize = 64;
+/// The longest target text of a `JournalRec`, in UTF-16 units (its cap).
+const TARGET_UNITS: usize = 260;
 
 /// The name of one of the agent's pipes.
 pub(crate) fn pipe_name(purpose: &str, nonce: &str) -> Result<PipeName, PipeError> {
@@ -90,6 +96,9 @@ pub(crate) trait Work {
     fn links(&mut self) -> Vec<(String, String, String)>;
     /// The version strings of the program at `path` and its icon at `px` (one of `EXE_ICON_PX`).
     fn exe_info(&mut self, path: &str, px: u16) -> ExeFacts;
+    /// The user journal (user.jsonl), read at medium: the agent runs as the shell's user, and the elevated dock never
+    /// reads that file.
+    fn user_journal(&mut self) -> Result<Journal, String>;
 }
 
 /// `--agent <nonce>`. Exit 2 when the dock's pipes cannot be reached or trusted, or its `Hello` is wrong; otherwise
@@ -320,8 +329,18 @@ fn serve_one(r: Request, send: &mut dyn FnMut(&Reply) -> bool, work: &mut dyn Wo
                 }
                 STATUS_OK
             }
-            // The user journal's reader lands with J1c.
-            Request::UserJournal { .. } => STATUS_FAILED,
+            Request::UserJournal { .. } => match work.user_journal() {
+                Ok(j) => {
+                    for rec in journal_records(id, &j) {
+                        if !send(&Reply::Journal(rec)) {
+                            return false;
+                        }
+                    }
+                    STATUS_OK
+                }
+                // Unreadable or corrupt: no record; the dock lists nothing and says why.
+                Err(_) => STATUS_FAILED,
+            },
             Request::Hello { .. } | Request::Cancel { .. } | Request::Bye => return true,
         }
     };
@@ -343,6 +362,66 @@ fn exe_record(id: u32, facts: ExeFacts, px: u16) -> ExeInfoRec {
         company: fit(facts.company),
         icon,
     }
+}
+
+/// The `UserJournal` answer for `j`: one record per open takeover entry (one undone, or of a failed or committed run,
+/// is not open), in file order, at most `JOURNAL_RECS_MAX`; a target longer than its cap is cut. UserEdit, Install and
+/// Update entries and a newer version's kinds are not listed.
+pub(crate) fn journal_records(id: u32, j: &Journal) -> Vec<JournalRec> {
+    oled_trust::journal::views(j)
+        .into_iter()
+        .filter_map(|v| match v.kind {
+            Kind::Takeover(t) => Some(JournalRec {
+                id,
+                seq: v.seq,
+                kind: takeover_kind(t).to_string(),
+                target: cut_units(target_text(&v.target), TARGET_UNITS),
+                ts: v.ts,
+            }),
+            Kind::Install | Kind::Update | Kind::UserEdit(_) | Kind::Unknown(_) => None,
+        })
+        .take(JOURNAL_RECS_MAX)
+        .collect()
+}
+
+/// A takeover's kind as the journal's lines write it (F-P5's "kind" strings, fixed forever).
+fn takeover_kind(t: TakeoverId) -> &'static str {
+    match t {
+        TakeoverId::FolderVerbs => "takeover.folder_verbs",
+    }
+}
+
+/// What a change touches, as a list shows it: a registry key as `HKCU\<key>`, a value as its key and its name in
+/// parentheses, a task by its name, a file by its path.
+pub(crate) fn target_text(t: &Target) -> String {
+    match t {
+        Target::Reg { hive, key, name } => {
+            let root = match hive {
+                Hive::Hkcu => "HKCU",
+                Hive::Hklm => "HKLM",
+            };
+            match name {
+                Some(n) => format!("{root}\\{key} ({n})"),
+                None => format!("{root}\\{key}"),
+            }
+        }
+        Target::Task(name) => name.clone(),
+        Target::File(path) => path.clone(),
+    }
+}
+
+/// `s` cut to at most `max` UTF-16 units, at a character's end.
+fn cut_units(s: String, max: usize) -> String {
+    if s.encode_utf16().count() <= max {
+        return s;
+    }
+    let mut units = 0;
+    s.chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= max
+        })
+        .collect()
 }
 
 /// How a stream ended.
@@ -452,6 +531,16 @@ impl Work for ShellWork {
             .and_then(|b| nonempty(crate::icons::resize_area(&b, u32::from(px))));
         ExeFacts { description: info.description, product: info.product, company: info.company, icon }
     }
+
+    fn user_journal(&mut self) -> Result<Journal, String> {
+        read_user_journal_at_medium()
+    }
+}
+
+/// The agent's reader of the user journal (user.jsonl), at medium: with --undo-user's, the only read of that file in
+/// the dock's code, each under a name of its own (`the_elevated_side_never_reads_user_jsonl` pins both).
+fn read_user_journal_at_medium() -> Result<Journal, String> {
+    oled_sys::journal_os::load(oled_trust::journal::Scope::User)
 }
 
 /// The shortcuts of the user's own Start menu folder (`FOLDERID_Programs`: the agent runs as the shell's user), read by
@@ -967,6 +1056,25 @@ impl Link {
         info.filter(|_| outcome == Outcome::Done(STATUS_OK))
     }
 
+    /// The open takeovers of the user journal, read by the agent at medium (the elevated dock never reads user.jsonl):
+    /// at most `JOURNAL_RECS_MAX` records, when the agent answers within `deadline` (counted from the request; starting
+    /// an agent adds up to `ACCEPT_TIMEOUT`). Past the deadline the agent is killed.
+    pub(crate) fn user_journal(&mut self, deadline: Duration) -> Result<Vec<JournalRec>, String> {
+        let mut records = Vec::new();
+        let outcome = self.call(|id| Request::UserJournal { id }, deadline, Late::Kill, &mut |r| match r {
+            Reply::Journal(j) if records.len() < JOURNAL_RECS_MAX => {
+                records.push(j);
+                true
+            }
+            _ => false,
+        });
+        match outcome {
+            Outcome::Done(STATUS_OK) => Ok(records),
+            Outcome::Done(_) => Err("the agent could not read the user journal".into()),
+            other => Err(other.why()),
+        }
+    }
+
     fn take_id(&mut self) -> u32 {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.next_id
@@ -1319,6 +1427,8 @@ pub(crate) mod tests {
         /// `exe_info` calls, and how long each one takes.
         pub(crate) calls: Arc<AtomicUsize>,
         pub(crate) slow: Duration,
+        /// The user journal file's bytes (None: it cannot be read).
+        pub(crate) journal: Option<Vec<u8>>,
     }
 
     impl Work for Fake {
@@ -1340,6 +1450,10 @@ pub(crate) mod tests {
             self.calls.fetch_add(1, SeqCst);
             std::thread::sleep(self.slow);
             self.exe.clone()
+        }
+        fn user_journal(&mut self) -> Result<Journal, String> {
+            let bytes = self.journal.as_ref().ok_or("no user journal")?;
+            Journal::parse(oled_trust::journal::Scope::User, bytes).map_err(|e| format!("{e:?}"))
         }
     }
 
@@ -1568,6 +1682,80 @@ pub(crate) mod tests {
     }
 
     // ---------------------------------------------------------------- helper processes
+
+    /// A user journal file: a UserEdit entry, a takeover undone, a takeover of a committed run, a takeover of a value's
+    /// default, then `n` takeovers of named values (seq 10 on), as journal lines.
+    fn user_journal_file(n: u64) -> Vec<u8> {
+        use oled_trust::journal::{AppId, Change, Entry, Record, RegData, RegPath, RunId};
+        let key = RegPath::new(r"Software\Classes\Directory\shell\oled-test").unwrap();
+        let change = |name: Option<String>| Change::RegValue {
+            hive: Hive::Hkcu,
+            key: key.clone(),
+            name,
+            before: None,
+            after: Some(RegData::Sz("x".into())),
+        };
+        let entry = |seq: u64, run: u64, kind: Kind, name: Option<String>| {
+            Record::Entry(Entry { seq, run: RunId(run), ts: 1_700_000_000 + seq, kind, change: change(name) })
+        };
+        let takeover = || Kind::Takeover(TakeoverId::FolderVerbs);
+        let mut records = vec![
+            entry(1, 1, Kind::UserEdit(AppId::Tasks), Some("edit".into())),
+            entry(2, 2, takeover(), Some("undone".into())),
+            Record::Undone { seq: 2 },
+            entry(3, 3, takeover(), Some("committed".into())),
+            Record::Committed { run: RunId(3) },
+            entry(4, 4, takeover(), None),
+        ];
+        records.extend((0..n).map(|k| entry(10 + k, 5, takeover(), Some(format!("v{k}")))));
+        records.iter().flat_map(|r| Journal::encode(r).unwrap()).collect()
+    }
+
+    #[test]
+    fn agent_user_journal_records() {
+        let file = user_journal_file(70);
+        // The kind the records name is the journal's own string for it.
+        assert!(String::from_utf8_lossy(&file).contains(r#""kind":"takeover.folder_verbs""#));
+        let mut work = Fake { journal: Some(file.clone()), ..Fake::default() };
+        let (exit, replies) = serve_frames(vec![frame(&Request::UserJournal { id: 9 })], &mut work);
+        assert_eq!(exit, None);
+        // One record per open takeover, at most 64, in file order, then End.
+        assert_eq!(replies.len(), JOURNAL_RECS_MAX + 1);
+        assert_eq!(replies.last(), Some(&Reply::End { id: 9, status: STATUS_OK }));
+        let records: Vec<&JournalRec> =
+            replies.iter().filter_map(|r| if let Reply::Journal(j) = r { Some(j) } else { None }).collect();
+        let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [4].into_iter().chain(10..73).collect::<Vec<u64>>());
+        let key = r"HKCU\Software\Classes\Directory\shell\oled-test";
+        let first =
+            JournalRec { id: 9, seq: 4, kind: "takeover.folder_verbs".into(), target: key.into(), ts: 1_700_000_004 };
+        assert_eq!(records[0], &first);
+        assert_eq!(records[1].target, format!("{key} (v0)"));
+        // An empty journal: End alone. One that does not parse, or cannot be read: End with a failure, no record.
+        for (journal, status) in
+            [(Some(Vec::new()), STATUS_OK), (Some(b"00000000 {}\n".to_vec()), STATUS_FAILED), (None, STATUS_FAILED)]
+        {
+            let mut work = Fake { journal, ..Fake::default() };
+            let (_, replies) = serve_frames(vec![frame(&Request::UserJournal { id: 3 })], &mut work);
+            assert_eq!(replies, [Reply::End { id: 3, status }]);
+        }
+        // A target over its cap is cut at a character's end, so the record still encodes.
+        let long = target_text(&Target::File(format!("C:\\{}\u{1F600}", "x".repeat(256))));
+        let cut = cut_units(long, TARGET_UNITS);
+        assert_eq!((cut.encode_utf16().count(), cut.ends_with('x')), (259, true));
+        let rec = JournalRec { id: 1, seq: 1, kind: takeover_kind(TakeoverId::FolderVerbs).into(), target: cut, ts: 0 };
+        assert!(encode_reply(&Reply::Journal(rec)).is_ok());
+        let value = Target::Reg { hive: Hive::Hklm, key: "SOFTWARE\\x".into(), name: Some("v".into()) };
+        assert_eq!(target_text(&value), "HKLM\\SOFTWARE\\x (v)");
+        assert_eq!(target_text(&Target::Task("\\Dock".into())), "\\Dock");
+        // Through the dock's link, over the real pipes: the same records; an agent that cannot read it is an error.
+        let mut link = Link::new(Box::new(ThreadLauncher(Fake { journal: Some(file), ..Fake::default() })));
+        let got = link.user_journal(Duration::from_secs(5)).unwrap();
+        assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<u64>>(), seqs);
+        assert_eq!(got[0], JournalRec { id: got[0].id, ..first });
+        let mut link = Link::new(Box::new(ThreadLauncher(Fake::default())));
+        assert!(link.user_journal(Duration::from_secs(5)).is_err());
+    }
 
     /// Turns this test binary into a helper process of the agent tests ("<role> <nonce>"); set by them only.
     const HELPER_VAR: &str = "DOCK_AGENT_TEST_HELPER";

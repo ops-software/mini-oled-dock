@@ -5,6 +5,8 @@
 //! `generate` turns the pair into `$OUT_DIR/strings.rs`: a `k` module of `S` constants and a `TABLE` of
 //! `oled_sys::i18n::Table`, sorted by hash.
 
+pub mod lang;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;

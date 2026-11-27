@@ -1,9 +1,11 @@
 //! The view: the frames taken from the sampler, the merge into rows, the sort and the publish into the table model.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use oled_sysmon::heat::{heat, HeatStep, Machine, MetricKind};
+use oled_sysmon::percore::{dpc_irq_percent, CoreTimes};
 use oled_sysmon::{ProcKey, ProcRow, ProcTable};
 use oled_trust::frame::tasks::SortBy;
 use oled_ui::model::{RowKey, RowOut};
@@ -11,15 +13,17 @@ use oled_ui::widgets::VirtualTable;
 use oled_ui::{CommandId, EventCx, UiLang};
 
 use super::commands::{PAUSE, SAMPLE_NOW};
-use super::rows::{proc_key, RowEntry, RowKind, RowVals, TasksTable};
+use super::order;
+use super::rows::{proc_key, Decor, RowAct, RowEntry, RowKind, RowVals, TasksTable, COL_PID};
 use super::screen::TasksScreen;
 use crate::app::options::OpenSort;
 use crate::app::sampling::Sampling;
+use crate::app::state::StateHandle;
 use crate::app::Deps;
 use crate::engine::cadence::Refresh;
 use crate::engine::frame::Frame;
 use crate::model::classify::InfoBook;
-use crate::model::group::Interner;
+use crate::model::group::{Interner, ProcInfo};
 use crate::model::order::auto_sort;
 use crate::model::rates::RateBook;
 use crate::model::view::{ColumnId, Section, ViewMode};
@@ -42,6 +46,8 @@ impl Default for SortState {
 /// The machine's totals of the last good frame, as the gauge header shows them; None until measured.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Gauges {
+    /// The sequence number of the good frame these totals come from; 0 before the first one.
+    pub seq: u64,
     pub procs: usize,
     /// Whole-processor share, 0..=100.
     pub cpu: Option<f32>,
@@ -51,6 +57,8 @@ pub struct Gauges {
     pub io: Option<f32>,
     /// CPU, Memory, I/O.
     pub heat: [HeatStep; 3],
+    /// The PID column shows (List mode only): the gauge header lays its cells out with it.
+    pub show_pid: bool,
 }
 
 /// What the cost line of the More menu measured last: the process's CPU time and the wall time of that moment.
@@ -74,8 +82,22 @@ pub struct View {
     good_t_us: u64,
     prev_t_us: u64,
     info: InfoBook,
+    /// One entry per row of the newest good frame's processes (the InfoBook's, copied when the frame is merged).
+    info_rows: Vec<ProcInfo>,
     rates: RateBook,
-    names: Interner,
+    /// The one interner of identities, lower-cased exe paths and image names; the builds intern identities through
+    /// `intern`, so it sits in a RefCell.
+    names: RefCell<Interner>,
+    /// The window's remembered state and the folder of tasks.exe, taken from the first merge's Deps.
+    state: Option<StateHandle>,
+    install_dir: Option<PathBuf>,
+    /// The cores of the frame before the newest good one, and the interrupt and driver share between the two.
+    prev_cores: Vec<CoreTimes>,
+    dpc_irq: f32,
+    /// The labels of the rows the build of the mode wrote this pass (see TasksTable::set_decor).
+    decor: RefCell<HashMap<RowKey, Decor>>,
+    /// The notes and inline actions the actions step wrote this pass (see TasksTable::set_acts).
+    acts: RefCell<HashMap<RowKey, RowAct>>,
     /// The heat step of every (row key, column 0 CPU / 1 Memory / 2 I/O) that is above S0, as last published.
     heat: HashMap<(u64, u8), HeatStep>,
     heat_next: HashMap<(u64, u8), HeatStep>,
@@ -94,6 +116,8 @@ pub struct View {
     cost: Cell<Option<CostMark>>,
     /// A scene's fixed cost line: (CPU share, private bytes), so a menu picture does not depend on the machine.
     cost_fixture: Option<(f32, u64)>,
+    /// The labels of the ended processes the list keeps as ghosts (order.rs sets them; the frame no longer knows them).
+    ended: Vec<(ProcKey, String)>,
 }
 
 impl Default for View {
@@ -108,8 +132,15 @@ impl Default for View {
             good_t_us: 0,
             prev_t_us: 0,
             info: InfoBook::new(),
+            info_rows: Vec::new(),
             rates: RateBook::new(),
-            names: Interner::new(),
+            names: RefCell::new(Interner::new()),
+            state: None,
+            install_dir: None,
+            prev_cores: Vec::new(),
+            dpc_irq: 0.0,
+            decor: RefCell::new(HashMap::new()),
+            acts: RefCell::new(HashMap::new()),
             heat: HashMap::new(),
             heat_next: HashMap::new(),
             machine: Machine { logical_cpus: 1, total_phys: 0 },
@@ -123,6 +154,7 @@ impl Default for View {
             nf: oled_sysmon::fmt::NumFmt::EN,
             cost: Cell::new(None),
             cost_fixture: None,
+            ended: Vec::new(),
         }
     }
 }
@@ -202,6 +234,10 @@ impl View {
             self.topmost_pending = options.always_on_top;
         }
         self.note_refresh(options.refresh);
+        if self.state.is_none() {
+            self.state = Some(deps.state.clone());
+            self.install_dir.clone_from(&deps.install_dir);
+        }
         if !std::mem::take(&mut self.fresh) {
             return;
         }
@@ -211,7 +247,12 @@ impl View {
         }
         self.read_error = None;
         let procs = &self.frame.procs;
-        self.info.update(procs, &self.frame.paths, &deps.system_root, &mut self.names);
+        let info = self.info.update(procs, &self.frame.paths, &deps.system_root, self.names.get_mut());
+        self.info_rows.clear();
+        self.info_rows.extend_from_slice(info);
+        self.dpc_irq = dpc_irq_percent(&self.prev_cores, &self.frame.sys.cores);
+        self.prev_cores.clear();
+        self.prev_cores.extend_from_slice(&self.frame.sys.cores);
         let cpus = self.frame.sys.logical_cpus;
         // The interval between the two tables, not between the last two frames (an error may lie between them).
         let dt_ms = match self.good_t_us.checked_sub(self.prev_t_us) {
@@ -236,6 +277,7 @@ impl View {
         let mem_load = mem.map(|m| m.load_pct);
         let prev = self.gauges.heat;
         self.gauges = Gauges {
+            seq: self.frame.seq,
             procs: procs.rows.len(),
             cpu,
             mem_load,
@@ -245,6 +287,7 @@ impl View {
                 mem_load.map_or(HeatStep::S0, |v| share_step(f32::from(v), prev[1])),
                 io.map_or(HeatStep::S0, |v| heat(MetricKind::Io, f64::from(v), prev[2], &self.machine)),
             ],
+            show_pid: self.mode == ViewMode::List,
         };
         if !self.sort_decided {
             self.sort_decided = true;
@@ -252,6 +295,87 @@ impl View {
                 self.sort.column = open_sort(mem_load.unwrap_or(0), options.open_sorted_by, deps.show.sort);
                 self.sort.descending = true;
             }
+        }
+    }
+
+    /// The newest frame taken (an error frame leaves its processes in place).
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    /// One entry per process of the newest good frame, in the table's order.
+    pub fn info_rows(&self) -> &[ProcInfo] {
+        &self.info_rows
+    }
+
+    /// The window's remembered state; None before the first merge.
+    pub fn state(&self) -> Option<&StateHandle> {
+        self.state.as_ref()
+    }
+
+    /// The folder of tasks.exe (the dock family lives beside it).
+    pub fn install_dir(&self) -> Option<&std::path::Path> {
+        self.install_dir.as_deref()
+    }
+
+    /// The interrupt and driver share of the processor over the last two good frames.
+    pub fn dpc_irq_pct(&self) -> f32 {
+        self.dpc_irq
+    }
+
+    /// The id of a string in the one interner (identities, lower-cased exe paths, lower-cased image names).
+    pub fn intern(&self, s: &str) -> u32 {
+        self.names.borrow_mut().intern(s)
+    }
+
+    /// The string behind an id of the interner.
+    pub fn interned(&self, id: u32) -> String {
+        self.names.borrow().get(id).to_string()
+    }
+
+    /// The label of a row that shows more than its image name (written by the build of the mode, every pass).
+    pub fn set_decor(&self, key: RowKey, d: Decor) {
+        self.decor.borrow_mut().insert(key, d);
+    }
+
+    /// A row's note and inline action (actions::decorate, every pass).
+    pub fn set_act(&self, key: RowKey, a: RowAct) {
+        self.acts.borrow_mut().insert(key, a);
+    }
+
+    /// A build starts: the labels of the last pass are forgotten.
+    pub fn clear_decor(&self) {
+        self.decor.borrow_mut().clear();
+    }
+
+    /// The processes the newest frame has and the one before did not.
+    pub fn added(&self) -> &[ProcKey] {
+        &self.frame.added
+    }
+
+    /// The processes the newest frame lost.
+    pub fn gone(&self) -> &[ProcKey] {
+        &self.frame.gone
+    }
+
+    /// The image name of a process of the table before the newest frame (a process that has just ended).
+    pub fn prev_name(&self, key: ProcKey, out: &mut String) -> bool {
+        match self.prev.find(key) {
+            Some(row) => {
+                out.extend(
+                    char::decode_utf16(self.prev.names.get(row.image).iter().copied()).map(|r| r.unwrap_or('\u{FFFD}')),
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The labels of the ghost rows, replacing the ones before.
+    pub fn set_ended(&mut self, names: &[(ProcKey, String)]) {
+        if self.ended.as_slice() != names {
+            self.ended.clear();
+            self.ended.extend(names.iter().cloned());
         }
     }
 
@@ -341,6 +465,8 @@ impl View {
                 char::decode_utf16(self.frame.procs.names.get(row.image).iter().copied())
                     .map(|r| r.unwrap_or('\u{FFFD}')),
             );
+        } else if let Some((_, name)) = self.ended.iter().find(|e| e.0 == key) {
+            out.push_str(name);
         }
     }
 
@@ -384,9 +510,26 @@ impl View {
             self.nf = if self.lang.italian { oled_sysmon::fmt::NumFmt::IT } else { oled_sysmon::fmt::NumFmt::EN };
         }
         // Only the rows on screen are signed (and so formatted); the rest are looked at when they scroll in.
+        // The PID column is List mode's.
+        let want_pid = self.mode == ViewMode::List;
+        if table.columns().iter().any(|c| c.id == COL_PID && c.visible != want_pid) {
+            let mut cols = table.columns().to_vec();
+            for c in cols.iter_mut().filter(|c| c.id == COL_PID) {
+                c.visible = want_pid;
+            }
+            table.set_columns(cx, cols);
+        }
         let window = table.visible_rows();
         let model = table.model_mut();
         model.configure(self.lang, self.nf);
+        let mut labels = std::mem::take(self.decor.get_mut());
+        model.set_decor(&mut labels);
+        labels.clear();
+        *self.decor.get_mut() = labels;
+        let mut acts = std::mem::take(self.acts.get_mut());
+        model.set_acts(&mut acts);
+        acts.clear();
+        *self.acts.get_mut() = acts;
         model.set_dim(self.read_error.is_some());
         let this = &*self;
         let structure = model.install(rows, window, &mut |e, out| this.name_of(e, out));
@@ -409,6 +552,7 @@ impl View {
 
     pub fn set_mode(&mut self, m: ViewMode) {
         self.mode = m;
+        self.gauges.show_pid = m == ViewMode::List;
     }
 
     pub fn paused(&self) -> bool {
@@ -478,7 +622,13 @@ impl View {
 /// SAMPLE_NOW and PAUSE.
 pub fn on_command(s: &mut TasksScreen, cx: &mut EventCx, id: CommandId) {
     match id {
-        SAMPLE_NOW => s.deps.sampling.sample_now(),
+        SAMPLE_NOW => {
+            s.deps.sampling.sample_now();
+            // Refresh now also lets go of the held order.
+            order::release(&mut s.p.order);
+            let now = cx.now_ms();
+            s.run_pipeline(cx, now);
+        }
         PAUSE => {
             let to = if s.v.paused() { s.v.resume_refresh() } else { Refresh::Paused };
             super::more_menu::set_refresh(s, cx, to);

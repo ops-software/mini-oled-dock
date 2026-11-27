@@ -258,6 +258,12 @@ fn g7_values_are_pinned() {
     assert_eq!(value("wakeups.files_linger"), 0.0);
     assert_eq!(value("start.handoff_files_ms"), 15.0);
     assert_eq!(value("exe_size.tasks_admin"), (0.6 * MIB).round());
+    assert_eq!(value("tasks.private_t1"), 10.0 * MIB);
+    assert_eq!(value("tasks.minimised_iterations"), 0.0);
+    assert_eq!(value("tasks.first_frame_p95_ms"), 100.0);
+    assert_eq!(value("tasks.chord_visible_ms"), 300.0);
+    assert_eq!(value("bench.tasks_ui_tick_us"), 1400.0);
+    assert_eq!(value("bench.tasks_search_key_us"), 2000.0);
     assert_eq!(value("golden.bytes"), 32.0 * MIB);
 }
 
@@ -354,6 +360,12 @@ fn every_g7_budget_has_a_row() {
         "tasks.sampler_hidden_iterations",
         "private.dock_t0_delta",
         "bench.launcher_query_ratio",
+        "bench.tasks_ui_tick_us",
+        "tasks.private_t1",
+        "tasks.minimised_iterations",
+        "tasks.first_frame_p95_ms",
+        "tasks.chord_visible_ms",
+        "bench.tasks_search_key_us",
     ];
     let rows = rows();
     for id in IDS {
@@ -384,6 +396,14 @@ fn semver_compares_numerically() {
 fn exe_size_within_ledger() {
     let size = std::fs::metadata(std::env::var("DOCK_EXE").expect("DOCK_EXE")).unwrap().len();
     assert!(size <= limit_of_budgets_json(), "dock.exe is {size} bytes");
+}
+
+#[test]
+#[ignore = "needs a release build: TASKS_EXE=<path>"]
+fn tasks_exe_size_within_budget() {
+    let size = std::fs::metadata(std::env::var("TASKS_EXE").expect("TASKS_EXE")).unwrap().len();
+    let max = value("exe_size.tasks") as u64;
+    assert!(size <= max, "tasks.exe is {size} bytes, budget {max}");
 }
 
 #[test]

@@ -15,9 +15,14 @@ use crate::log;
 use crate::msg::{ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, WM_DOCK_APP_MENU_CMD};
 use crate::popup::{center_y, hline, lift, row_plate, AppMenuInfo, Content, HitMap, PopupKind, Reply};
 use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
+use crate::ui::suite_links::{self, App};
+use oled_trust::frame::tasks::Show;
 
 /// Id of the first jump list row; the following ones count up in menu order (`AppPopup::links`).
 const ID_JUMP_BASE: u32 = 100;
+
+/// "Show in Tasks": below the jump rows, distinct from the `ID_MENU_*` commands (1 to 5). No message to the dock.
+const ID_SHOW_IN_TASKS: u32 = 90;
 
 /// What a line of the menu is.
 enum Line {
@@ -27,6 +32,11 @@ enum Line {
     Row { id: u32, text: String, enabled: bool },
 }
 
+/// The text of the "Show in Tasks" row.
+fn show_in_tasks_text() -> String {
+    oled_sys::i18n::subst(crate::i18n::t(crate::i18n::k::LINKS_SHOW_IN), &[("app", suite_links::name(App::Tasks))])
+}
+
 pub(crate) struct AppPopup {
     info: AppMenuInfo,
     hits: HitMap,
@@ -34,6 +44,8 @@ pub(crate) struct AppPopup {
     pending: Option<u32>,
     /// Jump list entry to start after closing: `(target, arguments)`.
     launch: Option<(String, String)>,
+    /// "Show in Tasks" was chosen.
+    show: bool,
     /// `(target, arguments)` of the jump list rows, by `id - ID_JUMP_BASE`.
     links: Vec<(String, String)>,
     /// The lines below the header with their top edge, laid out by `size` (physical px).
@@ -42,6 +54,8 @@ pub(crate) struct AppPopup {
     sep_y: i32,
     pad_text: i32,
     width: i32,
+    /// The width the Beta tag of the Tasks row takes, with its gap (0: no tag).
+    tag_w: i32,
     /// Name already shortened.
     title: String,
 }
@@ -53,21 +67,36 @@ pub(crate) fn new(info: AppMenuInfo) -> Box<dyn Content> {
         hits: HitMap::default(),
         pending: None,
         launch: None,
+        show: false,
         links: Vec::new(),
         lines: Vec::new(),
         sep_y: 0,
         pad_text: 0,
         width: 0,
+        tag_w: 0,
         title: String::new(),
     })
 }
 
 impl AppPopup {
+    /// The width of the Beta tag and its gap, when the Tasks row carries one.
+    fn tag_w(&self, s: &Surface) -> i32 {
+        let on = self.info.show_in_tasks && suite_links::beta(App::Tasks);
+        if on {
+            suite_links::tag_width(s, crate::i18n::t(crate::i18n::k::COMMON_BETA)) + s.metrics().px(12)
+        } else {
+            0
+        }
+    }
+
     /// The dock's own rows in order: (id, text, enabled).
     fn rows(&self) -> Vec<(u32, String, bool)> {
         let mut v = Vec::new();
         if self.info.can_launch {
             v.push((ID_MENU_NEW_WINDOW, crate::i18n::t(crate::i18n::k::COMMON_NEW_WINDOW).to_string(), true));
+        }
+        if self.info.show_in_tasks && suite_links::select_of(&self.info.key).is_some() {
+            v.push((ID_SHOW_IN_TASKS, show_in_tasks_text(), true));
         }
         if self.info.pinned {
             v.push((ID_MENU_UNPIN, crate::i18n::t(crate::i18n::k::APP_UNPIN_FROM_DOCK).to_string(), true));
@@ -118,12 +147,16 @@ impl Content for AppPopup {
         let m = s.metrics();
         let (inset, row, head, gap) = (m.px(8), m.px(34), m.px(24), m.px(2));
         self.pad_text = m.px(12);
+        self.tag_w = self.tag_w(s);
         let mut lines = self.all_lines();
         // Width = widest text + padding, within min/max (wider when the app brings its own rows).
         let mut tw = s.text_width(&self.info.name, Font::Bold);
         for l in &lines {
             tw = tw.max(match l {
-                Line::Row { text, .. } => s.text_width(text, Font::Normal),
+                Line::Row { id, text, .. } => {
+                    let tag = if *id == ID_SHOW_IN_TASKS { self.tag_w(s) } else { 0 };
+                    s.text_width(text, Font::Normal) + tag
+                }
                 Line::Head(text) => s.text_width(text, Font::Small),
                 Line::Sep => 0,
             });
@@ -141,7 +174,8 @@ impl Content for AppPopup {
         for mut l in lines.drain(..) {
             let h = match &mut l {
                 Line::Row { id, text, enabled } => {
-                    *text = s.ellipsize(text, Font::Normal, text_w);
+                    let tag = if *id == ID_SHOW_IN_TASKS { self.tag_w } else { 0 };
+                    *text = s.ellipsize(text, Font::Normal, text_w - tag);
                     if *enabled {
                         self.hits.add(*id, rect_wh(inset, y, w - 2 * inset, row));
                     }
@@ -176,6 +210,9 @@ impl Content for AppPopup {
                     let alpha = if *enabled { TEXT_ALPHA } else { TEXT2_ALPHA };
                     let ty = center_y(&rc, s.line_height(Font::Normal));
                     s.text(text, x0, ty, Font::Normal, WHITE, lift(alpha, h));
+                    if *id == ID_SHOW_IN_TASKS && suite_links::beta(App::Tasks) {
+                        suite_links::paint_tag(s, rc, crate::i18n::t(crate::i18n::k::COMMON_BETA));
+                    }
                 }
                 Line::Head(text) => {
                     let rc = rect_wh(inset, *y, self.width - 2 * inset, head);
@@ -198,6 +235,7 @@ impl Content for AppPopup {
     fn click(&mut self, id: u32) -> Reply {
         match id.checked_sub(ID_JUMP_BASE) {
             Some(i) => self.launch = self.links.get(i as usize).cloned(),
+            None if id == ID_SHOW_IN_TASKS => self.show = true,
             None => {
                 self.pending = Some(id);
                 crate::popup::set_app_menu_key(self.info.key.clone());
@@ -210,6 +248,12 @@ impl Content for AppPopup {
         if let Some((target, args)) = self.launch.take() {
             let args = Some(args).filter(|a| !a.is_empty());
             crate::shell_thread::request(crate::shell_thread::ShellRequest::Launch { target, args });
+        }
+        if std::mem::take(&mut self.show) {
+            // The row was built only for a key the contract accepts; a refusal here leaves the key out.
+            if let Some(select) = suite_links::select_of(&self.info.key) {
+                suite_links::open_tasks(Show { select, ..Show::default() });
+            }
         }
         if let Some(cmd) = self.pending.take() {
             // SAFETY: PostMessageW to the dock window; if it no longer exists it just fails.
@@ -232,7 +276,15 @@ mod tests {
     use super::*;
 
     fn info(windows: usize, pinned: bool, jump: Vec<crate::jumplist::Group>) -> AppMenuInfo {
-        AppMenuInfo { key: "contoso".to_string(), name: "Contoso".to_string(), pinned, windows, can_launch: true, jump }
+        AppMenuInfo {
+            key: "contoso".to_string(),
+            name: "Contoso".to_string(),
+            pinned,
+            windows,
+            can_launch: true,
+            jump,
+            show_in_tasks: false,
+        }
     }
 
     /// The popup around `info`, as `new` builds it, to read its rows.
@@ -242,13 +294,32 @@ mod tests {
             hits: HitMap::default(),
             pending: None,
             launch: None,
+            show: false,
             links: Vec::new(),
             lines: Vec::new(),
             sep_y: 0,
             pad_text: 0,
             width: 0,
+            tag_w: 0,
             title: String::new(),
         }
+    }
+
+    #[test]
+    fn show_in_tasks_row() {
+        let ids = |i: AppMenuInfo| popup(i).rows().into_iter().map(|r| r.0).collect::<Vec<_>>();
+        let with =
+            |key: &str, on: bool| AppMenuInfo { key: key.to_string(), show_in_tasks: on, ..info(1, false, Vec::new()) };
+        let base = ids(info(1, false, Vec::new()));
+        assert_eq!(base, [ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_CLOSE_ALL]);
+        assert_eq!(ids(with("contoso", true)), [ID_MENU_NEW_WINDOW, 90, ID_MENU_PIN, ID_MENU_CLOSE_ALL]);
+        assert_eq!(ids(with("contoso", false)), base, "not while Tasks is not usable");
+        for bad in ["", &"a".repeat(513), "a\u{7}b", "--x", "12345"] {
+            assert_eq!(ids(with(bad, true)), base, "{bad:?}");
+        }
+        assert_eq!(ID_SHOW_IN_TASKS, 90);
+        let text = popup(with("contoso", true)).rows().into_iter().find(|r| r.0 == 90).unwrap().1;
+        assert!(text.contains(suite_links::name(App::Tasks)));
     }
 
     #[test]

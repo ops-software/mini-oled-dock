@@ -10,8 +10,8 @@ use oled_sysmon::fmt::{self, NumFmt, Tone, Unit};
 use oled_sysmon::heat::HeatStep;
 use oled_sysmon::ProcKey;
 use oled_ui::model::{
-    Align, CellKind, CellOut, ColId, Column, FgRole, HeatStep as KitHeat, ListModel, RowKey, RowOut, SortDir,
-    TableModel, TreeInfo,
+    Align, CellKind, CellOut, ColId, Column, FgRole, HeatStep as KitHeat, ListModel, RowKey, RowMotion, RowOut,
+    SortDir, TableModel, TreeInfo,
 };
 use oled_ui::node::Text;
 use oled_ui::UiLang;
@@ -143,8 +143,14 @@ pub fn column_of(id: ColId) -> Option<ColumnId> {
     }
 }
 
-/// The table's columns of the beta (Name, CPU, Memory, I/O, PID) with the titles and descriptions in `lang`. PID is not in the default set: the column chooser is Phase 4's.
+/// The table's columns of the beta (Name, CPU, Memory, I/O, PID) with the titles and descriptions in `lang`. PID is
+/// List mode's: the column chooser is Phase 4's.
 pub fn columns(lang: UiLang) -> Vec<Column> {
+    columns_with(lang, false)
+}
+
+/// columns, with the PID column shown or hidden.
+pub fn columns_with(lang: UiLang, show_pid: bool) -> Vec<Column> {
     let col = |id, title: Text, width, min, flex, align, desc: Option<Text>| Column {
         id,
         title,
@@ -158,8 +164,8 @@ pub fn columns(lang: UiLang) -> Vec<Column> {
         hideable: false,
         tip: desc,
     };
-    let mut pid = col(COL_PID, t(lang, k::TASKS_COL_PID), 64, 48, false, Align::End, None);
-    pid.visible = false;
+    let mut pid = col(COL_PID, t(lang, k::TASKS_COL_PID), 56, 48, false, Align::End, None);
+    pid.visible = show_pid;
     vec![
         col(COL_NAME, t(lang, k::TASKS_COL_NAME), 200, 200, true, Align::Start, None),
         col(COL_CPU, t(lang, k::TASKS_COL_CPU), 64, 48, false, Align::Decimal, Some(t(lang, k::TASKS_COL_CPU_DESC))),
@@ -260,6 +266,24 @@ pub fn row_signature(e: &RowEntry, nf: NumFmt, dim: bool) -> u64 {
     h
 }
 
+/// What a row's name cell shows beyond its default label: the head of the label (empty: the default one, the image or
+/// section name), the tertiary tail after it (a count, a friendly name, a pid) and the "Not responding" note. Written
+/// by the build of the mode each frame; the model keeps the last published set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Decor {
+    pub head: String,
+    pub tail: String,
+    pub hung: bool,
+}
+
+/// What an action shows on a row (T3.8, written by actions::decorate every pass through View::set_act): a note in
+/// the status slot, over "Not responding" and "Ended", and the inline action the kit shows on hover.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowAct {
+    pub note: Option<(Text, FgRole)>,
+    pub action: Option<oled_ui::model::RowAction>,
+}
+
 /// The signature of a row nobody asked for: a row that comes into the window compares as changed once.
 const SIG_OUTSIDE: u64 = u64::MAX;
 
@@ -290,6 +314,10 @@ pub struct TasksTable {
     dim: bool,
     /// The labels were written in another language than `lang`: the next install writes them again.
     names_stale: bool,
+    /// The labels and notes of the rows that have more than their image name.
+    decor: HashMap<RowKey, Decor>,
+    /// The notes and inline actions of the rows an action touched, and the inline actions of the rest.
+    acts: HashMap<RowKey, RowAct>,
     /// How many cells were asked for (the tests read it: only the visible rows are formatted).
     cell_calls: Cell<u64>,
     /// How many row signatures were computed (each formats the row's three metric cells).
@@ -310,6 +338,8 @@ impl Default for TasksTable {
             lang: UiLang::EN,
             dim: false,
             names_stale: false,
+            decor: HashMap::new(),
+            acts: HashMap::new(),
             cell_calls: Cell::new(0),
             sig_calls: 0,
         }
@@ -322,6 +352,28 @@ impl TasksTable {
         self.names_stale |= self.lang != lang;
         self.lang = lang;
         self.nf = nf;
+    }
+
+    /// Swaps in the labels of the rows about to be installed (`next` gets the old set back, to be cleared and filled
+    /// again). true when they differ from the published ones: the next install writes every label again.
+    pub fn set_decor(&mut self, next: &mut HashMap<RowKey, Decor>) -> bool {
+        if self.decor == *next {
+            return false;
+        }
+        std::mem::swap(&mut self.decor, next);
+        self.names_stale = true;
+        true
+    }
+
+    /// Swaps in the notes and inline actions of the rows about to be installed, as set_decor; true when they differ
+    /// (the next install lays the table out anew).
+    pub fn set_acts(&mut self, next: &mut HashMap<RowKey, RowAct>) -> bool {
+        if self.acts == *next {
+            return false;
+        }
+        std::mem::swap(&mut self.acts, next);
+        self.names_stale = true;
+        true
     }
 
     /// The text of every value cell dims to FG_SECONDARY while a snapshot fails; true when this changed it.
@@ -390,7 +442,13 @@ impl TasksTable {
             self.names.resize_with(self.rows.len(), String::new);
             for (e, s) in self.rows.iter().zip(self.names.iter_mut()) {
                 s.clear();
-                name_of(e, s);
+                match self.decor.get(&e.key) {
+                    Some(d) if !d.head.is_empty() => s.push_str(&d.head),
+                    _ => name_of(e, s),
+                }
+                if let Some(d) = self.decor.get(&e.key) {
+                    s.push_str(&d.tail);
+                }
             }
         }
         if rename || !self.changed.is_empty() {
@@ -399,8 +457,71 @@ impl TasksTable {
         rename
     }
 
+    /// The plain name of a row, as its first cell shows it.
+    pub fn name(&self, row: usize) -> &str {
+        self.names.get(row).map_or("", String::as_str)
+    }
+
+    /// The row's label for a screen reader: "{name}, CPU 12.0 %, memory 3.10 GB, I/O 1.50 MB/s" ("not measured yet"
+    /// for a figure that has none), and for a section its title, its number of items and its state.
+    fn spoken(&self, row: usize) -> String {
+        let name = self.name(row);
+        let Some(e) = self.rows.get(row) else { return name.to_string() };
+        let lang = self.lang;
+        if let RowKind::Section(s) = e.kind {
+            let title = t(
+                lang,
+                match s {
+                    Section::Apps => k::TASKS_SECTION_APPS,
+                    Section::Background => k::TASKS_SECTION_BACKGROUND,
+                    Section::Windows => k::TASKS_SECTION_WINDOWS,
+                },
+            );
+            let n = self.decor.get(&e.key).map_or("", |d| d.tail.trim().trim_matches(|c| c == '(' || c == ')'));
+            let state = t(lang, if e.expanded { k::TASKS_A11Y_EXPANDED } else { k::TASKS_A11Y_COLLAPSED });
+            return oled_sys::i18n::subst(
+                &t(lang, k::TASKS_A11Y_SECTION),
+                &[("section", title.as_ref()), ("n", n), ("state", state.as_ref())],
+            );
+        }
+        let say = |c: &fmt::Cell, percent: bool| -> String {
+            if c.text() == "\u{2014}" {
+                return t(lang, k::TASKS_A11Y_UNMEASURED).into_owned();
+            }
+            let mut s = if c.is_empty() { "0".to_string() } else { c.text().to_string() };
+            if c.unit() != Unit::None {
+                s.push(' ');
+                s.push_str(c.unit().as_str());
+            }
+            if percent {
+                s.push_str(" %");
+            }
+            s
+        };
+        let cells = metric_cells(&e.vals, self.nf);
+        if e.kind == RowKind::Hardware {
+            return oled_sys::i18n::subst(
+                &t(lang, k::TASKS_A11Y_ROW_CPU),
+                &[("name", name), ("cpu", &say(&cells[0], true))],
+            );
+        }
+        oled_sys::i18n::subst(
+            &t(lang, k::TASKS_A11Y_ROW),
+            &[
+                ("name", name),
+                ("cpu", &say(&cells[0], true)),
+                ("mem", &say(&cells[1], false)),
+                ("io", &say(&cells[2], false)),
+            ],
+        )
+    }
+
     /// Writes the three metric cells of `e` for column `col`.
     fn metric(&self, e: &RowEntry, which: usize, out: &mut CellOut) {
+        // The hardware row has the interrupt and driver time only: no memory, no I/O.
+        if e.kind == RowKind::Hardware && which != 0 {
+            return;
+        }
         let cell = metric_cells(&e.vals, self.nf)[which];
         let kind = match which {
             0 => CellKind::Percent,
@@ -426,10 +547,16 @@ impl TasksTable {
             out.push_span(start, end, FgRole::Tertiary);
         }
         let step = e.vals.heat[which];
-        out.heat = kit_heat(step);
+        // Section and hardware rows are totals, not workloads: no plate.
+        out.heat = if e.out.section || e.kind == RowKind::Hardware { None } else { kit_heat(step) };
         let ink = if cell.tone() == Tone::Tertiary { FgRole::Tertiary } else { heat_fg(step) };
         // Dimmed text is capped, never lifted: tertiary stays tertiary, every brighter ink becomes secondary.
         out.fg = if self.dim && ink != FgRole::Tertiary { FgRole::Secondary } else { ink };
+        // An ended row keeps its last values, quiet: no heat, the disabled ink.
+        if matches!(e.kind, RowKind::Ghost(_)) {
+            out.heat = None;
+            out.fg = FgRole::Disabled;
+        }
     }
 }
 
@@ -446,8 +573,10 @@ impl ListModel for TasksTable {
         self.index.get(&key).copied()
     }
 
+    /// What a screen reader says (T5.7): the name and the figures, or a section's state. It starts with the name, so
+    /// type-ahead still finds a row by it; `name` is the plain name.
     fn label(&self, row: usize) -> Cow<'_, str> {
-        Cow::Borrowed(self.names.get(row).map_or("", String::as_str))
+        Cow::Owned(self.spoken(row))
     }
 
     fn generation(&self) -> u64 {
@@ -464,8 +593,33 @@ impl TableModel for TasksTable {
             COL_NAME => {
                 out.set_text(CellKind::Text, self.names.get(row).map_or("", String::as_str));
                 out.role = oled_ui::theme::TypeRole::Body;
-                out.fg =
-                    if matches!(e.kind, RowKind::Ghost(_)) || self.dim { FgRole::Secondary } else { FgRole::Primary };
+                out.fg = if matches!(e.kind, RowKind::Ghost(_)) {
+                    FgRole::Disabled
+                } else if self.dim {
+                    FgRole::Secondary
+                } else {
+                    FgRole::Primary
+                };
+                if let Some(d) = self.decor.get(&e.key) {
+                    let end = out.text.len() as u32;
+                    if !d.tail.is_empty() && d.tail.len() < out.text.len() {
+                        out.push_span(end - d.tail.len() as u32, end, FgRole::Tertiary);
+                    }
+                    if d.hung {
+                        out.note = Some((t(self.lang, k::TASKS_ROW_NOT_RESPONDING), FgRole::Attention));
+                    }
+                }
+                // An ended row says so, whatever its label said while it ran.
+                if matches!(e.kind, RowKind::Ghost(_)) {
+                    out.note = Some((t(self.lang, k::TASKS_ROW_ENDED), FgRole::Disabled));
+                }
+                // What an action says of the row, and its inline action.
+                if let Some(a) = self.acts.get(&e.key) {
+                    if a.note.is_some() {
+                        out.note.clone_from(&a.note);
+                    }
+                    out.action.clone_from(&a.action);
+                }
             }
             COL_CPU => self.metric(e, 0, out),
             COL_MEMORY => self.metric(e, 1, out),
@@ -494,6 +648,10 @@ impl TableModel for TasksTable {
             expandable: e.expandable,
             expanded: e.expanded,
         })
+    }
+
+    fn motion(&self, row: usize) -> RowMotion {
+        self.rows.get(row).map_or(RowMotion::NONE, |e| RowMotion { dy: e.motion.get().0, opacity: e.motion.get().1 })
     }
 }
 
@@ -610,12 +768,24 @@ mod tests {
             t.install(&mut rows, 0..n, &mut |_, out| out.push_str(if lang.italian { "ciao" } else { "hello" }))
         };
         assert!(words(UiLang::EN, &mut t));
-        assert_eq!(t.label(0), "hello");
+        assert_eq!(t.name(0), "hello");
         assert!(!words(UiLang::EN, &mut t), "nothing changed");
         t.configure(UiLang::IT, NumFmt::IT);
         assert!(words(UiLang::IT, &mut t), "a language switch lays the table out again");
-        assert_eq!(t.label(0), "ciao");
+        assert_eq!(t.name(0), "ciao");
         assert!(!words(UiLang::IT, &mut t));
+    }
+
+    #[test]
+    fn the_label_says_the_name_and_the_figures() {
+        let mut t = TasksTable::default();
+        let rows = vec![proc(1, Some(12.04), 3_328_180_224, Some(1.5 * 1_048_576.0)), proc(2, None, 1 << 20, None)];
+        install(&mut t, rows);
+        let (n0, n1) = (t.name(0).to_string(), t.name(1).to_string());
+        assert_eq!(t.label(0), format!("{n0}, CPU 12.0 %, memory 3.10 GB, I/O 1.50 MB/s"));
+        assert_eq!(t.label(1), format!("{n1}, CPU not measured yet, memory 1.00 MB, I/O not measured yet"));
+        t.configure(UiLang::IT, NumFmt::IT);
+        assert_eq!(t.label(0), format!("{n0}, CPU 12,0 %, memoria 3,10 GB, I/O 1,50 MB/s"));
     }
 
     #[test]

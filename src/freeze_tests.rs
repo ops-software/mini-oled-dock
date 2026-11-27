@@ -85,16 +85,17 @@ fn autostart_action_table() {
 #[test]
 fn stubs_say_not_available() {
     assert_eq!(crate::agent::run("0123456789abcdef0123456789abcdef"), 2);
-    assert_eq!(crate::journal_ui::run_undo_user(None), 2);
-    assert_eq!(crate::recover::run(true), 2);
-    assert_eq!(crate::update::suite::run_sync(false), 2);
-    // Only Some(..): None would reach the network.
-    assert_eq!(crate::update::run_fetch_child_for(Some("v9.9.9")), 2);
+    // U1e implemented --suite-sync, which acts on the installed suite: it is tested over fakes (update::suite's
+    // sync_outcomes and the tests beside it), never run here.
+    // U1b implemented --update-fetch <tag>, so a canonical tag (or none) would reach the network: only the refusal of
+    // a tag that is not canonical, before any GET, is left to check here.
+    assert_eq!(crate::update::run_fetch_child_for(Some("v9.9")), 2);
     assert!(!crate::recover::safe_mode());
     assert!(crate::recover::clear_safe_mode().is_ok());
+    // J1c and J1d implemented --undo-user, --recover and the journal's undo helpers. They act on the machine
+    // (--undo-user's deadline ends its process; the helpers start processes through Explorer), so only their reads
+    // without a data folder are left to check here.
     assert!(crate::journal_ui::machine_views().is_empty());
-    assert!(crate::journal_ui::user_views(Duration::ZERO).is_err());
-    assert!(crate::journal_ui::undo_all_takeovers().is_err());
     assert!(crate::theme_sync::last_written().is_none());
     assert!(crate::update::suite::status().components.is_empty());
 }

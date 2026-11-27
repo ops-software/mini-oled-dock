@@ -25,9 +25,11 @@ foreach ($step in $Only) { switch ($step) {
   'lint' { pwsh tools/ci/fmt-changed.ps1 -SelfTest; if ($LASTEXITCODE -ne 0) { throw 'fmt-changed self-test failed' }
            Use-Env $T { Invoke-Cargo clippy --locked --workspace --all-targets '--' -D warnings
                          Invoke-Cargo clippy --locked --all-targets --features owner-probe '--' -D warnings
-                         Invoke-Cargo clippy --locked --all-targets --features wake-probe '--' -D warnings }
+                         Invoke-Cargo clippy --locked --all-targets --features wake-probe '--' -D warnings
+                         Invoke-Cargo clippy --locked -p tasks --all-targets --features fault-inject '--' -D warnings }
            pwsh tools/ci/fmt-changed.ps1 -BaseRef $BaseRef; if ($LASTEXITCODE -ne 0) { throw 'fmt-changed failed' } }
-  'test' { Use-Env $T { Invoke-Cargo test --locked --workspace; Invoke-Cargo test --locked --features owner-probe; Invoke-Cargo test --locked --features wake-probe }
+  'test' { Use-Env $T { Invoke-Cargo test --locked --workspace; Invoke-Cargo test --locked --features owner-probe; Invoke-Cargo test --locked --features wake-probe
+                         Invoke-Cargo test --locked -p tasks --features fault-inject --test fault_t6b --test smoke_instance }
            Use-Env $T { pwsh tools/ci/ratchet.ps1 -BaseRef $BaseRef }; if ($LASTEXITCODE -ne 0) { throw 'ratchet failed' } }
   'crates' { Use-Env $T { $m = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages.name
              foreach ($n in $m) { Invoke-Cargo check --locked -p $n --all-targets } } }

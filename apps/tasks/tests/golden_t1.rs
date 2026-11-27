@@ -316,7 +316,7 @@ fn only_visible_rows_are_formatted() {
     let calls = r.h.screen().table().model().cell_calls() - before;
     let visible = r.h.screen().table().visible_rows().len() as u64;
     assert!(visible > 0 && visible < 30, "{visible} rows fit");
-    assert!(calls <= (visible + 3) * 4, "{calls} cells for {visible} visible rows");
+    assert!(calls <= (visible + 3) * 5, "{calls} cells for {visible} visible rows");
     assert_eq!(r.h.screen().table().model().len(), 300);
     // The signatures (each formats the row's three metric cells) are computed for the rows on screen only: every
     // publish of the three frames signs at most the visible rows, whatever the process count.
@@ -416,8 +416,9 @@ fn the_stored_always_on_top_reaches_the_window() {
 fn header_aligns_with_columns() {
     let mut r = open("t1_list_calm");
     let img = r.h.render();
-    // At 96 DPI the columns are 408 | 64 | 80 | 88 wide: the labels end 12 px before their column's right edge.
-    for edge in [472, 552, 640] {
+    // At 96 DPI the List columns are 352 | 64 | 80 | 88 | 56 wide (PID is List mode's): the labels end 12 px before
+    // their column's right edge.
+    for edge in [416, 496, 584] {
         let want = edge - 12;
         assert!(
             img.text_rects.iter().any(|t| t.t >= 44 && t.b <= 44 + 24 && t.r == want),
@@ -437,12 +438,12 @@ fn click_sorts_and_reverses() {
     let mut r = open("t1_list_calm");
     let sort = |r: &Rig| r.h.screen().view().sort();
     assert_eq!((sort(&r).column, sort(&r).descending), (ColumnId::Cpu, true));
-    r.h.click(pt(440, 60));
+    r.h.click(pt(384, 60));
     assert_eq!((sort(&r).column, sort(&r).descending, sort(&r).auto), (ColumnId::Cpu, false, false), "again reverses");
     let m = r.h.screen().table().model();
     let cpu: Vec<f32> = m.rows.iter().filter_map(|e| e.vals.cpu).collect();
     assert!(cpu.windows(2).all(|w| w[0] <= w[1]), "lowest first");
-    r.h.click(pt(500, 60));
+    r.h.click(pt(456, 60));
     assert_eq!((sort(&r).column, sort(&r).descending), (ColumnId::Memory, true), "numbers go down first");
     r.h.click(pt(100, 60));
     assert_eq!((sort(&r).column, sort(&r).descending), (ColumnId::Name, false), "the name goes up first");
@@ -491,8 +492,10 @@ fn more_menu_items() {
     assert!(matches!(items.last(), Some(MenuItem::Header(_))), "the cost line is last");
     // Refresh: 0.5 s, 1 s, 2 s, 5 s, Paused; the default one second is checked.
     assert_eq!(checks(submenu(&items, 0)), [Some(false), Some(true), Some(false), Some(false), Some(false)]);
+    // Density (T5.6): Standard is checked.
+    assert_eq!(checks(submenu(&items, 1)), [Some(true), Some(false)]);
     // Open sorted by: Automatic is checked.
-    assert_eq!(checks(submenu(&items, 2)), [Some(true), Some(false), Some(false)]);
+    assert_eq!(checks(submenu(&items, 3)), [Some(true), Some(false), Some(false)]);
     assert!(items.iter().any(|i| matches!(i, MenuItem::Command(id) if *id == tasks::ui::commands::ABOUT)));
     r.h.assert_named();
     // Pause (Ctrl+P): the sampler's control follows and the menu shows it checked.

@@ -2,7 +2,8 @@
 //! every test child gets its own folder and no test process touches the real one).
 //!
 //! This is the only file of the package's code where files.exe itself writes, renames or deletes a file (lint
-//! mutations_go_through_ifileoperation); user files change only in the ops host, through IFileOperation.
+//! mutations_go_through_ifileoperation), besides ops/binrec.rs, which removes the bin's $I record of a restored item;
+//! user files change only in the ops host, through IFileOperation.
 //!
 //! Every method takes a path relative to the folder and refuses one that is absolute, holds a "." or ".." component,
 //! a drive or stream colon, a control character or a component Win32 would trim (a trailing dot or space), one that

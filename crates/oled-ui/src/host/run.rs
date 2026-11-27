@@ -67,6 +67,8 @@ pub(crate) struct LoopShared {
     pub(crate) quit: Cell<Option<i32>>,
     pub(crate) store: RefCell<Option<Box<dyn PlacementStore>>>,
     pub(crate) caption_spike: Cell<bool>,
+    /// A window's system menu is up in this loop (TrackPopupMenuEx runs its own loop): a second one never opens over it.
+    pub(crate) menu_up: Cell<bool>,
     /// The window classes this loop registered (or found registered).
     pub(crate) classes: RefCell<Vec<&'static str>>,
     start: Instant,
@@ -195,6 +197,7 @@ impl EventLoop {
             quit: Cell::new(None),
             store: RefCell::new(None),
             caption_spike: Cell::new(false),
+            menu_up: Cell::new(false),
             classes: RefCell::new(Vec::new()),
             start: Instant::now(),
             stats: Cell::new(LoopStats::default()),

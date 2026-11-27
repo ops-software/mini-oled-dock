@@ -43,6 +43,7 @@
 "files.state.gone" = "{name} è stato spostato o eliminato."
 "files.state.handoff" = "Questo percorso si apre in Esplora file"
 "files.state.too_long" = "Questo percorso è troppo lungo per essere aperto qui."
+"files.state.bad_path" = "Questo non è un percorso valido"
 "files.state.unsupported" = "Questo percorso non può essere elencato qui."
 "files.action.open_explorer" = "Apri in Esplora file"
 "files.action.open_explorer_arrow" = "Apri ↗"
@@ -164,3 +165,4 @@
 "files.cmd.path_history" = "Percorsi recenti"
 "files.cmd.context_menu" = "Menu di scelta rapida"
 "files.cmd.escape" = "Annulla"
+"files.view.details" = "Dettagli"

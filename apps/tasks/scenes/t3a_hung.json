@@ -1,0 +1,161 @@
+{
+ "size": [
+  760,
+  420
+ ],
+ "machine": {
+  "logical_cpus": 16,
+  "total_phys": 34359738368,
+  "mem_load": 52,
+  "commit_pct": 40,
+  "cpu_pct": 18,
+  "dpc_irq_pct": 1.4
+ },
+ "ticks": 2,
+ "mode": "grouped",
+ "procs": [
+  {
+   "pid": 0,
+   "created": 0,
+   "parent": 0,
+   "session": 0,
+   "image": "",
+   "path": null,
+   "cpu": [
+    60
+   ],
+   "ws_private": 10486,
+   "io": [
+    0
+   ],
+   "threads": 8,
+   "handles": 200
+  },
+  {
+   "pid": 4,
+   "created": 133500000000004000,
+   "parent": 0,
+   "session": 0,
+   "image": "System",
+   "path": "C:\\Windows\\System32\\ntoskrnl.exe",
+   "cpu": [
+    0.2
+   ],
+   "ws_private": 209715,
+   "io": [
+    5000
+   ],
+   "threads": 12,
+   "handles": 204
+  },
+  {
+   "pid": 1000,
+   "created": 133500000001000000,
+   "parent": 0,
+   "session": 1,
+   "image": "explorer.exe",
+   "path": "C:\\Windows\\explorer.exe",
+   "cpu": [
+    0.3
+   ],
+   "ws_private": 188743680,
+   "io": [
+    3000
+   ],
+   "threads": 14,
+   "handles": 210
+  },
+  {
+   "pid": 2000,
+   "created": 133500000002000000,
+   "parent": 1000,
+   "session": 1,
+   "image": "frozen.exe",
+   "path": "C:\\Program Files\\Frozen\\frozen.exe",
+   "cpu": [
+    0
+   ],
+   "ws_private": 230686720,
+   "io": [
+    0
+   ],
+   "threads": 13,
+   "handles": 220
+  },
+  {
+   "pid": 2010,
+   "created": 133500000002010000,
+   "parent": 2000,
+   "session": 1,
+   "image": "frozen.exe",
+   "path": "C:\\Program Files\\Frozen\\frozen.exe",
+   "cpu": [
+    0
+   ],
+   "ws_private": 83886080,
+   "io": [
+    0
+   ],
+   "threads": 9,
+   "handles": 230
+  },
+  {
+   "pid": 3000,
+   "created": 133500000003000000,
+   "parent": 1000,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\Orbit\\orbit.exe",
+   "cpu": [
+    1.5
+   ],
+   "ws_private": 157286400,
+   "io": [
+    9000
+   ],
+   "threads": 12,
+   "handles": 230
+  },
+  {
+   "pid": 7000,
+   "created": 133500000007000000,
+   "parent": 1000,
+   "session": 1,
+   "image": "syncer.exe",
+   "path": "C:\\Program Files\\Syncer\\syncer.exe",
+   "cpu": [
+    0.1
+   ],
+   "ws_private": 47185920,
+   "io": [
+    3000
+   ],
+   "threads": 8,
+   "handles": 270
+  }
+ ],
+ "windows": [
+  {
+   "pid": 1000,
+   "identity": "explorer-id"
+  },
+  {
+   "pid": 2000,
+   "identity": "frozen-id",
+   "hung": true
+  },
+  {
+   "pid": 3000,
+   "identity": "orbit-id"
+  }
+ ],
+ "names": {
+  "explorer-id": "File Explorer",
+  "frozen-id": "Frozen Notes",
+  "orbit-id": "Orbit",
+  "c:\\program files\\syncer\\syncer.exe": "Syncer"
+ },
+ "collapsed": {
+  "windows": false
+ }
+}

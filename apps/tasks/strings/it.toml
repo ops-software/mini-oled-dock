@@ -85,6 +85,7 @@
 "tasks.unavailable.denied" = "Windows non consente a {name} di leggerlo"
 "tasks.updated.text" = "{name} è stata aggiornata. Riavviala per usare la nuova versione."
 "tasks.updated.action" = "Riavvia"
+"tasks.updated.failed" = "Impossibile riavviare"
 "tasks.about.version" = "Versione {v}"
 "tasks.about.beta" = "Beta"
 "tasks.about.legal" = "Parte di mini-oled-dock. Licenza MIT."
@@ -111,3 +112,14 @@
 "tasks.keys.row_19" = "Passa tra le colonne e ordina"
 "tasks.keys.row_20" = "Chiudi il menu, cancella la ricerca, annulla la selezione, poi chiudi la finestra"
 "tasks.keys.row_21" = "Chiudi la finestra"
+
+# TA-T5b: cosa dice un lettore di schermo per una riga (T5.7)
+"tasks.a11y.row" = "{name}, CPU {cpu}, memoria {mem}, I/O {io}"
+"tasks.a11y.row_cpu" = "{name}, CPU {cpu}"
+"tasks.a11y.section" = "{section}, {n} elementi, {state}"
+"tasks.a11y.expanded" = "espansa"
+"tasks.a11y.collapsed" = "compressa"
+"tasks.a11y.unmeasured" = "non ancora misurato"
+"tasks.a11y.header_total" = "{label}, totale {total}"
+"tasks.more.options" = "Altre opzioni"
+"tasks.keys.menu_key" = "Tasto menu"

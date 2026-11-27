@@ -1,0 +1,43 @@
+{
+  "size": [760, 640],
+  "mode": "grouped",
+  "machine": {"logical_cpus": 16, "total_phys": 34359738368, "mem_load": 52, "commit_pct": 40, "cpu_pct": 18, "dpc_irq_pct": 1.4},
+  "ticks": 2,
+  "procs": [
+    {"pid": 0, "created": 0, "parent": 0, "session": 0, "image": "", "path": null, "cpu": [40], "ws_private": 10486, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 4, "created": 133500000000004000, "parent": 0, "session": 0, "image": "System", "path": "C:\\Windows\\System32\\ntoskrnl.exe", "cpu": [0.4], "ws_private": 209715, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 600, "created": 133500000000600000, "parent": 0, "session": 1, "image": "csrss.exe", "path": "C:\\Windows\\System32\\csrss.exe", "cpu": [0.2], "ws_private": 6291456, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 700, "created": 133500000000700000, "parent": 4, "session": 0, "image": "services.exe", "path": "C:\\Windows\\System32\\services.exe", "cpu": [0.05], "ws_private": 9437184, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 800, "created": 133500000000800000, "parent": 700, "session": 0, "image": "svchost.exe", "path": "C:\\Windows\\System32\\svchost.exe", "cpu": [0.6], "ws_private": 50331648, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 900, "created": 133500000000900000, "parent": 4, "session": 1, "image": "dwm.exe", "path": "C:\\Windows\\System32\\dwm.exe", "cpu": [1.2], "ws_private": 167772160, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 1000, "created": 133500000001000000, "parent": 0, "session": 1, "image": "explorer.exe", "path": "C:\\Windows\\explorer.exe", "cpu": [0.4], "ws_private": 220200960, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 2000, "created": 133500000002000000, "parent": 1000, "session": 1, "image": "orbit.exe", "path": "C:\\Program Files\\Orbit\\orbit.exe", "cpu": [2.2], "ws_private": 188743680, "io": [40000], "threads": 8, "handles": 150},
+    {"pid": 2100, "created": 133500000002100000, "parent": 2000, "session": 1, "image": "orbit.exe", "path": "C:\\Program Files\\Orbit\\orbit.exe", "cpu": [0.8], "ws_private": 100663296, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 2110, "created": 133500000002110000, "parent": 2100, "session": 1, "image": "orbit.exe", "path": "C:\\Program Files\\Orbit\\orbit.exe", "cpu": [0.1], "ws_private": 54525952, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 2200, "created": 133500000002200000, "parent": 2000, "session": 1, "image": "orbit.exe", "path": "C:\\Program Files\\Orbit\\orbit.exe", "cpu": [1.4], "ws_private": 73400320, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 3000, "created": 133500000003000000, "parent": 1000, "session": 1, "image": "ember.exe", "path": "C:\\Games\\Ember\\ember.exe", "cpu": [9], "ws_private": 2516582400, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 3100, "created": 133500000003100000, "parent": 3000, "session": 1, "image": "ember.exe", "path": "C:\\Games\\Ember\\ember.exe", "cpu": [1], "ws_private": 325058560, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 5000, "created": 133500000005000000, "parent": 1000, "session": 1, "image": "quill.exe", "path": "C:\\Program Files\\Quill\\quill.exe", "cpu": [0.5], "ws_private": 96468992, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 7000, "created": 133500000007000000, "parent": 1000, "session": 1, "image": "syncer.exe", "path": "C:\\Program Files\\Syncer\\syncer.exe", "cpu": [0.1], "ws_private": 47185920, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 7001, "created": 133500000007001000, "parent": 1000, "session": 1, "image": "syncer.exe", "path": "C:\\Program Files\\Syncer\\syncer.exe", "cpu": [0.1], "ws_private": 39845888, "io": [0], "threads": 8, "handles": 150},
+    {"pid": 7500, "created": 133500000007500000, "parent": 1000, "session": 1, "image": "notes.exe", "path": "C:\\Tools\\notes.exe", "cpu": [0.3], "ws_private": 12582912, "io": [0], "threads": 8, "handles": 150}
+  ],
+  "windows": [
+    {"pid": 1000, "identity": "explorer-id"},
+    {"pid": 2000, "identity": "orbit-id"},
+    {"pid": 3000, "identity": "ember-id"},
+    {"pid": 5000, "identity": "quill-id", "hung": true}
+  ],
+  "services": [
+    {"pid": 800, "name": "Audiosrv", "display": "Windows Audio"}
+  ],
+  "names": {
+    "explorer-id": "File Explorer",
+    "orbit-id": "Orbit",
+    "ember-id": "Ember",
+    "quill-id": "Quill",
+    "c:\\program files\\syncer\\syncer.exe": "Syncer",
+    "c:\\tools\\notes.exe": "Notes"
+  },
+  "collapsed": {"apps": false, "background": false, "windows": false}
+}
