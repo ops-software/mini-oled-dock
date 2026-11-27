@@ -1,0 +1,40 @@
+TabList
+  Tab "Documents" [focusable, selected]
+    Button "Close tab"
+  Tab "Pictures" [focusable]
+    Button "Close tab"
+  Tab "A folder with a name too long to fit its tab" [focusable]
+    Button "Close tab"
+  Tab "Downloads" [focusable]
+    Button "Close tab"
+  Button "New tab" [focusable]
+TabList
+  Tab "Archive" [focusable]
+    Button "Close tab"
+  Tab "Loading" [focusable, selected, busy]
+    Button "Close tab"
+  Tab "Unavailable" [focusable, invalid]
+    Button "Close tab"
+  Button "New tab" [focusable]
+TabList
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable]
+    Button "Close tab"
+  Tab "Project folder" [focusable, selected]
+    Button "Close tab"
+  Button "New tab" [focusable]

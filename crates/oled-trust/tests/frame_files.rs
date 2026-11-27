@@ -58,6 +58,7 @@ const KINDS: &[(&str, u16)] = &[
     ("ShellReq::QuickAccessPins", 0x0209),
     ("ShellReq::CancelGen", 0x020A),
     ("ShellReq::Bye", 0x020B),
+    ("ShellReq::TypeNames", 0x020C),
     ("ShellEvt::Ready", 0x0281),
     ("ShellEvt::MenuShown", 0x0282),
     ("ShellEvt::MenuDone", 0x0283),
@@ -71,6 +72,7 @@ const KINDS: &[(&str, u16)] = &[
     ("ShellEvt::Failed", 0x028B),
     ("ShellEvt::Busy", 0x028C),
     ("ShellEvt::ReqDone", 0x028D),
+    ("ShellEvt::TypeNames", 0x028E),
 ];
 
 /// A message of any of the five enums.
@@ -181,6 +183,7 @@ impl Msg {
                 ShellReq::QuickAccessPins { .. } => "ShellReq::QuickAccessPins",
                 ShellReq::CancelGen { .. } => "ShellReq::CancelGen",
                 ShellReq::Bye => "ShellReq::Bye",
+                ShellReq::TypeNames { .. } => "ShellReq::TypeNames",
             },
             Msg::ShellEvt(m) => match m {
                 ShellEvt::Ready { .. } => "ShellEvt::Ready",
@@ -196,6 +199,7 @@ impl Msg {
                 ShellEvt::Failed { .. } => "ShellEvt::Failed",
                 ShellEvt::Busy { .. } => "ShellEvt::Busy",
                 ShellEvt::ReqDone { .. } => "ShellEvt::ReqDone",
+                ShellEvt::TypeNames { .. } => "ShellEvt::TypeNames",
             },
         }
     }
@@ -305,9 +309,17 @@ const VERBS: [Verb; 8] = [
 const CANON: [CanonVerb; 6] =
     [CanonVerb::Delete, CanonVerb::Cut, CanonVerb::Copy, CanonVerb::Paste, CanonVerb::PasteLink, CanonVerb::Rename];
 
-/// One sample or more of every variant, with every value of every nested enum somewhere among them. The frozen v1
-/// bytes are these samples encoded in this order: never edit or reorder them.
+/// One sample or more of every variant, with every value of every nested enum somewhere among them: the variants of
+/// version 1, then the ones version 2 added.
 fn samples() -> Vec<Msg> {
+    let mut v = samples_v1();
+    v.extend(samples_v2());
+    v
+}
+
+/// One sample or more of every variant of version 1. The frozen v1 bytes are these samples encoded in this order:
+/// never edit or reorder them.
+fn samples_v1() -> Vec<Msg> {
     let a = p(r"C:\data\report.txt");
     let dir = p(r"C:\data");
     let unc = p(r"\\server\share\folder");
@@ -489,6 +501,28 @@ fn samples() -> Vec<Msg> {
         Msg::ShellEvt(ShellEvt::ReqDone { req: ReqId(9) }),
     ]);
     v
+}
+
+/// One sample or more of every variant SHELL version 2 added (type names). The frozen v2 bytes are these samples
+/// encoded in this order: never edit or reorder them.
+fn samples_v2() -> Vec<Msg> {
+    let accented: Box<str> = "\u{e9}t\u{e9}".into();
+    vec![
+        Msg::ShellReq(ShellReq::TypeNames { req: ReqId(10), exts: vec!["txt".into(), "pdf".into(), accented.clone()] }),
+        Msg::ShellReq(ShellReq::TypeNames { req: ReqId(11), exts: vec![] }),
+        Msg::ShellEvt(ShellEvt::TypeNames {
+            req: ReqId(10),
+            names: vec![
+                TypeName { ext: "txt".into(), name: "Text Document".into() },
+                TypeName { ext: "pdf".into(), name: "PDF File".into() },
+                TypeName { ext: accented, name: "\u{c9}T\u{c9} File".into() },
+            ],
+        }),
+        Msg::ShellEvt(ShellEvt::TypeNames {
+            req: ReqId(11),
+            names: vec![TypeName { ext: "".into(), name: "File".into() }],
+        }),
+    ]
 }
 
 /// A frame with the given kind and payload, built by hand.
@@ -699,6 +733,81 @@ fn ext_is_lower_case_without_a_dot() {
         types: vec![ShellNewType { ext: ".txt".into(), label: "Text".into() }],
     });
     assert_eq!(decode::<ShellEvt>(&new.frame()), Err(FrameError::Invalid { field: "ShellNewType.ext" }));
+    // Type names (SHELL 2) key their extensions the same way, both ways.
+    let type_names = |e: &str| Msg::ShellReq(ShellReq::TypeNames { req: ReqId(1), exts: vec!["txt".into(), e.into()] });
+    let type_name = |e: &str| {
+        Msg::ShellEvt(ShellEvt::TypeNames { req: ReqId(1), names: vec![TypeName { ext: e.into(), name: "x".into() }] })
+    };
+    for bad in [".txt", "t.xt", "TXT", "a\\b", "a/b", "a\u{1}"] {
+        assert_eq!(
+            decode::<ShellReq>(&type_names(bad).frame()),
+            Err(FrameError::Invalid { field: "TypeNames.exts" }),
+            "{bad:?}"
+        );
+        assert_eq!(
+            decode::<ShellEvt>(&type_name(bad).frame()),
+            Err(FrameError::Invalid { field: "TypeName.ext" }),
+            "{bad:?}"
+        );
+    }
+    for good in ["txt", "", "\u{e9}t\u{e9}", "7z", &long[1..]] {
+        assert!(decode::<ShellReq>(&type_names(good).frame()).is_ok(), "{good:?}");
+        assert!(decode::<ShellEvt>(&type_name(good).frame()).is_ok(), "{good:?}");
+    }
+    assert_eq!(
+        decode::<ShellReq>(&type_names(&long).frame()),
+        Err(FrameError::Cap { field: "TypeNames.exts", len: 65, max: 64 })
+    );
+}
+
+#[test]
+fn type_names_request_holds_at_most_256_exts() {
+    let req = |n: usize| ShellReq::TypeNames { req: ReqId(1), exts: (0..n).map(|i| format!("e{i}").into()).collect() };
+    let m = req(256);
+    let f = Msg::ShellReq(m.clone()).frame();
+    assert_eq!(decode::<ShellReq>(&f), Ok((m, f.len())));
+    let f = Msg::ShellReq(req(257)).frame();
+    assert_eq!(decode::<ShellReq>(&f), Err(FrameError::Cap { field: "TypeNames.exts", len: 257, max: 256 }));
+}
+
+#[test]
+fn type_names_reply_is_never_empty() {
+    let empty = payload(|wr| {
+        wr.u32(4);
+        wr.u32(0);
+    });
+    assert_eq!(decode::<ShellEvt>(&raw(0x028E, &empty)), Err(FrameError::Invalid { field: "TypeNames.names" }));
+    // The same bytes under Pins' kind, one bit away, are an empty Pins, as version 1 decodes them: so an empty
+    // TypeNames is never sent and never decoded, and no flip turns one kind into the other.
+    assert_eq!(decode::<ShellEvt>(&raw(0x028A, &empty)), Ok((ShellEvt::Pins { req: ReqId(4), pins: vec![] }, 14)));
+    assert_eq!((0x028E_u16 ^ 0x028A).count_ones(), 1);
+}
+
+/// SHELL 2's kinds are one bit from kinds of version 1 (0x020C from ShellNewTypes 0x0208 and RunTyped 0x0204; 0x028E
+/// from Busy 0x028C, Pins 0x028A and Icon 0x0286), so their payloads keep them apart: every single-bit flip of a
+/// TypeNames frame's kind, and every flip of any sample's kind onto a TypeNames kind, is refused by every decoder.
+#[test]
+fn no_bit_flip_crosses_type_names() {
+    const NEW: [u16; 2] = [0x020C, 0x028E];
+    let mut checked = 0;
+    for m in samples() {
+        let f = m.frame();
+        let kind = m.kind();
+        for bit in 0..16 {
+            let flipped = kind ^ (1 << bit);
+            if !NEW.contains(&kind) && !NEW.contains(&flipped) {
+                continue;
+            }
+            let mut g = f.clone();
+            g[4..6].copy_from_slice(&flipped.to_le_bytes());
+            for (name, _, _, dec, _) in ENUMS {
+                let got = dec(&g);
+                assert!(got.is_err(), "{} with kind bit {bit} flipped decodes through {name}: {got:?}", m.name());
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 4 * 16, "{checked} flips checked");
 }
 
 #[test]
@@ -767,6 +876,8 @@ fn string_fields_keep_their_caps() {
     );
     let new_type = |s: String| ShellNewType { ext: "txt".into(), label: s.into() };
     cap(|s| Msg::ShellEvt(ShellEvt::ShellNew { req: ReqId(1), types: vec![new_type(s)] }), "ShellNewType.label", 512);
+    let type_name = |s: String| TypeName { ext: "txt".into(), name: s.into() };
+    cap(|s| Msg::ShellEvt(ShellEvt::TypeNames { req: ReqId(1), names: vec![type_name(s)] }), "TypeName.name", 260);
     // A PIDL hand-off is at most 64 KiB.
     let stage = |n: usize| Msg::OpReq(OpReq::Stage { op: OpId(1), items: vec![ItemRef::Pidl(vec![0; n].into())] });
     assert!(stage(65_536).decode_as(&stage(65_536).frame()).is_ok());
@@ -872,12 +983,14 @@ fn list_frames_are_fixed_plus_count_plus_elements() {
             Msg::ShellEvt(ShellEvt::Modern { items, .. }) => (5, total(items)),
             Msg::ShellEvt(ShellEvt::ShellNew { types, .. }) => (4, total(types)),
             Msg::ShellEvt(ShellEvt::Pins { pins, .. }) => (4, total(pins)),
+            Msg::ShellReq(ShellReq::TypeNames { exts, .. }) => (4, total(exts)),
+            Msg::ShellEvt(ShellEvt::TypeNames { names, .. }) => (4, total(names)),
             _ => continue,
         };
         assert_eq!(m.frame().len() - HEADER_LEN, fixed + 4 + elems, "{}", m.name());
         seen.insert(m.name());
     }
-    assert_eq!(seen.len(), 12);
+    assert_eq!(seen.len(), 14);
 }
 
 /// wire_len (FZ2) against the encoder, element by element: a frame with one element minus the same frame empty.
@@ -901,6 +1014,7 @@ fn wire_len_equals_the_encoded_length() {
     let mut types = vec![ShellNewType { ext: "x".repeat(64).into(), label: "\u{e9}".repeat(256).into() }];
     let mut pins = vec![d1.clone()];
     let mut exts: Vec<Box<str>> = vec!["x".repeat(64).into()];
+    let mut type_names = vec![TypeName { ext: "x".repeat(64).into(), name: "\u{e9}".repeat(130).into() }];
     for m in samples() {
         match m {
             Msg::OpReq(OpReq::Stage { items: v, .. }) | Msg::ShellReq(ShellReq::Menu { items: v, .. }) => {
@@ -913,7 +1027,9 @@ fn wire_len_equals_the_encoded_length() {
             Msg::ShellEvt(ShellEvt::Modern { items: v, .. }) => modern.extend(v),
             Msg::ShellEvt(ShellEvt::ShellNew { types: v, .. }) => types.extend(v),
             Msg::ShellEvt(ShellEvt::Pins { pins: v, .. }) => pins.extend(v),
-            Msg::ShellReq(ShellReq::ClassIcons { exts: v, .. }) => exts.extend(v),
+            Msg::ShellReq(ShellReq::ClassIcons { exts: v, .. })
+            | Msg::ShellReq(ShellReq::TypeNames { exts: v, .. }) => exts.extend(v),
+            Msg::ShellEvt(ShellEvt::TypeNames { names: v, .. }) => type_names.extend(v),
             _ => {}
         }
     }
@@ -926,6 +1042,8 @@ fn wire_len_equals_the_encoded_length() {
     each(&types, |v| Msg::ShellEvt(ShellEvt::ShellNew { req: ReqId(1), types: v }));
     each(&pins, |v| Msg::ShellEvt(ShellEvt::Pins { req: ReqId(1), pins: v }));
     each(&exts, |v| Msg::ShellReq(ShellReq::ClassIcons { req: ReqId(1), exts: v, px: 16 }));
+    each(&exts, |v| Msg::ShellReq(ShellReq::TypeNames { req: ReqId(1), exts: v }));
+    each(&type_names, |v| Msg::ShellEvt(ShellEvt::TypeNames { req: ReqId(1), names: v }));
 }
 
 // ---- byte-split list frames (2.2's splitting rules)
@@ -1121,6 +1239,28 @@ fn pins_and_shell_new_split() {
 }
 
 #[test]
+fn type_names_split() {
+    // 2,048 names of the longest extension and name: a frame's count cap, and still within its bytes (2,048 x 332
+    // bytes), so the count splits a TypeNames list before the bytes would.
+    let names: Vec<TypeName> = (0..MAX_LIST as usize)
+        .map(|i| TypeName { ext: format!("{i:064}").into(), name: format!("{}{i:012}", "n".repeat(248)).into() })
+        .collect();
+    assert!(names.iter().all(|t| t.ext.len() == 64 && t.name.len() == 260 && t.wire_len() == 332));
+    let wrap = |v: Vec<TypeName>, _: bool| Msg::ShellEvt(ShellEvt::TypeNames { req: ReqId(7), names: v });
+    let unwrap = |m: Msg, _: bool| match m {
+        Msg::ShellEvt(ShellEvt::TypeNames { names, .. }) => names,
+        m => panic!("{m:?}"),
+    };
+    assert_eq!(split_round_trip(&names, 4, wrap, unwrap), 1, "2,048 names of 260 bytes fit one frame");
+    let twice: Vec<TypeName> = names.iter().chain(&names).cloned().collect();
+    assert_eq!(split_round_trip(&twice, 4, wrap, unwrap), 2, "the count cap splits");
+    // Names of four-byte characters: 260 bytes are 65 of them.
+    let wide: Vec<TypeName> =
+        (0..MAX_LIST).map(|i| TypeName { ext: format!("e{i}").into(), name: "\u{1F600}".repeat(65).into() }).collect();
+    assert_eq!(split_round_trip(&wide, 4, wrap, unwrap), 1);
+}
+
+#[test]
 fn whole_frames_report_too_long() {
     let _one = deep_lock();
     let base = deep_base();
@@ -1186,19 +1326,37 @@ fn one_element_always_fits() {
 
 /// The build id of the frozen Hello frames (any id decodes: it is logged, never compared).
 const FROZEN_BUILD: [u8; 16] = *b"frozen-v1\0\0\0\0\0\0\0";
+const FROZEN_BUILD_V2: [u8; 16] = *b"frozen-v2\0\0\0\0\0\0\0";
+/// The protocols as they are now.
 const PROTOS: [Proto; 3] = [OPS, SHELL, INSTANCE];
+/// The protocols as version 1 froze them: SHELL was version 1 then.
+const PROTOS_V1: [Proto; 3] = [OPS, Proto { version: 1, ..SHELL }, INSTANCE];
 
 fn v1_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/frames/files-v1.bin")
 }
 
-/// The Hello of each protocol, then every sample in order.
+fn v2_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/frames/files-v2.bin")
+}
+
+/// The version-1 Hello of each protocol, then every version-1 sample in order.
 fn v1_stream() -> Vec<u8> {
     let mut out = Vec::new();
-    for p in &PROTOS {
+    for p in &PROTOS_V1 {
         encode_hello(p, FROZEN_BUILD, &mut out);
     }
-    for m in samples() {
+    for m in samples_v1() {
+        m.encode(&mut out).unwrap();
+    }
+    out
+}
+
+/// SHELL's version-2 Hello, then every sample of the kinds version 2 added, in order.
+fn v2_stream() -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_hello(&SHELL, FROZEN_BUILD_V2, &mut out);
+    for m in samples_v2() {
         m.encode(&mut out).unwrap();
     }
     out
@@ -1218,6 +1376,19 @@ fn write_frames_v1() {
     std::fs::write(&path, v1_stream()).unwrap();
 }
 
+/// Writes files-v2.bin: once, when version 2 of the shell protocol is frozen, and never again.
+#[test]
+#[ignore = "writes tests/fixtures/frames/files-v2.bin: UPDATE_FRAMES=1, once"]
+fn write_frames_v2() {
+    if std::env::var("UPDATE_FRAMES").as_deref() != Ok("1") {
+        eprintln!("UPDATE_FRAMES is not 1: nothing written");
+        return;
+    }
+    let path = v2_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, v2_stream()).unwrap();
+}
+
 #[test]
 fn frozen_bytes_v1() {
     let bytes = std::fs::read(v1_path()).expect("tests/fixtures/frames/files-v1.bin");
@@ -1225,16 +1396,49 @@ fn frozen_bytes_v1() {
     asm.push(&bytes);
     let frames: Vec<Vec<u8>> = std::iter::from_fn(|| asm.next_frame().unwrap()).collect();
     assert_eq!(frames.concat(), bytes, "the file is whole frames and nothing else");
-    let samples = samples();
-    assert_eq!(frames.len(), PROTOS.len() + samples.len());
-    for (f, p) in frames.iter().zip(&PROTOS) {
-        let hello = Hello { magic: p.magic, proto: p.version, build: FROZEN_BUILD };
-        assert_eq!(decode_hello(p, f), Ok((hello, f.len())));
+    let samples = samples_v1();
+    assert_eq!(frames.len(), PROTOS_V1.len() + samples.len());
+    for (f, (v1, now)) in frames.iter().zip(PROTOS_V1.iter().zip(&PROTOS)) {
+        let hello = Hello { magic: v1.magic, proto: v1.version, build: FROZEN_BUILD };
+        assert_eq!(decode_hello(v1, f), Ok((hello, f.len())));
         let mut again = Vec::new();
-        encode_hello(p, FROZEN_BUILD, &mut again);
+        encode_hello(v1, FROZEN_BUILD, &mut again);
         assert_eq!(&again, f);
+        // Today: a protocol still at version 1 accepts its v1 Hello; one at a later version refuses it.
+        let want = if now.version == v1.version {
+            Ok((hello, f.len()))
+        } else {
+            Err(FrameError::BadProto { got: v1.version, want: now.version })
+        };
+        assert_eq!(decode_hello(now, f), want);
     }
-    for (f, m) in frames[PROTOS.len()..].iter().zip(&samples) {
+    // SHELL is version 2: a v1 shell host or client is refused at its Hello, so nothing else on that stream is
+    // decoded; OPS and INSTANCE are still version 1.
+    assert_eq!(decode_hello(&SHELL, &frames[1]), Err(FrameError::BadProto { got: 1, want: 2 }));
+    assert_eq!(decode_hello(&OPS, &frames[0]).map(|(h, _)| h.proto), Ok(1));
+    assert_eq!(decode_hello(&INSTANCE, &frames[2]).map(|(h, _)| h.proto), Ok(1));
+    // Version 2 only added kinds: every v1 frame still decodes and encodes to its frozen bytes.
+    for (f, m) in frames[PROTOS_V1.len()..].iter().zip(&samples) {
+        assert_eq!(Msg::decode_any(f), Ok((m.clone(), f.len())), "{}", m.name());
+        assert_eq!(&m.frame(), f, "{} encodes to its frozen bytes", m.name());
+    }
+}
+
+#[test]
+fn frozen_bytes_v2() {
+    let bytes = std::fs::read(v2_path()).expect("tests/fixtures/frames/files-v2.bin");
+    let mut asm = Assembler::new(SHELL.max_payload);
+    asm.push(&bytes);
+    let frames: Vec<Vec<u8>> = std::iter::from_fn(|| asm.next_frame().unwrap()).collect();
+    assert_eq!(frames.concat(), bytes, "the file is whole frames and nothing else");
+    let samples = samples_v2();
+    assert_eq!(frames.len(), 1 + samples.len());
+    let hello = Hello { magic: SHELL.magic, proto: 2, build: FROZEN_BUILD_V2 };
+    assert_eq!(decode_hello(&SHELL, &frames[0]), Ok((hello, frames[0].len())));
+    let mut again = Vec::new();
+    encode_hello(&SHELL, FROZEN_BUILD_V2, &mut again);
+    assert_eq!(again, frames[0]);
+    for (f, m) in frames[1..].iter().zip(&samples) {
         assert_eq!(Msg::decode_any(f), Ok((m.clone(), f.len())), "{}", m.name());
         assert_eq!(&m.frame(), f, "{} encodes to its frozen bytes", m.name());
     }

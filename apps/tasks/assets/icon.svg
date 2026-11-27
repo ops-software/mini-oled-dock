@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- The tasks app's icon, 256 px master. The dock's black tile (8 px margin, radius 52.8) with its 2 px #3A3A3A rim,
+       no screen outline, and a white trace of five square-cornered bars (16 px stroke) that rises in three steps from
+       bottom left to top right (the "load" sign). tools/make-icon.ps1 -Variant tasks draws the same geometry per size
+       into apps/tasks/assets/tasks.ico; keep both in sync. -->
+  <rect x="8" y="8" width="240" height="240" rx="52.8" fill="#3A3A3A"/>
+  <rect x="10" y="10" width="236" height="236" rx="50.8" fill="#000000"/>
+  <rect x="56" y="176" width="53" height="16" fill="#FFFFFF"/>
+  <rect x="109" y="128" width="16" height="64" fill="#FFFFFF"/>
+  <rect x="109" y="128" width="48" height="16" fill="#FFFFFF"/>
+  <rect x="157" y="80" width="16" height="64" fill="#FFFFFF"/>
+  <rect x="157" y="80" width="43" height="16" fill="#FFFFFF"/>
+</svg>

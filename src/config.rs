@@ -7,12 +7,19 @@
 //!
 //! Command-line options override the config ONLY through the `effective_*` functions.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
 
+#[cfg(test)]
+use oled_config::Options;
+use oled_config::{
+    options, Cond, ConfigError, Control, FileKind, FileSpec, Kept, Kind, LoadOutcome, MigrateError, PageId, Problem,
+    Range, Reload, Scope, SecId, Store, Unit, ValueType,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::i18n::{k, t};
 
 /// `Config::monitor` value meaning "follow the pointer": the Win key brings the bar to the display
 /// under the mouse pointer (Settings -> Screen -> "Pointer").
@@ -494,6 +501,13 @@ pub(crate) const LAUNCHER_PREFIXES: [(&str, &str); 8] = [
     ("file ", "files"),
 ];
 
+/// The values of the launcher's closed lists, the default first.
+const LAUNCHER_CHORDS: [&str; 3] = ["off", "alt+space", "alt+shift+space"];
+const LAUNCHER_WITH_POWERTOYS: [&str; 2] = ["yield", "take"];
+const LAUNCHER_MONITORS: [&str; 3] = ["pointer", "active", "primary"];
+const LAUNCHER_OVER_FULLSCREEN: [&str; 2] = ["pass", "open"];
+const LAUNCHER_WEB_ENGINES: [&str; 4] = ["google", "bing", "duckduckgo", "custom"];
+
 /// `launcher` section of the config (SPEC-launcher 5.6). Plain data: nothing here names a program, a path or a verb.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -593,10 +607,10 @@ impl LauncherConfig {
     /// Brings every key into its closed list or range and returns one message per fix. Never runs anything.
     pub fn sanitize(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        fix_choice(&mut self.chord, &["off", "alt+space", "alt+shift+space"], "off", "chord", &mut out);
-        fix_choice(&mut self.with_powertoys, &["yield", "take"], "yield", "with_powertoys", &mut out);
-        fix_choice(&mut self.monitor, &["pointer", "active", "primary"], "pointer", "monitor", &mut out);
-        fix_choice(&mut self.over_fullscreen, &["pass", "open"], "pass", "over_fullscreen", &mut out);
+        fix_choice(&mut self.chord, &LAUNCHER_CHORDS, "off", "chord", &mut out);
+        fix_choice(&mut self.with_powertoys, &LAUNCHER_WITH_POWERTOYS, "yield", "with_powertoys", &mut out);
+        fix_choice(&mut self.monitor, &LAUNCHER_MONITORS, "pointer", "monitor", &mut out);
+        fix_choice(&mut self.over_fullscreen, &LAUNCHER_OVER_FULLSCREEN, "pass", "over_fullscreen", &mut out);
         let (lo, hi, _) = LAUNCHER_TOP_PERCENT;
         let v = self.top_percent.clamp(lo, hi);
         if v != self.top_percent {
@@ -669,7 +683,7 @@ impl LauncherConfig {
             out.push(format!("launcher.aliases: {over} entries over a cap dropped"));
         }
         // web: a custom template must pass the validator, else Google
-        fix_choice(&mut self.web_engine, &["google", "bing", "duckduckgo", "custom"], "google", "web_engine", &mut out);
+        fix_choice(&mut self.web_engine, &LAUNCHER_WEB_ENGINES, "google", "web_engine", &mut out);
         if self.web_engine == "custom" {
             if let Err(why) = crate::launcher::web::validate_template(&self.web_url) {
                 out.push(format!("launcher.web_url: {why}, using google"));
@@ -723,144 +737,1344 @@ pub struct StartFolder {
     pub apps: Vec<String>,
 }
 
-/// Contents of `config.json`. Missing fields = defaults (`#[serde(default)]`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(default)]
-pub struct Config {
-    /// Language of the dock: "auto" (Windows display language), "en" or "it" (`i18n`).
-    pub language: Language,
-    pub position: Position,
-    /// Display the bar sits on: empty = the primary monitor (default), otherwise a GDI device name
-    /// such as "\\.\DISPLAY2". A display that is not connected falls back to the primary one.
-    /// `MONITOR_POINTER` ("pointer") = the Win key brings the bar to the display under the pointer.
-    pub monitor: String,
-    pub autohide: bool,
-    /// Auto-hide: ms the pointer may be off the bar before it hides, 0..=5000 (`HIDE_DELAY_RANGE`).
-    /// A missing key reads 2500; a fresh install writes 1000.
-    pub hide_delay_ms: u32,
-    /// Auto-hide: ms the pointer rests at the screen edge before the bar shows, 0..=1000.
-    pub show_delay_ms: u32,
-    /// How the hidden bar is revealed at the edge.
-    pub reveal: Reveal,
-    /// Push reveal: raw pointer counts within one second that count as a push, 20..=1000.
-    pub push_threshold: u32,
-    /// Owned keyboard chords.
-    pub keyboard: KeyboardConfig,
-    /// true once the privacy-indicator migration (`migrate_privacy`) has run for this file. A file without
-    /// the key reads false (so the migration runs); a config built in memory has nothing to migrate.
-    #[serde(default = "no_privacy_migration_yet")]
-    pub tray_privacy_migrated: bool,
-    /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
-    /// (`picker`). false = no hover timer is armed and no picker window is ever created.
-    pub window_previews: bool,
-    /// Every Win tap opens / closes the Start menu together with the bar, as one show/hide
-    /// animation (`ui::start_with_bar`). false = the original behaviour: Win toggles the bar,
-    /// double tap = Start.
-    pub win_opens_start: bool,
-    pub hide_native_taskbar: bool,
-    pub pinned: Vec<PinnedApp>,
-    /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
-    /// in order: AppsFolder ids (`shell_thread::StartApp::id`). Separate from the bar's `pinned`.
-    pub start_pins: Vec<String>,
-    /// Folders of that pinned grid: each groups some of the `start_pins` under one tile, shown where
-    /// its first pinned app is. An app listed here but not pinned is ignored.
-    pub start_folders: Vec<StartFolder>,
-    /// Layout of that Start menu: "compact" (default) or "windows11" (`StartStyle`).
-    pub start_style: StartStyle,
-    /// Windows 11 layout: "All apps" as a grid of icons instead of a list.
-    pub start_grid: bool,
-    /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
-    /// value = name to show.
-    pub names: BTreeMap<String, String>,
-    pub show_date: bool,
-    pub show_volume_percent: bool,
-    /// hosts the tray icons of other apps in the dock (`tray_host`). false = never started.
-    pub show_tray: bool,
-    /// true = every tray icon is shown in the bar and `tray_hidden` is ignored (kept in the file untouched, so
-    /// switching this off brings the earlier choices back). Default: false.
-    pub tray_show_all: bool,
-    /// Per-module visibility of the system modules (see `MODULE_NAMES` / `module_visible`).
-    /// A hidden module is not laid out and costs nothing: no timer, no polling, nothing loaded.
-    pub show_notifications: bool,
-    pub show_volume: bool,
-    /// Network module: Wi-Fi / ethernet glyph with internet state, popup with the details (`net`).
-    pub show_network: bool,
-    /// CPU / RAM usage module (`metrics`).
-    pub show_metrics: bool,
-    /// Battery module: "auto" (only on a laptop) | true | false (`BatteryShow`).
-    pub show_battery: BatteryShow,
-    /// Battery module: show the charge percentage.
-    pub battery_percent: bool,
-    /// Battery module: put the percentage inside the battery body instead of beside it.
-    pub battery_percent_inside: bool,
-    pub show_clock: bool,
-    pub show_desktop_button: bool,
-    /// Start button: fixed item at the left end of the bar (not a movable module); see `module_visible("start")`.
-    pub show_start_button: bool,
-    /// Entry display: "icon_text" | "icon" | "text".
-    pub display_mode: DisplayMode,
-    /// Legacy "small" | "medium" | "large": migrated to the four sizes below when read, never written.
-    #[serde(skip_serializing)]
-    pub bar_size: Option<BarSize>,
-    /// App icon side, logical px (`APP_ICON_SIZE`).
-    pub app_icon_size: u8,
-    /// App name text height, logical px (`APP_TEXT_SIZE`).
-    pub app_text_size: u8,
-    /// Tray icon side, logical px (`TRAY_ICON_SIZE`).
-    pub tray_icon_size: u8,
-    /// Scale of the system modules in percent (`MODULE_SIZE`).
-    pub module_size: u8,
-    /// Background colour of the bar and the popups ("#RRGGBB").
-    pub background: Background,
-    /// Opacity of the bar and popup backgrounds in percent (0..=100; text and icons stay fully opaque).
-    pub bar_opacity: u8,
-    /// Size of the Settings window in logical pixels (96 DPI), [width, height]. Use `settings_size`.
-    pub settings_window_size: [u16; 2],
-    /// Clock picture for GetTimeFormatEx (default "HH:mm").
-    pub time_format: String,
-    /// If true and `time_format` has no "s", ":ss" is appended.
-    pub show_seconds: bool,
-    /// Date picture for GetDateFormatEx (default "ddd d MMM"; empty = no date).
-    pub date_format: String,
-    /// GUIDs (lowercase, no braces) of the system tray icons NOT to show
-    /// (they keep being answered and forwarded to Explorer).
-    pub tray_hidden_guids: Vec<String>,
-    /// Tray icons the user chose as "not in the bar" (they stay in the chevron popup).
-    /// Per-icon key (`tray_host::item_keys`): lowercase GUID without braces if the icon has one,
-    /// otherwise `<lowercase exe name>|<n>` (e.g. "discord.exe|0"), n = the icon's 0-based place among that
-    /// exe's icons without a GUID. The `<exe>#<uID>` keys of releases before 1.5.1 are rewritten when the exe's
-    /// icons register (`tray_host::key::migrate`). Default: empty.
-    pub tray_hidden: Vec<String>,
-    /// Relative order of the app entries that are NOT pinned (their keys). Pinned entries use the
-    /// `pinned` array order. Apps missing from the list go last, in the order they were first seen.
-    /// Written when the user drags an entry; capped at `APP_ORDER_CAP` keys.
-    pub app_order: Vec<String>,
-    /// Order of the tray icons (same key as `tray_hidden`). Unknown icons go last, in registration order.
-    pub tray_order: Vec<String>,
-    /// Order of the system modules: "metrics", "notifications", "network", "volume", "clock",
-    /// "show_desktop", "power". Validated on use (`render::modules_from_names`): unknown names are
-    /// ignored, a missing module goes back next to its default neighbour.
-    pub modules_order: Vec<String>,
-    /// Layout of the volume popup (`AudioLayout`): section order, expanded / collapsed and hidden.
-    /// Written as a short string, e.g. "MOSX" (the default).
-    pub audio_layout: AudioLayout,
-    /// true once the `notif` thread has already asked for notification access once
-    /// (`RequestAccessAsync`): the prompt is not shown again on every start.
-    pub notif_prompted: bool,
-    /// true = once a day ask GitHub whether a newer release exists (badge only).
-    pub update_check: bool,
-    /// true = also download, verify and install a new release by itself when it is quiet.
-    pub update_auto_install: bool,
-    /// Internal: UTC time (RFC 3339) of the last successful update check, "" = never.
-    pub last_update_check: String,
-    /// Internal: tag of the newest release found by the last check, "" = none.
-    pub update_available: String,
-    /// The launcher (Alt+Space style search box); off until a chord is set.
-    pub launcher: LauncherConfig,
-    /// Top-level keys this release does not know, kept verbatim so that an older release does not erase
-    /// a newer one's settings; never shown in Settings. Read by `parse`, written last by `render`.
-    #[serde(skip)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+// The kinds of the fields shown in Settings (`Descriptor::kind`).
+impl Kind for Language {
+    const KIND: ValueType = ValueType::Enum;
+}
+
+impl Kind for Position {
+    const KIND: ValueType = ValueType::Enum;
+}
+
+impl Kind for DisplayMode {
+    const KIND: ValueType = ValueType::Enum;
+}
+
+impl Kind for Reveal {
+    const KIND: ValueType = ValueType::Enum;
+}
+
+impl Kind for StartStyle {
+    const KIND: ValueType = ValueType::Enum;
+}
+
+impl Kind for BatteryShow {
+    const KIND: ValueType = ValueType::Enum;
+}
+
+impl Kind for Background {
+    const KIND: ValueType = ValueType::Color;
+}
+
+impl Kind for KeyboardConfig {
+    const KIND: ValueType = ValueType::Object;
+}
+
+impl Kind for LauncherConfig {
+    const KIND: ValueType = ValueType::Object;
+}
+
+/// The first two lines of the auto-hide guide (`timing_guide`): the two delays, the value a fresh install writes and
+/// the value of a missing key in one sentence.
+macro_rules! timing_guide_head {
+    () => {
+        "Auto-hide timing (ms): show_delay_ms 0-1000 at the screen edge (default 150),\n\
+         hide_delay_ms 0-5000 after the pointer leaves the bar (a new install writes 1000; a missing key reads 2500).\n"
+    };
+}
+
+/// The guide line of `reveal` and `push_threshold` (`reveal_guide`): while the Push reveal is not shipped nothing reads
+/// the two keys.
+macro_rules! reveal_guide_line {
+    (true) => {
+        "reveal: \"dwell\" (rest the pointer at the edge) or \"push\" \
+         (push against the edge, push_threshold 20-1000 counts)."
+    };
+    (false) => {
+        "reveal and push_threshold are not used yet: the bar always shows on a rest at the edge. \
+         The keys stay for a later release."
+    };
+}
+
+/// The guide line of `reveal` and `push_threshold`, as the file writes it (`timing_guide`'s last line).
+#[cfg(test)]
+fn reveal_guide(push_available: bool) -> &'static str {
+    if push_available {
+        reveal_guide_line!(true)
+    } else {
+        reveal_guide_line!(false)
+    }
+}
+
+/// The guide above `show_delay_ms`, `hide_delay_ms`, `reveal` and `push_threshold`.
+fn timing_guide(push_available: bool) -> &'static str {
+    if push_available {
+        concat!(timing_guide_head!(), reveal_guide_line!(true))
+    } else {
+        concat!(timing_guide_head!(), reveal_guide_line!(false))
+    }
+}
+
+options! {
+    /// Contents of `config.json`. Missing fields = defaults (`#[serde(default)]`). Declared once: the struct in its
+    /// field order (serde's, so the snapshots'), and per field its place in the written file (`slot`), how it is
+    /// written, its guide and, for an option Settings shows, its descriptor.
+    #[derive(Eq)]
+    pub struct Config(
+        file: "config.json",
+        version: 1,
+        mark: TEMPLATE_MARK,
+        header: HEADER,
+        migrations: &[migrate_v0],
+    ) {
+        /// Language of the dock: "auto" (Windows display language), "en" or "it" (`i18n`).
+        pub language: Language = Language::Auto => {
+            json: "language",
+            slot: 0,
+            fmt: Js,
+            gap: false,
+            guide: "Language of the dock: \"auto\" (follows the Windows display language), \"en\" or \"it\".\n\
+                 Also sets the language of the clock, date and calendar names. Normally chosen in Settings.",
+            since: 1,
+            reason: "The dock speaks English or Italian whatever the Windows display language is.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("language"),
+                order: 7,
+                control: Control::Segmented(&[(|| t(k::SETTINGS_PAGES_SYSTEM), "auto"), (|| "English", "en"), (|| "Italiano", "it")]),
+                label: || t(k::SETTINGS_PAGES_LANGUAGE),
+                help: || "",
+                glyph: "globe_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        pub position: Position = Position::Bottom => {
+            json: "position",
+            slot: 1,
+            fmt: Js,
+            gap: true,
+            guide: "Where the bar sits on screen: \"top\" or \"bottom\".",
+            since: 1,
+            reason: "Some people want the bar at the top of the screen.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("position"),
+                order: 1,
+                control: Control::Segmented(&[(|| t(k::SETTINGS_PAGES_TOP), "top"), (|| t(k::SETTINGS_PAGES_BOTTOM), "bottom")]),
+                label: || t(k::SETTINGS_PAGES_POSITION),
+                help: || "",
+                glyph: "bar_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Display the bar sits on: empty = the primary monitor (default), otherwise a GDI device name
+        /// such as "\\.\DISPLAY2". A display that is not connected falls back to the primary one.
+        /// `MONITOR_POINTER` ("pointer") = the Win key brings the bar to the display under the pointer.
+        pub monitor: String = String::new() => {
+            json: "monitor",
+            slot: 2,
+            fmt: Js,
+            gap: true,
+            guide: "Display the bar sits on: \"\" = the primary monitor, or a device name such as \"\\\\\\\\.\\\\DISPLAY2\".\n\
+                 Normally chosen in Settings -> Screen (shown with two or more displays). If that display is\n\
+                 not connected the bar uses the primary monitor, and moves back when it returns.\n\
+                 \"pointer\" = the Win key shows the bar (and a double tap the Start menu) on the display under the pointer.",
+            since: 1,
+            reason: "With several displays the bar can sit on another one, or follow the pointer.",
+            ui: Some {
+                page: PageId("screen"),
+                section: SecId("display"),
+                order: 1,
+                control: Control::Custom("screens"),
+                label: || t(k::COMMON_DISPLAY),
+                help: || t(k::SETTINGS_PAGES_POINTER_THE_WIN_KEY_BRINGS),
+                glyph: "monitor_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        pub autohide: bool = true => {
+            json: "autohide",
+            slot: 11,
+            fmt: Raw,
+            gap: true,
+            guide: "Hide the bar when the pointer leaves it, show it when you touch the screen edge.",
+            since: 1,
+            reason: "The bar takes no screen space until the pointer reaches the edge.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 3,
+                control: Control::Toggle,
+                label: || t(k::COMMON_AUTO_HIDE),
+                help: || t(k::SETTINGS_PAGES_SHOWS_UP_WITH_THE_WIN),
+                glyph: "chevron_down_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Auto-hide: ms the pointer may be off the bar before it hides, 0..=5000 (`HIDE_DELAY_RANGE`).
+        /// A missing key reads 2500; a fresh install writes 1000.
+        pub hide_delay_ms: u32 = LEGACY_HIDE_DELAY_MS => {
+            json: "hide_delay_ms",
+            slot: 13,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "How long the bar waits before it hides suits the hand that uses it.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 5,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_HIDE_DELAY),
+                help: || t(k::SETTINGS_PAGES_AFTER_THE_POINTER_LEAVES_THE),
+                glyph: "clock_shape",
+                keywords: &[],
+                range: Some(Range { min: HIDE_DELAY_RANGE.0 as i64, max: HIDE_DELAY_RANGE.1 as i64, step: 100, unit: Unit::Ms }),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Auto-hide: ms the pointer rests at the screen edge before the bar shows, 0..=1000.
+        pub show_delay_ms: u32 = DEFAULT_SHOW_DELAY_MS => {
+            json: "show_delay_ms",
+            slot: 12,
+            fmt: Raw,
+            gap: true,
+            guide: timing_guide(crate::ui::PUSH_AVAILABLE),
+            since: 1,
+            reason: "A short rest at the edge keeps the bar from showing by accident.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 4,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_SHOW_DELAY),
+                help: || t(k::SETTINGS_PAGES_POINTER_RESTING_AT_THE_SCREEN),
+                glyph: "clock_shape",
+                keywords: &[],
+                range: Some(Range { min: SHOW_DELAY_RANGE.0 as i64, max: SHOW_DELAY_RANGE.1 as i64, step: 50, unit: Unit::Ms }),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// How the hidden bar is revealed at the edge.
+        pub reveal: Reveal = Reveal::Dwell => {
+            json: "reveal",
+            slot: 14,
+            fmt: Js,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "Pushing against the edge suits people who rest the pointer there for other reasons.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 6,
+                control: Control::Segmented(&[(|| t(k::SETTINGS_PAGES_REST), "dwell"), (|| t(k::SETTINGS_PAGES_PUSH), "push")]),
+                label: || t(k::SETTINGS_PAGES_SHOW_AT_THE_EDGE),
+                help: || "",
+                glyph: "chevron_down_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Push reveal: raw pointer counts within one second that count as a push, 20..=1000.
+        #[serde(deserialize_with = "read_push_threshold")]
+        pub push_threshold: u32 = DEFAULT_PUSH_THRESHOLD => {
+            json: "push_threshold",
+            slot: 15,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "How hard a push must be depends on the mouse and its speed.",
+            ui: None,
+        },
+        /// Owned keyboard chords.
+        pub keyboard: KeyboardConfig = KeyboardConfig::default() => {
+            json: "keyboard",
+            slot: 16,
+            fmt: Js,
+            gap: true,
+            guide: "Keyboard: win_numbers = Win+1..9/0 (also with Shift and Alt), win_t = Win+T and Win+Shift+T, win_b = Win+B,\n\
+                 peek = digit chips while Win is held. Owned only while hide_native_taskbar is true.",
+            since: 1,
+            reason: "The Win key chords are the dock's only while the native taskbar is hidden; some people want Windows' own.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 10,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_KEYBOARD_SHORTCUTS),
+                help: || t(k::SETTINGS_PAGES_WIN_1_9_OPEN_THE),
+                glyph: "keycap_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// true once the privacy-indicator migration (`migrate_privacy`) has run for this file. A file without
+        /// the key reads false (so the migration runs); a config built in memory has nothing to migrate.
+        #[serde(default = "no_privacy_migration_yet")]
+        pub tray_privacy_migrated: bool = true => {
+            json: "tray_privacy_migrated",
+            slot: 42,
+            fmt: Raw,
+            gap: true,
+            guide: "Internal: set once the privacy indicators (microphone, location) were let out of the list above. Leave as is.",
+            since: 1,
+            reason: "Internal: the privacy indicators leave the hidden list once, never again after the user's own choice.",
+            ui: None,
+        },
+        /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
+        /// (`picker`). false = no hover timer is armed and no picker window is ever created.
+        pub window_previews: bool = true => {
+            json: "window_previews",
+            slot: 17,
+            fmt: Raw,
+            gap: true,
+            guide: "Resting the pointer on an app with several windows shows a live preview of each one (with its\n\
+                 title); click a preview to switch to that window. false = no previews and no extra window.",
+            since: 1,
+            reason: "Live previews cost a window and a timer; some people never need them.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 7,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_WINDOW_PREVIEWS),
+                help: || t(k::SETTINGS_PAGES_REST_THE_POINTER_ON_AN),
+                glyph: "eye_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Every Win tap opens / closes the Start menu together with the bar, as one show/hide
+        /// animation (`ui::start_with_bar`). false = the original behaviour: Win toggles the bar,
+        /// double tap = Start.
+        pub win_opens_start: bool = false => {
+            json: "win_opens_start",
+            slot: 18,
+            fmt: Raw,
+            gap: true,
+            guide: "true = the Win key opens the Start menu together with the bar and the next tap closes both\n\
+                 (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.",
+            since: 1,
+            reason: "One tap of Win shows the bar and the Start menu together, as on the native taskbar.",
+            ui: Some {
+                page: PageId("start"),
+                section: SecId("start_menu"),
+                order: 3,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_WIN_KEY_OPENS_START),
+                help: || t(k::SETTINGS_PAGES_TOGETHER_WITH_THE_BAR),
+                glyph: "keycap_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        pub hide_native_taskbar: bool = true => {
+            json: "hide_native_taskbar",
+            slot: 21,
+            fmt: Raw,
+            gap: true,
+            guide: "Hide Windows' own taskbar while the dock runs (restored when the dock exits).",
+            since: 1,
+            reason: "The dock replaces the taskbar; keeping both is for trying the dock out.",
+            ui: None,
+        },
+        pub pinned: Vec<PinnedApp> = Vec::new() => {
+            json: "pinned",
+            slot: 43,
+            fmt: Block,
+            gap: true,
+            guide: "Pinned apps, in order. Normally managed with Pin/Unpin in the app menu. Fields:\n\
+                 \x20 \"key\"    grouping key: the AUMID, or the lowercase exe path\n\
+                 \x20 \"name\"   fallback label, refreshed automatically from the app itself; use the \"names\"\n\
+                 \x20          map to set a fixed label\n\
+                 \x20 \"launch\" exe path, or \"shell:AppsFolder\\\\<AUMID>\" for Store/packaged apps\n\
+                 \x20 \"icon\"   optional custom icon: plain PNG file name inside %ProgramData%\\mini-oled-dock\\icons\\\n\
+                 \x20          (e.g. \"discord.png\"; paths, \"..\", drive letters and UNC paths are rejected)\n\
+                 List the AUMIDs of installed apps with:  Get-StartApps   (PowerShell)",
+            since: 1,
+            reason: "The apps pinned to the bar, in order.",
+            ui: None,
+        },
+        /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
+        /// in order: AppsFolder ids (`shell_thread::StartApp::id`). Separate from the bar's `pinned`.
+        pub start_pins: Vec<String> = Vec::new() => {
+            json: "start_pins",
+            slot: 44,
+            fmt: Block,
+            gap: true,
+            guide: "Apps pinned at the top of the Start menu that a double tap of the Win key opens (separate from\n\
+                 the bar pins above). Normally managed with a right click on an app in that menu. Each entry is\n\
+                 the app's id inside shell:AppsFolder (an AUMID for Store apps); see:  Get-StartApps  (PowerShell)",
+            since: 1,
+            reason: "The apps pinned in the dock's Start menu, in order.",
+            ui: None,
+        },
+        /// Folders of that pinned grid: each groups some of the `start_pins` under one tile, shown where
+        /// its first pinned app is. An app listed here but not pinned is ignored.
+        pub start_folders: Vec<StartFolder> = Vec::new() => {
+            json: "start_folders",
+            slot: 45,
+            fmt: Block,
+            gap: true,
+            guide: "Folders of those pins: each one shows some of the pinned apps under a single tile, placed where\n\
+                 its first app is. Normally managed by dragging a pinned app onto another one in the menu.\n\
+                 Example: [{ \"name\": \"Games\", \"apps\": [\"<id>\", \"<id>\"] }]",
+            since: 1,
+            reason: "Folders group pinned apps under one tile.",
+            ui: None,
+        },
+        /// Layout of that Start menu: "compact" (default) or "windows11" (`StartStyle`).
+        pub start_style: StartStyle = StartStyle::Compact => {
+            json: "start_style",
+            slot: 19,
+            fmt: Js,
+            gap: true,
+            guide: "Layout of the dock's Start menu: \"compact\" (a quick launcher: search, one strip of pinned icons,\n\
+                 the list of all apps) or \"windows11\" (the full menu: one scrolling page with the pinned tiles\n\
+                 and all apps, user name and folder shortcuts at the bottom). Normally chosen in Settings. The old names \"vertical\" and\n\
+                 \"horizontal\" are still read; other values = \"compact\".",
+            since: 1,
+            reason: "A quick launcher or the full Windows 11 layout.",
+            ui: Some {
+                page: PageId("start"),
+                section: SecId("start_menu"),
+                order: 2,
+                control: Control::Segmented(&[(|| t(k::SETTINGS_PAGES_COMPACT), "compact"), (|| t(k::SETTINGS_PAGES_WINDOWS_11), "windows11")]),
+                label: || t(k::SETTINGS_PAGES_START_LAYOUT),
+                help: || "",
+                glyph: "grid_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Windows 11 layout: "All apps" as a grid of icons instead of a list.
+        pub start_grid: bool = false => {
+            json: "start_grid",
+            slot: 20,
+            fmt: Raw,
+            gap: true,
+            guide: "\"All apps\" in the \"windows11\" layout: false = a list, true = a grid of icons. Normally chosen\n\
+                 with the button next to \"All apps\" in the menu.",
+            since: 1,
+            reason: "All apps as a grid of icons or as a list.",
+            ui: None,
+        },
+        /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
+        /// value = name to show.
+        pub names: BTreeMap<String, String> = BTreeMap::new() => {
+            json: "names",
+            slot: 49,
+            fmt: Block,
+            gap: true,
+            guide: "Display-name overrides. Key = exe file name lowercase (e.g. \"code.exe\") or AUMID;\n\
+                 value = the name to show. Example: { \"code.exe\": \"VS Code\" }",
+            since: 1,
+            reason: "A name of one's own for an app whose own name is long or unclear.",
+            ui: None,
+        },
+        pub show_date: bool = true => {
+            json: "show_date",
+            slot: 22,
+            fmt: Raw,
+            gap: true,
+            guide: "Show the date next to the clock.",
+            since: 1,
+            reason: "The date next to the clock takes room some people need.",
+            ui: None,
+        },
+        pub show_volume_percent: bool = true => {
+            json: "show_volume_percent",
+            slot: 26,
+            fmt: Raw,
+            gap: true,
+            guide: "Show the percentage next to the volume icon.",
+            since: 1,
+            reason: "The number next to the speaker is a matter of taste.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 9,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_VOLUME_PERCENT),
+                help: || t(k::SETTINGS_PAGES_NEXT_TO_THE_SPEAKER),
+                glyph: "speaker_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// hosts the tray icons of other apps in the dock (`tray_host`). false = never started.
+        pub show_tray: bool = true => {
+            json: "show_tray",
+            slot: 27,
+            fmt: Raw,
+            gap: true,
+            guide: "Host other apps' tray icons inside the dock. All visible icons are shown (no limit);\n\
+                 the bar widens and narrows dynamically.",
+            since: 1,
+            reason: "The tray icons of other apps, hosted in the bar.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("tray"),
+                order: 10,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_TRAY_ICONS),
+                help: || "",
+                glyph: "ring_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// true = every tray icon is shown in the bar and `tray_hidden` is ignored (kept in the file untouched, so
+        /// switching this off brings the earlier choices back). Default: false.
+        pub tray_show_all: bool = false => {
+            json: "tray_show_all",
+            slot: 28,
+            fmt: Raw,
+            gap: true,
+            guide: "true = show every tray icon in the bar, without choosing them one by one. \"tray_hidden\" is then ignored\n\
+                 (but kept as it is, so switching this off brings your earlier choices back). Icons that appear later are\n\
+                 shown too.",
+            since: 1,
+            reason: "Every tray icon in the bar without choosing them one by one.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("tray"),
+                order: 11,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_SHOW_ALL),
+                help: || t(k::SETTINGS_PAGES_SHOW_EVERY_TRAY_ICON_IN),
+                glyph: "eye_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: Some(Cond { json: "show_tray", equals: "true" }),
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Per-module visibility of the system modules (see `MODULE_NAMES` / `module_visible`).
+        /// A hidden module is not laid out and costs nothing: no timer, no polling, nothing loaded.
+        pub show_notifications: bool = true => {
+            json: "show_notifications",
+            slot: 29,
+            fmt: Raw,
+            gap: true,
+            guide: "System modules on the right of the bar: true = shown, false = removed from the bar.\n\
+                 A hidden module costs nothing (no timer, no polling, no system library loaded).\n\
+                 The power button is always shown (it holds the dock's own menu).",
+            since: 1,
+            reason: "A module nobody uses costs nothing when it is hidden.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("modules"),
+                order: 1,
+                control: Control::Toggle,
+                label: || t(k::COMMON_NOTIFICATIONS),
+                help: || "",
+                glyph: "bell_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        pub show_volume: bool = true => {
+            json: "show_volume",
+            slot: 30,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "A module nobody uses costs nothing when it is hidden.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("modules"),
+                order: 2,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_VOLUME),
+                help: || "",
+                glyph: "speaker_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Network module: Wi-Fi / ethernet glyph with internet state, popup with the details (`net`).
+        pub show_network: bool = true => {
+            json: "show_network",
+            slot: 31,
+            fmt: Raw,
+            gap: true,
+            guide: "Network: Wi-Fi signal bars or ethernet glyph, with a small globe when the internet is reachable\n\
+                 and a small x when it is not. Click for the connection details. Refreshed every ~6 s while\n\
+                 the bar is visible.",
+            since: 1,
+            reason: "A module nobody uses costs nothing when it is hidden.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("modules"),
+                order: 3,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_NETWORK),
+                help: || "",
+                glyph: "wifi_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// CPU / RAM usage module (`metrics`).
+        pub show_metrics: bool = false => {
+            json: "show_metrics",
+            slot: 32,
+            fmt: Raw,
+            gap: true,
+            guide: "CPU and RAM usage in percent (two small lines). Refreshed every 2 s while the bar is visible.\n\
+                 Click to open Task Manager.",
+            since: 1,
+            reason: "CPU and RAM at a glance, off by default.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("modules"),
+                order: 4,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_SYSTEM_METRICS),
+                help: || "",
+                glyph: "bars_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Battery module: "auto" (only on a laptop) | true | false (`BatteryShow`).
+        pub show_battery: BatteryShow = BatteryShow::Auto => {
+            json: "show_battery",
+            slot: 33,
+            fmt: Js,
+            gap: true,
+            guide: "Battery: an Apple-style icon filled in proportion to the charge, with a bolt while charging.\n\
+                 Click for the details. Refreshed every 30 s while the bar is visible, and at once when the\n\
+                 charger is plugged or unplugged.\n\
+                 \x20 show_battery            \"auto\" (only on a laptop) | true (always; an icon with a slash when there\n\
+                 \x20                         is no battery) | false\n\
+                 \x20 battery_percent         show the number\n\
+                 \x20 battery_percent_inside  put the number inside the battery body (Apple style) instead of beside it",
+            since: 1,
+            reason: "The battery only matters on a laptop.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("battery"),
+                order: 7,
+                control: Control::Segmented(&[(|| t(k::SETTINGS_PAGES_AUTO), "auto"), (|| t(k::SETTINGS_PAGES_ON), "true"), (|| t(k::SETTINGS_PAGES_OFF), "false")]),
+                label: || t(k::SETTINGS_PAGES_SHOW_BATTERY),
+                help: || t(k::SETTINGS_PAGES_SHOWN_AUTOMATICALLY_ON_LAPTOPS),
+                glyph: "battery_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Battery module: show the charge percentage.
+        pub battery_percent: bool = true => {
+            json: "battery_percent",
+            slot: 34,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "The charge as a number beside the battery.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("battery"),
+                order: 8,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_PERCENTAGE),
+                help: || "",
+                glyph: "text_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Battery module: put the percentage inside the battery body instead of beside it.
+        pub battery_percent_inside: bool = false => {
+            json: "battery_percent_inside",
+            slot: 35,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "The number inside the battery body, as on a Mac.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("battery"),
+                order: 9,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_PERCENTAGE_INSIDE_THE_ICON),
+                help: || t(k::SETTINGS_PAGES_APPLE_STYLE),
+                glyph: "battery_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        pub show_clock: bool = true => {
+            json: "show_clock",
+            slot: 36,
+            fmt: Raw,
+            gap: true,
+            guide: "",
+            since: 1,
+            reason: "A module nobody uses costs nothing when it is hidden.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("modules"),
+                order: 5,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_CLOCK),
+                help: || "",
+                glyph: "clock_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        pub show_desktop_button: bool = true => {
+            json: "show_desktop_button",
+            slot: 37,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "A module nobody uses costs nothing when it is hidden.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("modules"),
+                order: 6,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_SHOW_DESKTOP),
+                help: || "",
+                glyph: "show_desktop_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Start button: fixed item at the left end of the bar (not a movable module); see `module_visible("start")`.
+        pub show_start_button: bool = true => {
+            json: "show_start_button",
+            slot: 38,
+            fmt: Raw,
+            gap: true,
+            guide: "Windows logo button at the left end of the bar: left click opens Start, right click the Win+X menu.",
+            since: 1,
+            reason: "Some people open Start only with the Win key.",
+            ui: Some {
+                page: PageId("start"),
+                section: SecId("start_menu"),
+                order: 1,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_START_BUTTON),
+                help: || "",
+                glyph: "windows_logo_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Entry display: "icon_text" | "icon" | "text".
+        pub display_mode: DisplayMode = DisplayMode::IconText => {
+            json: "display_mode",
+            slot: 3,
+            fmt: Js,
+            gap: true,
+            guide: "What each entry shows: \"icon_text\" (icon + name), \"icon\" (icon only) or \"text\" (name only).\n\
+                 The indicator bar under each entry adapts to the chosen mode.",
+            since: 1,
+            reason: "Icons and names, icons only for a short bar, or names only.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("position"),
+                order: 2,
+                control: Control::Segmented(&[(|| t(k::SETTINGS_PAGES_ICON_NAME), "icon_text"), (|| t(k::SETTINGS_PAGES_ICON), "icon"), (|| t(k::SETTINGS_PAGES_NAME), "text")]),
+                label: || t(k::SETTINGS_PAGES_DISPLAY_MODE),
+                help: || "",
+                glyph: "text_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// App icon side, logical px (`APP_ICON_SIZE`).
+        pub app_icon_size: u8 = APP_ICON_SIZE.default => {
+            json: "app_icon_size",
+            slot: 4,
+            fmt: Raw,
+            gap: true,
+            guide: "Sizes, each independent (the bar height follows the tallest content):\n\
+                 \x20 app_icon_size   app icons, 14-32 px (default 16)\n\
+                 \x20 app_text_size   app names, 10-18 px (default 13)\n\
+                 \x20 tray_icon_size  tray icons, 12-24 px (default 16)\n\
+                 \x20 module_size     start button, notifications, volume, network, metrics, battery, clock, show desktop and\n\
+                 \x20                 power, 75-150 % (default 100)\n\
+                 Logical pixels: the Windows display scaling is applied on top.",
+            since: 1,
+            reason: "Icon size suits the display and the eyes.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("sizes"),
+                order: 3,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_APP_ICONS),
+                help: || "",
+                glyph: "square_shape",
+                keywords: &[],
+                range: Some(size_range(APP_ICON_SIZE, Unit::Px)),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// App name text height, logical px (`APP_TEXT_SIZE`).
+        pub app_text_size: u8 = APP_TEXT_SIZE.default => {
+            json: "app_text_size",
+            slot: 5,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "Name size suits the display and the eyes.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("sizes"),
+                order: 4,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_APP_NAMES),
+                help: || "",
+                glyph: "text_shape",
+                keywords: &[],
+                range: Some(size_range(APP_TEXT_SIZE, Unit::Px)),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Tray icon side, logical px (`TRAY_ICON_SIZE`).
+        pub tray_icon_size: u8 = TRAY_ICON_SIZE.default => {
+            json: "tray_icon_size",
+            slot: 6,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "Tray icon size suits the display and the eyes.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("sizes"),
+                order: 5,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_TRAY_ICONS),
+                help: || "",
+                glyph: "ring_shape",
+                keywords: &[],
+                range: Some(size_range(TRAY_ICON_SIZE, Unit::Px)),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Scale of the system modules in percent (`MODULE_SIZE`).
+        pub module_size: u8 = MODULE_SIZE.default => {
+            json: "module_size",
+            slot: 7,
+            fmt: Raw,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "The system modules scale apart from the apps.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("sizes"),
+                order: 6,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_MODULES),
+                help: || "",
+                glyph: "bars_shape",
+                keywords: &[],
+                range: Some(size_range(MODULE_SIZE, Unit::Percent)),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Background colour of the bar and the popups ("#RRGGBB").
+        pub background: Background = Background::BLACK => {
+            json: "background",
+            slot: 8,
+            fmt: Js,
+            gap: true,
+            guide: "Background colour of the bar and the popups as a hex code, #RRGGBB (e.g. #000000, pure black,\n\
+                 ideal for OLED). The Settings window offers dark presets and a colour picker.",
+            since: 1,
+            reason: "Black for OLED, or a dark tone of one's own.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("colour"),
+                order: 1,
+                control: Control::Swatches,
+                label: || t(k::SETTINGS_PAGES_BACKGROUND),
+                help: || "",
+                glyph: "circle_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Opacity of the bar and popup backgrounds in percent (0..=100; text and icons stay fully opaque).
+        pub bar_opacity: u8 = DEFAULT_BAR_OPACITY => {
+            json: "bar_opacity",
+            slot: 9,
+            fmt: Custom(bar_opacity_text),
+            gap: true,
+            guide: "Opacity of the bar and popup backgrounds in percent, 0-100 (0 = only text and icons are\n\
+                 visible; they still react to the mouse). Text and icons always stay fully opaque.",
+            since: 1,
+            reason: "A see-through bar for people who like the wallpaper.",
+            ui: Some {
+                page: PageId("appearance"),
+                section: SecId("colour"),
+                order: 2,
+                control: Control::Slider,
+                label: || t(k::SETTINGS_PAGES_OPACITY),
+                help: || "",
+                glyph: "drop_shape",
+                keywords: &[],
+                range: Some(Range { min: 0, max: 100, step: 1, unit: Unit::Percent }),
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Size of the Settings window in logical pixels (96 DPI), [width, height]. Use `settings_size`.
+        pub settings_window_size: [u16; 2] = [SETTINGS_WINDOW_DEFAULT.0 as u16, SETTINGS_WINDOW_DEFAULT.1 as u16] => {
+            json: "settings_window_size",
+            slot: 10,
+            fmt: Js,
+            gap: true,
+            guide: "Size of the Settings window in logical pixels (96 DPI), [width, height]. Remembered when you\n\
+                 resize it; at least [640, 460]; clamped to the display it opens on.",
+            since: 1,
+            reason: "Internal: the Settings window keeps the size it was given.",
+            ui: None,
+        },
+        /// Clock picture for GetTimeFormatEx (default "HH:mm").
+        pub time_format: String = "HH:mm".to_string() => {
+            json: "time_format",
+            slot: 23,
+            fmt: Js,
+            gap: true,
+            guide: "Clock format (Windows time picture, uses the dock language, or your system locale with \"auto\").\n\
+                 \x20 H / HH = hour 0-23      h / hh = hour 1-12      m / mm = minutes\n\
+                 \x20 s / ss = seconds        t / tt = AM/PM marker\n\
+                 Examples: \"HH:mm\" -> 14:05 (24h)    \"h:mm tt\" -> 2:05 PM (12h)",
+            since: 1,
+            reason: "The clock as the user reads time: 24 h, 12 h, with seconds.",
+            ui: None,
+        },
+        /// If true and `time_format` has no "s", ":ss" is appended.
+        pub show_seconds: bool = false => {
+            json: "show_seconds",
+            slot: 24,
+            fmt: Raw,
+            gap: true,
+            guide: "true = always show seconds (\":ss\" is appended if time_format has no \"s\").\n\
+                 The clock then refreshes every second instead of every minute.",
+            since: 1,
+            reason: "Seconds on the clock, at the cost of one wake-up a second.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 8,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_CLOCK_SECONDS),
+                help: || "",
+                glyph: "clock_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Date picture for GetDateFormatEx (default "ddd d MMM"; empty = no date).
+        pub date_format: String = "ddd d MMM".to_string() => {
+            json: "date_format",
+            slot: 25,
+            fmt: Js,
+            gap: true,
+            guide: "Date format (Windows date picture). Empty string \"\" = no date.\n\
+                 \x20 d / dd = day of month   ddd / dddd = short / full weekday name\n\
+                 \x20 M / MM = month number   MMM / MMMM = short / full month name\n\
+                 \x20 yy / yyyy = year\n\
+                 Examples: \"ddd d MMM\" -> Fri 23 Oct    \"dd/MM/yyyy\" -> 23/10/2026",
+            since: 1,
+            reason: "The date as the user writes it, or none.",
+            ui: None,
+        },
+        /// GUIDs (lowercase, no braces) of the system tray icons NOT to show
+        /// (they keep being answered and forwarded to Explorer).
+        pub tray_hidden_guids: Vec<String> = DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect() => {
+            json: "tray_hidden_guids",
+            slot: 41,
+            fmt: Block,
+            gap: true,
+            guide: "System tray icons the dock never shows (volume, network, power: the dock draws those itself).",
+            since: 1,
+            reason: "System tray icons the dock draws itself are never shown twice.",
+            ui: None,
+        },
+        /// Tray icons the user chose as "not in the bar" (they stay in the chevron popup).
+        /// Per-icon key (`tray_host::item_keys`): lowercase GUID without braces if the icon has one,
+        /// otherwise `<lowercase exe name>|<n>` (e.g. "discord.exe|0"), n = the icon's 0-based place among that
+        /// exe's icons without a GUID. The `<exe>#<uID>` keys of releases before 1.5.1 are rewritten when the exe's
+        /// icons register (`tray_host::key::migrate`). Default: empty.
+        pub tray_hidden: Vec<String> = Vec::new() => {
+            json: "tray_hidden",
+            slot: 39,
+            fmt: Block,
+            gap: true,
+            guide: "Tray icons you chose to keep out of the bar (they stay in the tray popup).\n\
+                 Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces),\n\
+                 e.g. \"7820ae73-23e3-4229-82c1-e41cb67d5b9c\", or for an icon without one\n\
+                 \"<exe name lowercase>|<n>\", n counting that app's icons from 0, e.g. \"discord.exe|0\".",
+            since: 1,
+            reason: "Tray icons the user keeps out of the bar.",
+            ui: Some {
+                page: PageId("modules"),
+                section: SecId("tray"),
+                order: 12,
+                control: Control::List,
+                label: || t(k::SETTINGS_PAGES_CHOOSE_VISIBLE_ICONS),
+                help: || "",
+                glyph: "eye_icon",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: Some(Cond { json: "show_tray", equals: "true" }),
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Relative order of the app entries that are NOT pinned (their keys). Pinned entries use the
+        /// `pinned` array order. Apps missing from the list go last, in the order they were first seen.
+        /// Written when the user drags an entry; capped at `APP_ORDER_CAP` keys.
+        pub app_order: Vec<String> = Vec::new() => {
+            json: "app_order",
+            slot: 46,
+            fmt: Block,
+            gap: true,
+            guide: "Order of the open apps that are NOT pinned (their keys). Pinned apps follow the \"pinned\" order\n\
+                 above. Normally managed by dragging an entry in the bar; apps not listed go last, in the order\n\
+                 they were first seen. At most 64 keys are kept.",
+            since: 1,
+            reason: "Internal: the order the user dragged the open apps into.",
+            ui: None,
+        },
+        /// Order of the tray icons (same key as `tray_hidden`). Unknown icons go last, in registration order.
+        pub tray_order: Vec<String> = Vec::new() => {
+            json: "tray_order",
+            slot: 40,
+            fmt: Block,
+            gap: true,
+            guide: "Order of the tray icons in the bar (same keys as \"tray_hidden\"). Normally managed by\n\
+                 dragging an icon in the bar; icons not listed go last, in the order they registered.",
+            since: 1,
+            reason: "Internal: the order the user dragged the tray icons into.",
+            ui: None,
+        },
+        /// Order of the system modules: "metrics", "notifications", "network", "volume", "clock",
+        /// "show_desktop", "power". Validated on use (`render::modules_from_names`): unknown names are
+        /// ignored, a missing module goes back next to its default neighbour.
+        pub modules_order: Vec<String> = DEFAULT_MODULES_ORDER.iter().map(|s| s.to_string()).collect() => {
+            json: "modules_order",
+            slot: 47,
+            fmt: Block,
+            gap: true,
+            guide: "Order of the system buttons on the right of the bar. Normally managed by dragging them.\n\
+                 Names: \"metrics\", \"notifications\", \"network\", \"volume\", \"battery\", \"clock\", \"show_desktop\", \"power\".\n\
+                 Missing names go back next to their default neighbour, unknown names are ignored.\n\
+                 Hiding a module (the show_* switches above) keeps its place in this list.",
+            since: 1,
+            reason: "The order the user dragged the system modules into.",
+            ui: None,
+        },
+        /// Layout of the volume popup (`AudioLayout`): section order, expanded / collapsed and hidden.
+        /// Written as a short string, e.g. "MOSX" (the default).
+        pub audio_layout: AudioLayout = AudioLayout::default() => {
+            json: "audio_layout",
+            slot: 48,
+            fmt: Js,
+            gap: true,
+            guide: "Volume panel layout. Normally changed in the panel itself: click a section title to expand or\n\
+                 collapse it, or use the pencil button at the bottom (Customize) to drag sections into a new\n\
+                 order and to hide them. One letter per section, in display order: M = master volume,\n\
+                 O = output devices, S = spatial sound, X = volume mixer. Upper case = expanded, lower case =\n\
+                 collapsed, a leading \"-\" hides the section. Missing sections come back at the end.\n\
+                 Example: \"M-OsX\". Default: \"MOSX\".\n\
+                 A collapsed or hidden section reads nothing from Windows.",
+            since: 1,
+            reason: "The volume panel's sections in the user's order, expanded or hidden.",
+            ui: None,
+        },
+        /// true once the `notif` thread has already asked for notification access once
+        /// (`RequestAccessAsync`): the prompt is not shown again on every start.
+        pub notif_prompted: bool = false => {
+            json: "notif_prompted",
+            slot: 55,
+            fmt: Raw,
+            gap: true,
+            guide: "Internal: set once the notification-access prompt has been shown. Leave as is.",
+            since: 1,
+            reason: "Internal: the notification-access prompt is shown once.",
+            ui: None,
+        },
+        /// true = once a day ask GitHub whether a newer release exists (badge only).
+        pub update_check: bool = true => {
+            json: "update_check",
+            slot: 50,
+            fmt: Raw,
+            gap: true,
+            guide: "Updates. Once a day the dock asks GitHub (api.github.com) whether a newer release exists and\n\
+                 shows a badge on Settings; nothing is downloaded until you choose \"Update now\" in Settings ->\n\
+                 Updates. false = never ask by itself (\"Check now\" still works).",
+            since: 1,
+            reason: "Some people want no network call they did not ask for.",
+            ui: Some {
+                page: PageId("updates"),
+                section: SecId("automatic"),
+                order: 1,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_CHECK_AUTOMATICALLY),
+                help: || t(k::SETTINGS_PAGES_ONCE_A_DAY_ON_GITHUB),
+                glyph: "refresh_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// true = also download, verify and install a new release by itself when it is quiet.
+        pub update_auto_install: bool = false => {
+            json: "update_auto_install",
+            slot: 51,
+            fmt: Raw,
+            gap: true,
+            guide: "true = also download, verify (SHA-256 + version) and install a new release by itself, the next\n\
+                 time no popup or Settings window is open and no fullscreen app is in front.",
+            since: 1,
+            reason: "Updates without a click, for people who never want to think about them.",
+            ui: Some {
+                page: PageId("updates"),
+                section: SecId("automatic"),
+                order: 2,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_INSTALL_AUTOMATICALLY),
+                help: || t(k::SETTINGS_PAGES_WHEN_THE_DOCK_IS_IDLE),
+                glyph: "download_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+        /// Internal: UTC time (RFC 3339) of the last successful update check, "" = never.
+        pub last_update_check: String = String::new() => {
+            json: "last_update_check",
+            slot: 52,
+            fmt: Js,
+            gap: true,
+            guide: "Internal: time of the last successful check (UTC) and the newest release found. Leave as is.",
+            since: 1,
+            reason: "Internal: the daily check runs once a day.",
+            ui: None,
+        },
+        /// Internal: tag of the newest release found by the last check, "" = none.
+        pub update_available: String = String::new() => {
+            json: "update_available",
+            slot: 53,
+            fmt: Js,
+            gap: false,
+            guide: "",
+            since: 1,
+            reason: "Internal: the badge on Settings survives a restart.",
+            ui: None,
+        },
+        /// The launcher (Alt+Space style search box); off until a chord is set.
+        #[serde(deserialize_with = "read_launcher")]
+        pub launcher: LauncherConfig = LauncherConfig::default() => {
+            json: "launcher",
+            slot: 54,
+            fmt: Custom(launcher_text),
+            gap: true,
+            guide: "Launcher: a search box over the desktop (apps, open windows, settings, commands, calculator).\n\
+                 It stays off until \"chord\" is set. Unknown or out-of-range values fall back to the default.",
+            since: 1,
+            reason: "A search box over the desktop for people who start everything from the keyboard.",
+            ui: Some {
+                page: PageId("launcher"),
+                section: SecId("launcher"),
+                order: 1,
+                control: Control::Custom("launcher"),
+                label: || t(k::COMMON_LAUNCHER),
+                help: || t(k::SETTINGS_PAGES_FIND_AND_START_ANYTHING_FROM),
+                glyph: "magnifier",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
+            },
+        },
+    }
 }
 
 /// Maximum number of keys kept in `app_order` / `tray_order` (the oldest, not-seen-recently ones fall off).
@@ -903,90 +2117,45 @@ fn same_set(list: &[String], want: &[&str]) -> bool {
         && want.iter().all(|w| list.iter().any(|g| g.eq_ignore_ascii_case(w)))
 }
 
-/// Once per file (`tray_privacy_migrated`): a hidden-icons list equal to the old default takes the new one,
-/// so the microphone and location indicators show. Any other list is the user's and stays. Returns
+/// Once per file (`tray_privacy_migrated`, here `done`): a hidden-icons list equal to the old default takes the new
+/// one, so the microphone and location indicators show. Any other list is the user's and stays. Returns
 /// whether the list changed.
-fn migrate_privacy(c: &mut Config) -> bool {
-    if c.tray_privacy_migrated {
+fn privacy_step(done: &mut bool, list: &mut Vec<String>) -> bool {
+    if *done {
         return false;
     }
-    c.tray_privacy_migrated = true;
-    if !same_set(&c.tray_hidden_guids, &OLD_DEFAULT_TRAY_HIDDEN_GUIDS) {
+    *done = true;
+    if !same_set(list, &OLD_DEFAULT_TRAY_HIDDEN_GUIDS) {
         return false;
     }
-    c.tray_hidden_guids = DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect();
+    *list = DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect();
     true
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            language: Language::Auto,
-            position: Position::Bottom,
-            monitor: String::new(),
-            autohide: true,
-            hide_delay_ms: LEGACY_HIDE_DELAY_MS,
-            show_delay_ms: DEFAULT_SHOW_DELAY_MS,
-            reveal: Reveal::Dwell,
-            push_threshold: DEFAULT_PUSH_THRESHOLD,
-            keyboard: KeyboardConfig::default(),
-            tray_privacy_migrated: true,
-            window_previews: true,
-            win_opens_start: false,
-            hide_native_taskbar: true,
-            pinned: Vec::new(),
-            start_pins: Vec::new(),
-            start_folders: Vec::new(),
-            start_style: StartStyle::Compact,
-            start_grid: false,
-            names: BTreeMap::new(),
-            show_date: true,
-            show_volume_percent: true,
-            show_tray: true,
-            tray_show_all: false,
-            show_notifications: true,
-            show_volume: true,
-            show_network: true,
-            show_metrics: false,
-            show_battery: BatteryShow::Auto,
-            battery_percent: true,
-            battery_percent_inside: false,
-            show_clock: true,
-            show_desktop_button: true,
-            show_start_button: true,
-            display_mode: DisplayMode::IconText,
-            bar_size: None,
-            app_icon_size: APP_ICON_SIZE.default,
-            app_text_size: APP_TEXT_SIZE.default,
-            tray_icon_size: TRAY_ICON_SIZE.default,
-            module_size: MODULE_SIZE.default,
-            background: Background::BLACK,
-            bar_opacity: DEFAULT_BAR_OPACITY,
-            settings_window_size: [SETTINGS_WINDOW_DEFAULT.0 as u16, SETTINGS_WINDOW_DEFAULT.1 as u16],
-            time_format: "HH:mm".to_string(),
-            show_seconds: false,
-            date_format: "ddd d MMM".to_string(),
-            tray_hidden_guids: DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect(),
-            tray_hidden: Vec::new(),
-            app_order: Vec::new(),
-            tray_order: Vec::new(),
-            modules_order: DEFAULT_MODULES_ORDER.iter().map(|s| s.to_string()).collect(),
-            audio_layout: AudioLayout::default(),
-            notif_prompted: false,
-            update_check: true,
-            update_auto_install: false,
-            last_update_check: String::new(),
-            update_available: String::new(),
-            launcher: LauncherConfig::default(),
-            extra: serde_json::Map::new(),
-        }
+/// `privacy_step` over a config.
+#[cfg(test)]
+fn migrate_privacy(c: &mut Config) -> bool {
+    privacy_step(&mut c.tray_privacy_migrated, &mut c.tray_hidden_guids)
+}
+
+/// The config file, from `init` on.
+static STORE: OnceLock<Store<Config>> = OnceLock::new();
+/// Before `init`, and in the modes that never call it (`--preview`): the defaults, never written.
+static UNLOADED: OnceLock<Store<Config>> = OnceLock::new();
+
+fn store() -> &'static Store<Config> {
+    match STORE.get() {
+        Some(s) => s,
+        None => UNLOADED.get_or_init(|| Store::new(None, on_set)),
     }
 }
 
-static CURRENT: OnceLock<Mutex<Arc<Config>>> = OnceLock::new();
-
-fn cell() -> &'static Mutex<Arc<Config>> {
-    CURRENT.get_or_init(|| Mutex::new(Arc::new(Config::default())))
+/// Runs after every change of the snapshot (start, Settings, hand edit, drag): the dock language follows the config,
+/// and so do the theme file (TH2) and the entry points (I1b).
+fn on_set(c: &Config) {
+    crate::i18n::apply(c.language);
+    crate::theme_sync::on_config(c);
+    crate::entry_points::on_config(c);
 }
 
 // -------------------------------------------------------------------- access
@@ -994,239 +2163,55 @@ fn cell() -> &'static Mutex<Arc<Config>> {
 /// Current config snapshot (cheap: clones an `Arc`). Available from any thread.
 /// Before `init()` it returns the defaults.
 pub fn get() -> Arc<Config> {
-    match cell().lock() {
-        Ok(g) => Arc::clone(&g),
-        Err(p) => Arc::clone(&p.into_inner()),
-    }
+    store().get()
 }
 
 pub(crate) fn set(c: Config) {
-    // Every path that changes the config ends here: the dock language follows it.
-    crate::i18n::apply(c.language);
-    let new = Arc::new(c);
-    match cell().lock() {
-        Ok(mut g) => *g = new,
-        Err(p) => *p.into_inner() = new,
-    }
+    store().set(c);
 }
 
-/// mtime of `config.json` at our last read/write (`None` = file missing/unknown).
-static LAST_MTIME: Mutex<Option<SystemTime>> = Mutex::new(None);
-/// Serializes read-modify-writes (`modify`) and writes (`save`) across threads.
-static WRITE_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_mtime() -> std::sync::MutexGuard<'static, Option<SystemTime>> {
-    LAST_MTIME.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-fn file_mtime(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).ok()?.modified().ok()
-}
-
-/// Reads a config file through `datadir` (no reparse point followed, size-capped). The content is
-/// untrusted anyway (the user may edit it), so extra hard links do not matter for a read.
-fn read_text(p: &Path) -> std::io::Result<String> {
-    let bytes = crate::datadir::read_file(p, crate::datadir::CONFIG_MAX_BYTES, false)?;
-    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// Removes `//` line comments and `/* */` block comments (JSONC), leaving string literals intact
-/// (escaped quotes included). Newlines are kept so serde error positions still match the file.
-fn strip_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut it = src.chars().peekable();
-    let mut in_str = false;
-    while let Some(c) = it.next() {
-        if in_str {
-            out.push(c);
-            if c == '\\' {
-                if let Some(n) = it.next() {
-                    out.push(n);
-                }
-            } else if c == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_str = true;
-                out.push(c);
-            }
-            '/' if it.peek() == Some(&'/') => {
-                while let Some(&n) = it.peek() {
-                    if n == '\n' {
-                        break;
-                    }
-                    it.next();
-                }
-            }
-            '/' if it.peek() == Some(&'*') => {
-                it.next();
-                let mut prev = '\0';
-                for n in it.by_ref() {
-                    if n == '\n' {
-                        out.push('\n');
-                    }
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-                out.push(' ');
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Parses the config (JSONC). Tolerates a leading UTF-8 BOM (Notepad). Missing fields = defaults.
+/// Parses a config text as the store reads its file (a BOM, comments, the migrations, the readers' fixes). Used to
+/// import an older copy, and by the tests.
 fn parse(text: &str) -> Result<Config, String> {
-    parse_with_notes(text).map(|(c, _)| c)
+    oled_config::parse_text::<Config>(text, None).map(|(c, _)| c).map_err(|e| error_text(&e))
 }
 
-/// `parse`, and what the load noticed (`LoadNotes`): a `show_battery` value that is none of the accepted ones, and
-/// whether the privacy migration changed the hidden-icons list (the file is then rewritten).
+/// A whole-file error as serde_json words it: the message, then " at line L column C" when the position is known (the
+/// text the dock has always logged).
+fn error_text(e: &oled_config::ConfigError) -> String {
+    match &e.problem {
+        oled_config::Problem::Parse(m) if e.line > 0 => format!("{m} at line {} column {}", e.line, e.col),
+        oled_config::Problem::Parse(m) => m.clone(),
+        _ => e.log_line(),
+    }
+}
+
+/// `parse`, and what the read noticed (`LoadNotes`).
+#[cfg(test)]
 fn parse_with_notes(text: &str) -> Result<(Config, LoadNotes), String> {
-    let t = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let t = strip_comments(t);
-    let mut value = serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string())?;
-    let new_keys_invalid = sanitize_new_keys(&mut value);
-    // A failure reads the text again, for the error with its line and column.
-    let mut c = Config::deserialize(&value).map_err(|_| match serde_json::from_str::<Config>(&t) {
-        Err(e) => e.to_string(),
-        Ok(_) => "unreadable".to_string(),
-    })?;
-    let (mut notes, extra) = notes_and_unknown(value);
-    notes.new_keys_invalid = new_keys_invalid;
-    c.extra = extra;
-    migrate_bar_size(&mut c);
-    clamp_timing(&mut c);
-    notes.privacy_flag_set = !c.tray_privacy_migrated;
-    notes.privacy_migrated = migrate_privacy(&mut c);
-    for msg in c.launcher.sanitize() {
-        crate::log!("config error: {msg}");
-    }
-    Ok((c, notes))
+    READING.with(|r| r.set(None));
+    let c = parse(text)?;
+    Ok((c, READING.with(Cell::take).map(|r| r.notes).unwrap_or_default()))
 }
 
-/// The keys of the four keyboard switches (`KeyboardConfig`).
-const KEYBOARD_FLAGS: [&str; 4] = ["win_numbers", "win_t", "win_b", "peek"];
-
-/// Reads the keys added in 1.6 leniently, as `reveal` and `show_battery` are: a value of the wrong type is
-/// dropped (the key then reads its default) instead of refusing the whole file; `"keyboard": true` or
-/// `false` sets all four switches; a number too big for u32 becomes the largest one (the range clamp
-/// follows). Returns whether a value was dropped.
-fn sanitize_new_keys(v: &mut serde_json::Value) -> bool {
-    use serde_json::Value;
-    let Some(o) = v.as_object_mut() else { return false };
-    let mut dropped = false;
-    for k in ["hide_delay_ms", "show_delay_ms", "push_threshold"] {
-        match o.get(k).map(Value::as_u64) {
-            None => {}
-            Some(Some(n)) if n <= u64::from(u32::MAX) => {}
-            Some(Some(_)) => {
-                o.insert(k.to_string(), Value::from(u32::MAX));
-            }
-            Some(None) => {
-                o.remove(k);
-                dropped = true;
-            }
-        }
-    }
-    if o.get("tray_privacy_migrated").is_some_and(|f| !f.is_boolean()) {
-        o.remove("tray_privacy_migrated");
-        dropped = true;
-    }
-    match o.get_mut("keyboard") {
-        None => {}
-        Some(Value::Bool(on)) => {
-            let on = *on;
-            let all = KEYBOARD_FLAGS.iter().map(|f| (f.to_string(), Value::Bool(on))).collect();
-            o.insert("keyboard".to_string(), Value::Object(all));
-        }
-        Some(Value::Object(m)) => {
-            for f in KEYBOARD_FLAGS {
-                if m.get(f).is_some_and(|x| !x.is_boolean()) {
-                    m.remove(f);
-                    dropped = true;
-                }
-            }
-        }
-        Some(_) => {
-            o.remove("keyboard");
-            dropped = true;
-        }
-    }
-    dropped
+/// `parse` over `last_good`, and the errors of the text: the store's, then the launcher's fixes (as `errors` lists
+/// them after a load).
+#[cfg(test)]
+fn parse_with_errors(text: &str, last_good: Option<&Config>) -> Result<(Config, Vec<ConfigError>), String> {
+    READING.with(|r| r.set(None));
+    let (c, mut errors) = oled_config::parse_text::<Config>(text, last_good).map_err(|e| error_text(&e))?;
+    let launcher = READING.with(Cell::take).map(|r| r.launcher).unwrap_or_default();
+    errors.extend(located(launcher, text));
+    Ok((c, errors))
 }
 
-/// The top-level keys this release knows: every key serde writes for a `Config` (what `render` writes; a
-/// test pins the list to `serde_json::to_value(Config::default())`) and the legacy `bar_size` (read by
-/// `migrate_bar_size`, never written). A list, because serializing the defaults at run time costs the exe
-/// about 8 KiB. A new top-level field goes here too, or it would be kept as unknown and written twice.
-const KNOWN_KEYS: [&str; 57] = [
-    "language",
-    "position",
-    "monitor",
-    "autohide",
-    "hide_delay_ms",
-    "show_delay_ms",
-    "reveal",
-    "push_threshold",
-    "keyboard",
-    "tray_privacy_migrated",
-    "window_previews",
-    "win_opens_start",
-    "hide_native_taskbar",
-    "pinned",
-    "start_pins",
-    "start_folders",
-    "start_style",
-    "start_grid",
-    "names",
-    "show_date",
-    "show_volume_percent",
-    "show_tray",
-    "tray_show_all",
-    "show_notifications",
-    "show_volume",
-    "show_network",
-    "show_metrics",
-    "show_battery",
-    "battery_percent",
-    "battery_percent_inside",
-    "show_clock",
-    "show_desktop_button",
-    "show_start_button",
-    "display_mode",
-    "bar_size",
-    "app_icon_size",
-    "app_text_size",
-    "tray_icon_size",
-    "module_size",
-    "background",
-    "bar_opacity",
-    "settings_window_size",
-    "time_format",
-    "show_seconds",
-    "date_format",
-    "tray_hidden_guids",
-    "tray_hidden",
-    "app_order",
-    "tray_order",
-    "modules_order",
-    "audio_layout",
-    "notif_prompted",
-    "update_check",
-    "update_auto_install",
-    "last_update_check",
-    "update_available",
-    "launcher",
-];
+/// The file `c` makes: `Config::to_template`.
+#[cfg(test)]
+fn render(c: &Config) -> String {
+    c.to_template()
+}
 
-/// What a load noticed about the file, for Settings and the log. `privacy_migrated` is filled by `parse_with_notes`.
+/// What a load noticed about the file, for Settings and the log. `privacy_migrated` is filled by `migrate_v0`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadNotes {
     /// `show_battery` is present and is neither a boolean nor "auto", "true" or "false": "auto" is used.
@@ -1234,10 +2219,12 @@ pub struct LoadNotes {
     /// The privacy migration changed the hidden-icons list in this load.
     pub privacy_migrated: bool,
     /// The file had no valid `tray_privacy_migrated` and this load set it: the file is rewritten so that the flag is
-    /// stored, whether or not the list changed.
+    /// stored, whether or not the list changed (at the start by the store, as a migrated file; after a hand edit by
+    /// `poll_changed`), once it has no errors.
     pub privacy_flag_set: bool,
-    /// A key added in 1.6 (a delay, `push_threshold`, `keyboard`, `tray_privacy_migrated`) held a value of the
-    /// wrong type: it was ignored and the key reads its default.
+    /// A key added in 1.6 (a delay, `push_threshold`, `keyboard` or one of its switches, `tray_privacy_migrated`)
+    /// held a value of the wrong type: it was ignored (one error of the read) and the key reads its default, or at a
+    /// reload its last good value.
     pub new_keys_invalid: bool,
 }
 
@@ -1253,6 +2240,52 @@ static NOTES: Mutex<LoadNotes> = Mutex::new(LoadNotes {
     new_keys_invalid: false,
 });
 
+/// What the read of a config text noticed beyond its values: the notes, and the fixes the launcher's reader made.
+#[derive(Default)]
+struct Reading {
+    notes: LoadNotes,
+    launcher: Vec<ConfigError>,
+}
+
+thread_local! {
+    /// The record of the last config text read on this thread (`migrate_v0` starts it and `read_launcher` adds to it
+    /// while the store reads), taken by `init` and `poll_changed` after their read.
+    static READING: Cell<Option<Reading>> = const { Cell::new(None) };
+}
+
+/// The launcher's fixes in the file as last read (none after our own write), each with its line.
+static LAUNCHER_ERRORS: Mutex<Vec<ConfigError>> = Mutex::new(Vec::new());
+
+/// The errors of the file as last read, none after our own write: each value that did not load (its last good value,
+/// or the default, stands in), in the order of the file, then the launcher's fixes. For Settings (P3-dock-suite).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn errors() -> Arc<[ConfigError]> {
+    let read = store().errors();
+    let launcher = LAUNCHER_ERRORS.lock().unwrap_or_else(|p| p.into_inner());
+    if launcher.is_empty() {
+        return read;
+    }
+    read.iter().chain(launcher.iter()).cloned().collect()
+}
+
+/// After a read of the file by the store: its notes and the launcher's fixes, located in the file and logged once.
+fn publish(reading: Reading) {
+    store_notes(reading.notes);
+    let launcher = if reading.launcher.is_empty() { Vec::new() } else { located(reading.launcher, &file_text()) };
+    for e in &launcher {
+        crate::log!("config: {}", e.log_line());
+    }
+    *LAUNCHER_ERRORS.lock().unwrap_or_else(|p| p.into_inner()) = launcher;
+}
+
+/// The text of the config file ("" when it cannot be read): only to find the line of an error.
+fn file_text() -> String {
+    crate::datadir::config_path()
+        .and_then(|p| crate::datadir::read_file(&p, crate::datadir::CONFIG_MAX_BYTES, false).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default()
+}
+
 fn store_notes(n: LoadNotes) {
     *NOTES.lock().unwrap_or_else(|p| p.into_inner()) = n;
     if n.show_battery_invalid {
@@ -1263,13 +2296,27 @@ fn store_notes(n: LoadNotes) {
     }
 }
 
-/// The notes a parsed file leaves (all but `privacy_migrated`, `privacy_flag_set` and `new_keys_invalid`) and its
-/// top-level keys that are not `KNOWN_KEYS`. Anything unexpected keeps nothing, as before.
-fn notes_and_unknown(json: serde_json::Value) -> (LoadNotes, serde_json::Map<String, serde_json::Value>) {
-    let serde_json::Value::Object(mut all) = json else {
-        return (LoadNotes::default(), serde_json::Map::new());
-    };
-    let show_battery_invalid = match all.get("show_battery") {
+/// After every write of ours: the file just written holds a valid show_battery, new keys of the right type and a
+/// sanitized launcher section, so the notes about an invalid show_battery or new key and the launcher's fixes are stale.
+fn written() {
+    let mut notes = NOTES.lock().unwrap_or_else(|p| p.into_inner());
+    notes.show_battery_invalid = false;
+    notes.new_keys_invalid = false;
+    drop(notes);
+    LAUNCHER_ERRORS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+}
+
+/// Version 0 (every file so far: the dock has never written a "version") to 1, run by every read of a file: the legacy
+/// `bar_size` becomes the four sizes, `"keyboard": true` or `false` the four switches, the privacy indicators leave an
+/// untouched old hidden list once (the flag is set), and what the read notices is noted (`LoadNotes`, on this thread).
+/// Each changes only a file that needs it, so a file this release wrote is not rewritten.
+fn migrate_v0(v: &mut serde_json::Value) -> Result<(), MigrateError> {
+    let Some(o) = v.as_object_mut() else { return Ok(()) };
+    migrate_bar_size(o)?;
+    let new_keys_invalid = new_keys_of_the_wrong_type(o);
+    let privacy_flag_set = !matches!(o.get("tray_privacy_migrated"), Some(serde_json::Value::Bool(true)));
+    let privacy_migrated = migrate_privacy_value(o);
+    let show_battery_invalid = match o.get("show_battery") {
         None | Some(serde_json::Value::Bool(_)) => false,
         Some(serde_json::Value::String(s)) => {
             let s = s.trim();
@@ -1277,17 +2324,171 @@ fn notes_and_unknown(json: serde_json::Value) -> (LoadNotes, serde_json::Map<Str
         }
         Some(_) => true,
     };
-    for k in KNOWN_KEYS {
-        all.remove(k);
-    }
-    (LoadNotes { show_battery_invalid, ..LoadNotes::default() }, all)
+    let notes = LoadNotes { show_battery_invalid, privacy_migrated, privacy_flag_set, new_keys_invalid };
+    READING.with(|r| r.set(Some(Reading { notes, launcher: Vec::new() })));
+    Ok(())
 }
 
-/// Clamps the three auto-hide numbers into their ranges.
-fn clamp_timing(c: &mut Config) {
-    c.hide_delay_ms = c.hide_delay_ms.clamp(HIDE_DELAY_RANGE.0, HIDE_DELAY_RANGE.1);
-    c.show_delay_ms = c.show_delay_ms.clamp(SHOW_DELAY_RANGE.0, SHOW_DELAY_RANGE.1);
-    c.push_threshold = c.push_threshold.clamp(PUSH_THRESHOLD_RANGE.0, PUSH_THRESHOLD_RANGE.1);
+/// The keys of the four keyboard switches (`KeyboardConfig`).
+const KEYBOARD_FLAGS: [&str; 4] = ["win_numbers", "win_t", "win_b", "peek"];
+
+/// The keys added in 1.6 as a file holds them: `"keyboard": true` or `false` becomes the four switches, as 1.6.0 read
+/// it. Returns whether one of them (a delay, `push_threshold`, `keyboard` or one of its switches,
+/// `tray_privacy_migrated`) has a value of the wrong type (for the three numbers: anything but a whole number from 0
+/// up), for `LoadNotes::new_keys_invalid`; the read itself drops such a value, one error each. A whole number above the
+/// range is not of the wrong type: the range check (or `read_push_threshold`'s clamp) takes it.
+fn new_keys_of_the_wrong_type(o: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    use serde_json::Value;
+    let not_a_count = |v: &Value| v.as_u64().is_none();
+    let mut wrong =
+        ["hide_delay_ms", "show_delay_ms", "push_threshold"].iter().any(|k| o.get(*k).is_some_and(not_a_count));
+    wrong |= o.get("tray_privacy_migrated").is_some_and(|f| !f.is_boolean());
+    match o.get("keyboard") {
+        None => {}
+        Some(Value::Bool(on)) => {
+            let on = *on;
+            let all = KEYBOARD_FLAGS.iter().map(|f| (f.to_string(), Value::Bool(on))).collect();
+            o.insert("keyboard".to_string(), Value::Object(all));
+        }
+        Some(Value::Object(m)) => wrong |= KEYBOARD_FLAGS.iter().any(|f| m.get(*f).is_some_and(|x| !x.is_boolean())),
+        Some(_) => wrong = true,
+    }
+    wrong
+}
+
+/// The keys of the four sizes, in the order of `migrate_bar_size`'s values.
+const SIZE_KEYS: [(&str, SizeRange); 4] = [
+    ("app_icon_size", APP_ICON_SIZE),
+    ("app_text_size", APP_TEXT_SIZE),
+    ("tray_icon_size", TRAY_ICON_SIZE),
+    ("module_size", MODULE_SIZE),
+];
+
+/// Converts a legacy `bar_size` (one knob scaling the whole bar: small 7/8, medium 1, large 5/4)
+/// into the four independent sizes, unless those were already changed (a hand edit wins). Removes
+/// `bar_size`, which is never written back. An unknown value makes the file invalid, as it always has.
+fn migrate_bar_size(o: &mut serde_json::Map<String, serde_json::Value>) -> Result<(), MigrateError> {
+    let Some(size) = o.remove("bar_size") else { return Ok(()) };
+    let size = Option::<BarSize>::deserialize(&size).map_err(|e| MigrateError(format!("bar_size: {e}")))?;
+    let sizes: [u8; 4] = match size {
+        Some(BarSize::Small) => [14, 11, 14, 88],
+        Some(BarSize::Large) => [20, 16, 20, 125],
+        Some(BarSize::Medium) | None => return Ok(()),
+    };
+    let untouched =
+        SIZE_KEYS.iter().all(|(key, range)| o.get(*key).is_none_or(|v| v.as_u64() == Some(u64::from(range.default))));
+    if untouched {
+        for ((key, _), n) in SIZE_KEYS.iter().zip(sizes) {
+            o.insert((*key).to_string(), n.into());
+        }
+    }
+    Ok(())
+}
+
+/// `migrate_privacy` over a file's keys: a `tray_privacy_migrated` that is not true (missing, false, unreadable)
+/// becomes true, and a hidden list equal to the old default takes the new one (a list of the wrong type is left for the
+/// read to report). Returns whether the list changed.
+fn migrate_privacy_value(o: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    if matches!(o.get("tray_privacy_migrated"), Some(serde_json::Value::Bool(true))) {
+        return false;
+    }
+    o.insert("tray_privacy_migrated".to_string(), true.into());
+    let mut list: Vec<String> = match o.get("tray_hidden_guids") {
+        None => DEFAULT_TRAY_HIDDEN_GUIDS.iter().map(|s| s.to_string()).collect(),
+        Some(v) => match Vec::<String>::deserialize(v) {
+            Ok(l) => l,
+            Err(_) => return false,
+        },
+    };
+    let changed = privacy_step(&mut false, &mut list);
+    if changed {
+        o.insert("tray_hidden_guids".to_string(), list.into());
+    }
+    changed
+}
+
+/// `push_threshold` as read: clamped into `PUSH_THRESHOLD_RANGE`, a number too big for u32 too (Settings has no row for
+/// it, so no descriptor gives it a range to check).
+fn read_push_threshold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    u64::deserialize(d)
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX).clamp(PUSH_THRESHOLD_RANGE.0, PUSH_THRESHOLD_RANGE.1))
+}
+
+/// The `launcher` section as read: every key brought into its closed list or range, each fix one error of the read
+/// (`launcher_error`), recorded on this thread with the notes. A number out of its range takes its default, as a
+/// top-level one does, not the value `sanitize` clamps it to: its error says the default was kept.
+fn read_launcher<'de, D: serde::Deserializer<'de>>(d: D) -> Result<LauncherConfig, D::Error> {
+    let before = LauncherConfig::deserialize(d)?;
+    let mut l = before.clone();
+    let errors: Vec<ConfigError> = l.sanitize().iter().map(|m| launcher_error(m, &before)).collect();
+    if l.top_percent != before.top_percent {
+        l.top_percent = LAUNCHER_TOP_PERCENT.2;
+    }
+    if l.rows != before.rows {
+        l.rows = LAUNCHER_ROWS.2;
+    }
+    if l.width != before.width {
+        l.width = LAUNCHER_WIDTH.2;
+    }
+    READING.with(|r| {
+        let mut reading = r.take();
+        if let Some(x) = reading.as_mut() {
+            x.launcher = errors;
+        }
+        r.set(reading);
+    });
+    Ok(l)
+}
+
+/// One fix of `LauncherConfig::sanitize` (its message, the section before the fix) as an error under
+/// "launcher.<key>"; its line and column are found later in the text (`located`).
+fn launcher_error(message: &str, before: &LauncherConfig) -> ConfigError {
+    let path = message.split_once(": ").map_or(message, |(p, _)| p);
+    let range = |r: (i64, i64), got: i64| Problem::Range { min: r.0, max: r.1, got };
+    let problem = match path.strip_prefix("launcher.").unwrap_or(path) {
+        "chord" => Problem::UnknownValue { allowed: &LAUNCHER_CHORDS },
+        "with_powertoys" => Problem::UnknownValue { allowed: &LAUNCHER_WITH_POWERTOYS },
+        "monitor" => Problem::UnknownValue { allowed: &LAUNCHER_MONITORS },
+        "over_fullscreen" => Problem::UnknownValue { allowed: &LAUNCHER_OVER_FULLSCREEN },
+        "web_engine" => Problem::UnknownValue { allowed: &LAUNCHER_WEB_ENGINES },
+        "top_percent" => {
+            let (lo, hi, _) = LAUNCHER_TOP_PERCENT;
+            range((lo.into(), hi.into()), before.top_percent.into())
+        }
+        "rows" => {
+            let (lo, hi, _) = LAUNCHER_ROWS;
+            range((lo.into(), hi.into()), before.rows.into())
+        }
+        "width" if !(LAUNCHER_WIDTH.0..=LAUNCHER_WIDTH.1).contains(&before.width) => {
+            range((LAUNCHER_WIDTH.0.into(), LAUNCHER_WIDTH.1.into()), before.width.into())
+        }
+        "width" => Problem::Type { expected: "560 to 880 in steps of 40" },
+        "providers" => Problem::UnknownValue { allowed: &LAUNCHER_PROVIDERS },
+        "prefixes" => Problem::Type {
+            expected: "prefixes of 1 to 5 characters (a word ends with a space), each once, for a known provider",
+        },
+        "providers.apps" => Problem::Type { expected: "true (apps are always on)" },
+        // Entries are dropped for a word or target over the text cap, else for their number.
+        "aliases" if before.aliases.iter().any(|(w, t)| w.chars().count().max(t.chars().count()) > ALIAS_TEXT_CAP) => {
+            Problem::TooLong { max: ALIAS_TEXT_CAP }
+        }
+        "aliases" => {
+            let n = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+            range((0, n(ALIAS_ENTRIES_CAP)), n(before.aliases.len()))
+        }
+        "web_url" => Problem::Type { expected: "an https:// address with {q}" },
+        _ => Problem::Type { expected: "a value of its list" },
+    };
+    ConfigError { path: path.to_string(), line: 0, col: 0, problem, kept: Kept::Default }
+}
+
+/// `errors` with the line and column of their key in `text` (a BOM skipped).
+fn located(mut errors: Vec<ConfigError>, text: &str) -> Vec<ConfigError> {
+    let text = oled_config::jsonc::strip_bom(text);
+    for e in &mut errors {
+        (e.line, e.col) = oled_config::jsonc::locate(text, &e.path).unwrap_or((0, 0));
+    }
+    errors
 }
 
 /// The config of a fresh install: today's defaults, a one-second hide delay and nothing left to migrate.
@@ -1300,296 +2501,31 @@ fn fresh_config() -> Config {
     c
 }
 
-/// Converts a legacy `bar_size` (one knob scaling the whole bar: small 7/8, medium 1, large 5/4)
-/// into the four independent sizes, unless those were already changed (a hand edit wins). Clears
-/// `bar_size`, which is never written back.
-fn migrate_bar_size(c: &mut Config) {
-    let Some(size) = c.bar_size.take() else { return };
-    let untouched = c.app_icon_size == APP_ICON_SIZE.default
-        && c.app_text_size == APP_TEXT_SIZE.default
-        && c.tray_icon_size == TRAY_ICON_SIZE.default
-        && c.module_size == MODULE_SIZE.default;
-    if !untouched {
-        return;
-    }
-    let (icon, text, tray, module) = match size {
-        BarSize::Small => (14, 11, 14, 88),
-        BarSize::Medium => return,
-        BarSize::Large => (20, 16, 20, 125),
-    };
-    c.app_icon_size = icon;
-    c.app_text_size = text;
-    c.tray_icon_size = tray;
-    c.module_size = module;
-}
-
 /// Marker on the first line of every file we write; a config without it is a legacy plain JSON
 /// file and gets migrated to the commented template.
 const TEMPLATE_MARK: &str = "// mini-oled-dock configuration";
 
-fn js<T: Serialize + ?Sized>(v: &T) -> String {
-    serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+/// The text above the opening brace of the file: the mark, then how to edit it.
+const HEADER: &str = "// mini-oled-dock configuration\n\
+    // Edit and save: changes are picked up within ~2 seconds, no restart needed.\n\
+    // The folder is admin-only: edit this file with Notepad (it saves in place) or an elevated editor.\n\
+    // Editors that save by writing a new file and renaming it over this one cannot write here.\n\
+    // Comments (// and /* */) are allowed. If the file has a syntax error the previous\n\
+    // settings are kept; if the dock must save a change (pin, tray icon) before you fix it,\n\
+    // your file is first copied to config.json.bak so no edit is lost.";
+
+/// `bar_opacity` as the file writes it: at most 100.
+fn bar_opacity_text(c: &Config) -> String {
+    c.bar_opacity.min(100).to_string()
 }
 
-/// Pretty JSON of a collection, continuation lines indented to sit under a 2-space key.
-fn js_block<T: Serialize + ?Sized>(v: &T) -> String {
-    serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".to_string()).replace('\n', "\n  ")
-}
-
-/// The `extra` keys as the last lines of the file, one compact line each: "" when there are none, so
-/// such a file is written as before.
-fn render_extra(extra: &serde_json::Map<String, serde_json::Value>) -> String {
-    if extra.is_empty() {
-        return String::new();
-    }
-    let lines: Vec<String> = extra.iter().map(|(k, v)| format!("  {}: {}", js(k), js(v))).collect();
-    format!(",\n\n  // Kept from a newer version of the dock. Leave as is.\n{}", lines.join(",\n"))
-}
-
-/// Serializes `c` as a commented JSONC file: an English guide above every field, current values
-/// inline, so the comments survive every programmatic rewrite.
-fn render(c: &Config) -> String {
-    let mode = match c.display_mode {
-        DisplayMode::IconText => "icon_text",
-        DisplayMode::Icon => "icon",
-        DisplayMode::Text => "text",
-    };
-    let pos = match c.position {
-        Position::Top => "top",
-        Position::Bottom => "bottom",
-    };
-    let bg = c.background.hex();
-    let lang = match c.language {
-        Language::Auto => "auto",
-        Language::En => "en",
-        Language::It => "it",
-    };
+/// The `launcher` section as the file writes it, its comments included.
+fn launcher_text(c: &Config) -> String {
+    let l = &c.launcher;
+    // Pretty JSON of a map or list, its continuation lines under a 4-space key.
+    let block = |v: String| v.replace('\n', "\n  ");
     format!(
-        r#"{TEMPLATE_MARK}
-// Edit and save: changes are picked up within ~2 seconds, no restart needed.
-// The folder is admin-only: edit this file with Notepad (it saves in place) or an elevated editor.
-// Editors that save by writing a new file and renaming it over this one cannot write here.
-// Comments (// and /* */) are allowed. If the file has a syntax error the previous
-// settings are kept; if the dock must save a change (pin, tray icon) before you fix it,
-// your file is first copied to config.json.bak so no edit is lost.
-{{
-  // Language of the dock: "auto" (follows the Windows display language), "en" or "it".
-  // Also sets the language of the clock, date and calendar names. Normally chosen in Settings.
-  "language": "{lang}",
-
-  // Where the bar sits on screen: "top" or "bottom".
-  "position": "{pos}",
-
-  // Display the bar sits on: "" = the primary monitor, or a device name such as "\\\\.\\DISPLAY2".
-  // Normally chosen in Settings -> Screen (shown with two or more displays). If that display is
-  // not connected the bar uses the primary monitor, and moves back when it returns.
-  // "pointer" = the Win key shows the bar (and a double tap the Start menu) on the display under the pointer.
-  "monitor": {monitor},
-
-  // What each entry shows: "icon_text" (icon + name), "icon" (icon only) or "text" (name only).
-  // The indicator bar under each entry adapts to the chosen mode.
-  "display_mode": "{mode}",
-
-  // Sizes, each independent (the bar height follows the tallest content):
-  //   app_icon_size   app icons, 14-32 px (default 16)
-  //   app_text_size   app names, 10-18 px (default 13)
-  //   tray_icon_size  tray icons, 12-24 px (default 16)
-  //   module_size     start button, notifications, volume, network, metrics, battery, clock, show desktop and
-  //                   power, 75-150 % (default 100)
-  // Logical pixels: the Windows display scaling is applied on top.
-  "app_icon_size": {icon_size},
-  "app_text_size": {text_size},
-  "tray_icon_size": {tray_size},
-  "module_size": {module_size},
-
-  // Background colour of the bar and the popups as a hex code, #RRGGBB (e.g. #000000, pure black,
-  // ideal for OLED). The Settings window offers dark presets and a colour picker.
-  "background": "{bg}",
-
-  // Opacity of the bar and popup backgrounds in percent, 0-100 (0 = only text and icons are
-  // visible; they still react to the mouse). Text and icons always stay fully opaque.
-  "bar_opacity": {opacity},
-
-  // Size of the Settings window in logical pixels (96 DPI), [width, height]. Remembered when you
-  // resize it; at least [640, 460]; clamped to the display it opens on.
-  "settings_window_size": {settings_size},
-
-  // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
-  "autohide": {autohide},
-
-  // Auto-hide timing (ms): show_delay_ms 0-1000 at the screen edge (default 150),
-  // hide_delay_ms 0-5000 after the pointer leaves the bar (a new install writes 1000; a missing key reads 2500).
-  // {reveal_guide}
-  "show_delay_ms": {show_delay},
-  "hide_delay_ms": {hide_delay},
-  "reveal": {reveal},
-  "push_threshold": {push_threshold},
-
-  // Keyboard: win_numbers = Win+1..9/0 (also with Shift and Alt), win_t = Win+T and Win+Shift+T, win_b = Win+B,
-  // peek = digit chips while Win is held. Owned only while hide_native_taskbar is true.
-  "keyboard": {keyboard},
-
-  // Resting the pointer on an app with several windows shows a live preview of each one (with its
-  // title); click a preview to switch to that window. false = no previews and no extra window.
-  "window_previews": {window_previews},
-
-  // true = the Win key opens the Start menu together with the bar and the next tap closes both
-  // (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.
-  "win_opens_start": {win_opens_start},
-
-  // Layout of the dock's Start menu: "compact" (a quick launcher: search, one strip of pinned icons,
-  // the list of all apps) or "windows11" (the full menu: one scrolling page with the pinned tiles
-  // and all apps, user name and folder shortcuts at the bottom). Normally chosen in Settings. The old names "vertical" and
-  // "horizontal" are still read; other values = "compact".
-  "start_style": "{start_style}",
-
-  // "All apps" in the "windows11" layout: false = a list, true = a grid of icons. Normally chosen
-  // with the button next to "All apps" in the menu.
-  "start_grid": {start_grid},
-
-  // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
-  "hide_native_taskbar": {hide_native},
-
-  // Show the date next to the clock.
-  "show_date": {show_date},
-
-  // Clock format (Windows time picture, uses the dock language, or your system locale with "auto").
-  //   H / HH = hour 0-23      h / hh = hour 1-12      m / mm = minutes
-  //   s / ss = seconds        t / tt = AM/PM marker
-  // Examples: "HH:mm" -> 14:05 (24h)    "h:mm tt" -> 2:05 PM (12h)
-  "time_format": {time_format},
-
-  // true = always show seconds (":ss" is appended if time_format has no "s").
-  // The clock then refreshes every second instead of every minute.
-  "show_seconds": {show_seconds},
-
-  // Date format (Windows date picture). Empty string "" = no date.
-  //   d / dd = day of month   ddd / dddd = short / full weekday name
-  //   M / MM = month number   MMM / MMMM = short / full month name
-  //   yy / yyyy = year
-  // Examples: "ddd d MMM" -> Fri 23 Oct    "dd/MM/yyyy" -> 23/10/2026
-  "date_format": {date_format},
-
-  // Show the percentage next to the volume icon.
-  "show_volume_percent": {show_volume},
-
-  // Host other apps' tray icons inside the dock. All visible icons are shown (no limit);
-  // the bar widens and narrows dynamically.
-  "show_tray": {show_tray},
-
-  // true = show every tray icon in the bar, without choosing them one by one. "tray_hidden" is then ignored
-  // (but kept as it is, so switching this off brings your earlier choices back). Icons that appear later are
-  // shown too.
-  "tray_show_all": {tray_show_all},
-
-  // System modules on the right of the bar: true = shown, false = removed from the bar.
-  // A hidden module costs nothing (no timer, no polling, no system library loaded).
-  // The power button is always shown (it holds the dock's own menu).
-  "show_notifications": {show_notif},
-  "show_volume": {show_vol_mod},
-
-  // Network: Wi-Fi signal bars or ethernet glyph, with a small globe when the internet is reachable
-  // and a small x when it is not. Click for the connection details. Refreshed every ~6 s while
-  // the bar is visible.
-  "show_network": {show_network},
-
-  // CPU and RAM usage in percent (two small lines). Refreshed every 2 s while the bar is visible.
-  // Click to open Task Manager.
-  "show_metrics": {show_metrics},
-
-  // Battery: an Apple-style icon filled in proportion to the charge, with a bolt while charging.
-  // Click for the details. Refreshed every 30 s while the bar is visible, and at once when the
-  // charger is plugged or unplugged.
-  //   show_battery            "auto" (only on a laptop) | true (always; an icon with a slash when there
-  //                           is no battery) | false
-  //   battery_percent         show the number
-  //   battery_percent_inside  put the number inside the battery body (Apple style) instead of beside it
-  "show_battery": {show_battery},
-  "battery_percent": {battery_percent},
-  "battery_percent_inside": {battery_percent_inside},
-
-  "show_clock": {show_clock},
-  "show_desktop_button": {show_desk},
-
-  // Windows logo button at the left end of the bar: left click opens Start, right click the Win+X menu.
-  "show_start_button": {show_start},
-
-  // Tray icons you chose to keep out of the bar (they stay in the tray popup).
-  // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces),
-  // e.g. "7820ae73-23e3-4229-82c1-e41cb67d5b9c", or for an icon without one
-  // "<exe name lowercase>|<n>", n counting that app's icons from 0, e.g. "discord.exe|0".
-  "tray_hidden": {tray_hidden},
-
-  // Order of the tray icons in the bar (same keys as "tray_hidden"). Normally managed by
-  // dragging an icon in the bar; icons not listed go last, in the order they registered.
-  "tray_order": {tray_order},
-
-  // System tray icons the dock never shows (volume, network, power: the dock draws those itself).
-  "tray_hidden_guids": {tray_guids},
-
-  // Internal: set once the privacy indicators (microphone, location) were let out of the list above. Leave as is.
-  "tray_privacy_migrated": {tray_privacy_migrated},
-
-  // Pinned apps, in order. Normally managed with Pin/Unpin in the app menu. Fields:
-  //   "key"    grouping key: the AUMID, or the lowercase exe path
-  //   "name"   fallback label, refreshed automatically from the app itself; use the "names"
-  //            map to set a fixed label
-  //   "launch" exe path, or "shell:AppsFolder\\<AUMID>" for Store/packaged apps
-  //   "icon"   optional custom icon: plain PNG file name inside %ProgramData%\mini-oled-dock\icons\
-  //            (e.g. "discord.png"; paths, "..", drive letters and UNC paths are rejected)
-  // List the AUMIDs of installed apps with:  Get-StartApps   (PowerShell)
-  "pinned": {pinned},
-
-  // Apps pinned at the top of the Start menu that a double tap of the Win key opens (separate from
-  // the bar pins above). Normally managed with a right click on an app in that menu. Each entry is
-  // the app's id inside shell:AppsFolder (an AUMID for Store apps); see:  Get-StartApps  (PowerShell)
-  "start_pins": {start_pins},
-
-  // Folders of those pins: each one shows some of the pinned apps under a single tile, placed where
-  // its first app is. Normally managed by dragging a pinned app onto another one in the menu.
-  // Example: [{{ "name": "Games", "apps": ["<id>", "<id>"] }}]
-  "start_folders": {start_folders},
-
-  // Order of the open apps that are NOT pinned (their keys). Pinned apps follow the "pinned" order
-  // above. Normally managed by dragging an entry in the bar; apps not listed go last, in the order
-  // they were first seen. At most 64 keys are kept.
-  "app_order": {app_order},
-
-  // Order of the system buttons on the right of the bar. Normally managed by dragging them.
-  // Names: "metrics", "notifications", "network", "volume", "battery", "clock", "show_desktop", "power".
-  // Missing names go back next to their default neighbour, unknown names are ignored.
-  // Hiding a module (the show_* switches above) keeps its place in this list.
-  "modules_order": {modules_order},
-
-  // Volume panel layout. Normally changed in the panel itself: click a section title to expand or
-  // collapse it, or use the pencil button at the bottom (Customize) to drag sections into a new
-  // order and to hide them. One letter per section, in display order: M = master volume,
-  // O = output devices, S = spatial sound, X = volume mixer. Upper case = expanded, lower case =
-  // collapsed, a leading "-" hides the section. Missing sections come back at the end.
-  // Example: "M-OsX". Default: "MOSX".
-  // A collapsed or hidden section reads nothing from Windows.
-  "audio_layout": {audio_layout},
-
-  // Display-name overrides. Key = exe file name lowercase (e.g. "code.exe") or AUMID;
-  // value = the name to show. Example: {{ "code.exe": "VS Code" }}
-  "names": {names},
-
-  // Updates. Once a day the dock asks GitHub (api.github.com) whether a newer release exists and
-  // shows a badge on Settings; nothing is downloaded until you choose "Update now" in Settings ->
-  // Updates. false = never ask by itself ("Check now" still works).
-  "update_check": {update_check},
-
-  // true = also download, verify (SHA-256 + version) and install a new release by itself, the next
-  // time no popup or Settings window is open and no fullscreen app is in front.
-  "update_auto_install": {update_auto_install},
-
-  // Internal: time of the last successful check (UTC) and the newest release found. Leave as is.
-  "last_update_check": {last_update_check},
-  "update_available": {update_available},
-
-  // Launcher: a search box over the desktop (apps, open windows, settings, commands, calculator).
-  // It stays off until "chord" is set. Unknown or out-of-range values fall back to the default.
-  "launcher": {{
+        r#"{{
     // false = the launcher is never started, whatever the chord says.
     "enabled": {l_enabled},
     // The key chord that opens it: "off", "alt+space" or "alt+shift+space".
@@ -1633,159 +2569,61 @@ fn render(c: &Config) -> String {
     "offer_done": {l_offer_done},
     // Internal: set once that PowerToys question was answered (any choice, or Don't show again). Leave as is.
     "powertoys_done": {l_powertoys_done}
-  }},
-
-  // Internal: set once the notification-access prompt has been shown. Leave as is.
-  "notif_prompted": {notif}{extra}
-}}
-"#,
-        monitor = js(&c.monitor),
-        opacity = c.bar_opacity.min(100),
-        settings_size = js(&c.settings_window_size),
-        icon_size = c.app_icon_size,
-        text_size = c.app_text_size,
-        tray_size = c.tray_icon_size,
-        module_size = c.module_size,
-        autohide = c.autohide,
-        show_delay = c.show_delay_ms,
-        hide_delay = c.hide_delay_ms,
-        reveal_guide = reveal_guide(crate::ui::PUSH_AVAILABLE),
-        reveal = if c.reveal == Reveal::Push { "\"push\"" } else { "\"dwell\"" },
-        push_threshold = c.push_threshold,
-        keyboard = format_args!(
-            "{{\"win_numbers\":{},\"win_t\":{},\"win_b\":{},\"peek\":{}}}",
-            c.keyboard.win_numbers, c.keyboard.win_t, c.keyboard.win_b, c.keyboard.peek
-        ),
-        window_previews = c.window_previews,
-        win_opens_start = c.win_opens_start,
-        start_style = c.start_style.as_str(),
-        start_grid = c.start_grid,
-        hide_native = c.hide_native_taskbar,
-        show_date = c.show_date,
-        time_format = js(&c.time_format),
-        show_seconds = c.show_seconds,
-        date_format = js(&c.date_format),
-        show_volume = c.show_volume_percent,
-        show_tray = c.show_tray,
-        tray_show_all = c.tray_show_all,
-        show_notif = c.show_notifications,
-        show_vol_mod = c.show_volume,
-        show_network = c.show_network,
-        show_metrics = c.show_metrics,
-        show_battery = js(&c.show_battery),
-        battery_percent = c.battery_percent,
-        battery_percent_inside = c.battery_percent_inside,
-        show_clock = c.show_clock,
-        show_desk = c.show_desktop_button,
-        show_start = c.show_start_button,
-        tray_hidden = js_block(&c.tray_hidden),
-        tray_order = js_block(&c.tray_order),
-        app_order = js_block(&c.app_order),
-        modules_order = js_block(&c.modules_order),
-        audio_layout = js(&c.audio_layout.encode()),
-        tray_guids = js_block(&c.tray_hidden_guids),
-        tray_privacy_migrated = c.tray_privacy_migrated,
-        pinned = js_block(&c.pinned),
-        start_pins = js_block(&c.start_pins),
-        start_folders = js_block(&c.start_folders),
-        names = js_block(&c.names),
-        notif = c.notif_prompted,
-        update_check = c.update_check,
-        update_auto_install = c.update_auto_install,
-        last_update_check = js(&c.last_update_check),
-        update_available = js(&c.update_available),
-        l_enabled = c.launcher.enabled,
-        l_chord = js(&c.launcher.chord),
-        l_with_powertoys = js(&c.launcher.with_powertoys),
-        l_monitor = js(&c.launcher.monitor),
-        l_top_percent = c.launcher.top_percent,
-        l_width = c.launcher.width,
-        l_rows = c.launcher.rows,
-        l_animate = c.launcher.animate,
-        l_keep_query = c.launcher.keep_query,
-        l_over_fullscreen = js(&c.launcher.over_fullscreen),
-        l_learn = c.launcher.learn,
-        l_announce = c.launcher.announce_selection,
-        l_providers = js_block(&c.launcher.providers).replace("\n", "\n  "),
-        l_prefixes = js_block(&c.launcher.prefixes).replace("\n", "\n  "),
-        l_aliases = js_block(&c.launcher.aliases).replace("\n", "\n  "),
-        l_file_folders = js_block(&c.launcher.file_folders).replace("\n", "\n  "),
-        l_web_engine = js(&c.launcher.web_engine),
-        l_web_url = js(&c.launcher.web_url),
-        l_offer_done = c.launcher.offer_done,
-        l_powertoys_done = c.launcher.powertoys_done,
-        extra = render_extra(&c.extra),
+  }}"#,
+        l_enabled = l.enabled,
+        l_chord = oled_config::jsonc::js(&l.chord),
+        l_with_powertoys = oled_config::jsonc::js(&l.with_powertoys),
+        l_monitor = oled_config::jsonc::js(&l.monitor),
+        l_top_percent = l.top_percent,
+        l_width = l.width,
+        l_rows = l.rows,
+        l_animate = l.animate,
+        l_keep_query = l.keep_query,
+        l_over_fullscreen = oled_config::jsonc::js(&l.over_fullscreen),
+        l_learn = l.learn,
+        l_announce = l.announce_selection,
+        l_providers = block(oled_config::jsonc::js_block(&l.providers)),
+        l_prefixes = block(oled_config::jsonc::js_block(&l.prefixes)),
+        l_aliases = block(oled_config::jsonc::js_block(&l.aliases)),
+        l_file_folders = block(oled_config::jsonc::js_block(&l.file_folders)),
+        l_web_engine = oled_config::jsonc::js(&l.web_engine),
+        l_web_url = oled_config::jsonc::js(&l.web_url),
+        l_offer_done = l.offer_done,
+        l_powertoys_done = l.powertoys_done,
     )
 }
 
-/// The guide line of `reveal` and `push_threshold`: while the Push reveal is not shipped nothing reads the two keys.
-fn reveal_guide(push_available: bool) -> &'static str {
-    if push_available {
-        "reveal: \"dwell\" (rest the pointer at the edge) or \"push\" \
-         (push against the edge, push_threshold 20-1000 counts)."
-    } else {
-        "reveal and push_threshold are not used yet: the bar always shows on a rest at the edge. \
-         The keys stay for a later release."
-    }
-}
-
-/// Whether the start rewrites a file that parsed: it is not in the commented format yet, it still has the legacy
-/// `bar_size`, or its load ran the privacy migration (the flag is stored even when the list did not change, so
-/// a list restored by hand later is not migrated a second time).
-fn needs_rewrite(text: &str, notes: &LoadNotes) -> bool {
-    !text.contains(TEMPLATE_MARK) || text.contains("\"bar_size\"") || notes.privacy_migrated || notes.privacy_flag_set
+/// `Range` of a size setting, for its descriptor.
+const fn size_range(s: SizeRange, unit: Unit) -> Range {
+    Range { min: s.min as i64, max: s.max as i64, step: 1, unit }
 }
 
 /// Reads the config from disk; if the file is missing it creates it with the defaults; if it is unreadable/invalid
 /// it logs and uses the defaults WITHOUT overwriting the file. Sets the global snapshot and remembers
 /// the mtime for `poll_changed`. Called once at startup from the main thread.
 pub fn init() -> Arc<Config> {
-    let Some(path) = crate::datadir::config_path() else {
-        crate::log!("config: no usable data folder: running with the defaults, nothing is saved");
-        set(Config::default());
-        return get();
-    };
-    report_legacy_dir();
-    match read_text(&path) {
-        Ok(text) => match parse_with_notes(&text) {
-            Ok((c, notes)) => {
-                crate::log!("config: read from {}", path.display());
-                store_notes(notes);
-                let privacy_changed = notes.privacy_migrated;
-                if privacy_changed {
-                    crate::log!("config: privacy indicators no longer hidden by default (list migrated)");
-                }
-                if needs_rewrite(&text, &notes) {
-                    // Legacy plain JSON (or the legacy "bar_size", or the privacy migration, run by `parse`):
-                    // rewrite once with the commented guide.
-                    let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                    match write_file(&c) {
-                        Ok(()) => crate::log!("config: migrated to the commented format"),
-                        Err(e) => crate::log!("config: migration failed: {e}"),
-                    }
-                }
-                set(c);
-            }
-            Err(e) => {
-                crate::log!("config: {} is invalid ({e}): using defaults, the file is left untouched", path.display());
-                set(Config::default());
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let c = migrate_legacy().unwrap_or_else(fresh_config);
-            crate::log!("config: missing, creating {}", path.display());
-            if let Err(e) = save(&c) {
-                crate::log!("config: creation failed: {e}");
-            }
-            set(c);
+    let spec = crate::datadir::config_path().map(|path| FileSpec {
+        path,
+        kind: FileKind::AdminRootUserEditable,
+        cap: crate::datadir::CONFIG_MAX_BYTES,
+    });
+    if spec.is_some() {
+        report_legacy_dir();
+    }
+    let store = STORE.get_or_init(|| Store::new(spec, on_set));
+    READING.with(|r| r.set(None));
+    let outcome = store.load(|| Some(migrate_legacy().unwrap_or_else(fresh_config)));
+    if let (LoadOutcome::Read | LoadOutcome::Rewritten, Some(reading)) = (&outcome, READING.with(Cell::take)) {
+        let notes = reading.notes;
+        publish(reading);
+        if notes.privacy_migrated {
+            crate::log!("config: privacy indicators no longer hidden by default (list migrated)");
         }
-        Err(e) => {
-            crate::log!("config: reading {} failed ({e}): using defaults", path.display());
-            set(Config::default());
+        if outcome == LoadOutcome::Rewritten {
+            written();
         }
     }
-    *lock_mtime() = file_mtime(&path);
-    get()
+    store.get()
 }
 
 /// One-time migration: reads the legacy `%LOCALAPPDATA%\Dock\config.json` (safely, see
@@ -1840,16 +2678,11 @@ fn report_legacy_dir() {
 /// true if the file's mtime differs from the one remembered at our last read/write (a hand edit that
 /// `poll_changed` has not loaded yet). Does not consume the change.
 pub fn external_edit_pending() -> bool {
-    let Some(path) = crate::datadir::config_path() else { return false };
-    should_post(file_mtime(&path), *lock_mtime())
+    store().external_edit_pending()
 }
 
-/// The change notification of the data folder fires for every write in it (dock.log, the launcher's state file); only
-/// a modification time of `config.json` that differs from the remembered one is worth a message to the UI thread.
-fn should_post(now: Option<SystemTime>, remembered: Option<SystemTime>) -> bool {
-    now != remembered
-}
-
+// The watch stays here rather than in `Store::watch`: its callback counts itself in the wake probe
+// (`config.watch_callbacks`), which oled-config cannot reach.
 /// Raw handle of the folder's change notification (`FindFirstChangeNotificationW`), 0 = no watch.
 static WATCH_CHANGE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Raw handle of the thread-pool wait registered on it, 0 = none.
@@ -1982,109 +2815,79 @@ unsafe extern "system" fn on_folder_change(_context: *mut core::ffi::c_void, _ti
 /// snapshot is kept, a message is logged once and `false` is returned; the file is re-read on the next
 /// change. Returns `true` only if the parsed content differs from the snapshot.
 pub fn poll_changed() -> bool {
-    let Some(path) = crate::datadir::config_path() else { return false };
-    let now = file_mtime(&path);
-    {
-        let mut last = lock_mtime();
-        if *last == now {
-            return false;
-        }
-        *last = now;
-    }
-    if now.is_none() {
-        // File deleted: the snapshot is kept; it will be recreated on the next save.
-        crate::log!("config: file removed, keeping the current configuration");
-        return false;
-    }
-    let text = match read_text(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            crate::log!("config: re-read failed ({e})");
-            return false;
-        }
-    };
-    match parse_with_notes(&text) {
-        Ok((c, notes)) => {
-            store_notes(notes);
-            if notes.privacy_flag_set {
-                // A file edited or restored by hand without the flag: store it, so the migration runs once.
-                let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(e) = write_file(&c) {
-                    crate::log!("config: storing the privacy flag failed: {e}");
+    READING.with(|r| r.set(None));
+    let r = store().reload_if_changed();
+    match &r {
+        Reload::Invalid(_) => LAUNCHER_ERRORS.lock().unwrap_or_else(|p| p.into_inner()).clear(),
+        _ => {
+            if let Some(reading) = READING.with(Cell::take) {
+                let flag_set = reading.notes.privacy_flag_set;
+                publish(reading);
+                if flag_set && store().errors().is_empty() {
+                    // A file edited or restored by hand without the flag: stored, so the migration runs once (the
+                    // start rewrites such a file itself, as a migrated one).
+                    if let Err(e) = modify(|_| {}) {
+                        crate::log!("config: storing the privacy flag failed: {e}");
+                    }
                 }
             }
-            if c == *get() {
-                return false;
-            }
-            crate::log!("config: changed on disk, reloaded");
-            set(c);
-            true
-        }
-        Err(e) => {
-            crate::log!("config: invalid change ({e}), keeping the previous one");
-            false
         }
     }
+    r == Reload::Changed
 }
 
 /// Atomic read-modify-write of the config: applies `f` to a copy of the current snapshot,
 /// writes the file (temp + rename) and, if that succeeds, updates the global snapshot.
 /// Used by Pin/Unpin. Write errors -> `Err` (the snapshot stays unchanged).
 pub fn modify<F: FnOnce(&mut Config)>(f: F) -> Result<(), String> {
-    let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let mut c = (*get()).clone();
-    f(&mut c);
-    write_file(&c)?;
-    set(c);
+    before_write()?;
+    store().modify(f).map_err(|e| e.to_string())?;
+    written();
     Ok(())
 }
 
 /// Atomically writes `c` to `config.json` (`.tmp` file in the same folder + rename).
 /// Updates the global snapshot and the remembered mtime (so `poll_changed` does not re-read
 /// our own write).
+// No caller in the dock since the store creates a missing file itself; kept for the API's callers to come.
+#[allow(dead_code)]
 pub fn save(c: &Config) -> Result<(), String> {
-    let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    write_file(c)?;
-    set(c.clone());
+    before_write()?;
+    store().save(c).map_err(|e| e.to_string())?;
+    written();
     Ok(())
 }
 
-/// If `config.json` exists but does not parse (the user is mid-edit or made a typo), copies it to
-/// `config.json.bak` so the rewrite that follows does not destroy those edits.
-fn backup_if_broken(path: &Path) -> Result<(), String> {
-    let text = match read_text(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
-    };
-    if parse(&text).is_ok() {
+/// Before a write of ours (`modify`, `save`): the launcher's fixes in the file it replaces saved aside. One body for
+/// every closure `modify` is called with.
+#[inline(never)]
+fn before_write() -> Result<(), String> {
+    // The file from `init` on, while the data folder is writable (else the store refuses the write itself).
+    let path = STORE.get().and_then(|_| crate::datadir::config_path()).filter(|_| crate::datadir::writable());
+    back_up_launcher_fixes(path.as_deref())
+}
+
+/// Before a write of ours over `path`: a file that loads only through fixes of its launcher section (`read_launcher`)
+/// is copied to `<file>.bak` first, as the store copies a file with errors of its own (it sees only those), so what
+/// the fixes drop (aliases, prefixes, provider names) outlives the rewrite. Err when the copy fails: then nothing is
+/// written. A file that cannot be read or parsed is the store's to copy.
+fn back_up_launcher_fixes(path: Option<&std::path::Path>) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let read = crate::datadir::read_file(path, crate::datadir::CONFIG_MAX_BYTES, false);
+    let Some(text) = read.ok().and_then(|b| String::from_utf8(b).ok()) else { return Ok(()) };
+    READING.with(|r| r.set(Some(Reading::default())));
+    let parsed = parse(&text).is_ok();
+    let fixed = READING.with(Cell::take).is_some_and(|r| !r.launcher.is_empty());
+    if !(parsed && fixed) {
         return Ok(());
     }
-    let bak = path.with_extension("json.bak");
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".bak");
+    let bak = std::path::PathBuf::from(bak);
+    // The error names the file it failed on.
     crate::datadir::write_atomic(&bak, text.as_bytes(), crate::datadir::FileAcl::Inherit)
-        .map_err(|e| format!("backup to {}: {e}", bak.display()))?;
-    crate::log!("config: {} has errors, copied to {} before rewriting", path.display(), bak.display());
-    Ok(())
-}
-
-/// Atomic write + update of the remembered mtime. Call with `WRITE_LOCK` held.
-/// The new file gets the user-editable DACL (`datadir::FileAcl::UserEditable`) before it replaces
-/// the old one, so hand-editing keeps working after every programmatic save.
-fn write_file(c: &Config) -> Result<(), String> {
-    if !crate::datadir::writable() {
-        return Err("no writable data folder".into());
-    }
-    let path = crate::datadir::config_path().ok_or_else(|| "no data folder".to_string())?;
-    let json = render(c);
-    // Never lose unparsed user edits: refuse to write if they cannot be saved aside.
-    backup_if_broken(&path)?;
-    crate::datadir::write_atomic(&path, json.as_bytes(), crate::datadir::FileAcl::UserEditable)?;
-    // The file just written holds a valid show_battery, so the note about an invalid one is stale.
-    let mut notes = NOTES.lock().unwrap_or_else(|p| p.into_inner());
-    notes.show_battery_invalid = false;
-    notes.new_keys_invalid = false;
-    drop(notes);
-    *lock_mtime() = file_mtime(&path);
+        .map_err(|e| format!("backup: {e}"))?;
+    crate::log!("config: the launcher section has errors, the file was copied to config.json.bak before rewriting");
     Ok(())
 }
 
@@ -2605,7 +3408,7 @@ mod tests {
     #[test]
     fn launcher_section_roundtrips_and_parse_sanitizes() {
         let c = parse(r#"{"launcher": {"chord": "alt+space", "rows": 20, "prefixes": {"file ": "files"}}}"#).unwrap();
-        assert_eq!(c.launcher.rows, 12);
+        assert_eq!(c.launcher.rows, LAUNCHER_ROWS.2, "out of its range: the default");
         assert_eq!(c.launcher.chord_spec().map(|s| s.vk), Some(0x20));
         let r = render(&c);
         assert_eq!(parse(&r).unwrap(), c);
@@ -2616,13 +3419,22 @@ mod tests {
     fn timing_keys_default_and_clamp() {
         let c = parse("{}").unwrap();
         assert_eq!((c.hide_delay_ms, c.show_delay_ms, c.reveal, c.push_threshold), (2500, 150, Reveal::Dwell, 100));
-        assert_eq!(parse("{\"hide_delay_ms\": 9000}").unwrap().hide_delay_ms, 5000);
-        assert_eq!(parse("{\"show_delay_ms\": 20000}").unwrap().show_delay_ms, 1000);
+        // The two delays have a range in Settings: a value outside it is an error and the default stands in.
+        let (c, errors) = parse_with_errors("{\"hide_delay_ms\": 9000, \"show_delay_ms\": 20000}", None).unwrap();
+        assert_eq!((c.hide_delay_ms, c.show_delay_ms, errors.len()), (2500, 150, 2));
+        // The push threshold has no Settings row: it is still clamped as it is read.
         assert_eq!(parse("{\"push_threshold\": 1}").unwrap().push_threshold, 20);
         assert_eq!(parse("{\"push_threshold\": 5000}").unwrap().push_threshold, 1000);
         assert_eq!(parse("{\"hide_delay_ms\": 0}").unwrap().hide_delay_ms, 0);
-        // A number too big for u32 is clamped like any other number out of range.
-        assert_eq!(parse("{\"hide_delay_ms\": 5000000000}").unwrap().hide_delay_ms, 5000);
+        // A negative number is below the range: that key alone falls back, the file is read.
+        let (c, errors) = parse_with_errors("{\"hide_delay_ms\": -5, \"autohide\": false}", None).unwrap();
+        assert_eq!((c.hide_delay_ms, c.autohide), (2500, false));
+        assert_eq!(errors[0].problem, Problem::Range { min: 0, max: 5000, got: -5 });
+        // A number too big for u32 is above the range like any other: that key falls back; the push threshold, clamped
+        // as it is read, takes its maximum.
+        let (c, errors) = parse_with_errors("{\"hide_delay_ms\": 5000000000}", None).unwrap();
+        assert_eq!(c.hide_delay_ms, 2500);
+        assert_eq!(errors[0].problem, Problem::Range { min: 0, max: 5000, got: 5_000_000_000 });
         assert_eq!(parse("{\"push_threshold\": 99999999999}").unwrap().push_threshold, 1000);
     }
 
@@ -2658,17 +3470,20 @@ mod tests {
                 "{text}"
             );
         }
-        // A wrong flag inside `keyboard` drops only that switch.
+        // A wrong switch inside `keyboard` leaves the note too; the section is one value, so it reads its default as a
+        // whole (the store's rule for a wrong value inside a section, `a_wrong_value_inside_a_section_says_...`).
         let (c, notes) = parse_with_notes("{\"keyboard\": {\"win_t\": \"no\", \"win_b\": false}}").unwrap();
         assert!(notes.new_keys_invalid);
-        assert_eq!(c.keyboard, KeyboardConfig { win_b: false, ..KeyboardConfig::default() });
+        assert_eq!(c.keyboard, KeyboardConfig::default());
         // Right types leave no note, including the keys the file does not have.
         for ok in ["{}", "{\"hide_delay_ms\": 0, \"show_delay_ms\": 9999, \"keyboard\": {\"peek\": false}}"] {
             assert!(!parse_with_notes(ok).unwrap().1.new_keys_invalid, "{ok}");
         }
-        // What is not one of the new keys stays strict: a file that is not an object, or a wrong type elsewhere.
+        // A syntax error is still the whole file's; a key that is not new in 1.6 loses its value alone too, without
+        // the note.
         assert!(parse("{ \"hide_delay_ms\": ").is_err());
-        assert!(parse("{\"autohide\": \"yes\"}").is_err());
+        let (c, notes) = parse_with_notes("{\"autohide\": \"yes\", \"position\": \"top\"}").unwrap();
+        assert!(c.autohide && c.position == Position::Top && !notes.new_keys_invalid);
     }
 
     #[test]
@@ -2822,15 +3637,15 @@ mod tests {
 
     #[test]
     fn privacy_flag_is_stored_whenever_a_load_set_it() {
-        // A file with the user's own list and no flag: the list stays, this load sets the flag, so the start
-        // rewrites the file (before, only a changed list did).
+        // A file with the user's own list and no flag: the list stays and this load sets the flag, so the file is
+        // rewritten (before, only a changed list was): the store rewrites a file a migration changed
+        // (`fixtures::a_file_without_the_privacy_flag_is_rewritten_once`), `poll_changed` stores it after a hand edit.
         let list = vec!["00000000-0000-0000-0000-000000000000".to_string()];
         let own = Config { tray_hidden_guids: list, ..Config::default() };
         let text = render(&Config { tray_privacy_migrated: false, ..own.clone() });
         let (c, notes) = parse_with_notes(&text).unwrap();
         assert!(!notes.privacy_migrated && notes.privacy_flag_set);
         assert_eq!(c.tray_hidden_guids, own.tray_hidden_guids);
-        assert!(needs_rewrite(&text, &notes));
         // A key that is missing altogether is the same.
         let (_, notes) = parse_with_notes("{}").unwrap();
         assert!(notes.privacy_flag_set);
@@ -2838,13 +3653,10 @@ mod tests {
         // default is the user's choice, not migrated a second time.
         let stored = render(&c);
         let (_, again) = parse_with_notes(&stored).unwrap();
-        assert!(!again.privacy_flag_set && !needs_rewrite(&stored, &again));
+        assert!(!again.privacy_flag_set);
         let restored = Config { tray_hidden_guids: OLD_DEFAULT_TRAY_HIDDEN_GUIDS.map(String::from).to_vec(), ..c };
         let (back, notes) = parse_with_notes(&render(&restored)).unwrap();
-        assert!(!notes.privacy_migrated && back.tray_hidden_guids.len() == 5);
-        // A file in the commented format with the flag set and nothing legacy is left alone.
-        let (_, notes) = parse_with_notes(&render(&Config::default())).unwrap();
-        assert!(!needs_rewrite(&render(&Config::default()), &notes));
+        assert!(!notes.privacy_migrated && !notes.privacy_flag_set && back.tray_hidden_guids.len() == 5);
     }
 
     #[test]
@@ -3197,13 +4009,13 @@ mod tests {
     fn legacy_bar_size_migrates() {
         let c = parse("{\"bar_size\": \"large\"}").unwrap();
         assert_eq!(c.sizes(), (20, 16, 20, 125));
-        assert_eq!(c.bar_size, None);
+        assert!(c.extra.is_empty(), "bar_size is read once, never kept");
         assert_eq!(parse("{\"bar_size\": \"small\"}").unwrap().sizes(), (14, 11, 14, 88));
         assert_eq!(parse("{\"bar_size\": \"medium\"}").unwrap(), Config::default());
         // New keys already set: they win.
         assert_eq!(parse("{\"bar_size\": \"large\", \"app_icon_size\": 30}").unwrap().sizes(), (30, 13, 16, 100));
-        // Out-of-range values are clamped on use.
-        assert_eq!(parse("{\"app_icon_size\": 200, \"module_size\": 5}").unwrap().sizes(), (32, 13, 16, 75));
+        // Out-of-range values are errors and the defaults stand in (the clamps on use stay as a second fence).
+        assert_eq!(parse("{\"app_icon_size\": 200, \"module_size\": 5}").unwrap().sizes(), (16, 13, 16, 100));
     }
 
     #[test]
@@ -3227,8 +4039,9 @@ mod tests {
         // Tolerant parse: junk and repeats ignored, missing sections appended.
         assert_eq!(AudioLayout::parse("x, m ?? X").encode(), "xmOS");
         assert_eq!(AudioLayout::parse("so").encode(), "soMX");
-        // A value of the wrong type still rejects the file like any other field.
-        assert!(parse("{\"audio_layout\": 5}").is_err());
+        // A value of the wrong type is an error of that key alone, like any other field: the default stands in.
+        let (c, errors) = parse_with_errors("{\"audio_layout\": 5, \"show_tray\": false}", None).unwrap();
+        assert_eq!((c.audio_layout, c.show_tray, errors.len()), (d, false, 1));
     }
 
     #[test]
@@ -3288,17 +4101,6 @@ mod tests {
         c.pinned.push(PinnedApp { key: "k".into(), name: "N".into(), launch: "L".into(), icon: Some("i.png".into()) });
         c.names.insert("code.exe".into(), "VS Code".into());
         assert_eq!(parse(&serde_json::to_string_pretty(&c).unwrap()).unwrap(), c);
-    }
-
-    #[test]
-    fn only_a_config_mtime_change_posts() {
-        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
-        let t1 = t0 + std::time::Duration::from_secs(1);
-        assert!(!should_post(Some(t0), Some(t0)));
-        assert!(should_post(Some(t1), Some(t0)));
-        assert!(should_post(None, Some(t0)));
-        assert!(should_post(Some(t0), None));
-        assert!(!should_post(None, None));
     }
 
     #[test]

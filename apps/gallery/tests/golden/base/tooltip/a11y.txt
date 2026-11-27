@@ -1,0 +1,7 @@
+Label "Chips"
+Label "Icon buttons (hold the pointer for half a second)"
+Button "Back" [focusable]
+Button "Refresh" [focusable]
+Button "Search" [focusable]
+Button "Pin" [focusable]
+Button "Settings" [focusable]

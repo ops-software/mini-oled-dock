@@ -1,0 +1,9 @@
+Group
+Dialog "Delete 3 items?"
+Button "Cancel" [focusable]
+Button "Delete" [focusable]
+Group
+Dialog "End this process?"
+Button "Cancel" [focusable]
+Button "Close it" [focusable]
+Button "End now" [focusable]

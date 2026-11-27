@@ -1,0 +1,41 @@
+Toolbar "Tasks"
+Button "More (F10)" [focusable]
+Label "Every 1 s"
+ColumnHeader "Name 41 processes" [focusable]
+ColumnHeader "CPU 3.2 %" [focusable]
+ColumnHeader "Memory 41 %" [focusable]
+ColumnHeader "I/O 1.02 MB/s" [focusable]
+Table "Name" 3 of 41
+  Row "lantern.exe" [focusable] 1 of 41
+  Row "ember.exe" [focusable] 2 of 41
+  Row "pebble.exe" [focusable, selected] 3 of 41
+  Row "prism.exe" [focusable] 4 of 41
+  Row "orbit.exe" [focusable] 5 of 41
+  Row "willow.exe" [focusable] 6 of 41
+  Row "atlas.exe" [focusable] 7 of 41
+  Row "willow.exe" [focusable] 8 of 41
+  Row "harbor.exe" [focusable] 9 of 41
+  Row "quill.exe" [focusable] 10 of 41
+  Row "orbit.exe" [focusable] 11 of 41
+  Row "ember.exe" [focusable] 12 of 41
+  Row "marble.exe" [focusable] 13 of 41
+  Row "tundra.exe" [focusable] 14 of 41
+  Row "lantern.exe" [focusable] 15 of 41
+  Row "cobalt.exe" [focusable] 16 of 41
+  Row "services.exe" [focusable] 17 of 41
+  Row "svchost.exe" [focusable] 18 of 41
+  Row "csrss.exe" [focusable] 19 of 41
+  Row "tundra.exe" [focusable] 20 of 41
+  Row "lsass.exe" [focusable] 21 of 41
+  Row "explorer.exe" [focusable] 22 of 41
+  Row "cobalt.exe" [focusable] 23 of 41
+  Row "svchost.exe" [focusable] 24 of 41
+  Row "svchost.exe" [focusable] 25 of 41
+  Row "svchost.exe" [focusable] 26 of 41
+  Row "svchost.exe" [focusable] 27 of 41
+  Row "svchost.exe" [focusable] 28 of 41
+  Row "svchost.exe" [focusable] 29 of 41
+  Row "conhost.exe" [focusable] 30 of 41
+  Row "svchost.exe" [focusable] 31 of 41
+  Row "svchost.exe" [focusable] 32 of 41
+  Row "dwm.exe" [focusable] 33 of 41

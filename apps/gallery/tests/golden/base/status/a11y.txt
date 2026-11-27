@@ -1,0 +1,5 @@
+Status "1,204 items · 3 selected"
+Status "142 processes · Paused"
+Alert "Some processes could not be read."
+  Button "Details" [focusable]
+Alert "Some processes could not be read."

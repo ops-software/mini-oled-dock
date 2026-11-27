@@ -46,3 +46,7 @@
 "kit.verb.restart_desc" = "Stops it and starts it again."
 "kit.app.tasks" = "Tasks"
 "kit.app.files" = "Folio"
+"kit.splitter" = "Resize panes"
+"kit.path" = "Path"
+"kit.subfolders" = "Subfolders"
+"kit.refresh" = "Refresh"

@@ -1,20 +1,66 @@
 [package]
 name = "tasks"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 rust-version = "1.87"
+description = "The tasks app of the suite: every process grouped as the dock names it, safe to close and end."
 license = "MIT"
 publish = false
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
 doctest = false
 
+[[bin]]
+name = "tasks"
+path = "src/main.rs"
+
+[features]
+default = []
+# Never in a shipped build: reads a fault script at start for the live chord matrix (TA-T6b).
+fault-inject = []
+# --preview and --list-apps, and the scenes embedded for them; the live tester's build.
+preview = []
+
 [dependencies]
+oled-ui = { workspace = true }
+oled-config = { workspace = true }
+oled-sys = { workspace = true }
+oled-trust = { workspace = true }
 oled-sysmon = { workspace = true }
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security",
-    "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_Services", "Win32_System_SystemInformation",
-    "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+oled-shellmodel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The features of this package only: the dock's release build selects the root package alone, so none reaches dock.exe.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+oled-i18n-build = { workspace = true }
+embed-manifest = "1.5.1"
+winresource = "0.1.19"
 
 [[example]]
 name = "testee"
@@ -24,4 +70,14 @@ name = "trace_record"
 test = true
 [[example]]
 name = "sampler_bench"
+test = true
+# P3-tasks-app's examples: stub mains until their groups fill them (the manifest is not edited again for them).
+[[example]]
+name = "testee_close"
+test = true
+[[example]]
+name = "post_updated"
+test = true
+[[example]]
+name = "chord_probe"
 test = true

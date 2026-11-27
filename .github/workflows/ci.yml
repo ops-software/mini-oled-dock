@@ -71,6 +71,13 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo clippy --locked --all-targets --features wake-probe -- -D warnings
 
+      # The kit with its a11y feature (P2-kit K2b.8): oled-ui and the gallery with AccessKit compiled in.
+      - name: Clippy (kit a11y)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo clippy --locked -p oled-ui -p gallery --all-targets --features oled-ui/a11y -- -D warnings
+
       # Resolver 2 unifies features across the workspace, so a crate that forgot a windows feature builds inside it
       # and breaks alone (an app built with -p): check every member on its own.
       - name: Each member builds alone
@@ -105,6 +112,10 @@ jobs:
       - name: cargo deny
         run: cargo deny --locked --workspace check
 
+      # The licences of the a11y feature's extra dependencies (P2-kit K2b.8), checked with the feature on.
+      - name: cargo deny (kit a11y)
+        run: cargo deny --locked --workspace --features oled-ui/a11y check licenses
+
   test:
     runs-on: windows-latest
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
@@ -137,11 +148,12 @@ jobs:
           RATCHET_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: pwsh tools/ci/ratchet.ps1
 
+      # --no-fail-fast: one failing test binary does not hide the result of the binaries after it.
       - name: Tests
         env:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
 
       # Features of the dock package: no --workspace, the root package is selected by default.
       - name: Tests (owner-probe)
@@ -156,12 +168,34 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --features wake-probe
 
+      # CI-only window smoke tests of the kit (P2-kit 0.4 rule 1): they open windows, so they run here and nowhere else.
+      - name: Kit window smoke tests
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked -p gallery -p oled-ui -- --ignored smoke
+
+      # The kit with the a11y feature (K.CI2): its tests, then its idle smoke test (no wake-up with no client attached).
+      - name: Kit a11y tests
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked -p oled-ui -p gallery --features oled-ui/a11y
+
+      - name: Kit a11y smoke tests
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked -p gallery --features oled-ui/a11y -- --ignored smoke_idle_a11y
+
       - name: Golden diffs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: golden-diffs
-          path: target-test/tmp/golden
+          path: |
+            target-test/tmp/golden
+            target-test/tmp/files-golden
           if-no-files-found: ignore
           retention-days: 14
 
@@ -194,6 +228,38 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --test budgets -- --ignored exe_size_within_ledger
 
+      # The kit's minimal app (K.CI2): what the kit adds to an exe, plain (target) and with the a11y feature (target-a11y).
+      - name: Release build (kit_min)
+        run: cargo build --release --locked -p gallery --example kit_min
+
+      - name: Release build (kit_min, a11y)
+        env:
+          CARGO_TARGET_DIR: target-a11y
+        run: cargo build --release --locked -p gallery --example kit_min --features oled-ui/a11y
+
+      - name: Kit_min size
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          KIT_MIN_EXE: target/release/examples/kit_min.exe
+        run: cargo test --locked -p gallery --test budgets -- --ignored kit_min_size_within_row
+
+      - name: Kit_min size (a11y)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          KIT_MIN_ROW: exe_size.kit_min_a11y
+          KIT_MIN_EXE: target-a11y/release/examples/kit_min.exe
+        run: cargo test --locked -p gallery --test budgets -- --ignored kit_min_size_within_row
+
+      - name: Kit a11y size delta
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          KIT_MIN_EXE: target/release/examples/kit_min.exe
+          KIT_MIN_A11Y_EXE: target-a11y/release/examples/kit_min.exe
+        run: cargo test --locked -p gallery --test budgets -- --ignored kit_min_a11y_delta_within_350_kb
+
       # The files app's release exe (its engine roles until its window lands): row exe_size.files.
       - name: Release build (files)
         run: cargo build -p files --release --locked
@@ -204,6 +270,13 @@ jobs:
           FILES_EXE: target/release/files.exe
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --test budgets -- --ignored files_exe_size_within_budget
+
+      # The files preview exe the tester runs (internal build, never installed by CI).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: files-preview
+          path: target/release/files.exe
+          retention-days: 7
 
       - uses: actions/upload-artifact@v4
         with:
@@ -280,7 +353,7 @@ jobs:
           $names = @(git grep -h -o -E 'fn bench_[a-z0-9_]+' -- apps/files | ForEach-Object { $_ -replace '^fn bench_', '' } | Sort-Object -Unique)
           if ($names.Count -eq 0) { 'no files benches yet'; exit 0 }
           $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
-          $out = cargo test -p files --release --locked -- --ignored bench_ --nocapture --test-threads=1 2>&1 | ForEach-Object { "$_" }
+          $out = cargo test -p files --release --locked --no-fail-fast -- --ignored bench_ --nocapture --test-threads=1 2>&1 | ForEach-Object { "$_" }
           $code = $LASTEXITCODE
           $ErrorActionPreference = 'Stop'
           $out | Write-Host
@@ -307,6 +380,54 @@ jobs:
           $missing = @($names | Where-Object { -not ($out -match "bench: files $([regex]::Escape($_)) ") })
           if ($missing.Count -gt 0) { throw "files timings without their bench line: $($missing -join ', ')" }
 
+  # Kit benches (P2-kit K.CI1, K.CI2): the gallery's release benches, each gated against its budgets.json row (x 1.5 under CI).
+  # The job fails unless every bench ran and printed its line; the field bench (bench_field) runs after them.
+  kit-bench:
+    runs-on: windows-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.regen) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      - name: Kit bench
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-bench
+        run: |
+          $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
+          $out = cargo test --release --locked -p gallery --test bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          # A filter that matches no test passes silently: the job fails unless each bench ran and printed its line.
+          if ($out -match 'running 0 tests') { throw 'kit bench: no test ran' }
+          foreach ($name in 'raster_4k_settings_like', 'table_hover', 'table_text_40x4', 'scroll_strip', 'table_4k_full') {
+            if (-not ($out -match ('\{"bench":"' + $name + '"'))) { throw "kit bench: no bench line for $name" }
+          }
+
+      # The field bench (K2b.3): a keystroke to the repainted field, with its own guard and line check.
+      - name: Kit field bench
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-bench
+        run: |
+          $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
+          $out = cargo test --release --locked -p gallery --test bench_field -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          if ($out -match 'running 0 tests') { throw 'kit field bench: no test ran' }
+          if (-not ($out -match '\{"bench":"field_key"')) { throw 'kit field bench: no bench line for field_key' }
+
   regen-golden:
     runs-on: windows-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.regen }}
@@ -328,8 +449,45 @@ jobs:
           UPDATE_GOLDEN: "1"
         run: cargo test --locked --test golden
 
+      # Guarded: the target lands with the files window goldens; until then the step and its upload are skipped.
+      - name: Regenerate files goldens
+        if: ${{ hashFiles('apps/files/tests/golden.rs') != '' }}
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          GOLDEN_CI_REGEN: "1"
+          UPDATE_GOLDEN: "1"
+        run: cargo test --locked -p files --test golden
+
+      # Never committed by the job: the owner downloads files-golden-regen, looks at the PNGs and commits them.
+      - uses: actions/upload-artifact@v4
+        if: ${{ hashFiles('apps/files/tests/golden.rs') != '' }}
+        with:
+          name: files-golden-regen
+          path: apps/files/tests/golden/base
+          retention-days: 14
+
+      - name: Regenerate kit goldens
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          GOLDEN_CI_REGEN: "1"
+          UPDATE_GOLDEN: "1"
+        run: cargo test --locked -p gallery --test golden
+
+      - name: Regenerate tasks goldens
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          GOLDEN_CI_REGEN: "1"
+          UPDATE_GOLDEN: "1"
+        run: cargo test --locked -p tasks -- golden_
+
       - uses: actions/upload-artifact@v4
         with:
           name: golden-regen
-          path: tests/golden
+          path: |
+            tests/golden
+            apps/gallery/tests/golden/base
+            apps/tasks/tests/golden/base
           retention-days: 14

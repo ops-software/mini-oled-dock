@@ -1,0 +1,2 @@
+Splitter "Resize panes" [focusable] 32.05128%
+Splitter "Resize panes" [focusable] 51.28205%

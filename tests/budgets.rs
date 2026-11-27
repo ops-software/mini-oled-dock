@@ -132,6 +132,7 @@ fn schema_is_valid() {
                 "private.uia_",
                 "exe_size.tasks",
                 "exe_size.files",
+                "exe_size.kit",
             ]
             .iter()
             .any(|p| id.starts_with(p));
@@ -243,6 +244,19 @@ fn g7_values_are_pinned() {
     assert_eq!(value("private.files_shell_host"), 15.0 * MIB);
     assert_eq!(value("wakeups.files_ops_idle"), 0.0);
     assert_eq!(value("wakeups.files_shell_idle"), 0.0);
+    assert_eq!(value("files.ui_first_frame_ms"), 30.0);
+    assert_eq!(value("files.frame_1080p_ms"), 8.0);
+    assert_eq!(value("files.cells_40x4_us"), 500.0);
+    assert_eq!(value("files.key_move_us"), 1000.0);
+    assert_eq!(value("files.menu_build_us"), 1000.0);
+    assert_eq!(value("files.menu_draw_ms"), 16.0);
+    assert_eq!(value("files.instance_forward_ms"), 5.0);
+    assert_eq!(value("files.ui_heap_100k_bytes"), 10.0 * MIB);
+    assert_eq!(value("golden.files_bytes"), 16.0 * MIB);
+    assert_eq!(value("wakeups.files_ui_idle"), 0.0);
+    assert_eq!(value("private.files_linger"), 5.0 * MIB);
+    assert_eq!(value("wakeups.files_linger"), 0.0);
+    assert_eq!(value("start.handoff_files_ms"), 15.0);
     assert_eq!(value("exe_size.tasks_admin"), (0.6 * MIB).round());
     assert_eq!(value("golden.bytes"), 32.0 * MIB);
 }
@@ -301,12 +315,31 @@ fn every_g7_budget_has_a_row() {
         "private.files_shell_host",
         "wakeups.files_ops_idle",
         "wakeups.files_shell_idle",
+        "files.ui_first_frame_ms",
+        "files.frame_1080p_ms",
+        "files.cells_40x4_us",
+        "files.key_move_us",
+        "files.menu_build_us",
+        "files.menu_draw_ms",
+        "files.instance_forward_ms",
+        "files.ui_heap_100k_bytes",
+        "golden.files_bytes",
+        "wakeups.files_ui_idle",
+        "private.files_linger",
+        "wakeups.files_linger",
+        "start.handoff_files_ms",
         "exe_size.tasks_admin",
         "frame.bar_150",
         "frame.table_hover",
         "frame.table_text_40x4",
         "frame.scroll_strip",
         "frame.table_4k_full",
+        "frame.raster_4k",
+        "frame.field_key",
+        "golden.gallery_bytes",
+        "exe_size.kit_min",
+        "exe_size.kit_min_a11y",
+        "theme.switch_ms",
         "frame.screen_p95_4k",
         "frame.tears_per_100",
         "start.first_frame_tasks",
@@ -367,4 +400,12 @@ fn golden_set_fits_its_budget() {
     let used = dir_bytes(&root().join("tests/golden/base"));
     let max = value("golden.bytes") as u64;
     assert!(used <= max, "tests/golden/base is {used} bytes, budget {max}");
+}
+
+#[test]
+fn golden_files_bytes() {
+    // The files package's committed set (CI-made, never from a developer's machine); a missing folder counts as empty.
+    let used = dir_bytes(&root().join("apps/files/tests/golden/base"));
+    let max = value("golden.files_bytes") as u64;
+    assert!(used <= max, "apps/files/tests/golden/base is {used} bytes, budget {max}");
 }

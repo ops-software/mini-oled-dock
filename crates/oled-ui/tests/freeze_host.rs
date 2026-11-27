@@ -243,7 +243,7 @@ fn signatures_are_frozen() {
     let _f: fn(&EventLoop, WindowRef) -> Option<HWND> = EventLoop::hwnd;
     let _f: fn(&mut EventLoop) = EventLoop::caption_spike;
     let _f: fn(EventLoop) -> i32 = EventLoop::run;
-    assert!(matches!(EventLoop::new(AppId("gallery"), Lang::En, ThemeSpec::oled()), Err(UiError::NotReady(_))));
+    assert!(EventLoop::new(AppId("gallery"), Lang::En, ThemeSpec::oled()).is_ok(), "a loop opens no window by itself");
     // ---- present and harness (2.5)
     let _f: fn(i32) -> i32 = band_height;
     let _s = Image { w: 0, h: 0, px: Vec::new(), text_rects: Vec::new() };
@@ -356,4 +356,94 @@ fn cx_signatures<'a>() {
     let _f: fn(&mut LoopCx<'a>, ThemeSpec) = LoopCx::set_theme;
     let _f: fn(&mut LoopCx<'a>, WindowSpec, Two) -> Result<WindowRef, UiError> = LoopCx::open::<Two>;
     let _f: fn(&mut LoopCx<'a>, i32) = LoopCx::quit;
+}
+
+/// A screen with the TK1 hooks (P3-tasks-app F-T3): it takes a copy-data payload, answers a routed message and asks
+/// for the window requests on a click.
+struct Front {
+    cmds: CommandTable,
+    got: Vec<(usize, Vec<u8>)>,
+    routed: Vec<(u32, usize, isize)>,
+    front: Option<FrontResult>,
+}
+
+impl Screen for Front {
+    fn layout(&mut self, cx: &mut LayoutCx, avail: SizeP) -> SizeP {
+        let one = Node::new(NodeId::new(WidgetId(1), 0), Role::Button, RectP::wh(0, 0, cx.px(80), cx.px(28)));
+        cx.push(one.label(Cow::Borrowed("Front")).focus(Focusable::Tab).actions(Actions::CLICK));
+        avail
+    }
+
+    fn paint(&self, cx: &mut PaintCx) {
+        let _ = cx;
+    }
+
+    fn event(&mut self, cx: &mut EventCx, ev: &Event) -> Reply {
+        if let Event::Click { .. } = ev {
+            self.front = cx.front_result();
+            cx.bring_to_front();
+            cx.set_topmost(true);
+        }
+        Reply::None
+    }
+
+    fn copy_data(&mut self, cx: &mut EventCx, tag: usize, bytes: &[u8]) -> bool {
+        let _ = cx;
+        self.got.push((tag, bytes.to_vec()));
+        tag == 1
+    }
+
+    fn app_message(&mut self, cx: &mut EventCx, msg: u32, wparam: usize, lparam: isize) -> Reply {
+        let _ = cx;
+        self.routed.push((msg, wparam, lparam));
+        Reply::None
+    }
+
+    fn commands(&self) -> &CommandTable {
+        &self.cmds
+    }
+}
+
+#[test]
+#[allow(clippy::type_complexity)]
+fn kit1_window_items_are_usable() {
+    use oled_ui::harness::WindowRequest;
+    let front = Front { cmds: CommandTable::new(), got: Vec::new(), routed: Vec::new(), front: None };
+    let mut h = Harness::new(front, SizeL { w: 200, h: 100 }, 96, Tokens::oled());
+    assert!(h.copy_data(1, b"show") && !h.copy_data(2, b""), "the screen's answers");
+    assert!(!h.copy_data(1, &vec![0u8; 64 * 1024 + 1]), "above 64 KiB: refused without a call");
+    h.app_message(0xC123, 7, -1).click(PointL { x: 10, y: 10 }).click(PointL { x: 10, y: 10 });
+    assert_eq!(h.screen().got, [(1, b"show".to_vec()), (2, Vec::new())]);
+    assert_eq!(h.screen().routed, [(0xC123, 7, -1)]);
+    assert_eq!(h.screen().front, Some(FrontResult::Foreground), "the outcome of the first click's request");
+    let want = [WindowRequest::BringToFront, WindowRequest::Topmost(true)];
+    assert_eq!(h.window_requests(), [want, want].concat());
+    let _e = [FrontResult::Foreground, FrontResult::Topmost, FrontResult::None];
+    let _f: fn(&mut Front, &mut EventCx<'_>, usize, &[u8]) -> bool = <Front as Screen>::copy_data;
+    let _f: fn(&mut Front, &mut EventCx<'_>, u32, usize, isize) -> Reply = <Front as Screen>::app_message;
+    let _f: fn(&mut Box<dyn Screen>, &mut EventCx<'_>, usize, &[u8]) -> bool = <Box<dyn Screen> as Screen>::copy_data;
+    let _f: fn(&mut EventLoop, WindowRef, u32) -> bool = EventLoop::route_message;
+    let _f: fn(&mut Harness<Front>, usize, &[u8]) -> bool = Harness::copy_data;
+    let _f: for<'h> fn(&'h mut Harness<Front>, u32, usize, isize) -> &'h mut Harness<Front> = Harness::app_message;
+    let _f: fn(&Harness<Front>) -> &[WindowRequest] = Harness::window_requests;
+    kit1_cx_signatures();
+    let mut lp = EventLoop::new(AppId("tasks"), Lang::En, ThemeSpec::oled()).expect("a loop opens no window by itself");
+    assert!(!lp.route_message(WindowRef(1), 0xC123), "no such window");
+    assert!(!lp.route_message(WindowRef(1), 0x000F), "WM_PAINT is never routable");
+}
+
+/// The TK1 methods of EventCx.
+#[allow(clippy::extra_unused_lifetimes)]
+fn kit1_cx_signatures<'a>() {
+    let _f: fn(&mut EventCx<'a>) = EventCx::bring_to_front;
+    let _f: fn(&mut EventCx<'a>, bool) = EventCx::set_topmost;
+    let _f: fn(&EventCx<'a>) -> Option<FrontResult> = EventCx::front_result;
+}
+
+#[test]
+fn kit_names_exist() {
+    assert_eq!(UiLang::EN.kit(strings::k::KIT_APP_TASKS), "Tasks");
+    assert_eq!(UiLang::IT.kit(strings::k::KIT_APP_TASKS), "Attività");
+    assert_eq!(UiLang::EN.kit(strings::k::KIT_APP_FILES), "Folio");
+    assert_eq!(UiLang::IT.kit(strings::k::KIT_APP_FILES), "Folio");
 }

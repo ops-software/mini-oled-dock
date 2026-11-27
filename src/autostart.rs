@@ -35,7 +35,9 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Threading::{GetCurrentProcessId, CREATE_NO_WINDOW};
-use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+use windows::Win32::UI::Shell::{
+    FOLDERID_CommonPrograms, FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+};
 
 use crate::log;
 use crate::update_release::{parse_version_output, Version};
@@ -127,16 +129,26 @@ const INSTALL_DIR_NAME: &str = "mini-oled-dock";
 
 /// `%ProgramFiles%` from `FOLDERID_ProgramFiles` (never hardcoded).
 fn program_files() -> Result<PathBuf, String> {
+    known_folder(&FOLDERID_ProgramFiles, "ProgramFiles")
+}
+
+/// The all-users Start menu Programs folder (`FOLDERID_CommonPrograms`), admin-only to write.
+fn common_programs() -> Result<PathBuf, String> {
+    known_folder(&FOLDERID_CommonPrograms, "CommonPrograms")
+}
+
+/// A known folder's path, resolved by id (never from an environment variable).
+fn known_folder(id: &windows::core::GUID, what: &str) -> Result<PathBuf, String> {
     // SAFETY: valid known-folder id, no token (current user); the returned buffer is freed below.
-    let p = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
-        .map_err(|e| format!("SHGetKnownFolderPath(ProgramFiles): {e}"))?;
+    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
+        .map_err(|e| format!("SHGetKnownFolderPath({what}): {e}"))?;
     // SAFETY: `p` is the NUL-terminated string returned by SHGetKnownFolderPath, read once.
     let s = unsafe { p.to_string() };
     // SAFETY: same pointer, allocated with CoTaskMemAlloc, not used after this line.
     unsafe { CoTaskMemFree(Some(p.0 as *const std::ffi::c_void)) };
-    let s = s.map_err(|e| format!("ProgramFiles path: {e}"))?;
+    let s = s.map_err(|e| format!("{what} path: {e}"))?;
     if s.trim().is_empty() {
-        return Err("ProgramFiles path is empty".into());
+        return Err(format!("{what} path is empty"));
     }
     Ok(PathBuf::from(s))
 }
@@ -428,6 +440,23 @@ fn retry_copy(
     }
 }
 
+/// `std::fs::copy` (CopyFileExW) also copies alternate data streams, so a browser-downloaded exe would keep
+/// its `Zone.Identifier` (Mark of the Web) in the install folder, and the agent started through Explorer
+/// would then be zone-checked on every start. The install is an explicit, elevated act, so the mark is dropped
+/// from the copy (only the stream is removed, never the file). NotFound means there was no mark.
+fn copy_without_zone_mark(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let n = std::fs::copy(src, dst)?;
+    let mut stream = dst.as_os_str().to_os_string();
+    stream.push(":Zone.Identifier");
+    match std::fs::remove_file(PathBuf::from(stream)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            log!("autostart: could not clear the download mark of {}: {e}", dst.display());
+        }
+        _ => {}
+    }
+    Ok(n)
+}
+
 /// Copies the current exe to `dest` through `dock.exe.new` and a rename (`dest` is never written in
 /// place). If the rename is refused and `allow_stop` is set, signals the running instance to exit
 /// (`signal_stop_to_instance`; with no instance, e.g. after a crash, its watchdog may still hold the
@@ -465,13 +494,13 @@ fn copy_self(dest: &Path, allow_stop: bool) -> InstallReport {
     let _ = std::fs::remove_file(&prev_new);
     let mut keep = keeps_prev(installed, Version::current());
     if keep {
-        if let Err(e) = std::fs::copy(dest, &prev_new) {
+        if let Err(e) = copy_without_zone_mark(dest, &prev_new) {
             log!("autostart: previous version not kept (copy failed: {e})");
             let _ = std::fs::remove_file(&prev_new);
             keep = false;
         }
     }
-    if let Err(e) = std::fs::copy(&me, &new) {
+    if let Err(e) = copy_without_zone_mark(&me, &new) {
         let _ = std::fs::remove_file(&new);
         let _ = std::fs::remove_file(&prev_new);
         return fail(format!("copy to {} failed: {e}", new.display()));
@@ -696,9 +725,22 @@ pub(crate) fn stop_and_wait(exe: &Path) -> Result<(), InstallError> {
     }
 }
 
+/// The install-relative names `--uninstall --remove` deletes: the dock's own five, then every other
+/// component's file, staging copy, previous copy and its staging copy, then the suite's own files. Pure.
+fn removal_names() -> Vec<String> {
+    use oled_trust::manifest::suite::{ComponentId, SUITE_FILES};
+    let mut v: Vec<String> =
+        ["dock.exe", "dock.exe.new", PREV_NAME, "dock.prev.exe.new", "autostart-task.xml"].map(String::from).into();
+    for c in ComponentId::ALL.into_iter().filter(|c| *c != ComponentId::Dock) {
+        v.extend(c.install_names());
+    }
+    v.extend(SUITE_FILES.map(String::from));
+    v
+}
+
 /// The only files `--uninstall --remove` deletes from the install folder. Pure.
-fn removal_targets(install_dir: &Path) -> [PathBuf; 5] {
-    ["dock.exe", "dock.exe.new", PREV_NAME, "dock.prev.exe.new", "autostart-task.xml"].map(|n| install_dir.join(n))
+fn removal_targets(install_dir: &Path) -> Vec<PathBuf> {
+    removal_names().iter().map(|n| install_dir.join(n)).collect()
 }
 
 /// Asks Windows to delete `path` (a file or an empty folder) at the next restart. Elevated only.
@@ -717,10 +759,11 @@ fn old_copy_path(path: &Path, pid: u32) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// True for a name made by `old_copy_path` from one of `removal_targets`. Pure.
+/// True for a name (install-relative, so `lang\it.lang.old-7` for a file in `lang`) made by
+/// `old_copy_path` from one of `removal_targets`. Pure.
 fn is_old_copy_name(name: &str) -> bool {
-    ["dock.exe", "dock.exe.new", PREV_NAME, "dock.prev.exe.new", "autostart-task.xml"].iter().any(|t| {
-        name.strip_prefix(t)
+    removal_names().iter().any(|t| {
+        name.strip_prefix(t.as_str())
             .and_then(|rest| rest.strip_prefix(".old-"))
             .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
     })
@@ -729,10 +772,25 @@ fn is_old_copy_name(name: &str) -> bool {
 /// Deletes the `*.old-<pid>` leftovers of an uninstall not yet followed by a restart (`--install`).
 /// Only regular files (no reparse points); one still in use is left to its delete at restart.
 fn remove_old_copies(dir: &Path) {
+    remove_old_copies_in(dir, "");
+    let lang = dir.join(oled_trust::manifest::suite::LANG_DIR);
+    if std::fs::symlink_metadata(&lang).is_ok_and(|m| m.is_dir() && !is_reparse(&m)) {
+        remove_old_copies_in(&lang, &format!("{}\\", oled_trust::manifest::suite::LANG_DIR));
+    }
+}
+
+/// True for a folder or file that is a reparse point.
+fn is_reparse(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+}
+
+/// `remove_old_copies` for one folder; `rel` is its install-relative prefix ("" or "lang\").
+fn remove_old_copies_in(dir: &Path, rel: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
-        if !name.to_str().is_some_and(is_old_copy_name) {
+        if !name.to_str().is_some_and(|n| is_old_copy_name(&format!("{rel}{n}"))) {
             continue;
         }
         let p = e.path();
@@ -790,6 +848,35 @@ impl UninstallReport {
     }
 }
 
+/// The file part of `remove_install`: every `removal_targets` file, then `lang\` when it is a real, empty
+/// folder. A `lang\` that is a junction or symlink is left alone: nothing inside it is touched.
+fn remove_our_files(dir: &Path, report: &mut UninstallReport) {
+    let lang_dir = oled_trust::manifest::suite::LANG_DIR;
+    let lang = dir.join(lang_dir);
+    let lang_meta = std::fs::symlink_metadata(&lang);
+    let lang_real = lang_meta.as_ref().is_ok_and(|m| m.is_dir() && !is_reparse(m));
+    if lang_meta.is_ok() && !lang_real {
+        report.failures.push(format!("{} is not a real folder: nothing deleted there", lang.display()));
+    }
+    let lang_prefix = format!("{lang_dir}\\");
+    for (name, p) in removal_names().into_iter().zip(removal_targets(dir)) {
+        if name.starts_with(&lang_prefix) && !lang_real {
+            continue;
+        }
+        if std::fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        match remove_or_schedule(&p) {
+            Ok(now) => report.scheduled |= !now,
+            Err(e) => report.failures.push(e),
+        }
+    }
+    // lang\ goes only when it is a real folder and empty (remove_dir fails on a non-empty one).
+    if lang_real {
+        let _ = std::fs::remove_dir(&lang);
+    }
+}
+
 /// Deletes the install folder for `--uninstall --remove`: only `removal_targets`, then the folder if
 /// it is empty (nothing unknown is deleted). Every failure is pushed to `report.failures`.
 fn remove_install(dir: &Path, report: &mut UninstallReport) {
@@ -803,20 +890,95 @@ fn remove_install(dir: &Path, report: &mut UninstallReport) {
             }
         }
     }
-    for p in removal_targets(dir) {
-        if std::fs::symlink_metadata(&p).is_err() {
-            continue;
-        }
-        match remove_or_schedule(&p) {
-            Ok(now) => report.scheduled |= !now,
-            Err(e) => report.failures.push(e),
-        }
-    }
+    remove_our_files(dir, report);
     if let Err(e) = std::fs::remove_dir(dir) {
         log!("autostart: removing {} failed ({e}), scheduling it at restart", dir.display());
         match delete_at_reboot(dir) {
             Ok(()) => report.scheduled = true,
             Err(e) => report.failures.push(e),
+        }
+    }
+}
+
+/// Test helper, also for the update group's swap test: every path in `created` (a file the swap creates, as
+/// an install-relative or absolute path under `install_dir`) is deleted by `--uninstall --remove`: it is in
+/// `removal_targets`, or its `.old-3` copy passes `is_old_copy_name`.
+#[cfg(test)]
+pub(crate) fn assert_uninstall_removes(install_dir: &Path, created: &[PathBuf]) {
+    let targets = removal_targets(install_dir);
+    for c in created {
+        let full = if c.is_absolute() { c.clone() } else { install_dir.join(c) };
+        let rel = full.strip_prefix(install_dir).expect("created path is inside the install folder");
+        let rel = rel.to_string_lossy().replace('/', "\\");
+        assert!(targets.contains(&full), "{rel} is removed");
+        assert!(is_old_copy_name(&format!("{rel}.old-3")), "{rel}.old-3 is ours");
+    }
+}
+
+/// Lexical form for comparing two paths: backslashes, no `.` or `..` parts, no trailing slash, lower case.
+fn normal_path(p: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for s in p.replace('/', "\\").split('\\') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s.to_lowercase()),
+        }
+    }
+    parts.join("\\")
+}
+
+/// True when `path` is a shortcut of ours: a `.lnk` (any name or case) directly in `programs_root` whose
+/// `target` is `<install_dir>\tasks.exe` or `<install_dir>\files.exe`. Pure.
+fn should_delete_shortcut(path: &Path, target: &str, programs_root: &Path, install_dir: &Path) -> bool {
+    let is_lnk = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+    let direct = path
+        .parent()
+        .is_some_and(|p| normal_path(&p.to_string_lossy()) == normal_path(&programs_root.to_string_lossy()));
+    if !is_lnk || !direct {
+        return false;
+    }
+    let t = normal_path(target);
+    let dir = normal_path(&install_dir.to_string_lossy());
+    [oled_trust::manifest::suite::ComponentId::Tasks, oled_trust::manifest::suite::ComponentId::Files]
+        .iter()
+        .any(|c| t == format!("{dir}\\{}", c.file()))
+}
+
+/// Deletes our shortcuts in the all-users Programs folder (no recursion; the target of each `.lnk` is read
+/// with the bounded Rust parser, no COM). Every failure is pushed to `report.failures`.
+fn remove_shortcuts(install_dir: &Path, report: &mut UninstallReport) {
+    let root = match common_programs() {
+        Ok(r) => r,
+        Err(e) => {
+            log!("autostart: Start menu folder not found ({e})");
+            return report.failures.push(format!("Start menu folder not found: {e}"));
+        }
+    };
+    let entries = match std::fs::read_dir(&root) {
+        Ok(x) => x,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log!("autostart: Start menu folder not listed ({e})");
+            return report.failures.push(format!("{}: {e}", root.display()));
+        }
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+            continue;
+        }
+        if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let Ok(facts) = crate::jumplist::read_lnk(&p) else { continue };
+        if should_delete_shortcut(&p, &facts.target, &root, install_dir) {
+            match std::fs::remove_file(&p) {
+                Ok(()) => log!("autostart: shortcut {} deleted", p.display()),
+                Err(e) => report.failures.push(format!("{}: {e}", p.display())),
+            }
         }
     }
 }
@@ -867,6 +1029,7 @@ pub fn run_uninstall_cli(remove: bool) -> i32 {
     if remove {
         if let Ok(d) = &dir {
             remove_install(d, &mut report);
+            remove_shortcuts(d, &mut report);
         }
         report.failures.extend(crate::datadir::remove_update_dir().err().map(|e| format!("update folder: {e}")));
     }
@@ -892,6 +1055,30 @@ pub fn run_uninstall_cli(remove: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_copy_drops_the_download_mark() {
+        let dir = std::env::temp_dir().join(format!("dock-zone-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.exe");
+        let dst = dir.join("dst.exe");
+        std::fs::write(&src, b"image").unwrap();
+        let zone = |p: &Path| PathBuf::from(format!("{}:Zone.Identifier", p.display()));
+        std::fs::write(zone(&src), b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        // Plain copy keeps the stream (the behaviour this guards against).
+        let plain = dir.join("plain.exe");
+        std::fs::copy(&src, &plain).unwrap();
+        assert!(zone(&plain).exists(), "std::fs::copy is expected to carry the stream");
+        assert_eq!(copy_without_zone_mark(&src, &dst).unwrap(), 5);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"image");
+        let e = std::fs::metadata(zone(&dst)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        // A source without a mark copies the same way.
+        std::fs::remove_file(zone(&src)).unwrap();
+        assert_eq!(copy_without_zone_mark(&src, &dst).unwrap(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn under_program_files() {
@@ -963,16 +1150,136 @@ mod tests {
     #[test]
     fn removal_targets_are_only_our_files() {
         let d = Path::new(r"C:\Program Files\mini-oled-dock");
-        assert_eq!(
-            removal_targets(d),
-            [
-                d.join("dock.exe"),
-                d.join("dock.exe.new"),
-                d.join("dock.prev.exe"),
-                d.join("dock.prev.exe.new"),
-                d.join("autostart-task.xml")
-            ]
-        );
+        let mut want: Vec<PathBuf> =
+            ["dock.exe", "dock.exe.new", "dock.prev.exe", "dock.prev.exe.new", "autostart-task.xml"]
+                .iter()
+                .map(|n| d.join(n))
+                .collect();
+        for n in [
+            "tasks.exe",
+            "tasks.exe.new",
+            "tasks.prev.exe",
+            "tasks.prev.exe.new",
+            "tasks-admin.exe",
+            "tasks-admin.exe.new",
+            "tasks-admin.prev.exe",
+            "tasks-admin.prev.exe.new",
+            "files.exe",
+            "files.exe.new",
+            "files.prev.exe",
+            "files.prev.exe.new",
+            r"lang\it.lang",
+            r"lang\it.lang.new",
+            r"lang\it.prev.lang",
+            r"lang\it.prev.lang.new",
+            "suite.json",
+            "suite.json.tmp",
+        ] {
+            want.push(d.join(n));
+        }
+        assert_eq!(removal_targets(d), want);
+    }
+
+    #[test]
+    fn every_name_the_swap_creates_is_removed() {
+        use oled_trust::manifest::suite::ComponentId;
+        let d = Path::new(r"C:\P\m");
+        let created: Vec<PathBuf> =
+            ComponentId::ALL.into_iter().flat_map(|c| c.install_names()).map(PathBuf::from).collect();
+        assert_uninstall_removes(d, &created);
+    }
+
+    #[test]
+    fn old_copies_of_component_names_are_ours() {
+        for t in removal_names() {
+            assert!(is_old_copy_name(&format!("{t}.old-12")));
+        }
+        assert!(is_old_copy_name(r"lang\it.lang.old-7"));
+        assert!(!is_old_copy_name("tasks.exe.old-"));
+        assert!(!is_old_copy_name("tasks.exe.old-1a"));
+    }
+
+    #[test]
+    fn lang_folder_removed_only_when_empty() {
+        let base = std::env::temp_dir().join(format!("dock-fc1-lang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("lang")).unwrap();
+        std::fs::write(base.join("lang").join("it.lang"), b"x").unwrap();
+        std::fs::write(base.join("lang").join("mine.txt"), b"x").unwrap();
+        let mut r = UninstallReport::default();
+        remove_our_files(&base, &mut r);
+        let kept = base.join("lang").join("mine.txt").exists() && !base.join("lang").join("it.lang").exists();
+        std::fs::remove_file(base.join("lang").join("mine.txt")).unwrap();
+        std::fs::write(base.join("lang").join("it.lang"), b"x").unwrap();
+        let mut r2 = UninstallReport::default();
+        remove_install(&base, &mut r2);
+        let gone = !base.exists();
+        let clean = r.failures.is_empty() && r2.failures.is_empty() && !r2.scheduled;
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(clean, "{:?} {:?}", r.failures, r2.failures);
+        assert!(kept, "a foreign file keeps lang\\ and only ours goes");
+        assert!(gone, "an emptied lang\\ and the folder go");
+    }
+
+    #[test]
+    fn lang_junction_is_not_followed() {
+        let base = std::env::temp_dir().join(format!("dock-fc1-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("it.lang"), b"x").unwrap();
+        let inst = base.join("inst");
+        std::fs::create_dir_all(&inst).unwrap();
+        use std::os::windows::process::CommandExt;
+        let made = std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .args(["/C", "mklink", "/J"])
+            .arg(inst.join("lang"))
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let mut r = UninstallReport::default();
+        if made {
+            remove_our_files(&inst, &mut r);
+        }
+        let survives = outside.join("it.lang").exists();
+        let _ = std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .args(["/C", "rmdir"])
+            .arg(inst.join("lang"))
+            .output();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(made, "the junction could be made");
+        assert!(survives, "a file behind a lang junction is not deleted");
+        assert!(!r.failures.is_empty(), "the junction is reported");
+    }
+
+    #[test]
+    fn our_shortcuts_only() {
+        let root = Path::new(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs");
+        let d = Path::new(r"C:\Program Files\mini-oled-dock");
+        let lnk = root.join("Anything.LNK");
+        assert!(should_delete_shortcut(&lnk, r"C:\Program Files\mini-oled-dock\tasks.exe", root, d));
+        assert!(should_delete_shortcut(&lnk, r"c:\program files\MINI-oled-dock\Files.exe", root, d));
+        assert!(should_delete_shortcut(&lnk, r"C:\Program Files\mini-oled-dock\x\..\files.exe", root, d));
+        assert!(!should_delete_shortcut(
+            &root.join("sub").join("a.lnk"),
+            r"C:\Program Files\mini-oled-dock\tasks.exe",
+            root,
+            d
+        ));
+        assert!(!should_delete_shortcut(&lnk, r"C:\Program Files\mini-oled-dock\dock.exe", root, d));
+        assert!(!should_delete_shortcut(&root.join("a.url"), r"C:\Program Files\mini-oled-dock\tasks.exe", root, d));
+        assert!(!should_delete_shortcut(&lnk, r"C:\Other\tasks.exe", root, d));
+    }
+
+    #[test]
+    fn no_display_name_literal() {
+        let src = include_str!("autostart.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        for w in ["Tasks", "Folio", "Attivit\u{e0}"] {
+            assert!(!body.contains(&format!("\"{w}\"")), "no quoted {w}");
+        }
     }
 
     #[test]

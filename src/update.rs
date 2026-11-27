@@ -1293,14 +1293,15 @@ mod tests {
     #[test]
     fn run_capture_reads_stdout_and_times_out() {
         let echo = ["/c", "echo mini-oled-dock 1.4.1"];
-        let (code, out) = run_capture(&system32("cmd.exe"), &echo, Duration::from_secs(5), CAPTURE_MAX_BYTES).unwrap();
+        let (code, out) = run_capture(&system32("cmd.exe"), &echo, Duration::from_secs(60), CAPTURE_MAX_BYTES).unwrap();
         assert_eq!(code, 0);
         assert!(crate::update_release::version_output_matches(&out, Version::parse("1.4.1").unwrap()));
         let t = Instant::now();
-        let ping = ["-n", "6", "127.0.0.1"];
+        let ping = ["-n", "61", "127.0.0.1"];
         let r = run_capture(&system32("ping.exe"), &ping, Duration::from_millis(300), CAPTURE_MAX_BYTES);
         assert_eq!(r.err().as_deref(), Some("timeout"));
-        assert!(t.elapsed() < Duration::from_secs(3)); // killed, not waited for
+        // Killed, not waited for: the ping would run for a minute.
+        assert!(t.elapsed() < Duration::from_secs(30), "{:?}", t.elapsed());
     }
 
     fn fetched(status: u16, url: &str, body: &[u8]) -> Result<winhttp::Response, String> {

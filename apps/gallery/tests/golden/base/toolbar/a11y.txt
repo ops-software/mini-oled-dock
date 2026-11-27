@@ -1,0 +1,19 @@
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Tab "Performance" [focusable]
+  Tab "Services" [focusable]
+  Button "Refresh" [focusable]
+  Button "Pause" [focusable]
+SearchInput "Search" [focusable] ""
+Toolbar
+  Tab "Processes" [focusable]
+  Tab "Performance" [focusable, selected]
+  Tab "Services" [focusable]
+  Button "Refresh" [focusable]
+  Button "Pause" [focusable, checked]
+SearchInput "Search" [focusable] ""
+Toolbar
+  Button "Back" [focusable]
+  Button "More" [focusable]
+TextInput "Path" [focusable] "C:\\Data\\Reports"
+  Button "Clear"

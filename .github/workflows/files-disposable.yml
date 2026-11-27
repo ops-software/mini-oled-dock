@@ -57,7 +57,7 @@ jobs:
         run: |
           $n = @(git grep -h -o -E 'fn disposable_[a-z0-9_]+' -- apps/files).Count
           if ($n -eq 0) { 'no disposable tests yet'; exit 0 }
-          cargo test -p files --locked -- --ignored disposable_ --nocapture
+          cargo test -p files --locked --no-fail-fast -- --ignored disposable_ --nocapture
 
       # The nightly fuzz of the frame codecs (ROADMAP 6.3, a trailing gate).
       - name: Frame fuzz

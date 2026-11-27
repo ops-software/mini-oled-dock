@@ -243,6 +243,21 @@ impl Gdi {
         Ok(())
     }
 
+    /// Makes sure the scratch DIB for text is at least `w` x `h` physical px, without touching the main DIB (a kit window
+    /// that only draws text through the engine has no main DIB here). The scratch DIB grows, it never shrinks.
+    pub fn ensure_txt(&mut self, w: i32, h: i32) -> Result<(), String> {
+        let (cw, ch) = self.txt.as_ref().map_or((0, 0), |t| (t.w, t.h));
+        if cw >= w && ch >= h {
+            return Ok(());
+        }
+        // The old DIB goes first: freeing it restores the bitmap that was selected before it, which would deselect the new one.
+        if let Some(old) = self.txt.take() {
+            free_dib(self.dc_txt, old);
+        }
+        self.txt = Some(make_dib(self.dc_txt, w.max(cw).max(1), h.max(ch).max(1))?);
+        Ok(())
+    }
+
     /// Canvas over the main DIB, writes limited to `clip` (`None` = the whole DIB). Short-lived:
     /// see the invariant of `dib_pixels`.
     pub fn canvas(&self, clip: Option<RECT>) -> Option<Canvas<'_>> {

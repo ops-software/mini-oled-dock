@@ -1,0 +1,50 @@
+Label "General"
+Label "Appearance"
+Label "Display"
+Label "Sound"
+Label "Network"
+Label "Power"
+Label "Storage"
+Label "Privacy"
+Label "Updates"
+Label "About"
+Label "Show the clock 1"
+Button "Open" [focusable]
+Label "Brightness 1"
+Label "Open the folder 1"
+Label "Start with Windows 1"
+Button "Open" [focusable]
+Label "Volume 1"
+Label "Reset the layout 1"
+Label "Notifications 1"
+Button "Open" [focusable]
+Label "Opacity 1"
+Label "Export the settings 1"
+Label "Keep on top 1"
+Button "Open" [focusable]
+Label "Show the clock 2"
+Label "Brightness 2"
+Label "Open the folder 2"
+Button "Open" [focusable]
+Label "Start with Windows 2"
+Label "Volume 2"
+Label "Reset the layout 2"
+Button "Open" [focusable]
+Label "Notifications 2"
+Label "Opacity 2"
+Label "Export the settings 2"
+Button "Open" [focusable]
+Label "Keep on top 2"
+Label "Show the clock 3"
+Label "Brightness 3"
+Button "Open" [focusable]
+Label "Open the folder 3"
+Label "Start with Windows 3"
+Label "Volume 3"
+Button "Open" [focusable]
+Label "Reset the layout 3"
+Label "Notifications 3"
+Label "Opacity 3"
+Button "Open" [focusable]
+Label "Export the settings 3"
+Label "Keep on top 3"

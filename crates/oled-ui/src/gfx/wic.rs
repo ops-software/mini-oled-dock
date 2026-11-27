@@ -159,6 +159,45 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<IconBitmap> {
     }
 }
 
+/// Decodes an in-memory PNG at its own size (no downscaling, no refusal of empty images) into a premultiplied bitmap:
+/// the kit's golden comparator reads its reference images with it. Requires COM on the calling thread.
+pub fn decode_png_exact(bytes: &[u8]) -> Result<IconBitmap, String> {
+    if !is_png(bytes) {
+        return Err("not a PNG".into());
+    }
+    let factory = wic_factory()?;
+    // SAFETY: `stream` is initialised on `bytes`, which outlives this function; the decoder and the converter are only
+    // used in here; the pixel buffer is exactly w * h * 4 bytes (BGRA little-endian bytes equal 0xAARRGGBB).
+    unsafe {
+        let stream: IWICStream = factory.CreateStream().map_err(|e| format!("CreateStream: {e}"))?;
+        stream.InitializeFromMemory(bytes).map_err(|e| format!("InitializeFromMemory: {e}"))?;
+        let decoder = factory
+            .CreateDecoder(&GUID_ContainerFormatPng, &GUID_VendorMicrosoftBuiltIn)
+            .map_err(|e| format!("CreateDecoder(PNG): {e}"))?;
+        decoder.Initialize(&stream, WICDecodeMetadataCacheOnDemand).map_err(|e| format!("Decoder::Initialize: {e}"))?;
+        let frame = decoder.GetFrame(0).map_err(|e| format!("GetFrame: {e}"))?;
+        let conv = factory.CreateFormatConverter().map_err(|e| format!("CreateFormatConverter: {e}"))?;
+        conv.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )
+        .map_err(|e| format!("FormatConverter::Initialize: {e}"))?;
+        let (mut w, mut h) = (0u32, 0u32);
+        conv.GetSize(&mut w, &mut h).map_err(|e| format!("GetSize: {e}"))?;
+        if w == 0 || h == 0 {
+            return Err("empty image".into());
+        }
+        let mut pixels = vec![0u32; (w as usize) * (h as usize)];
+        let out = std::slice::from_raw_parts_mut(pixels.as_mut_ptr().cast::<u8>(), pixels.len() * 4);
+        conv.CopyPixels(std::ptr::null(), w * 4, out).map_err(|e| format!("CopyPixels: {e}"))?;
+        Ok(IconBitmap { width: w, height: h, pixels })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

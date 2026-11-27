@@ -1,0 +1,17 @@
+# The marker DLL of the live check L-I1 (d), built only by the tester: on load it writes loaded-<its file name>.txt next
+# to itself. Copied as dwmapi.dll, propsys.dll, version.dll and winhttp.dll beside a dock.exe in a scratch folder, it
+# shows whether the loader took a planted DLL. Standalone (its own [workspace] below), not a member of the repository's
+# workspace: cargo build --release --manifest-path tools/marker-dll/Cargo.toml
+[package]
+name = "marker-dll"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[profile.release]
+panic = "abort"

@@ -6,6 +6,8 @@
 //! - a missing file is created from the defaults (or the legacy import); a file without the template mark, or one a
 //!   migration changed, is rewritten once; an invalid file keeps the defaults (at load) or the last good snapshot
 //!   (at reload) and is never touched by a load;
+//! - one bad value keeps the rest: a number outside its descriptor's range, or a key of the wrong type, is one error
+//!   with its line, and the last good value (at load: the default) stands in for that key alone;
 //! - every write is atomic (`oled_sys::datadir::write_atomic`) and is refused unless a file with errors could first
 //!   be copied to `<file>.bak`;
 //! - the watch is a folder change notification with a thread-pool wait: the callback re-arms the notification first,
@@ -464,9 +466,11 @@ struct Decoded<C> {
 }
 
 /// Text to options: JSONC (a leading BOM skipped, comments stripped), a JSON object, the migrations from the file's
-/// "version" (absent = 0) up to `C::VERSION`, then `C::from_value`. Err (the file as a whole is unusable, with
-/// `kept`) for a syntax error, a value that is not an object, a failed migration, or a `Problem::Parse` that
-/// `from_value` reports. Total.
+/// "version" (absent = 0) up to `C::VERSION`, then `C::from_value`. One bad value keeps the rest: a top-level number
+/// outside its descriptor's range, and a top-level key `from_value` cannot read alone, each give one error at their
+/// line (`jsonc::locate`) and lose their value: the last good one stands in (none: the key is dropped, so the
+/// reader's default applies). Err (the file as a whole is unusable, with `kept`) for a syntax error, a value that is
+/// not an object, a failed migration, or a `Problem::Parse` that `from_value` still reports. Total.
 fn decode<C: Options>(text: &str, last_good: Option<&C>, kept: Kept) -> Result<Decoded<C>, ConfigError> {
     let text = jsonc::strip_bom(text);
     let mut v: Value =
@@ -482,15 +486,159 @@ fn decode<C: Options>(text: &str, last_good: Option<&C>, kept: Kept) -> Result<D
         m(&mut v).map_err(|e| whole_file(format!("migration from version {i} failed: {}", e.0), kept))?;
         migrated |= v != before;
     }
-    let (value, errors) = C::from_value(&v, text, last_good);
-    if let Some(e) = errors.iter().find(|e| matches!(e.problem, Problem::Parse(_))) {
+    let mut stand_in = StandIn { last_good, template: None };
+    let mut errors = out_of_range::<C>(&mut v, text, &mut stand_in);
+    let (mut value, mut found) = C::from_value(&v, text, last_good);
+    if found.iter().any(is_whole) {
+        errors.extend(wrong_types::<C>(&mut v, text, &mut stand_in));
+        (value, found) = C::from_value(&v, text, last_good);
+    }
+    if let Some(e) = found.iter().find(|e| is_whole(e)) {
         return Err(ConfigError { kept, ..e.clone() });
     }
+    errors.extend(found);
+    // In the order of the file (an error without a line first).
+    errors.sort_by_key(|e| (e.line, e.col));
     Ok(Decoded { value, errors, migrated })
+}
+
+/// An error that makes the whole file unusable.
+fn is_whole(e: &ConfigError) -> bool {
+    matches!(e.problem, Problem::Parse(_))
+}
+
+/// What stands in for a key that lost its value: its value in the last good options' template, or none.
+struct StandIn<'a, C> {
+    last_good: Option<&'a C>,
+    /// The last good options as JSON, made once, at the first key that needs it.
+    template: Option<Value>,
+}
+
+impl<C: Options> StandIn<'_, C> {
+    fn kept(&self) -> Kept {
+        if self.last_good.is_some() {
+            Kept::LastGood
+        } else {
+            Kept::Default
+        }
+    }
+
+    /// Puts the stand-in of `key` in place of its value, or drops the key when there is none.
+    fn replace(&mut self, o: &mut serde_json::Map<String, Value>, key: &str) {
+        let with = match self.last_good {
+            Some(lg) => self.template.get_or_insert_with(|| template_value(&lg.to_template())).get(key).cloned(),
+            None => None,
+        };
+        match with {
+            Some(x) => {
+                o.insert(key.to_string(), x);
+            }
+            None => {
+                o.remove(key);
+            }
+        }
+    }
+}
+
+/// The top-level numbers outside the range of their descriptor: one `Problem::Range` each, the stand-in in place.
+fn out_of_range<C: Options>(v: &mut Value, text: &str, stand_in: &mut StandIn<C>) -> Vec<ConfigError> {
+    let mut out = Vec::new();
+    let Some(o) = v.as_object_mut() else { return out };
+    for d in C::descriptors() {
+        let Some(r) = d.range else { continue };
+        let Some(got) = o.get(d.json).and_then(number) else { continue };
+        if (r.min..=r.max).contains(&got) {
+            continue;
+        }
+        stand_in.replace(o, d.json);
+        out.push(error_at(text, d.json, Problem::Range { min: r.min, max: r.max, got }, stand_in.kept()));
+    }
+    out
+}
+
+/// The top-level keys `from_value` cannot read on their own: one `Problem::Type` each, the stand-in in place. Only
+/// the declared keys are read alone: an unknown key is kept aside as it is and cannot fail, and a file of many small
+/// unknown keys costs no read per key.
+fn wrong_types<C: Options>(v: &mut Value, text: &str, stand_in: &mut StandIn<C>) -> Vec<ConfigError> {
+    let mut out = Vec::new();
+    let Some(o) = v.as_object_mut() else { return out };
+    for &key in C::known_keys() {
+        let Some(x) = o.get(key) else { continue };
+        let alone = Value::Object(std::iter::once((key.to_string(), x.clone())).collect());
+        // Its own text too: a reader that words its error from the text (as `options!`'s does) then names this key.
+        let (_, found) = C::from_value(&alone, &jsonc::js(&alone), None);
+        let Some(e) = found.into_iter().find(is_whole) else { continue };
+        let expected = expected::<C>(key, x, &e);
+        stand_in.replace(o, key);
+        out.push(error_at(text, key, Problem::Type { expected }, stand_in.kept()));
+    }
+    out
+}
+
+/// A JSON number as an i64: a fraction cut, a number beyond i64 saturated.
+fn number(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_u64().map(|_| i64::MAX)).or_else(|| v.as_f64().map(|f| f as i64))
+}
+
+/// What a key of the wrong type should have been: from its descriptor's kind, else from serde's words. A value that
+/// already is the object or list its kind says (the wrong value is inside it) takes serde's words too.
+fn expected<C: Options>(key: &str, x: &Value, e: &ConfigError) -> &'static str {
+    use crate::desc::ValueType;
+    if let Some(d) = C::descriptors().iter().find(|d| d.json == key) {
+        let inside = match d.kind {
+            ValueType::List => x.is_array(),
+            ValueType::Map | ValueType::Object => x.is_object(),
+            _ => false,
+        };
+        if !inside {
+            return match d.kind {
+                ValueType::Bool => "a boolean",
+                ValueType::Int => "a number",
+                ValueType::Str => "a string",
+                ValueType::Enum => "one of its values",
+                ValueType::Color => "a colour",
+                ValueType::List => "a list",
+                ValueType::Map | ValueType::Object => "an object",
+            };
+        }
+    }
+    const SERDE: [(&str, &str); 12] = [
+        ("a boolean", "a boolean"),
+        ("a string", "a string"),
+        ("a sequence", "a list"),
+        ("an array", "a list"),
+        ("a map", "an object"),
+        ("struct", "an object"),
+        ("u8", "a number"),
+        ("u16", "a number"),
+        ("u32", "a number"),
+        ("u64", "a number"),
+        ("i64", "a number"),
+        ("f64", "a number"),
+    ];
+    let said = match &e.problem {
+        Problem::Parse(m) => m.rsplit("expected ").next().unwrap_or(""),
+        _ => "",
+    };
+    SERDE.iter().find(|(serde, _)| said.starts_with(serde)).map_or("another value", |(_, ours)| ours)
+}
+
+/// An error at the key `path` of `text` (line and column 0 when the key is not found).
+fn error_at(text: &str, path: &str, problem: Problem, kept: Kept) -> ConfigError {
+    let (line, col) = jsonc::locate(text, path).unwrap_or((0, 0));
+    ConfigError { path: path.to_string(), line, col, problem, kept }
 }
 
 fn whole_file(message: String, kept: Kept) -> ConfigError {
     ConfigError { path: String::new(), line: 0, col: 0, problem: Problem::Parse(message), kept }
+}
+
+/// Reads a text as `Store::load` and `reload_if_changed` read their file (a BOM, comments, the migrations from the
+/// file's version, `Options::from_value`): the options and their value errors, or the error that makes the text
+/// unusable as a whole. For a copy that is not the store's own file (a one-time import), and for tests.
+pub fn parse_text<C: Options>(text: &str, last_good: Option<&C>) -> Result<(C, Vec<ConfigError>), ConfigError> {
+    let kept = if last_good.is_some() { Kept::LastGood } else { Kept::Default };
+    decode::<C>(text, last_good, kept).map(|d| (d.value, d.errors))
 }
 
 /// Logs each value error of a load once, as "<tag>: <log_line>".
@@ -615,6 +763,12 @@ mod tests {
     #[derive(Clone, Debug, Default, PartialEq)]
     struct Any(Value);
 
+    #[cfg(test)]
+    thread_local! {
+        /// The calls of `Any::from_value` on this thread.
+        static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     fn m0(v: &mut Value) -> Result<(), MigrateError> {
         if let Some(o) = v.as_object_mut() {
             o.insert("m0".into(), Value::Bool(true));
@@ -646,6 +800,7 @@ mod tests {
             &["a"]
         }
         fn from_value(v: &Value, _: &str, last_good: Option<&Self>) -> (Self, Vec<ConfigError>) {
+            READS.with(|n| n.set(n.get() + 1));
             match v.get("a") {
                 Some(Value::String(_)) => {
                     (last_good.cloned().unwrap_or_default(), vec![whole_file("a is a string".into(), Kept::Default)])
@@ -695,8 +850,11 @@ mod tests {
     #[test]
     fn decode_tells_a_whole_file_error_from_a_value_error() {
         let last = Any(serde_json::json!({"x": 1}));
-        let e = decode::<Any>("{\"version\": 3, \"a\": \"s\"}", Some(&last), Kept::LastGood).err();
-        assert_eq!(e.map(|e| e.kept), Some(Kept::LastGood));
+        // A key the options cannot read on its own loses only itself: one Type error, the last good value standing in
+        // (here it has none, so the key is dropped).
+        let d = decode::<Any>("{\"version\": 3,\n \"a\": \"s\"}", Some(&last), Kept::LastGood).ok();
+        let d = d.map(|d| (d.value.0, d.errors.iter().map(|e| (e.path.clone(), e.line, e.kept)).collect::<Vec<_>>()));
+        assert_eq!(d, Some((serde_json::json!({"version": 3}), vec![("a".to_string(), 2, Kept::LastGood)])));
         let d = decode::<Any>("{\"version\": 3, \"a\": 4}", Some(&last), Kept::LastGood).ok();
         assert_eq!(d.map(|d| d.errors.len()), Some(1));
         for bad in ["", "[]", "3", "{", "// only a comment", "\u{feff}"] {
@@ -705,6 +863,21 @@ mod tests {
         let e = decode::<Any>("{\n  \"a\": trux\n}", None, Kept::Default).err();
         assert_eq!(e.as_ref().map(|e| (e.line, e.problem.clone())), Some((2, Problem::Parse("expected ident".into()))));
         assert_eq!(e.map(|e| e.serde_text()), Some("expected ident at line 2 column 11".to_string()));
+    }
+
+    #[test]
+    fn a_wrong_type_is_looked_for_in_the_declared_keys_only() {
+        // 100,000 unknown keys beside one key of the wrong type: that key is read alone once, no unknown key is (an
+        // unknown key is kept aside as it is and cannot fail), so a large file of small keys costs no read per key.
+        let mut text = String::from("{\"a\": \"s\"");
+        for i in 0..100_000 {
+            text.push_str(&format!(", \"k{i}\": {i}"));
+        }
+        text.push('}');
+        READS.with(|n| n.set(0));
+        let d = decode::<Any>(&text, None, Kept::Default).ok();
+        assert_eq!(d.map(|d| d.errors.iter().map(|e| e.path.clone()).collect::<Vec<_>>()), Some(vec!["a".to_string()]));
+        assert_eq!(READS.with(std::cell::Cell::get), 3, "the file, \"a\" alone, the file again");
     }
 
     /// xorshift64: the fuzz inputs, seeded, so a failure repeats.

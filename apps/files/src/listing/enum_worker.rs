@@ -8,12 +8,13 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME, ERROR_DIRECTORY, ERROR_FILENAME_EXCED_RANGE,
     ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_NETNAME_DELETED, ERROR_NETWORK_UNREACHABLE,
-    ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND, ERROR_UNEXP_NET_ERR,
+    ERROR_NOT_SUPPORTED, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, ERROR_UNEXP_NET_ERR, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FILE_ATTRIBUTE_REPARSE_POINT,
-    FIND_FIRST_EX_FLAGS, WIN32_FIND_DATAW,
+    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, FILE_ATTRIBUTE_REPARSE_POINT,
+    FIND_FIRST_EX_FLAGS, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use super::types::{Batch, CancelToken, EnumError, RawEntry};
 use super::{Gen, WidePath};
@@ -35,10 +36,129 @@ impl Default for FindEnumerator {
     }
 }
 
+impl FindEnumerator {
+    /// Whether the batch under way is due: the entry count reached its limit or its age reached the limit in
+    /// microseconds. `first` selects the first batch's limits, else the later ones.
+    pub(crate) fn flush_due(&self, count: usize, elapsed_us: u32, first: bool) -> bool {
+        let (entries, ms) =
+            if first { (self.first_entries, self.first_ms) } else { (self.later_entries, self.later_ms) };
+        count >= entries || u64::from(elapsed_us) >= u64::from(ms) * 1_000
+    }
+}
+
+/// QueryPerformanceCounter in microseconds.
+struct Clock {
+    freq: u128,
+}
+
+impl Clock {
+    fn new() -> Clock {
+        let mut f = 0i64;
+        // SAFETY: `f` is a writable i64 for the call.
+        let _ = unsafe { QueryPerformanceFrequency(&mut f) };
+        Clock { freq: u128::try_from(f).unwrap_or(0).max(1) }
+    }
+
+    fn now_us(&self) -> u64 {
+        let mut t = 0i64;
+        // SAFETY: `t` is a writable i64 for the call.
+        let _ = unsafe { QueryPerformanceCounter(&mut t) };
+        u64::try_from(u128::try_from(t).unwrap_or(0) * 1_000_000 / self.freq).unwrap_or(u64::MAX)
+    }
+}
+
+/// FindClose on every path out of a listing.
+struct FindGuard(HANDLE);
+
+impl Drop for FindGuard {
+    fn drop(&mut self) {
+        // SAFETY: the find handle FindFirstFileExW returned, closed once here.
+        let _ = unsafe { FindClose(self.0) };
+    }
+}
+
 impl Enumerator for FindEnumerator {
     fn run(&mut self, dir: &WidePath, gen: Gen, cancel: &CancelToken, out: &mut dyn FnMut(Batch)) {
-        let _ = (dir, gen, cancel, out);
-        todo!("F-ENUM")
+        let clock = Clock::new();
+        let run_start = clock.now_us();
+        let mut path = dir.raw();
+        path.pop(); // the NUL
+        if path.last() != Some(&u16::from(b'\\')) {
+            path.push(u16::from(b'\\'));
+        }
+        path.push(u16::from(b'*'));
+        path.push(0);
+        let elapsed = |since: u64| u32::try_from(clock.now_us().saturating_sub(since)).unwrap_or(u32::MAX);
+        let last = |gen: Gen, names: Vec<u8>, entries: Vec<RawEntry>, error: Option<EnumError>, elapsed_us: u32| {
+            Batch { gen, names, entries, done: true, error, elapsed_us }
+        };
+
+        let mut fd = WIN32_FIND_DATAW::default();
+        // SAFETY: `path` is NUL-terminated and lives for the call; `fd` is the WIN32_FIND_DATAW FindExInfoBasic fills.
+        let found = unsafe {
+            FindFirstFileExW(
+                PCWSTR(path.as_ptr()),
+                FindExInfoBasic,
+                (&mut fd as *mut WIN32_FIND_DATAW).cast::<c_void>(),
+                FindExSearchNameMatch,
+                None,
+                FIND_FIRST_EX_LARGE_FETCH,
+            )
+        };
+        let guard = match found {
+            Ok(h) => FindGuard(h),
+            Err(e) => {
+                let code = win32_code(&e);
+                let waited = elapsed(run_start);
+                let error = if code == ERROR_FILE_NOT_FOUND.0 && dir.is_root() {
+                    None // a root with nothing in it: an empty listing
+                } else {
+                    Some(map_find_error(code, waited / 1_000))
+                };
+                out(last(gen, Vec::new(), Vec::new(), error, waited));
+                return;
+            }
+        };
+        let mut names: Vec<u8> = Vec::new();
+        let mut entries: Vec<RawEntry> = Vec::new();
+        let mut first = true;
+        let mut batch_start = run_start;
+        let mut error = None;
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let name = until_nul(&fd.cFileName);
+            let dot = u16::from(b'.');
+            if !(name == [dot] || name == [dot, dot]) {
+                entries.push(raw_from_find(&fd, &mut names));
+                let el = elapsed(batch_start);
+                if self.flush_due(entries.len(), el, first) {
+                    out(Batch {
+                        gen,
+                        names: std::mem::take(&mut names),
+                        entries: std::mem::take(&mut entries),
+                        done: false,
+                        error: None,
+                        elapsed_us: el,
+                    });
+                    first = false;
+                    batch_start = clock.now_us();
+                }
+            }
+            // SAFETY: the live find handle of `guard` and the record it fills.
+            if let Err(e) = unsafe { FindNextFileW(guard.0, &mut fd) } {
+                if win32_code(&e) != ERROR_NO_MORE_FILES.0 {
+                    error = Some(map_find_error(win32_code(&e), elapsed(run_start) / 1_000));
+                }
+                break;
+            }
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+        let el = elapsed(batch_start);
+        out(last(gen, names, entries, error, el));
     }
 }
 
@@ -215,6 +335,195 @@ mod tests {
 
     fn wide_path(p: &std::path::Path) -> WidePath {
         WidePath::new(&p.as_os_str().encode_wide().collect::<Vec<u16>>()).unwrap()
+    }
+
+    fn en(first: usize, first_ms: u32, later: usize, later_ms: u32) -> FindEnumerator {
+        FindEnumerator { first_entries: first, first_ms, later_entries: later, later_ms }
+    }
+
+    fn list(en: &mut FindEnumerator, dir: &WidePath) -> Vec<Batch> {
+        let mut got = Vec::new();
+        en.run(dir, Gen(7), &CancelToken::new(), &mut |b| got.push(b));
+        got
+    }
+
+    fn names_of(batches: &[Batch]) -> Vec<String> {
+        let mut v: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                b.entries
+                    .iter()
+                    .map(|e| {
+                        let o = e.name_off as usize;
+                        String::from_utf8_lossy(&b.names[o..o + usize::from(e.name_len)]).into_owned()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn empty_dir_is_done_and_empty() {
+        let root = TempRoot::new("enum_empty");
+        let got = list(&mut FindEnumerator::default(), &wide_path(root.path()));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].done && got[0].entries.is_empty() && got[0].error.is_none());
+        assert_eq!(got[0].gen, Gen(7));
+    }
+
+    #[test]
+    fn lists_files_and_folders_without_dots() {
+        let root = TempRoot::new("enum_basic");
+        root.file("a.txt", b"hello");
+        root.dir("sub");
+        let got = list(&mut FindEnumerator::default(), &wide_path(root.path()));
+        assert_eq!(names_of(&got), ["a.txt", "sub"]);
+        let b = &got[0];
+        let a = b.entries.iter().find(|e| b.names[e.name_off as usize] == b'a').unwrap();
+        assert_eq!(a.size, 5);
+        assert!(a.mtime > 0 && a.ctime > 0);
+        let sub = b.entries.iter().find(|e| b.names[e.name_off as usize] == b's').unwrap();
+        assert_ne!(sub.attrs & FILE_ATTRIBUTE_DIRECTORY.0, 0);
+    }
+
+    #[test]
+    fn three_hundred_entries_two_batches() {
+        let root = TempRoot::new("enum_300");
+        for i in 0..300 {
+            root.file(&format!("f{i:03}.txt"), b"");
+        }
+        let got = list(&mut en(256, 60_000, 2_048, 60_000), &wide_path(root.path()));
+        let lens: Vec<usize> = got.iter().map(|b| b.entries.len()).collect();
+        assert_eq!(lens, [256, 44]);
+        assert_eq!(got.iter().map(|b| b.done).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(names_of(&got).len(), 300);
+    }
+
+    #[test]
+    fn flush_due_table() {
+        let e = en(256, 8, 2_048, 16);
+        // count limit, first and later
+        assert!(!e.flush_due(255, 0, true));
+        assert!(e.flush_due(256, 0, true));
+        assert!(!e.flush_due(256, 0, false));
+        assert!(e.flush_due(2_048, 0, false));
+        // time limit, first and later
+        assert!(!e.flush_due(1, 7_999, true));
+        assert!(e.flush_due(1, 8_000, true));
+        assert!(!e.flush_due(1, 15_999, false));
+        assert!(e.flush_due(1, 16_000, false));
+        // the later limits do not apply to the first batch and the reverse
+        assert!(!e.flush_due(1, 10_000, false));
+        assert!(!e.flush_due(300, 0, false));
+        // both at once
+        assert!(e.flush_due(256, 8_000, true));
+    }
+
+    #[test]
+    fn batches_follow_the_rule() {
+        let root = TempRoot::new("enum_rule");
+        for i in 0..10_000 {
+            root.file(&format!("n{i:05}"), b"");
+        }
+        let mut e = FindEnumerator::default();
+        let got = list(&mut e, &wide_path(root.path()));
+        assert!(got.last().unwrap().done);
+        assert_eq!(got.iter().filter(|b| b.done).count(), 1);
+        let total: usize = got.iter().map(|b| b.entries.len()).sum();
+        assert_eq!(total, 10_000);
+        for (i, b) in got.iter().enumerate() {
+            let (limit, ms) = if i == 0 { (e.first_entries, e.first_ms) } else { (e.later_entries, e.later_ms) };
+            assert!(b.entries.len() <= limit, "batch {i} has {} entries over {limit}", b.entries.len());
+            if i + 1 < got.len() {
+                assert!(
+                    b.entries.len() == limit || u64::from(b.elapsed_us) >= u64::from(ms) * 1_000,
+                    "batch {i}: {} entries, {} us",
+                    b.entries.len(),
+                    b.elapsed_us
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_and_lone_surrogate_names() {
+        let root = TempRoot::new("enum_unicode");
+        let lone = [u16::from(b'x'), 0xD800, u16::from(b'y')];
+        root.file_wide(&lone, b"1");
+        root.file("caf\u{e9} \u{4e2d}.txt", b"2");
+        let got = list(&mut FindEnumerator::default(), &wide_path(root.path()));
+        let b = &got[0];
+        let mut all: Vec<Vec<u8>> =
+            b.entries.iter().map(|e| b.names[e.name_off as usize..][..usize::from(e.name_len)].to_vec()).collect();
+        all.sort();
+        let mut want = vec![vec![b'x', 0xED, 0xA0, 0x80, b'y'], "caf\u{e9} \u{4e2d}.txt".as_bytes().to_vec()];
+        want.sort();
+        assert_eq!(all, want);
+    }
+
+    #[test]
+    fn long_path_beyond_260() {
+        let root = TempRoot::new("enum_long");
+        let seg = "d".repeat(50);
+        let rel = format!("{seg}/{seg}/{seg}/{seg}/{seg}/{seg}");
+        root.file(&format!("{rel}/deep.bin"), &[1, 2, 3]);
+        let dir = wide_path(&root.at(&rel));
+        assert!(dir.units().len() > 260);
+        let got = list(&mut FindEnumerator::default(), &dir);
+        assert_eq!(names_of(&got), ["deep.bin"]);
+        assert!(got.last().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn access_denied() {
+        let root = TempRoot::new("enum_denied");
+        root.file("locked/inner.txt", b"x");
+        root.deny_listing("locked");
+        let got = list(&mut FindEnumerator::default(), &wide_path(&root.at("locked")));
+        root.allow_listing("locked");
+        assert_eq!(got.len(), 1);
+        assert!(got[0].done && got[0].entries.is_empty());
+        assert_eq!(got[0].error, Some(EnumError::AccessDenied));
+    }
+
+    #[test]
+    fn not_found() {
+        let root = TempRoot::new("enum_missing");
+        let got = list(&mut FindEnumerator::default(), &wide_path(&root.path().join("nope")));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].done);
+        assert_eq!(got[0].error, Some(EnumError::NotFound));
+    }
+
+    #[test]
+    fn file_instead_of_dir() {
+        let root = TempRoot::new("enum_file");
+        root.file("plain.txt", b"x");
+        let got = list(&mut FindEnumerator::default(), &wide_path(&root.at("plain.txt")));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].error, Some(EnumError::NotFound));
+    }
+
+    #[test]
+    fn cancel_stops() {
+        let root = TempRoot::new("enum_cancel");
+        for i in 0..600 {
+            root.file(&format!("c{i:03}"), b"");
+        }
+        let cancel = CancelToken::new();
+        let mut seen = 0;
+        FindEnumerator { first_entries: 100, first_ms: 60_000, later_entries: 100, later_ms: 60_000 }.run(
+            &wide_path(root.path()),
+            Gen(1),
+            &cancel,
+            &mut |_b| {
+                seen += 1;
+                cancel.cancel();
+            },
+        );
+        assert_eq!(seen, 1, "no batch after the cancel");
     }
 
     #[test]

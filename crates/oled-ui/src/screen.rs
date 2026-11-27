@@ -19,6 +19,17 @@ pub trait Screen {
         let _ = (cx, msg);
         Reply::None
     }
+    /// A WM_COPYDATA sent to the window (TK1): `tag` is its dwData, `bytes` a copy of its payload (at most 64 KiB: the
+    /// window refuses a larger one before any call). The answer is what the sender's SendMessage returns.
+    fn copy_data(&mut self, cx: &mut EventCx, tag: usize, bytes: &[u8]) -> bool {
+        let _ = (cx, tag, bytes);
+        false
+    }
+    /// A message the app routed to the window with EventLoop::route_message (TK1), posted or sent to it.
+    fn app_message(&mut self, cx: &mut EventCx, msg: u32, wparam: usize, lparam: isize) -> Reply {
+        let _ = (cx, msg, wparam, lparam);
+        Reply::None
+    }
     fn commands(&self) -> &CommandTable;
     /// Custom caption only (K3.5).
     fn caption_hit(&self, p: PointP) -> CaptionHit {
@@ -64,6 +75,14 @@ impl<S: Screen + ?Sized> Screen for Box<S> {
 
     fn data(&mut self, cx: &mut EventCx, msg: AppMsg) -> Reply {
         (**self).data(cx, msg)
+    }
+
+    fn copy_data(&mut self, cx: &mut EventCx, tag: usize, bytes: &[u8]) -> bool {
+        (**self).copy_data(cx, tag, bytes)
+    }
+
+    fn app_message(&mut self, cx: &mut EventCx, msg: u32, wparam: usize, lparam: isize) -> Reply {
+        (**self).app_message(cx, msg, wparam, lparam)
     }
 
     fn commands(&self) -> &CommandTable {

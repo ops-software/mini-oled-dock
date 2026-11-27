@@ -49,6 +49,30 @@ pub trait TableModel: ListModel {
         let _ = (row, col);
         None
     }
+    /// How the row is painted now (a slide and a fade); asked once per visible row at each paint.
+    fn motion(&self, row: usize) -> RowMotion {
+        let _ = row;
+        RowMotion::NONE
+    }
+}
+
+/// A row's paint-time motion. Hit testing and the accessibility rects ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowMotion {
+    /// Logical px added to the painted y (a slide).
+    pub dy: i16,
+    /// 255 = opaque; scales the alpha of every ink of the row: plate, text, icon, heat, note.
+    pub opacity: u8,
+}
+
+impl RowMotion {
+    pub const NONE: RowMotion = RowMotion { dy: 0, opacity: 255 };
+}
+
+impl Default for RowMotion {
+    fn default() -> RowMotion {
+        RowMotion::NONE
+    }
 }
 
 /// A row's place in a tree.
@@ -160,6 +184,8 @@ pub struct CellOut {
     pub badge: Option<Badge>,
     /// Dimmed while on the clipboard as cut.
     pub cut: bool,
+    /// The icon alone drawn at half alpha (files: hidden items), the text unchanged.
+    pub dim_icon: bool,
     /// The status slot, CAPTION, right.
     pub note: Option<(Text, FgRole)>,
     /// Shown on hover.

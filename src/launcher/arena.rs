@@ -698,6 +698,67 @@ pub fn encode_apps(entries: &[CatApp], caps: Caps) -> Result<Vec<u8>, ArenaError
     fit(Kind::Apps, "", ents, caps)
 }
 
+/// The apps catalogue of `arena` without the entries whose id `keep` refuses, encoded again under `caps`, and how many
+/// were left out (`arena` itself when none is). A kept entry keeps all it had: its names, words, ranks, Start's
+/// keywords, inbox entry and hidden keywords (read back from the dictionaries), so the result is the arena the encoder
+/// makes of the kept entries alone. Err(BadHeader) for a settings arena.
+pub fn retain_apps(arena: Arena, keep: impl Fn(&str) -> bool, caps: Caps) -> Result<(Arena, usize), ArenaError> {
+    use crate::start_search::{Keys, XML_KEYWORD_PENALTY};
+    if arena.layout.kind != Kind::Apps {
+        return Err(ArenaError::BadHeader);
+    }
+    let v = arena.view();
+    let kept: Vec<bool> = (0..v.len()).map(|i| keep(v.id(i))).collect();
+    let left_out = kept.iter().filter(|k| !**k).count();
+    if left_out == 0 {
+        return Ok((arena, 0));
+    }
+    // The hidden keywords of every entry: the curated ones with their penalty, the XML ones with theirs.
+    let mut keys = vec![Keys::default(); v.len()];
+    for (dict, posts, size) in [(CUR, CURP, CUR_POST), (XML, XMLP, POST)] {
+        let posts = v.sec(posts);
+        for rec in v.sec(dict).chunks_exact(DICT_REC) {
+            let text = v.text(u32_at(rec, 0), u16_at(rec, 4).map(usize::from));
+            let first = u32_at(rec, 8).map_or(0, |n| n as usize);
+            let count = u32_at(rec, 12).map_or(0, |n| n as usize);
+            for p in first..first.saturating_add(count) {
+                let at = p.saturating_mul(size);
+                let penalty =
+                    if size == CUR_POST { u32_at(posts, at.saturating_add(4)) } else { Some(XML_KEYWORD_PENALTY) };
+                let entry = u32_at(posts, at).and_then(|e| keys.get_mut(e as usize));
+                if let (Some(k), Some(penalty)) = (entry, penalty) {
+                    k.push(text, penalty);
+                }
+            }
+        }
+    }
+    let mut apps = Vec::with_capacity(v.len() - left_out);
+    for (i, keys) in keys.into_iter().enumerate() {
+        if !kept.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let rec = v.rec(i);
+        let first = u32_at(rec, 18).map_or(0, |f| f as usize);
+        let count = u16_at(rec, 22).map_or(0, usize::from);
+        let words = v.sec(WORDS).get(first.saturating_mul(2)..first.saturating_add(count).saturating_mul(2));
+        apps.push(CatApp {
+            id: v.id(i).into(),
+            name: v.name(i).into(),
+            folded: v.folded(i).into(),
+            words: words.unwrap_or_default().into(),
+            initials: v.short(i, 12).into(),
+            keys,
+            extra: v.names(i),
+            inbox: u16_at(rec, 42).filter(|&x| x != NO_INBOX),
+            rank: v.rank(i),
+            start_keys: Keys::from_packed(v.start_keys(i)),
+            start_rank: v.start_rank(i),
+        });
+    }
+    let bytes = encode_apps(&apps, caps)?;
+    Ok((Arena::new(bytes, Kind::Apps, None, caps)?, left_out))
+}
+
 /// The buffer of the settings catalogue, fitted to `caps` (`fit`); `key` is the line that names what it was built from
 /// (printable ASCII, at most 2 KiB). The position of a setting in the buffer is its index (in `entries` too, unless the
 /// caps left some out).
@@ -1072,6 +1133,26 @@ mod tests {
         let (_, s) = catalogue();
         let bytes = encode_settings("a|b|fmt 2", &s, Caps::BENCH).unwrap();
         (s, Arena::new(bytes, Kind::Settings, Some("a|b|fmt 2"), Caps::BENCH).unwrap())
+    }
+
+    /// An apps arena less some of its entries (`retain_apps`) is, byte for byte, the arena the encoder makes of the
+    /// others alone: every kept entry keeps its names, words, ranks, Start's keywords, inbox entry and hidden keywords.
+    #[test]
+    fn retain_apps_is_the_encoding_of_the_kept_entries() {
+        let (apps, a) = apps_arena();
+        let gone = |id: &str| id.ends_with("3!App") || id.starts_with("Microsoft.WindowsCalculator");
+        let kept: Vec<CatApp> = apps.iter().filter(|a| !gone(&a.id)).cloned().collect();
+        assert!(kept.len() + 5 == apps.len() && kept.iter().any(|a| a.inbox.is_some()));
+        let (got, n) = retain_apps(a.clone(), |id| !gone(id), Caps::BENCH).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(got.raw(), &encode_apps(&kept, Caps::BENCH).unwrap()[..]);
+        // None left out: the same arena, not encoded again; all of them: an empty catalogue.
+        let (same, none) = retain_apps(a.clone(), |_| true, Caps::BENCH).unwrap();
+        assert_eq!((same.raw(), none), (a.raw(), 0));
+        let (empty, all) = retain_apps(a, |_| false, Caps::BENCH).unwrap();
+        assert_eq!((empty.len(), all), (0, apps.len()));
+        let (_, s) = settings_arena();
+        assert_eq!(retain_apps(s, |_| true, Caps::BENCH).unwrap_err(), ArenaError::BadHeader);
     }
 
     #[test]

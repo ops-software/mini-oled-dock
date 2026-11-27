@@ -1,13 +1,12 @@
 //! The window procedure (P2-kit 2.13): K0.1b writes the whole match, one delegation per message to the module of the
 //! group that handles it; KA2 owns the file and keeps every arm.
-#![allow(dead_code)] // Registered with the window class by K1a.7.
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::{
-    a11y, caption, def_proc, dpi, frame, hooks, ime, input, menu, placement, proxy, window, WM_OLED_A11Y, WM_OLED_DATA,
-    WM_OLED_RETRY,
+    a11y, caption, def_proc, dpi, frame, hooks, ime, input, menu, placement, proxy, tooltip, window, WM_OLED_A11Y,
+    WM_OLED_DATA, WM_OLED_RETRY,
 };
 
 /// WM_MOUSELEAVE (winuser.h; the windows crate has it under UI::Controls only).
@@ -19,6 +18,10 @@ pub(crate) unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, l
         WM_NCCREATE => window::on_nccreate(hwnd, msg, wp, lp),
         WM_NCDESTROY => window::on_ncdestroy(hwnd, msg, wp, lp),
         WM_SIZE => window::on_size(hwnd, msg, wp, lp),
+        WM_SHOWWINDOW | WM_ENABLE => {
+            tooltip::on_owner_message(hwnd, msg, wp, lp);
+            def_proc(hwnd, msg, wp, lp)
+        }
         WM_ERASEBKGND => window::on_erasebkgnd(hwnd, msg, wp, lp),
         WM_OLED_RETRY => window::on_retry(hwnd, msg, wp, lp),
         WM_PAINT => crate::present::banded::on_paint(hwnd, msg, wp, lp),
@@ -26,10 +29,12 @@ pub(crate) unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, l
         | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN
         | WM_XBUTTONUP | WM_XBUTTONDBLCLK | WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN
         | WM_SYSKEYUP | WM_CHAR | WM_SETFOCUS | WM_KILLFOCUS | WM_ACTIVATE | WM_CLOSE | WM_SETCURSOR
-        | WM_CAPTURECHANGED | WM_TIMER => input::on_input(hwnd, msg, wp, lp),
+        | WM_CAPTURECHANGED | WM_TIMER | WM_SYSCHAR => input::on_input(hwnd, msg, wp, lp),
         WM_DPICHANGED => dpi::on_dpichanged(hwnd, msg, wp, lp),
+        WM_GETMINMAXINFO => window::on_getminmaxinfo(hwnd, msg, wp, lp),
         WM_EXITSIZEMOVE => placement::on_exitsizemove(hwnd, msg, wp, lp),
         WM_OLED_DATA => proxy::drain(hwnd, msg, wp, lp),
+        WM_COPYDATA => window::on_copydata(hwnd, msg, wp, lp),
         WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => frame::on_setting_change(hwnd, msg, wp, lp),
         WM_GETOBJECT => a11y::on_getobject(hwnd, msg, wp, lp).unwrap_or_else(|| def_proc(hwnd, msg, wp, lp)),
         WM_OLED_A11Y => a11y::on_action(hwnd, msg, wp, lp),
@@ -48,6 +53,8 @@ pub(crate) unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, l
             let _ = window::with_host(hwnd, |h| hooks::on_destroy(h, hwnd));
             def_proc(hwnd, msg, wp, lp)
         }
+        // The messages the app routed to its screen (EventLoop::route_message), before the default.
+        _ if window::is_routed(hwnd, msg) => window::on_routed(hwnd, msg, wp, lp),
         _ => def_proc(hwnd, msg, wp, lp),
     }
 }

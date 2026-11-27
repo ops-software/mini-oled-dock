@@ -1,6 +1,6 @@
 [package]
 name = "dock"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 rust-version = "1.87"
 description = "A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with no UI framework."
@@ -31,6 +31,8 @@ oled-i18n-build = { path = "crates/oled-i18n-build", version = "0.0.0" }
 oled-sysmon = { path = "crates/oled-sysmon", version = "0.0.0" }
 # L-P (P2-plumbing)
 oled-config = { path = "crates/oled-config", version = "0.0.0" }
+# DK-SM1 (P1-dock-keys)
+oled-shellmodel = { path = "crates/oled-shellmodel", version = "0.0.0" }
 
 [dependencies]
 serde = { workspace = true }
@@ -41,6 +43,7 @@ windows-core = { workspace = true }
 windows-future = { workspace = true }
 windows-collections = { workspace = true }
 oled-config = { workspace = true }
+oled-shellmodel = { workspace = true }
 oled-sys = { workspace = true }
 oled-sysmon = { workspace = true }
 oled-trust = { workspace = true }

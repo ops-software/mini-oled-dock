@@ -1,0 +1,70 @@
+TabList
+  Tab "Downloads" [focusable, selected]
+    Button "Close tab"
+  Tab "Documents" [focusable]
+    Button "Close tab"
+  Tab "Pictures" [focusable]
+    Button "Close tab"
+  Tab "Projects" [focusable]
+    Button "Close tab"
+  Button "New tab" [focusable]
+Toolbar
+  Button "Back" [focusable]
+  Button "Forward" [focusable]
+  Button "Up" [focusable]
+SearchInput "Filter" [focusable] ""
+Toolbar "Path"
+  Link "Local Disk (C:)" [focusable]
+  Button "Subfolders"
+  Link "Users" [focusable]
+  Button "Subfolders"
+  Link "Downloads" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Splitter "Resize panes" [focusable] 20.833334%
+Tree
+  Label "Pinned"
+  TreeItem "Desktop" [focusable] level 1
+  TreeItem "Downloads" [focusable, selected] level 1
+  TreeItem "Documents" [focusable] level 1
+  TreeItem "Pictures" [focusable] level 1
+  Label "This PC"
+  TreeItem "Local Disk (C:)" [focusable] level 1
+  TreeItem "Data (D:)" [focusable] level 1
+ColumnHeader "Name" [focusable]
+ColumnHeader "Size" [focusable]
+Table "Files" 3 of 100000
+  Row "item 0.txt" [focusable] 1 of 100000
+  Row "item 1.rs" [focusable, selected] 2 of 100000
+  Row "item 2.png" [focusable, selected] 3 of 100000
+  Row "item 3.docx" [focusable, selected] 4 of 100000
+  Row "A long descriptive file name that cannot fit its column 4.zip" [focusable] 5 of 100000
+  Row "item 5.txt" [focusable] 6 of 100000
+  Row "item 6.rs" [focusable] 7 of 100000
+  Row "item 7.png" [focusable] 8 of 100000
+  Row "item 8.docx" [focusable] 9 of 100000
+  Row "item 9.zip" [focusable] 10 of 100000
+  Row "item 10.txt" [focusable] 11 of 100000
+  Row "item 11.rs" [focusable] 12 of 100000
+  Row "item 12.png" [focusable] 13 of 100000
+  Row "A long descriptive file name that cannot fit its column 13.docx" [focusable] 14 of 100000
+  Row "item 14.zip" [focusable] 15 of 100000
+  Row "item 15.txt" [focusable] 16 of 100000
+  Row "item 16.rs" [focusable] 17 of 100000
+  Row "item 17.png" [focusable] 18 of 100000
+  Row "item 18.docx" [focusable] 19 of 100000
+  Row "item 19.zip" [focusable] 20 of 100000
+  Row "item 20.txt" [focusable] 21 of 100000
+  Row "item 21.rs" [focusable] 22 of 100000
+  Row "A long descriptive file name that cannot fit its column 22.png" [focusable] 23 of 100000
+  Row "item 23.docx" [focusable] 24 of 100000
+  Row "item 24.zip" [focusable] 25 of 100000
+  Row "item 25.txt" [focusable] 26 of 100000
+  Row "item 26.rs" [focusable] 27 of 100000
+  Row "item 27.png" [focusable] 28 of 100000
+  Row "item 28.docx" [focusable] 29 of 100000
+  Row "item 29.zip" [focusable] 30 of 100000
+  Row "item 30.txt" [focusable] 31 of 100000
+  Row "A long descriptive file name that cannot fit its column 31.rs" [focusable] 32 of 100000
+  Row "item 32.png" [focusable] 33 of 100000
+Status "100,000 items · 3 selected"

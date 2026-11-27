@@ -1,0 +1,25 @@
+Tree
+  TreeItem "buttons" [focusable, selected] level 1
+  TreeItem "glyphs" [focusable] level 1
+  TreeItem "settings_like" [focusable] level 1
+  TreeItem "index" [focusable] level 1
+  TreeItem "toggles" [focusable] level 1
+  TreeItem "sidebar" [focusable] level 1
+  TreeItem "scroll" [focusable] level 1
+  TreeItem "tooltip" [focusable] level 1
+  TreeItem "table" [focusable] level 1
+  TreeItem "table100k" [focusable] level 1
+  TreeItem "mock_tasks" [focusable] level 1
+  TreeItem "menus" [focusable] level 1
+  TreeItem "fields" [focusable] level 1
+  TreeItem "toolbar" [focusable] level 1
+  TreeItem "dialogs" [focusable] level 1
+  TreeItem "status" [focusable] level 1
+  TreeItem "tabs" [focusable] level 1
+  TreeItem "split" [focusable] level 1
+  TreeItem "path" [focusable] level 1
+  TreeItem "progress" [focusable] level 1
+  TreeItem "mock_files" [focusable] level 1
+  TreeItem "caption" [focusable] level 1
+  TreeItem "charts" [focusable] level 1
+  TreeItem "properties" [focusable] level 1

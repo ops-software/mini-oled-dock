@@ -339,6 +339,86 @@ fn service_paths() {
 }
 
 #[test]
+fn unquoted_arguments_cannot_climb_out_of_the_programs_folder() {
+    // When the program of an unquoted line is missing, CreateProcess goes on to the longer space-separated prefixes
+    // (the program, a space and part of the arguments, ".exe" appended) and normalises each one: a ".." segment there
+    // climbs out of the program's folder. `C:\Windows\x.exe \..\..\Users\Public\evil` runs C:\Users\Public\evil.exe.
+    let roots = [r"C:\Windows", r"C:\Program Files"];
+    let refused = [
+        r"C:\Windows\x.exe \..\..\Users\Public\evil",
+        r"C:\Windows\x.exe /../../Users/Public/evil",
+        r"C:\Windows\System32\x.exe -c ..\..\..\..\Users\Public\evil",
+        r"C:\Program Files\Vendor\svc.exe --config \..\..\..\Users\Public\evil -k",
+        r"C:\Windows\x.exe a\..\..\..\Temp\evil",
+    ];
+    for path in refused {
+        assert_eq!(service_image_allowed(path, &roots), Err(DenyReason::ServiceImagePath), "{path}");
+    }
+    // A quoted program is the only name Windows tries. Without "..", every longer prefix lies in a folder named after
+    // the program, inside the program's own folder, so slashes, colons and backslashes in the arguments are harmless.
+    let ok = [
+        r#""C:\Windows\x.exe" \..\..\Users\Public\evil"#,
+        r"C:\Windows\System32\dllhost.exe /Processid:{02D4B3F1-FD88-11D1-960D-00805FC79235}",
+        r"C:\Windows\System32\msiexec.exe /V",
+        r"C:\Windows\System32\x.exe -config C:\ProgramData\Vendor\x.ini",
+    ];
+    for path in ok {
+        assert_eq!(service_image_allowed(path, &roots), Ok(()), "{path}");
+    }
+}
+
+#[test]
+fn folders_a_standard_user_can_write_inside_a_root_are_refused() {
+    // SystemRoot holds folders where a standard user can create files or folders (Temp, the task folders, tracing, the
+    // colour profiles, ...): a program planted there lies under the root, but the user chose it.
+    let roots = [r"C:\Windows", r"C:\Program Files"];
+    let refused = [
+        r"C:\Windows\Temp\x.exe",
+        r"c:\windows\temp\x.exe -k",
+        r#""C:\Windows\Temp\Vendor Setup\x.exe" -k"#,
+        r"C:\Windows\Tasks\x.exe",
+        r"C:\Windows\tracing\x.exe",
+        r"C:\Windows\Registration\CRMLog\x.exe",
+        r"C:\Windows\debug\WIA\x.exe",
+        r"C:\Windows\PLA\Reports\x.exe",
+        r"C:\Windows\System32\Tasks\Microsoft\Windows\SyncCenter\x.exe",
+        r"C:\Windows\System32\Tasks_Migrated\x.exe",
+        r"C:\Windows\System32\spool\drivers\color\x.exe",
+        r"C:\Windows\System32\spool\PRINTERS\x.exe",
+        r"C:\Windows\System32\com\dmp\x.exe",
+        r"C:\Windows\System32\FxsTmp\x.exe",
+        r"C:\Windows\System32\LogFiles\WMI\x.exe",
+        r"C:\Windows\System32\Microsoft\Crypto\RSA\MachineKeys\x.exe",
+        r"C:\Windows\SysWOW64\Tasks\x.exe",
+        r"C:\Windows\SysWOW64\com\dmp\x.exe",
+        r"C:\Windows\SysWOW64\FxsTmp\x.exe",
+        // The same folders as Windows normalises them: an empty or "." segment, a trailing dot or space.
+        r#""C:\Windows\\Temp\x.exe""#,
+        r#""C:\Windows\.\Temp\x.exe""#,
+        r#""C:\Windows\Temp.\x.exe""#,
+        r#""C:\Windows\Temp \x.exe""#,
+        r#""C:\Windows\System32\\spool\.\drivers\color\x.exe""#,
+        // Below every root, not only SystemRoot.
+        r"C:\Program Files\Temp\x.exe",
+    ];
+    for path in refused {
+        assert_eq!(service_image_allowed(path, &roots), Err(DenyReason::ServiceImagePath), "{path}");
+    }
+    // Their neighbours stay admitted.
+    let ok = [
+        r"C:\Windows\System32\spoolsv.exe",
+        r"C:\Windows\System32\Tasks.exe",
+        r"C:\Windows\System32\com\x.exe",
+        r"C:\Windows\System32\Microsoft\Crypto\x.exe",
+        r"C:\Windows\System32\svchost.exe -k netsvcs",
+        r#""C:\Program Files\Vendor App\svc.exe" -k"#,
+    ];
+    for path in ok {
+        assert_eq!(service_image_allowed(path, &roots), Ok(()), "{path}");
+    }
+}
+
+#[test]
 fn service_stop_refuses_a_reboot_on_failure() {
     assert_eq!(service_stop_allowed(true), Err(DenyReason::RebootOnFailure));
     assert_eq!(service_stop_allowed(false), Ok(()));

@@ -216,7 +216,7 @@ fn a_migration_rewrites_the_file_once() {
 
 #[test]
 fn an_invalid_file_keeps_defaults_and_is_left_untouched() {
-    for bad in ["{ \"a\": fal", "[1, 2]", "{\"n\": \"three\"}", "\u{feff}// c\n{ \"a\": true,, }", "\u{0}\u{ff}"] {
+    for bad in ["{ \"a\": fal", "[1, 2]", "\u{feff}// c\n{ \"a\": true,, }", "\u{0}\u{ff}"] {
         let dir = TempDir::new("invalid");
         std::fs::write(dir.file(), bad).unwrap();
         let s = store(&dir);
@@ -228,6 +228,15 @@ fn an_invalid_file_keeps_defaults_and_is_left_untouched() {
         assert_eq!(errors[0].kept, Kept::Default);
         assert!(matches!(errors[0].problem, Problem::Parse(_)));
     }
+    // A wrong type is not the whole file (W5d): that key loses its value, the rest is read, the file stays as it is.
+    let dir = TempDir::new("wrongtype");
+    std::fs::write(dir.file(), "{\"n\": \"three\", \"a\": false}").unwrap();
+    let s = store(&dir);
+    assert_eq!(s.load(|| None), LoadOutcome::Read);
+    assert_eq!((s.get().n, s.get().a), (7, false));
+    let errors: Vec<(String, Kept)> = s.errors().iter().map(|e| (e.path.clone(), e.kept)).collect();
+    assert_eq!(errors, [("n".to_string(), Kept::Default)]);
+    assert_eq!(read(&dir.file()), "{\"n\": \"three\", \"a\": false}");
     // A syntax error keeps its position: in the error, and in the text the dock has always logged.
     let dir = TempDir::new("position");
     std::fs::write(dir.file(), "{\n  \"a\": true\n  \"n\": 1\n}").unwrap();
@@ -282,9 +291,14 @@ fn modify_backs_up_an_unparsable_file_first() {
     let dir = TempDir::new("backup");
     let s = store(&dir);
     s.load(|| None);
-    for broken in [format!("{MARK}\n{{ \"n\": 5, oops }}"), format!("{MARK}\n{{ \"n\": \"five\" }}")] {
+    for (broken, whole) in
+        [(format!("{MARK}\n{{ \"n\": 5, oops }}"), true), (format!("{MARK}\n{{ \"n\": \"five\" }}"), false)]
+    {
         edit(&dir.file(), &broken);
-        assert!(matches!(s.reload_if_changed(), Reload::Invalid(_)));
+        // A syntax error is the whole file; a wrong type only its key, the last good value standing in (W5d).
+        let r = s.reload_if_changed();
+        assert!(if whole { matches!(r, Reload::Invalid(_)) } else { r == Reload::Unchanged }, "{r:?}");
+        assert_eq!(s.errors().len(), 1);
         s.modify(|c| c.n += 1).unwrap();
         assert_eq!(read(&dir.bak()), broken);
         assert_eq!(read(&dir.file()), s.get().to_template());

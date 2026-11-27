@@ -2,18 +2,20 @@
 //! Dispatcher (frame, interaction state, animation, menus, tips, toasts) and its drawing resources; the Harness and the
 //! host make them through the pub(crate) constructors below. The bodies marked "filled by" are KA1's (K1a.4).
 
+use crate::anim::HOVER_CHANNEL;
 use crate::command::CommandId;
 use crate::dispatch::{Dispatcher, Effect};
 use crate::event::TimerId;
-use crate::geom::{PointP, RectP, Scale};
-use crate::glyph::Glyph;
+use crate::geom::{self, PointP, RectP, Scale};
+use crate::glyph::{Glyph, GlyphCache};
 use crate::host::Caption;
 use crate::model::Align;
 use crate::node::{Node, NodeId, Text};
 use crate::strings::UiLang;
-use crate::text::{FontId, TextEngine, TextLayout, Trim};
+use crate::text::{FontId, LayoutOpts, TextEngine, TextLayout, Trim};
 use crate::theme::{Ink, Tokens, TypeRole};
-use crate::w3::{Canvas, IconBitmap};
+use crate::w3::{argb, Canvas, IconBitmap};
+use windows::Win32::Foundation::RECT;
 
 /// An animated value of a node; a node may animate several channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,14 +101,17 @@ pub(crate) struct Env<'a> {
     pub(crate) caption_spike: bool,
 }
 
-/// A window's drawing resources kept between frames: the text engine (K1a.3 adds the glyph cache here).
+/// A window's drawing resources kept between frames: the text engine and the glyph cache.
 pub(crate) struct Res {
     pub(crate) text: Box<dyn TextEngine>,
+    pub(crate) glyphs: GlyphCache,
+    /// The digit atlases of the fonts in use (K2a.4), built at the first figure.
+    pub(crate) digits: crate::text::digits::Atlases,
 }
 
 impl Res {
     pub(crate) fn new(text: Box<dyn TextEngine>) -> Res {
-        Res { text }
+        Res { text, glyphs: GlyphCache::new(), digits: crate::text::digits::Atlases::default() }
     }
 }
 
@@ -200,6 +205,17 @@ impl<'a> PaintCx<'a> {
 }
 
 impl PaintCx<'_> {
+    /// Points the canvas clip at band ∩ damage in canvas coordinates (every drawing call starts here).
+    pub(crate) fn sync_clip(&mut self) {
+        let c = self.clip;
+        self.canvas.clip = Some(RECT {
+            left: c.l - self.origin.x,
+            top: c.t - self.origin.y,
+            right: c.r - self.origin.x,
+            bottom: c.b - self.origin.y,
+        });
+    }
+
     /// Band ∩ damage, window coordinates.
     pub fn clip(&self) -> RectP {
         self.clip
@@ -246,12 +262,13 @@ impl PaintCx<'_> {
         self.disp.state.window_active
     }
 
-    /// 0..=1, animated for HOVER_FADE nodes (K1a.4); until then 0 or 1.
+    /// 0..=1, animated for HOVER_FADE nodes (DUR_FAST in, DUR_NORMAL out), else 0 or 1.
     pub fn hover_t(&self, id: NodeId) -> f32 {
-        if self.hot(id) {
-            1.0
-        } else {
-            0.0
+        let fade = AnimId { node: id, channel: HOVER_CHANNEL };
+        match self.disp.anim.value(fade, self.env.now_ms) {
+            Some(v) => v.clamp(0.0, 1.0),
+            None if self.hot(id) => 1.0,
+            None => 0.0,
         }
     }
 
@@ -264,45 +281,107 @@ impl PaintCx<'_> {
         self.env.now_ms
     }
 
-    /// Canvas::fill_rr. Filled by K1a.4.
+    /// `r` in canvas coordinates.
+    fn local(&self, r: RectP) -> RECT {
+        RECT {
+            left: r.l - self.origin.x,
+            top: r.t - self.origin.y,
+            right: r.r - self.origin.x,
+            bottom: r.b - self.origin.y,
+        }
+    }
+
+    /// Canvas::fill_rr.
     pub fn fill(&mut self, r: RectP, radius: i32, ink: Ink) {
-        let _ = (r, radius, ink, &mut self.canvas, self.origin);
+        if r.is_empty() || ink.a == 0 || !self.visible(r) {
+            return;
+        }
+        self.sync_clip();
+        let rc = self.local(r);
+        self.canvas.fill_rr(rc, radius, ink.rgb, ink.a);
     }
 
-    /// An inner ring of `width` px, any colour (high contrast). Filled by K1a.4.
+    /// An inner ring of `width` px, any colour (high contrast).
     pub fn stroke(&mut self, r: RectP, radius: i32, width: i32, ink: Ink) {
-        let _ = (r, radius, width, ink);
+        if r.is_empty() || ink.a == 0 || !self.visible(r) {
+            return;
+        }
+        self.sync_clip();
+        let rc = self.local(r);
+        self.canvas.stroke_rr_ink(rc, radius, width, ink);
     }
 
-    /// A 1 physical px horizontal line from x0 to x1. Filled by K1a.4.
+    /// A 1 physical px horizontal line from x0 to x1.
     pub fn hline(&mut self, x0: i32, x1: i32, y: i32, ink: Ink) {
-        let _ = (x0, x1, y, ink);
+        if ink.a == 0 {
+            return;
+        }
+        self.sync_clip();
+        let src = argb(ink.a, ink.rgb.0, ink.rgb.1, ink.rgb.2);
+        self.canvas.blend_run(y - self.origin.y, x0 - self.origin.x, x1 - self.origin.x, src);
     }
 
-    /// A 1 physical px vertical line from y0 to y1. Filled by K1a.4.
+    /// A 1 physical px vertical line from y0 to y1.
     pub fn vline(&mut self, x: i32, y0: i32, y1: i32, ink: Ink) {
-        let _ = (x, y0, y1, ink);
+        if ink.a == 0 {
+            return;
+        }
+        self.sync_clip();
+        let src = argb(ink.a, ink.rgb.0, ink.rgb.1, ink.rgb.2);
+        for y in y0..y1 {
+            self.canvas.blend(x - self.origin.x, y - self.origin.y, src);
+        }
     }
 
-    /// A glyph centred in `r`. Filled by K1a.3.
+    /// A glyph centred in `r`, as large as the smaller side of `r`.
     pub fn glyph(&mut self, r: RectP, g: Glyph, ink: Ink) {
-        let _ = (r, g, ink);
+        let size = r.w().min(r.h());
+        if size <= 0 || ink.a == 0 {
+            return;
+        }
+        let hits = self.res.glyphs.hits(g, size);
+        let x = r.l + (r.w() - size) / 2 - self.origin.x;
+        let y = r.t + (r.h() - size) / 2 - self.origin.y;
+        self.sync_clip();
+        self.canvas.glyph_from_hits(x, y, size, ink.rgb, ink.a, &hits);
     }
 
-    /// An image at `at`, `size` px square. Filled by K1a.4.
+    /// An image at `at`, `size` px square.
     pub fn image(&mut self, img: &IconBitmap, at: PointP, size: i32, opacity: u32) {
-        let _ = (img, at, size, opacity);
+        if size <= 0 || !self.visible(RectP::wh(at.x, at.y, size, size)) {
+            return;
+        }
+        self.sync_clip();
+        self.canvas.blit(img, at.x - self.origin.x, at.y - self.origin.y, size, opacity);
     }
 
-    /// A layout at `at`; records the rect for the golden comparator. Filled by K1a.4.
+    /// A layout at `at`; records the rect for the golden comparator.
     pub fn text(&mut self, l: &TextLayout, at: PointP, ink: Ink) {
-        let _ = (l, at, ink, &mut self.res, self.text_log.is_some());
+        let r = RectP::wh(at.x, at.y, l.width, l.height);
+        if !self.visible(r) {
+            return;
+        }
+        if let Some(log) = self.text_log.as_deref_mut() {
+            log.push(r);
+        }
+        self.sync_clip();
+        let local = PointP { x: at.x - self.origin.x, y: at.y - self.origin.y };
+        self.res.text.draw(&mut self.canvas, l, local, ink);
     }
 
-    /// One line of text in `r`, centred vertically; returns the width drawn. Filled by K1a.4.
+    /// One line of text in `r`, centred vertically; returns the width drawn. Start aligns left, End and Decimal right.
     pub fn text_in(&mut self, s: &str, role: TypeRole, r: RectP, align: Align, trim: Trim, ink: Ink) -> i32 {
-        let _ = (s, role, r, align, trim, ink);
-        0
+        let (scale, ts) = (self.env.scale, self.env.tokens.text_scale);
+        let font = self.res.text.font(role, None, scale, ts);
+        let opts = LayoutOpts { max_width: Some(r.w().max(0)), trim, wrap: false };
+        let l = self.res.text.layout(s, font, &opts);
+        let x = match align {
+            Align::Start => r.l,
+            Align::End | Align::Decimal => r.r - l.width,
+        };
+        let y = r.t + (r.h() - l.height) / 2;
+        self.text(&l, PointP { x, y }, ink);
+        l.width
     }
 
     /// Figures from the digit atlas, right-aligned at `right_top` (K2a.4); returns the width drawn.
@@ -315,10 +394,16 @@ impl PaintCx<'_> {
         crate::gfx::spans::draw(self, x0, spans, ink);
     }
 
-    /// The focus ring around a plate (inset: on a row plate), only if focus_visible() && window_active(). Filled by
-    /// K1a.4.
+    /// The focus ring around a plate (inset: on a row plate), only if focus_visible() && window_active(). With
+    /// rim_focus white (every theme but high contrast) the pixels are Canvas::stroke_rr's: the dock's ring.
     pub fn focus_ring(&mut self, around: RectP, radius: i32, inset: bool) {
-        let _ = (around, radius, inset);
+        if !self.focus_visible() || !self.window_active() {
+            return;
+        }
+        let s = self.env.scale;
+        let ring = if inset { geom::focus_ring_inset(around, radius, s) } else { geom::focus_ring(around, radius, s) };
+        let ink = self.env.tokens.color.rim_focus;
+        self.stroke(ring.rect, ring.radius, ring.width, ink);
     }
 
     /// Runs `f` with the clip narrowed to `r`, then restores it.
@@ -328,6 +413,18 @@ impl PaintCx<'_> {
         f(self);
         self.clip = saved;
     }
+}
+
+/// What the last bring_to_front of a window achieved (TK1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontResult {
+    /// The window became the foreground window.
+    Foreground,
+    /// Windows kept the foreground elsewhere: the window was raised above the other windows and its taskbar button
+    /// flashed.
+    Topmost,
+    /// Neither took effect.
+    None,
 }
 
 /// The event context: what a screen reads and asks for while it handles one event. Requests become effects that the
@@ -416,6 +513,7 @@ impl EventCx<'_> {
     pub fn open_menu(&mut self, items: Vec<MenuItem>, at: Anchor) -> MenuId {
         let id = self.disp.next_menu_id();
         let opener = self.target;
+        crate::widgets::menu::opened(&mut self.disp.menus, id, items.clone(), at, opener);
         self.disp.effects.push(Effect::OpenMenu { id, items, at, opener });
         id
     }
@@ -423,21 +521,25 @@ impl EventCx<'_> {
     /// Opens a list popup (keys stay with the caller); picks come back as Event::ListPicked.
     pub fn open_list(&mut self, items: Vec<Text>, at: Anchor, highlight: Option<usize>) -> MenuId {
         let id = self.disp.next_menu_id();
+        crate::widgets::menu::list_opened(&mut self.disp.menus, id, &items, at, highlight, self.target);
         self.disp.effects.push(Effect::OpenList { id, items, at, highlight });
         id
     }
 
     pub fn update_list(&mut self, id: MenuId, items: Vec<Text>, highlight: Option<usize>) {
+        crate::widgets::menu::list_updated(&mut self.disp.menus, id, &items, highlight);
         self.disp.effects.push(Effect::UpdateList { id, items, highlight });
     }
 
     pub fn close_menus(&mut self) {
+        crate::widgets::menu::closed_by_screen(&mut self.disp.menus);
         self.disp.effects.push(Effect::CloseMenus);
     }
 
     /// Shows a toast (the host draws it above the screen and gives it hit priority).
     pub fn toast(&mut self, t: ToastSpec) {
         crate::host::toast::push(&mut self.disp.toasts, t, self.env.now_ms);
+        self.disp.effects.push(Effect::Relayout);
     }
 
     /// Arms a one-shot timer: Event::Timer(id) after `after_ms`.
@@ -467,6 +569,24 @@ impl EventCx<'_> {
         self.disp.effects.push(Effect::CloseWindow);
     }
 
+    /// Brings the window to the front once the event has returned (TK1): restored if minimised, then made the
+    /// foreground window; when Windows refuses that, raised above the other windows without taking the activation and
+    /// its taskbar button flashed. Nothing is logged (the app logs front_result).
+    pub fn bring_to_front(&mut self) {
+        self.disp.effects.push(Effect::BringToFront);
+    }
+
+    /// Keeps the window above every window that is not topmost (on) or lets it back among them (off), once the event
+    /// has returned; the activation is not taken (TK1).
+    pub fn set_topmost(&mut self, on: bool) {
+        self.disp.effects.push(Effect::Topmost(on));
+    }
+
+    /// The outcome of the last bring_to_front of this window, once applied (None before the first one).
+    pub fn front_result(&self) -> Option<FrontResult> {
+        self.disp.front
+    }
+
     pub fn now_ms(&self) -> u64 {
         self.env.now_ms
     }
@@ -489,5 +609,111 @@ impl EventCx<'_> {
 
     pub fn text(&mut self) -> &mut dyn TextEngine {
         &mut *self.res.text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::GdiTextEngine;
+    use windows::Win32::Foundation::RECT;
+
+    const W: i32 = 100;
+    const H: i32 = 80;
+
+    /// Paints into a fresh buffer through a PaintCx with the given interaction state.
+    fn paint(dpi: u32, visible: bool, active: bool, tokens: &Tokens, f: impl FnOnce(&mut PaintCx)) -> Vec<u32> {
+        let mut disp = Dispatcher::new();
+        disp.state.focus_visible = visible;
+        disp.state.window_active = active;
+        let mut res = Res::new(Box::new(GdiTextEngine::new().unwrap()));
+        let env = Env {
+            scale: Scale { dpi },
+            tokens,
+            lang: UiLang::EN,
+            now_ms: 0,
+            caption: Caption::System,
+            caption_spike: false,
+        };
+        let mut buf = vec![0u32; (W * H) as usize];
+        {
+            let canvas = Canvas { buf: &mut buf, w: W, h: H, clip: None };
+            let mut cx = PaintCx::new(env, canvas, PointP { x: 0, y: 0 }, RectP::wh(0, 0, W, H), &disp, &mut res, None);
+            f(&mut cx);
+        }
+        buf
+    }
+
+    fn reference(rc: RECT, radius: i32, width: i32) -> Vec<u32> {
+        let mut buf = vec![0u32; (W * H) as usize];
+        Canvas { buf: &mut buf, w: W, h: H, clip: None }.stroke_rr(rc, radius, width, 160);
+        buf
+    }
+
+    #[test]
+    fn ring_widths() {
+        for (dpi, w) in [(96, 2), (120, 2), (144, 2), (192, 3)] {
+            assert_eq!(Scale { dpi }.ring(), crate::tokens::rim_focus_px(dpi));
+            assert_eq!(Scale { dpi }.ring(), w);
+        }
+    }
+
+    #[test]
+    fn ring_pixels_match_dock_keys() {
+        let t = Tokens::oled();
+        // Z3's geometry: the plate inflated by FOCUS_GAP + width, the radius grown by the same.
+        let got = paint(96, true, true, &t, |cx| cx.focus_ring(RectP { l: 10, t: 5, r: 36, b: 31 }, 7, false));
+        let want = reference(RECT { left: 6, top: 1, right: 40, bottom: 35 }, 11, 2);
+        assert!(got.iter().any(|p| *p != 0));
+        assert_eq!(got, want, "96 dpi");
+        let got = paint(192, true, true, &t, |cx| cx.focus_ring(RectP { l: 20, t: 10, r: 72, b: 62 }, 14, false));
+        let want = reference(RECT { left: 13, top: 3, right: 79, bottom: 69 }, 21, 3);
+        assert_eq!(got, want, "192 dpi");
+    }
+
+    #[test]
+    fn ring_needs_keyboard_focus_and_an_active_window() {
+        let t = Tokens::oled();
+        let ring = |cx: &mut PaintCx| cx.focus_ring(RectP { l: 10, t: 5, r: 36, b: 31 }, 7, false);
+        assert!(paint(96, false, true, &t, ring).iter().all(|p| *p == 0));
+        assert!(paint(96, true, false, &t, ring).iter().all(|p| *p == 0));
+    }
+
+    #[test]
+    fn a_coloured_ring_has_the_same_shape() {
+        let mut t = Tokens::oled();
+        let white = paint(96, true, true, &t, |cx| cx.focus_ring(RectP { l: 10, t: 5, r: 36, b: 31 }, 7, false));
+        t.color.rim_focus = Ink { rgb: (0, 255, 255), a: 160 };
+        let cyan = paint(96, true, true, &t, |cx| cx.focus_ring(RectP { l: 10, t: 5, r: 36, b: 31 }, 7, false));
+        let alpha = |v: &[u32]| v.iter().map(|p| p >> 24).collect::<Vec<_>>();
+        assert_eq!(alpha(&white), alpha(&cyan));
+        assert!(cyan.iter().any(|p| *p != 0 && (p >> 16) & 0xFF == 0), "no red in a cyan ring");
+    }
+
+    #[test]
+    fn drawing_is_translated_and_clipped_to_the_band() {
+        let t = Tokens::oled();
+        let mut disp = Dispatcher::new();
+        disp.state.window_active = true;
+        let mut res = Res::new(Box::new(GdiTextEngine::new().unwrap()));
+        let env = Env {
+            scale: Scale { dpi: 96 },
+            tokens: &t,
+            lang: UiLang::EN,
+            now_ms: 0,
+            caption: Caption::System,
+            caption_spike: false,
+        };
+        // A 20-row band at window y = 30; the fill spans window rows 20..60 but only 30..50 is the band.
+        let (w, h) = (40, 20);
+        let mut buf = vec![0u32; (w * h) as usize];
+        {
+            let canvas = Canvas { buf: &mut buf, w, h, clip: None };
+            let mut cx =
+                PaintCx::new(env, canvas, PointP { x: 0, y: 30 }, RectP::wh(0, 30, w, h), &disp, &mut res, None);
+            cx.fill(RectP::wh(5, 20, 20, 40), 0, Ink::white(255));
+        }
+        let row = |y: i32| (0..w).map(|x| buf[(y * w + x) as usize] != 0).collect::<Vec<_>>();
+        assert!(row(0)[5] && row(19)[24] && !row(0)[4] && !row(0)[25], "the fill lands at band-local x 5..25");
     }
 }

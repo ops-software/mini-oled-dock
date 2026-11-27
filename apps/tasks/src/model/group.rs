@@ -227,6 +227,10 @@ pub fn totals(g: &Group, procs: &ProcTable, rates: &RateBook) -> Totals {
 pub fn group_stats(g: &Grouping, procs: &ProcTable, rates: &RateBook, out: &mut Vec<GroupStat>) {
     out.clear();
     for group in &g.groups {
+        // The System Idle Process is the unused CPU, not a workload: it never competes for a verdict.
+        if matches!(group.key, AppKey::Single(k) if k.pid == 0) {
+            continue;
+        }
         let t = totals(group, procs, rates);
         out.push(GroupStat {
             key: group.key,
@@ -658,5 +662,23 @@ mod tests {
         assert_eq!((stats[0].cpu, stats[0].mem, stats[0].io_bps), (tot.cpu, tot.mem, tot.io_bps));
         assert_eq!((stats[0].key, stats[0].section), (g.groups[0].key, Section::Apps));
         assert!(stats[0].hung && stats[0].has_windows);
+    }
+
+    #[test]
+    fn group_stats_leave_out_the_idle_process() {
+        let (t, book) = rated();
+        let g = Grouping {
+            groups: vec![Group {
+                key: AppKey::Single(key(0)),
+                section: Section::Windows,
+                members: vec![key(0)],
+                windows: 0,
+                hung_windows: 0,
+            }],
+            member_of: Vec::new(),
+        };
+        let mut stats = Vec::new();
+        group_stats(&g, &t, &book, &mut stats);
+        assert!(stats.is_empty());
     }
 }

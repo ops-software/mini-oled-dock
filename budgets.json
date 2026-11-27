@@ -9,7 +9,7 @@
       "unit": "bytes",
       "gate": "ledger",
       "base_bytes": 1400320,
-      "target": "1.6.0",
+      "target": "1.7.0",
       "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test. 1.5.0 step re-keyed (owner decision, L3 T23): the launcher was never in the ledger; the release exe of feat/launcher after plan L3 was 1765888 bytes. Re-keyed again at the close of the 1.5.0 branch (owner's delegated decision, no reserve: part L2 is in): the release exe (cargo build --release --locked, manifest kept) is 1859584 bytes after the size trims of part L2 (AliasTable::build sort, preview alias map by insert), rounded up to the next 16 KiB 1867776 bytes, which is 456.5 KiB over base_bytes and is written as 457 whole KiB (limit 1868288, 8704 bytes of room). Raised by one 16 KiB unit at the verification fixes of 920d775 (owner's delegated decision): the release exe measured 1869312 bytes, 1884160 bytes is 472.5 KiB over base_bytes and is written as 473 whole KiB (limit 1884672, 15360 bytes of room). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of it. Release 1.5.1 step (owner-delegated ledger decision, R151 5.2): the final 1.5.0 key plus 48 KiB, 473 + 48 = 521 whole KiB (limit 1,933,824 bytes), and the later steps shifted by +48 so they keep their own increments; the target is 1.5.1, the version this branch ships as. Re-keyed at the merge of the release's parallel tracks (owner-delegated ledger decision of 2026-11-23; nothing cut for size): D8 (the audio popup's scroll area) and N6 were not in the size plan and D6 took 9 KiB, so the merged release exe measured 1940480 bytes, above the 521 KiB limit; rounded up to the next 16 KiB 1949696 bytes, plus one more 16 KiB step of room for review fixes, 1966080 bytes, which is 552.5 KiB over base_bytes and is written as 553 whole KiB (limit 1,966,592 bytes), and the later steps shifted by +32 so they keep their own increments. Release 1.5.2 step (R152 T5, per R151 5.2): the 1.5.1 key is settled down to the measured 1.5.1 release exe, 1940992 bytes, rounded up to the next 16 KiB 1949696 bytes, 536.5 KiB over base_bytes, written as 537 whole KiB. The 1.5.2 key is the merged release exe, 1953792 bytes, rounded up to the next 16 KiB 1966080 bytes, plus one 16 KiB step of room, 1982464 bytes, 568.5 KiB over base_bytes, written as 569 whole KiB (limit 1,982,976 bytes). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of the settled 1.5.1 key.",
       "ledger_kib_cumulative": {
         "1.4.2": 0,
@@ -123,7 +123,7 @@
     },
     {
       "id": "wakeups.kit_static",
-      "where": "VM",
+      "where": "OWNER",
       "status": "pending",
       "unit": "ctxsw_per_s",
       "gate": "max",
@@ -132,7 +132,7 @@
     },
     {
       "id": "private.kit_empty",
-      "where": "VM",
+      "where": "OWNER",
       "status": "pending",
       "unit": "bytes",
       "gate": "max",
@@ -161,7 +161,7 @@
     },
     {
       "id": "private.files_1100x720",
-      "where": "VM",
+      "where": "OWNER",
       "status": "pending",
       "unit": "bytes",
       "gate": "max",
@@ -171,7 +171,7 @@
     },
     {
       "id": "private.files_3840x2160",
-      "where": "VM",
+      "where": "OWNER",
       "status": "pending",
       "unit": "bytes",
       "gate": "max",
@@ -313,7 +313,7 @@
       "unit": "ms",
       "gate": "max",
       "value": 50,
-      "note": "bench_enum_sort_10k: 10,000 empty files listed and sorted by name, release, median of 5 (ROADMAP 3.6 Phase 1 exit)"
+      "note": "bench_enum_sort_10k: 10,000 empty files listed and sorted by name, release, median of 5 (ROADMAP 3.6 Phase 1 exit). CI measurements (bench job of the 1.7.0 pull request, 2026-11-27, GitHub-hosted windows-latest, temp folder on the runner's system disk): median 95.6 ms in the first run, 11.0 ms in the second; the row stays pending and the bench does not gate it until it is made active"
     },
     {
       "id": "files.first_batch_p99",
@@ -322,7 +322,7 @@
       "unit": "us",
       "gate": "max",
       "value": 10000,
-      "note": "bench_first_batch: time to the first batch of a 10,000-file folder, p99 of 50, release, serial (F 5.5.2: 256 entries or 8 ms)"
+      "note": "bench_first_batch: time to the first batch of a 10,000-file folder, p99 of 50, release, serial (F 5.5.2: 256 entries or 8 ms). CI measurements (bench job of the 1.7.0 pull request, 2026-11-27, GitHub-hosted windows-latest, temp folder on the runner's system disk): p99 265,272 us in the first run, 3,062 us in the second; the row stays pending and the bench does not gate it until it is made active"
     },
     {
       "id": "files.sort_100k",
@@ -439,7 +439,7 @@
       "unit": "ctxsw_per_s",
       "gate": "max",
       "value": 0,
-      "note": "measured by LIVE-F2 step 1"
+      "note": "measured by LIVE-F2 step 1; the row counts the host's own threads. Measured live on build 26300 in a quiet window: 4 context switches in the first 60 s of the process, all from the ntdll loader pool workers that end about 30 s after the start, then 0 in the next 64 s"
     },
     {
       "id": "wakeups.files_shell_idle",
@@ -448,7 +448,125 @@
       "unit": "ctxsw_per_s",
       "gate": "max",
       "value": 0,
-      "note": "measured by LIVE-F2 step 3"
+      "note": "measured by LIVE-F2 step 3; the row counts the host's own threads (0 measured). Threads that Windows shell components start inside the host (ntdll pool workers, a shcore message thread, a CRYPT32 thread) made 13 to 162 context switches in the idle minute; the host ends 120 s after the last request"
+    },
+    {
+      "id": "files.ui_first_frame_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 30,
+      "note": "bench_ui_first_frame: FilesScreen with 256 entries, layout and paint at 1100x720, 144 DPI, median of 20, release, serial"
+    },
+    {
+      "id": "files.frame_1080p_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 8,
+      "note": "bench_frame_1080p: full repaint, 100,000 entries scrolled to the middle, 1920x1080 at 96 DPI, median of 20"
+    },
+    {
+      "id": "files.cells_40x4_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 500,
+      "note": "bench_cells_40x4: 160 TableModel::cell calls, p99 of 200"
+    },
+    {
+      "id": "files.key_move_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 1000,
+      "note": "bench_key_move: Down at 100,000 rows without paint, p99 of 500"
+    },
+    {
+      "id": "files.menu_build_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 1000,
+      "note": "bench_menu_build: our first-level menu for 3 files, p99 of 500 (SPEC-files 5.4.4: 1 ms to build)"
+    },
+    {
+      "id": "files.menu_draw_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 16,
+      "note": "bench_menu_draw: our first-level menu for 3 files opened and drawn (Harness menu_image) at 144 DPI, p99 of 100 (SPEC-files 8.2 F2)"
+    },
+    {
+      "id": "files.instance_forward_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 5,
+      "note": "bench_instance_forward: in-process find, image check and answered WM_COPYDATA against a test-ipc child of its own tag, p99 of 50, release; process creation is start.handoff_files_ms (OWNER)"
+    },
+    {
+      "id": "files.ui_heap_100k_bytes",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 10485760,
+      "note": "ui_heap_100k: live heap of store, model, table state and 50,000 selected keys (counting allocator)"
+    },
+    {
+      "id": "golden.files_bytes",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 16777216,
+      "note": "apps/files/tests/golden/base"
+    },
+    {
+      "id": "wakeups.files_ui_idle",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0,
+      "note": "UI process, window open and idle for 60 s after a done listing; LIVE-FA step 3"
+    },
+    {
+      "id": "private.files_linger",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 5242880,
+      "provisional": true,
+      "note": "lingering with no window after HeapCompact; LIVE-FD step 7"
+    },
+    {
+      "id": "wakeups.files_linger",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0,
+      "note": "lingering, 60 s; LIVE-FD step 7"
+    },
+    {
+      "id": "start.handoff_files_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 15,
+      "note": "second files.exe forwarding to the running instance, logged; LIVE-FA step 6"
     },
     {
       "id": "exe_size.tasks_admin",
@@ -470,7 +588,7 @@
     {
       "id": "frame.table_hover",
       "where": "CI",
-      "status": "pending",
+      "status": "active",
       "unit": "ms",
       "gate": "max",
       "value": 0.5,
@@ -483,12 +601,12 @@
       "unit": "ms",
       "gate": "max",
       "value": 1.5,
-      "note": "40 rows x 4 cells of text"
+      "note": "40 rows x 4 cells of text. Made active with the kit rows before any CI run; its first CI measurements (kit-bench job of the 1.7.0 pull request, 2026-11-27, GitHub-hosted windows-latest) were 3.26, 0.0, 2.77 and 3.46 ms, over the value x 1.5 (2.25 ms) in three runs of four, while a local release run measured 0.71 ms (frame 3.25 ms, empty frame 2.54 ms; the runner's frames took 2 to 5 times as long). Pending again, the value unchanged, until a CI run is under it"
     },
     {
       "id": "frame.scroll_strip",
       "where": "CI",
-      "status": "pending",
+      "status": "active",
       "unit": "ms",
       "gate": "max",
       "value": 2
@@ -496,10 +614,66 @@
     {
       "id": "frame.table_4k_full",
       "where": "CI",
-      "status": "pending",
+      "status": "active",
       "unit": "ms",
       "gate": "max",
       "value": 8
+    },
+    {
+      "id": "frame.raster_4k",
+      "where": "CI",
+      "status": "active",
+      "unit": "ms",
+      "gate": "max",
+      "value": 8,
+      "note": "offscreen bench median of the 4K settings-like raster, x 1.5 under CI"
+    },
+    {
+      "id": "frame.field_key",
+      "where": "CI",
+      "status": "active",
+      "unit": "ms",
+      "gate": "max",
+      "value": 0.3,
+      "note": "field key bench (gallery bench_field, CI kit bench job)"
+    },
+    {
+      "id": "golden.gallery_bytes",
+      "where": "CI",
+      "status": "active",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 16777216,
+      "note": "committed apps/gallery/tests/golden/base set only"
+    },
+    {
+      "id": "exe_size.kit_min",
+      "where": "CI",
+      "status": "active",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 511386,
+      "note": "kit_min release exe, no a11y feature (size job, kit_min_size_within_row); re-keyed to measured + 10 % by K.CI2 if lower",
+      "provisional": true
+    },
+    {
+      "id": "exe_size.kit_min_a11y",
+      "where": "CI",
+      "status": "active",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 690484,
+      "note": "kit_min release exe with the a11y feature (size job, kit_min_size_within_row); re-keyed to measured + 10 % by K.CI2 if lower",
+      "provisional": true
+    },
+    {
+      "id": "theme.switch_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 50,
+      "note": "live theme switch on the owner's PC (OWNER-LIVE)"
     },
     {
       "id": "frame.screen_p95_4k",
@@ -530,7 +704,7 @@
     },
     {
       "id": "start.first_frame_files",
-      "where": "VM",
+      "where": "OWNER",
       "status": "pending",
       "unit": "ms",
       "gate": "max",

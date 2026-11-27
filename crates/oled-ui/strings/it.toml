@@ -46,3 +46,7 @@
 "kit.verb.restart_desc" = "Lo arresta e lo avvia di nuovo."
 "kit.app.tasks" = "Attività"
 "kit.app.files" = "Folio"
+"kit.splitter" = "Ridimensiona i riquadri"
+"kit.path" = "Percorso"
+"kit.subfolders" = "Sottocartelle"
+"kit.refresh" = "Aggiorna"

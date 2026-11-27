@@ -368,3 +368,49 @@ fn widget_signatures<'a>() {
     let _f: fn(&[f32], usize) -> Vec<f32> = resample_peak;
     let _o: Option<PropertySheet> = None;
 }
+
+/// TK2 (F-T4): RowMotion, TableModel::motion, VirtualTable::set_row_height and the three glyphs.
+#[test]
+fn freeze_tk2_items() {
+    struct Moving(Demo);
+    impl ListModel for Moving {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn key(&self, row: usize) -> RowKey {
+            self.0.key(row)
+        }
+        fn row_of(&self, key: RowKey) -> Option<usize> {
+            self.0.row_of(key)
+        }
+        fn label(&self, row: usize) -> Cow<'_, str> {
+            self.0.label(row)
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+    impl TableModel for Moving {
+        fn cell(&self, row: usize, _col: ColId, out: &mut CellOut) {
+            out.set_text(CellKind::Text, &self.0 .0[row].1);
+        }
+        fn motion(&self, row: usize) -> RowMotion {
+            if row == 0 {
+                RowMotion { dy: 6, opacity: 128 }
+            } else {
+                RowMotion::NONE
+            }
+        }
+    }
+    assert_eq!(RowMotion::NONE, RowMotion { dy: 0, opacity: 255 });
+    assert_eq!(RowMotion::default(), RowMotion::NONE);
+    let m = Moving(Demo(vec![(1, "a".into()), (2, "b".into())]));
+    assert_eq!(m.motion(0).dy, 6);
+    assert_eq!(m.motion(1), RowMotion::NONE);
+    let _f: for<'a> fn(&mut VirtualTable<Moving>, &mut EventCx<'a>, Option<i32>) =
+        VirtualTable::<Moving>::set_row_height;
+    let _g = [Glyph::Pause, Glyph::SortUpOutline, Glyph::SortDownOutline];
+    for g in _g {
+        let _shape: fn(f32, f32) -> bool = g.shape();
+    }
+}

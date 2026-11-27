@@ -34,37 +34,34 @@ use std::time::Instant;
 use windows::core::{Interface, BSTR, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, PROPERTYKEY, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::DeleteObject;
-use windows::Win32::Graphics::Gdi::HGDIOBJ;
+use windows::Win32::Graphics::Gdi::{HBITMAP, HGDIOBJ};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WIN32_FIND_DATAW};
+use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 use windows::Win32::System::Com::{
-    CoAllowSetForegroundWindow, CoCreateInstance, CoFreeUnusedLibraries, CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    IBindCtx, IDispatch, IPersistFile, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
+    CoAllowSetForegroundWindow, CoCreateInstance, CoFreeUnusedLibraries, CoInitializeEx, CoUninitialize, IBindCtx,
+    IDispatch, IPersistFile, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER,
     COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4};
-use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     VIRTUAL_KEY, VK_LWIN,
 };
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, FOLDERID_CommonPrograms, FOLDERID_Programs, IEnumShellItems, IShellDispatch4, IShellItem,
-    IShellItem2, IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName, SHDefExtractIconW, SHGetFileInfoW,
-    SHGetImageList, SHGetKnownFolderPath, Shell, ShellExecuteExW, ShellLink, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI,
-    SHELLEXECUTEINFOW, SHFILEINFOW, SHGFI_SYSICONINDEX, SHIL_JUMBO, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
-    SIIGBF_ICONONLY,
+    IShellItem2, IShellItemImageFactory, IShellLinkW, SHCreateItemFromParsingName, SHGetKnownFolderPath, Shell,
+    ShellExecuteExW, ShellLink, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, SIGDN_NORMALDISPLAY,
+    SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::Shell::{
     IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellWindows, SID_STopLevelBrowser, ShellWindows,
     CSIDL_DESKTOP, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, GetWindowThreadProcessId,
-    KillTimer, PeekMessageW, PostMessageW, PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage,
-    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
-    WM_GETICON, WM_QUIT, WM_TIMER,
+    AllowSetForegroundWindow, DispatchMessageW, GetMessageW, GetWindowThreadProcessId, KillTimer, PeekMessageW,
+    PostMessageW, PostThreadMessageW, SetTimer, TranslateMessage, ASFW_ANY, HICON, MSG, PM_NOREMOVE, SW_HIDE,
+    SW_SHOWNORMAL, WM_QUIT, WM_TIMER,
 };
 
 use crate::audio::{self, AudioController};
@@ -76,6 +73,15 @@ use crate::launcher::gesture::{is_marker, is_network_file, Gesture};
 use crate::launcher::web::{check_authority, MAX_URL_BYTES};
 use crate::log;
 use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
+use oled_shellmodel::appsfolder;
+use oled_shellmodel::icon::{self, IconDecode, IconQuery};
+use oled_shellmodel::identity::is_usable_exe;
+use oled_shellmodel::names::{
+    natural_name, override_name, pretty_stem, strip_generic, NameQuery, NameSources, SystemSources,
+};
+use oled_shellmodel::version::take_pwstr;
+// `FileInfo` lives in the shell model; `tray_host` and the tests keep this path.
+pub(crate) use oled_shellmodel::version::FileInfo;
 
 // ------------------------------------------------------------------ public types
 
@@ -158,7 +164,8 @@ pub enum ShellRequest {
     LaunchAdmin(AdminTool),
     /// Start menu "Run as administrator" on an app of the catalog: the desktop shell runs
     /// `shell:AppsFolder\<id>` with the `runas` verb (UAC prompt, the dock's token never used), as
-    /// the native Start menu does. `id` is an AppsFolder id the menu got from `StartApps`.
+    /// the native Start menu does. `id` is an AppsFolder id the menu got from `StartApps`, elevated only when an
+    /// enumeration the dock made itself lists it (`launch_app_admin_with`).
     LaunchAppAdmin { id: String },
     /// Start menu "Open file location": selects the target of the app `id` in a File Explorer
     /// window (de-elevated). Nothing for a Store app, which has no file to show.
@@ -251,7 +258,7 @@ pub enum ShellRequest {
     /// registry row): the same function, so the same updated-exe and folder logic, which exists for
     /// these targets only; nothing typed reaches it. Unlike `Launch`, a failure pushes `LaunchFailed`.
     LauncherLaunch { target: String, args: Option<String> },
-    /// `LaunchAppAdmin` for the launcher: a failure pushes `LaunchFailed`.
+    /// `LaunchAppAdmin` for the launcher: a failed shell call pushes `LaunchFailed` (an id refused before it does not).
     LauncherAppAdmin { id: String },
     /// `RevealApp` for the launcher: a failure pushes `LaunchFailed` (an app with no file to show is
     /// no failure).
@@ -443,32 +450,17 @@ pub(crate) fn push_event(ui: isize, ev: ShellEvent) {
 
 // ------------------------------------------------------------------ constants
 
-/// Period of the thread timer that runs only while an icons child exists: `reap_icon_jobs` (at the start of
-/// every `pump`) is the only place that reaps an ended child and kills one past its deadline, and nothing
-/// posts a message when a normal child ends. With no job there is no timer and no wake (a `WM_SHELL_WAKE`
-/// swallowed by a nested COM loop leaves nothing behind: `pump` drains the channel after every message).
+/// Period of the thread timer that runs only while an icons job or an agent exists: `reap_icon_jobs` (at the start of
+/// every `pump`) is the only place that reaps an ended job and kills one past its deadline, `agent::Link::tick` the
+/// only one that ends an idle agent, and nothing posts a message when a normal job ends. With neither there is no timer
+/// and no wake (a `WM_SHELL_WAKE` swallowed by a nested COM loop leaves nothing behind: `pump` drains the channel after
+/// every message).
 const SAFETY_TIMER_MS: u32 = 1000;
 
-/// True while the thread needs its timer: a Start menu or a launcher icons child is running.
-fn timer_wanted(start_job: bool, launcher_job: bool) -> bool {
-    start_job || launcher_job
+/// True while the thread needs its timer: a Start menu or a launcher icons job is running, or an agent lives.
+fn timer_wanted(start_job: bool, launcher_job: bool, agent_up: bool) -> bool {
+    start_job || launcher_job || agent_up
 }
-/// Side (px) requested from high-resolution icon sources.
-const SRC_ICON_PX: i32 = 256;
-/// `WM_GETICON` timeout towards other apps' windows.
-const GETICON_TIMEOUT_MS: u32 = 50;
-/// `PKEY_FileDescription` ({0CEF7D53-FA64-11D1-A203-0000F81FEDEE}, 3). Defined here to avoid
-/// enabling the `Win32_Storage_EnhancedStorage` feature just for a constant.
-const PKEY_FILE_DESCRIPTION: PROPERTYKEY =
-    PROPERTYKEY { fmtid: GUID::from_u128(0x0cef7d53_fa64_11d1_a203_0000f81fedee), pid: 3 };
-
-/// `PKEY_Software_ProductName` (same format id as FileDescription, 7).
-const PKEY_PRODUCT_NAME: PROPERTYKEY =
-    PROPERTYKEY { fmtid: GUID::from_u128(0x0cef7d53_fa64_11d1_a203_0000f81fedee), pid: 7 };
-/// `PKEY_Company` ({D5CDD502-2E9C-101B-9397-08002B2CF9AE}, 15).
-const PKEY_COMPANY: PROPERTYKEY =
-    PROPERTYKEY { fmtid: GUID::from_u128(0xd5cdd502_2e9c_101b_9397_08002b2cf9ae), pid: 15 };
-
 // ------------------------------------------------------------------ thread
 
 /// State owned by the shell thread.
@@ -490,6 +482,17 @@ struct Shell {
     launcher_job: Option<IconJob>,
     /// An icons child of this process gave no header: every later batch is made here, as before T20.
     icons_child_off: bool,
+    /// The medium agent (AG3): it lists the catalogue and makes the icons when it can, before the children and this
+    /// thread (`agent::next_source`).
+    agent: crate::agent::Link,
+    /// The catalogue the dock last listed itself (its `--start-apps` child, or here), shared with the UI: the only
+    /// apps whose icons the dock's own helpers make (`own_ids`), and which "Open file location" and "Run as
+    /// administrator" take with no new enumeration (`own_app_id`). None while the agent's listing stands, and from a
+    /// `StartRelease` that finds no other holder (no launcher: Start copies its rows out of it).
+    own_apps: Option<Arc<Arena>>,
+    /// The dock's `elevation()`, read once: a dock known not to be elevated has no elevated helper to guard, so
+    /// `own_ids` hands its helpers every id.
+    elevation: Option<bool>,
 }
 
 fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
@@ -518,6 +521,9 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         start_job: None,
         launcher_job: None,
         icons_child_off: false,
+        agent: crate::agent::Link::shell(),
+        own_apps: None,
+        elevation: elevation(),
     };
 
     // The thread timer (null hwnd, system-chosen id, no callback: it arrives as WM_TIMER in the thread queue)
@@ -551,7 +557,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             }
         }
         shell.pump(&rx);
-        let wanted = timer_wanted(shell.start_job.is_some(), shell.launcher_job.is_some());
+        let wanted = timer_wanted(shell.start_job.is_some(), shell.launcher_job.is_some(), shell.agent.timer_wanted());
         if wanted && timer == 0 {
             // SAFETY: thread timer on this thread, see above.
             timer = unsafe { SetTimer(None, 0, SAFETY_TIMER_MS, None) };
@@ -567,9 +573,10 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         // SAFETY: `timer` is the id returned by SetTimer on this thread.
         let _ = unsafe { KillTimer(None, timer) };
     }
-    // No icons child outlives the thread that started it.
+    // No icons child, and no agent, outlives the thread that started it.
     let _ = shell.end_job(IconClient::Start);
     let _ = shell.end_job(IconClient::Launcher);
+    shell.agent.exit();
     // COM objects (audio callbacks, network list manager) must be released before CoUninitialize.
     shell.net = None;
     if let Some(a) = shell.audio.take() {
@@ -643,10 +650,11 @@ impl Shell {
         push_event(self.ui, ShellEvent::AudioSessions(rows));
     }
 
-    /// Reaps the icons jobs that ended or hung (`reap_icon_jobs`), then drains the mpsc queue and works
-    /// through the requests: volume/launch first, then the (slow) resolutions and Start menu icon batches,
-    /// re-checking the queue after each request.
+    /// Lets an idle, gone or hung agent go (`agent::Link::tick`), reaps the icons jobs that ended or hung
+    /// (`reap_icon_jobs`), then drains the mpsc queue and works through the requests: volume/launch first, then the
+    /// (slow) resolutions and Start menu icon batches, re-checking the queue after each request.
     fn pump(&mut self, rx: &Receiver<ShellRequest>) {
+        self.agent.tick();
         self.reap_icon_jobs();
         loop {
             while let Ok(r) = rx.try_recv() {
@@ -671,10 +679,12 @@ impl Shell {
             }
             ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
             ShellRequest::LaunchAppAdmin { id } => {
-                let _ = launch_app_admin(&id, LaunchBy::Shared);
+                if let Err(Fail::Refused(why)) = launch_app_admin(&id, self.own_apps.as_deref(), LaunchBy::Shared) {
+                    log!("shell: LaunchAppAdmin ({} chars) not executed: {why}: REFUSED", id.chars().count());
+                }
             }
             ShellRequest::RevealApp { id } => {
-                let _ = reveal_app(&id);
+                let _ = reveal_app(&id, self.own_apps.as_deref());
             }
             // launcher arms: begin
             req @ (ShellRequest::OpenPath { .. }
@@ -684,10 +694,10 @@ impl Shell {
             | ShellRequest::OpenUrl { .. }
             | ShellRequest::LauncherLaunch { .. }
             | ShellRequest::LauncherAppAdmin { .. }
-            | ShellRequest::LauncherRevealApp { .. }) => launcher_launch(self.ui, req),
+            | ShellRequest::LauncherRevealApp { .. }) => launcher_launch(self.ui, req, self.own_apps.as_deref()),
             ShellRequest::StartIconsFor { icon_px, ids } => {
                 let px = icon_px.clamp(*ICON_PX_RANGE.start(), *ICON_PX_RANGE.end());
-                if let Err(back) = self.start_icon_job(IconClient::Launcher, px, ids) {
+                if let Err(back) = self.start_icon_job(IconClient::Launcher, px, ids, true) {
                     launcher_icons(self.ui, px, back);
                 }
             }
@@ -773,6 +783,12 @@ impl Shell {
             ShellRequest::StartSettingsReady => push_event(self.ui, ShellEvent::StartSettings),
             ShellRequest::StartRelease => {
                 let _ = self.end_job(IconClient::Start);
+                // The dock's own listing goes with Start's data unless the UI holds it too: the launcher keeps its
+                // catalogue up to 10 minutes after Start closed and asks for its rows' icons, and dropping a listing
+                // it holds would free nothing.
+                if self.own_apps.as_ref().is_some_and(|a| Arc::strong_count(a) == 1) {
+                    self.own_apps = None;
+                }
                 start_release(&mut self.start_px, &mut self.start_sent, &mut self.pending);
                 crate::start_search::release_app_index();
                 // The icon pipeline and the AppsFolder catalog are done: this STA's COM servers with no object left are
@@ -809,7 +825,10 @@ impl Shell {
     /// `ListStartApps`: lists the catalogue (`list_apps_arena`), publishes it, then has the icons the Start menu does
     /// not have yet made (`start_menu_icons`). One listing serves Start and the launcher.
     fn list_start_apps(&mut self, icon_px: u32, icons: &IconPlan, child: bool) {
-        let apps = Arc::new(list_apps_arena(child));
+        let (apps, source) = list_apps_arena(child, &mut self.agent);
+        let apps = Arc::new(apps);
+        // The agent's listing is its word, not a listing of the dock's own (`own_ids`).
+        self.own_apps = (source != crate::agent::Source::Agent).then(|| Arc::clone(&apps));
         let v = apps.view();
         let ids = (0..v.len()).map(|i| v.id(i));
         let missing =
@@ -841,7 +860,7 @@ impl Shell {
             }
         }
         push_event(self.ui, ShellEvent::AppName { key: r.key.clone(), name });
-        let bitmap = resolve_icon(&r);
+        let bitmap = resolve_icon(&r, Some(&mut self.agent));
         if bitmap.is_none() {
             log!("shell: no icon for a pin ({} chars)", r.key.chars().count());
         }
@@ -851,14 +870,19 @@ impl Shell {
     /// Config override, then in-memory cache, then resolution (AppsFolder, FileDescription, stem).
     /// The flag is true when the name comes from a `names` override.
     fn resolve_name(&mut self, r: &ResolveApp) -> (String, bool) {
-        if let Some(o) = override_name(&crate::config::get().names, r) {
+        if let Some(o) = override_name(&crate::config::get().names, &name_query(r)) {
             return (o, true);
         }
         if let Some(n) = self.names.get(&r.key) {
             return (n.clone(), false);
         }
-        let (n, step) = natural_name(r);
-        log!("shell: name for a pin ({} chars) = {} chars ({step})", r.key.chars().count(), n.chars().count());
+        let (n, step) = natural_name(&name_query(r), &DockSources::new(Some(&mut self.agent)));
+        log!(
+            "shell: name for a pin ({} chars) = {} chars ({})",
+            r.key.chars().count(),
+            n.chars().count(),
+            step.as_str()
+        );
         self.names.insert(r.key.clone(), n.clone());
         (n, false)
     }
@@ -866,99 +890,39 @@ impl Shell {
 
 // ------------------------------------------------------------------ program name
 
-fn exe_file_name(exe_path: &str) -> Option<String> {
-    Path::new(exe_path).file_name().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty())
+/// The sources of the dock's names: the catalogue, its Start Menu index, the version strings (the agent's for a program
+/// a user can write) and `%SystemRoot%`. The agent link is borrowed for the one call.
+struct DockSources<'a> {
+    agent: RefCell<Option<&'a mut crate::agent::Link>>,
 }
 
-/// true if `exe_path` points to an executable usable for name/icon (not empty and not the
-/// UWP window container, which would give the wrong identity).
-fn is_usable_exe(exe_path: &str) -> bool {
-    match exe_file_name(exe_path) {
-        Some(n) => !n.eq_ignore_ascii_case("applicationframehost.exe"),
-        None => false,
-    }
-}
-
-/// Override from `config.names`: key = AUMID, exe file name (lowercase) or group key,
-/// case-insensitive comparison.
-fn override_name(names: &std::collections::BTreeMap<String, String>, r: &ResolveApp) -> Option<String> {
-    if names.is_empty() {
-        return None;
-    }
-    let find = |k: &str| -> Option<String> {
-        if k.is_empty() {
-            return None;
-        }
-        names
-            .iter()
-            .find(|(nk, v)| nk.eq_ignore_ascii_case(k) && !v.trim().is_empty())
-            .map(|(_, v)| v.trim().to_string())
-    };
-    r.aumid
-        .as_deref()
-        .and_then(find)
-        .or_else(|| exe_file_name(&r.exe_path).and_then(|n| find(&n)))
-        .or_else(|| find(&r.key))
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
+impl<'a> DockSources<'a> {
+    fn new(agent: Option<&'a mut crate::agent::Link>) -> Self {
+        DockSources { agent: RefCell::new(agent) }
     }
 }
 
-/// "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App" -> "WindowsTerminal".
-fn name_from_aumid(aumid: &str) -> String {
-    let base = aumid.split(['!', '_']).next().unwrap_or(aumid);
-    capitalize(base.rsplit('.').next().unwrap_or(base))
+impl NameSources for DockSources<'_> {
+    fn appsfolder_name(&self, aumid: &str) -> Option<String> {
+        appsfolder::display_name(aumid)
+    }
+
+    fn start_menu_name(&self, exe_path: &str) -> Option<String> {
+        start_menu_name(exe_path, self.agent.borrow_mut().as_deref_mut())
+    }
+
+    fn file_info(&self, exe_path: &str) -> FileInfo {
+        exe_file_info(exe_path, self.agent.borrow_mut().as_deref_mut())
+    }
+
+    fn in_windows_dir(&self, exe_path: &str) -> bool {
+        SystemSources.in_windows_dir(exe_path)
+    }
 }
 
-/// Program name without override, in this order: (b) AppsFolder catalog (packaged / explicit AUMID),
-/// (c) Start Menu shortcut name for the exe, (d) smart choice between FileDescription and ProductName,
-/// (e) prettified exe stem, then (last resort) AUMID piece or key. Also says which step produced it.
-fn natural_name(r: &ResolveApp) -> (String, &'static str) {
-    let aumid = r.aumid.as_deref().map(str::trim).filter(|a| !a.is_empty());
-    if let Some(a) = aumid {
-        if let Some(n) = appsfolder_name(a) {
-            return (n, "aumid");
-        }
-    }
-    if is_usable_exe(&r.exe_path) {
-        if let Some(n) = start_menu_name(&r.exe_path) {
-            return (n, "shortcut");
-        }
-        let stem = Path::new(&r.exe_path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let info = FileInfo::read(&r.exe_path);
-        // Windows' own programs have localized descriptions ("Esplora risorse") that share no word with the stem.
-        if in_windows_dir(&r.exe_path) {
-            if let Some(d) = info.description.as_deref().map(strip_generic).filter(|d| !d.is_empty()) {
-                return (d, "description");
-            }
-        }
-        if let Some(n) =
-            pick_description(info.description.as_deref(), info.product.as_deref(), info.company.as_deref(), &stem)
-        {
-            return (n, "description");
-        }
-        let pretty = pretty_stem(&stem);
-        if !pretty.is_empty() {
-            return (pretty, "stem");
-        }
-    }
-    if let Some(a) = aumid {
-        let n = name_from_aumid(a);
-        if !n.is_empty() {
-            return (n, "aumid-id");
-        }
-    }
-    if let Some(stem) = Path::new(&r.exe_path).file_stem().map(|s| s.to_string_lossy().into_owned()) {
-        if !stem.is_empty() {
-            return (capitalize(&stem), "stem");
-        }
-    }
-    (r.key.clone(), "key")
+/// The query a pin or a window asks the names with.
+fn name_query(r: &ResolveApp) -> NameQuery<'_> {
+    NameQuery { key: &r.key, exe_path: &r.exe_path, aumid: r.aumid.as_deref() }
 }
 
 /// Name of a mixer row without a usable session display name: the exe FileDescription (generic
@@ -977,125 +941,7 @@ fn session_app_name(pid: u32) -> String {
     }
 }
 
-/// True for executables under `%SystemRoot%`.
-fn in_windows_dir(exe_path: &str) -> bool {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    norm_path(exe_path).starts_with(&format!("{}\\", norm_path(&root).trim_end_matches('\\')))
-}
-
 // ------------------------------------------------------------------ name heuristics (pure)
-
-/// Words of `s`, case preserved: splits on non-alphanumerics and camelCase boundaries
-/// (`RazerAppEngine` -> Razer App Engine, `HTTPServer` -> HTTP Server).
-fn split_words(s: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur: Vec<char> = Vec::new();
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        if !c.is_alphanumeric() {
-            if !cur.is_empty() {
-                out.push(cur.drain(..).collect());
-            }
-            continue;
-        }
-        if let Some(&prev) = cur.last() {
-            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
-            let boundary =
-                (prev.is_lowercase() && c.is_uppercase()) || (prev.is_uppercase() && c.is_uppercase() && next_lower);
-            if boundary {
-                out.push(cur.drain(..).collect());
-            }
-        }
-        cur.push(c);
-    }
-    if !cur.is_empty() {
-        out.push(cur.into_iter().collect());
-    }
-    out
-}
-
-fn tokens(s: &str) -> Vec<String> {
-    split_words(s).into_iter().map(|w| w.to_lowercase()).collect()
-}
-
-/// Corporate suffixes ignored when matching the company name.
-const COMPANY_NOISE: [&str; 10] =
-    ["inc", "corporation", "corp", "ltd", "llc", "co", "gmbh", "software", "the", "limited"];
-
-/// True if some token of `cand` equals (or, for tokens of 4+ chars, is a prefix of / prefixed by) a token of `refs`.
-fn shares_token(cand: &[String], refs: &[String]) -> bool {
-    cand.iter().any(|c| {
-        refs.iter().any(|r| {
-            c == r || (c.len() >= 4 && r.len() >= 4 && (r.starts_with(c.as_str()) || c.starts_with(r.as_str())))
-        })
-    })
-}
-
-/// Generic trailing words removed from a name (only while something remains).
-const GENERIC_TAIL: [&str; 10] =
-    ["client", "bootstrapper", "webhelper", "helper", "host", "launcher", "application", "app", "service", "desktop"];
-
-fn strip_generic(name: &str) -> String {
-    let mut words: Vec<&str> = name.split_whitespace().collect();
-    while words.len() > 1 && words.last().is_some_and(|w| GENERIC_TAIL.contains(&w.to_lowercase().as_str())) {
-        words.pop();
-    }
-    words.join(" ")
-}
-
-/// `PowerToys.QuickAccess`-style identifier: contains a dot between alphanumerics and no spaces.
-fn is_dotted_identifier(s: &str) -> bool {
-    !s.contains(char::is_whitespace) && s.contains('.')
-}
-
-/// True if `a` is a whole-word prefix of `b` (case-insensitive): "Steam" of "Steam Client".
-fn word_prefix(a: &str, b: &str) -> bool {
-    let (ta, tb) = (tokens(a), tokens(b));
-    !ta.is_empty() && ta.len() < tb.len() && tb[..ta.len()] == ta[..]
-}
-
-/// Smart choice between FileDescription and ProductName: a candidate sharing no word with the other
-/// sources (exe stem, the other candidate, company) is rejected (taglines like "Freedom to Stream"),
-/// as are dotted identifiers. Generic tails are stripped; the shorter of two nested names wins.
-fn pick_description(desc: Option<&str>, product: Option<&str>, company: Option<&str>, stem: &str) -> Option<String> {
-    let company_tokens: Vec<String> =
-        company.map(tokens).unwrap_or_default().into_iter().filter(|t| !COMPANY_NOISE.contains(&t.as_str())).collect();
-    let valid = |c: Option<&str>, other: Option<&str>, with_company: bool| -> Option<String> {
-        let c = c.map(str::trim).filter(|c| !c.is_empty() && !is_dotted_identifier(c))?;
-        let mut refs = tokens(stem);
-        refs.extend(other.map(tokens).unwrap_or_default());
-        if with_company {
-            refs.extend(company_tokens.iter().cloned());
-        }
-        if !shares_token(&tokens(c), &refs) {
-            return None;
-        }
-        let s = strip_generic(c);
-        Some(s).filter(|s| !s.is_empty())
-    };
-    let d = valid(desc, product, true);
-    let p = valid(product, desc, false);
-    match (d, p) {
-        (Some(d), Some(p)) => Some(if word_prefix(&p, &d) { p } else { d }),
-        (Some(d), None) => Some(d),
-        (None, p) => p,
-    }
-}
-
-/// Words dropped when prettifying an exe stem.
-const STEM_NOISE: [&str; 9] = ["shell", "ng", "x64", "x86", "win64", "win32", "helper", "app", "exe"];
-
-/// `stremio-shell-ng` -> "Stremio"; `RazerAppEngine` -> "Razer App Engine"; `zen` -> "Zen".
-fn pretty_stem(stem: &str) -> String {
-    let words = split_words(stem);
-    let kept: Vec<&String> = words.iter().filter(|w| !STEM_NOISE.contains(&w.to_lowercase().as_str())).collect();
-    let chosen: Vec<&String> = if kept.is_empty() { words.iter().collect() } else { kept };
-    chosen
-        .iter()
-        .map(|w| if w.chars().any(char::is_uppercase) { (*w).clone() } else { capitalize(w) })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 // ------------------------------------------------------------------ Start Menu shortcut index
 
@@ -1104,22 +950,29 @@ const INDEX_MAX_AGE: Duration = Duration::from_secs(600);
 /// Maximum folder depth scanned under each Start Menu root.
 const INDEX_MAX_DEPTH: u32 = 6;
 /// Most `.lnk` files indexed under each Start Menu root.
-const INDEX_MAX_FILES: usize = 4096;
+pub(crate) const INDEX_MAX_FILES: usize = 4096;
 
 /// A `.lnk` of the Start Menu index. `per_user`: under the user's own Programs folder, which any
-/// program of the user can write, so its bytes are parsed in Rust (`jumplist::read_lnk`) and never
-/// reach the shell link loader; the all-users folder is writable by administrators only.
+/// program of the user can write, so its bytes never reach the elevated dock's shell link loader: the
+/// agent's shell reads it at medium (`agent::Link::start_links`), else the Rust parser does
+/// (`jumplist::read_lnk`); the all-users folder is writable by administrators only.
 ///
-/// RESIDUAL (accepted for 1.5.1): `enum_apps_folder` (and the `--start-apps` child, `APPS_FLAG`, as
-/// elevated as the dock), `appsfolder_name`, `app_target_path` and the AppsFolder icon factories
-/// (`start_icon`, `icon_from_appsfolder`, and `icons::appsfolder_icon` for the notification icons)
-/// still have the shell resolve per-user shortcuts in an elevated process; `FileInfo::read` (version
-/// strings) and the exe icon extractors (`icon_from_jumbo_list`, `icon_from_def_extract`) still have
-/// the shell read user-writable exes; a subfolder of the all-users Start menu that an installer left
+/// MOVED (1.7.0, `agent.rs`): the Start catalogue (`enum_apps_folder` through `apps_child_bytes`) and Start's
+/// icons (`start_icon` through `write_start_icons`) are made by the medium agent whenever it serves, the
+/// per-user shortcuts' targets and names come from its shell, and so do the version strings and the icon of a
+/// bar entry's program that a user can write (`exe_file_info`, `exe_icon`: not `admin_only_exe`).
+/// RESIDUAL: the same helpers, here and in the `--start-apps` / `--start-icons` children (`APPS_FLAG`, as
+/// elevated as the dock), when the agent cannot serve (counted in the log: `agent::served_line`);
+/// `appsfolder::display_name`, `app_target_path`, `icon_from_appsfolder` and `icons::appsfolder_icon` (the
+/// notification icons) still have the shell resolve per-user shortcuts in an elevated process;
+/// `FileInfo::read` (version strings) and the exe icon extractors (`icon_from_jumbo_list`,
+/// `icon_from_def_extract`) still have the shell read a user-writable exe when the agent does not answer
+/// within `EXE_INFO_DEADLINE`, and always for the mixer's names (`session_app_name`) and the tray's
+/// (`tray_host`); a subfolder of the all-users Start menu or of Program Files that an installer left
 /// writable is treated as admin-writable.
-struct StartLnk {
-    path: std::path::PathBuf,
-    per_user: bool,
+pub(crate) struct StartLnk {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) per_user: bool,
 }
 
 /// Per-user shortcuts refused by a COM wrapper (`com_guard`) of the index or the Start import; the
@@ -1139,15 +992,18 @@ pub(crate) fn com_guard(per_user: bool) -> bool {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct IndexStats {
     /// Per-user links whose target the Rust parser read, and those it could not read, by kind (in the
-    /// order of `LnkMiss::ALL`).
+    /// order of `LnkMiss::ALL`; a target the agent gave that is no local file counts as refused).
     rust_parsed: usize,
     rust_unresolved: [usize; LnkMiss::ALL.len()],
     /// All-users links given to the shell link loader.
     com_common: usize,
+    /// Per-user links whose target and name the agent gave (the shell, at medium).
+    agent: usize,
 }
 
 /// The Start Menu index log line: counts only, never a name or a path. "unresolved: 8 (arguments: 5,
-/// shell item: 3)", the kinds in the order of `LnkMiss::ALL`, the empty ones left out.
+/// shell item: 3)", the kinds in the order of `LnkMiss::ALL`, the empty ones left out; "per-user via agent: n"
+/// counts the per-user links the agent resolved.
 fn index_line(scanned: usize, exe_targets: usize, stats: &IndexStats, via_com: usize) -> String {
     let total: usize = stats.rust_unresolved.iter().sum();
     let kinds: Vec<String> = LnkMiss::ALL
@@ -1158,8 +1014,8 @@ fn index_line(scanned: usize, exe_targets: usize, stats: &IndexStats, via_com: u
         .collect();
     let unresolved = if kinds.is_empty() { total.to_string() } else { format!("{total} ({})", kinds.join(", ")) };
     format!(
-        "{scanned} shortcuts scanned, {exe_targets} exe targets, per-user parsed in Rust: {}, unresolved: {unresolved}, per-user via COM: {via_com}",
-        stats.rust_parsed
+        "{scanned} shortcuts scanned, {exe_targets} exe targets, per-user parsed in Rust: {}, per-user via agent: {}, unresolved: {unresolved}, per-user via COM: {via_com}",
+        stats.rust_parsed, stats.agent
     )
 }
 
@@ -1179,8 +1035,8 @@ fn norm_path(p: &str) -> String {
 }
 
 /// Name of the Start Menu shortcut whose target is `exe_path`, if any. Builds the index lazily, once,
-/// and rebuilds it on a miss when it is older than ten minutes.
-fn start_menu_name(exe_path: &str) -> Option<String> {
+/// and rebuilds it on a miss when it is older than ten minutes (with the agent's per-user links when it serves).
+fn start_menu_name(exe_path: &str, agent: Option<&mut crate::agent::Link>) -> Option<String> {
     let key = norm_path(exe_path);
     let stale = START_INDEX.with(|i| i.borrow().built.is_none_or(|t| t.elapsed() >= INDEX_MAX_AGE));
     let hit = |key: &str| START_INDEX.with(|i| i.borrow().map.get(key).cloned());
@@ -1190,7 +1046,7 @@ fn start_menu_name(exe_path: &str) -> Option<String> {
     if let Some(n) = hit(&key) {
         return Some(n);
     }
-    let map = build_start_index();
+    let map = build_start_index(agent);
     START_INDEX.with(|i| *i.borrow_mut() = StartIndex { map, built: Some(Instant::now()) });
     hit(&key)
 }
@@ -1209,14 +1065,15 @@ fn strip_paren_suffix(name: &str) -> String {
     t.to_string()
 }
 
-fn known_folder(id: &GUID) -> Option<std::path::PathBuf> {
-    // SAFETY: COM initialized; the returned PWSTR is freed by `take_pwstr`.
+pub(crate) fn known_folder(id: &GUID) -> Option<std::path::PathBuf> {
+    // SAFETY: COM initialized; `SHGetKnownFolderPath` returns a CoTaskMemAlloc'd string, which `take_pwstr` frees.
     let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.ok()?;
-    take_pwstr(p).map(std::path::PathBuf::from)
+    // SAFETY: `p` is that string and is not used after this call.
+    unsafe { take_pwstr(p) }.map(std::path::PathBuf::from)
 }
 
 /// The `.lnk` files under `dir`, at most `INDEX_MAX_DEPTH` folders deep and `*left` files in all.
-fn collect_lnk(dir: &Path, depth: u32, per_user: bool, left: &mut usize, out: &mut Vec<StartLnk>) {
+pub(crate) fn collect_lnk(dir: &Path, depth: u32, per_user: bool, left: &mut usize, out: &mut Vec<StartLnk>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         if *left == 0 {
@@ -1236,7 +1093,7 @@ fn collect_lnk(dir: &Path, depth: u32, per_user: bool, left: &mut usize, out: &m
 }
 
 /// Resolves the target of a .lnk without UI and without searching (`IPersistFile::Load` + `GetPath`).
-fn lnk_target(link: &IShellLinkW, file: &IPersistFile, lnk: &Path) -> Option<String> {
+pub(crate) fn lnk_target(link: &IShellLinkW, file: &IPersistFile, lnk: &Path) -> Option<String> {
     let wide = HSTRING::from(lnk.as_os_str());
     // SAFETY: COM STA initialized; `wide` is NUL-terminated and lives for the call.
     unsafe { file.Load(PCWSTR(wide.as_ptr()), STGM_READ) }.ok()?;
@@ -1256,36 +1113,48 @@ fn lnk_target(link: &IShellLinkW, file: &IPersistFile, lnk: &Path) -> Option<Str
 }
 
 /// Display name of a `.lnk` as the shell shows it: localized, without the extension.
-fn lnk_display_name(lnk: &Path) -> Option<String> {
+pub(crate) fn lnk_display_name(lnk: &Path) -> Option<String> {
     let wide = HSTRING::from(lnk.as_os_str());
     // SAFETY: COM STA initialized on this thread; `wide` lives for the call.
     let item: IShellItem = unsafe { SHCreateItemFromParsingName(&wide, None::<&IBindCtx>) }.ok()?;
-    // SAFETY: `item` is valid; the returned PWSTR is freed by `take_pwstr`.
-    let name = take_pwstr(unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.ok()?)?;
+    // SAFETY: `item` is valid; `GetDisplayName` returns a CoTaskMemAlloc'd string, which `take_pwstr` frees.
+    let name = unsafe { take_pwstr(item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?) }?;
     let name = name.trim();
     let name = if name.len() > 4 && name.to_lowercase().ends_with(".lnk") { &name[..name.len() - 4] } else { name };
     Some(name.to_string()).filter(|n| !n.is_empty())
 }
 
+/// How long the index waits for the agent's per-user links (`StartLinks`); past it the Rust parser reads them.
+const START_LINKS_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Scans the common and per-user Start Menu `.lnk` files; keeps only `exe path -> name` pairs.
-/// The all-users links go to the shell (target and localized name), the per-user ones to the Rust
-/// parser (target; the name is the one their folder's `desktop.ini` gives them, else the file's),
-/// see `StartLnk`.
-fn build_start_index() -> HashMap<String, String> {
-    let (map, line) = start_index();
+/// The all-users links go to the shell (target and localized name); the per-user ones to the agent when
+/// it serves (`agent::Link::start_links`: the shell at medium gives their target and their localized
+/// name), else, and for each one it did not resolve, to the Rust parser (target; the name is the one
+/// their folder's `desktop.ini` gives them, else the file's), see `StartLnk`.
+fn build_start_index(agent: Option<&mut crate::agent::Link>) -> HashMap<String, String> {
+    let links = agent.filter(|a| a.usable()).and_then(|a| a.start_links(START_LINKS_DEADLINE, INDEX_MAX_FILES));
+    let (map, line) = start_index(links);
     log!("shell: Start Menu index: {line}");
+    log!("shell: {}", crate::agent::served_line());
     map
 }
 
-/// `build_start_index` without the log: the map and the counts of its log line.
-fn start_index() -> (HashMap<String, String>, String) {
+/// `build_start_index` without the log: the map and the counts of its log line, with the agent's per-user
+/// links when it gave them.
+fn start_index(agent_links: Option<Vec<crate::agent_proto::LinkRec>>) -> (HashMap<String, String>, String) {
     let mut files = Vec::new();
+    let mut user_root = None;
     for (id, per_user) in [(FOLDERID_CommonPrograms, false), (FOLDERID_Programs, true)] {
         if let Some(dir) = known_folder(&id) {
             let mut left = INDEX_MAX_FILES;
             collect_lnk(&dir, 0, per_user, &mut left, &mut files);
+            if per_user {
+                user_root = Some(dir);
+            }
         }
     }
+    let agent = agent_links.zip(user_root).map(|(links, root)| AgentLinks::new(root, links));
     // SAFETY: COM STA initialized on this thread; ShellLink CLSID with the requested interface.
     let Ok(link) = (unsafe { CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) }) else {
         return (HashMap::new(), "the shell link object is not available".into());
@@ -1327,7 +1196,8 @@ fn start_index() -> (HashMap<String, String>, String) {
             lnk_display_name(&l.path)
         }
     };
-    let (mut map, stats) = index_links(&files, &mut rust_target, &mut rust_display, &mut com_target, &mut com_display);
+    let (mut map, stats) =
+        index_links(&files, agent.as_ref(), &mut rust_target, &mut rust_display, &mut com_target, &mut com_display);
     map.shrink_to_fit();
     let line = index_line(files.len(), map.len(), &stats, PER_USER_VIA_COM.load(Relaxed));
     (map, line)
@@ -1377,11 +1247,32 @@ fn system_string(module: &str, id: u16) -> Option<String> {
     (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_string())
 }
 
+/// The per-user links the agent resolved (`agent::Link::start_links`), by their path under the user's
+/// Programs folder (`root`), lowercase: each one's target and the shell's display name ("" when none).
+struct AgentLinks {
+    root: std::path::PathBuf,
+    map: HashMap<String, (String, String)>,
+}
+
+impl AgentLinks {
+    fn new(root: std::path::PathBuf, links: Vec<crate::agent_proto::LinkRec>) -> AgentLinks {
+        AgentLinks { root, map: links.into_iter().map(|l| (l.rel.to_lowercase(), (l.target, l.name))).collect() }
+    }
+
+    /// The agent's answer for the per-user link `lnk`.
+    fn get(&self, lnk: &Path) -> Option<&(String, String)> {
+        self.map.get(&lnk.strip_prefix(&self.root).ok()?.to_string_lossy().to_lowercase())
+    }
+}
+
 /// The loop of `build_start_index` (pure): `exe path -> name` pairs of `files`, ambiguous targets
-/// dropped. A per-user link is read by `rust_target` and `rust_display` only (its `desktop.ini`
-/// name, else the file's); an all-users one by `com_target` and `com_display`.
+/// dropped. A per-user link the agent resolved takes its target (a local file only, as the Rust parser's)
+/// and its shell display name, else the file's; any other per-user link is read by `rust_target` and
+/// `rust_display` only (its `desktop.ini` name, else the file's); an all-users one by `com_target` and
+/// `com_display`.
 fn index_links(
     files: &[StartLnk],
+    agent: Option<&AgentLinks>,
     rust_target: &mut dyn FnMut(&StartLnk) -> Result<String, LnkMiss>,
     rust_display: &mut dyn FnMut(&StartLnk) -> Option<String>,
     com_target: &mut dyn FnMut(&StartLnk) -> Option<String>,
@@ -1390,8 +1281,21 @@ fn index_links(
     let mut stats = IndexStats::default();
     let mut map: HashMap<String, String> = HashMap::new();
     let mut ambiguous: Vec<String> = Vec::new();
+    let refused = LnkMiss::ALL.iter().position(|&k| k == LnkMiss::Refused);
     for lnk in files {
-        let target = if lnk.per_user {
+        let answered = if lnk.per_user { agent.and_then(|a| a.get(&lnk.path)) } else { None };
+        let target = if let Some((target, _)) = answered {
+            let target = expand_env(target);
+            if crate::jumplist::is_local_file_path(&target) {
+                stats.agent += 1;
+                Some(target)
+            } else {
+                if let Some(i) = refused {
+                    stats.rust_unresolved[i] += 1;
+                }
+                None
+            }
+        } else if lnk.per_user {
             match rust_target(lnk) {
                 Ok(t) => {
                     stats.rust_parsed += 1;
@@ -1421,7 +1325,11 @@ fn index_links(
         // The name the shell shows (Windows' own shortcuts are localized through `desktop.ini`:
         // "Remote Desktop Connection.lnk" is "Connessione Desktop remoto" in Italian, as in the
         // Start menu), else the file name.
-        let shown = if lnk.per_user { rust_display(lnk) } else { com_display(lnk) };
+        let shown = match answered {
+            Some((_, name)) => Some(name.clone()).filter(|n| !n.is_empty()),
+            None if lnk.per_user => rust_display(lnk),
+            None => com_display(lnk),
+        };
         let name = strip_paren_suffix(&shown.unwrap_or(stem));
         if name.is_empty() {
             continue;
@@ -1488,9 +1396,12 @@ pub fn list_apps() -> i32 {
             icon_px: 24,
             custom_icon: None,
         };
-        let (name, step) = match override_name(&names, &r) {
+        let (name, step) = match override_name(&names, &name_query(&r)) {
             Some(o) => (o, "config"),
-            None => natural_name(&r),
+            None => {
+                let (n, step) = natural_name(&name_query(&r), &DockSources::new(None));
+                (n, step.as_str())
+            }
         };
         say(&format!("- window : {}", w.title));
         say(&format!("  name   : {name}   [{step}]"));
@@ -1504,33 +1415,6 @@ pub fn list_apps() -> i32 {
         unsafe { CoUninitialize() };
     }
     0
-}
-
-/// Frees a `PWSTR` allocated by COM (`CoTaskMemAlloc`) and extracts its string.
-fn take_pwstr(p: PWSTR) -> Option<String> {
-    if p.is_null() {
-        return None;
-    }
-    // SAFETY: `p` is a NUL-terminated wide string returned by a shell API; it is read
-    // once and then freed with CoTaskMemFree, as required by the GetDisplayName/GetString contract.
-    let s = unsafe { p.to_string() }.ok();
-    // SAFETY: same pointer, allocated by COM, not used after this line.
-    unsafe { CoTaskMemFree(Some(p.0 as *const c_void)) };
-    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-/// Name from the `shell:AppsFolder\<AUMID>` catalog (`SIGDN_NORMALDISPLAY`).
-fn appsfolder_name(aumid: &str) -> Option<String> {
-    let path = HSTRING::from(format!("shell:AppsFolder\\{aumid}"));
-    // SAFETY: COM STA initialized on the thread; `path` lives for the call.
-    let item: IShellItem = unsafe { SHCreateItemFromParsingName(&path, None::<&IBindCtx>) }.ok()?;
-    // SAFETY: `item` is valid; the returned PWSTR is freed by `take_pwstr`.
-    let name = take_pwstr(unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.ok()?)?;
-    // If the catalog does not know the AUMID some paths return the AUMID itself: discarded.
-    if name.eq_ignore_ascii_case(aumid) || name.contains('!') {
-        return None;
-    }
-    Some(name)
 }
 
 /// Start menu icons per `StartIcons` batch (keeps every other request responsive while ~300 load).
@@ -1547,6 +1431,49 @@ fn keep_start_app(id: &str, name: &str) -> bool {
         && !n.contains("disinstall")
         && !i.starts_with("http:")
         && !i.starts_with("https:")
+}
+
+/// The longest AppsFolder id the dock takes from its agent, in bytes: an icons request's own cap for one id.
+const APP_ID_MAX_BYTES: usize = ICON_ID_MAX_BYTES;
+
+/// Whether `id` has a form an AppsFolder id has (what `enum_apps_folder` lists): a name with no `\`, `/` or `:` (an
+/// AUMID: `Family_publisher!App`, or a program's own, such as `Vendor.App` or `308046B0AF4A39CB`); a path under a known
+/// folder (`{GUID}\dir\app.exe`) or on a drive (`C:\dir\app.exe`) made of plain names; or the link of an Internet
+/// shortcut (`steam://...`), of no `file`, `http`, `https` or `shell` scheme. Never a control character, `..`, a UNC
+/// or device path, a colon outside a drive or a scheme, blanks around it or more than `APP_ID_MAX_BYTES` bytes. Every
+/// id of the agent's listing passes it before any use (`agent_listing`).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn is_app_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > APP_ID_MAX_BYTES || id.trim() != id || id.contains("..") {
+        return false;
+    }
+    if id.chars().any(char::is_control) {
+        return false;
+    }
+    // One plain name: no separator, colon or character a file name cannot hold, and not the folder itself.
+    let name = |s: &str| !s.is_empty() && s != "." && !s.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']);
+    if let Some((root, rest)) = id.split_once('\\') {
+        let drive = root.len() == 2 && root.ends_with(':') && root.starts_with(|c: char| c.is_ascii_alphabetic());
+        return (drive || is_braced_guid(root)) && rest.split('\\').all(name);
+    }
+    if let Some((scheme, rest)) = id.split_once("://") {
+        let mut chars = scheme.chars();
+        let scheme_ok = scheme.len() > 1
+            && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+            && !["file", "http", "https", "shell"].iter().any(|s| scheme.eq_ignore_ascii_case(s));
+        // A link's rest: no blank, backslash, quote or character a URL never holds unescaped.
+        let odd = |c: char| c.is_whitespace() || "\\\"<>|^`{}".contains(c);
+        return scheme_ok && !rest.is_empty() && !rest.contains(odd);
+    }
+    name(id)
+}
+
+/// `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`, of hex digits in any case: the id of a known folder.
+fn is_braced_guid(s: &str) -> bool {
+    s.strip_prefix('{').and_then(|r| r.strip_suffix('}')).is_some_and(|g| {
+        g.split('-').map(str::len).eq([8, 4, 4, 4, 12]) && g.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+    })
 }
 
 /// Every app of `shell:AppsFolder` (desktop shortcuts of the Start Menu folders AND packaged Store
@@ -1583,9 +1510,9 @@ pub(crate) fn enum_apps_folder() -> Vec<StartApp> {
         }
         let Some(item) = items[0].take() else { break };
         // SAFETY: `item` is valid; the returned PWSTRs are freed by `take_pwstr`.
-        let id = unsafe { item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING) }.ok().and_then(take_pwstr);
+        let id = unsafe { item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING).ok().and_then(|p| take_pwstr(p)) };
         // SAFETY: as above.
-        let name = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.ok().and_then(take_pwstr);
+        let name = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY).ok().and_then(|p| take_pwstr(p)) };
         let (Some(id), Some(name)) = (id, name) else { continue };
         if !keep_start_app(&id, &name) || !seen.insert(id.to_lowercase()) {
             continue;
@@ -1609,49 +1536,78 @@ const APPS_CHILD_MAX_BYTES: u64 = Caps::APPS.bytes as u64;
 /// Exit code of `--start-apps` when nothing was listed (AppsFolder unavailable or empty): the dock then lists in-process.
 const APPS_EXIT_EMPTY: i32 = 3;
 
-/// The catalogue of one `ListStartApps`, from an `--start-apps` child (`update::run_capture`: no window, the dock's
-/// job, at most the apps arena's cap read, 5 s), taken only as `apps_from_child` checks it. A child that cannot start,
-/// fails, or prints anything the check refuses is logged (once per process) and the catalogue is listed here as before,
-/// through the same encoder; after a child that ran out of time every later listing of this process is made here, so a
-/// hung child never holds this thread 5 s twice. The AppsFolder enumeration and Windows' app index (the shell modules and
-/// the parse of two index files) then load only in the child, which takes them with it when it exits. With `child`
-/// false (Start with no launcher chord) the catalogue is listed here as in M1, with no child, thread or job.
+/// The catalogue of one `ListStartApps`, from the first source that gives one (`agent::next_source`, each counted in
+/// `agent::served`): the medium agent (`agent::Link::apps`: what `--start-apps` prints, made at medium, 5 s, then the
+/// agent is killed), when it can serve; an `--start-apps` child (`update::run_capture`: no window, the dock's job, at
+/// most the apps arena's cap read, 5 s), when `child`; then here, through the same encoder. Either answer is taken
+/// only as `apps_from_child` checks it, the agent's less the ids `agent_listing` refuses. A failed agent or child is
+/// logged (once per process); after a child that ran out of time every later listing of this process skips the child,
+/// so a hung child never holds this thread 5 s twice.
+/// The AppsFolder enumeration and Windows' app index (the shell modules and the parse of two index files) then load
+/// only in the agent or the child, which take them with them when they exit. With no agent and `child` false (Start
+/// with no launcher chord) the catalogue is listed here as in M1, with no child, thread or job. With the source that
+/// gave it.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn list_apps_arena(child: bool) -> Arena {
+fn list_apps_arena(child: bool, agent: &mut crate::agent::Link) -> (Arena, crate::agent::Source) {
+    use crate::agent::{next_source, served, Source};
     static CHILD_OFF: AtomicBool = AtomicBool::new(false);
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if child && !CHILD_OFF.load(Relaxed) {
+    static AGENT_WARNED: AtomicBool = AtomicBool::new(false);
+    let child_ok = || child && !CHILD_OFF.load(Relaxed);
+    let mut source = next_source(None, agent.usable(), child_ok());
+    loop {
         let t = Instant::now();
-        let out = crate::update::child_exe()
-            .and_then(|exe| crate::update::run_capture(&exe, &[APPS_FLAG], APPS_CHILD_TIMEOUT, APPS_CHILD_MAX_BYTES));
-        match apps_from_child(out) {
-            Ok(a) => {
-                log!("shell: Start menu: {} apps listed in {} ms (child)", a.len(), t.elapsed().as_millis());
-                return a;
+        match source {
+            Source::Agent => match agent_listing(agent.apps(APPS_CHILD_TIMEOUT, Caps::APPS.bytes)) {
+                Ok(a) => {
+                    log!("shell: Start menu: {} apps listed in {} ms (agent)", a.len(), t.elapsed().as_millis());
+                    served(Source::Agent);
+                    return (a, Source::Agent);
+                }
+                Err(why) => {
+                    if !AGENT_WARNED.swap(true, Relaxed) {
+                        log!("shell: Start menu: the agent's listing failed ({why}), using the dock's own helpers");
+                    }
+                }
+            },
+            Source::Child => {
+                let out = crate::update::child_exe().and_then(|exe| {
+                    crate::update::run_capture(&exe, &[APPS_FLAG], APPS_CHILD_TIMEOUT, APPS_CHILD_MAX_BYTES)
+                });
+                match apps_from_child(out) {
+                    Ok(a) => {
+                        log!("shell: Start menu: {} apps listed in {} ms (child)", a.len(), t.elapsed().as_millis());
+                        served(Source::Child);
+                        return (a, Source::Child);
+                    }
+                    Err(why) => {
+                        let hung = t.elapsed() >= APPS_CHILD_TIMEOUT;
+                        if hung {
+                            CHILD_OFF.store(true, Relaxed);
+                        }
+                        if !WARNED.swap(true, Relaxed) || hung {
+                            let rest = if hung { " from now on" } else { "" };
+                            log!("shell: Start menu: the apps process failed ({why}), listing in-process{rest}");
+                        }
+                    }
+                }
             }
-            Err(why) => {
-                let hung = t.elapsed() >= APPS_CHILD_TIMEOUT;
-                if hung {
-                    CHILD_OFF.store(true, Relaxed);
-                }
-                if !WARNED.swap(true, Relaxed) || hung {
-                    let rest = if hung { " from now on" } else { "" };
-                    log!("shell: Start menu: the apps process failed ({why}), listing in-process{rest}");
-                }
+            Source::Here => {
+                COM_WORK.store(true, SeqCst);
+                let list = enum_apps_folder();
+                crate::start_search::load_app_index();
+                let index = crate::start_search::take_app_index();
+                let arena = catalog::build_apps(&list, index.as_ref()).unwrap_or_else(|e| {
+                    log!("shell: Start menu: the catalogue of {} apps was not kept: {e}", list.len());
+                    Arena::default()
+                });
+                log!("shell: Start menu: {} apps listed in {} ms", arena.len(), t.elapsed().as_millis());
+                served(Source::Here);
+                return (arena, Source::Here);
             }
         }
+        source = next_source(Some(source), false, child_ok());
     }
-    COM_WORK.store(true, SeqCst);
-    let t = Instant::now();
-    let list = enum_apps_folder();
-    crate::start_search::load_app_index();
-    let index = crate::start_search::take_app_index();
-    let arena = catalog::build_apps(&list, index.as_ref()).unwrap_or_else(|e| {
-        log!("shell: Start menu: the catalogue of {} apps was not kept: {e}", list.len());
-        Arena::default()
-    });
-    log!("shell: Start menu: {} apps listed in {} ms", arena.len(), t.elapsed().as_millis());
-    arena
 }
 
 /// What the dock keeps of an `--start-apps` child's `run_capture` result: the arena, when the child exited 0 and its
@@ -1667,10 +1623,24 @@ fn apps_from_child(out: Result<(i32, Vec<u8>), String>) -> Result<Arena, String>
     Arena::new(bytes, ArenaKind::Apps, None, Caps::APPS).map_err(|e| format!("{n} bytes refused: {e}"))
 }
 
-/// `--start-apps`, in the child `list_apps_arena` starts: the AppsFolder catalogue and Windows' app index, folded and
-/// indexed by the in-process path's entry builder and encoder, written to stdout as one apps arena. It touches no data
-/// folder, logger, mutex or console, reads no input and writes nothing but stdout. Exit 0 = an arena written; 1 = COM,
-/// the encoder or stdout failed; 3 = nothing listed.
+/// What the dock keeps of the agent's `ListApps` answer: the arena `apps_from_child` takes, less every app whose id
+/// `is_app_id` refuses (counted, and logged once per process without its id); every other is kept whole
+/// (`arena::retain_apps`). The agent runs at medium: any program of the user can tamper with it or with what it reads,
+/// so none of its ids is an AppsFolder id until it passes.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn agent_listing(out: Result<(i32, Vec<u8>), String>) -> Result<Arena, String> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let (kept, left_out) = crate::launcher::arena::retain_apps(apps_from_child(out)?, is_app_id, Caps::APPS)
+        .map_err(|e| format!("its apps without a bad id could not be kept: {e}"))?;
+    if left_out > 0 && !WARNED.swap(true, Relaxed) {
+        log!("shell: Start menu: {left_out} apps of the agent's listing have an id of no AppsFolder form: left out");
+    }
+    Ok(kept)
+}
+
+/// `--start-apps`, in the child `list_apps_arena` starts: `apps_child_bytes`, written to stdout as one apps arena. It
+/// touches no data folder, logger, mutex or console, reads no input and writes nothing but stdout. Exit 0 = an arena
+/// written; 1 = COM, the encoder or stdout failed; 3 = nothing listed.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn run_apps_child() -> i32 {
     use std::io::Write;
@@ -1679,26 +1649,33 @@ pub fn run_apps_child() -> i32 {
     if hr.is_err() {
         return 1;
     }
-    let list = enum_apps_folder();
-    let code = if list.is_empty() {
-        APPS_EXIT_EMPTY
-    } else {
-        crate::start_search::load_app_index();
-        let index = crate::start_search::take_app_index();
-        match catalog::encode_app_list(&list, index.as_ref()) {
-            Ok(bytes) => {
-                let mut stdout = std::io::stdout().lock();
-                match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
-                    Ok(()) => 0,
-                    Err(_) => 1,
-                }
-            }
-            Err(_) => 1,
+    let (mut code, bytes) = apps_child_bytes();
+    if code == 0 {
+        let mut stdout = std::io::stdout().lock();
+        if stdout.write_all(&bytes).and_then(|()| stdout.flush()).is_err() {
+            code = 1;
         }
-    };
+    }
     // SAFETY: paired with the successful CoInitializeEx above; the listing released every COM object it made.
     unsafe { CoUninitialize() };
     code
+}
+
+/// What `--start-apps` and the agent's `ListApps` answer: the AppsFolder catalogue and Windows' app index, folded and
+/// indexed by the in-process path's entry builder and encoder, as one apps arena, with the child's exit code (0 = the
+/// arena; 1 = the encoder failed; 3 = nothing listed, no bytes). Needs COM on the calling thread.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn apps_child_bytes() -> (i32, Vec<u8>) {
+    let list = enum_apps_folder();
+    if list.is_empty() {
+        return (APPS_EXIT_EMPTY, Vec::new());
+    }
+    crate::start_search::load_app_index();
+    let index = crate::start_search::take_app_index();
+    match catalog::encode_app_list(&list, index.as_ref()) {
+        Ok(bytes) => (0, bytes),
+        Err(_) => (1, Vec::new()),
+    }
 }
 
 // ------------------------------------------------------------------ icons from a child (L3 T20, M1 F5)
@@ -1744,13 +1721,15 @@ enum IconClient {
 /// index went to the UI), that it ended (both pipes closed: nothing more comes), that the shell thread stopped the
 /// child on purpose (nothing more of the job goes to the UI, and its cut output is no failure to log), and that the
 /// child gave no header while nobody stopped it (`icons_in_process`; stored before `ended`): it made no icon, so the
-/// shell thread makes the job's ids itself.
+/// shell thread makes the job's ids itself; or that its output was refused after the header while nobody stopped it
+/// (`broken`, stored before `ended` too): an agent that sends what the dock refuses is let go.
 #[derive(Default)]
 struct IconProgress {
     delivered: AtomicUsize,
     ended: AtomicBool,
     stopped: AtomicBool,
     no_header: AtomicBool,
+    broken: AtomicBool,
 }
 
 /// How a job's output ended, as its reader saw it.
@@ -1773,10 +1752,16 @@ fn icons_in_process(end: &IconEnd, stopped: bool) -> bool {
     matches!(end, IconEnd::NoHeader(_)) && !stopped
 }
 
-/// One `--start-icons` child at work for a client: the process (only the shell thread waits on it or kills it; the
-/// reader thread holds its pipes), the size and ids it was given, its progress and when it started.
+/// What makes a job's icons: an `--start-icons` child (only the shell thread waits on it or kills it; the reader thread
+/// holds its pipes), or the agent's stream `id` (the link writes its chunks into the reader's pipe).
+enum IconSource {
+    Child(crate::update::JobChild),
+    Agent { id: u32 },
+}
+
+/// One icons job at work for a client: its source, the size and ids it was given, its progress and when it started.
 struct IconJob {
-    child: crate::update::JobChild,
+    source: IconSource,
     px: u32,
     ids: Arc<[String]>,
     progress: Arc<IconProgress>,
@@ -1791,17 +1776,35 @@ impl IconJob {
         ICON_JOB_BASE.saturating_add(ICON_JOB_PER_ID.saturating_mul(n))
     }
 
-    /// Kills and reaps the child (harmless once it has exited; the wait is bounded by `ICON_REAP_WAIT_MS`): its ids and
-    /// how many of them were answered. Its reader sees the output close and ends; nothing it still decodes goes to the
-    /// UI.
+    /// The agent's stream id, for an agent's job.
+    fn agent(&self) -> Option<u32> {
+        match self.source {
+            IconSource::Agent { id } => Some(id),
+            IconSource::Child(_) => None,
+        }
+    }
+
+    /// Whether what makes the icons is done: the child exited, or the agent's stream reached its reader's end.
+    fn exited(&mut self) -> bool {
+        match &mut self.source {
+            IconSource::Child(child) => !matches!(child.try_wait(), Ok(None)),
+            IconSource::Agent { .. } => self.progress.ended.load(SeqCst),
+        }
+    }
+
+    /// Stops the job: nothing it still decodes goes to the UI. A child is killed and reaped (harmless once it has exited;
+    /// the wait is bounded by `ICON_REAP_WAIT_MS`), and its reader sees the output close and ends; an agent's stream is
+    /// ended by the caller (`Shell::end_job`). Its ids and how many of them were answered.
     fn stop(mut self) -> (Arc<[String]>, usize) {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::System::Threading::WaitForSingleObject;
         self.progress.stopped.store(true, SeqCst);
-        let _ = self.child.kill();
-        // SAFETY: the process handle is valid while `self.child` lives; waiting on it has no other effect.
-        let _ = unsafe { WaitForSingleObject(HANDLE(self.child.as_raw_handle()), ICON_REAP_WAIT_MS) };
-        let _ = self.child.try_wait();
+        if let IconSource::Child(child) = &mut self.source {
+            let _ = child.kill();
+            // SAFETY: the process handle is valid while `child` lives; waiting on it has no other effect.
+            let _ = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), ICON_REAP_WAIT_MS) };
+            let _ = child.try_wait();
+        }
         (self.ids, self.progress.delivered.load(SeqCst))
     }
 }
@@ -1815,43 +1818,66 @@ impl Shell {
         }
     }
 
-    /// Ends the client's job, if any (killed and reaped): its size, ids and answered count.
+    /// Ends the client's job, if any (a child killed and reaped, an agent's stream ended): its size, ids and answered
+    /// count.
     fn end_job(&mut self, c: IconClient) -> Option<(u32, Arc<[String]>, usize)> {
         let job = self.job(c).take()?;
         let px = job.px;
+        let agent = job.agent();
         let (ids, delivered) = job.stop();
+        if let Some(id) = agent {
+            self.agent.end_stream(id);
+        }
         Some((px, ids, delivered))
     }
 
-    /// At each pass of the queue: a job whose reader ended is reaped once its child exited, or at once when the child
-    /// gave no header; a job past its deadline is killed and reaped (a hung child; logged once per process). The ids of
-    /// a job whose child gave no header are made here (`icons_here`), and so is every later batch of this process
-    /// (`icons_child_off`). What any other job left unanswered for the Start menu leaves `start_sent`, so its next
-    /// listing asks for it again.
+    /// At each pass of the queue: a job whose reader ended is reaped once its child exited (an agent's stream: at once),
+    /// or at once when it gave no header; a job past its deadline is stopped and reaped: a hung child is killed (logged
+    /// once per process), a hung agent too (`agent::Link::stream_missed`), and so is an agent whose stream was refused
+    /// (`agent::Link::stream_refused`). The ids of a job whose child gave no header
+    /// are made here (`icons_here`), and so is every later batch of this process (`icons_child_off`); those of an
+    /// agent's job that gave none go to the dock's own helpers (a child, else here). What any other job left unanswered
+    /// for the Start menu leaves `start_sent`, so its next listing asks for it again.
     fn reap_icon_jobs(&mut self) {
         for c in [IconClient::Start, IconClient::Launcher] {
             let Some(job) = self.job(c).as_mut() else { continue };
-            let exited = !matches!(job.child.try_wait(), Ok(None));
+            let exited = job.exited();
             let late = job.started.elapsed() > job.deadline();
+            let deadline = job.deadline();
+            let agent = job.agent().is_some();
             let ended = job.progress.ended.load(SeqCst);
             // Stored before `ended`, so read after it.
             let no_header = ended && job.progress.no_header.load(SeqCst);
+            let broken = ended && job.progress.broken.load(SeqCst);
             if !(late || ended && (exited || no_header)) {
                 continue;
             }
             if late && !exited && !no_header {
-                static WARNED: AtomicBool = AtomicBool::new(false);
-                if !WARNED.swap(true, Relaxed) {
-                    log!(
-                        "start icons: the icons process was still at work after {} ms and was stopped",
-                        job.deadline().as_millis()
-                    );
+                if agent {
+                    self.agent.stream_missed();
+                } else {
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Relaxed) {
+                        log!(
+                            "start icons: the icons process was still at work after {} ms and was stopped",
+                            deadline.as_millis()
+                        );
+                    }
                 }
+            } else if agent && broken {
+                self.agent.stream_refused();
+            } else if agent && !no_header {
+                self.agent.stream_done();
             }
             if let Some((px, ids, delivered)) = self.end_job(c) {
-                if no_header {
+                let rest = ids.get(delivered..).unwrap_or(&[]).to_vec();
+                if no_header && agent {
+                    if let Err(back) = self.start_icon_job(c, px, rest, false) {
+                        self.icons_here(c, px, back);
+                    }
+                } else if no_header {
                     self.icons_child_off = true;
-                    self.icons_here(c, px, ids.get(delivered..).unwrap_or(&[]).to_vec());
+                    self.icons_here(c, px, rest);
                 } else if c == IconClient::Start {
                     unsend_icons(&mut self.start_sent, &ids, delivered);
                 }
@@ -1866,6 +1892,7 @@ impl Shell {
         if ids.is_empty() {
             return;
         }
+        crate::agent::served(crate::agent::Source::Here);
         match c {
             IconClient::Start => {
                 for chunk in ids.chunks(START_ICON_BATCH) {
@@ -1876,13 +1903,16 @@ impl Shell {
         }
     }
 
-    /// Starts the client's icons child for `ids` at `px` in place of its running job, whose ids not answered yet (at
+    /// Starts the client's icons job for `ids` at `px` in place of its running job, whose ids not answered yet (at
     /// the same size) go first (`next_icon_batch`): killing a batch would otherwise lose its rest for the whole open,
-    /// since neither the launcher nor Start asks for an id twice. An id a child cannot take gets no icon; past
-    /// `ICON_IDS_MAX` the others are dropped (for Start they leave `start_sent`). Err: the child could not start
-    /// (logged once per process) or an icons child of this process gave no header (`icons_child_off`), with the ids to
-    /// make here, as before.
-    fn start_icon_job(&mut self, c: IconClient, px: u32, ids: Vec<String>) -> Result<(), Vec<String>> {
+    /// since neither the launcher nor Start asks for an id twice. The agent's stream when `agent` and it can serve,
+    /// else an icons child. An id a child cannot take gets no icon; past `ICON_IDS_MAX` the others are dropped (for
+    /// Start they leave `start_sent`). On a dock that may be elevated neither a child nor this thread is given an id
+    /// the dock did not list itself (`own_ids`: the agent's are untrusted, so the elevated dock never extracts from
+    /// them): it gets no icon (for Start it leaves `start_sent`). Err: the child could not start (logged once per
+    /// process) or an icons child of this process gave no header (`icons_child_off`), with the ids to make here, as
+    /// before.
+    fn start_icon_job(&mut self, c: IconClient, px: u32, ids: Vec<String>, agent: bool) -> Result<(), Vec<String>> {
         let ids = match self.end_job(c) {
             Some((old_px, old, delivered)) if old_px == px => next_icon_batch(&old, delivered, ids),
             _ => ids,
@@ -1896,12 +1926,37 @@ impl Shell {
         if batch.is_empty() {
             return Ok(());
         }
+        let batch = if agent && self.agent.usable() {
+            match spawn_agent_icon_job(self.ui, c, px, batch, &mut self.agent) {
+                Ok(job) => {
+                    *self.job(c) = Some(job);
+                    crate::agent::served(crate::agent::Source::Agent);
+                    return Ok(());
+                }
+                Err(batch) => batch,
+            }
+        } else {
+            batch
+        };
+        // The elevated dock's own helpers (its child, or here) make only the icons of apps it listed itself: an id only
+        // the agent gave gets none from them (its row keeps the placeholder), and Start asks for it again at its next
+        // listing.
+        let (batch, theirs) = own_ids(self.own_apps.as_deref(), self.elevation, batch);
+        if c == IconClient::Start {
+            for id in &theirs {
+                self.start_sent.remove(id);
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
         if self.icons_child_off {
             return Err(batch);
         }
         match spawn_icon_job(self.ui, c, px, batch) {
             Ok(job) => {
                 *self.job(c) = Some(job);
+                crate::agent::served(crate::agent::Source::Child);
                 Ok(())
             }
             Err((why, batch)) => {
@@ -1925,7 +1980,7 @@ impl Shell {
         if missing.is_empty() {
             return;
         }
-        if let Err(back) = self.start_icon_job(IconClient::Start, px, missing) {
+        if let Err(back) = self.start_icon_job(IconClient::Start, px, missing, true) {
             self.icons_here(IconClient::Start, px, back);
         }
     }
@@ -1952,7 +2007,8 @@ fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> R
     let ids: Arc<[String]> = ids.into();
     let progress = Arc::new(IconProgress::default());
     let started = Instant::now();
-    let reader = IconReader { ui, client, px, ids: Arc::clone(&ids), progress: Arc::clone(&progress), started };
+    let reader =
+        IconReader { ui, client, px, ids: Arc::clone(&ids), progress: Arc::clone(&progress), started, via: Via::Child };
     let spawned = std::thread::Builder::new().name("icons".into()).stack_size(ICON_READER_STACK).spawn(move || {
         probe!(crate::probe::bump(crate::probe::C::Spawned));
         reader.run(input, output)
@@ -1962,7 +2018,43 @@ fn spawn_icon_job(ui: isize, client: IconClient, px: u32, ids: Vec<String>) -> R
         let _ = child.wait();
         return Err((format!("no reader thread: {e}"), ids.to_vec()));
     }
-    Ok(IconJob { child, px, ids, progress, started })
+    Ok(IconJob { source: IconSource::Child(child), px, ids, progress, started })
+}
+
+/// Starts an agent's icons job for `ids` at `px` (`agent::Link::icons`): the link writes its chunks into a pipe whose
+/// reader end the job's reader thread ("icons", 128 KB of stack, as for a child) reads as it reads a child's stdout, with
+/// the same decoder. Err: the ids back (no agent, or no thread).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn spawn_agent_icon_job(
+    ui: isize,
+    client: IconClient,
+    px: u32,
+    ids: Vec<String>,
+    agent: &mut crate::agent::Link,
+) -> Result<IconJob, Vec<String>> {
+    let Ok((output, input)) = std::io::pipe() else { return Err(ids) };
+    let Some(id) = agent.icons(px, &ids, Arc::new(input)) else { return Err(ids) };
+    let ids: Arc<[String]> = ids.into();
+    let progress = Arc::new(IconProgress::default());
+    let started = Instant::now();
+    let reader =
+        IconReader { ui, client, px, ids: Arc::clone(&ids), progress: Arc::clone(&progress), started, via: Via::Agent };
+    let spawned = std::thread::Builder::new().name("icons".into()).stack_size(ICON_READER_STACK).spawn(move || {
+        probe!(crate::probe::bump(crate::probe::C::Spawned));
+        reader.run_agent(output)
+    });
+    if spawned.is_err() {
+        agent.end_stream(id);
+        return Err(ids.to_vec());
+    }
+    Ok(IconJob { source: IconSource::Agent { id }, px, ids, progress, started })
+}
+
+/// Who makes a reader's frames, for its log lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    Child,
+    Agent,
 }
 
 /// What a job's reader thread needs besides the pipes.
@@ -1973,6 +2065,7 @@ struct IconReader {
     ids: Arc<[String]>,
     progress: Arc<IconProgress>,
     started: Instant,
+    via: Via,
 }
 
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -1983,10 +2076,9 @@ impl IconReader {
     /// waits in the pipe. It ends at the end of the output, at a write error, a missing header or the first frame
     /// refused (each kind logged once per process; dropping the pipes makes a child still at work exit at its next
     /// write), or when the shell thread kills the child; then it logs what it delivered. A child that gave no header,
-    /// unless stopped, marks the job `no_header` and wakes the shell thread, which makes its ids in-process.
+    /// unless stopped, marks the job `no_header` and wakes the shell thread, which makes its ids in-process (an agent's
+    /// job: through the dock's own helpers).
     fn run(self, input: std::io::PipeWriter, output: std::io::PipeReader) {
-        static HEADER_WARNED: AtomicBool = AtomicBool::new(false);
-        static FRAME_WARNED: AtomicBool = AtomicBool::new(false);
         let (first, end) = match self.feed(input) {
             Ok(()) => self.read(output),
             Err(e) => {
@@ -1994,20 +2086,44 @@ impl IconReader {
                 (None, IconEnd::NoHeader(format!("the ids could not be written: {e}")))
             }
         };
+        self.finish(first, end);
+    }
+
+    /// The reader thread of an agent's job: the request went over the agent's pipe, so there is nothing to feed; the
+    /// stream's bytes arrive in `output` as the link writes them, and end when it drops its end.
+    fn run_agent(self, output: std::io::PipeReader) {
+        let (first, end) = self.read(output);
+        self.finish(first, end);
+    }
+
+    /// The end of a job's output: marks the job ended (and `no_header` or `broken`), wakes the shell thread when its
+    /// ids are left to make, and logs what it delivered.
+    fn finish(&self, first: Option<Duration>, end: IconEnd) {
+        static HEADER_WARNED: AtomicBool = AtomicBool::new(false);
+        static FRAME_WARNED: AtomicBool = AtomicBool::new(false);
+        static AGENT_WARNED: AtomicBool = AtomicBool::new(false);
+        static AGENT_FRAME_WARNED: AtomicBool = AtomicBool::new(false);
         let stopped = self.progress.stopped.load(SeqCst);
         let here = icons_in_process(&end, stopped);
         self.progress.no_header.store(here, SeqCst);
+        self.progress.broken.store(matches!(end, IconEnd::Broken(_)) && !stopped, SeqCst);
         self.progress.ended.store(true, SeqCst);
         let tid = thread_id();
         if here && tid != 0 {
             // SAFETY: PostThreadMessageW is thread-safe; if the thread no longer exists it just fails.
             let _ = unsafe { PostThreadMessageW(tid, WM_SHELL_WAKE, WPARAM(0), LPARAM(0)) };
         }
-        match end {
-            IconEnd::NoHeader(why) if here && !HEADER_WARNED.swap(true, Relaxed) => {
+        match (end, self.via) {
+            (IconEnd::NoHeader(why), Via::Agent) if here && !AGENT_WARNED.swap(true, Relaxed) => {
+                log!("start icons: the agent's icons failed ({why}), the dock's own helpers make the rest");
+            }
+            (IconEnd::Broken(why), Via::Agent) if !stopped && !AGENT_FRAME_WARNED.swap(true, Relaxed) => {
+                log!("start icons: the agent's icons failed ({why}); its other icons are not made");
+            }
+            (IconEnd::NoHeader(why), Via::Child) if here && !HEADER_WARNED.swap(true, Relaxed) => {
                 log!("start icons: the icons process failed ({why}), icons made in-process from now on");
             }
-            IconEnd::Broken(why) if !stopped && !FRAME_WARNED.swap(true, Relaxed) => {
+            (IconEnd::Broken(why), Via::Child) if !stopped && !FRAME_WARNED.swap(true, Relaxed) => {
                 log!("start icons: the icons process failed ({why}); its other icons are not made");
             }
             _ => {}
@@ -2017,7 +2133,8 @@ impl IconReader {
         let first =
             first.map_or_else(|| "none delivered".to_string(), |t| format!("first batch after {} ms", t.as_millis()));
         let whose = if self.client == IconClient::Launcher { " for the launcher" } else { "" };
-        log!("start icons: {delivered} of {n} in {} ms, {first} (child){whose}", self.started.elapsed().as_millis());
+        let via = if self.via == Via::Agent { "agent" } else { "child" };
+        log!("start icons: {delivered} of {n} in {} ms, {first} ({via}){whose}", self.started.elapsed().as_millis());
     }
 
     /// Writes the ids, one per line, and closes the child's input.
@@ -2083,10 +2200,9 @@ impl IconReader {
 }
 
 /// `--start-icons <px>`, in the child a job starts: all of stdin is read first (`read_icon_ids`; the dock's writer and
-/// this reader never wait on each other), then `write_icon_frames` with the pixels of `start_icon`, so identical to the
-/// ones the dock made in-process. It touches no data folder, logger, mutex or console and writes nothing but stdout.
-/// Exit 0 = every frame written; 1 = COM failed, or a write failed (the dock went away or stopped the job): it exits at
-/// once.
+/// this reader never wait on each other), then `write_start_icons` into stdout. It touches no data folder, logger, mutex
+/// or console and writes nothing but stdout. Exit 0 = every frame written; 1 = COM failed, or a write failed (the dock
+/// went away or stopped the job): it exits at once.
 pub fn run_icons_child(px: u32) -> i32 {
     let ids = read_icon_ids(&mut std::io::stdin().lock());
     // SAFETY: the first COM call of this thread (the child's main thread); paired with CoUninitialize below.
@@ -2095,7 +2211,7 @@ pub fn run_icons_child(px: u32) -> i32 {
         return 1;
     }
     let mut out = std::io::BufWriter::with_capacity(ICON_IO_BUF, std::io::stdout().lock());
-    let code = write_icon_frames(&ids, px, &mut out, start_icon);
+    let code = write_start_icons(&ids, px, &mut out);
     if code == 0 {
         // SAFETY: paired with the successful CoInitializeEx above; every icon released its COM objects.
         unsafe { CoUninitialize() };
@@ -2103,12 +2219,19 @@ pub fn run_icons_child(px: u32) -> i32 {
     code
 }
 
+/// What an icons child given `ids` (an id the child could not read is None) at `px` writes to `out`, and what the agent
+/// streams for an `Icons` request: `write_icon_frames` with the pixels of `start_icon`, so identical to the ones the
+/// dock makes in-process. Needs COM on the calling thread.
+pub(crate) fn write_start_icons(ids: &[Option<String>], px: u32, out: &mut impl std::io::Write) -> i32 {
+    write_icon_frames(ids, px, out, start_icon)
+}
+
 /// What an icons child given `ids` at `px` writes to `out`: the header, then one frame per id in input order, each
 /// written and flushed at once. A frame carries `make`'s bitmap only when it is exactly `px` x `px`; otherwise, and
 /// for a line the child could not read (`None`, never given to `make`), it is the 0 x 0 frame. 0 = every frame
 /// written; 1 at the first write or flush that fails, after which nothing more is made or written.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn write_icon_frames(
+pub(crate) fn write_icon_frames(
     ids: &[Option<String>],
     px: u32,
     out: &mut impl std::io::Write,
@@ -2256,6 +2379,20 @@ fn icon_batch(ids: Vec<String>) -> (Vec<String>, Vec<String>) {
     (batch, over)
 }
 
+/// The ids of `ids` that the dock's own last listing (`own`: its child's or its own, never the agent's) holds, and the
+/// others, each in their order; with no such listing, none is the dock's. On a dock known not to be elevated
+/// (`elevation`) all of them are: its helpers run as the user, as the agent does.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn own_ids(own: Option<&Arena>, elevation: Option<bool>, ids: Vec<String>) -> (Vec<String>, Vec<String>) {
+    if elevation == Some(false) {
+        return (ids, Vec::new());
+    }
+    let Some(own) = own else { return (Vec::new(), ids) };
+    let v = own.view();
+    let listed: HashSet<&str> = (0..v.len()).map(|i| v.id(i)).collect();
+    ids.into_iter().partition(|id| listed.contains(id.as_str()))
+}
+
 /// The batch that replaces a running job of the same client: the ids the old job had not answered (`old[delivered..]`)
 /// that `ids` does not ask for again, first (they were asked earlier), then `ids`.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -2344,37 +2481,9 @@ fn start_icon(id: &str, px: u32) -> Option<IconBitmap> {
     nonempty(icons::resize_area(&b?, px))
 }
 
-/// Version-resource strings of an executable, read through `IShellItem2::GetString`. Also used by
-/// `tray_host` for the tray icons' app names. Needs COM initialized on the calling thread.
-#[derive(Default)]
-pub(crate) struct FileInfo {
-    pub(crate) description: Option<String>,
-    product: Option<String>,
-    company: Option<String>,
-}
-
-impl FileInfo {
-    pub(crate) fn read(exe_path: &str) -> FileInfo {
-        let path = HSTRING::from(exe_path);
-        // SAFETY: COM STA initialized; `path` lives for the call.
-        let Ok(item) = (unsafe { SHCreateItemFromParsingName::<_, _, IShellItem2>(&path, None::<&IBindCtx>) }) else {
-            return FileInfo::default();
-        };
-        let get = |key: &PROPERTYKEY| {
-            // SAFETY: `item` is valid, key is valid; the PWSTR is freed by `take_pwstr`.
-            unsafe { item.GetString(key) }.ok().and_then(take_pwstr)
-        };
-        FileInfo {
-            description: get(&PKEY_FILE_DESCRIPTION),
-            product: get(&PKEY_PRODUCT_NAME),
-            company: get(&PKEY_COMPANY),
-        }
-    }
-}
-
 // ------------------------------------------------------------------ icon
 
-fn nonempty(b: IconBitmap) -> Option<IconBitmap> {
+pub(crate) fn nonempty(b: IconBitmap) -> Option<IconBitmap> {
     if b.is_empty() || !b.has_visible_pixels() {
         None
     } else {
@@ -2382,9 +2491,10 @@ fn nonempty(b: IconBitmap) -> Option<IconBitmap> {
     }
 }
 
-/// Order: custom PNG, disk cache, extraction (AppsFolder, jumbo, SHDefExtractIconW,
-/// WM_GETICON/class). Returns the icon already scaled to `r.icon_px`.
-fn resolve_icon(r: &ResolveApp) -> Option<IconBitmap> {
+/// Order: custom PNG, disk cache, extraction (AppsFolder; for the exe, the agent's answer when a user can
+/// write it, else SHDefExtractIconW and jumbo; WM_GETICON/class). Returns the icon already scaled to
+/// `r.icon_px`.
+fn resolve_icon(r: &ResolveApp, agent: Option<&mut crate::agent::Link>) -> Option<IconBitmap> {
     let px = if r.icon_px == 0 { 24 } else { r.icon_px.clamp(8, 256) };
 
     // 1. User's custom PNG (absolute priority, never cached).
@@ -2405,7 +2515,7 @@ fn resolve_icon(r: &ResolveApp) -> Option<IconBitmap> {
     }
 
     // 3-5. Extraction.
-    let (src, cacheable) = extract_icon(r, exe_ok)?;
+    let (src, cacheable) = extract_icon(r, exe_ok, px, agent)?;
     let master = nonempty(icons::resize_area(&src, MASTER_PX))?;
     if cacheable {
         icons::cache_store(&r.key, &master);
@@ -2414,124 +2524,191 @@ fn resolve_icon(r: &ResolveApp) -> Option<IconBitmap> {
     nonempty(icons::resize_area(if px > MASTER_PX { &src } else { &master }, px))
 }
 
-/// Tries the sources in order; the second value says whether the result should be cached
-/// (the window icon, low resolution and per-window, should not).
-fn extract_icon(r: &ResolveApp, exe_ok: bool) -> Option<(IconBitmap, bool)> {
+fn extract_icon(
+    r: &ResolveApp,
+    exe_ok: bool,
+    px: u32,
+    agent: Option<&mut crate::agent::Link>,
+) -> Option<(IconBitmap, bool)> {
     if let Some(a) = r.aumid.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-        if let Some(b) = icon_from_appsfolder(a) {
+        if let Some(b) = icon::from_appsfolder(a, &DockIcons) {
             return Some((b, true));
         }
     }
+    // The sources the shell model walks from here: the exe (SHDefExtractIconW, then the jumbo list as a fallback only)
+    // and the window. An agent's answer stands, icon or none: then the exe is not read here.
+    let mut exe_path = if exe_ok { r.exe_path.as_str() } else { "" };
     if exe_ok {
-        if let Some(b) = icon_from_def_extract(&r.exe_path) {
-            return Some((b, true));
-        }
-        // Fallback only: the jumbo system image list caches ~256 KB per index for the life of the process.
-        if let Some(b) = icon_from_jumbo_list(&r.exe_path) {
-            return Some((b, true));
+        match exe_icon(&r.exe_path, px, agent) {
+            Some(Some(b)) => return Some((b, true)),
+            Some(None) => exe_path = "",
+            None => {}
         }
     }
-    if r.hwnd != 0 {
-        if let Some(b) = icon_from_window(r.hwnd) {
-            return Some((b, false));
-        }
+    icon::extract(&IconQuery { exe_path, aumid: None, hwnd: r.hwnd }, &DockIcons)
+}
+
+/// The dock's bitmaps for the shell model's icon sources: converted by `icons`, an empty or invisible one is none.
+struct DockIcons;
+
+impl IconDecode for DockIcons {
+    type Bitmap = IconBitmap;
+
+    fn from_hicon(&self, icon: HICON) -> Option<IconBitmap> {
+        icons::hicon_to_bitmap(icon).and_then(nonempty)
     }
-    None
+
+    fn from_hbitmap(&self, bmp: HBITMAP) -> Option<IconBitmap> {
+        icons::hbitmap_to_bitmap(bmp).and_then(nonempty)
+    }
 }
 
-/// Converts an owned HICON (to be destroyed) into a bitmap.
-fn owned_hicon_to_bitmap(icon: HICON) -> Option<IconBitmap> {
-    let b = icons::hicon_to_bitmap(icon).and_then(nonempty);
-    // SAFETY: `icon` was created for us (GetIcon/SHDefExtractIconW) and is no longer used.
-    let _ = unsafe { DestroyIcon(icon) };
-    b
+/// `SHDefExtractIconW` of the exe at 256 px (the agent's child process reads the exe sources through these two).
+pub(crate) fn icon_from_def_extract(exe_path: &str) -> Option<IconBitmap> {
+    icon::from_def_extract(exe_path, &DockIcons)
 }
 
-/// (2) `IShellItemImageFactory::GetImage(256, SIIGBF_ICONONLY)` on `shell:AppsFolder\<AUMID>`.
-fn icon_from_appsfolder(aumid: &str) -> Option<IconBitmap> {
-    let path = HSTRING::from(format!("shell:AppsFolder\\{aumid}"));
-    // SAFETY: COM STA initialized; `path` lives for the call.
-    let item: IShellItemImageFactory = unsafe { SHCreateItemFromParsingName(&path, None::<&IBindCtx>) }.ok()?;
-    // SAFETY: `item` is valid; the returned HBITMAP is ours and is deleted below.
-    let hbm = unsafe { item.GetImage(SIZE { cx: SRC_ICON_PX, cy: SRC_ICON_PX }, SIIGBF_ICONONLY) }.ok()?;
-    let b = icons::hbitmap_to_bitmap(hbm).and_then(nonempty);
-    // SAFETY: bitmap owned by us, not selected into any DC.
-    let _ = unsafe { DeleteObject(HGDIOBJ(hbm.0)) };
-    b
+/// The jumbo system image list's icon of the exe, a fallback only.
+pub(crate) fn icon_from_jumbo_list(exe_path: &str) -> Option<IconBitmap> {
+    icon::from_jumbo_list(exe_path, &DockIcons)
 }
 
-/// (3) `SHGetFileInfoW(SHGFI_SYSICONINDEX)` + `SHGetImageList(SHIL_JUMBO)` + `GetIcon(ILD_TRANSPARENT)`,
-/// discarding `iIcon == 0` (generic document icon).
-fn icon_from_jumbo_list(exe_path: &str) -> Option<IconBitmap> {
-    let path = HSTRING::from(exe_path);
-    let mut sfi = SHFILEINFOW::default();
-    // SAFETY: `path` NUL-terminated for the duration of the call; `sfi` writable with its size.
-    let ok = unsafe {
-        SHGetFileInfoW(
-            &path,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            Some(&mut sfi),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_SYSICONINDEX,
-        )
+// ------------------------------------------------------------------ programs a user can write (AG5)
+
+/// How long a name or an icon waits for the agent's answer about a program a user can write; past it the
+/// dock reads the program here as before, and the late answer is dropped.
+const EXE_INFO_DEADLINE: Duration = Duration::from_millis(150);
+/// The `ExeInfo` icon size when only the strings are wanted (the smallest).
+const STRINGS_ICON_PX: u16 = 16;
+
+/// The folders whose programs only administrators can change, as `norm_exe_path` gives them: the Windows
+/// folder (`GetSystemWindowsDirectoryW`) and the Program Files folders (`FOLDERID_ProgramFiles`,
+/// `FOLDERID_ProgramFilesX86`), never from an environment variable. Read once. (A subfolder that an installer
+/// left writable counts as admin-only, as the all-users Start menu's does.)
+fn admin_roots() -> &'static [String] {
+    static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots = Vec::new();
+        let mut buf = [0u16; 260];
+        // SAFETY: `buf` is writable and its length is passed by the wrapper.
+        let n = unsafe { windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW(Some(&mut buf)) };
+        if let Some(w) = buf.get(..n as usize).filter(|w| !w.is_empty() && (n as usize) < buf.len()) {
+            roots.push(norm_exe_path(&String::from_utf16_lossy(w)));
+        }
+        use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86};
+        for id in [FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86] {
+            if let Some(p) = known_folder(&id) {
+                roots.push(norm_exe_path(&p.to_string_lossy()));
+            }
+        }
+        roots.retain(|r| !r.is_empty() && !r.starts_with(r"\\"));
+        roots
+    })
+}
+
+/// `path` as `admin_only_exe` compares it: `/` as `\`, a `\\?\` prefix dropped (`\\?\UNC\` as `\\`), `.` and
+/// `..` resolved by name (never above the drive or the server), 8.3 short forms made long (`long_path`),
+/// lowercase, no trailing separator.
+fn norm_exe_path(path: &str) -> String {
+    let p = path.replace('/', "\\");
+    let (unc, rest) = if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        (true, rest)
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        (false, rest)
+    } else if let Some(rest) = p.strip_prefix(r"\\") {
+        (true, rest)
+    } else {
+        (false, p.as_str())
     };
-    if ok == 0 || sfi.iIcon == 0 {
-        return None;
-    }
-    // SAFETY: COM STA initialized; the requested interface matches the IID.
-    let list: IImageList = unsafe { SHGetImageList(SHIL_JUMBO as i32) }.ok()?;
-    // SAFETY: `list` is valid; index obtained from SHGetFileInfoW on the same system list.
-    let icon = unsafe { list.GetIcon(sfi.iIcon, ILD_TRANSPARENT.0) }.ok()?;
-    owned_hicon_to_bitmap(icon)
-}
-
-/// (4) `SHDefExtractIconW(exe, 0, 0, 256)`: extracts the resource closest to 256 px.
-fn icon_from_def_extract(exe_path: &str) -> Option<IconBitmap> {
-    let path = HSTRING::from(exe_path);
-    let mut large = HICON::default();
-    // SAFETY: `path` valid for the call; `large` is writable; small icon not requested.
-    let hr = unsafe { SHDefExtractIconW(&path, 0, 0, Some(&mut large), None, SRC_ICON_PX as u32) };
-    if hr.is_err() || large.is_invalid() {
-        return None;
-    }
-    owned_hicon_to_bitmap(large)
-}
-
-/// (5) `WM_GETICON` (with timeout, ICON_BIG then ICON_SMALL2), then the class icon.
-/// The HICONs remain owned by the window/class: they must NOT be destroyed.
-fn icon_from_window(hwnd: isize) -> Option<IconBitmap> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    for kind in [ICON_BIG, ICON_SMALL2] {
-        let mut res = 0usize;
-        // SAFETY: SendMessageTimeoutW with SMTO_ABORTIFHUNG and a short timeout: it cannot block for
-        // long; `res` is writable. The shell thread is not the thread of any dock window.
-        let r = unsafe {
-            SendMessageTimeoutW(
-                hwnd,
-                WM_GETICON,
-                WPARAM(kind as usize),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG,
-                GETICON_TIMEOUT_MS,
-                Some(&mut res),
-            )
-        };
-        if r.0 != 0 && res != 0 {
-            if let Some(b) = icons::hicon_to_bitmap(HICON(res as *mut c_void)).and_then(nonempty) {
-                return Some(b);
+    let mut parts: Vec<&str> = Vec::new();
+    for c in rest.split('\\') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if parts.len() > 1 {
+                    parts.pop();
+                }
             }
+            c => parts.push(c),
         }
     }
-    for idx in [GCLP_HICON, GCLP_HICONSM] {
-        // SAFETY: reads a class attribute; if the window is gone it returns 0.
-        let v = unsafe { GetClassLongPtrW(hwnd, idx) };
-        if v != 0 {
-            if let Some(b) = icons::hicon_to_bitmap(HICON(v as *mut c_void)).and_then(nonempty) {
-                return Some(b);
-            }
+    let joined = format!("{}{}", if unc { r"\\" } else { "" }, parts.join("\\"));
+    let long = if joined.contains('~') && !unc { long_path(&joined).unwrap_or(joined) } else { joined };
+    long.to_lowercase()
+}
+
+/// The long form of `path` (`GetLongPathNameW`) for its longest part that exists, the rest kept as written:
+/// `C:\PROGRA~1\Vendor\new.exe` is `C:\Program Files\Vendor\new.exe` before `new.exe` exists.
+fn long_path(path: &str) -> Option<String> {
+    let mut cut = path.len();
+    loop {
+        let (head, tail) = (path.get(..cut)?, path.get(cut..)?);
+        let wide = HSTRING::from(head);
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `wide` is NUL-terminated and lives for the call; `buf` is writable for its length.
+        let n = unsafe { windows::Win32::Storage::FileSystem::GetLongPathNameW(&wide, Some(&mut buf)) } as usize;
+        if let Some(long) = buf.get(..n).filter(|b| !b.is_empty() && n < buf.len()) {
+            return Some(format!("{}{tail}", String::from_utf16_lossy(long)));
         }
+        cut = head.rfind('\\').filter(|&i| i > 0)?;
     }
-    None
+}
+
+/// Whether the program at `path` is one only administrators can change: under one of `roots` (each as
+/// `norm_exe_path` gives it), so the elevated dock may read it itself. A UNC path, another drive, the
+/// user's profile, a root itself: false. Pure but for `norm_exe_path`'s 8.3 lookup.
+fn admin_only_exe(path: &str, roots: &[String]) -> bool {
+    let p = norm_exe_path(path);
+    !p.starts_with(r"\\")
+        && roots.iter().any(|r| {
+            !r.is_empty() && p.strip_prefix(r.as_str()).is_some_and(|rest| rest.len() > 1 && rest.starts_with('\\'))
+        })
+}
+
+/// The `ExeInfo` icon size for an icon made at `px`: the nearest of `EXE_ICON_PX` at or above it; None above
+/// 64 px (such an icon is made here, as before).
+fn exe_icon_px(px: u32) -> Option<u16> {
+    crate::agent_proto::EXE_ICON_PX.iter().copied().find(|&s| u32::from(s) >= px)
+}
+
+/// The agent's answer about a program a user can write (not `admin_only_exe`), with its icon at `px`, when
+/// the agent can serve and answers within `EXE_INFO_DEADLINE`.
+fn ask_agent(
+    exe_path: &str,
+    px: u16,
+    agent: Option<&mut crate::agent::Link>,
+) -> Option<crate::agent_proto::ExeInfoRec> {
+    let agent = agent.filter(|a| a.usable())?;
+    if admin_only_exe(exe_path, admin_roots()) {
+        return None;
+    }
+    agent.exe_info(exe_path, px, EXE_INFO_DEADLINE)
+}
+
+/// The version strings of the program at `exe_path`: the agent's for a program a user can write (the shell
+/// reads it at medium), else, and without an answer in time, `FileInfo::read` here as before.
+fn exe_file_info(exe_path: &str, agent: Option<&mut crate::agent::Link>) -> FileInfo {
+    match ask_agent(exe_path, STRINGS_ICON_PX, agent) {
+        Some(e) => FileInfo { description: e.description, product: e.product, company: e.company },
+        None => FileInfo::read(exe_path),
+    }
+}
+
+/// The icon of a program a user can write, for an icon made at `px`, from the agent: Some(icon or none)
+/// when it answered, None when the dock extracts it here (an admin-only program, more than 64 px, no agent
+/// or no answer in time). The agent's icon is asked at the master's size (`MASTER_PX`), which every icon up
+/// to it is made from and which the disk cache keeps.
+fn exe_icon(exe_path: &str, px: u32, agent: Option<&mut crate::agent::Link>) -> Option<Option<IconBitmap>> {
+    let size = exe_icon_px(px.max(MASTER_PX))?;
+    let e = ask_agent(exe_path, size, agent)?;
+    Some(e.icon.and_then(|(side, bytes)| {
+        let side = u32::from(side);
+        let pixels: Vec<u32> =
+            bytes.chunks_exact(4).map(|c| <[u8; 4]>::try_from(c).map_or(0, u32::from_le_bytes)).collect();
+        (pixels.len() as u64 == u64::from(side) * u64::from(side))
+            .then_some(IconBitmap { width: side, height: side, pixels })
+            .and_then(nonempty)
+    }))
 }
 
 // ------------------------------------------------------------------ launch
@@ -2762,21 +2939,40 @@ fn launch_admin(tool: AdminTool) {
     }
 }
 
-/// `ShellRequest::LaunchAppAdmin`: like `launch_admin`, for an app of the AppsFolder catalog.
-fn launch_app_admin(id: &str, by: LaunchBy) -> Result<(), String> {
-    let id = id.trim();
-    if id.is_empty() {
-        return Err("empty app id".into());
-    }
+/// `ShellRequest::LaunchAppAdmin`: like `launch_admin`, for an app of the AppsFolder catalog (`launch_app_admin_with`
+/// with the dock's in-process enumeration and the desktop shell). `own` is the dock's own last listing
+/// (`Shell::own_apps`).
+fn launch_app_admin(id: &str, own: Option<&Arena>, by: LaunchBy) -> Result<(), Fail> {
+    let mut exec = |file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb| {
+        desktop_shell_execute(file, args, dir, verb, SW_SHOWNORMAL.0).map_err(|e| e.to_string())
+    };
+    launch_app_admin_with(id, own, by, &mut enum_apps_folder, &mut exec)
+}
+
+/// `launch_app_admin` with the enumeration and the shell call given: `exec` has Explorer run
+/// `shell:AppsFolder\<id>` with `runas` only for an id that an enumeration the dock made itself lists, by that
+/// enumeration's string (`own_app_id`). Any other, such as one only the agent gave, is refused before any shell call:
+/// the program Windows elevates is never named by a string of the agent's.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn launch_app_admin_with(
+    id: &str,
+    own: Option<&Arena>,
+    by: LaunchBy,
+    enumerate: &mut dyn FnMut() -> Vec<StartApp>,
+    exec: Exec,
+) -> Result<(), Fail> {
+    let Some(id) = own_app_id(own, id, enumerate) else {
+        return Err(Fail::Refused("an app no enumeration of the dock's own lists"));
+    };
     let target = format!("shell:AppsFolder\\{id}");
-    match desktop_shell_execute(&target, None, None, Verb::RunAs, SW_SHOWNORMAL.0) {
+    match exec(&target, None, None, Verb::RunAs) {
         Ok(()) => {
             log!("{}", app_admin_line(by, &target, Ok(())));
             Ok(())
         }
         Err(e) => {
-            log!("{}", app_admin_line(by, &target, Err(&e.to_string())));
-            Err(format!("desktop shell: {e}"))
+            log!("{}", app_admin_line(by, &target, Err(&e)));
+            Err(Fail::Shell(format!("desktop shell: {e}")))
         }
     }
 }
@@ -2791,22 +2987,51 @@ fn app_target_path(id: &str) -> Option<String> {
     let name = HSTRING::from(format!("shell:AppsFolder\\{}", id.trim()));
     // SAFETY: COM STA initialized on the shell thread; `name` lives for the call.
     let item: IShellItem2 = unsafe { SHCreateItemFromParsingName(&name, None::<&IBindCtx>) }.ok()?;
-    // SAFETY: `item` is valid; the returned PWSTR is freed by `take_pwstr`.
-    let path = take_pwstr(unsafe { item.GetString(&PKEY_LINK_TARGET) }.ok()?)?;
+    // SAFETY: `item` is valid; `GetString` returns a CoTaskMemAlloc'd string, which `take_pwstr` frees.
+    let path = unsafe { take_pwstr(item.GetString(&PKEY_LINK_TARGET).ok()?) }?;
     let p = Path::new(&path);
     (p.is_absolute() && !path.contains('"') && p.exists()).then_some(path)
 }
 
 /// `ShellRequest::RevealApp`: File Explorer (from the Windows folder) with the app's file selected.
-/// An app with no file to show (a Store app) is not a failure.
-fn reveal_app(id: &str) -> Result<(), String> {
-    reveal_app_with(id, LaunchBy::Shared)
+/// An app with no file to show (a Store app, or one only the agent lists: `reveal_target`) is not a failure. `own`
+/// is the dock's own last listing (`Shell::own_apps`).
+fn reveal_app(id: &str, own: Option<&Arena>) -> Result<(), String> {
+    reveal_app_with(id, own, LaunchBy::Shared)
+}
+
+/// The file "Open file location" shows for the app `id`: what `target` (the shell's link target, read in the
+/// elevated dock) gives for it, asked only for an id that an enumeration the dock made itself lists (`own_app_id`)
+/// and with that enumeration's string. An id only the agent gave never reaches the shell here: None, no file to show.
+fn reveal_target(
+    own: Option<&Arena>,
+    id: &str,
+    enumerate: &mut dyn FnMut() -> Vec<StartApp>,
+    target: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    target(&own_app_id(own, id, enumerate)?)
+}
+
+/// The AppsFolder id `id` (trimmed) as an enumeration the dock made itself lists it, with that enumeration's string:
+/// its own last listing `own`, else a fresh one (`enumerate`). None for an empty id, with no enumeration, and for an
+/// id neither lists, such as one only the agent gave: what the dock asks the shell to do with an app ("Open file
+/// location", "Run as administrator") is never named by a string of the agent's.
+fn own_app_id(own: Option<&Arena>, id: &str, enumerate: &mut dyn FnMut() -> Vec<StartApp>) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let in_own = own.and_then(|a| {
+        let v = a.view();
+        (0..v.len()).map(|i| v.id(i)).find(|&o| o == id).map(str::to_string)
+    });
+    in_own.or_else(|| enumerate().into_iter().map(|a| a.id).find(|o| o == id))
 }
 
 /// `reveal_app` with the caller's rule for `launch_with`.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn reveal_app_with(id: &str, by: LaunchBy) -> Result<(), String> {
-    let Some(path) = app_target_path(id) else {
+fn reveal_app_with(id: &str, own: Option<&Arena>, by: LaunchBy) -> Result<(), String> {
+    let Some(path) = reveal_target(own, id, &mut enum_apps_folder, &mut app_target_path) else {
         log!("{}", reveal_line(by, id, None, ""));
         return Ok(());
     };
@@ -2902,9 +3127,9 @@ fn failure_event(kind: LaunchKind, r: &Result<(), Fail>) -> Option<ShellEvent> {
 }
 
 /// Runs one launcher launch; a failure is logged (kind and error only), and pushed as `LaunchFailed`
-/// when the shell call failed (`failure_event`).
+/// when the shell call failed (`failure_event`). `own` is the dock's own last listing (`reveal_app`).
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn launcher_launch(ui: isize, req: ShellRequest) {
+fn launcher_launch(ui: isize, req: ShellRequest, own: Option<&Arena>) {
     let Some(kind) = launch_kind(&req) else { return };
     let mut exec =
         |file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb| shell_exec(kind, file, args, dir, verb);
@@ -2951,8 +3176,8 @@ fn launcher_launch(ui: isize, req: ShellRequest) {
         ShellRequest::LauncherLaunch { target, args } => {
             launch_with(&target, args.as_deref(), LaunchBy::Launcher).map_err(Fail::Shell)
         }
-        ShellRequest::LauncherAppAdmin { id } => launch_app_admin(&id, LaunchBy::Launcher).map_err(Fail::Shell),
-        ShellRequest::LauncherRevealApp { id } => reveal_app_with(&id, LaunchBy::Launcher).map_err(Fail::Shell),
+        ShellRequest::LauncherAppAdmin { id } => launch_app_admin(&id, own, LaunchBy::Launcher),
+        ShellRequest::LauncherRevealApp { id } => reveal_app_with(&id, own, LaunchBy::Launcher).map_err(Fail::Shell),
         _ => return,
     };
     if let Err(err) = &r {
@@ -3620,36 +3845,6 @@ mod tests {
     }
 
     #[test]
-    fn words_and_tokens() {
-        assert_eq!(split_words("RazerAppEngine"), ["Razer", "App", "Engine"]);
-        assert_eq!(split_words("stremio-shell-ng"), ["stremio", "shell", "ng"]);
-        assert_eq!(split_words("HTTPServer"), ["HTTP", "Server"]);
-    }
-
-    #[test]
-    fn description_choice() {
-        let pick = |d, p, c, s| pick_description(d, p, c, s);
-        // Tagline rejected, nothing else usable.
-        assert_eq!(
-            pick(Some("Freedom to Stream"), Some("stremio-shell-ng"), None, "stremio-shell-ng"),
-            Some("stremio-shell-ng".into())
-        );
-        // Dotted identifier loses against the product name.
-        assert_eq!(
-            pick(Some("PowerToys.QuickAccess"), Some("PowerToys"), None, "PowerToys.QuickAccess"),
-            Some("PowerToys".into())
-        );
-        // Generic tails stripped, shorter nested name wins.
-        assert_eq!(pick(Some("Steam Client WebHelper"), Some("Steam"), None, "steamwebhelper"), Some("Steam".into()));
-        assert_eq!(
-            pick(Some("Steam Client Bootstrapper"), Some("Steam"), Some("Valve"), "steam"),
-            Some("Steam".into())
-        );
-        assert_eq!(pick(Some("Discord"), Some("Discord"), Some("Discord Inc."), "Discord"), Some("Discord".into()));
-        assert_eq!(pick(Some("Freedom to Stream"), None, None, "stremio-shell-ng"), None);
-    }
-
-    #[test]
     fn start_menu_filter() {
         assert!(keep_start_app("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", "Calculator"));
         assert!(keep_start_app("{6D809377-6AF0-444B-8957-A3773F02200E}\\Git\\git-bash.exe", "Git Bash"));
@@ -3657,6 +3852,99 @@ mod tests {
         assert!(!keep_start_app("x", "Disinstalla Foo"));
         assert!(!keep_start_app("https://example.com/", "Example website"));
         assert!(!keep_start_app("id", "  "));
+    }
+
+    /// The forms of an AppsFolder id (`is_app_id`): what the dock's own enumeration lists and the tests' fixtures hold;
+    /// a separator, `..`, a UNC or device path, a stray colon, a control character, blanks or length outside them.
+    #[test]
+    fn app_id_forms() {
+        for id in [
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+            "Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows",
+            "Custom.App!Main",
+            "Microsoft.Windows.Explorer",
+            "Microsoft.AutoGenerated.{923DD477-5846-686B-A659-0FCCD73851A8}",
+            "308046B0AF4A39CB",
+            "Vendor Tool 2",
+            "Àlfa.exe",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\Git\git-bash.exe",
+            r"{1ac14e77-02e7-4e5d-b744-2eb1ae5198b7}\notepad.exe",
+            r"{D65231B0-B2F1-4857-A4CE-A8E7C6EA7D27}\WindowsPowerShell\v1.0\powershell.exe",
+            r"{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}\Notepad++\notepad++.exe",
+            r"C:\Tools\tool.exe",
+            r"d:\Games\Some Game (x64)\game.exe",
+            "steam://rungameid/440",
+            "com.epicgames.launcher://apps/Game?action=launch&silent=true",
+        ] {
+            assert!(is_app_id(id), "{id}");
+        }
+        let long = format!("Vendor.{}", "x".repeat(APP_ID_MAX_BYTES));
+        for id in [
+            "",
+            long.as_str(),
+            " Vendor.Tool",
+            "Vendor.Tool ",
+            "Vendor.\u{7}Tool",
+            "Vendor.Tool\u{85}",
+            ".",
+            "..",
+            "Vendor..Tool",
+            r"\\server\share\tool.exe",
+            r"\\?\C:\Tools\tool.exe",
+            r"\??\C:\Tools\tool.exe",
+            r"\Tools\tool.exe",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\..\tool.exe",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\.\tool.exe",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\Git\\git-bash.exe",
+            r"{6D809377}\Telegram\Telegram.exe",
+            r"{6D809377-6AF0-444B-8957-A3773F02200G}\tool.exe",
+            r"Vendor\tool.exe",
+            r"C:\Tools\..\tool.exe",
+            r"C:\Tools/tool.exe",
+            r"C:\Tools\tool.exe:hidden",
+            r"C:\Tools\tool?.exe",
+            "C:tool.exe",
+            "C:",
+            r"C:\",
+            r"1:\tool.exe",
+            "Vendor.Tool:hidden",
+            "Vendor/Tool",
+            "Vendor|Tool",
+            "file://server/share/tool.exe",
+            "FILE://server/share/tool.exe",
+            "http://example.com/",
+            "https://example.com/",
+            "shell://AppsFolder",
+            "c://tool.exe",
+            "steam://",
+            "steam://run game",
+            r"steam://run\game",
+            "9steam://rungameid/440",
+        ] {
+            assert!(!is_app_id(id), "{id:?}");
+        }
+    }
+
+    /// Every id of this machine's AppsFolder has a form `is_app_id` takes (run by hand: `cargo test -- --ignored
+    /// --nocapture real_apps_folder_ids_have_appsfolder_forms`). Prints counts, and the shape of an id refused (its
+    /// letters and digits masked), never an id.
+    #[test]
+    #[ignore = "reads this machine's AppsFolder"]
+    fn real_apps_folder_ids_have_appsfolder_forms() {
+        // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let list = enum_apps_folder();
+        let shape = |id: &str| -> String { id.chars().map(|c| if c.is_alphanumeric() { 'a' } else { c }).collect() };
+        let refused: Vec<String> = list.iter().filter(|a| !is_app_id(&a.id)).map(|a| shape(&a.id)).collect();
+        println!("AppsFolder: {} ids, {} refused: {refused:?}", list.len(), refused.len());
+        assert!(list.len() > 10, "too few apps: {}", list.len());
+        assert!(refused.is_empty());
+        if hr.is_ok() {
+            // SAFETY: paired with the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
     }
 
     #[test]
@@ -3716,13 +4004,13 @@ mod tests {
             assert!(!s.per_user, "{:?} reached the shell's display name", s.path);
             s.path.ends_with("Tool.lnk").then(|| "Strumento".to_string())
         };
-        let (map, stats) = index_links(&files, &mut rust, &mut rust_display, &mut com_target, &mut com_display);
+        let (map, stats) = index_links(&files, None, &mut rust, &mut rust_display, &mut com_target, &mut com_display);
         let me = |p: &str| std::path::PathBuf::from(p);
         let per_user =
             [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Broken.lnk"), me(r"C:\Me\Magnify.lnk"), me(r"C:\Me\Args.lnk")];
         assert_eq!(rust_calls, per_user);
         assert_eq!(rust_names, [me(r"C:\Me\Mine.lnk"), me(r"C:\Me\Magnify.lnk")], "named only when indexed");
-        assert_eq!(stats, IndexStats { rust_parsed: 2, rust_unresolved: [1, 1, 0, 0, 0, 0], com_common: 3 });
+        assert_eq!(stats, IndexStats { rust_parsed: 2, rust_unresolved: [1, 1, 0, 0, 0, 0], com_common: 3, agent: 0 });
         let windows_exe = norm_path(&expand_env(r"%SystemRoot%\System32\x.exe"));
         assert_eq!(map.get(&windows_exe).map(String::as_str), Some("Lente"), "its desktop.ini name: {map:?}");
         assert_eq!(map.get(r"c:\me\mine.exe").map(String::as_str), Some("Mine"), "per-user: else the file name");
@@ -3785,16 +4073,18 @@ mod tests {
 
     #[test]
     fn index_line_counts_by_kind() {
-        let mut stats = IndexStats { rust_parsed: 47, rust_unresolved: [0; LnkMiss::ALL.len()], com_common: 146 };
+        let mut stats =
+            IndexStats { rust_parsed: 47, rust_unresolved: [0; LnkMiss::ALL.len()], com_common: 146, agent: 0 };
         let line = |s: &IndexStats| index_line(201, 112, s, 0);
         assert_eq!(
             line(&stats),
-            "201 shortcuts scanned, 112 exe targets, per-user parsed in Rust: 47, unresolved: 0, per-user via COM: 0"
+            "201 shortcuts scanned, 112 exe targets, per-user parsed in Rust: 47, per-user via agent: 0, unresolved: 0, \
+             per-user via COM: 0"
         );
         stats.rust_unresolved = [5, 3, 0, 0, 0, 1];
         assert_eq!(
             line(&stats),
-            "201 shortcuts scanned, 112 exe targets, per-user parsed in Rust: 47, \
+            "201 shortcuts scanned, 112 exe targets, per-user parsed in Rust: 47, per-user via agent: 0, \
              unresolved: 9 (arguments: 5, shell item: 3, damaged: 1), per-user via COM: 0"
         );
         stats.rust_unresolved = [1; LnkMiss::ALL.len()];
@@ -3810,7 +4100,7 @@ mod tests {
     fn start_index_counts() {
         // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        let (_, line) = start_index();
+        let (_, line) = start_index(None);
         println!("{line}");
         if hr.is_ok() {
             // SAFETY: paired with the successful CoInitializeEx above.
@@ -3902,7 +4192,7 @@ mod tests {
     fn start_index_uses_the_shell_display_name() {
         // SAFETY: COM STA for this test thread, paired with CoUninitialize below.
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        let map = build_start_index();
+        let map = build_start_index(None);
         let apps = enum_apps_folder();
         let sys = system_dir().expect("system dir");
         let name = map.get(&norm_path(&sys.join("mstsc.exe").to_string_lossy())).expect("mstsc shortcut");
@@ -3991,8 +4281,6 @@ mod tests {
 
     #[test]
     fn stems_and_suffixes() {
-        assert_eq!(pretty_stem("stremio-shell-ng"), "Stremio");
-        assert_eq!(pretty_stem("zen"), "Zen");
         assert_eq!(strip_paren_suffix("PowerToys (Preview)"), "PowerToys");
         assert_eq!(strip_paren_suffix("Steam"), "Steam");
         assert_eq!(expand_env("%NOPE_X%\\a"), "%NOPE_X%\\a");
@@ -4585,10 +4873,10 @@ mod tests {
 
     #[test]
     fn the_safety_timer_follows_the_icon_jobs() {
-        assert!(!timer_wanted(false, false));
-        assert!(timer_wanted(true, false));
-        assert!(timer_wanted(false, true));
-        assert!(timer_wanted(true, true));
+        assert!(!timer_wanted(false, false, false));
+        assert!(timer_wanted(true, false, false));
+        assert!(timer_wanted(false, true, false));
+        assert!(timer_wanted(true, true, false));
     }
 
     #[test]
@@ -5022,6 +5310,7 @@ mod tests {
             ids: ids.into(),
             progress: Arc::clone(&progress),
             started: Instant::now(),
+            via: Via::Child,
         };
         reader.run(input, output);
         let _ = child.wait();
@@ -5076,7 +5365,17 @@ mod tests {
             start_job: None,
             launcher_job: None,
             icons_child_off: false,
+            agent: crate::agent::Link::unavailable(),
+            own_apps: None,
+            // The elevated dock, whose own helpers `own_ids` guards.
+            elevation: Some(true),
         }
+    }
+
+    /// A catalogue of `ids` as the dock lists it itself (its child, or here): `Shell::own_apps`.
+    fn own_listing(ids: &[&str]) -> Arc<Arena> {
+        let apps: Vec<StartApp> = ids.iter().map(|id| StartApp { id: id.to_string(), name: id.to_string() }).collect();
+        Arc::new(catalog::build_apps(&apps, None).unwrap())
     }
 
     /// A job whose "child" waits on its input until it is killed (`cmd /c pause` on a pipe), or exits at once.
@@ -5101,8 +5400,13 @@ mod tests {
             )
             .unwrap();
         }
-        let job =
-            IconJob { child, px: 24, ids: strings(ids).into(), progress: Arc::default(), started: Instant::now() };
+        let job = IconJob {
+            source: IconSource::Child(child),
+            px: 24,
+            ids: strings(ids).into(),
+            progress: Arc::default(),
+            started: Instant::now(),
+        };
         (job, seen)
     }
 
@@ -5133,7 +5437,7 @@ mod tests {
         assert!(sh.launcher_job.is_none());
         assert!(ended(launcher_seen, 0), "killed and reaped before the request returned");
         // Start's job is untouched.
-        let still = sh.start_job.as_mut().map(|j| matches!(j.child.try_wait(), Ok(None)));
+        let still = sh.start_job.as_mut().map(|j| !j.exited());
         assert_eq!(still, Some(true));
         // Start's own release ends it.
         sh.handle_request(ShellRequest::StartRelease);
@@ -5160,6 +5464,7 @@ mod tests {
                 ids: strings(&["a", "b"]).into(),
                 progress: Arc::clone(&progress),
                 started: Instant::now(),
+                via: Via::Child,
             };
             reader.run(input, output);
             let _ = child.wait();
@@ -5211,8 +5516,9 @@ mod tests {
             .collect();
         let want = [(true, 24, ten[..8].to_vec()), (true, 24, ten[8..].to_vec()), (false, 24, strings(&["x", "y"]))];
         assert_eq!(queued, want);
-        // From now on no child starts: the ids come back to be made here.
-        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, strings(&["k"])), Err(strings(&["k"])));
+        // From now on no child starts: the ids of apps the dock listed itself come back to be made here.
+        sh.own_apps = Some(own_listing(&["k", "m"]));
+        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, strings(&["k"]), true), Err(strings(&["k"])));
         sh.start_menu_icons(strings(&["m"]));
         assert!(sh.start_job.is_none() && sh.launcher_job.is_none());
         assert!(matches!(sh.pending.pop_front(), Some(ShellRequest::StartIcons { icon_px: 24, ids }) if ids == ["m"]));
@@ -5228,7 +5534,7 @@ mod tests {
         progress.delivered.store(1, Relaxed);
         sh.start_sent = strings(&["a", "b", "c", "z"]).into_iter().collect();
         sh.start_job = Some(job);
-        assert!(ended(seen, 10_000));
+        assert!(ended(seen, 60_000));
         if let Some(j) = sh.start_job.as_mut() {
             j.started = Instant::now();
         }
@@ -5243,14 +5549,665 @@ mod tests {
         // A child still running within its deadline stays; past it (2 s and 50 ms per id) it is killed and reaped.
         let (job, seen) = fake_job(&["x"], true);
         sh.launcher_job = Some(job);
+        if let Some(j) = sh.launcher_job.as_mut() {
+            j.started = Instant::now();
+        }
         sh.reap_icon_jobs();
         assert!(sh.launcher_job.is_some());
         if let Some(j) = sh.launcher_job.as_mut() {
             j.started = Instant::now().checked_sub(Duration::from_millis(2_100)).unwrap();
         }
         sh.reap_icon_jobs();
-        assert!(sh.launcher_job.is_none() && ended(seen, 0));
+        assert!(sh.launcher_job.is_none() && ended(seen, 60_000), "the killed child ends");
         assert!(sh.start_sent.len() == 2, "the launcher's job touches nothing of Start's");
         assert!(sh.pending.is_empty() && !sh.icons_child_off, "a job with a header, or killed: nothing made here");
+    }
+
+    /// The dock's own helpers (an elevated icons child, or this thread) make no icon for an id only the agent gave:
+    /// while the agent's listing stands, or for an id the dock's own listing does not hold, what the agent did not
+    /// answer gets no icon from the dock (its row keeps the placeholder), and Start asks for it again at its next
+    /// listing.
+    #[test]
+    fn agent_ids_get_no_icon_from_the_dock() {
+        let mut sh = test_shell();
+        sh.start_px = 24;
+        // No child starts in this test: what would go to one comes back to be made here.
+        sh.icons_child_off = true;
+        // The agent's listing stands, and the agent cannot serve.
+        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, strings(&["Agent.App"]), true), Ok(()));
+        sh.start_sent = strings(&["Agent.App"]).into_iter().collect();
+        sh.start_menu_icons(strings(&["Agent.App"]));
+        assert!(sh.pending.is_empty(), "nothing is made here");
+        assert!(sh.start_sent.is_empty(), "Start asks for it again at its next listing");
+        // A listing of the dock's own: its apps go to the dock's helpers, an id it does not hold still does not.
+        sh.own_apps = Some(own_listing(&["Own.App"]));
+        let ids = strings(&["Own.App", "Agent.App"]);
+        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, ids.clone(), true), Err(strings(&["Own.App"])));
+        // An agent's job that gave no header: its rest goes to the dock's helpers for the dock's own apps only.
+        sh.start_sent = ids.iter().cloned().collect();
+        let progress = Arc::new(IconProgress::default());
+        progress.no_header.store(true, SeqCst);
+        progress.ended.store(true, SeqCst);
+        let source = IconSource::Agent { id: 7 };
+        sh.start_job = Some(IconJob { source, px: 24, ids: ids.into(), progress, started: Instant::now() });
+        sh.reap_icon_jobs();
+        assert!(sh.start_job.is_none());
+        let queued: Vec<ShellRequest> = sh.pending.drain(..).collect();
+        assert!(matches!(&queued[..], [ShellRequest::StartIcons { icon_px: 24, ids }] if ids == &["Own.App"]));
+        assert!(sh.start_sent.len() == 1 && sh.start_sent.contains("Own.App"));
+        // Held nowhere else (no launcher), the dock's own listing goes with the rest of Start's data at the release.
+        sh.handle_request(ShellRequest::StartRelease);
+        assert!(sh.own_apps.is_none());
+    }
+
+    /// Start's release keeps the dock's own listing while the UI holds it too: the launcher keeps its catalogue up to
+    /// 10 minutes after Start closed, and while the agent cannot serve (a broken agent, or none: a dock not elevated)
+    /// the icons of its rows are the dock's helpers' to make. Held nowhere else, it goes with Start's data. A dock
+    /// known not to be elevated has no elevated helper: every id goes to its helpers, listed or not.
+    #[test]
+    fn launcher_icons_after_start_release_when_the_agent_cannot_serve() {
+        let mut sh = test_shell();
+        // No child starts in this test: what would go to one comes back to be made here.
+        sh.icons_child_off = true;
+        // A listing of the dock's own, which the launcher keeps.
+        let catalogue = own_listing(&["Own.App"]);
+        sh.own_apps = Some(Arc::clone(&catalogue));
+        sh.handle_request(ShellRequest::StartRelease);
+        let ids = strings(&["Own.App"]);
+        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, ids.clone(), true), Err(ids));
+        // The launcher let it go: the next release frees it.
+        drop(catalogue);
+        sh.handle_request(ShellRequest::StartRelease);
+        assert!(sh.own_apps.is_none());
+        // Not elevated: with no listing of the dock's own, every id still comes back to be made.
+        sh.elevation = Some(false);
+        let ids = strings(&["Own.App", "Agent.App"]);
+        assert_eq!(sh.start_icon_job(IconClient::Launcher, 24, ids.clone(), true), Err(ids));
+    }
+
+    /// "Open file location" has the elevated dock resolve an app's file (the shell's link target) only for an id that
+    /// an enumeration the dock made itself lists, with that enumeration's string: its own last listing, else a fresh
+    /// one. An id only the agent gave never reaches the shell: no file to show.
+    #[test]
+    fn reveal_resolves_only_ids_the_dock_lists_itself() {
+        use std::cell::{Cell, RefCell};
+        let own = own_listing(&["Own.App"]);
+        let (enumerated, asked) = (Cell::new(0), RefCell::new(Vec::new()));
+        let reveal = |own: Option<&Arena>, id: &str| {
+            let mut enumerate = || {
+                enumerated.set(enumerated.get() + 1);
+                vec![StartApp { id: "Fresh.App".into(), name: "Fresh".into() }]
+            };
+            let mut target = |id: &str| {
+                asked.borrow_mut().push(id.to_string());
+                Some(format!(r"C:\Apps\{id}.exe"))
+            };
+            reveal_target(own, id, &mut enumerate, &mut target)
+        };
+        // An app of the dock's own listing: resolved at once.
+        assert_eq!(reveal(Some(&*own), " Own.App"), Some(r"C:\Apps\Own.App.exe".to_string()));
+        assert_eq!(enumerated.get(), 0);
+        // Not in it, or the agent's listing stands: a fresh enumeration of the dock's decides.
+        assert_eq!(reveal(None, "Fresh.App"), Some(r"C:\Apps\Fresh.App.exe".to_string()));
+        assert_eq!(reveal(None, "Agent.App"), None);
+        assert_eq!(reveal(Some(&*own), "Agent.App"), None);
+        assert_eq!(enumerated.get(), 3);
+        assert_eq!(*asked.borrow(), ["Own.App", "Fresh.App"], "nothing else reached the shell");
+    }
+
+    /// "Run as administrator" (Start's, and the launcher's Ctrl+Shift+Enter) has Explorer elevate only an app that an
+    /// enumeration the dock made itself lists, by that enumeration's string: its own last listing, else a fresh one. An
+    /// id only the agent gave (a drive path under a row's familiar name, say) never reaches the shell: refused, so the
+    /// launcher pushes no `LaunchFailed`.
+    #[test]
+    fn run_as_admin_elevates_only_ids_the_dock_lists_itself() {
+        use std::cell::Cell;
+        let own = own_listing(&["Own.App"]);
+        let enumerated = Cell::new(0);
+        let mut enumerate = || {
+            enumerated.set(enumerated.get() + 1);
+            vec![StartApp { id: "Fresh.App".into(), name: "Fresh".into() }]
+        };
+        let mut calls = Vec::new();
+        let mut admin = |id: &str, mine: Option<&Arena>, by: LaunchBy, ok: bool| {
+            launch_app_admin_with(id, mine, by, &mut enumerate, &mut recorder(&mut calls, ok))
+        };
+        // An app of the dock's own listing: elevated at once. Not in it, or the agent's listing stands: a fresh
+        // enumeration of the dock's decides.
+        assert_eq!((admin(" Own.App", Some(&*own), LaunchBy::Shared, true), enumerated.get()), (Ok(()), 0));
+        assert_eq!((admin("Fresh.App", None, LaunchBy::Launcher, true), enumerated.get()), (Ok(()), 1));
+        // Ids only the agent gave: refused before any shell call.
+        for id in ["Agent.App", r"C:\Users\Public\x\powershell.exe", ""] {
+            for mine in [None, Some(&*own)] {
+                let r = admin(id, mine, LaunchBy::Launcher, true);
+                assert!(matches!(r, Err(Fail::Refused(_))), "{id:?}: {r:?}");
+                assert!(failure_event(LaunchKind::Admin, &r).is_none(), "{id:?}");
+            }
+        }
+        assert_eq!(enumerated.get(), 5, "an empty id is refused with no enumeration");
+        // A shell call that failed is the launcher's `LaunchFailed`.
+        let r = admin("Own.App", Some(&*own), LaunchBy::Launcher, false);
+        let failed = failure_event(LaunchKind::Admin, &r);
+        assert!(matches!(failed, Some(ShellEvent::LaunchFailed { kind: LaunchKind::Admin })), "{r:?}");
+        let runas = |id: &str| (format!(r"shell:AppsFolder\{id}"), None::<String>, None::<String>, "runas");
+        let got: Vec<_> = calls.iter().map(|(f, a, d, v)| (f.clone(), a.clone(), d.clone(), v.as_str())).collect();
+        assert_eq!(got, [runas("Own.App"), runas("Fresh.App"), runas("Own.App")], "nothing else reached the shell");
+    }
+
+    // ---------------------------------------------------------------- the agent (AG3)
+
+    #[test]
+    fn timer_follows_the_agent() {
+        use crate::agent::tests::{Fake, ThreadLauncher};
+        use crate::agent::{AgentState, Link, IDLE};
+        assert!(!timer_wanted(false, false, false), "hidden and idle: no timer");
+        assert!(timer_wanted(false, false, true));
+        assert!(timer_wanted(true, false, true));
+        // No agent, no timer; one up, the timer; idle 30 s, Bye: no timer again.
+        assert!(!Link::unavailable().timer_wanted());
+        let mut link = Link::new(Box::new(ThreadLauncher(Fake { apps: (0, b"x".to_vec()), ..Fake::default() })));
+        assert!(!link.timer_wanted());
+        assert_eq!(link.apps(APPS_CHILD_TIMEOUT, 64), Ok((0, b"x".to_vec())));
+        assert!(matches!(link.state(), AgentState::Up { .. }));
+        assert!(link.timer_wanted(), "while the agent is up");
+        link.tick_at(Instant::now() + IDLE - Duration::from_secs(2));
+        assert!(link.timer_wanted(), "not idle yet");
+        link.tick_at(Instant::now() + IDLE);
+        assert_eq!(link.state(), AgentState::Off);
+        assert!(!link.timer_wanted(), "after the agent's Bye");
+    }
+
+    #[test]
+    fn a_refused_agent_stream_lets_the_agent_go() {
+        use crate::agent::tests::{Fake, ThreadLauncher};
+        use crate::agent::{AgentState, Link};
+        use std::io::Write;
+        // The reader: a frame refused after the header marks the job broken, not without header, unless it was stopped.
+        let broken = |stopped: bool| {
+            let progress = Arc::new(IconProgress::default());
+            progress.stopped.store(stopped, SeqCst);
+            let (output, mut input) = std::io::pipe().unwrap();
+            input.write_all(&[ICONS_HEADER, &raw_frame(5, 0, 0, 0)].concat()).unwrap();
+            drop(input);
+            let reader = IconReader {
+                ui: 0,
+                client: IconClient::Launcher,
+                px: 10,
+                ids: strings(&["a", "b"]).into(),
+                progress: Arc::clone(&progress),
+                started: Instant::now(),
+                via: Via::Agent,
+            };
+            reader.run_agent(output);
+            assert!(progress.ended.load(SeqCst) && !progress.no_header.load(SeqCst));
+            progress.broken.load(SeqCst)
+        };
+        assert!(broken(false), "a frame refused");
+        assert!(!broken(true), "stopped by the shell thread");
+        // Reaped: a whole stream is an answer; a refused one lets the agent go, as any answer the dock refuses, and
+        // nothing is made here: Start's ids leave start_sent, so its next listing asks again.
+        let mut sh = test_shell();
+        sh.agent = Link::new(Box::new(ThreadLauncher(Fake { apps: (0, b"x".to_vec()), ..Fake::default() })));
+        assert_eq!(sh.agent.apps(APPS_CHILD_TIMEOUT, 64), Ok((0, b"x".to_vec())));
+        let job = |broken: bool| {
+            let progress = Arc::new(IconProgress::default());
+            progress.broken.store(broken, SeqCst);
+            progress.ended.store(true, SeqCst);
+            IconJob {
+                source: IconSource::Agent { id: 999 },
+                px: 24,
+                ids: strings(&["a", "b"]).into(),
+                progress,
+                started: Instant::now(),
+            }
+        };
+        for broken in [false, true] {
+            sh.start_sent = strings(&["a", "b"]).into_iter().collect();
+            sh.start_job = Some(job(broken));
+            sh.reap_icon_jobs();
+            assert!(sh.start_job.is_none() && sh.start_sent.is_empty() && sh.pending.is_empty(), "{broken}");
+            assert_eq!(matches!(sh.agent.state(), AgentState::Up { .. }), !broken, "{broken}");
+        }
+        assert_eq!(sh.agent.state(), AgentState::Off, "one failure, counted, and the agent killed");
+    }
+
+    #[test]
+    fn agent_apps_go_through_apps_from_child() {
+        use crate::agent::tests::{Fake, ThreadLauncher};
+        use crate::agent::{AgentState, Link};
+        let list = [
+            StartApp { id: "Vendor.Tool".into(), name: "Tool".into() },
+            StartApp { id: "Vendor.Editor_x!App".into(), name: "Editor".into() },
+        ];
+        let bytes = catalog::encode_app_list(&list, None).unwrap();
+        let mut link = Link::new(Box::new(ThreadLauncher(Fake { apps: (0, bytes.clone()), ..Fake::default() })));
+        let via_agent = apps_from_child(link.apps(APPS_CHILD_TIMEOUT, Caps::APPS.bytes)).unwrap();
+        let via_child = apps_from_child(Ok((0, bytes))).unwrap();
+        assert_eq!(via_agent.len(), via_child.len());
+        for i in 0..via_child.len() {
+            assert_eq!(via_agent.view().id(i), via_child.view().id(i));
+            assert_eq!(via_agent.view().name(i), via_child.view().name(i));
+        }
+        assert_eq!(via_agent.raw(), via_child.raw(), "the same arena, byte for byte");
+        // The child's own codes: nothing listed is the in-process path's cue, as from a child.
+        let mut empty =
+            Link::new(Box::new(ThreadLauncher(Fake { apps: (APPS_EXIT_EMPTY, Vec::new()), ..Fake::default() })));
+        assert!(apps_from_child(empty.apps(APPS_CHILD_TIMEOUT, Caps::APPS.bytes)).unwrap_err().contains("exit code 3"));
+        // A listing over the cap is refused before it is kept, and the agent is let go.
+        let mut big = Link::new(Box::new(ThreadLauncher(Fake { apps: (0, vec![0; 100]), ..Fake::default() })));
+        assert!(big.apps(APPS_CHILD_TIMEOUT, 99).is_err());
+        assert_eq!(big.state(), AgentState::Off);
+    }
+
+    /// Every id of the agent's listing passes the AppsFolder id grammar before any use: an app whose id fails is left
+    /// out of the catalogue, the others are kept.
+    #[test]
+    fn agent_listing_leaves_out_ids_of_no_appsfolder_form() {
+        use crate::agent::tests::{Fake, ThreadLauncher};
+        use crate::agent::Link;
+        let good = [
+            "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\Git\git-bash.exe",
+            r"C:\Tools\tool.exe",
+            "308046B0AF4A39CB",
+            "steam://rungameid/440",
+        ];
+        let long = format!("Vendor.{}", "x".repeat(1100));
+        let bad = [
+            r"\\server\share\tool.exe",
+            r"\\?\C:\Tools\tool.exe",
+            r"{6D809377-6AF0-444B-8957-A3773F02200E}\..\..\Windows\tool.exe",
+            r"C:\Tools\..\tool.exe",
+            "C:tool.exe",
+            r"C:\Tools\tool.exe:hidden",
+            "Vendor.Tool:hidden",
+            "Vendor/Tool",
+            r"Vendor.Tool\tool.exe",
+            "Vendor.\u{1b}Tool",
+            "file://server/share/tool.exe",
+            "https://example.com/",
+            long.as_str(),
+        ];
+        let list: Vec<StartApp> = good
+            .iter()
+            .chain(&bad)
+            .enumerate()
+            .map(|(i, id)| StartApp { id: id.to_string(), name: format!("App {i}") })
+            .collect();
+        let bytes = catalog::encode_app_list(&list, None).unwrap();
+        let mut link = Link::new(Box::new(ThreadLauncher(Fake { apps: (0, bytes), ..Fake::default() })));
+        let (arena, _) = list_apps_arena(false, &mut link);
+        let v = arena.view();
+        let mut ids: Vec<&str> = (0..v.len()).map(|i| v.id(i)).collect();
+        ids.sort_unstable();
+        let mut want = good.to_vec();
+        want.sort_unstable();
+        assert_eq!(ids, want);
+    }
+
+    /// The apps arena of 40 made-up apps, as `--start-apps` and the agent print it.
+    fn fuzz_seed_arena() -> Vec<u8> {
+        let list: Vec<StartApp> =
+            (0..40).map(|i| StartApp { id: format!("Vendor.App{i}_x!App"), name: format!("App {i}") }).collect();
+        catalog::encode_app_list(&list, None).unwrap()
+    }
+
+    /// Seeded damage to an apps arena, as `launcher/arena.rs`'s `never_panics` does, through `apps_from_child` as the
+    /// agent's bytes reach it: never a panic, and every arena kept is within the apps caps and readable.
+    fn fuzz_apps_arena(cases: u32, seed: u64) {
+        let valid = fuzz_seed_arena();
+        let mut rng = crate::launcher::testkit::XorShift::new(seed);
+        let mut kept = 0u32;
+        for round in 0..cases {
+            let mut b = valid.clone();
+            match round % 5 {
+                0 => {
+                    for _ in 0..1 + rng.next_u64() % 4 {
+                        let at = rng.next_u64() as usize % b.len();
+                        b[at] = rng.next_u64() as u8;
+                    }
+                }
+                1 => b.truncate(rng.next_u64() as usize % (b.len() + 1)),
+                2 => {
+                    let at = (rng.next_u64() as usize % (b.len() / 4)) * 4;
+                    let v = *rng.pick(&[u32::MAX, 0x7FFF_FFFF, 0x8000_0000, 0x1_0000, 0xFFFF, 0, 1, 2001]);
+                    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                3 => b.extend((0..1 + rng.next_u64() % 64).map(|_| rng.next_u64() as u8)),
+                _ => {
+                    // Random bytes behind the arena's own header line.
+                    let head = b.iter().position(|&c| c == b'\n').map_or(0, |i| i + 1);
+                    b.truncate(head);
+                    b.extend((0..rng.next_u64() % 2000).map(|_| rng.next_u64() as u8));
+                }
+            }
+            if let Ok(a) = apps_from_child(Ok((0, b))) {
+                kept += 1;
+                assert!(a.len() <= Caps::APPS.entries && a.raw().len() <= Caps::APPS.bytes);
+                let v = a.view();
+                for i in 0..a.len() {
+                    let _ = (v.id(i), v.name(i));
+                }
+            }
+        }
+        assert!(kept < cases, "damage is refused");
+    }
+
+    #[test]
+    fn fuzz_apps_arena_10k() {
+        fuzz_apps_arena(10_000, 0xA995_0001);
+    }
+
+    #[test]
+    #[ignore = "nightly: 1,000,000 inputs"]
+    fn fuzz_apps_arena_1m() {
+        fuzz_apps_arena(1_000_000, 0xA995_0002);
+    }
+
+    /// A valid icons stream (the one `icon_frame_reader_never_panics` damages), damaged the same way, then cut into
+    /// chunk payloads of 1..=CHUNK_MAX bytes that cross the codec and the link's routing into a stream's sink, and read
+    /// back by the job reader's decoder: never a panic, the bytes reassembled exactly, never more than n frames, no
+    /// frame larger than px x px x 4.
+    fn fuzz_icon_frames(cases: u32, seed: u64) {
+        use crate::agent::tests::Memory;
+        use crate::agent::{route, Route, Shared};
+        use crate::agent_proto::{decode_reply, encode_reply, Reply, CHUNK_MAX};
+        let mut rng = crate::launcher::testkit::XorShift::new(seed);
+        let valid = [
+            ICONS_HEADER.to_vec(),
+            encode_icon_frame(0, Some(&IconBitmap::new(8, 8))),
+            encode_icon_frame(2, None),
+            encode_icon_frame(3, Some(&IconBitmap { width: 8, height: 8, pixels: vec![0xFF00_00FF; 64] })),
+        ]
+        .concat();
+        let mut frames = 0usize;
+        for round in 0..cases {
+            let mut stream: Vec<u8> = if round % 2 == 0 {
+                let mut b = valid.clone();
+                for _ in 0..1 + rng.next_u64() % 4 {
+                    let at = (rng.next_u64() as usize) % b.len();
+                    b[at] = rng.next_u64() as u8;
+                }
+                b.truncate((rng.next_u64() as usize) % (b.len() + 1));
+                b
+            } else {
+                (0..rng.next_u64() % 700).map(|_| rng.next_u64() as u8).collect()
+            };
+            if round % 4 == 1 {
+                stream.splice(0..0, ICONS_HEADER.iter().copied());
+            }
+            let shared = Shared::default();
+            let sink = Arc::new(Memory::default());
+            shared.routes.lock().unwrap().insert(1, Route::Stream(sink.clone()));
+            let mut at = 0;
+            loop {
+                let size = if rng.next_u64().is_multiple_of(8) {
+                    1 + rng.next_u64() as usize % CHUNK_MAX
+                } else {
+                    1 + rng.next_u64() as usize % 64
+                };
+                let end = (at + size).min(stream.len());
+                let last = end == stream.len();
+                let frame = encode_reply(&Reply::Chunk { id: 1, last, bytes: stream[at..end].to_vec() }).unwrap();
+                assert!(route(&shared, decode_reply(&frame).unwrap()));
+                at = end;
+                if last {
+                    break;
+                }
+            }
+            assert!(route(&shared, Reply::End { id: 1, status: 0 }));
+            let got = std::mem::take(&mut *sink.0.lock().unwrap());
+            assert_eq!(got, stream);
+            let n = (rng.next_u64() % 6) as usize;
+            let px = *rng.pick(&[8u32, 9, 30, 256]);
+            let mut r = &got[..];
+            if read_icon_header(&mut r).is_err() {
+                continue;
+            }
+            let (mut prev, mut count): (Option<usize>, usize) = (None, 0);
+            while let Ok(Some((i, icon))) = read_icon_frame(&mut r, n, px, prev) {
+                assert!(i < n && prev.is_none_or(|p| i > p));
+                if let Some(b) = icon {
+                    assert_eq!(b.pixels.len() * 4, (px * px * 4) as usize);
+                }
+                prev = Some(i);
+                count += 1;
+                assert!(count <= n);
+            }
+            frames += count;
+        }
+        assert!(frames > cases as usize / 20, "the damaged streams reach the frames: {frames}");
+    }
+
+    #[test]
+    fn fuzz_icon_frames_10k() {
+        fuzz_icon_frames(10_000, 0x1C0F_0003);
+    }
+
+    #[test]
+    #[ignore = "nightly: 1,000,000 inputs"]
+    fn fuzz_icon_frames_1m() {
+        fuzz_icon_frames(1_000_000, 0x1C0F_0004);
+    }
+
+    // ---------------------------------------------------------------- per-user links through the agent (AG4)
+
+    /// The agent's answer for the per-user folder `root`.
+    fn agent_links_at(root: &str, links: &[(&str, &str, &str)]) -> AgentLinks {
+        let rec = |(rel, target, name): &(&str, &str, &str)| crate::agent_proto::LinkRec {
+            id: 1,
+            rel: rel.to_string(),
+            target: target.to_string(),
+            name: name.to_string(),
+        };
+        AgentLinks::new(root.into(), links.iter().map(rec).collect())
+    }
+
+    /// The agent's answer for the per-user folder `C:\Me`.
+    fn agent_links(links: &[(&str, &str, &str)]) -> AgentLinks {
+        agent_links_at(r"C:\Me", links)
+    }
+
+    #[test]
+    fn index_uses_agent_links() {
+        let l = |p: &str, per_user: bool| StartLnk { path: p.into(), per_user };
+        let files = [
+            l(r"C:\Me\Mine.lnk", true),
+            l(r"C:\Me\Tools\Loc.lnk", true),
+            l(r"C:\Me\Other.lnk", true),
+            l(r"C:\Me\Net.lnk", true),
+            l(r"C:\Me\Plain.lnk", true),
+            l(r"C:\All\Tool.lnk", false),
+        ];
+        let agent = agent_links(&[
+            ("Mine.lnk", r"C:\Apps\mine.exe", "Mine"),
+            // A per-user link to a localized program: the shell's name, from the agent (its case aside).
+            (r"tools\loc.lnk", r"C:\Apps\loc.exe", "Programma localizzato"),
+            (r"Net.lnk", r"\\server\share\net.exe", "Net"),
+            ("Plain.lnk", r"C:\Apps\plain.exe", ""),
+            ("Elsewhere.lnk", r"C:\Apps\elsewhere.exe", "Elsewhere"),
+        ]);
+        let mut rust_calls = Vec::new();
+        let mut rust = |s: &StartLnk| {
+            rust_calls.push(s.path.clone());
+            Ok(r"C:\Me\other.exe".to_string())
+        };
+        let mut rust_names = Vec::new();
+        let mut rust_display = |s: &StartLnk| {
+            rust_names.push(s.path.clone());
+            None
+        };
+        let mut com_target = |s: &StartLnk| Some(format!(r"C:\All\{}.exe", s.path.file_stem()?.to_string_lossy()));
+        let mut com_display = |_: &StartLnk| None;
+        let (map, stats) =
+            index_links(&files, Some(&agent), &mut rust, &mut rust_display, &mut com_target, &mut com_display);
+        // The Rust parser reads only the per-user link the agent did not answer.
+        let other = std::path::PathBuf::from(r"C:\Me\Other.lnk");
+        assert_eq!(rust_calls, std::slice::from_ref(&other));
+        assert_eq!(rust_names, [other]);
+        assert_eq!(map.get(r"c:\apps\loc.exe").map(String::as_str), Some("Programma localizzato"));
+        assert_eq!(map.get(r"c:\apps\mine.exe").map(String::as_str), Some("Mine"));
+        assert_eq!(map.get(r"c:\apps\plain.exe").map(String::as_str), Some("Plain"), "no shell name: the file's");
+        assert_eq!(map.get(r"c:\me\other.exe").map(String::as_str), Some("Other"));
+        assert!(!map.keys().any(|k| k.contains("net.exe") || k.contains("elsewhere")), "{map:?}");
+        let refused = LnkMiss::ALL.iter().position(|&k| k == LnkMiss::Refused).unwrap();
+        let mut unresolved = [0; LnkMiss::ALL.len()];
+        unresolved[refused] = 1;
+        assert_eq!(stats, IndexStats { rust_parsed: 1, rust_unresolved: unresolved, com_common: 1, agent: 3 });
+    }
+
+    #[test]
+    fn agent_absent_keeps_the_rust_parser() {
+        let l = |p: &str| StartLnk { path: p.into(), per_user: true };
+        let files = [l(r"C:\Me\Mine.lnk"), l(r"C:\Me\Args.lnk"), l(r"C:\All\Not mine.lnk")];
+        let run = |agent: Option<&AgentLinks>| {
+            let mut calls = 0;
+            let mut rust = |s: &StartLnk| {
+                calls += 1;
+                if s.path.ends_with("Args.lnk") {
+                    Err(LnkMiss::Arguments)
+                } else {
+                    Ok(format!(r"C:\Apps\{}.exe", s.path.file_stem().unwrap().to_string_lossy()))
+                }
+            };
+            let mut display = |_: &StartLnk| None;
+            let mut com = |_: &StartLnk| -> Option<String> { panic!("no all-users link here") };
+            let mut com_display = |_: &StartLnk| -> Option<String> { panic!("no all-users link here") };
+            let (map, stats) = index_links(&files, agent, &mut rust, &mut display, &mut com, &mut com_display);
+            let mut pairs: Vec<(String, String)> = map.into_iter().collect();
+            pairs.sort();
+            (pairs, stats, calls)
+        };
+        // No agent, an agent that answered nothing, one whose folder is another: today's path, the same output.
+        let none = run(None);
+        assert_eq!(none.2, 3);
+        assert_eq!(none.1, IndexStats { rust_parsed: 2, rust_unresolved: [1, 0, 0, 0, 0, 0], com_common: 0, agent: 0 });
+        assert_eq!(none.0.len(), 2);
+        assert_eq!(run(Some(&agent_links(&[]))), none);
+        assert_eq!(run(Some(&agent_links_at(r"D:\Else", &[("Mine.lnk", r"C:\x.exe", "X")]))), none);
+    }
+
+    #[test]
+    fn stats_line_counts_agent_links() {
+        let mut unresolved = [0; LnkMiss::ALL.len()];
+        unresolved[0] = 2;
+        let stats = IndexStats { rust_parsed: 3, rust_unresolved: unresolved, com_common: 40, agent: 17 };
+        let line = index_line(62, 51, &stats, 0);
+        assert!(
+            line.contains("per-user parsed in Rust: 3, per-user via agent: 17, unresolved: 2 (arguments: 2)"),
+            "{line}"
+        );
+        assert!(!line.contains('\\') && !line.contains(".exe"), "counts only: {line}");
+    }
+
+    // ---------------------------------------------------------------- programs a user can write (AG5)
+
+    #[test]
+    fn admin_only_exe_paths() {
+        let roots = [r"c:\windows", r"c:\program files", r"c:\program files (x86)"].map(String::from);
+        for p in [
+            r"C:\Windows\System32\notepad.exe",
+            r"c:\PROGRAM FILES\Vendor\app.exe",
+            r"C:/Program Files (x86)/Vendor/app.exe",
+            r"\\?\C:\Program Files\Vendor\app.exe",
+            r"C:\Users\me\..\..\Windows\explorer.exe",
+            r"C:\Program Files\.\Vendor\app.exe",
+        ] {
+            assert!(admin_only_exe(p, &roots), "{p}");
+        }
+        for p in [
+            r"C:\Users\me\AppData\Local\Programs\Tool\tool.exe",
+            r"D:\Tools\tool.exe",
+            r"D:\tool.exe",
+            r"\\server\share\Program Files\tool.exe",
+            r"\\?\UNC\server\share\tool.exe",
+            r"C:\Program Files\..\Users\me\tool.exe",
+            r"C:\Program FilesX\tool.exe",
+            r"C:\Windows",
+            r"C:\Windows\",
+            r"C:\..\..\tool.exe",
+            "",
+        ] {
+            assert!(!admin_only_exe(p, &roots), "{p}");
+        }
+        // The machine's own roots: from the system, never from the environment.
+        let real = admin_roots();
+        assert!(real.len() >= 2, "{} roots", real.len());
+        let notepad = system_dir().unwrap().join("notepad.exe");
+        assert!(admin_only_exe(&notepad.to_string_lossy(), real));
+        // An 8.3 form of an admin-only folder is made long first (where the volume has short names).
+        let pf = known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFiles).unwrap();
+        let wide = HSTRING::from(pf.as_os_str());
+        let mut buf = [0u16; 260];
+        // SAFETY: `wide` is NUL-terminated; `buf` is writable for its length.
+        let n = unsafe { windows::Win32::Storage::FileSystem::GetShortPathNameW(&wide, Some(&mut buf)) } as usize;
+        let short = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+        if !short.is_empty() && short.contains('~') {
+            assert!(admin_only_exe(&format!(r"{short}\Vendor\app.exe"), real), "{short}");
+        }
+    }
+
+    #[test]
+    fn exe_icon_sizes() {
+        let got: Vec<Option<u16>> = [1, 16, 17, 24, 25, 32, 33, 48, 64, 65, 256].map(exe_icon_px).to_vec();
+        assert_eq!(
+            got,
+            [Some(16), Some(16), Some(24), Some(24), Some(32), Some(32), Some(64), Some(64), Some(64), None, None]
+        );
+        // The icon path asks at the master's size; above it the dock extracts here.
+        assert_eq!(exe_icon_px(24u32.max(MASTER_PX)), Some(64));
+        assert_eq!(exe_icon_px(96u32.max(MASTER_PX)), None);
+    }
+
+    #[test]
+    fn user_writable_exe_asks_the_agent() {
+        use crate::agent::tests::{Fake, ThreadLauncher};
+        use crate::agent::{AgentState, ExeFacts, Link};
+        let user_exe = r"D:\Tools\editor.exe";
+        let icon = IconBitmap { width: 64, height: 64, pixels: vec![0xFF20_4080; 64 * 64] };
+        let facts = ExeFacts {
+            description: Some("Editor Pro".into()),
+            product: Some("Editor".into()),
+            company: Some("Vendor".into()),
+            icon: Some(icon),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = Fake { exe: facts.clone(), calls: Arc::clone(&calls), ..Fake::default() };
+        let mut link = Link::new(Box::new(ThreadLauncher(fake)));
+        // In time: the agent's strings and icon are used.
+        let info = exe_file_info(user_exe, Some(&mut link));
+        let strings = (info.description.as_deref(), info.product.as_deref(), info.company.as_deref());
+        assert_eq!(strings, (Some("Editor Pro"), Some("Editor"), Some("Vendor")));
+        let r = ResolveApp {
+            key: "k".into(),
+            exe_path: user_exe.into(),
+            aumid: None,
+            hwnd: 0,
+            icon_px: 24,
+            custom_icon: None,
+        };
+        let (b, cacheable) = extract_icon(&r, true, 24, Some(&mut link)).expect("the agent's icon");
+        assert_eq!((b.width, b.height, b.pixels[0], cacheable), (64, 64, 0xFF20_4080, true));
+        assert_eq!(calls.load(SeqCst), 2);
+        // An admin-only program, or an icon above 64 px: the agent is not asked.
+        let notepad = system_dir().unwrap().join("notepad.exe");
+        let _ = exe_file_info(&notepad.to_string_lossy(), Some(&mut link));
+        assert!(exe_icon(user_exe, 96, Some(&mut link)).is_none());
+        assert_eq!(calls.load(SeqCst), 2);
+        // Past 150 ms: today's path here (a program that does not exist reads as nothing), the late answer dropped,
+        // the agent kept.
+        let slow = Fake { exe: facts, calls: Arc::clone(&calls), slow: Duration::from_millis(600), ..Fake::default() };
+        let mut link = Link::new(Box::new(ThreadLauncher(slow)));
+        assert_eq!(link.apps(APPS_CHILD_TIMEOUT, 16), Ok((0, Vec::new())), "started");
+        let t = Instant::now();
+        let info = exe_file_info(user_exe, Some(&mut link));
+        let waited = t.elapsed();
+        assert!(waited >= EXE_INFO_DEADLINE && waited < Duration::from_millis(550), "{waited:?}");
+        assert_eq!(info.description, None, "read here: no such program");
+        assert!(matches!(link.state(), AgentState::Up { .. }));
+        std::thread::sleep(Duration::from_millis(800));
+        link.tick();
+        assert!(matches!(link.state(), AgentState::Up { .. }), "the late answer came and was dropped");
+        assert_eq!(calls.load(SeqCst), 3);
     }
 }
