@@ -172,6 +172,17 @@ impl PathBar {
         self.editing
     }
 
+    /// The edit mode with `text` and the caret at its end (a separator typed in the list moves the path here).
+    pub fn begin_edit_with(&mut self, cx: &mut EventCx, text: &str) {
+        if self.editing {
+            return;
+        }
+        self.editing = true;
+        self.field.set_text(cx, text, false);
+        cx.set_focus(self.field.node_id());
+        cx.relayout();
+    }
+
     /// Path completions: at most 8 rows under the field while it is open.
     pub fn set_completions(&mut self, cx: &mut EventCx, items: Vec<Text>) {
         self.completions = items.clone();

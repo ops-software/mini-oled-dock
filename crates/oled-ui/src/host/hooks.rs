@@ -91,6 +91,7 @@ mod tests {
         let _f: MsgOpt = a11y::on_getobject;
         let _f: Msg = a11y::on_action;
         let _f: MsgOpt = caption::on_nc;
+        let _f: fn(HWND, LPARAM) -> Option<LRESULT> = caption::system_menu;
         let _f: MsgOpt = ime::on_ime;
         let _f: fn(HWND, WPARAM) = menu::on_activate_app;
         // host/hooks.rs

@@ -8,10 +8,11 @@ use oled_ui::node::Text;
 use oled_ui::text::{TextEngine, Trim};
 use oled_ui::{
     Actions, CommandId, Event, EventCx, Focusable, Glyph, Ink, Key, LayoutCx, MouseButton, Node, NodeId, PaintCx,
-    PointP, RectP, Role, Scale, TypeRole, Widget,
+    PointP, RectP, Role, Scale, TypeRole, UiLang, Widget,
 };
 
 use super::commands::{SORT_COL_1, SORT_COL_2, SORT_COL_3, SORT_COL_4};
+use super::history::{self, History};
 use super::rows::{self, column_of};
 use super::screen::{TasksScreen, HEADER};
 use super::view::{Gauges, SortState};
@@ -38,6 +39,9 @@ struct Slot {
 pub struct GaugeHeader {
     rect: RectP,
     held: bool,
+    history: History,
+    /// The sequence number of the last frame pushed into the traces.
+    last_seq: u64,
     slots: Vec<Slot>,
     gauges: Gauges,
     sort: SortState,
@@ -58,6 +62,8 @@ impl Default for GaugeHeader {
         GaugeHeader {
             rect: RectP::EMPTY,
             held: false,
+            history: History::default(),
+            last_seq: 0,
             slots: Vec::new(),
             gauges: Gauges::default(),
             sort: SortState::default(),
@@ -98,10 +104,34 @@ fn faded(i: Ink, t: f32) -> Ink {
 }
 
 impl GaugeHeader {
-    /// The order is held (TA-T2M draws it). Stub (kept by T1a and TA-HDR): stores the flag.
+    /// The order is held: the sorted column draws its chevron outlined with a pause glyph beside it (TH2). The pause
+    /// glyph is a node of its own (the tip), so the layout runs again when the value changes.
     pub fn set_held(&mut self, cx: &mut EventCx, held: bool) {
-        let _ = cx;
+        if self.held == held {
+            return;
+        }
         self.held = held;
+        let scale = cx.scale();
+        if let Some(s) = self.slots.iter().find(|s| s.col == self.sort.column) {
+            cx.damage(RectP { t: self.rect.t + scale.px(6), b: self.rect.t + scale.px(22), ..s.rect });
+        }
+        cx.relayout();
+    }
+
+    /// The sort chevron's rect and the pause glyph's rect beside it, in the cell of slot `i`.
+    fn sort_marks(&self, i: usize, px: &dyn Fn(i32) -> i32) -> (RectP, RectP) {
+        let (s, lw) = (&self.slots[i], self.label_w.get(i).copied().unwrap_or(0));
+        let (chev_y, pause_y) = (self.rect.t + px(10), self.rect.t + px(8));
+        if s.col == ColumnId::Name {
+            let chev = RectP::wh(s.rect.l + px(16) + lw + px(4), chev_y, px(8), px(8));
+            (chev, RectP::wh(chev.r + px(4), pause_y, px(12), px(12)))
+        } else {
+            let right = s.rect.r - px(12);
+            (
+                RectP::wh(s.rect.r - px(10), chev_y, px(8), px(8)),
+                RectP::wh(right - lw - px(4) - px(12), pause_y, px(12), px(12)),
+            )
+        }
     }
 
     pub fn held(&self) -> bool {
@@ -137,18 +167,37 @@ impl GaugeHeader {
             }
         };
         let totals = [cpu, mem, io];
-        let changed = count != self.count || totals != self.totals || g.heat != self.gauges.heat || sort != self.sort;
+        // One sample per good frame; a read error or a stopped sampler brings no frame and so no sample.
+        let fresh = g.seq != 0 && g.seq != self.last_seq;
+        if fresh {
+            self.last_seq = g.seq;
+            self.history.push(cx.now_ms(), g.cpu, g.mem_load, g.io);
+        }
+
+        let columns_moved = g.show_pid != self.gauges.show_pid;
+        let changed = columns_moved
+            || count != self.count
+            || totals != self.totals
+            || g.heat != self.gauges.heat
+            || sort != self.sort;
         self.nf = nf;
         self.sort = sort;
         self.gauges = g;
         if !changed {
+            if fresh {
+                // The traces repaint alone: three 12 px rects, no blit.
+                let scale = cx.scale();
+                for r in self.trace_rects(scale).into_iter().flatten() {
+                    cx.damage(r);
+                }
+            }
             return;
         }
         self.count = count;
         self.totals = totals;
         let (scale, ts) = (cx.scale(), cx.tokens().text_scale);
         self.measure(cx.text(), scale, ts);
-        if self.rect.is_empty() {
+        if self.rect.is_empty() || columns_moved {
             cx.relayout();
         } else {
             cx.damage(self.rect);
@@ -167,6 +216,28 @@ impl GaugeHeader {
         self.label_w = self.slots.iter().map(|s| eng.width(&s.label, caption)).collect();
     }
 
+    /// The three trace rects (CPU, Memory, I/O), None before the first layout.
+    fn trace_rects(&self, scale: Scale) -> [Option<RectP>; 3] {
+        let mut out = [None; 3];
+        for s in &self.slots {
+            let which = match s.col {
+                ColumnId::Cpu => 0,
+                ColumnId::Memory => 1,
+                ColumnId::Io => 2,
+                _ => continue,
+            };
+            let top = self.rect.t + scale.px(history::TRACE_TOP);
+            let r = RectP { l: s.rect.l, r: s.rect.r - scale.px(12), t: top, b: top + scale.px(history::TRACE_H) };
+            out[which] = (!r.is_empty()).then_some(r);
+        }
+        out
+    }
+
+    /// The samples behind the traces.
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
     fn node_of(&self, i: usize) -> NodeId {
         NodeId::new(HEADER, 1 + i as u32)
     }
@@ -176,8 +247,8 @@ impl GaugeHeader {
         (n.owner() == HEADER && i < self.slots.len()).then_some(i)
     }
 
-    /// The accessible name of a cell: its title and its total, "CPU 88.7 %".
-    fn name_of(&self, i: usize) -> Text {
+    /// The accessible name of a cell: its title and its total, "CPU, total 88.7 %".
+    fn name_of(&self, lang: UiLang, i: usize) -> Text {
         let Some(s) = self.slots.get(i) else { return Text::Borrowed("") };
         let total = match s.col {
             ColumnId::Name => self.count.as_str(),
@@ -186,7 +257,14 @@ impl GaugeHeader {
             ColumnId::Io => self.totals[2].as_str(),
             _ => "",
         };
-        Text::Owned(format!("{} {}", s.label, total))
+        if total.is_empty() {
+            return Text::Owned(s.label.to_string());
+        }
+        if s.col == ColumnId::Name {
+            return Text::Owned(format!("{}, {}", s.label, total));
+        }
+        let args = [("label", &*s.label), ("total", total)];
+        Text::Owned(oled_sys::i18n::subst(&t(lang, k::TASKS_A11Y_HEADER_TOTAL), &args))
     }
 
     /// The columns' rects: the table's own widths (Column::width, the flex one takes the rest, none below its minimum)
@@ -207,12 +285,37 @@ impl GaugeHeader {
     }
 }
 
+impl GaugeHeader {
+    /// The traces under the three numeric columns: the fill from the baseline at chart_fill, the line along the top at
+    /// FG_SECONDARY, each one PaintCx::spans call over the device columns of its rect.
+    fn paint_traces(&self, cx: &mut PaintCx, c: &oled_ui::ColorTokens) {
+        if self.history.is_empty() {
+            return;
+        }
+        let scale = cx.scale();
+        let hair = history::hairline(scale.dpi as f32 / 96.0);
+        let height = cx.px(history::TRACE_H);
+        for (which, r) in self.trace_rects(scale).into_iter().enumerate() {
+            let Some(r) = r else { continue };
+            if !cx.visible(r) {
+                continue;
+            }
+            let t = self.history.trace(which, r.w(), height, hair, r.b);
+            if t.fill.is_empty() {
+                continue;
+            }
+            cx.spans(r.l + t.x_off, &t.fill, c.chart_fill);
+            cx.spans(r.l + t.x_off, &t.line, c.fg_secondary);
+        }
+    }
+}
+
 impl Widget for GaugeHeader {
     type Out = HeaderOut;
 
     fn layout(&mut self, cx: &mut LayoutCx, rect: RectP) {
         self.rect = rect;
-        let cols = rows::columns(cx.lang());
+        let cols = rows::columns_with(cx.lang(), self.gauges.show_pid);
         self.slots.clear();
         for (id, r) in GaugeHeader::column_rects(&cols, rect, cx.scale(), oled_ui::tokens::COL_MIN_W) {
             let Some(col) = column_of(id) else { continue };
@@ -227,13 +330,25 @@ impl Widget for GaugeHeader {
             let s = &self.slots[i];
             let plate = RectP { t: rect.t + cx.px(2), b: rect.b - cx.px(2), ..s.rect };
             let mut node = Node::new(self.node_of(i), Role::ColumnHeader, plate)
-                .label(self.name_of(i))
+                .label(self.name_of(cx.lang(), i))
                 .focus(if i == self.cur { Focusable::Tab } else { Focusable::Roving })
                 .actions(Actions::CLICK | Actions::CONTEXT_MENU | Actions::FOCUS);
             if let Some(d) = &s.desc {
                 node = node.description(d.clone());
             }
             cx.push(node);
+        }
+        // The held look's pause glyph: its tip is the held explanation.
+        if self.held {
+            if let Some(i) = self.slots.iter().position(|s| s.col == self.sort.column) {
+                let (_, pause) = self.sort_marks(i, &|v| cx.px(v));
+                let tip = Text::Owned(t(cx.lang(), k::TASKS_HELD_TIP).to_string());
+                cx.push(
+                    Node::new(NodeId::new(HEADER, 1 + self.slots.len() as u32), Role::Image, pause)
+                        .label(tip.clone())
+                        .description(tip),
+                );
+            }
         }
     }
 
@@ -258,11 +373,17 @@ impl Widget for GaugeHeader {
             let numeric = s.col != ColumnId::Name;
             let label_r = RectP { t: rect.t + cx.px(6), b: rect.t + cx.px(6) + cx.px(16), ..plate };
             let total_r = RectP { t: rect.t + cx.px(24), b: rect.t + cx.px(24) + cx.px(18), ..plate };
-            let label_w = self.label_w.get(i).copied().unwrap_or(0);
-            let chev = cx.px(8);
-            let chev_y = rect.t + cx.px(10);
             let sorted = self.sort.column == s.col;
-            let glyph = if self.sort.descending { Glyph::SortDown } else { Glyph::SortUp };
+            let glyph = match (self.sort.descending, self.held) {
+                (true, false) => Glyph::SortDown,
+                (false, false) => Glyph::SortUp,
+                (true, true) => Glyph::SortDownOutline,
+                (false, true) => Glyph::SortUpOutline,
+            };
+            let (chev_r, pause_r) = self.sort_marks(i, &|v| cx.px(v));
+            if sorted && self.held {
+                cx.glyph(pause_r, Glyph::Pause, c.fg_secondary);
+            }
             if numeric {
                 let right = s.rect.r - cx.px(12);
                 cx.text_in(
@@ -274,29 +395,33 @@ impl Widget for GaugeHeader {
                     c.fg_secondary,
                 );
                 if sorted {
-                    cx.glyph(RectP::wh(s.rect.r - cx.px(10), chev_y, chev, chev), glyph, c.fg_secondary);
+                    cx.glyph(chev_r, glyph, c.fg_secondary);
                 }
+                // The PID column (List mode) has no total.
                 let which = match s.col {
-                    ColumnId::Cpu => 0,
-                    ColumnId::Memory => 1,
-                    _ => 2,
+                    ColumnId::Cpu => Some(0),
+                    ColumnId::Memory => Some(1),
+                    ColumnId::Io => Some(2),
+                    _ => None,
                 };
-                let step = self.gauges.heat[which];
-                let w = self.total_w[which];
-                if let Some(n) = step_index(step) {
-                    let pad = cx.px(3);
-                    cx.fill(RectP { l: right - w - pad, r: right + pad, ..total_r }, 0, c.heat[n]);
+                if let Some(which) = which {
+                    let step = self.gauges.heat[which];
+                    let w = self.total_w[which];
+                    if let Some(n) = step_index(step) {
+                        let pad = cx.px(3);
+                        cx.fill(RectP { l: right - w - pad, r: right + pad, ..total_r }, 0, c.heat[n]);
+                    }
+                    let dash = self.totals[which] == "\u{2014}";
+                    let fg = if dash { c.fg_tertiary } else { step_fg(step, &c) };
+                    cx.text_in(
+                        &self.totals[which],
+                        TypeRole::BodyStrong,
+                        RectP { l: s.rect.l, r: right, ..total_r },
+                        Align::End,
+                        Trim::End,
+                        fg,
+                    );
                 }
-                let dash = self.totals[which] == "\u{2014}";
-                let fg = if dash { c.fg_tertiary } else { step_fg(step, &c) };
-                cx.text_in(
-                    &self.totals[which],
-                    TypeRole::BodyStrong,
-                    RectP { l: s.rect.l, r: right, ..total_r },
-                    Align::End,
-                    Trim::End,
-                    fg,
-                );
             } else {
                 let left = s.rect.l + cx.px(16);
                 cx.text_in(
@@ -308,7 +433,7 @@ impl Widget for GaugeHeader {
                     c.fg_secondary,
                 );
                 if sorted {
-                    cx.glyph(RectP::wh(left + label_w + cx.px(4), chev_y, chev, chev), glyph, c.fg_secondary);
+                    cx.glyph(chev_r, glyph, c.fg_secondary);
                 }
                 cx.text_in(
                     &self.count,
@@ -323,6 +448,7 @@ impl Widget for GaugeHeader {
                 cx.focus_ring(plate, radius, false);
             }
         }
+        self.paint_traces(cx, &c);
         cx.hline(rect.l, rect.r, rect.b - 1, c.separator);
     }
 

@@ -42,6 +42,13 @@ jobs:
           rustup default ${{ env.RUST_TOOLCHAIN }}
           rustc -vV
 
+      # The exec smoke tests of tasks start its testee examples, which cargo test does not build under their own names.
+      - name: Build the tasks examples
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo build -p tasks --examples --locked
+
       - name: Tests
         env:
           DOCK_NO_MANIFEST: "1"
@@ -65,15 +72,34 @@ jobs:
           if (Test-Path $notes) { Copy-Item $notes dist/notes.md } else { "mini-oled-dock $env:VERSION" | Out-File -Encoding utf8 dist/notes.md }
           "`n---`n`n**SHA256** of ``dock.exe``: ``$h``" | Add-Content -Encoding utf8 dist/notes.md
 
+      # The suite's other components (P2-plumbing U1): the app packages that are in the workspace, it.lang, and the
+      # manifest that lists them with their SHA-256 and sizes (the dock and it.lang stable, the apps beta).
+      - name: Package the suite
+        run: |
+          $pkgs = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages.name
+          foreach ($app in 'tasks', 'files') {
+            if ($pkgs -notcontains $app) { "$app is not in the workspace yet: not published"; continue }
+            cargo build --release --locked -p $app
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            Copy-Item "target/release/$app.exe" "dist/$app.exe"
+          }
+          cargo run --release --locked -p oled-i18n-build --bin oled-lang -- --lang it --version $env:VERSION --out dist/lang-it.lang
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pwsh tools/ci/suite-manifest.ps1 -Version $env:VERSION -Dist dist -Stage beta
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-Content dist/suite.json
+
+      # Every asset in dist (notes.md is the release text, not an asset).
       - name: Publish
         run: |
+          $assets = @(Get-ChildItem dist -File | Where-Object Name -ne 'notes.md' | ForEach-Object { "dist/$($_.Name)" })
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG dist/dock.exe dist/dock.exe.sha256 --clobber
+            gh release upload $env:TAG @assets --clobber
             if ($LASTEXITCODE -ne 0) { exit 1 }
             gh release edit $env:TAG --notes-file dist/notes.md
           } else {
-            gh release create $env:TAG dist/dock.exe dist/dock.exe.sha256 --verify-tag --title "mini-oled-dock $env:VERSION" --notes-file dist/notes.md
+            gh release create $env:TAG @assets --verify-tag --title "mini-oled-dock $env:VERSION" --notes-file dist/notes.md
           }
 
       # GitHub's own SHA-256 of the uploaded asset, which the updater also checks, must be the built file's.
@@ -85,3 +111,17 @@ jobs:
           if (-not $d) { "::warning::GitHub reports no digest for dock.exe; clients check dock.exe.sha256 only"; exit 0 }
           if ($d -ne "sha256:$h") { Write-Error "GitHub's digest $d differs from the built dock.exe (sha256:$h)"; exit 1 }
           "dock.exe digest matches: $d"
+
+      # The same for every other asset: GitHub's digest, when it sends one, must be the built file's (the dock's sync
+      # checks the component assets and suite.json against it).
+      - name: Uploaded suite assets match the build
+        run: |
+          $assets = (gh api "repos/$env:GH_REPO/releases/tags/$env:TAG" | ConvertFrom-Json).assets
+          foreach ($f in Get-ChildItem dist -File | Where-Object { $_.Name -notin 'dock.exe', 'notes.md' }) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            $a = $assets | Where-Object name -eq $f.Name
+            if (-not $a) { Write-Error "$($f.Name) was not uploaded"; exit 1 }
+            if (-not $a.digest) { "::warning::GitHub reports no digest for $($f.Name)"; continue }
+            if ($a.digest -ne "sha256:$h") { Write-Error "GitHub's digest $($a.digest) differs from the built $($f.Name) (sha256:$h)"; exit 1 }
+            "$($f.Name) digest matches: $($a.digest)"
+          }

@@ -258,7 +258,8 @@ fn too_large_menu_falls_back() {
 #[test]
 fn request_and_drain_never_wait() {
     let root = TempRoot::new("nowait");
-    let c = Arc::new(client(&root, &[]));
+    // The flood asks for the pins: the host answers from a made-up list (it would read Quick access otherwise).
+    let c = Arc::new(client(&root, &[("FILES_TEST_PINS", r"C:\made-up\a")]));
     c.prespawn();
     ready_pid(&c, TEN_S).expect("Ready");
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -545,7 +546,11 @@ fn wait_fallback(seen: &Seen, req: ReqId) -> bool {
 fn faults_under_a_ui_loop(root: &TempRoot) -> (Arc<ShellClient>, Vec<u64>) {
     let mode = root.file("mode.txt", b"hang");
     let mode_s = mode.display().to_string();
-    let c = Arc::new(client(root, &[("FILES_FAULT_MODE_FILE", &mode_s), ("FILES_FAULT_POINT", "menu")]));
+    // The loop asks for the pins: the host answers from a made-up list (it would read Quick access otherwise).
+    let c = Arc::new(client(
+        root,
+        &[("FILES_FAULT_MODE_FILE", &mode_s), ("FILES_FAULT_POINT", "menu"), ("FILES_TEST_PINS", r"C:\made-up\a")],
+    ));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen: Seen = Arc::default();
     let ui = ui_loop(c.clone(), stop.clone(), seen.clone());
@@ -634,10 +639,11 @@ fn image_replies(c: &ShellClient, req: ReqId, within: Duration) -> Vec<ShellRepl
 #[test]
 fn icons_for_temp_files() {
     let root = TempRoot::new("icons");
+    let exe = root.file("a.exe", &std::fs::read(common::files_exe()).expect("files.exe"));
     let file = root.file("a.txt", b"x");
     let dir = root.dir("folder");
     let c = client(&root, &[]);
-    let req = icons_of(&c, 1, vec![item(&file), item(&dir)], 32);
+    let req = icons_of(&c, 1, vec![item(&exe), item(&file), item(&dir)], 32);
     let got = image_replies(&c, req, Duration::from_secs(30));
     let icons: Vec<(u32, u16, u16, usize)> = got
         .iter()
@@ -646,14 +652,49 @@ fn icons_for_temp_files() {
             _ => None,
         })
         .collect();
-    assert_eq!(icons, [(0, 32, 32, 32 * 32 * 4), (1, 32, 32, 32 * 32 * 4)], "{got:?}");
+    assert_eq!(icons, [(0, 32, 32, 32 * 32 * 4)], "only the file whose icon is its own: {got:?}");
     assert_eq!(got.last(), Some(&ShellReply::Evt(ShellEvt::ReqDone { req })));
+}
+
+/// The real host's check before the load, end to end: the fault DLL answers every load (mode ok), and only the one
+/// item the check passes gets an icon. Every refused item is local, so no attribute read could leave the machine;
+/// among them an item under a read-only folder whose desktop.ini names a folder shortcut and one under a
+/// `name.{CLSID}` folder. The fault point answers without the shell parser, so neither is ever bound to a class.
+#[test]
+fn host_loads_only_what_its_check_passes() {
+    let root = TempRoot::new("iconcheck");
+    let ok = root.file("ok.exe", b"x");
+    let class = "{0AFACED1-E828-11D1-9187-B532F1E9575D}";
+    root.file(r"ro\desktop.ini", format!("[.ShellClassInfo]\r\nCLSID2={class}\r\n").as_bytes());
+    let under_junction = root.file(r"ro\ok.exe", b"x");
+    root.set_readonly("ro", true);
+    let spelled =
+        |tail: &str| ItemRef::Path(WidePath::parse(&format!("{}{tail}", ok.display())).expect("an absolute path"));
+    let items = vec![
+        item(&ok),
+        item(&root.file("x.lnk", b"x")),
+        item(&root.file("x.scf", b"x")),
+        item(&root.file("%d%/ok.exe", b"x")),
+        item(&root.dir("folder.exe")),
+        spelled("."),
+        spelled(" "),
+        item(&under_junction),
+        item(&root.file(&format!(r"photos.{class}\ok.exe"), b"x")),
+    ];
+    let env = fault_env(&root, &[("FILES_FAULT_MODE", "ok"), ("FILES_FAULT_POINT", "icon")]);
+    let (mut d, _) = Direct::ready(&common::files_exe(), &pairs(&env), TEN_S).expect("Hello and Ready");
+    d.send(&ShellReq::Icons { req: ReqId(1), gen: Gen(1), items, px: 16 }).expect("sent");
+    let got = d.until(TEN_S, |e| matches!(e, ShellEvt::ReqDone { .. })).expect("the request ended");
+    let icons: Vec<u32> =
+        got.iter().filter_map(|e| if let ShellEvt::Icon { index, .. } = e { Some(*index) } else { None }).collect();
+    assert_eq!(icons, [0], "only the item the check passes is loaded");
+    assert_eq!(got.last(), Some(&ShellEvt::ReqDone { req: ReqId(1) }), "then ReqDone");
 }
 
 #[test]
 fn icon_hang_falls_back() {
     let root = TempRoot::new("iconhang");
-    let file = root.file("a.png", b"x");
+    let file = root.file("a.ico", b"x");
     let c = client(&root, &[("FILES_FAULT_MODE", "hang"), ("FILES_FAULT_POINT", "icon")]);
     c.prespawn();
     let pid = ready_pid(&c, TEN_S).expect("Ready");
@@ -677,7 +718,7 @@ fn thumb_die_falls_back() {
 #[test]
 fn idle_exit_waits_for_a_running_job() {
     let root = TempRoot::new("idlejob");
-    let files: Vec<ItemRef> = (0..3).map(|i| item(&root.file(&format!("f{i}.png"), b"x"))).collect();
+    let files: Vec<ItemRef> = (0..3).map(|i| item(&root.file(&format!("f{i}.ico"), b"x"))).collect();
     let env = fault_env(
         &root,
         &[("FILES_FAULT_MODE", "slow"), ("FILES_FAULT_POINT", "icon"), ("FILES_TEST_SHELL_IDLE_MS", "500")],
@@ -693,7 +734,7 @@ fn idle_exit_waits_for_a_running_job() {
 #[test]
 fn cancel_gen_drops_queued() {
     let root = TempRoot::new("cancelgen");
-    let files: Vec<ItemRef> = (0..3).map(|i| item(&root.file(&format!("f{i}.png"), b"x"))).collect();
+    let files: Vec<ItemRef> = (0..3).map(|i| item(&root.file(&format!("f{i}.ico"), b"x"))).collect();
     let c = client(&root, &[("FILES_FAULT_MODE", "slow"), ("FILES_FAULT_POINT", "icon")]);
     c.prespawn();
     ready_pid(&c, TEN_S).expect("Ready");
@@ -722,7 +763,7 @@ fn cancel_gen_drops_queued() {
 fn deadline_does_not_kill_busy() {
     let root = TempRoot::new("busydead");
     let file = root.file("a.txt", b"x");
-    let png = root.file("b.png", b"x");
+    let ico = root.file("b.ico", b"x");
     let out = root.path().join("out.bin");
     let out_s = out.display().to_string();
     let c = client(
@@ -740,7 +781,7 @@ fn deadline_does_not_kill_busy() {
     let pid = ready_pid(&c, TEN_S).expect("Ready");
     menu_of(&c, &file);
     replies_until(&c, TEN_S, |r| matches!(r, ShellReply::Evt(ShellEvt::Busy { on: true }))).expect("the invoke runs");
-    let req = icons_of(&c, 1, vec![item(&png)], 16);
+    let req = icons_of(&c, 1, vec![item(&ico)], 16);
     let got = image_replies(&c, req, TEN_S);
     assert_eq!(got.last(), Some(&ShellReply::Fallback { req, why: FallbackWhy::Deadline }), "{got:?}");
     assert!(file_len(&out) < 5 * 1024, "answered before the invoke ended");
@@ -833,7 +874,9 @@ fn per_user_classes_unused() -> Option<String> {
 
 /// The registered path (files-disposable.ps1 -Register): the same faults through the real lookup (GetUIObjectOf,
 /// GetImage), plus the modes that may raise Windows Error Reporting. Every request gets its Fallback within its
-/// deadline, and no dialog appears. Not applicable where per_user_classes_unused says so and the first fault did not
+/// deadline, and no dialog appears. Icons load only a file whose icon is its own, so a registered icon handler is
+/// never run: those requests end with ReqDone, the fault never reached.
+/// Not applicable where per_user_classes_unused says so and the first fault did not
 /// fire either; the reason is printed.
 #[test]
 #[ignore = "disposable: CI files-disposable job only"]
@@ -874,6 +917,11 @@ fn disposable_registered_faults() {
                 println!("disposable_registered_faults: not applicable: {why}");
                 return;
             }
+        }
+        if matches!(kind, CallKindOf::Icon) {
+            assert_eq!(got.last(), Some(&ShellReply::Evt(ShellEvt::ReqDone { req })), "{mode} at {point}: {got:?}");
+            assert!(!gone(pid, Duration::ZERO), "{mode} at {point}: the fault was never reached");
+            continue;
         }
         if matches!(kind, CallKindOf::Thumb) && !matches!(got.last(), Some(ShellReply::Fallback { .. })) {
             println!("disposable: the thumbnail handler did not load through the registered key (unverified name)");

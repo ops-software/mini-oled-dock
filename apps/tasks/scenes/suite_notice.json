@@ -1,0 +1,259 @@
+{
+ "size": [
+  640,
+  560
+ ],
+ "mode": "list",
+ "machine": {
+  "logical_cpus": 16,
+  "total_phys": 34359738368,
+  "mem_load": 41,
+  "commit_pct": 38,
+  "cpu_pct": 3.2,
+  "dpc_irq_pct": 0.4
+ },
+ "procs": [
+  {
+   "pid": 0,
+   "created": 0,
+   "parent": 0,
+   "session": 0,
+   "image": "",
+   "path": null,
+   "cpu": [
+    94
+   ],
+   "ws_private": 8192,
+   "io": [
+    0
+   ],
+   "threads": 16,
+   "handles": 0
+  },
+  {
+   "pid": 4,
+   "created": 133500000000004000,
+   "parent": 0,
+   "session": 0,
+   "image": "System",
+   "path": "C:\\Windows\\System32\\ntoskrnl.exe",
+   "cpu": [
+    0.014
+   ],
+   "ws_private": 63763482,
+   "io": [
+    12249
+   ],
+   "threads": 41,
+   "handles": 144
+  },
+  {
+   "pid": 40,
+   "created": 133500000000040000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.022
+   ],
+   "ws_private": 9632618,
+   "io": [
+    1375
+   ],
+   "threads": 43,
+   "handles": 975
+  },
+  {
+   "pid": 64,
+   "created": 133500000000064000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.027
+   ],
+   "ws_private": 40758530,
+   "io": [
+    12100
+   ],
+   "threads": 35,
+   "handles": 801
+  },
+  {
+   "pid": 84,
+   "created": 133500000000084000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.028
+   ],
+   "ws_private": 59903688,
+   "io": [
+    7249
+   ],
+   "threads": 23,
+   "handles": 182
+  },
+  {
+   "pid": 116,
+   "created": 133500000000116000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.05
+   ],
+   "ws_private": 28821974,
+   "io": [
+    3576
+   ],
+   "threads": 43,
+   "handles": 209
+  },
+  {
+   "pid": 136,
+   "created": 133500000000136000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.027
+   ],
+   "ws_private": 13086726,
+   "io": [
+    2280
+   ],
+   "threads": 28,
+   "handles": 795
+  },
+  {
+   "pid": 140,
+   "created": 133500000000140000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.036
+   ],
+   "ws_private": 64572218,
+   "io": [
+    5314
+   ],
+   "threads": 27,
+   "handles": 417
+  },
+  {
+   "pid": 156,
+   "created": 133500000000156000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.031
+   ],
+   "ws_private": 51066978,
+   "io": [
+    6195
+   ],
+   "threads": 10,
+   "handles": 886
+  },
+  {
+   "pid": 184,
+   "created": 133500000000184000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.023
+   ],
+   "ws_private": 68976709,
+   "io": [
+    9691
+   ],
+   "threads": 11,
+   "handles": 328
+  },
+  {
+   "pid": 224,
+   "created": 133500000000224000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.035
+   ],
+   "ws_private": 37294088,
+   "io": [
+    3497
+   ],
+   "threads": 21,
+   "handles": 260
+  },
+  {
+   "pid": 228,
+   "created": 133500000000228000,
+   "parent": 4,
+   "session": 1,
+   "image": "explorer.exe",
+   "path": "C:\\Windows\\explorer.exe",
+   "cpu": [
+    0.041
+   ],
+   "ws_private": 54109050,
+   "io": [
+    2893
+   ],
+   "threads": 25,
+   "handles": 767
+  },
+  {
+   "pid": 264,
+   "created": 133500000000264000,
+   "parent": 4,
+   "session": 1,
+   "image": "dwm.exe",
+   "path": "C:\\Windows\\System32\\dwm.exe",
+   "cpu": [
+    0.022
+   ],
+   "ws_private": 31875862,
+   "io": [
+    12767
+   ],
+   "threads": 37,
+   "handles": 553
+  },
+  {
+   "pid": 284,
+   "created": 133500000000284000,
+   "parent": 4,
+   "session": 0,
+   "image": "csrss.exe",
+   "path": "C:\\Windows\\System32\\csrss.exe",
+   "cpu": [
+    0.047
+   ],
+   "ws_private": 66512847,
+   "io": [
+    6488
+   ],
+   "threads": 39,
+   "handles": 286
+  }
+ ],
+ "ticks": 2,
+ "input": [
+  "updated"
+ ]
+}

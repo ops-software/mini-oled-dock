@@ -72,7 +72,9 @@ use crate::launcher::catalog;
 use crate::launcher::gesture::{is_marker, is_network_file, Gesture};
 use crate::launcher::web::{check_authority, MAX_URL_BYTES};
 use crate::log;
-use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
+use crate::msg::{
+    WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_TAKEOVER, WM_SHELL_WAKE,
+};
 use oled_shellmodel::appsfolder;
 use oled_shellmodel::icon::{self, IconDecode, IconQuery};
 use oled_shellmodel::identity::is_usable_exe;
@@ -157,6 +159,10 @@ pub enum ShellRequest {
     /// Launch `target` (exe path, `shell:AppsFolder\...`, `ms-settings:...`) with optional `args`.
     /// When the dock is elevated it ALWAYS runs de-elevated through the desktop shell, or not at all.
     Launch { target: String, args: Option<String> },
+    /// Tasks or Folio from the dock's menus and Settings: the launcher's rule (fail closed when elevated or unknown) and
+    /// its logging (lengths only), with no launcher notice.
+    #[allow(dead_code)] // built by DS-ENTRY
+    SuiteLaunch { target: String, args: Option<String> },
     /// Start menu "(admin)" entries: asks the desktop shell (Explorer, medium integrity) to run a FIXED
     /// tool with the `runas` verb, so Windows shows its UAC prompt. The dock's own token is never used;
     /// without the desktop shell the launch is refused. Only this request, `LaunchAppAdmin` and
@@ -533,8 +539,11 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
     let probe_hook = crate::probe::install_send_hook(crate::probe::Th::Shell);
 
     loop {
+        crate::hook::set_shell_busy(0);
         // SAFETY: `msg` is valid and writable; filter None = all thread messages.
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        // SAFETY: no preconditions.
+        crate::hook::set_shell_busy(unsafe { windows::Win32::System::SystemInformation::GetTickCount() } | 1);
         if r.0 <= 0 {
             break; // WM_QUIT or error
         }
@@ -548,6 +557,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
                     shell.push_spatial();
                 }
             }
+            WM_SHELL_TAKEOVER => crate::ui::takeover_os::on_message(msg.wParam.0, msg.lParam.0),
             _ => {
                 // SAFETY: `msg` was just filled by GetMessageW; needed by COM STA for its internal messages.
                 unsafe {
@@ -557,6 +567,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             }
         }
         shell.pump(&rx);
+        crate::ui::takeover_os::run_lost();
         let wanted = timer_wanted(shell.start_job.is_some(), shell.launcher_job.is_some(), shell.agent.timer_wanted());
         if wanted && timer == 0 {
             // SAFETY: thread timer on this thread, see above.
@@ -675,6 +686,11 @@ impl Shell {
             ShellRequest::Launch { target, args } => {
                 if let Err(e) = launch(&target, args.as_deref()) {
                     log!("shell: Launch ({} chars) not executed: {e}", target.chars().count());
+                }
+            }
+            ShellRequest::SuiteLaunch { target, args } => {
+                if let Err(e) = launch_with(&target, args.as_deref(), LaunchBy::Launcher) {
+                    log!("shell: suite launch not executed: {e}")
                 }
             }
             ShellRequest::LaunchAdmin(tool) => launch_admin(tool),
@@ -2766,6 +2782,7 @@ fn loads_com(req: &ShellRequest) -> bool {
         ShellRequest::ListStartApps { child: false, .. }
         | ShellRequest::ResolveApp(_)
         | ShellRequest::Launch { .. }
+        | ShellRequest::SuiteLaunch { .. }
         | ShellRequest::LaunchAdmin(_)
         | ShellRequest::LaunchAppAdmin { .. }
         | ShellRequest::RevealApp { .. }
@@ -3821,6 +3838,50 @@ mod tests {
         }
         assert!(lines[0].contains("(20 chars)"), "{}", lines[0]);
         assert!(lines[7].contains("(20 chars, arguments 12 chars)"), "{}", lines[7]);
+    }
+
+    /// The dock's own launches of the suite apps (menus, Settings) log kinds and lengths only, and a refusal says why
+    /// without naming the target.
+    #[test]
+    fn suite_launch_logs_no_path() {
+        let target = r"C:\Program Files\mini-oled-dock\tasks.exe";
+        let args = Some("--select c:\\apps\\contoso.exe");
+        for l in [
+            launch_line(LaunchBy::Launcher, target, args, ""),
+            launch_line(LaunchBy::Launcher, target, args, " via the desktop shell (de-elevated)"),
+            launch_refused_line(LaunchBy::Launcher, target, "x"),
+        ] {
+            assert!(!l.contains('\\') && !l.contains("contoso"), "{l}");
+        }
+        let src = include_str!("shell_thread.rs");
+        let arm = &src[src.find("ShellRequest::SuiteLaunch { target, args } =>").expect("the arm exists")..];
+        let arm = &arm[..arm.find("ShellRequest::LaunchAdmin(tool)").expect("the next arm exists")];
+        assert!(arm.contains("launch_with(&target, args.as_deref(), LaunchBy::Launcher)"), "{arm}");
+        assert!(!arm.contains("push") && !arm.contains("ShellEvent"), "the arm pushes no event");
+    }
+
+    #[test]
+    fn suite_launch_loads_com() {
+        assert!(loads_com(&ShellRequest::SuiteLaunch { target: String::new(), args: None }));
+    }
+
+    /// The hook reads the busy stamp: 0 exactly while the thread waits in GetMessageW.
+    #[test]
+    fn busy_stamps_wrap_get_message() {
+        let src = include_str!("shell_thread.rs").replace("\r\n", "\n");
+        let from = src.find("fn thread_main(").expect("thread_main exists");
+        let body = &src[from..];
+        let body = &body[..body.find("\n}\n").expect("thread_main ends")];
+        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.starts_with("//")).collect();
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}"));
+        let get = at("GetMessageW(&mut msg");
+        assert_eq!(at("set_shell_busy(0)") + 1, get, "the idle stamp is the statement before GetMessageW");
+        assert_eq!(
+            at("set_shell_busy(unsafe { windows::Win32::System::SystemInformation::GetTickCount() } | 1)"),
+            get + 1
+        );
+        assert!(body.contains("WM_SHELL_TAKEOVER => crate::ui::takeover_os::on_message("), "the takeover arm");
+        assert_eq!(at("run_lost()"), at("shell.pump(&rx)") + 1, "run_lost follows the pump");
     }
 
     #[test]

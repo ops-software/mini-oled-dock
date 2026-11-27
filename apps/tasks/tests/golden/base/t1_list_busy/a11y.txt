@@ -1,41 +1,43 @@
-Toolbar "Tasks"
-Button "More (F10)" [focusable]
-Label "Every 1 s"
-ColumnHeader "Name 41 processes" [focusable]
-ColumnHeader "CPU 46.5 %" [focusable]
-ColumnHeader "Memory 67 %" [focusable]
-ColumnHeader "I/O 308 MB/s" [focusable]
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Button "More options (F10)" [focusable]
+SearchInput "Search processes" [focusable] ""
+ColumnHeader "Name, 41 processes" [focusable]
+ColumnHeader "CPU, total 46.5 %" [focusable]
+ColumnHeader "Memory, total 67 %" [focusable]
+ColumnHeader "I/O, total 308 MB/s" [focusable]
+ColumnHeader "PID" [focusable]
 Table "Name" [focusable] 0 of 41
-  Row "svchost.exe" [focusable] 1 of 41
-  Row "explorer.exe" [focusable] 2 of 41
-  Row "dwm.exe" [focusable] 3 of 41
-  Row "csrss.exe" [focusable] 4 of 41
-  Row "harbor.exe" [focusable] 5 of 41
-  Row "marble.exe" [focusable] 6 of 41
-  Row "willow.exe" [focusable] 7 of 41
-  Row "prism.exe" [focusable] 8 of 41
-  Row "cobalt.exe" [focusable] 9 of 41
-  Row "services.exe" [focusable] 10 of 41
-  Row "ember.exe" [focusable] 11 of 41
-  Row "tundra.exe" [focusable] 12 of 41
-  Row "quill.exe" [focusable] 13 of 41
-  Row "pebble.exe" [focusable] 14 of 41
-  Row "harbor.exe" [focusable] 15 of 41
-  Row "lantern.exe" [focusable] 16 of 41
-  Row "pebble.exe" [focusable] 17 of 41
-  Row "tundra.exe" [focusable] 18 of 41
-  Row "cobalt.exe" [focusable] 19 of 41
-  Row "prism.exe" [focusable] 20 of 41
-  Row "atlas.exe" [focusable] 21 of 41
-  Row "orbit.exe" [focusable] 22 of 41
-  Row "orbit.exe" [focusable] 23 of 41
-  Row "conhost.exe" [focusable] 24 of 41
-  Row "lantern.exe" [focusable] 25 of 41
-  Row "svchost.exe" [focusable] 26 of 41
-  Row "willow.exe" [focusable] 27 of 41
-  Row "svchost.exe" [focusable] 28 of 41
-  Row "quill.exe" [focusable] 29 of 41
-  Row "svchost.exe" [focusable] 30 of 41
-  Row "RuntimeBroker.exe" [focusable] 31 of 41
-  Row "svchost.exe" [focusable] 32 of 41
-  Row "svchost.exe" [focusable] 33 of 41
+  Row "svchost.exe, CPU 30.0 %, memory 6.00 GB, I/O 220 MB/s" [focusable] 1 of 41
+  Row "explorer.exe, CPU 8.5 %, memory 3.40 GB, I/O 60.0 MB/s" [focusable] 2 of 41
+  Row "dwm.exe, CPU 4.2 %, memory 2.00 GB, I/O 14.0 MB/s" [focusable] 3 of 41
+  Row "csrss.exe, CPU 1.6 %, memory 1.20 GB, I/O 3.00 MB/s" [focusable] 4 of 41
+  Row "harbor.exe, CPU 1.0 %, memory 214 MB, I/O 14.9 KB/s" [focusable] 5 of 41
+  Row "marble.exe, CPU 0.9 %, memory 682 MB, I/O 502 KB/s" [focusable] 6 of 41
+  Row "willow.exe, CPU 0.9 %, memory 716 MB, I/O 173 KB/s" [focusable] 7 of 41
+  Row "prism.exe, CPU 0.9 %, memory 908 MB, I/O 552 KB/s" [focusable] 8 of 41
+  Row "cobalt.exe, CPU 0.8 %, memory 734 MB, I/O 478 KB/s" [focusable] 9 of 41
+  Row "services.exe, CPU 0.8 %, memory 700 MB, I/O 1.50 MB/s" [focusable] 10 of 41
+  Row "ember.exe, CPU 0.7 %, memory 317 MB, I/O 474 KB/s" [focusable] 11 of 41
+  Row "tundra.exe, CPU 0.6 %, memory 580 MB, I/O 522 KB/s" [focusable] 12 of 41
+  Row "quill.exe, CPU 0.6 %, memory 591 MB, I/O 617 KB/s" [focusable] 13 of 41
+  Row "pebble.exe, CPU 0.5 %, memory 387 MB, I/O 633 KB/s" [focusable] 14 of 41
+  Row "harbor.exe, CPU 0.5 %, memory 175 MB, I/O 445 KB/s" [focusable] 15 of 41
+  Row "lantern.exe, CPU 0.4 %, memory 159 MB, I/O 460 KB/s" [focusable] 16 of 41
+  Row "pebble.exe, CPU 0.4 %, memory 661 MB, I/O 671 KB/s" [focusable] 17 of 41
+  Row "tundra.exe, CPU 0.4 %, memory 504 MB, I/O 343 KB/s" [focusable] 18 of 41
+  Row "cobalt.exe, CPU 0.3 %, memory 487 MB, I/O 338 KB/s" [focusable] 19 of 41
+  Row "prism.exe, CPU 0.3 %, memory 330 MB, I/O 333 KB/s" [focusable] 20 of 41
+  Row "atlas.exe, CPU 0.3 %, memory 405 MB, I/O 192 KB/s" [focusable] 21 of 41
+  Row "orbit.exe, CPU 0.2 %, memory 628 MB, I/O 610 KB/s" [focusable] 22 of 41
+  Row "orbit.exe, CPU 0.1 %, memory 655 MB, I/O 225 KB/s" [focusable] 23 of 41
+  Row "conhost.exe, CPU 0.1 %, memory 42.9 MB, I/O 53.4 KB/s" [focusable] 24 of 41
+  Row "lantern.exe, CPU 0.1 %, memory 40.6 MB, I/O 41.2 KB/s" [focusable] 25 of 41
+  Row "svchost.exe, CPU 0.1 %, memory 49.7 MB, I/O 56.7 KB/s" [focusable] 26 of 41
+  Row "willow.exe, CPU 0.1 %, memory 244 MB, I/O 474 KB/s" [focusable] 27 of 41
+  Row "svchost.exe, CPU 0.1 %, memory 62.3 MB, I/O 42.5 KB/s" [focusable] 28 of 41
+  Row "quill.exe, CPU 0.1 %, memory 48.4 MB, I/O 679 KB/s" [focusable] 29 of 41
+  Row "svchost.exe, CPU 0.1 %, memory 30.0 MB, I/O 7.43 KB/s" [focusable] 30 of 41
+  Row "RuntimeBroker.exe, CPU 0.1 %, memory 28.9 MB, I/O 9.57 KB/s" [focusable] 31 of 41
+  Row "svchost.exe, CPU 0.1 %, memory 30.8 MB, I/O 14.9 KB/s" [focusable] 32 of 41
+  Row "svchost.exe, CPU 0.0 %, memory 27.3 MB, I/O 30.4 KB/s" [focusable] 33 of 41

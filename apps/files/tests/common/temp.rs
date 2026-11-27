@@ -130,6 +130,10 @@ impl TempRoot {
         fence::set_readonly(&self.path, rel, on)
     }
 
+    pub fn set_system(&self, rel: &str, on: bool) {
+        fence::set_system(&self.path, rel, on)
+    }
+
     /// Writes the alternate data stream `rel:stream`.
     pub fn ads(&self, rel: &str, stream: &str, bytes: &[u8]) {
         fence::ads(&self.path, rel, stream, bytes)
@@ -138,6 +142,12 @@ impl TempRoot {
     /// Makes `rel` a junction (mount point) to `target`, which must be a folder inside a TempRoot.
     pub fn junction(&self, rel: &str, target: &Path) {
         fence::junction(&self.path, rel, target, TEST_PREFIX)
+    }
+
+    /// Makes `rel` a file symbolic link to `target`, a file inside a TempRoot. False when this user may not create
+    /// one (neither the symbolic-link right nor Developer Mode): the caller skips that case and says so.
+    pub fn file_symlink(&self, rel: &str, target: &Path) -> bool {
+        fence::file_symlink(&self.path, rel, target, TEST_PREFIX)
     }
 
     /// FNV-1a 64 of the bytes of the file `rel`.
@@ -239,7 +249,8 @@ pub mod fence {
 
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        LocalFree, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_NO_MORE_FILES, FILETIME, GENERIC_WRITE, HANDLE, HLOCAL,
+        LocalFree, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_NO_MORE_FILES, ERROR_PRIVILEGE_NOT_HELD, FILETIME,
+        GENERIC_WRITE, HANDLE, HLOCAL,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
@@ -250,13 +261,14 @@ pub mod fence {
         PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindExInfoBasic, FindExSearchNameMatch,
-        FindFirstFileExW, FindFirstStreamW, FindNextFileW, FindNextStreamW, FindStreamInfoStandard, GetFileAttributesW,
-        RemoveDirectoryW, SetFileAttributesW, SetFileTime, CREATE_ALWAYS, CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FIND_FIRST_EX_FLAGS, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
-        WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
+        CreateDirectoryW, CreateFileW, CreateSymbolicLinkW, DeleteFileW, FindClose, FindExInfoBasic,
+        FindExSearchNameMatch, FindFirstFileExW, FindFirstStreamW, FindNextFileW, FindNextStreamW,
+        FindStreamInfoStandard, GetFileAttributesW, RemoveDirectoryW, SetFileAttributesW, SetFileTime, CREATE_ALWAYS,
+        CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES, FIND_FIRST_EX_FLAGS, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
+        SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE, WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
     };
     use windows::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
     use windows::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
@@ -511,6 +523,16 @@ pub mod fence {
             .unwrap_or_else(|e| panic!("set_readonly {rel}: {e}"));
     }
 
+    pub fn set_system(root: &Path, rel: &str, on: bool) {
+        const SYSTEM: u32 = windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM.0;
+        let w = verbatim(&resolve(root, rel));
+        // SAFETY: `w` is NUL-terminated and lives for the call.
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
+        assert!(attrs != INVALID_FILE_ATTRIBUTES, "set_system: {rel} does not exist");
+        set_attrs(&w, if on { attrs | SYSTEM } else { attrs & !SYSTEM })
+            .unwrap_or_else(|e| panic!("set_system {rel}: {e}"));
+    }
+
     fn set_attrs(w: &[u16], attrs: u32) -> windows::core::Result<()> {
         let attrs = if attrs == 0 { FILE_ATTRIBUTE_NORMAL.0 } else { attrs };
         // SAFETY: `w` is NUL-terminated and lives for the call.
@@ -557,6 +579,26 @@ pub mod fence {
             let _ = std::fs::remove_dir(&link);
             panic!("junction {rel} -> {}: {e}", target.display());
         }
+    }
+
+    /// Makes `rel` a file symbolic link to `target` (a file inside a fenced root of `prefix`, not a link itself). False
+    /// when the system refuses this user the right to create one; any other failure panics.
+    pub fn file_symlink(root: &Path, rel: &str, target: &Path, prefix: &str) -> bool {
+        assert!(
+            within_fenced(target, prefix) && std::fs::symlink_metadata(target).is_ok_and(|m| m.is_file()),
+            "symlink target {} must be a file inside a {prefix} root",
+            target.display()
+        );
+        let link = verbatim(&resolve(root, rel));
+        let to: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
+        let flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+        // SAFETY: both paths are NUL-terminated and live for the call.
+        if unsafe { CreateSymbolicLinkW(PCWSTR(link.as_ptr()), PCWSTR(to.as_ptr()), flags) } {
+            return true;
+        }
+        let e = std::io::Error::last_os_error();
+        assert_eq!(e.raw_os_error(), Some(ERROR_PRIVILEGE_NOT_HELD.0 as i32), "file symlink {rel}: {e}");
+        false
     }
 
     /// `p` is a folder, looked up by its exact name: a trailing dot or space is not trimmed (the \\?\ form).

@@ -1,0 +1,22 @@
+TabList
+  Tab "share" [focusable, selected, busy]
+    Button "Chiudi scheda"
+  Button "Nuova scheda" [focusable]
+Button "Indietro · Alt+←" [disabled]
+Button "Avanti · Alt+→" [disabled]
+Button "Su · Alt+↑" [disabled]
+Button "Nuovo" [focusable]
+Button "Ordina" [focusable]
+Button "Visualizza" [focusable]
+Button "Altro" [focusable]
+Toolbar "Percorso"
+  Link "\\\\made-up-server\\share" [focusable]
+  Button "Sottocartelle"
+  Button "Aggiorna" [focusable]
+ColumnHeader "Nome" [focusable]
+ColumnHeader "Ultima modifica" [focusable]
+ColumnHeader "Tipo" [focusable]
+ColumnHeader "Dimensione" [focusable]
+Table "Nome" [focusable] 0 of 0
+Label "Connessione a \\\\made-up-server\\share…"
+Label "0 elementi"

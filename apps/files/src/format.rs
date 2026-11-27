@@ -155,6 +155,11 @@ fn push_picture(out: &mut String, picture: &str, t: LocalTime, second: u8) {
 }
 
 impl Fmt {
+    /// The language the formatter was made for.
+    pub fn lang(&self) -> UiLang {
+        self.lang
+    }
+
     /// LOCALE_NAME_USER_DEFAULT through GetLocaleInfoEx, pictures read once; a value the system does not give keeps
     /// the fixed formatter's.
     pub fn system(lang: UiLang) -> Fmt {

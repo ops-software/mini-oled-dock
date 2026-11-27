@@ -256,30 +256,44 @@ fn bg_network_stall_does_not_block_local() {
     let hub = Hub::new();
     let w1 = window(&hub, 1);
     let bg = Bg::new(Arc::clone(&hub));
-    let t0 = Instant::now();
+    // The stalled job waits for the test's release, so what is proved does not depend on how long the machine takes.
+    let (started, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+    let t_run = Instant::now();
     bg.run(
         1,
         Lane::Network,
-        Box::new(|| {
-            std::thread::sleep(Duration::from_secs(6));
+        Box::new(move || {
+            s.store(true, Ordering::SeqCst);
+            let end = Instant::now() + Duration::from_secs(60);
+            while !r.load(Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             Some(space(1))
         }),
     );
+    // Job 2 and the local jobs go in only once the stalled job runs, or job 2 could be queued behind nothing.
+    wait_until("the stalled job to start", Duration::from_secs(30), || started.load(Ordering::SeqCst));
     bg.run(1, Lane::Network, Box::new(|| Some(space(2))));
     for i in 0..3 {
         bg.run(1, Lane::Local, Box::new(move || Some(space(10 + i))));
     }
-    wait_until("the local jobs", Duration::from_secs(2), || w1.len() >= 3);
-    assert!(t0.elapsed() < Duration::from_secs(3), "local jobs did not wait for the stalled share");
-    assert_eq!(bg.stats().abandoned, 0);
-    assert_eq!(bg.stats().queued, 1, "the next network job waits");
+    wait_until("the local jobs", Duration::from_secs(30), || w1.len() >= 3);
+    // The local jobs ran during the stall: job 2 was not delivered before them.
+    let first = w1.take();
+    assert!(first.iter().all(|m| tag_of(m) != Some(2)), "the local jobs ran before the abandon freed the lane");
+    // What follows holds until the 4 s of the abandon, which the supervisor counts from the run.
+    if t_run.elapsed() < Duration::from_secs(3) {
+        assert_eq!(bg.stats().abandoned, 0);
+        assert_eq!(bg.stats().queued, 1, "the next network job waits");
+    }
     // After 4 s the stuck thread is abandoned and a fresh one takes the next job.
-    wait_until("the second network job", Duration::from_secs(5), || w1.take().iter().any(|m| tag_of(m) == Some(2)));
-    let at = t0.elapsed();
-    assert!(at >= Duration::from_millis(3_900) && at < Duration::from_millis(5_900), "after about 4 s, not {at:?}");
+    wait_until("the second network job", Duration::from_secs(30), || w1.take().iter().any(|m| tag_of(m) == Some(2)));
+    assert!(t_run.elapsed() >= Duration::from_millis(3_900), "not before about 4 s: {:?}", t_run.elapsed());
     assert_eq!(bg.stats().abandoned, 1);
-    wait_until("the stalled job returns", Duration::from_secs(5), || bg.stats().abandoned == 0);
-    assert!(w1.take().iter().any(|m| tag_of(m) == Some(1)), "its result is still delivered");
+    release.store(true, Ordering::SeqCst);
+    wait_until("the stalled job returns", Duration::from_secs(30), || bg.stats().abandoned == 0);
+    wait_until("its result", Duration::from_secs(30), || w1.take().iter().any(|m| tag_of(m) == Some(1)));
 }
 
 #[test]

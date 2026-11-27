@@ -9,7 +9,7 @@
       "unit": "bytes",
       "gate": "ledger",
       "base_bytes": 1400320,
-      "target": "1.7.0",
+      "target": "1.8.0",
       "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test. 1.5.0 step re-keyed (owner decision, L3 T23): the launcher was never in the ledger; the release exe of feat/launcher after plan L3 was 1765888 bytes. Re-keyed again at the close of the 1.5.0 branch (owner's delegated decision, no reserve: part L2 is in): the release exe (cargo build --release --locked, manifest kept) is 1859584 bytes after the size trims of part L2 (AliasTable::build sort, preview alias map by insert), rounded up to the next 16 KiB 1867776 bytes, which is 456.5 KiB over base_bytes and is written as 457 whole KiB (limit 1868288, 8704 bytes of room). Raised by one 16 KiB unit at the verification fixes of 920d775 (owner's delegated decision): the release exe measured 1869312 bytes, 1884160 bytes is 472.5 KiB over base_bytes and is written as 473 whole KiB (limit 1884672, 15360 bytes of room). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of it. Release 1.5.1 step (owner-delegated ledger decision, R151 5.2): the final 1.5.0 key plus 48 KiB, 473 + 48 = 521 whole KiB (limit 1,933,824 bytes), and the later steps shifted by +48 so they keep their own increments; the target is 1.5.1, the version this branch ships as. Re-keyed at the merge of the release's parallel tracks (owner-delegated ledger decision of 2026-11-23; nothing cut for size): D8 (the audio popup's scroll area) and N6 were not in the size plan and D6 took 9 KiB, so the merged release exe measured 1940480 bytes, above the 521 KiB limit; rounded up to the next 16 KiB 1949696 bytes, plus one more 16 KiB step of room for review fixes, 1966080 bytes, which is 552.5 KiB over base_bytes and is written as 553 whole KiB (limit 1,966,592 bytes), and the later steps shifted by +32 so they keep their own increments. Release 1.5.2 step (R152 T5, per R151 5.2): the 1.5.1 key is settled down to the measured 1.5.1 release exe, 1940992 bytes, rounded up to the next 16 KiB 1949696 bytes, 536.5 KiB over base_bytes, written as 537 whole KiB. The 1.5.2 key is the merged release exe, 1953792 bytes, rounded up to the next 16 KiB 1966080 bytes, plus one 16 KiB step of room, 1982464 bytes, 568.5 KiB over base_bytes, written as 569 whole KiB (limit 1,982,976 bytes). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of the settled 1.5.1 key.",
       "ledger_kib_cumulative": {
         "1.4.2": 0,
@@ -147,7 +147,7 @@
       "gate": "max",
       "value": 15728640,
       "provisional": true,
-      "note": "300 processes"
+      "note": "300 processes; OWNER-LIVE, LIVE-T1"
     },
     {
       "id": "private.tasks_3840x2160",
@@ -157,7 +157,7 @@
       "gate": "max",
       "value": 15728640,
       "provisional": true,
-      "note": "300 processes"
+      "note": "300 processes; OWNER-LIVE, LIVE-T1"
     },
     {
       "id": "private.files_1100x720",
@@ -291,7 +291,7 @@
     {
       "id": "exe_size.tasks",
       "where": "CI",
-      "status": "pending",
+      "status": "active",
       "unit": "bytes",
       "gate": "max",
       "value": 1887437,
@@ -700,7 +700,7 @@
       "unit": "ms",
       "gate": "max",
       "value": 100,
-      "note": "warm, QPC log"
+      "note": "warm, QPC log; OWNER-LIVE, LIVE-T1"
     },
     {
       "id": "start.first_frame_files",
@@ -727,7 +727,7 @@
       "unit": "percent_core",
       "gate": "max",
       "value": 0.5,
-      "note": "of one core at 1 s refresh, sampling only while visible"
+      "note": "of one core at 1 s refresh, sampling only while visible; OWNER-LIVE, LIVE-T1"
     },
     {
       "id": "bench.sysmon_parse_300_us",
@@ -782,6 +782,60 @@
       "gate": "max",
       "value": 0,
       "note": "60 s hidden, live 4.3"
+    },
+    {
+      "id": "bench.tasks_ui_tick_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 1400,
+      "note": "ui_bench: the data path at 300 processes, 640 x 560 at 144 DPI, release, slack 1; ci.yml bench job at OLED_BENCH_SLACK=2; active after its first CI run (TC2)"
+    },
+    {
+      "id": "tasks.private_t1",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 10485760,
+      "note": "T1 gate at 300 processes, LIVE-T1"
+    },
+    {
+      "id": "tasks.minimised_iterations",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 0,
+      "note": "60 s minimised, LIVE-T1"
+    },
+    {
+      "id": "tasks.first_frame_p95_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 100,
+      "note": "20 warm runs, LIVE-T1"
+    },
+    {
+      "id": "tasks.chord_visible_ms",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 300,
+      "note": "running instance, LIVE-T6b"
+    },
+    {
+      "id": "bench.tasks_search_key_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 2000,
+      "note": "one filter pass, 1,000 rows, 3 terms, T5.2 (search_bench, ci.yml bench job at OLED_BENCH_SLACK=2); active after its first CI run (TC3)"
     },
     {
       "id": "private.dock_t0_delta",

@@ -1,0 +1,42 @@
+TabList
+  Tab "Home" [focusable, selected]
+    Button "Close tab"
+  Button "New tab" [focusable]
+Button "Back · Alt+←" [disabled]
+Button "Forward · Alt+→" [disabled]
+Button "Up · Alt+↑" [disabled]
+Button "New" [focusable]
+Button "Sort" [focusable]
+Button "View" [focusable]
+Button "More" [focusable]
+Toolbar "Path"
+  Link "Home" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Tree
+  Label "Pinned"
+  TreeItem "documents" [focusable, expandable] level 1
+  TreeItem "projects" [focusable, expandable] level 1
+  TreeItem "media" [focusable, expandable] level 1
+  TreeItem "a-folder-with-a-rather-long-name" [focusable, expandable] level 1
+  Label "This PC"
+  TreeItem "System (C:)" [focusable, expandable] level 1
+  TreeItem "Data (D:)" [focusable, expandable] level 1
+  Label "Network"
+  TreeItem "Share (Z:)" [focusable, expandable] level 1
+  TreeItem "\\\\made-up-server\\projects" [focusable, expandable] level 1
+  TreeItem "Network ↗" [focusable] level 1
+  TreeItem "Recycle Bin ↗" [focusable] level 1
+Splitter "Resize panes" [focusable] 22.222221%
+ListItem "documents" [focusable]
+ListItem "projects" [focusable]
+ListItem "media" [focusable]
+ListItem "a-folder-with-a-rather-long-name" [focusable]
+ListItem "System (C:)" [focusable]
+ListItem "Data (D:)" [focusable]
+ListItem "Share (Z:)" [focusable]
+ListItem "\\\\made-up-server\\projects" [focusable]
+ListItem "Recycle Bin ↗" [focusable]
+ListItem "Phones and other devices ↗" [focusable]
+ScrollBar 0%
+Label "0 items"

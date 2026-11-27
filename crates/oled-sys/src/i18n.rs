@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use std::sync::OnceLock;
 
+use crate::lang::LangFile;
+
 use windows::core::{w, PCWSTR};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 
@@ -34,6 +36,14 @@ pub struct Strings {
     pub spans: &'static [(u32, u32)],
 }
 
+/// The installed it.lang, when the process loaded one: its texts win over the compiled Italian.
+static LANG_FILE: OnceLock<&'static LangFile> = OnceLock::new();
+
+/// Sets the Italian data file once per process; false when one is already set.
+pub fn set_lang_file(f: &'static LangFile) -> bool {
+    LANG_FILE.set(f).is_ok()
+}
+
 /// The strings of one crate; `hashes` ascending, no duplicate.
 pub struct Table {
     pub hashes: &'static [u64],
@@ -58,6 +68,9 @@ impl Table {
             return "";
         };
         if italian {
+            if let Some(t) = LANG_FILE.get().and_then(|f| f.get(k.0)).filter(|t| !t.is_empty()) {
+                return t;
+            }
             let it = self.it.at(i);
             if !it.is_empty() {
                 return it;
@@ -249,6 +262,35 @@ mod tests {
         assert_eq!(t.get(key("t.three"), true), "Tre");
         assert_eq!(t.get(key("t.two"), true), "Two", "an empty IT span gives the EN text");
         assert_eq!(t.get(key("t.nope"), true), "");
+    }
+
+    /// Sets the process-wide data file once for the tests that need it (it holds only "df.one").
+    fn ensure_file() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let bytes = crate::lang::encode("it", (1, 8, 0), &[(fnv1a64("df.one"), "Primo")]).unwrap();
+            let f: &'static LangFile = Box::leak(Box::new(LangFile::parse(bytes).unwrap()));
+            assert!(set_lang_file(f));
+        });
+    }
+
+    #[test]
+    fn data_file_wins_then_falls_back() {
+        let t = leak_table(&[("df.one", "One", "Uno"), ("df.two", "Two", "Due"), ("df.three", "Three", "")]);
+        ensure_file();
+        assert_eq!(t.get(key("df.one"), true), "Primo");
+        assert_eq!(t.get(key("df.two"), true), "Due", "a key absent from the file keeps the compiled Italian");
+        assert_eq!(t.get(key("df.three"), true), "Three");
+        assert_eq!(t.get(key("df.one"), false), "One", "English is never read from the file");
+        assert_eq!(t.get(key("df.none"), true), "");
+    }
+
+    #[test]
+    fn set_lang_file_is_once() {
+        ensure_file();
+        let again: &'static LangFile =
+            Box::leak(Box::new(LangFile::parse(crate::lang::encode("it", (1, 8, 0), &[(1, "a")]).unwrap()).unwrap()));
+        assert!(!set_lang_file(again), "a second file is refused");
     }
 
     #[test]

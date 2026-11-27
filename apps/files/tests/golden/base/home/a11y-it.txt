@@ -1,0 +1,42 @@
+TabList
+  Tab "Home" [focusable, selected]
+    Button "Chiudi scheda"
+  Button "Nuova scheda" [focusable]
+Button "Indietro · Alt+←" [disabled]
+Button "Avanti · Alt+→" [disabled]
+Button "Su · Alt+↑" [disabled]
+Button "Nuovo" [focusable]
+Button "Ordina" [focusable]
+Button "Visualizza" [focusable]
+Button "Altro" [focusable]
+Toolbar "Percorso"
+  Link "Home" [focusable]
+  Button "Sottocartelle"
+  Button "Aggiorna" [focusable]
+Tree
+  Label "Aggiunti"
+  TreeItem "documents" [focusable, expandable] level 1
+  TreeItem "projects" [focusable, expandable] level 1
+  TreeItem "media" [focusable, expandable] level 1
+  TreeItem "a-folder-with-a-rather-long-name" [focusable, expandable] level 1
+  Label "Questo PC"
+  TreeItem "System (C:)" [focusable, expandable] level 1
+  TreeItem "Data (D:)" [focusable, expandable] level 1
+  Label "Rete"
+  TreeItem "Share (Z:)" [focusable, expandable] level 1
+  TreeItem "\\\\made-up-server\\projects" [focusable, expandable] level 1
+  TreeItem "Rete ↗" [focusable] level 1
+  TreeItem "Cestino ↗" [focusable] level 1
+Splitter "Ridimensiona i riquadri" [focusable] 22.222221%
+ListItem "documents" [focusable]
+ListItem "projects" [focusable]
+ListItem "media" [focusable]
+ListItem "a-folder-with-a-rather-long-name" [focusable]
+ListItem "System (C:)" [focusable]
+ListItem "Data (D:)" [focusable]
+ListItem "Share (Z:)" [focusable]
+ListItem "\\\\made-up-server\\projects" [focusable]
+ListItem "Cestino ↗" [focusable]
+ListItem "Telefoni e altri dispositivi ↗" [focusable]
+ScrollBar 0%
+Label "0 elementi"

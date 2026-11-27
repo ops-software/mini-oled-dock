@@ -1,7 +1,9 @@
 //! Undo (OP4): check a record against the disk, then plan its inverse as ordinary chunks for the runner. The host
 //! runs check again right before plan (the UI's copy of the record is not trusted for freshness). Entries are
 //! top-level items (OP3), so an undo acts on whole top-level folders. No plan ever holds DeletePermanent: copies and
-//! new folders go to the Recycle Bin, moves and renames go back, a recycle is restored or the bin opened.
+//! new folders go to the Recycle Bin, moves and renames go back, a recycle is restored or the bin opened. A restore
+//! moves the item out of the bin, which leaves the bin's $I record of it behind: the runner then removes that record,
+//! and only that one (binrec).
 
 use std::collections::HashMap;
 

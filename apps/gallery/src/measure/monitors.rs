@@ -53,7 +53,7 @@ fn monitors() -> Vec<Mon> {
 }
 
 /// The current refresh rate of a display device (0 when Windows does not say).
-fn refresh_hz(device: &str) -> u32 {
+pub(super) fn refresh_hz(device: &str) -> u32 {
     let wide: Vec<u16> = device.encode_utf16().chain([0]).collect();
     let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
     // SAFETY: `wide` is NUL-terminated and outlives the call; `dm` is writable with dmSize set. Read only.

@@ -1,4 +1,4 @@
-//! THIRD_PARTY_NOTICES.md must cover what ships in dock.exe.
+//! THIRD_PARTY_NOTICES.md must cover what ships in dock.exe and in tasks.exe (the apps that carry crates of their own).
 //! Regenerate the crate part with `pwsh tools/gen-notices.ps1`.
 
 use std::os::windows::process::CommandExt;
@@ -30,8 +30,19 @@ fn path_packages_are_the_suites_own() {
     assert_eq!(local_package("serde v1.0.229 (*)"), None);
 }
 
+/// The apps whose executables ship crates of their own, besides the dock (the root package).
+const APPS: [&str; 1] = ["tasks"];
+
 #[test]
 fn notices_list_every_crate_in_the_exe() {
+    notices_list_every_crate(&[]);
+    for app in APPS {
+        notices_list_every_crate(&["-p", app]);
+    }
+}
+
+/// `cargo tree` of one package (the root package for no arguments) with its default features: the build that ships.
+fn notices_list_every_crate(package: &[&str]) {
     let out = Command::new(env!("CARGO"))
         .creation_flags(CREATE_NO_WINDOW)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -48,6 +59,7 @@ fn notices_list_every_crate_in_the_exe() {
             "-f",
             "{p}",
         ])
+        .args(package)
         .output()
         .expect("run cargo tree");
     assert!(out.status.success(), "cargo tree failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -63,7 +75,7 @@ fn notices_list_every_crate_in_the_exe() {
         let line = line.trim_end_matches(" (*)").trim_end_matches(" (proc-macro)");
         if let Some(name) = local_package(line) {
             // The suite's own crates are covered by the repository's LICENSE; any other path package is unlicensed code.
-            if !name.starts_with("oled-") && !missing.contains(&name.to_string()) {
+            if !name.starts_with("oled-") && !APPS.contains(&name) && !missing.contains(&name.to_string()) {
                 missing.push(name.to_string());
             }
             continue;
@@ -108,6 +120,21 @@ fn stored_licences_are_verbatim() {
     let s = String::from_utf8(read("tools/notices/EarTrumpet-LICENSE.txt")).expect("licence is UTF-8");
     for who in ["Yellow Elephant Productions", "Tidal Media Inc.", "Articent Group LLC"] {
         assert!(s.contains(who), "licence file does not name {who}");
+    }
+}
+
+/// The crates whose package carries no licence file (AccessKit): the text kept in tools/notices-crates must be in the
+/// generated part, next to the crates it covers.
+#[test]
+fn crates_without_a_licence_file_carry_the_stored_text() {
+    let notices = String::from_utf8(read("THIRD_PARTY_NOTICES.md")).expect("notices are UTF-8");
+    let lic = String::from_utf8(read("tools/notices-crates/accesskit-LICENSE-MIT.txt")).expect("licence is UTF-8");
+    let at = notices.find("Used by: accesskit ").expect("notices do not name accesskit");
+    let mut parts = notices[at..].split("```");
+    let (users, text) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    assert!(text.contains(lic.trim_end()), "the AccessKit licence text is not beside its crates");
+    for name in ["accesskit_consumer", "accesskit_windows"] {
+        assert!(users.lines().next().is_some_and(|l| l.contains(name)), "{name} is not in the AccessKit group");
     }
 }
 

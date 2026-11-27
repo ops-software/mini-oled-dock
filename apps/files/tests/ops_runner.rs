@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use common::temp::TempRoot;
 use files_engine::ops::checks::check_item;
+use files_engine::ops::consts::{CANCEL_IN_OP, CHUNK_ITEMS};
 use files_engine::ops::flags::op_flags;
 use files_engine::ops::journal::{Pre, StagedItems};
 use files_engine::ops::preflight::{preflight, skip_present};
@@ -197,24 +198,26 @@ fn copy_folder_reports_top_level_only() {
 
 #[test]
 fn chunks_of_64() {
+    // CHUNK_ITEMS: 64 with CANCEL_IN_OP false, 256 with it true.
+    let n = 2 * CHUNK_ITEMS as u32 + 22;
     let root = TempRoot::new("ops_chunks");
-    let items = make_files(&root, "src", 150);
+    let items = make_files(&root, "src", n);
     let (c, rx) = ctx(&[&root]);
     let (end, evs) = run_all(3, job(OpKind::Copy, items, Some(wp(&root.dir("dst"))), Conflicts::AskSystem), &c, &rx);
     assert_eq!(end.result, OpResult::Done);
-    assert_eq!(c.stats.performs.load(Ordering::Relaxed), 3, "64 + 64 + 22");
+    assert_eq!(c.stats.performs.load(Ordering::Relaxed), 3, "two full chunks and 22");
     assert_eq!(c.stats.created.load(Ordering::Relaxed), 3);
-    for i in 0..150 {
+    for i in 0..n {
         assert_eq!(root.hash(&format!("dst/f{i:03}.bin")), root.hash(&format!("src/f{i:03}.bin")));
     }
-    assert_eq!(changes(&evs).len(), 150);
-    assert_eq!(finished(&evs).3, 150);
+    assert_eq!(changes(&evs).len(), n as usize);
+    assert_eq!(finished(&evs).3, n);
 }
 
 #[test]
 fn cancel_between_chunks() {
     let root = TempRoot::new("ops_cancel");
-    let items = make_files(&root, "src", 150);
+    let items = make_files(&root, "src", CHUNK_ITEMS as u32 + 86);
     let before = root.hash_tree("src");
     let (mut c, rx) = ctx(&[&root]);
     let cancel = c.cancel.clone();
@@ -226,7 +229,9 @@ fn cancel_between_chunks() {
     let (end, evs) = run_all(4, job(OpKind::Copy, items, Some(wp(&root.dir("dst"))), Conflicts::AskSystem), &c, &rx);
     assert_eq!(end.result, OpResult::Cancelled, "{:?}", evs.last());
     let copied = root.hash_tree("dst").len();
-    assert!((10..=64).contains(&copied), "at most one chunk reached the destination: {copied}");
+    // With CANCEL_IN_OP the cancel stops PerformOperations itself: the 11th item's Pre refuses it.
+    let most = if CANCEL_IN_OP { 11 } else { CHUNK_ITEMS };
+    assert!((10..=most).contains(&copied), "at most {most} items reached the destination: {copied}");
     assert_eq!(root.hash_tree("src"), before, "nothing at the source is lost");
     assert_eq!(c.stats.performs.load(Ordering::Relaxed), 1, "no further chunk");
     assert_eq!(finished(&evs).0, OpResult::Cancelled);

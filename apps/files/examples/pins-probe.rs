@@ -93,29 +93,18 @@ fn enumerate_all(out: &mut dyn FnMut(Found)) -> Result<u32, i32> {
     Ok(total)
 }
 
-/// The pinned folders of Quick access that have a filesystem path, each handed to out; the count. One function so
-/// that the library can take it over unchanged; it runs inside a COM apartment of the caller.
-fn enumerate_pins(out: &mut dyn FnMut(WidePath)) -> Result<u32, i32> {
-    let mut n = 0u32;
-    enumerate_all(&mut |f| {
-        if let (Some(true), Some(p)) = (f.pinned, f.path) {
-            n += 1;
-            out(p);
-        }
-    })?;
-    Ok(n)
-}
-
 /// The counts of one run.
 struct Counts {
     items: u32,
     pinned: u32,
     pinned_with_path: u32,
     state_unknown: u32,
+    /// What the library's own enumeration (the code the app runs) counted.
+    library_pinned_with_path: u32,
 }
 
 fn run() -> Result<Counts, i32> {
-    let mut c = Counts { items: 0, pinned: 0, pinned_with_path: 0, state_unknown: 0 };
+    let mut c = Counts { items: 0, pinned: 0, pinned_with_path: 0, state_unknown: 0, library_pinned_with_path: 0 };
     c.items = enumerate_all(&mut |f| match f.pinned {
         Some(true) => {
             c.pinned += 1;
@@ -126,9 +115,12 @@ fn run() -> Result<Counts, i32> {
         Some(false) => {}
         None => c.state_unknown += 1,
     })?;
-    // The count the library function gives must agree with the counted one.
-    let n = enumerate_pins(&mut |_| {})?;
-    debug_assert_eq!(n, c.pinned_with_path);
+    // The library's enumeration (the shell host's own) must agree with the counted one.
+    let n = files_engine::shell::pins::enumerate_pins(&mut |_| {})?;
+    c.library_pinned_with_path = n;
+    if n != c.pinned_with_path {
+        return Err(0x8000_4005_u32 as i32); // E_FAIL: the shipped enumeration disagrees with the probe
+    }
     Ok(c)
 }
 
@@ -176,12 +168,13 @@ fn main() {
                 "pinned": c.pinned,
                 "pinned_with_path": c.pinned_with_path,
                 "state_unknown": c.state_unknown,
+                "library_pinned_with_path": c.library_pinned_with_path,
             }))
             .unwrap_or_default();
             root.file(name, text.as_bytes());
             println!(
-                "probe: items {} pinned {} pinned_with_path {} state_unknown {}",
-                c.items, c.pinned, c.pinned_with_path, c.state_unknown
+                "probe: items {} pinned {} pinned_with_path {} state_unknown {} library_pinned_with_path {}",
+                c.items, c.pinned, c.pinned_with_path, c.state_unknown, c.library_pinned_with_path
             );
         }
         Err(code) => {

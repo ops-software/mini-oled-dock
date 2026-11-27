@@ -1,0 +1,31 @@
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Button "More options (F10)" [focusable]
+SearchInput "Search processes" [focusable] ""
+ColumnHeader "Name, 23 processes" [focusable]
+ColumnHeader "CPU, total 18.0 %" [focusable]
+ColumnHeader "Memory, total 52 %" [focusable]
+ColumnHeader "I/O, total 1.13 MB/s" [focusable]
+Image "Order held while you aim"
+Table "Name" [focusable] 0 of 21
+  Row "Apps, 4 items, expanded" [focusable, expandable, expanded] 1 of 21
+  Row "Calculator, CPU 0 %, memory 34.0 MB, I/O 0" [focusable] 2 of 21
+  Row "Ember (2), CPU 10.0 %, memory 2.65 GB, I/O 898 KB/s" [focusable, expandable] 3 of 21
+  Row "File Explorer, CPU 0.4 %, memory 210 MB, I/O 4.88 KB/s" [focusable] 4 of 21
+  Row "Orbit (5), CPU 4.8 %, memory 438 MB, I/O 60.8 KB/s" [focusable, expandable] 5 of 21
+  Row "Background, 3 items, expanded" [focusable, expandable, expanded] 6 of 21
+  Row "helper.exe, CPU 0.0 %, memory 14.0 MB, I/O 100 B/s" [focusable] 7 of 21
+  Row "Notes, CPU 0 %, memory 12.0 MB, I/O 0" [focusable] 8 of 21
+  Row "Syncer (2), CPU 0.2 %, memory 83.0 MB, I/O 5.37 KB/s" [focusable, expandable] 9 of 21
+  Row "Part of Windows, 9 items, expanded" [focusable, expandable, expanded] 10 of 21
+  Row "Hardware and drivers, CPU 1.4 %" [focusable] 11 of 21
+  Row "ApplicationFrameHost.exe, CPU 0.1 %, memory 24.0 MB, I/O 300 B/s" [focusable] 12 of 21
+  Row "audiodg.exe, CPU 31.0 %, memory 64.0 MB, I/O 146 KB/s" [focusable] 13 of 21
+  Row "dwm.exe, CPU 1.2 %, memory 160 MB, I/O 1.95 KB/s" [focusable] 14 of 21
+  Row "lsass.exe, CPU 0.1 %, memory 22.0 MB, I/O 900 B/s" [focusable] 15 of 21
+  Row "services.exe, CPU 0.1 %, memory 9.00 MB, I/O 300 B/s" [focusable] 16 of 21
+  Row "Service host: Windows Audio +1, CPU 7.0 %, memory 48.0 MB, I/O 29.3 KB/s" [focusable] 17 of 21
+  Row "Service host: DHCP Client, CPU 0.3 %, memory 31.0 MB, I/O 1.17 KB/s" [focusable] 18 of 21
+  Row "svchost.exe, CPU 0.1 %, memory 18.0 MB, I/O 400 B/s" [focusable] 19 of 21
+  Row "System, CPU 0.4 %, memory 205 KB, I/O 11.7 KB/s" [focusable] 20 of 21
+  Row "System Idle Process, CPU 40.0 %, memory 10.2 KB, I/O 0" [focusable] 21 of 21

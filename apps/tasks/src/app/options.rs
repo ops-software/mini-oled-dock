@@ -182,7 +182,7 @@ fn whole_file(message: String, line: u32, col: u32) -> ConfigError {
 pub fn on_set(_: &TasksOptions) {}
 
 /// The file's size cap.
-const FILE_CAP: u64 = 64 * 1024;
+pub(crate) const FILE_CAP: u64 = 64 * 1024;
 
 /// The Store on %APPDATA%\mini-oled-dock\tasks.json, loaded (no legacy file). Without a roaming folder it holds the
 /// defaults and never writes. Keys this version does not know stay in the file (the Store's rule).

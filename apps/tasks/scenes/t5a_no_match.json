@@ -1,0 +1,463 @@
+{
+ "size": [
+  760,
+  700
+ ],
+ "machine": {
+  "logical_cpus": 16,
+  "total_phys": 34359738368,
+  "mem_load": 52,
+  "commit_pct": 40,
+  "cpu_pct": 18,
+  "dpc_irq_pct": 1.4
+ },
+ "ticks": 2,
+ "mode": "grouped",
+ "procs": [
+  {
+   "pid": 0,
+   "created": 0,
+   "parent": 0,
+   "session": 0,
+   "image": "",
+   "path": null,
+   "cpu": [
+    40
+   ],
+   "ws_private": 10486,
+   "io": [
+    0
+   ],
+   "threads": 8,
+   "handles": 200
+  },
+  {
+   "pid": 4,
+   "created": 133500000000004000,
+   "parent": 0,
+   "session": 0,
+   "image": "System",
+   "path": "C:\\Windows\\System32\\ntoskrnl.exe",
+   "cpu": [
+    0.4
+   ],
+   "ws_private": 209715,
+   "io": [
+    12000
+   ],
+   "threads": 12,
+   "handles": 204
+  },
+  {
+   "pid": 700,
+   "created": 133500000000700000,
+   "parent": 4,
+   "session": 0,
+   "image": "services.exe",
+   "path": "C:\\Windows\\System32\\services.exe",
+   "cpu": [
+    0.05
+   ],
+   "ws_private": 9437184,
+   "io": [
+    300
+   ],
+   "threads": 8,
+   "handles": 270
+  },
+  {
+   "pid": 710,
+   "created": 133500000000710000,
+   "parent": 4,
+   "session": 0,
+   "image": "lsass.exe",
+   "path": "C:\\Windows\\System32\\lsass.exe",
+   "cpu": [
+    0.05
+   ],
+   "ws_private": 23068672,
+   "io": [
+    900
+   ],
+   "threads": 11,
+   "handles": 280
+  },
+  {
+   "pid": 800,
+   "created": 133500000000800000,
+   "parent": 700,
+   "session": 0,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    7
+   ],
+   "ws_private": 50331648,
+   "io": [
+    30000
+   ],
+   "threads": 10,
+   "handles": 280
+  },
+  {
+   "pid": 804,
+   "created": 133500000000804000,
+   "parent": 700,
+   "session": 0,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.3
+   ],
+   "ws_private": 32505856,
+   "io": [
+    1200
+   ],
+   "threads": 14,
+   "handles": 284
+  },
+  {
+   "pid": 808,
+   "created": 133500000000808000,
+   "parent": 700,
+   "session": 0,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.1
+   ],
+   "ws_private": 18874368,
+   "io": [
+    400
+   ],
+   "threads": 11,
+   "handles": 288
+  },
+  {
+   "pid": 900,
+   "created": 133500000000900000,
+   "parent": 4,
+   "session": 1,
+   "image": "dwm.exe",
+   "path": "C:\\Windows\\System32\\dwm.exe",
+   "cpu": [
+    1.2
+   ],
+   "ws_private": 167772160,
+   "io": [
+    2000
+   ],
+   "threads": 12,
+   "handles": 200
+  },
+  {
+   "pid": 950,
+   "created": 133500000000950000,
+   "parent": 700,
+   "session": 0,
+   "image": "audiodg.exe",
+   "path": "C:\\Windows\\System32\\audiodg.exe",
+   "cpu": [
+    31
+   ],
+   "ws_private": 67108864,
+   "io": [
+    150000
+   ],
+   "threads": 13,
+   "handles": 250
+  },
+  {
+   "pid": 1000,
+   "created": 133500000001000000,
+   "parent": 0,
+   "session": 1,
+   "image": "explorer.exe",
+   "path": "C:\\Windows\\explorer.exe",
+   "cpu": [
+    0.4
+   ],
+   "ws_private": 220200960,
+   "io": [
+    5000
+   ],
+   "threads": 14,
+   "handles": 210
+  },
+  {
+   "pid": 2000,
+   "created": 133500000002000000,
+   "parent": 1000,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\Orbit\\orbit.exe",
+   "cpu": [
+    2.2
+   ],
+   "ws_private": 188743680,
+   "io": [
+    40000
+   ],
+   "threads": 13,
+   "handles": 220
+  },
+  {
+   "pid": 2100,
+   "created": 133500000002100000,
+   "parent": 2000,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\Orbit\\orbit.exe",
+   "cpu": [
+    0.8
+   ],
+   "ws_private": 100663296,
+   "io": [
+    12000
+   ],
+   "threads": 8,
+   "handles": 230
+  },
+  {
+   "pid": 2110,
+   "created": 133500000002110000,
+   "parent": 2100,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\Orbit\\orbit.exe",
+   "cpu": [
+    0.1
+   ],
+   "ws_private": 54525952,
+   "io": [
+    800
+   ],
+   "threads": 11,
+   "handles": 240
+  },
+  {
+   "pid": 2200,
+   "created": 133500000002200000,
+   "parent": 2000,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\Orbit\\orbit.exe",
+   "cpu": [
+    1.4
+   ],
+   "ws_private": 73400320,
+   "io": [
+    9000
+   ],
+   "threads": 10,
+   "handles": 240
+  },
+  {
+   "pid": 2300,
+   "created": 133500000002300000,
+   "parent": 2000,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\Orbit\\orbit.exe",
+   "cpu": [
+    0.3
+   ],
+   "ws_private": 41943040,
+   "io": [
+    500
+   ],
+   "threads": 12,
+   "handles": 250
+  },
+  {
+   "pid": 3000,
+   "created": 133500000003000000,
+   "parent": 1000,
+   "session": 1,
+   "image": "ember.exe",
+   "path": "C:\\Games\\Ember\\ember.exe",
+   "cpu": [
+    9
+   ],
+   "ws_private": 2516582400,
+   "io": [
+    900000
+   ],
+   "threads": 12,
+   "handles": 230
+  },
+  {
+   "pid": 3100,
+   "created": 133500000003100000,
+   "parent": 3000,
+   "session": 1,
+   "image": "ember.exe",
+   "path": "C:\\Games\\Ember\\ember.exe",
+   "cpu": [
+    1
+   ],
+   "ws_private": 325058560,
+   "io": [
+    20000
+   ],
+   "threads": 14,
+   "handles": 240
+  },
+  {
+   "pid": 3500,
+   "created": 133500000003500000,
+   "parent": 1000,
+   "session": 1,
+   "image": "helper.exe",
+   "path": "C:\\Games\\Ember\\helper.exe",
+   "cpu": [
+    0.02
+   ],
+   "ws_private": 14680064,
+   "io": [
+    100
+   ],
+   "threads": 8,
+   "handles": 280
+  },
+  {
+   "pid": 4000,
+   "created": 133500000004000000,
+   "parent": 0,
+   "session": 1,
+   "image": "ApplicationFrameHost.exe",
+   "path": "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+   "cpu": [
+    0.1
+   ],
+   "ws_private": 25165824,
+   "io": [
+    300
+   ],
+   "threads": 11,
+   "handles": 240
+  },
+  {
+   "pid": 4100,
+   "created": 133500000004100000,
+   "parent": 4000,
+   "session": 1,
+   "image": "CalculatorApp.exe",
+   "path": "C:\\Program Files\\WindowsApps\\Calc\\CalculatorApp.exe",
+   "cpu": [
+    0
+   ],
+   "ws_private": 35651584,
+   "io": [
+    0
+   ],
+   "threads": 13,
+   "handles": 250
+  },
+  {
+   "pid": 7000,
+   "created": 133500000007000000,
+   "parent": 1000,
+   "session": 1,
+   "image": "syncer.exe",
+   "path": "C:\\Program Files\\Syncer\\syncer.exe",
+   "cpu": [
+    0.1
+   ],
+   "ws_private": 47185920,
+   "io": [
+    3000
+   ],
+   "threads": 8,
+   "handles": 270
+  },
+  {
+   "pid": 7001,
+   "created": 133500000007001000,
+   "parent": 1000,
+   "session": 1,
+   "image": "syncer.exe",
+   "path": "C:\\Program Files\\Syncer\\syncer.exe",
+   "cpu": [
+    0.1
+   ],
+   "ws_private": 39845888,
+   "io": [
+    2500
+   ],
+   "threads": 9,
+   "handles": 271
+  },
+  {
+   "pid": 7500,
+   "created": 133500000007500000,
+   "parent": 1000,
+   "session": 1,
+   "image": "notes.exe",
+   "path": "C:\\Tools\\notes.exe",
+   "cpu": [
+    0
+   ],
+   "ws_private": 12582912,
+   "io": [
+    0
+   ],
+   "threads": 11,
+   "handles": 230
+  }
+ ],
+ "windows": [
+  {
+   "pid": 1000,
+   "identity": "explorer-id"
+  },
+  {
+   "pid": 2000,
+   "identity": "orbit-id"
+  },
+  {
+   "pid": 3000,
+   "identity": "ember-id"
+  },
+  {
+   "pid": 4100,
+   "identity": "calc-id"
+  }
+ ],
+ "services": [
+  {
+   "pid": 800,
+   "name": "Audiosrv",
+   "display": "Windows Audio"
+  },
+  {
+   "pid": 800,
+   "name": "AudioEndpointBuilder",
+   "display": "Windows Audio Endpoint Builder"
+  },
+  {
+   "pid": 804,
+   "name": "Dhcp",
+   "display": "DHCP Client"
+  }
+ ],
+ "names": {
+  "explorer-id": "File Explorer",
+  "orbit-id": "Orbit",
+  "ember-id": "Ember",
+  "calc-id": "Calculator",
+  "c:\\program files\\syncer\\syncer.exe": "Syncer",
+  "c:\\program files\\orbit\\orbit.exe": "Orbit",
+  "c:\\games\\ember\\ember.exe": "Ember",
+  "c:\\tools\\notes.exe": "Notes"
+ },
+ "collapsed": {
+  "apps": false,
+  "background": false,
+  "windows": false
+ },
+ "input": [
+  "key Ctrl+F",
+  "type zzq"
+ ]
+}

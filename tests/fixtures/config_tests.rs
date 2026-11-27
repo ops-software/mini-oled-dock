@@ -148,7 +148,7 @@ fn known_and_legacy_keys_are_never_extra() {
     assert!(parse("{\"bar_size\":\"large\"}").unwrap().extra.is_empty());
     assert!(Config::default().extra.is_empty());
     // No unknown key: not one byte of the file changes.
-    assert!(render(&Config::default()).ends_with("  \"notif_prompted\": false\n}\n"));
+    assert!(render(&Config::default()).ends_with("  \"takeover_ctrl_shift_esc\": false\n}\n"));
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn rendered_keys_are_known_and_never_extra() {
 // ------------------------------------------------------------------ W5c: one declaration, the same file
 
 /// The fields of `Config` in the order 1.6 declared them: serde writes them in this order, so every snapshot does.
-const DECLARED: [&str; 56] = [
+const DECLARED: [&str; 59] = [
     "language",
     "position",
     "monitor",
@@ -237,6 +237,9 @@ const DECLARED: [&str; 56] = [
     "last_update_check",
     "update_available",
     "launcher",
+    "suite_tasks",
+    "suite_files",
+    "takeover_ctrl_shift_esc",
 ];
 
 /// The top-level keys of a pretty-printed JSON object, in their order.
@@ -280,6 +283,42 @@ fn public_functions_keep_their_signatures() {
     let _: fn() -> bool = external_edit_pending;
     let _: fn() -> LoadNotes = load_notes;
     let _: fn() -> Arc<[ConfigError]> = errors;
+}
+
+#[test]
+fn takeover_key_defaults_off() {
+    assert!(!Config::default().takeover_ctrl_shift_esc);
+    assert!(!parse("{}").unwrap().takeover_ctrl_shift_esc, "a file without the key reads false");
+    let on = parse("{\"takeover_ctrl_shift_esc\": true}").unwrap();
+    assert!(on.takeover_ctrl_shift_esc);
+    assert!(parse(&render(&on)).unwrap().takeover_ctrl_shift_esc, "true round-trips");
+    // A non-bool keeps the last good value and adds one error.
+    let (c, errors) = parse_with_errors("{\"takeover_ctrl_shift_esc\": 3}", Some(&on)).unwrap();
+    assert!(c.takeover_ctrl_shift_esc);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].path, "takeover_ctrl_shift_esc");
+    assert_eq!(errors[0].problem, Problem::Type { expected: "a boolean" });
+    assert_eq!(errors[0].kept, Kept::LastGood);
+}
+
+#[test]
+fn takeover_key_is_never_profileable() {
+    let d =
+        Config::descriptors().iter().find(|d| d.json == "takeover_ctrl_shift_esc").expect("the key has a descriptor");
+    assert_eq!(d.takeover, Some(oled_config::Takeover::CtrlShiftEsc));
+    assert!(!d.profileable);
+    let ui_page = (d.page, d.section);
+    assert_eq!(ui_page, (PageId("suite"), SecId("keyboard")));
+    assert!(matches!(d.control, Control::Toggle));
+    assert_eq!(d.reason, "opt-in takeover of Ctrl+Shift+Esc (ROADMAP X10, X34)");
+}
+
+#[test]
+fn template_has_the_key() {
+    let t = Config::default().to_template();
+    let files = t.find("\"suite_files\"").expect("suite_files");
+    let key = t.find("\"takeover_ctrl_shift_esc\": false").expect("the takeover key, off");
+    assert!(files < key, "the key comes after suite_files");
 }
 
 #[test]
@@ -438,6 +477,9 @@ fn random_config(r: &mut Rng) -> Config {
             offer_done: r.flip(),
             powertoys_done: r.flip(),
         },
+        suite_tasks: r.flip(),
+        suite_files: r.flip(),
+        takeover_ctrl_shift_esc: r.flip(),
         extra: (0..r.below(3))
             .map(|i| {
                 let v = match r.below(3) {
@@ -1180,7 +1222,15 @@ mod legacy {
   }},
 
   // Internal: set once the notification-access prompt has been shown. Leave as is.
-  "notif_prompted": {notif}{extra}
+  "notif_prompted": {notif},
+
+  // Suite. true = the Start menu has an entry for the Tasks app once it is installed;
+  // false = no entry (the app itself stays installed). Applied by the elevated dock.
+  "suite_tasks": {suite_tasks},
+  // true = the Start menu has an entry for the Files app once it is installed (as suite_tasks).
+  "suite_files": {suite_files},
+  // Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager (off by default; not available while Tasks is beta).
+  "takeover_ctrl_shift_esc": {takeover_ctrl_shift_esc}{extra}
 }}
 "#,
             monitor = js(&c.monitor),
@@ -1234,6 +1284,9 @@ mod legacy {
             start_folders = js_block(&c.start_folders),
             names = js_block(&c.names),
             notif = c.notif_prompted,
+            suite_tasks = c.suite_tasks,
+            suite_files = c.suite_files,
+            takeover_ctrl_shift_esc = c.takeover_ctrl_shift_esc,
             update_check = c.update_check,
             update_auto_install = c.update_auto_install,
             last_update_check = js(&c.last_update_check),

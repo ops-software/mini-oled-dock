@@ -63,6 +63,8 @@ pub(crate) mod popup_app;
 pub(crate) mod popup_dock;
 #[path = "popup_launcher.rs"]
 pub(crate) mod popup_launcher;
+#[path = "popup_metrics.rs"]
+pub(crate) mod popup_metrics;
 #[path = "popup_scroll.rs"]
 pub(crate) mod popup_scroll;
 #[path = "popup_start.rs"]
@@ -118,6 +120,8 @@ pub enum PopupKind {
     Launcher = 12,
     /// The dock menu (`popup_dock`): right click on empty bar space.
     DockMenu = 13,
+    /// The metrics menu (`popup_metrics`): right click on the bar's CPU or memory item.
+    MetricsMenu = 14,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -157,6 +161,9 @@ pub struct AppMenuInfo {
     pub can_launch: bool,
     /// The app's own jump list (`jumplist::load`), shown above the dock's rows; empty if none.
     pub jump: Vec<crate::jumplist::Group>,
+    /// true when Tasks is usable: the menu offers "Show in Tasks".
+    #[allow(dead_code)] // read by DS-ENTRY
+    pub show_in_tasks: bool,
 }
 
 /// Opens the themed context menu for an app item (same style as the popups). The choice reaches the
@@ -1041,6 +1048,7 @@ fn make_content(
         PopupKind::StartMenu => popup_startmenu::new(),
         PopupKind::Launcher => popup_launcher::new(),
         PopupKind::DockMenu => popup_dock::new(),
+        PopupKind::MetricsMenu => popup_metrics::new(),
     }
 }
 
@@ -2559,6 +2567,12 @@ mod tests {
         assert_eq!(window_name_for(PopupKind::Launcher), "Launcher");
         assert_eq!(window_name_for(PopupKind::StartMenu), "Dock popup");
         assert_eq!(window_name_for(PopupKind::Audio), "Dock popup");
+    }
+
+    #[test]
+    fn metrics_menu_kind_is_14() {
+        assert_eq!(PopupKind::MetricsMenu as usize, 14);
+        assert_eq!(window_name_for(PopupKind::MetricsMenu), "Dock popup");
     }
 
     #[test]

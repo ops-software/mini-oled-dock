@@ -244,8 +244,8 @@ fn every_route_runs() {
     // Snapshot B and the state write have run; nothing is left armed.
     h.advance(2_100);
     let s = h.screen();
-    assert_eq!(s.view().mode(), ViewMode::List, "grouped::initial_mode's stub");
-    assert!(!s.header().held(), "order::is_held's stub");
+    assert_eq!(s.view().mode(), ViewMode::Grouped, "grouped::initial_mode: a first start opens Grouped");
+    assert!(s.header().held(), "the pointer and the keys held the order a moment ago");
     assert_eq!(s.chrome().status(), Some(Status::Every { period_ms: 1000 }), "sampling::status's stub");
     let c = s.control_inputs();
     assert!(c.minimised && !c.cloaked && c.display_off && c.active && !c.windows_rows_visible);
@@ -254,6 +254,9 @@ fn every_route_runs() {
     assert_eq!(s.deps().sampling.sample_now_calls(), 1, "snapshot B, once");
     assert!(launcher.reqs.lock().unwrap().is_empty(), "no process started");
     assert!(exec.batches.lock().unwrap().is_empty(), "nothing acted on");
+    // The hold ends by its own timer.
+    h.advance(6_000);
+    assert!(!h.screen().header().held(), "the hold ended");
     assert!(h.is_idle(), "only the named one-shots were armed");
 }
 
@@ -300,7 +303,7 @@ fn placeholders(text: &str) -> BTreeSet<String> {
 }
 
 /// The number of keys of the beta (later groups only append, both files at once).
-const KEYS: usize = 111;
+const KEYS: usize = 121;
 
 #[test]
 fn strings_complete() {

@@ -1,0 +1,30 @@
+TabList
+  Tab "locked" [focusable, selected, invalid]
+    Button "Chiudi scheda"
+  Button "Nuova scheda" [focusable]
+Button "Indietro · Alt+←" [disabled]
+Button "Avanti · Alt+→" [disabled]
+Button "Su a documents · Alt+↑" [focusable]
+Button "Nuovo" [focusable]
+Button "Ordina" [focusable]
+Button "Visualizza" [focusable]
+Button "Altro" [focusable]
+Toolbar "Percorso"
+  Link "C:" [focusable]
+  Button "Sottocartelle"
+  Link "made-up" [focusable]
+  Button "Sottocartelle"
+  Link "documents" [focusable]
+  Button "Sottocartelle"
+  Link "locked" [focusable]
+  Button "Sottocartelle"
+  Button "Aggiorna" [focusable]
+ColumnHeader "Nome" [focusable]
+ColumnHeader "Ultima modifica" [focusable]
+ColumnHeader "Tipo" [focusable]
+ColumnHeader "Dimensione" [focusable]
+Table "Nome" [focusable] 0 of 0
+Button "Apri in Esplora file" [focusable]
+Button "Riprova (F5)" [focusable]
+Label "C:\\made-up\\documents\\locked non è raggiungibile"
+Label "0 elementi"

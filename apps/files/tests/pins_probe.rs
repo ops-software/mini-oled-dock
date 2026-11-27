@@ -30,7 +30,9 @@ fn probe_args_table() {
 
 #[test]
 fn probe_writes_nothing_but_out() {
-    let src = include_str!("../examples/pins-probe.rs");
+    let probe_src = include_str!("../examples/pins-probe.rs");
+    // The enumeration lives in the library now: the same scan covers it.
+    let lib_src = include_str!("../src/shell/pins.rs");
     // The banned names are built in pieces so this file never trips a scan for them.
     let banned = [
         concat!("Set", "Property"),
@@ -52,15 +54,21 @@ fn probe_writes_nothing_but_out() {
         concat!("P", "in"),
     ];
     let banned_ci = [concat!("pin", "tohome"), concat!("unpin", "fromhome"), concat!("Shell", "Execute")];
-    for line in src.lines().filter(|l| !l.trim_start().starts_with("//")) {
-        for b in banned {
-            assert!(!line.contains(b), "the probe names {b}: {line}");
-        }
-        let low = line.to_lowercase();
-        for b in banned_ci {
-            assert!(!low.contains(&b.to_lowercase()), "the probe names {b}: {line}");
+    for (name, text) in [("the probe", probe_src), ("shell/pins.rs", lib_src)] {
+        for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            // The wire names of the request kind and the reply event are not shell calls.
+            let owned = line.replace("CallKind::Pins", "").replace("ShellEvt::Pins", "");
+            let line = owned.as_str();
+            for b in banned {
+                assert!(!line.contains(b), "{name} names {b}: {line}");
+            }
+            let low = line.to_lowercase();
+            for b in banned_ci {
+                assert!(!low.contains(&b.to_lowercase()), "{name} names {b}: {line}");
+            }
         }
     }
+    let src = probe_src;
     // Its one write goes through the LiveRoot fence.
     assert!(
         src.lines().filter(|l| !l.trim_start().starts_with("//")).any(|l| l.contains("LiveRoot::at(")),

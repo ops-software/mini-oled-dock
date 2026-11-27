@@ -1,0 +1,5 @@
+# Sample strings for the it.lang tests.
+"sample.hello" = "Hello"
+"sample.count" = "{n} items"
+"sample.close" = "Close"
+"sample.settings" = "Settings"

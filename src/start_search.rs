@@ -1136,7 +1136,7 @@ const NT_KEY: windows::core::PCWSTR = windows::core::w!(r"SOFTWARE\Microsoft\Win
 
 /// `CurrentBuildNumber` and `UBR` of the running Windows ("26100.1742"); empty where unreadable
 /// (`catalog_key_of` then gives no key: an unreadable build means no cache at all).
-fn windows_build() -> String {
+pub(crate) fn windows_build() -> String {
     let mut buf = [0u16; 32];
     let mut size = std::mem::size_of_val(&buf) as u32;
     // SAFETY: `buf`/`size` are valid writable locals of the declared size (in bytes); the key and

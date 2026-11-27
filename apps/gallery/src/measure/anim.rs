@@ -1,7 +1,8 @@
 //! S-ANIM: the frame clock's pacing (K3.4). `--measure anim [--monitor <i>] [--pacing a|b]` opens a window on monitor i
 //! (default 0, in the order of --list-monitors) with candidate A (the default) or B of oled-ui's frame pacing, runs ten
 //! 2 s linear tweens of a plate across 400 px, logs the QPC of each painted frame (one line per tween), then counts the
-//! loop's wake-ups in the 5 s after the last tween. The summary line has the refresh period DWM reports, p95 of
+//! loop's wake-ups in the 5 s after the last tween. The summary line has the refresh period of the monitor the window
+//! is on (display settings; DWM's single desktop period stays as dwm_period_ms), the source, p95 of
 //! |interval - period|, the share of intervals at 15-16 ms and those wake-ups. Pass rule for B (LIVE-K3 step 1): p95
 //! <= 1 ms at 60 Hz and at 144 Hz where a monitor offers it, no 15-16 ms intervals on a monitor faster than 60 Hz, 0
 //! wake-ups after the tweens. It only reads the display settings and changes nothing.
@@ -21,12 +22,17 @@ use oled_ui::theme::ThemeSpec;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 
 use super::empty::{emit, private_bytes, Deadline};
 use super::idle::between;
+use super::monitors::refresh_hz;
 use crate::app::spec;
 use crate::cli::{MeasureOpts, Pacing};
 
@@ -57,6 +63,32 @@ pub fn tween_target(k: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+/// The refresh period the jitter is measured against, ms, and where it came from: the monitor's own rate (display
+/// settings, `hz`) when Windows gave a real one, else DWM's single desktop period (`dwm_ms`).
+pub fn period_for(hz: u32, dwm_ms: f64) -> (f64, &'static str) {
+    if hz >= 24 {
+        (1000.0 / f64::from(hz), "display_settings")
+    } else {
+        (dwm_ms, "dwm")
+    }
+}
+
+/// The period of a run (pure): the monitor the window ended on (the last sample, the placed one with none), its own
+/// refresh rate through `hz_of`, DWM's `dwm_ms` only when Windows gave no real rate. Returns (period ms, source,
+/// refresh rate, whether the window changed monitor during the run).
+pub fn run_period(
+    seen: &[String],
+    placed: &str,
+    hz_of: impl Fn(&str) -> u32,
+    dwm_ms: f64,
+) -> (f64, &'static str, u32, bool) {
+    let last = seen.last().map_or(placed, |s| s.as_str());
+    let moved = seen.iter().any(|d| d != last);
+    let hz = hz_of(last);
+    let (period, source) = period_for(hz, dwm_ms);
+    (period, source, hz, moved)
 }
 
 /// The intervals between consecutive frames, ms.
@@ -102,8 +134,16 @@ pub struct Summary {
     pub monitor: u32,
     pub pacing: Pacing,
     pub qpc_freq: i64,
-    /// DWM's refresh period, ms (0 when DWM gave none).
+    /// The refresh period the jitter uses, ms: the monitor's own (see period_for).
     pub period_ms: f64,
+    /// Where period_ms came from: "display_settings" or "dwm".
+    pub period_source: &'static str,
+    /// The monitor's refresh rate in display settings (0 when Windows did not say).
+    pub refresh_hz: u32,
+    /// DWM's one desktop period, ms (0 when DWM gave none): the number older records used for every monitor.
+    pub dwm_period_ms: f64,
+    /// The window was on more than one monitor during the run.
+    pub moved: bool,
     pub frames: usize,
     pub intervals: Vec<f64>,
     pub wakeups_after: u64,
@@ -118,10 +158,14 @@ pub fn summary_line(s: &Summary) -> String {
         Pacing::B => "b",
     };
     format!(
-        "{{\"monitor\":{},\"pacing\":\"{pacing}\",\"qpc_freq\":{},\"period_ms\":{:.3},\"frames\":{},\"intervals\":{},\"p95_jitter_ms\":{:.3},\"share_15_16\":{:.3},\"wakeups_after\":{},\"timers_live_after\":{},\"private_bytes\":{}}}",
+        "{{\"monitor\":{},\"pacing\":\"{pacing}\",\"qpc_freq\":{},\"period_ms\":{:.3},\"period_source\":\"{}\",\"refresh_hz\":{},\"dwm_period_ms\":{:.3},\"moved\":{},\"frames\":{},\"intervals\":{},\"p95_jitter_ms\":{:.3},\"share_15_16\":{:.3},\"wakeups_after\":{},\"timers_live_after\":{},\"private_bytes\":{}}}",
         s.monitor,
         s.qpc_freq,
         s.period_ms,
+        s.period_source,
+        s.refresh_hz,
+        s.dwm_period_ms,
+        s.moved,
         s.frames,
         s.intervals.len(),
         jitter_p95(&s.intervals, s.period_ms),
@@ -148,7 +192,7 @@ fn qpc_freq() -> i64 {
     v.max(1)
 }
 
-/// DWM's refresh period in QPC ticks (desktop timing, as the pacing reads it); 0 when DWM gives none.
+/// DWM's one desktop refresh period in QPC ticks (as the pacing reads it); 0 when DWM gives none.
 fn dwm_period() -> u64 {
     let mut info = DWM_TIMING_INFO { cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
     // SAFETY: `info` is writable with cbSize set; a null window asks for the desktop's timing. Read only.
@@ -197,9 +241,32 @@ impl PlacementStore for OnMonitor {
     }
 }
 
+/// The device name of the monitor the thread's active window is on (None: no active window).
+fn active_device() -> Option<String> {
+    // SAFETY: reads the thread's active window; sends no message.
+    let hwnd = unsafe { GetActiveWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+    // SAFETY: a window of this thread; the monitor handle is only read.
+    let h = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFOEXW::default();
+    mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    // SAFETY: `mi` is a writable MONITORINFOEXW whose cbSize says so.
+    if !unsafe { GetMonitorInfoW(h, (&mut mi as *mut MONITORINFOEXW).cast::<MONITORINFO>()) }.as_bool() {
+        return None;
+    }
+    let n = mi.szDevice.iter().position(|c| *c == 0).unwrap_or(mi.szDevice.len());
+    Some(String::from_utf16_lossy(&mi.szDevice[..n]))
+}
+
 /// The plate and its tweens; each painted frame's QPC goes to the current tween's list.
 struct AnimScreen {
     frames: Rc<RefCell<Vec<Vec<i64>>>>,
+    /// The monitor the window was on at the first frame of each tween (a window dragged away is seen here).
+    devices: Rc<RefCell<Vec<String>>>,
+    /// Where the window was placed: the monitor when the active window is not known.
+    placed: String,
     /// The tween running (None before the first one).
     tween: Cell<Option<usize>>,
     track: RectP,
@@ -242,6 +309,9 @@ impl Screen for AnimScreen {
         let mid = RectP::wh(self.track.l, self.track.t + self.track.h() / 2, 1, 1);
         if let Some(k) = self.tween.get().filter(|_| cx.visible(mid)) {
             if let Some(list) = self.frames.borrow_mut().get_mut(k) {
+                if list.is_empty() {
+                    self.devices.borrow_mut().push(active_device().unwrap_or_else(|| self.placed.clone()));
+                }
                 list.push(qpc());
             }
         }
@@ -290,10 +360,13 @@ pub fn run(opts: &MeasureOpts) -> i32 {
         }
     };
     let rect = RectP::wh(48, 48, SIZE.w, SIZE.h);
-    lp.set_placement_store(Box::new(OnMonitor(Placement { monitor: device, rect, dpi, maximized: false })));
+    lp.set_placement_store(Box::new(OnMonitor(Placement { monitor: device.clone(), rect, dpi, maximized: false })));
     let frames: Rc<RefCell<Vec<Vec<i64>>>> = Rc::new(RefCell::new(Vec::new()));
+    let devices: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let screen = AnimScreen {
         frames: Rc::clone(&frames),
+        devices: Rc::clone(&devices),
+        placed: device.clone(),
         tween: Cell::new(None),
         track: RectP::default(),
         commands: CommandTable::new(),
@@ -347,11 +420,18 @@ pub fn run(opts: &MeasureOpts) -> i32 {
         count += list.len();
     }
     let (wakeups_after, _) = between(s0, s1);
+    // The monitor the window ended on (the first tween's, when no sample was taken), its own refresh rate.
+    let dwm_period_ms = dwm_period() as f64 * 1000.0 / freq as f64;
+    let (period_ms, period_source, hz, moved) = run_period(&devices.borrow(), &device, refresh_hz, dwm_period_ms);
     let s = Summary {
         monitor: index,
         pacing,
         qpc_freq: freq,
-        period_ms: dwm_period() as f64 * 1000.0 / freq as f64,
+        period_ms,
+        period_source,
+        refresh_hz: hz,
+        dwm_period_ms,
+        moved,
         frames: count,
         intervals,
         wakeups_after,
@@ -382,6 +462,38 @@ mod tests {
     }
 
     #[test]
+    fn period_is_the_monitors_own() {
+        let dwm = 5.556;
+        let (p60, s60) = period_for(60, dwm);
+        assert!((p60 - 16.6667).abs() < 1e-3 && s60 == "display_settings", "60 Hz: {p60}");
+        let (p144, _) = period_for(144, dwm);
+        assert!((p144 - 6.9444).abs() < 1e-3, "144 Hz: {p144}");
+        // Windows says 0 or 1 for "the hardware default": DWM's number, named as such.
+        assert_eq!(period_for(0, dwm), (dwm, "dwm"));
+        assert_eq!(period_for(1, dwm), (dwm, "dwm"));
+        // Intervals of a 60 Hz monitor are no jitter against its own period, but were 11 ms of it against 5.556.
+        let iv = [16.667; 20];
+        assert!(jitter_p95(&iv, p60) < 1e-3 && jitter_p95(&iv, dwm) > 11.0);
+    }
+
+    #[test]
+    fn run_period_follows_the_monitor_it_ended_on() {
+        let hz_of = |d: &str| match d {
+            "DISPLAY5" => 144,
+            "DISPLAY2" => 60,
+            _ => 0,
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (p, src, hz, moved) = run_period(&s(&["DISPLAY2", "DISPLAY2"]), "DISPLAY5", hz_of, 5.556);
+        assert!((p - 16.6667).abs() < 1e-3 && src == "display_settings" && hz == 60 && !moved);
+        let (p, _, hz, moved) = run_period(&s(&["DISPLAY5", "DISPLAY2"]), "DISPLAY5", hz_of, 5.556);
+        assert!((p - 16.6667).abs() < 1e-3 && hz == 60 && moved, "the last monitor's rate, and it moved");
+        let (p, _, hz, moved) = run_period(&[], "DISPLAY5", hz_of, 5.556);
+        assert!((p - 6.9444).abs() < 1e-3 && hz == 144 && !moved, "no samples: the placed monitor");
+        assert_eq!(run_period(&[], "DISPLAY9", hz_of, 5.556), (5.556, "dwm", 0, false));
+    }
+
+    #[test]
     fn tweens_go_across_and_back() {
         let t: Vec<f32> = (0..4).map(tween_target).collect();
         assert_eq!(t, [1.0, 0.0, 1.0, 0.0]);
@@ -397,6 +509,10 @@ mod tests {
             pacing: Pacing::B,
             qpc_freq: 10_000_000,
             period_ms: 6.944,
+            period_source: "display_settings",
+            refresh_hz: 144,
+            dwm_period_ms: 5.556,
+            moved: false,
             frames: 3,
             intervals: vec![6.9, 7.0],
             wakeups_after: 0,
@@ -405,6 +521,8 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&summary_line(&s)).unwrap();
         assert_eq!(v["pacing"].as_str(), Some("b"));
+        assert_eq!((v["period_source"].as_str(), v["refresh_hz"].as_u64()), (Some("display_settings"), Some(144)));
+        assert!(v["dwm_period_ms"].as_f64().is_some_and(|d| (d - 5.556).abs() < 1e-9) && v["moved"] == false);
         assert_eq!(
             (v["frames"].as_u64(), v["intervals"].as_u64(), v["wakeups_after"].as_u64()),
             (Some(3), Some(2), Some(0))
@@ -423,8 +541,11 @@ mod tests {
         use oled_ui::harness::Harness;
         use oled_ui::theme::Tokens;
         let frames = Rc::new(RefCell::new(Vec::new()));
+        let devices = Rc::new(RefCell::new(Vec::new()));
         let screen = AnimScreen {
             frames: Rc::clone(&frames),
+            devices: Rc::clone(&devices),
+            placed: "\\\\.\\DISPLAY1".to_string(),
             tween: Cell::new(None),
             track: RectP::default(),
             commands: CommandTable::new(),
@@ -439,6 +560,8 @@ mod tests {
         let row = (MARGIN + PLATE / 2) as u32;
         let lit = |x: i32| mid.px[(row * mid.w + x as u32) as usize] & 0xFF != 0;
         assert!(lit(MARGIN + TRAVEL / 2 + PLATE / 2) && !lit(MARGIN + 4), "the plate moved");
+        let want = ["\\\\.\\DISPLAY1"];
+        assert_eq!(*devices.borrow(), want, "one monitor sample per tween: the placed one, no active window");
         assert_eq!(frames.borrow().len(), 1);
         let _ = h.render();
         assert_eq!(frames.borrow()[0].len(), 2, "one record per painted frame of the tween");

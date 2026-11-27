@@ -184,6 +184,12 @@ pub const WM_DOCK_WATCHDOG_EXITED: u32 = WM_APP + 31;
 pub const WM_DOCK_CHORD: u32 = WM_APP + 32;
 /// Hook -> UI: Peek began (wParam 1) or ended (0); lParam = `kb.time`. Handled by `ui`.
 pub const WM_DOCK_PEEK: u32 = WM_APP + 33;
+/// Hook -> shell thread (`PostThreadMessageW`): a swallowed takeover chord. wParam = `hook::encode_takeover`, lParam =
+/// `kb.time`. Handled by `shell_thread` -> `takeover_os::on_message`.
+pub const WM_SHELL_TAKEOVER: u32 = WM_APP + 34;
+/// Settings worker -> Settings window: the Safety data (changes list, undo report) is ready. Handled by `ui`.
+#[allow(dead_code)] // read by DS-SAFE
+pub const WM_SETTINGS_SUITE_DATA: u32 = WM_APP + 35;
 /// One-shot on the dock window while the bar is hidden: the hidden trim (4 s after a hide, a popup or Settings close
 /// or a data release; `main::trim_kick`) and the planned second COM pass. Kills itself, then `trim_tick`.
 /// Handled by `main`.
@@ -282,7 +288,7 @@ mod tests {
     fn message_and_timer_ids_are_distinct() {
         // WM_APP + n of msg.rs: one window, one id space.
         let msgs = scan(include_str!("msg.rs"), "WM_", "u32", "WM_APP +");
-        assert!(msgs.len() >= 31, "msg.rs scan found only {} WM_APP ids", msgs.len());
+        assert!(msgs.len() >= 33, "msg.rs scan found only {} WM_APP ids", msgs.len());
         assert_distinct("msg.rs WM_APP", &msgs);
 
         // Timer ids of the dock window: msg.rs's TIMER_ consts and ui.rs's private ones.

@@ -2,7 +2,8 @@
 //! item is top-level when its parsing name is in the chunk's map (folded name -> index, at most CHUNK_ITEMS entries),
 //! else nested (FS-3 e3: nested callbacks may or may not fire; both are handled). Top-level items are journaled
 //! ("started" at Pre, "done", "failed" or "skipped" at Post) and give one change and one undo entry; a nested item
-//! adds nothing but its failure, so the user learns which file failed. Nothing about nested items is held.
+//! adds nothing but its failure, so the user learns which file failed. Nothing about nested items is held. A top-level
+//! item moved out of the Recycle Bin is kept for the runner, which removes the bin's $I record of it after the chunk.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use windows::Win32::UI::Shell::{
     SIGDN_FILESYSPATH,
 };
 
+use super::binrec::bin_record;
 use super::checks::folded;
 use super::coalesce::Coalescer;
 use super::journal::{JournalWriter, PathRepr, Pre, Record, St};
@@ -54,6 +56,9 @@ pub struct SinkState {
     pub failed: u32,
     /// Top-level items that failed.
     pub failed_top: u32,
+    /// The top-level items of this chunk moved out of the Recycle Bin, each with where it was going and where it
+    /// went: the runner removes their bin records after the chunk.
+    pub from_bin: Vec<(WidePath, Vec<WidePath>)>,
 }
 
 impl SinkState {
@@ -76,6 +81,7 @@ impl SinkState {
             done: 0,
             failed: 0,
             failed_top: 0,
+            from_bin: Vec::new(),
         }
     }
 
@@ -201,6 +207,11 @@ impl SinkState {
         let (size, mtime, dir) = created.as_ref().and_then(attrs).unwrap_or((0, 0, false));
         self.journal_item(i, St::Done, created.as_ref(), size, mtime);
         self.done = self.done.saturating_add(1);
+        let from_bin = self.items.get(i).filter(|b| self.kind == OpKind::Move && bin_record(b).is_some()).cloned();
+        if let (Some(bin), Some(to)) = (from_bin, created.as_ref()) {
+            let restored = self.dsts.get(i).cloned().flatten().into_iter().chain([to.clone()]).collect();
+            self.from_bin.push((bin, restored));
+        }
         let (change, undo) = outcome(self.kind, kind, item, created, size, mtime, dir);
         let now = Instant::now();
         let mut out = self.co.change(change, now);

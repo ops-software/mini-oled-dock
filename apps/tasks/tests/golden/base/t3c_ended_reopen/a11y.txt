@@ -1,0 +1,26 @@
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Button "More options (F10)" [focusable]
+SearchInput "Search processes" [focusable] ""
+ColumnHeader "Name, 13 processes" [focusable]
+ColumnHeader "CPU, total 18.0 %" [focusable]
+ColumnHeader "Memory, total 52 %" [focusable]
+ColumnHeader "I/O, total 0 B/s" [focusable]
+Image "Order held while you aim"
+Table "Name" 4 of 16
+  Row "Apps, 3 items, expanded" [focusable, expandable, expanded] 1 of 16
+  Row "Ember (2), CPU 6.1 %, memory 2.65 GB, I/O 0" [focusable, expandable] 2 of 16
+  Row "File Explorer, CPU 0.2 %, memory 210 MB, I/O 0" [focusable] 3 of 16
+  Row "Orbit (4), CPU 4.5 %, memory 398 MB, I/O 39.1 KB/s" [focusable, selected] 4 of 16
+  Row "Quill, CPU 0.3 %, memory 92.0 MB, I/O 0" [focusable] 5 of 16
+  Row "Background, 2 items, expanded" [focusable, expandable, expanded] 6 of 16
+  Row "Notes, CPU 0.2 %, memory 12.0 MB, I/O 0" [focusable] 7 of 16
+  Row "Syncer (2), CPU 0.1 %, memory 83.0 MB, I/O 0" [focusable, expandable] 8 of 16
+  Row "Part of Windows, 5 items, expanded" [focusable, expandable, expanded] 9 of 16
+  Row "Hardware and drivers, CPU 0 %" [focusable] 10 of 16
+  Row "csrss.exe, CPU 0.1 %, memory 6.00 MB, I/O 0" [focusable] 11 of 16
+  Row "dwm.exe, CPU 0.7 %, memory 160 MB, I/O 0" [focusable] 12 of 16
+  Row "services.exe, CPU 0.0 %, memory 9.00 MB, I/O 0" [focusable] 13 of 16
+  Row "Service host: Windows Audio, CPU 0.4 %, memory 48.0 MB, I/O 0" [focusable] 14 of 16
+  Row "System, CPU 0.2 %, memory 205 KB, I/O 0" [focusable] 15 of 16
+  Row "System Idle Process, CPU 24.3 %, memory 10.2 KB, I/O 0" [focusable] 16 of 16

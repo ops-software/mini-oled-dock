@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{
 use crate::exit;
 use crate::shell::sta::{self, Job, Sta, StaSlot};
 use crate::shell::writer::Writer;
-use crate::shell::{class_icons, crumbs, exec, images, menu, type_names};
+use crate::shell::{class_icons, crumbs, exec, images, menu, pins, type_names};
 
 /// A test knob of the environment: read only in a debug build (FILES_TEST_*, FILES_FAULT_*); None in a release build.
 pub fn test_var(k: &str) -> Option<String> {
@@ -384,6 +384,10 @@ fn handle(req: ShellReq, w: &Writer, cfg: &HostCfg) {
             Err(hr) => w.send(&ShellEvt::Failed { req, hr }),
         },
         ShellReq::TypeNames { req, exts } => match type_names::serve(req, &exts, &mut |e| w.send(&e)) {
+            Ok(()) => w.send(&ShellEvt::ReqDone { req }),
+            Err(hr) => w.send(&ShellEvt::Failed { req, hr }),
+        },
+        ShellReq::QuickAccessPins { req } => match pins::serve_pins(req, &mut |e| w.send(&e)) {
             Ok(()) => w.send(&ShellEvt::ReqDone { req }),
             Err(hr) => w.send(&ShellEvt::Failed { req, hr }),
         },

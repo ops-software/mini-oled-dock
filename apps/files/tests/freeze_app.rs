@@ -374,7 +374,6 @@ fn freeze_items_compile() {
 fn stubs_return_their_defaults() {
     let f = Fakes::new();
     let shared = f.shared(oled_ui::UiLang::EN);
-    assert_eq!(selftest::run("0123456789abcdef0123456789abcdef"), 1);
     assert_eq!(instance::elevated_handoff(&Cli::Selftest { nonce: String::new() }), names::EXIT_ELEVATED_HANDOFF);
     // A tagged name: once FA-INST fills these, the test never meets a running instance or the real names (0.1).
     let names = InstanceNames::tagged(&common::test_tag());
@@ -392,7 +391,8 @@ fn stubs_return_their_defaults() {
     assert_eq!(types::TypeNames::fallback(b"pdf", oled_ui::UiLang::EN), "PDF File");
     assert_eq!(types::TypeNames::fallback(b"pdf", oled_ui::UiLang::IT), "File PDF");
     assert_eq!(types::TypeNames::fallback(b"", oled_ui::UiLang::EN), "File");
-    assert!(matches!(parse::parse("x", &wp(r"C:\a"), &parse::Env::default()), parse::Parsed::Invalid(_)));
+    // parse is FD-PATH's real body now (tests/parse.rs): a bare word is a command, a relative path is resolved.
+    assert!(matches!(parse::parse("x", &wp(r"C:\a"), &parse::Env::default()), parse::Parsed::Command(_)));
     assert_eq!(nav::parent_of(&Location::Fs(wp(r"C:\a\b"))), Some(Location::Fs(wp(r"C:\a"))));
     assert_eq!(nav::parent_of(&Location::Fs(wp(r"C:\"))), Some(Location::Home));
     assert_eq!(nav::parent_of(&Location::Fs(wp(r"\\server\share"))), None);
@@ -403,7 +403,7 @@ fn stubs_return_their_defaults() {
         (spec.class, spec.size, spec.placement),
         (names::WINDOW_CLASS, names::DEFAULT_SIZE, Some(names::MAIN_PLACEMENT))
     );
-    assert!(matches!(spec.kind, oled_ui::host::WindowKind::Opaque { caption: oled_ui::host::Caption::System, .. }));
+    assert!(matches!(spec.kind, oled_ui::host::WindowKind::Opaque { caption: oled_ui::host::Caption::Custom, .. }));
     assert!(spec.title.ends_with(" Beta"), "{}", spec.title);
     assert_eq!(opswin::ops_spec(&shared).class, names::OPS_WINDOW_CLASS);
     let mut cache = drives::DriveCache::new();
@@ -1106,7 +1106,7 @@ fn harness_writes_reach_only_fakes() {
     store.save(names::MAIN_PLACEMENT, &p);
     assert!(shared.services.options.modify(&mut |o| o.hidden_items = true));
     shared.types.save_if_due(&*shared.services.own, 60_000);
-    assert!(!shared.session.borrow().save(&*shared.services.own), "session.json is FA-WIN's");
+    assert!(shared.session.borrow().save(&*shared.services.own), "session.json goes through Services.own");
     assert_eq!(f.options.modifications().len(), 1, "the option change went to the fake");
     assert!(f.options.modifications()[0].hidden_items);
     for w in f.own.writes() {

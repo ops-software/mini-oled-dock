@@ -1549,7 +1549,7 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// the tray-fwd thread (no window, nothing to dispatch) and the shell model's WM_GETICON (read by the shell thread; none of the dock's windows; crates/oled-shellmodel/src/icon.rs, scanned with src/).
 /// The update guard's WM_NULL to the new dock's window blocks: the guard has no window, so SMTO_BLOCK only keeps its
 /// 2 s a true bound. A new SendMessageTimeoutW is listed here first.
-const TIMED_SENDS: [(&str, &str, bool, bool); 9] = [
+const TIMED_SENDS: [(&str, &str, bool, bool); 10] = [
     ("src/ui.rs", "fn answers(", true, false),
     ("src/apps.rs", "fn sys_command(", true, true),
     ("src/taskbar.rs", "fn appbar_direct_at(", true, true),
@@ -1559,6 +1559,7 @@ const TIMED_SENDS: [(&str, &str, bool, bool); 9] = [
     ("src/tray_host.rs", "fn forward_main(", false, false),
     ("crates/oled-shellmodel/src/icon.rs", "fn from_window<", false, false),
     ("src/update/guard.rs", "fn window_answers(", true, false),
+    ("src/takeover_os.rs", "fn copydata_send(", true, false),
 ];
 
 /// The shell model's icon sources, the one SendMessageTimeoutW that left src/ (the rule reads it with the tree).

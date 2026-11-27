@@ -120,6 +120,14 @@ pub(crate) mod actions;
 use actions::{resolve, Action, Gesture, SettingsLink, Target, TrayButton};
 #[path = "bar_keys.rs"]
 pub(crate) mod bar_keys; // DK-PAINT fills it
+#[path = "incidents.rs"]
+pub(crate) mod incidents; // DS-SAFE fills it
+#[path = "suite_links.rs"]
+pub(crate) mod suite_links; // DS-ENTRY fills it
+#[path = "takeover.rs"]
+pub(crate) mod takeover; // DS-GATE fills it
+#[path = "takeover_os.rs"]
+pub(crate) mod takeover_os; // DS-DELIVER fills it
 
 /// Push reveal is built and S-PUSH passed; settings_pages shows the Reveal row.
 pub(crate) const PUSH_AVAILABLE: bool = true;
@@ -541,6 +549,8 @@ pub fn attach(h: HWND) -> Result<(), String> {
         }
     }
     chords_sync();
+    suite_links::refresh();
+    takeover::refresh_gate();
     let ms = if config::effective_autohide() { SHOW_MS_STARTUP } else { u64::MAX / 4 };
     show_dock_as("startup", ms, false, true);
     Ok(())
@@ -660,6 +670,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             if wp.0 as u32 == EVENT_SYSTEM_FOREGROUND {
                 on_shell_hook(h, HSHELL_WINDOWACTIVATED, lp.0);
                 on_foreground_changed(HWND(lp.0 as *mut std::ffi::c_void));
+                takeover::on_foreground(HWND(lp.0 as *mut std::ffi::c_void));
                 chords_follow_foreground();
                 peek_fullscreen_sync(CHORDS.get());
                 kb_on_foreground();
@@ -973,6 +984,8 @@ pub fn config_reloaded() {
 /// (pins/names), rereads position/auto-hide and redraws.
 pub fn on_config_changed() {
     log!("ui::on_config_changed: rebuilding items and geometry");
+    suite_links::refresh();
+    takeover::refresh_gate();
     // Sizes (or what makes them count: display mode, tray) changed: same path as a DPI change
     // (fonts, icons at the new size, geometry).
     let (mon, cur) = UI.with(|u| {
@@ -1164,6 +1177,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Network => Some(ItemId::Network),
         PopupKind::Battery => Some(ItemId::Battery),
         PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
+        PopupKind::MetricsMenu => Some(ItemId::Metrics),
         PopupKind::AppMenu | PopupKind::DockMenu | PopupKind::Launcher => None,
     }
 }
@@ -3331,7 +3345,7 @@ fn chords_follow_foreground() {
             Front::Local => log!("keyboard: a local window is in front, the dock owns its Win chords again"),
         }
     }
-    hook::set_dock_chords(effective_chords(rows, front));
+    hook::set_dock_chords(effective_chords(rows, front).with(takeover::chord_bits_now()));
     if let Some(why) = front_cut_off(was, front) {
         hook::cut_off(why);
     }
@@ -4146,6 +4160,7 @@ fn show_app_menu(e: &Entry, id: ItemId) {
     // The id the app's jump list is stored under: the entry's, or the one its window publishes
     // (a helper window grouped under its root exe, like Steam's, has dropped it).
     let app_id = e.aumid.clone().or_else(|| e.windows.first().and_then(|h| apps::window_app_id(*h)));
+    suite_links::refresh();
     popup::open_app_menu(
         anchor,
         AppMenuInfo {
@@ -4155,6 +4170,7 @@ fn show_app_menu(e: &Entry, id: ItemId) {
             windows: e.windows.len(),
             can_launch: launch_target(e).is_some(),
             jump: crate::jumplist::load(app_id.as_deref(), &e.exe_path),
+            show_in_tasks: suite_links::usable(suite_links::App::Tasks),
         },
     );
 }
@@ -5569,7 +5585,59 @@ fn on_poll_body() {
 }
 
 #[cfg(test)]
+#[path = "theme_contract.rs"]
+mod theme_contract; // DS-THEME fills it
+
+#[cfg(test)]
 mod tests {
+    /// The text of ui.rs before its test module, comments dropped.
+    fn code_before_tests() -> String {
+        let src = include_str!("ui.rs");
+        let end = src.find("\nmod tests {").unwrap_or(src.len());
+        src.get(..end)
+            .unwrap_or("")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The takeover bits are part of every publication of the chord table: the hook gets one table, not two.
+    #[test]
+    fn takeover_bits_reach_every_chord_publication() {
+        let code = code_before_tests();
+        let calls: Vec<_> = code.match_indices("set_dock_chords(").collect();
+        assert!(!calls.is_empty(), "the publication exists");
+        for (at, _) in calls {
+            let line = code.get(at..).and_then(|t| t.lines().next()).unwrap_or("");
+            assert!(line.contains("chord_bits_now()"), "{line}");
+        }
+    }
+
+    /// The takeover's foreground hook sits in the WM_DOCK_APPS_DIRTY arm, beside the guard, never inside it.
+    #[test]
+    fn foreground_hook_is_beside_the_guard() {
+        let code = code_before_tests();
+        assert_eq!(code.matches("takeover::on_foreground(").count(), 1);
+        let arm = code.find("WM_DOCK_APPS_DIRTY => {").expect("the arm exists");
+        let hook = code.find("takeover::on_foreground(").expect("the call exists");
+        let next_arm = code.get(arm..).and_then(|t| t.find("WM_DOCK_SHELL_READY =>")).expect("the next arm exists");
+        assert!(arm < hook && hook < arm + next_arm, "the call is in the arm");
+        let f = code.find("fn on_foreground_changed(").expect("the guard exists");
+        let body = code.get(f..).and_then(|t| t.find("\n}\n").map(|e| &t[..e])).expect("the guard ends");
+        assert!(!body.contains("takeover::"), "nothing of the takeover inside the guard");
+    }
+
+    /// The app menu's rows depend on the apps' state: it is re-read right before the menu opens.
+    #[test]
+    fn app_menu_refreshes_first() {
+        let code = code_before_tests();
+        let open = code.find("popup::open_app_menu(").expect("the opener exists");
+        let before = code.get(..open).unwrap_or("").trim_end();
+        assert!(before.ends_with("suite_links::refresh();"), "the statement before the call");
+        assert!(code.get(open..).unwrap_or("").contains("show_in_tasks: suite_links::usable(suite_links::App::Tasks)"));
+    }
+
     #[test]
     fn ui_aliases_equal_their_old_literals() {
         assert_eq!(PLATE_IN_MS, 90);

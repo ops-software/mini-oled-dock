@@ -100,6 +100,7 @@ pub(crate) fn resolve(t: Target, g: Gesture) -> Action {
         (T::Clock, G::Click) => A::Popup(PopupKind::Calendar),
         (T::Power, G::Click) => A::Popup(PopupKind::Power),
         (T::Metrics, G::Click) => A::OpenTasks,
+        (T::Metrics, G::Right) => A::Popup(PopupKind::MetricsMenu),
         (T::ShowDesktop, G::Click) => A::ShowDesktop,
         (T::Start, G::Click) => A::Popup(PopupKind::StartMenu),
         (T::Start, G::Right) => A::Popup(PopupKind::Start),
@@ -174,7 +175,7 @@ mod tests {
             // Power
             [pop(PopupKind::Power), n, n, pop(PopupKind::Power), n, n, n],
             // Metrics
-            [A::OpenTasks, n, n, A::OpenTasks, n, n, n],
+            [A::OpenTasks, n, pop(PopupKind::MetricsMenu), A::OpenTasks, n, n, n],
             // ShowDesktop
             [A::ShowDesktop, n, n, A::ShowDesktop, n, n, n],
             // Tray
@@ -232,6 +233,7 @@ mod tests {
             T::Network => A::OpenSettings(SettingsLink::Network),
             T::Battery => A::OpenSettings(SettingsLink::BatterySaver),
             T::Start => pop(PopupKind::Start),
+            T::Metrics => pop(PopupKind::MetricsMenu),
             T::Tray => A::Tray(TrayButton::Right),
             // Empty space gets the dock menu (G2b); the rest did nothing.
             T::Empty => A::DockMenu,

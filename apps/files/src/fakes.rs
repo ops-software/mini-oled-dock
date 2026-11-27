@@ -72,6 +72,8 @@ impl Default for Fakes {
 impl Fakes {
     /// A Hub with a Collect attached as window 1 (more windows: attach_window).
     pub fn new() -> Fakes {
+        // The drives every test and scene sees, whatever machine it runs on (F4.9).
+        crate::drives::set_api(Some(Arc::new(crate::drives::MadeUpApi)));
         let hub = Hub::new();
         let posted = Arc::new(Collect::new());
         hub.attach(1, Box::new(Arc::clone(&posted)));

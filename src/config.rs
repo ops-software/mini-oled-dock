@@ -2074,6 +2074,55 @@ options! {
                 takeover: None,
             },
         },
+        /// true = the Start menu has an entry for the Tasks app once it is installed.
+        pub suite_tasks: bool = true => {
+            json: "suite_tasks",
+            slot: 56,
+            fmt: Raw,
+            gap: true,
+            guide: "Suite. true = the Start menu has an entry for the Tasks app once it is installed;\n\
+                 false = no entry (the app itself stays installed). Applied by the elevated dock.",
+            since: 1,
+            reason: "A user who does not want the entry can switch it off.",
+            ui: None,
+        },
+        /// true = the Start menu has an entry for the Files app once it is installed.
+        pub suite_files: bool = true => {
+            json: "suite_files",
+            slot: 57,
+            fmt: Raw,
+            gap: false,
+            guide: "true = the Start menu has an entry for the Files app once it is installed (as suite_tasks).",
+            since: 1,
+            reason: "A user who does not want the entry can switch it off.",
+            ui: None,
+        },
+        /// true = Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager; off by default.
+        pub takeover_ctrl_shift_esc: bool = false => {
+            json: "takeover_ctrl_shift_esc",
+            slot: 58,
+            fmt: Raw,
+            gap: false,
+            guide: "Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager (off by default; not available while Tasks is beta).",
+            since: 1,
+            reason: "opt-in takeover of Ctrl+Shift+Esc (ROADMAP X10, X34)",
+            ui: Some {
+                page: PageId("suite"),
+                section: SecId("keyboard"),
+                order: 1,
+                control: Control::Toggle,
+                label: || t(k::SUITE_CSE_LABEL),
+                help: || t(k::SUITE_CSE_HELP),
+                glyph: "keycap_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: Some(oled_config::Takeover::CtrlShiftEsc),
+            },
+        },
     }
 }
 

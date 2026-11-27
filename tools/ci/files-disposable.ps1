@@ -6,7 +6,9 @@
 #   pwsh tools/ci/files-disposable.ps1 -Setup               exports FILES_DISP_UNC, FILES_DISP_FAT, FILES_DISP_NUKE,
 #                                                            FILES_DISP_QUOTA and FILES_TEST_ROOT to $env:GITHUB_ENV
 #   pwsh tools/ci/files-disposable.ps1 -Register -Dll <p>   registers the fault DLL's three classes for .modfault (HKCU)
-param([switch]$Setup, [switch]$Register, [string]$Dll = '')
+#   pwsh tools/ci/files-disposable.ps1 -Hotplug attach      a 64 MiB NTFS VHD appears with a drive letter; prints "letter <X>"
+#   pwsh tools/ci/files-disposable.ps1 -Hotplug detach      that VHD is detached and its file deleted (the drive goes away)
+param([switch]$Setup, [switch]$Register, [string]$Dll = '', [ValidateSet('', 'attach', 'detach')][string]$Hotplug = '')
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
   Write-Host 'files-disposable.ps1 runs only on a GitHub-hosted runner (GITHUB_ACTIONS=true, RUNNER_ENVIRONMENT=github-hosted)'
@@ -46,6 +48,24 @@ function Set-BinValue($Vol, [string]$Name, [int]$Value) {
   New-Item -Path $key -Force | Out-Null
   New-ItemProperty -Path $key -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
   Write-Host "$key $Name=$Value"
+}
+
+if ($Hotplug) {
+  # One drive that comes and goes on demand: the files app's drive hot-plug test (F4.11) times how fast the sidebar follows.
+  $dir = Join-Path $env:RUNNER_TEMP 'mod-files-disp'
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  $vhd = Join-Path $dir 'hot.vhd'
+  if ($Hotplug -eq 'attach') {
+    $vol = New-TestVhd $vhd 64 'ntfs' 'MODHOT'
+    "letter $($vol.DriveLetter)"
+  } else {
+    $script = Join-Path $dir 'hot-detach.txt'
+    @("select vdisk file=`"$vhd`"", 'detach vdisk') | Set-Content -Encoding ascii $script
+    $out = diskpart /s $script
+    if ($LASTEXITCODE -ne 0) { $out | Write-Host; throw 'diskpart detach failed' }
+    Remove-Item -Force -ErrorAction SilentlyContinue $vhd
+    'detached'
+  }
 }
 
 if ($Setup) {

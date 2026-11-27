@@ -1229,6 +1229,7 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Ui, WM_DOCK_WATCHDOG_EXITED) => "WM_DOCK_WATCHDOG_EXITED",
         (Th::Ui, WM_DOCK_CHORD) => "WM_DOCK_CHORD",
         (Th::Ui, WM_DOCK_PEEK) => "WM_DOCK_PEEK",
+        (Th::Ui, WM_SETTINGS_SUITE_DATA) => "WM_SETTINGS_SUITE_DATA",
         // Labels without the launcher's probe-name prefix: launcher lint 14 rejects it in any string literal.
         (Th::Ui, WM_DOCK_LAUNCHER) => "launcher",
         (Th::Ui, WM_DOCK_LAUNCHER_YIELDED) => "launcher_yielded",
@@ -1241,6 +1242,7 @@ fn app_msg_name(th: Th, m: u32) -> Option<&'static str> {
         (Th::Shell, WM_SHELL_WAKE) => "WM_SHELL_WAKE",
         (Th::Shell, WM_SHELL_AUDIO_DEVICE_CHANGED) => "WM_SHELL_AUDIO_DEVICE_CHANGED",
         (Th::Shell, WM_SHELL_SPATIAL_CHANGED) => "WM_SHELL_SPATIAL_CHANGED",
+        (Th::Shell, WM_SHELL_TAKEOVER) => "WM_SHELL_TAKEOVER",
         (Th::Tray, 0x8001) => "WM_HOST_RESIZE",
         (Th::Tray, 0x8002) => "WM_HOST_RAISE",
         (Th::Tray, 0x8003) => "WM_HOST_RESCALE",

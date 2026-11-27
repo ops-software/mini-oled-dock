@@ -38,6 +38,7 @@ pub mod hub;
 pub mod icons;
 pub mod instance;
 pub mod keys;
+pub mod langfile;
 pub mod linger;
 pub mod live;
 pub mod menu;

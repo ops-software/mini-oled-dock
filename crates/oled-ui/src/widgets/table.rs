@@ -241,6 +241,11 @@ impl<M: TableModel> VirtualTable<M> {
         self.state.focused
     }
 
+    /// Moves the anchor of the next Shift+arrow or Shift+click range (None: the focused row).
+    pub fn set_anchor(&mut self, k: Option<RowKey>) {
+        self.state.anchor = k;
+    }
+
     /// Focuses the row of `k` and scrolls it into view.
     pub fn set_focused(&mut self, cx: &mut EventCx, k: RowKey, scroll: ScrollTo) {
         let Some(row) = self.model.row_of(k) else { return };

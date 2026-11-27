@@ -1,9 +1,13 @@
 //! The error band (a failed snapshot: its text and Open Windows Task Manager, in the verdict slot) and the notice line
 //! above the window's bottom (the Updated notice). Filled by TA-T1a (T1.4, the band) and TA-SUITE (TS3, the line).
 
+use oled_ui::event::{Key, TimerId};
 use oled_ui::model::FgRole;
-use oled_ui::widgets::{Button, ButtonKind, ButtonOut, TextLabel};
-use oled_ui::{Event, EventCx, LayoutCx, PaintCx, RectP, TypeRole, UiLang, Widget, WidgetId};
+use oled_ui::node::Text;
+use oled_ui::widgets::{
+    Button, ButtonKind, ButtonOut, Dialog, DialogOut, DialogSpec, Notice, StatusLine, StatusOut, TextLabel,
+};
+use oled_ui::{CommandId, Event, EventCx, LayoutCx, PaintCx, RectP, TypeRole, UiLang, Widget, WidgetId};
 
 use super::screen::NOTICES;
 use crate::strings::{k, t};
@@ -18,6 +22,10 @@ pub enum NoticeOut {
     /// The error band's button: open Windows' Task Manager.
     OpenTaskMgr,
 }
+
+/// The notice line's StatusLine and the modal dialog (About) take these widget ids; the dialog's buttons follow its own.
+pub const LINE: WidgetId = WidgetId(8);
+pub const DIALOG: WidgetId = WidgetId(0x40);
 
 /// The band's second text line, when the text needs two (its own node id, beside BAND_LABEL).
 const BAND_LABEL_2: WidgetId = WidgetId(BAND_LABEL.0 | 0x1_0000);
@@ -35,6 +43,11 @@ pub struct Notices {
     button: Option<Button>,
     /// The last layout had to cut a line of the text short.
     cut: bool,
+    /// The notice line (TS3): the kit's StatusLine notice, built at the first notice.
+    status: Option<StatusLine>,
+    shown: bool,
+    /// The modal dialog (About, the key sheet): laid out over the whole client, last.
+    dialog: Option<Dialog>,
 }
 
 impl Notices {
@@ -142,20 +155,85 @@ impl Notices {
         self.button.as_mut()?.event(cx, ev).map(|ButtonOut::Clicked| NoticeOut::OpenTaskMgr)
     }
 
-    /// True while a notice shows (the line takes STATUS_H). TS3. Stub: false.
+    /// True while a notice shows (the line takes STATUS_H).
     pub fn line_shown(&self) -> bool {
-        false
+        self.shown
     }
 
-    /// TS3. Stub: the rect only.
+    /// Shows a notice with one optional action: the kit's StatusLine notice (STATUS_H at the bottom, a 2 px attention
+    /// bar), hidden after 6 s or Esc.
+    pub fn show(&mut self, cx: &mut EventCx, text: Text, action: Option<(Text, CommandId)>) {
+        self.status.get_or_insert_with(|| StatusLine::new(LINE)).set_notice(cx, Some(Notice { text, action }));
+        self.shown = true;
+    }
+
+    /// show(), but the notice stays until Esc (no 6 s timer): the Updated notice.
+    pub fn show_kept(&mut self, cx: &mut EventCx, text: Text, action: Option<(Text, CommandId)>) {
+        self.show(cx, text, action);
+        cx.cancel_timer(TimerId::kit(LINE, 0));
+    }
+
+    /// The line's events: its timer, Esc and a click on its action. The action's command, when it was chosen.
+    pub fn line_event(&mut self, cx: &mut EventCx, ev: &Event) -> Option<CommandId> {
+        if !self.shown {
+            return None;
+        }
+        let out = self.status.as_mut()?.event(cx, ev);
+        match ev {
+            Event::Timer(id) if *id == TimerId::kit(LINE, 0) => self.shown = false,
+            Event::Key { key: Key::ESC, down: true, .. } => self.shown = false,
+            _ => {}
+        }
+        out.map(|StatusOut::Action(id)| id)
+    }
+
+    /// Laid out only while a notice shows.
     pub fn line(&mut self, cx: &mut LayoutCx, r: RectP) {
-        let _ = cx;
         self.line = r;
+        if let Some(s) = self.status.as_mut().filter(|_| self.shown) {
+            s.layout(cx, r);
+        }
     }
 
-    /// TS3. Stub: nothing.
     pub fn paint_line(&self, cx: &mut PaintCx) {
-        let _ = cx;
+        if let Some(s) = self.status.as_ref().filter(|_| self.shown) {
+            s.paint(cx);
+        }
+    }
+
+    /// Opens a modal dialog over the window (the focus goes to its primary button).
+    pub fn open_dialog(&mut self, cx: &mut EventCx, spec: DialogSpec) {
+        let d = Dialog::new(DIALOG, spec);
+        d.focus(cx);
+        self.dialog = Some(d);
+        cx.relayout();
+    }
+
+    pub fn dialog_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    /// Events to the open dialog; a choice or Esc closes it. The command of the button chosen.
+    pub fn dialog_event(&mut self, cx: &mut EventCx, ev: &Event) -> Option<CommandId> {
+        let out = self.dialog.as_mut()?.event(cx, ev)?;
+        self.dialog = None;
+        cx.relayout();
+        match out {
+            DialogOut::Chose(id) => Some(id),
+            DialogOut::Cancelled => None,
+        }
+    }
+
+    pub fn layout_dialog(&mut self, cx: &mut LayoutCx, client: RectP) {
+        if let Some(d) = self.dialog.as_mut() {
+            d.layout(cx, client);
+        }
+    }
+
+    pub fn paint_dialog(&self, cx: &mut PaintCx) {
+        if let Some(d) = &self.dialog {
+            d.paint(cx);
+        }
     }
 }
 

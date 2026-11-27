@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use oled_trust::manifest::suite::ComponentId;
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
@@ -24,8 +25,8 @@ pub enum RegValue {
     Dword(u32),
 }
 
-/// The values of the entry for an install in `install_dir`. Pure. `exe_bytes` = size of `dock.exe`,
-/// reported in KB rounded up (`EstimatedSize`).
+/// The values of the entry for an install in `install_dir`. Pure. `exe_bytes` = the bytes of the installed suite
+/// (`installed_bytes`: dock.exe and every other component present), reported in KB rounded up (`EstimatedSize`).
 pub fn arp_values(install_dir: &Path, version: &str, exe_bytes: u64) -> Vec<(&'static str, RegValue)> {
     let dir = install_dir.to_string_lossy().into_owned();
     let exe = install_dir.join("dock.exe").to_string_lossy().into_owned();
@@ -45,10 +46,22 @@ pub fn arp_values(install_dir: &Path, version: &str, exe_bytes: u64) -> Vec<(&'s
     ]
 }
 
-/// Writes the entry for the `dock.exe` in `install_dir` (creating or updating the key). Elevated only.
-pub fn write(install_dir: &Path) -> Result<(), String> {
+/// The bytes the suite takes in `install_dir`: dock.exe (which must be there) plus every other component file
+/// present (tasks.exe, tasks-admin.exe, files.exe, lang\it.lang), so EstimatedSize grows with the suite (U1e).
+pub fn installed_bytes(install_dir: &Path) -> Result<u64, String> {
     let exe = install_dir.join("dock.exe");
-    let bytes = std::fs::metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?.len();
+    let dock = std::fs::metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?.len();
+    let others = ComponentId::ALL
+        .into_iter()
+        .filter(|c| *c != ComponentId::Dock)
+        .filter_map(|c| std::fs::metadata(install_dir.join(c.file())).ok().filter(|m| m.is_file()))
+        .map(|m| m.len());
+    Ok(others.fold(dock, u64::saturating_add))
+}
+
+/// Writes the entry for the suite in `install_dir` (creating or updating the key). Elevated only.
+pub fn write(install_dir: &Path) -> Result<(), String> {
+    let bytes = installed_bytes(install_dir)?;
     let values = arp_values(install_dir, env!("CARGO_PKG_VERSION"), bytes);
     let mut key = HKEY::default();
     // SAFETY: `ARP_KEY` becomes a NUL-terminated HSTRING for the call; `key` is a writable HKEY.
@@ -126,5 +139,36 @@ mod tests {
         assert_eq!(get("NoRepair"), Some(RegValue::Dword(1)));
         assert_eq!(get("EstimatedSize"), Some(RegValue::Dword(684))); // KB, rounded up
         assert_eq!(v.len(), 10);
+    }
+
+    #[test]
+    fn estimated_size_includes_the_added_components() {
+        let dir = std::env::temp_dir().join(format!("dock-arp-{}-{:x}", std::process::id(), {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        }));
+        std::fs::create_dir_all(dir.join("lang")).unwrap();
+        let put = |name: &str, n: usize| std::fs::write(dir.join(name), vec![0u8; n]).unwrap();
+        let size = |dir: &Path| {
+            let v = arp_values(dir, "1.8.0", installed_bytes(dir).unwrap());
+            v.into_iter().find(|(n, _)| *n == "EstimatedSize").map(|(_, x)| x)
+        };
+        // dock.exe alone: today's value, its size in KB rounded up.
+        put("dock.exe", 700_001);
+        assert_eq!(installed_bytes(&dir).unwrap(), 700_001);
+        assert_eq!(size(&dir), Some(RegValue::Dword(684)));
+        // The suite: the sum of every component present, rounded up once.
+        put("tasks.exe", 300_000);
+        put("files.exe", 200_000);
+        put(r"lang\it.lang", 50_000);
+        let sum: u64 = 700_001 + 300_000 + 200_000 + 50_000;
+        assert_eq!(installed_bytes(&dir).unwrap(), sum);
+        assert_eq!(size(&dir), Some(RegValue::Dword(u32::try_from(sum.div_ceil(1024)).unwrap())));
+        // Other files of the folder (a suite.json, a previous copy) do not count; without dock.exe there is no entry.
+        put("suite.json", 999);
+        put("tasks.prev.exe", 300_000);
+        assert_eq!(installed_bytes(&dir).unwrap(), sum);
+        std::fs::remove_file(dir.join("dock.exe")).unwrap();
+        assert!(installed_bytes(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

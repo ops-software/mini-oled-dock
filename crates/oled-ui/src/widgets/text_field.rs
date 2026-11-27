@@ -155,6 +155,11 @@ impl TextField {
         }
     }
 
+    /// The line set_error shows, if any.
+    pub fn error(&self) -> Option<&Text> {
+        self.error.as_ref()
+    }
+
     pub fn set_busy(&mut self, on: bool) {
         self.busy = on;
     }

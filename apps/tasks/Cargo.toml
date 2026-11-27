@@ -1,6 +1,6 @@
 [package]
 name = "tasks"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2021"
 rust-version = "1.87"
 description = "The tasks app of the suite: every process grouped as the dock names it, safe to close and end."
@@ -17,7 +17,9 @@ name = "tasks"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["a11y"]
+# The AccessKit bridge of the kit (UI Automation for Narrator): in tasks.exe only; the dock's build stays without it.
+a11y = ["oled-ui/a11y"]
 # Never in a shipped build: reads a fault script at start for the live chord matrix (TA-T6b).
 fault-inject = []
 # --preview and --list-apps, and the scenes embedded for them; the live tester's build.

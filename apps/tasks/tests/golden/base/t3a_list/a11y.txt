@@ -1,0 +1,33 @@
+Toolbar
+  Tab "Processes" [focusable, selected]
+  Button "More options (F10)" [focusable]
+SearchInput "Search processes" [focusable] ""
+ColumnHeader "Name, 23 processes" [focusable]
+ColumnHeader "CPU, total 18.0 %" [focusable]
+ColumnHeader "Memory, total 52 %" [focusable]
+ColumnHeader "I/O, total 1.13 MB/s" [focusable]
+ColumnHeader "PID" [focusable]
+Table "Name" [focusable] 0 of 23
+  Row "audiodg.exe, CPU 31.0 %, memory 64.0 MB, I/O 146 KB/s" [focusable] 1 of 23
+  Row "ember.exe · Ember, CPU 9.0 %, memory 2.34 GB, I/O 879 KB/s" [focusable] 2 of 23
+  Row "svchost.exe, CPU 7.0 %, memory 48.0 MB, I/O 29.3 KB/s" [focusable] 3 of 23
+  Row "orbit.exe · Orbit, CPU 2.2 %, memory 180 MB, I/O 39.1 KB/s" [focusable] 4 of 23
+  Row "orbit.exe · Orbit, CPU 1.4 %, memory 70.0 MB, I/O 8.79 KB/s" [focusable] 5 of 23
+  Row "dwm.exe, CPU 1.2 %, memory 160 MB, I/O 1.95 KB/s" [focusable] 6 of 23
+  Row "ember.exe · Ember, CPU 1.0 %, memory 310 MB, I/O 19.5 KB/s" [focusable] 7 of 23
+  Row "orbit.exe · Orbit, CPU 0.8 %, memory 96.0 MB, I/O 11.7 KB/s" [focusable] 8 of 23
+  Row "System, CPU 0.4 %, memory 205 KB, I/O 11.7 KB/s" [focusable] 9 of 23
+  Row "explorer.exe, CPU 0.4 %, memory 210 MB, I/O 4.88 KB/s" [focusable] 10 of 23
+  Row "svchost.exe, CPU 0.3 %, memory 31.0 MB, I/O 1.17 KB/s" [focusable] 11 of 23
+  Row "orbit.exe · Orbit, CPU 0.3 %, memory 40.0 MB, I/O 500 B/s" [focusable] 12 of 23
+  Row "svchost.exe, CPU 0.1 %, memory 18.0 MB, I/O 400 B/s" [focusable] 13 of 23
+  Row "orbit.exe · Orbit, CPU 0.1 %, memory 52.0 MB, I/O 800 B/s" [focusable] 14 of 23
+  Row "ApplicationFrameHost.exe, CPU 0.1 %, memory 24.0 MB, I/O 300 B/s" [focusable] 15 of 23
+  Row "syncer.exe · Syncer, CPU 0.1 %, memory 45.0 MB, I/O 2.93 KB/s" [focusable] 16 of 23
+  Row "syncer.exe · Syncer, CPU 0.1 %, memory 38.0 MB, I/O 2.44 KB/s" [focusable] 17 of 23
+  Row "services.exe, CPU 0.1 %, memory 9.00 MB, I/O 300 B/s" [focusable] 18 of 23
+  Row "lsass.exe, CPU 0.1 %, memory 22.0 MB, I/O 900 B/s" [focusable] 19 of 23
+  Row "helper.exe, CPU 0.0 %, memory 14.0 MB, I/O 100 B/s" [focusable] 20 of 23
+  Row "CalculatorApp.exe, CPU 0 %, memory 34.0 MB, I/O 0" [focusable] 21 of 23
+  Row "notes.exe · Notes, CPU 0 %, memory 12.0 MB, I/O 0" [focusable] 22 of 23
+  Row "System Idle Process, CPU 40.0 %, memory 10.2 KB, I/O 0" [focusable] 23 of 23

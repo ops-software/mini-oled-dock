@@ -55,9 +55,15 @@ fn scan(lint: fn(&str, &str) -> Vec<String>) -> Vec<String> {
 
 // ---- D1: user files change only through IFileOperation in the ops host --------------------------------------------
 
-/// The files that may change files themselves: the app's own data folder, the two test fences and the fault DLL.
-const MUTATION_ALLOWED: [&str; 4] =
-    ["src/own_files.rs", "tests/common/temp.rs", "examples/common/live.rs", "examples/files_faultext/lib.rs"];
+/// The files that may change files themselves: the app's own data folder, the bin's $I records of restored items
+/// (removed through the handle that proved them, never by name), the two test fences and the fault DLL.
+const MUTATION_ALLOWED: [&str; 5] = [
+    "src/own_files.rs",
+    "src/ops/binrec.rs",
+    "tests/common/temp.rs",
+    "examples/common/live.rs",
+    "examples/files_faultext/lib.rs",
+];
 
 /// The files that may also open a file handle with CreateFileW: the change watcher, icons.bin's reader, the pipe and
 /// the hand-off's folder pin.
@@ -388,6 +394,11 @@ fn display_name_is_not_in_code() {
     let mut all = Vec::new();
     for f in files {
         let rel = f.strip_prefix(root()).unwrap_or(&f).to_string_lossy().replace('\\', "/");
+        // The golden base set is the runner's rendering of the scenes, not code: the About scene shows the name the
+        // kit's table gives it, and a new name regenerates the set.
+        if rel.starts_with("tests/golden/base/") {
+            continue;
+        }
         let bytes = std::fs::read(&f).unwrap_or_else(|e| panic!("read {}: {e}", f.display()));
         all.extend(display_name_violations(&rel, &bytes));
     }

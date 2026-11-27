@@ -1,0 +1,22 @@
+TabList
+  Tab "share" [focusable, selected, busy]
+    Button "Close tab"
+  Button "New tab" [focusable]
+Button "Back · Alt+←" [disabled]
+Button "Forward · Alt+→" [disabled]
+Button "Up · Alt+↑" [disabled]
+Button "New" [focusable]
+Button "Sort" [focusable]
+Button "View" [focusable]
+Button "More" [focusable]
+Toolbar "Path"
+  Link "\\\\made-up-server\\share" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+ColumnHeader "Name" [focusable]
+ColumnHeader "Date modified" [focusable]
+ColumnHeader "Type" [focusable]
+ColumnHeader "Size" [focusable]
+Table "Name" [focusable] 0 of 0
+Label "Connecting to \\\\made-up-server\\share…"
+Label "0 items"

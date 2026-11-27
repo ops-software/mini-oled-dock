@@ -104,7 +104,16 @@ fn long_of(p: &WidePath) -> Option<WidePath> {
         tail.push(base.file_name()?.to_vec());
         base = base.parent()?;
     }
-    let raw = base.raw();
+    let mut long = long_path(&base)?;
+    for name in tail.iter().rev() {
+        long = long.join(name).ok()?;
+    }
+    Some(long)
+}
+
+/// GetLongPathNameW of a path that exists: every 8.3 alias in it replaced by the long name; None when it fails.
+pub(crate) fn long_path(p: &WidePath) -> Option<WidePath> {
+    let raw = p.raw();
     let mut buf = vec![0u16; 1024];
     // SAFETY: raw is NUL-terminated; buf is writable for its length.
     let mut n = unsafe { GetLongPathNameW(PCWSTR(raw.as_ptr()), Some(&mut buf)) } as usize;
@@ -116,9 +125,5 @@ fn long_of(p: &WidePath) -> Option<WidePath> {
     if n == 0 || n > buf.len() {
         return None;
     }
-    let mut long = WidePath::new(buf.get(..n)?).ok()?;
-    for name in tail.iter().rev() {
-        long = long.join(name).ok()?;
-    }
-    Some(long)
+    WidePath::new(buf.get(..n)?).ok()
 }

@@ -3,19 +3,27 @@
 //! The dock's child spawner (moved from the dock's update.rs by WK1): `spawn_in_job` starts a child with no window,
 //! suspended until it is in the process's kill-on-close job, inheriting only its pipe ends; `run_capture` runs one to
 //! its end and keeps its stdout; `command_line` quotes its arguments; `trusted_exe` decides whether an elevated
-//! process may start an exe again. `set_on_thread` lets the host count the threads this module starts.
+//! process may start an exe again, and `held_start_path` gives the path that starts a file held open. `set_on_thread`
+//! lets the host count the threads this module starts.
 
+use std::ffi::OsString;
+use std::fs::File;
 use std::io::{PipeReader, PipeWriter, Read};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Storage::FileSystem::{
+    GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, FILE_SHARE_READ, GETFINALPATHNAMEBYHANDLE_FLAGS, VOLUME_NAME_DOS,
+    VOLUME_NAME_GUID,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -221,19 +229,110 @@ impl AsRawHandle for JobChild {
     }
 }
 
-/// `child_exe`'s decision on `exe`: unelevated, any file (a child gains nothing the user lacks); elevated, only the
-/// installed copy (`installed`, the same file) or an exe whose folder `admin_dir` accepts.
+/// `child_exe`'s decision on `exe`, and the path the caller starts: unelevated, `exe`, any file (a child gains nothing
+/// the user lacks); elevated, only the installed copy (`installed`, the same file), started by `installed` itself, or an
+/// exe on a local drive whose resolved folder `admin_dir` accepts, started by its resolved path (`admin_exe`). Never
+/// `exe` as given when elevated: a junction its user owns in that path could point at the checked file for the check
+/// and at another for the start. The resolved path is the final path of the file held open (`pin`) from before its
+/// folder is asked until the process ends: a user who can change a folder above an admin-only one could otherwise
+/// rename it between the check and the start and put another tree in its place.
 pub fn trusted_exe(
     exe: PathBuf,
     elevated: bool,
     installed: Option<&Path>,
     admin_dir: impl FnOnce(&Path) -> bool,
 ) -> Result<PathBuf, String> {
-    if !elevated || installed.is_some_and(|i| crate::ident::same_file(&exe, i)) || exe.parent().is_some_and(admin_dir) {
-        Ok(exe)
-    } else {
-        Err("the exe is not in an admin-only folder".into())
+    if !elevated {
+        return Ok(exe);
     }
+    if let Some(i) = installed.filter(|i| crate::ident::same_file(&exe, i)) {
+        return Ok(i.to_path_buf());
+    }
+    let pin = pin(&exe);
+    let started = admin_exe(pin.as_ref().and_then(held_start_path), admin_dir)?;
+    let mut held = PINNED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(f) = pin.filter(|_| !held.iter().any(|(p, _)| *p == started)) {
+        held.push((started.clone(), f));
+    }
+    Ok(started)
+}
+
+/// The exes `trusted_exe` accepted from an admin-only folder, by the path it gave, each held open (`pin`) until the
+/// process ends: one handle per path, however often it is asked.
+static PINNED: Mutex<Vec<(PathBuf, File)>> = Mutex::new(Vec::new());
+
+/// `exe` opened for reading with every link followed, shared for reading only: while the handle is open nobody can
+/// write, rename or delete the file, nor rename a folder above it on its volume, so its final path keeps naming it. A
+/// running image pins nothing: the handle it was started by is closed once its process runs.
+fn pin(exe: &Path) -> Option<File> {
+    std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ.0).open(exe).ok()
+}
+
+/// The path that starts the very file `f` holds while it is held: `start_path` of its final paths, by drive and by
+/// volume; None when it has none.
+pub fn held_start_path(f: &File) -> Option<PathBuf> {
+    start_path(&final_path(f, VOLUME_NAME_DOS)?, final_path(f, VOLUME_NAME_GUID).as_deref())
+}
+
+/// The final path of the file `f` holds, normalized (`GetFinalPathNameByHandleW`), with `volume`'s prefix: `\\?\` and a
+/// drive or `UNC\` (`VOLUME_NAME_DOS`, as `std::fs::canonicalize` gives it) or `\\?\Volume{...}` (`VOLUME_NAME_GUID`);
+/// None when it cannot be had.
+fn final_path(f: &File, volume: GETFINALPATHNAMEBYHANDLE_FLAGS) -> Option<String> {
+    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | volume.0);
+    let mut buf = vec![0u16; 512];
+    for _ in 0..2 {
+        // SAFETY: the handle is valid while `f` lives; `buf` is writable for its whole length.
+        let n = unsafe { GetFinalPathNameByHandleW(HANDLE(f.as_raw_handle()), &mut buf, flags) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            return buf.get(..n).and_then(|p| OsString::from_wide(p).into_string().ok());
+        }
+        // Too small: `n` is the length it needs, its NUL included.
+        buf.resize(n, 0);
+    }
+    None
+}
+
+/// Lets a test delete the folders of an exe `trusted_exe` accepted.
+#[cfg(test)]
+fn unpin(started: &Path) {
+    PINNED.lock().unwrap_or_else(PoisonError::into_inner).retain(|(p, _)| p != started);
+}
+
+/// The path an elevated child starts by when its exe is not the installed copy: `start`, the path that starts the exe
+/// held open (`held_start_path`, every junction and link in it followed), when `admin_dir` accepts its folder. None is
+/// refused before `admin_dir` reads a descriptor, as an exe on a share is: its owner and DACL are what its server
+/// reports, and the Administrators and SYSTEM they name are the server's. Whoever the server lets write there (this
+/// user's unelevated processes too, when the account administers the server) could swap the exe between the check and
+/// the start.
+fn admin_exe(start: Option<PathBuf>, admin_dir: impl FnOnce(&Path) -> bool) -> Result<PathBuf, String> {
+    match start {
+        Some(p) if p.parent().is_some_and(admin_dir) => Ok(p),
+        _ => Err("the exe is not in an admin-only folder".into()),
+    }
+}
+
+/// The path a start takes to the file whose final paths are `dos` (`\\?\X:\...`) and `guid` (`\\?\Volume{...}\...`,
+/// None when it has none): `dos` without its `\\?\` (the shell's launch does not take one), when it names that file
+/// and nothing else while the file is held. A held file pins the folders on its own volume only, and the DOS path of a
+/// volume with no drive letter goes through its mount folder on another (`\\?\C:\mnt\...`), which whoever can change
+/// it (a folder an admin makes at the root of a drive inherits Modify for every account) could rename and fill with
+/// another tree: the tail after the drive must be the one after the volume. A path the Win32 parser would change
+/// (`parsed_as_is`) names another file without its prefix. A share (`\\?\UNC\`, a mapped drive's too) has no volume
+/// path, and its folders are what its server reports. Any other form is None too. Pure.
+fn start_path(dos: &str, guid: Option<&str>) -> Option<PathBuf> {
+    let drive = dos.strip_prefix(r"\\?\").filter(|d| d.as_bytes().get(1) == Some(&b':'))?;
+    let tail = guid?.strip_prefix(r"\\?\Volume{")?.split_once('}')?.1;
+    (drive.get(2..) == Some(tail) && parsed_as_is(drive)).then(|| PathBuf::from(drive))
+}
+
+/// True when no name in `path` ends in '.' or ' '. The Win32 parser (`GetFullPathNameW`), which every start and every
+/// open of a path without `\\?\` goes through, drops a '.' at the end of a folder's name and every '.' and ' ' at the
+/// end of the file's: such a path, a final path without its prefix, names another file. Pure.
+fn parsed_as_is(path: &str) -> bool {
+    path.split('\\').all(|name| !name.ends_with(['.', ' ']))
 }
 
 /// Starts `"<exe>" args` with the dock's own token and no window, and puts it into the dock's job (created at the
@@ -411,25 +510,203 @@ mod tests {
 
     /// L3 review: an elevated dock starts itself again only from a file no non-admin can swap (the running exe can be
     /// renamed and another put at its path, which `current_exe` still names): the installed copy, or an exe in a folder
-    /// `datadir` accepts as admin-only. A temporary folder is the user's: refused when elevated, fine when not.
+    /// `datadir` accepts as admin-only. A temporary folder is the user's: refused when elevated, fine when not. SEC-4
+    /// review: elevated, the path to start is never the one given but the installed path or the exe resolved, so a
+    /// junction the user owns in the given path cannot point at the checked file for the check and elsewhere for the
+    /// start.
     #[test]
     fn children_run_only_an_exe_no_user_can_swap() {
-        let dir = std::env::temp_dir().join(format!("dock_child_exe_test_{}", std::process::id()));
+        use std::os::windows::process::CommandExt;
+        // A temporary folder with no link and no short name in its path: the resolved spelling of its files.
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let base = PathBuf::from(tmp.to_str().unwrap().trim_start_matches(r"\\?\"))
+            .join(format!("dock_child_exe_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("real");
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("dock.exe");
         std::fs::write(&exe, b"MZ").unwrap();
+        let link = base.join("link");
+        let made = std::process::Command::new(system32("cmd.exe"))
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&dir)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let (by_link, spelled) = (link.join("dock.exe"), PathBuf::from(exe.to_string_lossy().to_uppercase()));
         let refused = Err("the exe is not in an admin-only folder".to_string());
         let user_dir = trusted_exe(exe.clone(), true, None, crate::datadir::is_admin_only_dir);
         let unelevated = trusted_exe(exe.clone(), false, None, |_| false);
         let installed = trusted_exe(exe.clone(), true, Some(&exe), |_| false);
+        let installed_by_link = trusted_exe(by_link.clone(), true, Some(&exe), |_| false);
+        let installed_spelled = trusted_exe(spelled, true, Some(&exe), |_| false);
         let other = trusted_exe(exe.clone(), true, Some(&dir.join("other.exe")), |_| false);
         let admin_dir = trusted_exe(exe.clone(), true, None, |d| d == dir);
-        let _ = std::fs::remove_dir_all(&dir);
+        let admin_dir_by_link = trusted_exe(by_link, true, None, |d| d == dir);
+        unpin(&exe);
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(made, "the junction could be made");
         assert_eq!(user_dir, refused, "elevated, in a folder the user can write");
         assert_eq!(unelevated, Ok(exe.clone()), "unelevated: a child gains nothing the user lacks");
         assert_eq!(installed, Ok(exe.clone()), "the installed copy");
+        assert_eq!(installed_by_link, Ok(exe.clone()), "the installed copy by its own path, not through the junction");
+        assert_eq!(installed_spelled, Ok(exe.clone()), "the installed copy by its own path, not another spelling");
         assert_eq!(other, refused, "another file than the installed copy");
-        assert_eq!(admin_dir, Ok(exe), "a folder datadir accepts");
+        assert_eq!(admin_dir, Ok(exe.clone()), "a folder datadir accepts");
+        assert_eq!(admin_dir_by_link, Ok(exe), "the folder checked and the path started are the junction's target");
+    }
+
+    /// A share's owner and DACL are what its server reports, and the Administrators and SYSTEM they name are the
+    /// server's: an elevated dock never starts a child from one (`\\?\UNC\`, where a mapped drive resolves too), and
+    /// the folder's descriptor is not even read. A local drive path is asked as before and started without `\\?\`.
+    #[test]
+    fn an_exe_on_a_share_is_refused_before_its_folder_is_read() {
+        let refused = Err("the exe is not in an admin-only folder".to_string());
+        let mut asked = Vec::new();
+        let share = admin_exe(start_path(r"\\?\UNC\server\share\dock\dock.exe", None), |d| {
+            asked.push(d.to_path_buf());
+            true
+        });
+        assert_eq!(share, refused, "an exe on a share");
+        assert!(asked.is_empty(), "the descriptor of a share's folder is never read: {asked:?}");
+        let local = admin_exe(start_path(r"\\?\C:\dock\dock.exe", Some(r"\\?\Volume{v}\dock\dock.exe")), |d| {
+            asked.push(d.to_path_buf());
+            true
+        });
+        assert_eq!(local, Ok(PathBuf::from(r"C:\dock\dock.exe")), "a local drive path, started without its prefix");
+        assert_eq!(asked, [PathBuf::from(r"C:\dock")], "its folder is asked");
+        assert_eq!(admin_exe(None, |_| true), refused, "an exe that cannot be resolved");
+    }
+
+    /// SEC review: a start (`CreateProcessW`) and `admin_dir`'s open read a path without `\\?\` through the Win32
+    /// parser (`GetFullPathNameW`), which drops a '.' at the end of a folder's name and every '.' and ' ' at the end of
+    /// the file's. `C:\Tools.\dock\dock.exe`, the final path of a file held in the folder `Tools.`, would be read as
+    /// `C:\Tools\dock\dock.exe`, through a junction `Tools` its user can point at the held file for the check and at
+    /// their own tree for the start. A drive path with a name that ends in '.' or ' ' is refused before its folder is
+    /// read.
+    #[test]
+    fn a_path_the_parser_changes_is_refused_before_its_folder_is_read() {
+        let refused = Err("the exe is not in an admin-only folder".to_string());
+        let mut asked = Vec::new();
+        for real in [r"\\?\C:\Tools.\dock\dock.exe", r"\\?\C:\dock\dock.exe.", r"\\?\C:\dock\dock.exe "] {
+            let drive = real.strip_prefix(r"\\?\").unwrap();
+            assert_ne!(std::path::absolute(drive).unwrap(), Path::new(drive), "the parser changes {drive}");
+            let got = admin_exe(start_path(real, Some(&by_volume(real))), |d| {
+                asked.push(d.to_path_buf());
+                true
+            });
+            assert_eq!(got, refused, "{real}");
+        }
+        assert!(asked.is_empty(), "the folder of a path the parser changes is never read: {asked:?}");
+        let plain = r"C:\Tools\dock\dock.exe";
+        assert_eq!(std::path::absolute(plain).unwrap(), Path::new(plain), "the parser keeps {plain}");
+        let dos = format!(r"\\?\{plain}");
+        assert_eq!(admin_exe(start_path(&dos, Some(&by_volume(&dos))), |_| true), Ok(PathBuf::from(plain)));
+    }
+
+    /// The final path by volume of a file on a drive's own volume whose final path by drive is `dos` (`\\?\X:\...`).
+    fn by_volume(dos: &str) -> String {
+        format!(r"\\?\Volume{{v}}{}", dos.get(6..).unwrap())
+    }
+
+    /// SEC review: a held exe pins the folders on its own volume only. The DOS path of a volume with no drive letter
+    /// goes through its mount folder on another (`\\?\C:\mnt\dock\dock.exe`): whoever can change that folder (one an
+    /// admin makes at the root of a drive inherits Modify for every account) could rename it while the exe is held and
+    /// put another tree with another exe at its path, which the start would run. The DOS path is started only when its
+    /// tail after the drive is the one after the volume (`VOLUME_NAME_GUID`); otherwise, and with no path by volume (a
+    /// share), the exe is refused before its folder is read. The tests above hold real files: their final paths agree.
+    #[test]
+    fn an_exe_through_a_mount_folder_is_refused_before_its_folder_is_read() {
+        let mut asked = Vec::new();
+        let mut ask = |start: Option<PathBuf>| {
+            admin_exe(start, |d| {
+                asked.push(d.to_path_buf());
+                true
+            })
+        };
+        let refused = Err("the exe is not in an admin-only folder".to_string());
+        let mount = start_path(r"\\?\C:\mnt\dock\dock.exe", Some(r"\\?\Volume{v}\dock\dock.exe"));
+        assert_eq!(ask(mount), refused, "a volume reached through its mount folder");
+        assert_eq!(ask(start_path(r"\\?\C:\dock\dock.exe", None)), refused, "no path by volume");
+        let by_volume_only = start_path(r"\\?\Volume{v}\dock\dock.exe", Some(r"\\?\Volume{v}\dock\dock.exe"));
+        assert_eq!(ask(by_volume_only), refused, "a volume with no drive letter and no mount folder");
+        let own = start_path(r"\\?\C:\Tools\dock\dock.exe", Some(r"\\?\Volume{v}\Tools\dock\dock.exe"));
+        assert_eq!(ask(own), Ok(PathBuf::from(r"C:\Tools\dock\dock.exe")), "a drive's own volume");
+        assert_eq!(asked, [PathBuf::from(r"C:\Tools\dock")], "only the folder on the drive's own volume is asked");
+    }
+
+    /// SEC review: `held_start_path` asks for both final paths of the very file held; the tests above give `start_path`
+    /// strings. A real file in a folder whose name ends in '.' (made through `\\?\`: the Win32 parser reads that path
+    /// as the folder without the '.', where a junction could be) has no path to start it by; one in a plain sibling
+    /// folder starts by its canonical path, its drive and volume paths read from the file system.
+    #[test]
+    fn a_held_file_the_parser_would_read_as_another_has_no_start_path() {
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let base = tmp.join(format!("dock_child_parsed_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dotted, plain) = (base.join("dock.").join("dock.exe"), base.join("dock").join("dock.exe"));
+        for exe in [&dotted, &plain] {
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(exe, b"MZ").unwrap();
+        }
+        let held = [dotted.as_path(), plain.as_path()].map(pin);
+        let both_held = held.iter().all(Option::is_some);
+        let [dotted_start, plain_start] = held.each_ref().map(|f| f.as_ref().and_then(held_start_path));
+        drop(held);
+        let canonical = std::fs::canonicalize(&plain).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(both_held, "both files are held");
+        assert_eq!(dotted_start, None, "a folder whose name ends in '.'");
+        let plain_path = PathBuf::from(canonical.to_str().unwrap().trim_start_matches(r"\\?\"));
+        assert_eq!(plain_start, Some(plain_path), "a plain folder");
+    }
+
+    /// SEC review: elevated, the folder asked is the one that holds the file started. A running exe pins nothing (the
+    /// folder of a running image, and every folder above it, can be renamed while it runs), so a user who can change a
+    /// folder above an admin-only one could rename it between the check and the start and put another tree in its
+    /// place. The exe accepted is held open, shared for reading only, from before its folder is asked until the process
+    /// ends: no folder above it can be renamed, nor the file renamed or written. A refused exe is not held.
+    #[test]
+    fn the_exe_checked_is_the_exe_started() {
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let base = PathBuf::from(tmp.to_str().unwrap().trim_start_matches(r"\\?\"))
+            .join(format!("dock_child_pin_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // `admin` stands for an admin-only folder, `user` and `other` for folders above one that their user can change.
+        let (dir, refused_dir) = (base.join("user").join("admin"), base.join("other").join("admin"));
+        let (exe, refused_exe) = (dir.join("dock.exe"), refused_dir.join("dock.exe"));
+        for d in [&dir, &refused_dir] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("dock.exe"), b"MZ").unwrap();
+        }
+        // Renames `top` away and back: true when the rename went through.
+        let swap = |top: &str| {
+            let (from, to) = (base.join(top), base.join(format!("{top}.moved")));
+            std::fs::rename(&from, &to).is_ok_and(|()| std::fs::rename(&to, &from).is_ok())
+        };
+        let mut swapped_in_check = None;
+        let started = trusted_exe(exe.clone(), true, None, |d| {
+            swapped_in_check = Some(swap("user"));
+            d == dir
+        });
+        let swapped_after = swap("user");
+        let refused = trusted_exe(refused_exe.clone(), true, None, |_| false);
+        let refused_swapped = swap("other");
+        // The exe a dock starts again is its own running image, which opens shared for reading only too.
+        let own = trusted_exe(std::env::current_exe().unwrap(), true, None, |_| true);
+        if let Ok(own) = &own {
+            unpin(own);
+        }
+        unpin(&exe);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(started, Ok(exe), "an exe in a folder admin_dir accepts");
+        assert_eq!(swapped_in_check, Some(false), "a folder above was renamed while the exe's folder was asked");
+        assert!(!swapped_after, "a folder above was renamed between the check and the start");
+        assert_eq!(refused, Err("the exe is not in an admin-only folder".to_string()));
+        assert!(refused_swapped, "a refused exe is not held");
+        assert!(own.is_ok(), "the running image: {own:?}");
     }
 
     /// A child that writes more than a pipe buffer neither blocks nor loses a byte; one that writes more
