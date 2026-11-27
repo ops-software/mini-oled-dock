@@ -1,0 +1,720 @@
+{
+ "size": [
+  640,
+  560
+ ],
+ "mode": "list",
+ "machine": {
+  "logical_cpus": 16,
+  "total_phys": 34359738368,
+  "mem_load": 41,
+  "commit_pct": 38,
+  "cpu_pct": 3.2,
+  "dpc_irq_pct": 0.4
+ },
+ "procs": [
+  {
+   "pid": 0,
+   "created": 0,
+   "parent": 0,
+   "session": 0,
+   "image": "",
+   "path": null,
+   "cpu": [
+    94
+   ],
+   "ws_private": 8192,
+   "io": [
+    0
+   ],
+   "threads": 16,
+   "handles": 0
+  },
+  {
+   "pid": 4,
+   "created": 133500000000004000,
+   "parent": 0,
+   "session": 0,
+   "image": "System",
+   "path": "C:\\Windows\\System32\\ntoskrnl.exe",
+   "cpu": [
+    0.014
+   ],
+   "ws_private": 63763482,
+   "io": [
+    12249
+   ],
+   "threads": 41,
+   "handles": 144
+  },
+  {
+   "pid": 40,
+   "created": 133500000000040000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.022
+   ],
+   "ws_private": 9632618,
+   "io": [
+    1375
+   ],
+   "threads": 43,
+   "handles": 975
+  },
+  {
+   "pid": 64,
+   "created": 133500000000064000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.027
+   ],
+   "ws_private": 40758530,
+   "io": [
+    12100
+   ],
+   "threads": 35,
+   "handles": 801
+  },
+  {
+   "pid": 84,
+   "created": 133500000000084000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.028
+   ],
+   "ws_private": 59903688,
+   "io": [
+    7249
+   ],
+   "threads": 23,
+   "handles": 182
+  },
+  {
+   "pid": 116,
+   "created": 133500000000116000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.05
+   ],
+   "ws_private": 28821974,
+   "io": [
+    3576
+   ],
+   "threads": 43,
+   "handles": 209
+  },
+  {
+   "pid": 136,
+   "created": 133500000000136000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.027
+   ],
+   "ws_private": 13086726,
+   "io": [
+    2280
+   ],
+   "threads": 28,
+   "handles": 795
+  },
+  {
+   "pid": 140,
+   "created": 133500000000140000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.036
+   ],
+   "ws_private": 64572218,
+   "io": [
+    5314
+   ],
+   "threads": 27,
+   "handles": 417
+  },
+  {
+   "pid": 156,
+   "created": 133500000000156000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.031
+   ],
+   "ws_private": 51066978,
+   "io": [
+    6195
+   ],
+   "threads": 10,
+   "handles": 886
+  },
+  {
+   "pid": 184,
+   "created": 133500000000184000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.023
+   ],
+   "ws_private": 68976709,
+   "io": [
+    9691
+   ],
+   "threads": 11,
+   "handles": 328
+  },
+  {
+   "pid": 224,
+   "created": 133500000000224000,
+   "parent": 4,
+   "session": 1,
+   "image": "svchost.exe",
+   "path": "C:\\Windows\\System32\\svchost.exe",
+   "cpu": [
+    0.035
+   ],
+   "ws_private": 37294088,
+   "io": [
+    3497
+   ],
+   "threads": 21,
+   "handles": 260
+  },
+  {
+   "pid": 228,
+   "created": 133500000000228000,
+   "parent": 4,
+   "session": 1,
+   "image": "explorer.exe",
+   "path": "C:\\Windows\\explorer.exe",
+   "cpu": [
+    0.041
+   ],
+   "ws_private": 54109050,
+   "io": [
+    2893
+   ],
+   "threads": 25,
+   "handles": 767
+  },
+  {
+   "pid": 264,
+   "created": 133500000000264000,
+   "parent": 4,
+   "session": 1,
+   "image": "dwm.exe",
+   "path": "C:\\Windows\\System32\\dwm.exe",
+   "cpu": [
+    0.022
+   ],
+   "ws_private": 31875862,
+   "io": [
+    12767
+   ],
+   "threads": 37,
+   "handles": 553
+  },
+  {
+   "pid": 284,
+   "created": 133500000000284000,
+   "parent": 4,
+   "session": 0,
+   "image": "csrss.exe",
+   "path": "C:\\Windows\\System32\\csrss.exe",
+   "cpu": [
+    0.047
+   ],
+   "ws_private": 66512847,
+   "io": [
+    6488
+   ],
+   "threads": 39,
+   "handles": 286
+  },
+  {
+   "pid": 296,
+   "created": 133500000000296000,
+   "parent": 4,
+   "session": 0,
+   "image": "services.exe",
+   "path": "C:\\Windows\\System32\\services.exe",
+   "cpu": [
+    0.057
+   ],
+   "ws_private": 51267224,
+   "io": [
+    4175
+   ],
+   "threads": 6,
+   "handles": 364
+  },
+  {
+   "pid": 332,
+   "created": 133500000000332000,
+   "parent": 4,
+   "session": 0,
+   "image": "lsass.exe",
+   "path": "C:\\Windows\\System32\\lsass.exe",
+   "cpu": [
+    0.046
+   ],
+   "ws_private": 19543466,
+   "io": [
+    10185
+   ],
+   "threads": 34,
+   "handles": 475
+  },
+  {
+   "pid": 348,
+   "created": 133500000000348000,
+   "parent": 4,
+   "session": 1,
+   "image": "RuntimeBroker.exe",
+   "path": "C:\\Windows\\System32\\RuntimeBroker.exe",
+   "cpu": [
+    0.021
+   ],
+   "ws_private": 19221900,
+   "io": [
+    17416
+   ],
+   "threads": 12,
+   "handles": 710
+  },
+  {
+   "pid": 376,
+   "created": 133500000000376000,
+   "parent": 4,
+   "session": 1,
+   "image": "conhost.exe",
+   "path": "C:\\Windows\\System32\\conhost.exe",
+   "cpu": [
+    0.026
+   ],
+   "ws_private": 23189470,
+   "io": [
+    10477
+   ],
+   "threads": 17,
+   "handles": 190
+  },
+  {
+   "pid": 392,
+   "created": 133500000000392000,
+   "parent": 4,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\orbit\\orbit.exe",
+   "cpu": [
+    0.163
+   ],
+   "ws_private": 246572740,
+   "io": [
+    77531
+   ],
+   "threads": 34,
+   "handles": 308
+  },
+  {
+   "pid": 420,
+   "created": 133500000000420000,
+   "parent": 4,
+   "session": 1,
+   "image": "quill.exe",
+   "path": "C:\\Program Files\\quill\\quill.exe",
+   "cpu": [
+    0.205
+   ],
+   "ws_private": 62701655,
+   "io": [
+    66820
+   ],
+   "threads": 36,
+   "handles": 606
+  },
+  {
+   "pid": 456,
+   "created": 133500000000456000,
+   "parent": 4,
+   "session": 1,
+   "image": "marble.exe",
+   "path": "C:\\Program Files\\marble\\marble.exe",
+   "cpu": [
+    0.02
+   ],
+   "ws_private": 245587156,
+   "io": [
+    39212
+   ],
+   "threads": 43,
+   "handles": 920
+  },
+  {
+   "pid": 464,
+   "created": 133500000000464000,
+   "parent": 4,
+   "session": 1,
+   "image": "lantern.exe",
+   "path": "C:\\Program Files\\lantern\\lantern.exe",
+   "cpu": [
+    0.099
+   ],
+   "ws_private": 273055829,
+   "io": [
+    73070
+   ],
+   "threads": 43,
+   "handles": 956
+  },
+  {
+   "pid": 468,
+   "created": 133500000000468000,
+   "parent": 4,
+   "session": 1,
+   "image": "pebble.exe",
+   "path": "C:\\Program Files\\pebble\\pebble.exe",
+   "cpu": [
+    0.309
+   ],
+   "ws_private": 106922248,
+   "io": [
+    88252
+   ],
+   "threads": 13,
+   "handles": 931
+  },
+  {
+   "pid": 504,
+   "created": 133500000000504000,
+   "parent": 4,
+   "session": 1,
+   "image": "harbor.exe",
+   "path": "C:\\Program Files\\harbor\\harbor.exe",
+   "cpu": [
+    0.227
+   ],
+   "ws_private": 195255648,
+   "io": [
+    33472
+   ],
+   "threads": 11,
+   "handles": 124
+  },
+  {
+   "pid": 508,
+   "created": 133500000000508000,
+   "parent": 4,
+   "session": 1,
+   "image": "tundra.exe",
+   "path": "C:\\Program Files\\tundra\\tundra.exe",
+   "cpu": [
+    0.047
+   ],
+   "ws_private": 250346132,
+   "io": [
+    7881
+   ],
+   "threads": 18,
+   "handles": 542
+  },
+  {
+   "pid": 548,
+   "created": 133500000000548000,
+   "parent": 4,
+   "session": 1,
+   "image": "cobalt.exe",
+   "path": "C:\\Program Files\\cobalt\\cobalt.exe",
+   "cpu": [
+    0.066
+   ],
+   "ws_private": 192903506,
+   "io": [
+    45600
+   ],
+   "threads": 20,
+   "handles": 584
+  },
+  {
+   "pid": 552,
+   "created": 133500000000552000,
+   "parent": 4,
+   "session": 1,
+   "image": "willow.exe",
+   "path": "C:\\Program Files\\willow\\willow.exe",
+   "cpu": [
+    0.237
+   ],
+   "ws_private": 105914043,
+   "io": [
+    39778
+   ],
+   "threads": 11,
+   "handles": 772
+  },
+  {
+   "pid": 584,
+   "created": 133500000000584000,
+   "parent": 4,
+   "session": 1,
+   "image": "ember.exe",
+   "path": "C:\\Program Files\\ember\\ember.exe",
+   "cpu": [
+    0.151
+   ],
+   "ws_private": 73785238,
+   "io": [
+    82088
+   ],
+   "threads": 7,
+   "handles": 628
+  },
+  {
+   "pid": 592,
+   "created": 133500000000592000,
+   "parent": 4,
+   "session": 1,
+   "image": "prism.exe",
+   "path": "C:\\Program Files\\prism\\prism.exe",
+   "cpu": [
+    0.296
+   ],
+   "ws_private": 143698895,
+   "io": [
+    57548
+   ],
+   "threads": 22,
+   "handles": 342
+  },
+  {
+   "pid": 608,
+   "created": 133500000000608000,
+   "parent": 4,
+   "session": 1,
+   "image": "atlas.exe",
+   "path": "C:\\Program Files\\atlas\\atlas.exe",
+   "cpu": [
+    0.239
+   ],
+   "ws_private": 124528679,
+   "io": [
+    1226
+   ],
+   "threads": 35,
+   "handles": 605
+  },
+  {
+   "pid": 636,
+   "created": 133500000000636000,
+   "parent": 4,
+   "session": 1,
+   "image": "orbit.exe",
+   "path": "C:\\Program Files\\orbit\\orbit.exe",
+   "cpu": [
+    0.267
+   ],
+   "ws_private": 187077684,
+   "io": [
+    25945
+   ],
+   "threads": 12,
+   "handles": 958
+  },
+  {
+   "pid": 668,
+   "created": 133500000000668000,
+   "parent": 4,
+   "session": 1,
+   "image": "quill.exe",
+   "path": "C:\\Program Files\\quill\\quill.exe",
+   "cpu": [
+    0.01
+   ],
+   "ws_private": 130624145,
+   "io": [
+    46646
+   ],
+   "threads": 6,
+   "handles": 571
+  },
+  {
+   "pid": 708,
+   "created": 133500000000708000,
+   "parent": 4,
+   "session": 1,
+   "image": "marble.exe",
+   "path": "C:\\Program Files\\marble\\marble.exe",
+   "cpu": [
+    0.15
+   ],
+   "ws_private": 292837724,
+   "io": [
+    684
+   ],
+   "threads": 43,
+   "handles": 320
+  },
+  {
+   "pid": 728,
+   "created": 133500000000728000,
+   "parent": 4,
+   "session": 1,
+   "image": "lantern.exe",
+   "path": "C:\\Program Files\\lantern\\lantern.exe",
+   "cpu": [
+    0.328
+   ],
+   "ws_private": 109166829,
+   "io": [
+    12233
+   ],
+   "threads": 41,
+   "handles": 223
+  },
+  {
+   "pid": 744,
+   "created": 133500000000744000,
+   "parent": 4,
+   "session": 1,
+   "image": "pebble.exe",
+   "path": "C:\\Program Files\\pebble\\pebble.exe",
+   "cpu": [
+    0.012
+   ],
+   "ws_private": 189593291,
+   "io": [
+    16208
+   ],
+   "threads": 31,
+   "handles": 932
+  },
+  {
+   "pid": 764,
+   "created": 133500000000764000,
+   "parent": 4,
+   "session": 1,
+   "image": "harbor.exe",
+   "path": "C:\\Program Files\\harbor\\harbor.exe",
+   "cpu": [
+    0.021
+   ],
+   "ws_private": 279354087,
+   "io": [
+    40819
+   ],
+   "threads": 4,
+   "handles": 563
+  },
+  {
+   "pid": 796,
+   "created": 133500000000796000,
+   "parent": 4,
+   "session": 1,
+   "image": "tundra.exe",
+   "path": "C:\\Program Files\\tundra\\tundra.exe",
+   "cpu": [
+    0.101
+   ],
+   "ws_private": 149904659,
+   "io": [
+    51223
+   ],
+   "threads": 38,
+   "handles": 977
+  },
+  {
+   "pid": 824,
+   "created": 133500000000824000,
+   "parent": 4,
+   "session": 1,
+   "image": "cobalt.exe",
+   "path": "C:\\Program Files\\cobalt\\cobalt.exe",
+   "cpu": [
+    0.038
+   ],
+   "ws_private": 44966074,
+   "io": [
+    17781
+   ],
+   "threads": 41,
+   "handles": 624
+  },
+  {
+   "pid": 860,
+   "created": 133500000000860000,
+   "parent": 4,
+   "session": 1,
+   "image": "willow.exe",
+   "path": "C:\\Program Files\\willow\\willow.exe",
+   "cpu": [
+    0.242
+   ],
+   "ws_private": 241794264,
+   "io": [
+    14371
+   ],
+   "threads": 30,
+   "handles": 302
+  },
+  {
+   "pid": 864,
+   "created": 133500000000864000,
+   "parent": 4,
+   "session": 1,
+   "image": "ember.exe",
+   "path": "C:\\Program Files\\ember\\ember.exe",
+   "cpu": [
+    0.317
+   ],
+   "ws_private": 193291826,
+   "io": [
+    33114
+   ],
+   "threads": 38,
+   "handles": 844
+  },
+  {
+   "pid": 888,
+   "created": 133500000000888000,
+   "parent": 4,
+   "session": 1,
+   "image": "prism.exe",
+   "path": "C:\\Program Files\\prism\\prism.exe",
+   "cpu": [
+    0.001
+   ],
+   "ws_private": 153477581,
+   "io": [
+    74864
+   ],
+   "threads": 40,
+   "handles": 806
+  }
+ ],
+ "ticks": 2,
+ "input": [
+  "click 200,118",
+  "key Down",
+  "key Down"
+ ]
+}

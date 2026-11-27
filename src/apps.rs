@@ -34,15 +34,12 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows::core::{w, BOOL, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM, PROPERTYKEY, WPARAM};
+use windows::core::{w, BOOL, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, PROPERTYKEY, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
-use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -58,6 +55,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::log;
 use crate::msg::WM_DOCK_APPS_DIRTY;
+use oled_shellmodel::identity::is_application_frame_host;
+use oled_shellmodel::process::{exe_path as image_path, package_aumid, OwnedProcess, RootCache};
+// The identity rules live in the shell model; callers keep these paths.
+pub use oled_shellmodel::identity::{aumid_from_launch, key_from_exe_path, same_exe_other_version, updated_exe_path};
+pub(crate) use oled_shellmodel::process::{
+    creation_time_of_handle as creation_time, exe_path_of_handle as query_exe_path, exe_path_of_pid,
+    parent_pid_of_handle as parent_pid,
+};
 
 const GW_OWNER: GET_WINDOW_CMD = GET_WINDOW_CMD(4);
 
@@ -528,7 +533,7 @@ fn window_pid(h: HWND) -> u32 {
 /// Full identity resolution (without cache).
 fn resolve_identity(hwnd: HWND, pid: u32) -> Option<Resolved> {
     let proc = OwnedProcess::open(pid)?;
-    let exe_path = query_exe_path(proc.0)?;
+    let exe_path = image_path(&proc)?;
     let win_aumid = window_aumid(hwnd);
     let is_afh = is_application_frame_host(&exe_path);
 
@@ -540,20 +545,21 @@ fn resolve_identity(hwnd: HWND, pid: u32) -> Option<Resolved> {
             let core_pid = window_pid(core);
             if core_pid != 0 && core_pid != pid {
                 if let Some(p2) = OwnedProcess::open(core_pid) {
-                    real_exe = query_exe_path(p2.0);
-                    pkg_aumid = package_aumid(p2.0);
+                    real_exe = image_path(&p2);
+                    pkg_aumid = package_aumid(&p2);
                 }
             }
         }
     } else {
-        pkg_aumid = package_aumid(proc.0);
+        pkg_aumid = package_aumid(&proc);
     }
 
     // Helper process (e.g. steamwebhelper.exe) -> root of its install tree (steam.exe). Only for plain
     // Win32 apps: windows with an AUMID are already grouped and named through it.
     let own_exe = real_exe.clone().unwrap_or_else(|| exe_path.clone());
     let root_exe = if pkg_aumid.is_none() && !is_afh {
-        Some(root_exe_of(pid, proc.0, &exe_path)).filter(|r| !r.eq_ignore_ascii_case(&exe_path))
+        Some(ROOT_CACHE.with(|c| c.borrow_mut().root_exe_of(pid, &proc, &exe_path)))
+            .filter(|r| !r.eq_ignore_ascii_case(&exe_path))
     } else {
         None
     };
@@ -582,52 +588,10 @@ extern "system" {
     fn NtQueryInformationProcess(process: HANDLE, class: u32, info: *mut c_void, len: u32, ret_len: *mut u32) -> i32;
 }
 
-/// `PROCESS_BASIC_INFORMATION` (`ProcessBasicInformation` = class 0).
-#[repr(C)]
-struct ProcessBasicInformation {
-    exit_status: i32,
-    peb_base: *mut c_void,
-    affinity_mask: usize,
-    base_priority: i32,
-    pid: usize,
-    parent_pid: usize,
-}
-
-/// Maximum number of ancestors walked when looking for the root of an install tree.
-const MAX_ROOT_DEPTH: usize = 8;
-/// Bound on the per-pid root cache (cleared when exceeded: entries are cheap to recompute).
-const ROOT_CACHE_MAX: usize = 256;
-
 thread_local! {
-    /// pid -> (creation time of the pid, root exe). The creation time guards against pid reuse.
-    static ROOT_CACHE: RefCell<HashMap<u32, (u64, String)>> = RefCell::new(HashMap::new());
-}
-
-pub(crate) fn parent_pid(proc: HANDLE) -> Option<u32> {
-    let mut pbi = ProcessBasicInformation {
-        exit_status: 0,
-        peb_base: std::ptr::null_mut(),
-        affinity_mask: 0,
-        base_priority: 0,
-        pid: 0,
-        parent_pid: 0,
-    };
-    let mut ret = 0u32;
-    // SAFETY: `pbi` is a writable struct matching PROCESS_BASIC_INFORMATION with the declared size;
-    // `proc` is a handle with PROCESS_QUERY_LIMITED_INFORMATION, enough for class 0.
-    let st = unsafe {
-        NtQueryInformationProcess(
-            proc,
-            0,
-            (&mut pbi as *mut ProcessBasicInformation).cast::<c_void>(),
-            std::mem::size_of::<ProcessBasicInformation>() as u32,
-            &mut ret,
-        )
-    };
-    if st < 0 {
-        return None;
-    }
-    u32::try_from(pbi.parent_pid).ok().filter(|&p| p != 0)
+    /// pid -> (creation time of the pid, root exe), kept by the shell model. The cache stays on this thread and
+    /// outside every `STATE` borrow: the walk up the parents is the expensive call.
+    static ROOT_CACHE: RefCell<RootCache> = RefCell::new(RootCache::default());
 }
 
 /// `ProcessCommandLineInformation`: a UNICODE_STRING whose text follows it in the caller's buffer.
@@ -683,107 +647,6 @@ fn text_span(offset: usize, len: usize, header: usize, filled: usize) -> Option<
         .then_some(offset / 2..end / 2)
 }
 
-/// Process creation time (100 ns ticks since 1601).
-pub(crate) fn creation_time(proc: HANDLE) -> Option<u64> {
-    let (mut c, mut e, mut k, mut u) =
-        (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
-    // SAFETY: all four out-parameters are valid local FILETIMEs; `proc` is a valid process handle.
-    unsafe { GetProcessTimes(proc, &mut c, &mut e, &mut k, &mut u) }.ok()?;
-    Some((u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime))
-}
-
-/// Lowercase directory segments of an exe path (`c:`, `program files (x86)`, `steam`...), without the file name.
-fn dir_segments(exe: &str) -> Vec<String> {
-    let lower = exe.replace('/', "\\").to_lowercase();
-    let mut segs: Vec<String> = lower.split('\\').filter(|s| !s.is_empty()).map(str::to_string).collect();
-    segs.pop();
-    segs
-}
-
-/// A directory too generic to be an install root (drive root, Windows, Program Files, user profile...).
-fn is_generic_dir(segs: &[String]) -> bool {
-    if segs.len() < 2 {
-        return true;
-    }
-    match segs[1].as_str() {
-        "windows" => true,
-        "program files" | "program files (x86)" | "programdata" => segs.len() == 2,
-        // `c:\users`, `c:\users\<name>`, `...\appdata`, `...\appdata\<local|roaming>`, `...\appdata\local\programs`.
-        "users" => {
-            let seg = |i: usize| segs.get(i).map(String::as_str);
-            segs.len() <= 3
-                || (seg(3) == Some("appdata")
-                    && (segs.len() <= 5 || (segs.len() == 6 && seg(4) == Some("local") && seg(5) == Some("programs"))))
-        }
-        _ => false,
-    }
-}
-
-/// Directory names of game libraries kept inside a launcher's install tree (Steam `steamapps\common`,
-/// GOG Galaxy and Ubisoft Connect `games`...): what lives below them is a separate app, not a helper.
-const LIBRARY_DIRS: [&str; 4] = ["steamapps", "steamlibrary", "games", "common"];
-
-/// Normalized (lowercase, backslashes) form of an exe path, for comparisons.
-fn norm_path(exe: &str) -> String {
-    exe.replace('/', "\\").to_lowercase()
-}
-
-/// True when `parent_exe` is the root of an install tree containing `child_exe` as a helper: either the
-/// same exe (multi-process apps), or an exe in a strict subdirectory of the parent's one, which must not
-/// be a generic location and must not pass through a game library. A different exe in the same directory
-/// is a sibling app (Word started by Outlook), not a helper.
-fn same_install_tree(parent_exe: &str, child_exe: &str) -> bool {
-    let p = dir_segments(parent_exe);
-    let c = dir_segments(child_exe);
-    if is_generic_dir(&p) || c.len() < p.len() || c[..p.len()] != p[..] {
-        return false;
-    }
-    if c.len() == p.len() {
-        return norm_path(parent_exe) == norm_path(child_exe);
-    }
-    !c[p.len()..].iter().any(|s| LIBRARY_DIRS.contains(&s.as_str()))
-}
-
-/// Walks up the parent chain while the parent lives in the same install tree; returns the topmost
-/// such exe (or `exe_path` itself). Cached per pid.
-fn root_exe_of(pid: u32, proc: HANDLE, exe_path: &str) -> String {
-    let Some(t0) = creation_time(proc) else {
-        return exe_path.to_string();
-    };
-    if let Some(r) = ROOT_CACHE.with(|c| c.borrow().get(&pid).filter(|(t, _)| *t == t0).map(|(_, r)| r.clone())) {
-        return r;
-    }
-    let mut cur_exe = exe_path.to_string();
-    let mut cur_time = t0;
-    let mut cur_pid = pid;
-    let mut cur_handle = proc;
-    let mut held: Option<OwnedProcess> = None;
-    for _ in 0..MAX_ROOT_DEPTH {
-        let Some(ppid) = parent_pid(cur_handle).filter(|&p| p != cur_pid) else { break };
-        let Some(parent) = OwnedProcess::open(ppid) else { break };
-        // The parent must be older than the child, otherwise the pid was reused.
-        let Some(pt) = creation_time(parent.0).filter(|&pt| pt < cur_time) else { break };
-        let Some(pexe) = query_exe_path(parent.0) else { break };
-        if !same_install_tree(&pexe, &cur_exe) {
-            break;
-        }
-        cur_exe = pexe;
-        cur_time = pt;
-        cur_pid = ppid;
-        cur_handle = parent.0;
-        held = Some(parent); // keeps the handle alive for the next step; the previous one is closed
-    }
-    drop(held);
-    ROOT_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() >= ROOT_CACHE_MAX {
-            c.clear();
-        }
-        c.insert(pid, (t0, cur_exe.clone()));
-    });
-    cur_exe
-}
-
 // ------------------------------------------------------------------ diagnostics (--list-apps)
 
 /// One top-level app window with its resolved identity (for `--list-apps`).
@@ -812,76 +675,6 @@ pub fn list_windows() -> Vec<ListedWindow> {
         out.push(ListedWindow { title, own_exe: r.own_exe, ident: r.ident });
     }
     out
-}
-
-/// Automatically closed process handle.
-struct OwnedProcess(HANDLE);
-
-impl OwnedProcess {
-    fn open(pid: u32) -> Option<OwnedProcess> {
-        // SAFETY: OpenProcess has no preconditions; the obtained handle is owned by `OwnedProcess`.
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok().map(OwnedProcess)
-    }
-}
-
-impl Drop for OwnedProcess {
-    fn drop(&mut self) {
-        // SAFETY: valid handle obtained from OpenProcess, closed exactly once here.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
-/// Exe path of process `pid` (`None` if it cannot be opened). Used by the audio mixer for app names.
-pub(crate) fn exe_path_of_pid(pid: u32) -> Option<String> {
-    let proc = OwnedProcess::open(pid)?;
-    query_exe_path(proc.0)
-}
-
-pub(crate) fn query_exe_path(proc: HANDLE) -> Option<String> {
-    // Common case: stack buffer, no heap allocation.
-    let mut small = [0u16; 512];
-    let mut len = small.len() as u32;
-    // SAFETY: `small` has `len` writable elements; `len` is in/out (in: capacity, out: length written
-    // without NUL). `proc` is a handle with PROCESS_QUERY_LIMITED_INFORMATION.
-    let r = unsafe { QueryFullProcessImageNameW(proc, PROCESS_NAME_WIN32, PWSTR(small.as_mut_ptr()), &mut len) };
-    if r.is_ok() {
-        let s = String::from_utf16_lossy(&small[..(len as usize).min(small.len())]);
-        return if s.is_empty() { None } else { Some(s) };
-    }
-    // Long paths: retry once with the maximum size.
-    let mut buf = vec![0u16; 32768];
-    let mut len = buf.len() as u32;
-    // SAFETY: same contract as above, with `buf` as the output buffer.
-    let r = unsafe { QueryFullProcessImageNameW(proc, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) };
-    if r.is_err() {
-        return None;
-    }
-    let s = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-/// Package AUMID of the process. `None` if the process has no package identity
-/// (`APPMODEL_ERROR_NO_APPLICATION`).
-fn package_aumid(proc: HANDLE) -> Option<String> {
-    let mut buf = [0u16; 256]; // an AUMID is at most 129 characters
-    let mut len = buf.len() as u32;
-    // SAFETY: `buf` has `len` writable WCHARs; `len` is in/out; `proc` is a valid handle.
-    let rc = unsafe { GetApplicationUserModelId(proc, &mut len, Some(PWSTR(buf.as_mut_ptr()))) };
-    if rc.0 != 0 {
-        return None;
-    }
-    // `len` includes the terminating NUL.
-    let n = (len as usize).saturating_sub(1).min(buf.len());
-    let s = String::from_utf16_lossy(&buf[..n]);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
 }
 
 /// AUMID published by the window (`PKEY_AppUserModel_ID`) through `SHGetPropertyStoreForWindow`.
@@ -923,85 +716,12 @@ pub fn window_app_id(h: isize) -> Option<String> {
     window_aumid(hw(h))
 }
 
-fn is_application_frame_host(exe_path: &str) -> bool {
-    exe_path.rsplit(['\\', '/']).next().is_some_and(|f| f.eq_ignore_ascii_case("applicationframehost.exe"))
-}
-
 /// Child window `Windows.UI.Core.CoreWindow` of an `ApplicationFrameHost` frame.
 fn find_core_window(frame: HWND) -> Option<HWND> {
     // SAFETY: arbitrary HWND allowed; the strings are NUL-terminated literals ('static).
     unsafe { FindWindowExW(Some(frame), None, w!("Windows.UI.Core.CoreWindow"), PCWSTR::null()) }
         .ok()
         .filter(|h| !h.0.is_null())
-}
-
-/// Key from exe path: lowercase, `\` separators. (`C:/Foo/Bar.EXE` -> `c:\foo\bar.exe`).
-/// Squirrel-style versioned folders (`app-1.0.9265`) become `app-*`, so the key
-/// (and therefore a pin) survives app updates (Discord, Slack, etc.).
-pub fn key_from_exe_path(path: &str) -> String {
-    let lower = path.replace('/', "\\").to_lowercase();
-    lower
-        .split('\\')
-        .map(|seg| match seg.strip_prefix("app-") {
-            Some(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') => "app-*",
-            _ => seg,
-        })
-        .collect::<Vec<_>>()
-        .join("\\")
-}
-
-/// True for a Squirrel-style versioned folder name (`app-1.0.9265`).
-fn is_version_dir(seg: &str) -> bool {
-    seg.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("app-"))
-        && seg.len() > 4
-        && seg[4..].chars().all(|c| c.is_ascii_digit() || c == '.')
-}
-
-/// True when `a` and `b` are the same exe in two versioned folders of one app
-/// (`...\app-1.0.9265\Discord.exe` and `...\app-1.0.9267\Discord.exe`).
-pub fn same_exe_other_version(a: &str, b: &str) -> bool {
-    !a.is_empty() && !b.is_empty() && norm_path(a) != norm_path(b) && key_from_exe_path(a) == key_from_exe_path(b)
-}
-
-/// Where the exe `path` lives now, when it is gone because the app updated itself into a new
-/// versioned folder (Discord, Slack...: `app-1.0.9265` is deleted, `app-1.0.9267` appears): the same
-/// file inside the highest `app-<version>` folder next to the old one. `None` when `path` still
-/// exists, has no versioned folder, or no other version holds the file.
-pub fn updated_exe_path(path: &str) -> Option<String> {
-    use std::path::Path;
-    let p = Path::new(path);
-    if !p.is_absolute() || p.exists() {
-        return None;
-    }
-    let segs: Vec<&str> = path.split(['\\', '/']).collect();
-    let i = segs.iter().rposition(|s| is_version_dir(s))?;
-    let (base, rest) = (segs[..i].join("\\"), segs[i + 1..].join("\\"));
-    if rest.is_empty() {
-        return None;
-    }
-    let version = |name: &str| name[4..].split('.').map(|n| n.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    std::fs::read_dir(format!("{base}\\"))
-        .ok()?
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| is_version_dir(name))
-        .map(|name| (version(&name), format!("{base}\\{name}\\{rest}")))
-        .filter(|(_, cand)| Path::new(cand).is_file())
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, cand)| cand)
-}
-
-/// Extracts the AUMID from a launch target `shell:AppsFolder\<AUMID>`; `None` if it does not have that form.
-pub fn aumid_from_launch(launch: &str) -> Option<String> {
-    const PREFIX: &str = "shell:appsfolder\\";
-    if launch.len() > PREFIX.len()
-        && launch.is_char_boundary(PREFIX.len())
-        && launch[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
-    {
-        Some(launch[PREFIX.len()..].to_string())
-    } else {
-        None
-    }
 }
 
 // ------------------------------------------------------------------ foreground / MRU
@@ -1440,98 +1160,5 @@ mod tests {
     fn settings_window_is_not_an_app() {
         assert!(excluded_class("DockSettings") && excluded_class("Progman") && excluded_class("WorkerW"));
         assert!(!excluded_class("Notepad"));
-    }
-
-    #[test]
-    fn key_normalization() {
-        assert_eq!(key_from_exe_path("C:/Foo/Bar.EXE"), "c:\\foo\\bar.exe");
-        assert_eq!(
-            key_from_exe_path("C:\\Users\\x\\AppData\\Local\\Discord\\app-1.0.9265\\Discord.exe"),
-            "c:\\users\\x\\appdata\\local\\discord\\app-*\\discord.exe"
-        );
-        assert_eq!(key_from_exe_path("C:\\app-store\\a.exe"), "c:\\app-store\\a.exe");
-    }
-
-    #[test]
-    fn versioned_folders() {
-        assert!(is_version_dir("app-1.0.9265") && is_version_dir("APP-2"));
-        assert!(!is_version_dir("app-") && !is_version_dir("app-store"));
-        let (a, b) = ("C:\\x\\Discord\\app-1.0.9265\\Discord.exe", "c:/x/discord/app-1.0.9267/discord.exe");
-        assert!(same_exe_other_version(a, b));
-        assert!(!same_exe_other_version(a, a) && !same_exe_other_version(a, "C:\\x\\Discord\\Update.exe"));
-        assert!(!same_exe_other_version(a, "") && !same_exe_other_version("shell:AppsFolder\\A!B", a));
-    }
-
-    #[test]
-    fn updated_exe_path_follows_the_newest_version() {
-        let root = std::env::temp_dir().join(format!("dock-test-versions-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for v in ["app-1.0.9", "app-1.0.10", "app-1.0.11"] {
-            std::fs::create_dir_all(root.join(v)).unwrap();
-        }
-        // 1.0.11 does not hold the file (an update still being unpacked): 1.0.10 wins, not "1.0.9".
-        for v in ["app-1.0.9", "app-1.0.10"] {
-            std::fs::write(root.join(v).join("App.exe"), b"x").unwrap();
-        }
-        let r = root.to_string_lossy().into_owned();
-        assert_eq!(updated_exe_path(&format!("{r}\\app-1.0.3\\App.exe")), Some(format!("{r}\\app-1.0.10\\App.exe")));
-        assert_eq!(updated_exe_path(&format!("{r}\\app-1.0.9\\App.exe")), None, "still there: untouched");
-        assert_eq!(updated_exe_path(&format!("{r}\\app-1.0.3\\Other.exe")), None);
-        assert_eq!(updated_exe_path(&format!("{r}\\gone\\App.exe")), None, "no versioned folder");
-        assert_eq!(updated_exe_path("app-1.0.3\\App.exe"), None, "relative");
-        assert_eq!(updated_exe_path("shell:AppsFolder\\A!B"), None);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn aumid_prefix() {
-        assert_eq!(aumid_from_launch("shell:AppsFolder\\A.B_x!App").as_deref(), Some("A.B_x!App"));
-        assert_eq!(aumid_from_launch("C:\\x.exe"), None);
-        assert_eq!(aumid_from_launch("shell:AppsFolder\\"), None);
-    }
-
-    #[test]
-    fn install_tree() {
-        let steam = "C:\\Program Files (x86)\\Steam\\steam.exe";
-        let web = "C:\\Program Files (x86)\\Steam\\bin\\cef\\cef.win64\\steamwebhelper.exe";
-        assert!(same_install_tree(steam, web));
-        assert!(same_install_tree(web, web));
-        assert!(!same_install_tree("C:\\Windows\\explorer.exe", web));
-        assert!(!same_install_tree("C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\System32\\x\\a.exe"));
-        assert!(!same_install_tree("C:\\launcher.exe", "C:\\Games\\a\\a.exe"));
-        assert!(!same_install_tree("C:\\Program Files\\x.exe", "C:\\Program Files\\Foo\\y.exe"));
-        assert!(!same_install_tree("C:\\Users\\me\\t.exe", "C:\\Users\\me\\Foo\\y.exe"));
-        assert!(!same_install_tree("D:\\Other\\steam.exe", web));
-    }
-
-    #[test]
-    fn install_tree_rejects_games_and_siblings() {
-        let steam = "C:\\Program Files (x86)\\Steam\\steam.exe";
-        let portal = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Portal 2\\portal2.exe";
-        assert!(!same_install_tree(steam, portal));
-        let gog = "C:\\Program Files (x86)\\GOG Galaxy\\GalaxyClient.exe";
-        assert!(!same_install_tree(gog, "C:\\Program Files (x86)\\GOG Galaxy\\Games\\Witcher\\bin\\w.exe"));
-        let upc = "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\upc.exe";
-        assert!(!same_install_tree(upc, "C:\\Program Files (x86)\\Ubisoft\\Ubisoft Game Launcher\\games\\X\\x.exe"));
-        let office = "C:\\Program Files\\Microsoft Office\\root\\Office16\\";
-        assert!(!same_install_tree(&format!("{office}OUTLOOK.EXE"), &format!("{office}WINWORD.EXE")));
-        assert!(same_install_tree(&format!("{office}OUTLOOK.EXE"), &format!("{office}outlook.exe")));
-    }
-
-    #[test]
-    fn local_programs_is_generic() {
-        let progs = "C:\\Users\\me\\AppData\\Local\\Programs";
-        assert!(!same_install_tree(&format!("{progs}\\stub.exe"), &format!("{progs}\\Foo\\foo.exe")));
-        assert!(same_install_tree(&format!("{progs}\\Foo\\foo.exe"), &format!("{progs}\\Foo\\bin\\h.exe")));
-        assert!(!same_install_tree(
-            "C:\\Users\\me\\AppData\\Roaming\\s.exe",
-            "C:\\Users\\me\\AppData\\Roaming\\A\\a.exe"
-        ));
-    }
-
-    #[test]
-    fn afh_detection() {
-        assert!(is_application_frame_host("C:\\Windows\\System32\\ApplicationFrameHost.exe"));
-        assert!(!is_application_frame_host("C:\\x\\notepad.exe"));
     }
 }

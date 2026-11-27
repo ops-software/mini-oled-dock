@@ -27,7 +27,7 @@ use crate::geom::SizeL;
 use crate::node::Text;
 pub use placement::{Placement, PlacementKey, PlacementStore};
 pub use proxy::Proxy;
-pub use run::{EventLoop, LoopCx};
+pub use run::{EventLoop, LoopCx, LoopStats, Show};
 
 /// An app's id: "tasks", "files", "gallery" (X11 names).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

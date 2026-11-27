@@ -1,13 +1,15 @@
 <#
 .SYNOPSIS
     Regenerates the application icon: assets/dock.ico (16, 20, 24, 32, 40, 48, 64, 256 px) and
-    assets/icon-256.png.
+    assets/icon-256.png; with -Variant tasks, the tasks app's apps/tasks/assets/tasks.ico (same sizes) and
+    apps/tasks/assets/tasks-256.png.
 
 .DESCRIPTION
     How to regenerate (PowerShell 7, nothing to install; run from the repo root):
 
         pwsh -NoProfile -File tools/make-icon.ps1
         pwsh -NoProfile -File tools/make-icon.ps1 -Preview <dir>   # also writes enlarged previews
+        pwsh -NoProfile -File tools/make-icon.ps1 -Variant tasks [-Preview <dir>]   # the tasks app's icon
 
     then rebuild (`cargo build --release --locked`): build.rs embeds assets/dock.ico as icon id 1.
 
@@ -19,12 +21,17 @@
     short white pill low in the centre (the dock floating at the bottom of the screen). At 16 and 20 px
     the outline is dropped (it would blur into the rim) and the pill is drawn larger.
 
+    The tasks variant (apps/tasks/assets/icon.svg is its 256 px master) keeps the same tile, rim and face, has no
+    screen outline, and draws a white trace of five square-cornered bars that rises in three steps from bottom left
+    to top right (the "load" sign).
+
     Rendering: each pixel is the average of 16 x 16 samples of exact rounded-rectangle shapes, so the
     output is deterministic and needs no graphics library. Small entries are 32-bit BMP entries with
     alpha, the 256 px entry is PNG-compressed.
 #>
 param(
-    [string]$Out = (Join-Path $PSScriptRoot '..\assets'),
+    [ValidateSet('dock', 'tasks')] [string]$Variant = 'dock',
+    [string]$Out = '',
     [string]$Preview = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -54,10 +61,11 @@ public static class DockIcon
     }
 
     // Geometry of one size. variant 0 = owner's sketch (small square in the centre),
-    // 1 = pill in the centre, 2 = pill low in the outline (the chosen design).
+    // 1 = pill in the centre, 2 = pill low in the outline (the chosen design), 3 = the tasks app (Trace, no outline).
     struct Geo
     {
         public RRect Tile, Face, Outer, Inner, Mark;
+        public RRect[] Trace;
         public bool Outline;
     }
 
@@ -70,7 +78,7 @@ public static class DockIcon
         int t = s - 2 * m;                        // tile side
         double r = 0.22 * t;                      // tile corner radius
         g.Tile = new RRect(m, m, s - m, s - m, r);
-        g.Outline = s >= 24;
+        g.Outline = s >= 24 && variant != 3;
         // Dark grey rim: at 16/20 (no outline) and from 64 up. From 24 to 48 the white outline sits
         // 2-4 px from the edge and already draws it; a rim there would turn the edge into mush.
         int rim = !g.Outline || s >= 64 ? Math.Max(1, (int)Math.Round(s / 128.0)) : 0;
@@ -79,6 +87,21 @@ public static class DockIcon
         int stroke = Math.Max(1, (int)Math.Round(s / 64.0));     // outline thickness
         g.Outer = g.Tile.Inset(gap);
         g.Inner = g.Outer.Inset(stroke);
+        if (variant == 3)
+        {
+            // Five axis-aligned bars, corner radius 0, edges on whole pixels: x and y = m + round(f * t).
+            int k = Math.Max(2, Even(t * 0.067));                 // stroke: 16 at 256
+            Func<double, int> at = f => m + (int)Math.Round(f * t);
+            g.Trace = new[]
+            {
+                new RRect(at(0.20), at(0.70), at(0.42), at(0.70) + k, 0),       // tread 1
+                new RRect(at(0.42), at(0.50), at(0.42) + k, at(0.70) + k, 0),   // riser 1
+                new RRect(at(0.42), at(0.50), at(0.62), at(0.50) + k, 0),       // tread 2
+                new RRect(at(0.62), at(0.30), at(0.62) + k, at(0.50) + k, 0),   // riser 2
+                new RRect(at(0.62), at(0.30), at(0.80), at(0.30) + k, 0),       // tread 3
+            };
+            return g;
+        }
         if (variant == 0)
         {
             int side = Math.Max(2, Even(t * 0.15));
@@ -121,7 +144,8 @@ public static class DockIcon
                         int c = 0x3A;                                     // rim
                         if (g.Face.Contains(sx, sy)) c = 0x00;           // black face
                         if (g.Outline && g.Outer.Contains(sx, sy) && !g.Inner.Contains(sx, sy)) c = 0xFF;
-                        if (g.Mark.Contains(sx, sy)) c = 0xFF;
+                        if (g.Trace == null) { if (g.Mark.Contains(sx, sy)) c = 0xFF; }
+                        else foreach (var q in g.Trace) if (q.Contains(sx, sy)) c = 0xFF;
                         cr += c; cg += c; cb += c; ca += 1;
                     }
                 int o = (y * s + x) * 4;
@@ -275,18 +299,29 @@ public static class DockIcon
 }
 '@
 
-$variant = 2
+if ($Variant -eq 'tasks') {
+    $shape = 3; $ico = 'tasks.ico'; $png = 'tasks-256.png'
+    if (-not $Out) { $Out = Join-Path $PSScriptRoot '..\apps\tasks\assets' }
+} else {
+    $shape = 2; $ico = 'dock.ico'; $png = 'icon-256.png'
+    if (-not $Out) { $Out = Join-Path $PSScriptRoot '..\assets' }
+}
 $sizes = 16, 20, 24, 32, 40, 48, 64, 256
 $Out = [System.IO.Path]::GetFullPath($Out)
 New-Item -ItemType Directory -Force $Out | Out-Null
-[System.IO.File]::WriteAllBytes((Join-Path $Out 'dock.ico'), [DockIcon]::Ico($sizes, $variant))
-[System.IO.File]::WriteAllBytes((Join-Path $Out 'icon-256.png'), [DockIcon]::Png([DockIcon]::Render(256, $variant), 256, 256))
-Write-Host "wrote $Out\dock.ico and $Out\icon-256.png"
+[System.IO.File]::WriteAllBytes((Join-Path $Out $ico), [DockIcon]::Ico($sizes, $shape))
+[System.IO.File]::WriteAllBytes((Join-Path $Out $png), [DockIcon]::Png([DockIcon]::Render(256, $shape), 256, 256))
+Write-Host "wrote $Out\$ico and $Out\$png"
 
 if ($Preview) {
     $Preview = [System.IO.Path]::GetFullPath($Preview)
     New-Item -ItemType Directory -Force $Preview | Out-Null
     $small = 16, 20, 24, 32, 40, 48
-    [System.IO.File]::WriteAllBytes((Join-Path $Preview 'icon-variants.png'), [DockIcon]::Sheet($small, @(0, 1, 2), 8))
-    Write-Host "wrote $Preview\icon-variants.png (rows: square, centred pill, low pill)"
+    if ($Variant -eq 'tasks') {
+        [System.IO.File]::WriteAllBytes((Join-Path $Preview 'tasks-icon.png'), [DockIcon]::Sheet($small, @(3), 8))
+        Write-Host "wrote $Preview\tasks-icon.png (each size on black, #202020 and white; 256 px at 1:1)"
+    } else {
+        [System.IO.File]::WriteAllBytes((Join-Path $Preview 'icon-variants.png'), [DockIcon]::Sheet($small, @(0, 1, 2), 8))
+        Write-Host "wrote $Preview\icon-variants.png (rows: square, centred pill, low pill)"
+    }
 }

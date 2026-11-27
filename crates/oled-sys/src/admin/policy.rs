@@ -181,13 +181,16 @@ pub fn descendants(root: ProcKey, procs: &[ProcEdge], out: &mut Vec<ProcKey>) {
     }
 }
 
-/// Judges the program of a service's command line (QueryServiceConfig's binary path), never its arguments: it must
-/// lie under one of `roots` (folders a standard user cannot write, such as SystemRoot and the program folders) and,
-/// when unquoted, hold no space after the root, because Windows would try each space-separated prefix as a program.
+/// Judges the program of a service's command line (QueryServiceConfig's binary path), never what its arguments do: it
+/// must lie under one of `roots` (folders a standard user cannot write, such as SystemRoot and the program folders),
+/// in none of their folders that a standard user can write (WRITABLE_IN_ROOT) and, when unquoted, hold no space after
+/// the root and be followed by no "..", because Windows would try each space-separated prefix of the line as a
+/// program, the shorter ones first and the longer ones when the program is missing.
 pub fn service_image_allowed(binary_path: &str, roots: &[&str]) -> Result<(), DenyReason> {
     let Some((program, quoted)) = program_of(binary_path) else {
         return Err(DenyReason::ServiceImagePath);
     };
+    // Interpreters and loaders (cmd, powershell, rundll32, ...) pass too: their arguments are the administrator's.
     if is_plain_absolute(program) && roots.iter().any(|root| lies_under(program, root, quoted)) {
         Ok(())
     } else {
@@ -197,9 +200,11 @@ pub fn service_image_allowed(binary_path: &str, roots: &[&str]) -> Result<(), De
 
 /// The program of a command line and whether it was quoted. Quoted: the text inside the first pair of quotes.
 /// Unquoted: the shortest prefix ending in ".exe" (ASCII case-insensitive) followed by the end or a space, else the
-/// whole line when it is one name. None when no program can be told apart: an unclosed quote, or a line with no
-/// ".exe" and more text after its first name (when that name plus ".exe" is missing, Windows goes on to try the
-/// longer space-separated prefixes, which these rules would not have judged).
+/// whole line when it is one name. None when no program can be told apart: an unclosed quote, a line with no ".exe"
+/// and more text after its first name (when that name plus ".exe" is missing, Windows goes on to try the longer
+/// space-separated prefixes, which these rules would not have judged), or an unquoted program followed by ".."
+/// (when the program is missing, Windows tries it with part of the arguments and normalises the result:
+/// `C:\Windows\x.exe \..\..\Users\Public\evil` runs C:\Users\Public\evil.exe).
 fn program_of(line: &str) -> Option<(&str, bool)> {
     if let Some(rest) = line.strip_prefix('"') {
         let end = rest.find('"')?;
@@ -209,6 +214,10 @@ fn program_of(line: &str) -> Option<(&str, bool)> {
     for (i, w) in bytes.windows(4).enumerate() {
         let end = i + 4;
         if w.eq_ignore_ascii_case(b".exe") && matches!(bytes.get(end), None | Some(b' ')) {
+            // Without "..", every longer prefix lies in a folder named after the program, in the program's folder.
+            if line.get(end..).is_none_or(|args| args.contains("..")) {
+                return None;
+            }
             return line.get(..end).map(|p| (p, false));
         }
     }
@@ -236,6 +245,7 @@ fn is_plain_absolute(p: &str) -> bool {
 /// `program` is `root` (ASCII case-insensitive, a trailing '\' ignored), a '\' and at least one more character;
 /// unquoted, the part after the root holds no space (the root's own spaces lead only to its parent folders, which a
 /// standard user cannot write either). A root must name a folder: a drive alone or a relative root admits nothing.
+/// A program in a folder of WRITABLE_IN_ROOT, or below one, does not lie under the root.
 fn lies_under(program: &str, root: &str, quoted: bool) -> bool {
     let root = root.trim_end_matches('\\');
     if !matches!(root.as_bytes(), [d, b':', b'\\', _, ..] if d.is_ascii_alphabetic()) {
@@ -247,7 +257,43 @@ fn lies_under(program: &str, root: &str, quoted: bool) -> bool {
     let Some(inside) = rest.strip_prefix('\\') else {
         return false;
     };
-    head.eq_ignore_ascii_case(root) && !inside.is_empty() && (quoted || !inside.contains(' '))
+    head.eq_ignore_ascii_case(root)
+        && !inside.is_empty()
+        && (quoted || !inside.contains(' '))
+        && !in_writable_folder(inside)
+}
+
+/// Folders inside SystemRoot where a standard user can create files or folders (Users, Authenticated Users, Everyone or
+/// Performance Log Users hold that right in a stock Windows 11), relative to a root and refused below every root.
+/// Folders a third party made writable are not here: only an ACL check by the executor can see them (T9).
+const WRITABLE_IN_ROOT: [&str; 16] = [
+    "Temp",
+    "Tasks",
+    "tracing",
+    r"debug\WIA",
+    "PLA",
+    r"Registration\CRMLog",
+    r"System32\Tasks",
+    r"System32\Tasks_Migrated",
+    r"System32\spool",
+    r"System32\com\dmp",
+    r"System32\FxsTmp",
+    r"System32\LogFiles\WMI",
+    r"System32\Microsoft\Crypto\RSA\MachineKeys",
+    r"SysWOW64\Tasks",
+    r"SysWOW64\com\dmp",
+    r"SysWOW64\FxsTmp",
+];
+
+/// `inside` (a path relative to a root) lies in a folder of WRITABLE_IN_ROOT or below it. The segments are compared
+/// as Windows normalises them (ASCII case-insensitive): empty and "." segments drop out, trailing dots and spaces do
+/// not count.
+fn in_writable_folder(inside: &str) -> bool {
+    let segments = || inside.split('\\').map(|s| s.trim_end_matches(['.', ' '])).filter(|s| !s.is_empty());
+    WRITABLE_IN_ROOT.iter().any(|folder| {
+        let mut path = segments();
+        folder.split('\\').all(|f| path.next().is_some_and(|s| s.eq_ignore_ascii_case(f))) && path.next().is_some()
+    })
 }
 
 /// A service whose failure action reboots the machine is never stopped.

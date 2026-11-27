@@ -10,4 +10,5 @@ pub mod images;
 pub mod menu;
 pub mod sta;
 pub mod supervisor;
+pub mod type_names;
 pub mod writer;

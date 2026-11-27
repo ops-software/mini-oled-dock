@@ -87,6 +87,11 @@ impl TempRoot {
         fence::dir(&self.path, rel)
     }
 
+    /// Creates the folder `rel` and its parents by their exact names: a trailing dot or space is kept.
+    pub fn dir_exact(&self, rel: &str) -> PathBuf {
+        fence::dir_exact(&self.path, rel)
+    }
+
     /// Overwrites the existing file `rel`.
     pub fn write(&self, rel: &str, bytes: &[u8]) {
         fence::write(&self.path, rel, bytes)
@@ -104,6 +109,16 @@ impl TempRoot {
 
     pub fn rename(&self, from: &str, to: &str) {
         fence::rename(&self.path, from, to)
+    }
+
+    /// Renames `from` to `to` and gives the result back: a rename that a held handle must refuse.
+    pub fn try_rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        fence::try_rename(&self.path, from, to)
+    }
+
+    /// Removes the empty folder `rel` and gives the result back.
+    pub fn try_remove_dir(&self, rel: &str) -> std::io::Result<()> {
+        fence::try_remove_dir(&self.path, rel)
     }
 
     /// Sets the last-write time of `rel` (a FILETIME value).
@@ -257,14 +272,25 @@ pub mod fence {
         pub reparse_tag: u32,
     }
 
-    /// %TEMP%, checked: absolute and no reparse point in its chain.
+    /// %TEMP%, checked: absolute and no reparse point in its chain; in its long form.
     pub fn temp_base() -> PathBuf {
         let base = std::env::temp_dir();
         assert!(base.is_absolute(), "%TEMP% is not absolute: {}", base.display());
         if let Err(e) = check_chain(&base) {
             panic!("refusing a test root under {}: {e}", base.display());
         }
-        base
+        temp_long()
+    }
+
+    /// %TEMP% with its 8.3 components expanded (C:\Users\RUNNER~1 on the CI runner): the shell reports long paths, so
+    /// the test roots and the paths the tests expect are long too. %TEMP% itself when it cannot be read.
+    pub fn temp_long() -> PathBuf {
+        let base = std::env::temp_dir();
+        let long = std::fs::canonicalize(&base).ok().and_then(|p| {
+            let s = p.to_str()?.to_string();
+            s.strip_prefix(r"\\?\").filter(|rest| !rest.starts_with("UNC\\")).map(PathBuf::from)
+        });
+        long.unwrap_or(base)
     }
 
     /// No existing component of `p` (the path itself and every parent) is a reparse point.
@@ -288,7 +314,7 @@ pub mod fence {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
             return false;
         };
-        lower(parent) == lower(&std::env::temp_dir())
+        (lower(parent) == lower(&std::env::temp_dir()) || lower(parent) == lower(&temp_long()))
             && name.starts_with(prefix)
             && name.len() > prefix.len()
             && !name.contains(['\\', '/', ':'])
@@ -422,6 +448,19 @@ pub mod fence {
         p
     }
 
+    /// Creates the folder `rel` and its parents by their exact names: a trailing dot or space is kept (the \\?\ form).
+    pub fn dir_exact(root: &Path, rel: &str) -> PathBuf {
+        let mut p = root.to_path_buf();
+        for c in resolve(root, rel).strip_prefix(root).iter().flat_map(|r| r.components()) {
+            p.push(c);
+            let w = verbatim(&p);
+            // SAFETY: `w` is NUL-terminated and lives for the call.
+            let _ = unsafe { CreateDirectoryW(PCWSTR(w.as_ptr()), None) };
+        }
+        assert!(is_dir_exact(&p), "create {}", p.display());
+        p
+    }
+
     pub fn write(root: &Path, rel: &str, bytes: &[u8]) {
         let p = resolve(root, rel);
         not_a_link(&p);
@@ -439,6 +478,14 @@ pub mod fence {
         let p = resolve(root, rel);
         not_a_link(&p);
         std::fs::remove_dir(&p).unwrap_or_else(|e| panic!("remove {}: {e}", p.display()));
+    }
+
+    pub fn try_rename(root: &Path, from: &str, to: &str) -> std::io::Result<()> {
+        std::fs::rename(resolve(root, from), resolve(root, to))
+    }
+
+    pub fn try_remove_dir(root: &Path, rel: &str) -> std::io::Result<()> {
+        std::fs::remove_dir(resolve(root, rel))
     }
 
     pub fn rename(root: &Path, from: &str, to: &str) {
@@ -480,7 +527,7 @@ pub mod fence {
     /// Makes `rel` a mount-point junction to `target` (a folder inside a fenced root of `prefix`); no admin right needed.
     pub fn junction(root: &Path, rel: &str, target: &Path, prefix: &str) {
         assert!(
-            within_fenced(target, prefix) && target.is_dir(),
+            within_fenced(target, prefix) && is_dir_exact(target),
             "junction target {} must be a folder inside a {prefix} root",
             target.display()
         );
@@ -510,6 +557,13 @@ pub mod fence {
             let _ = std::fs::remove_dir(&link);
             panic!("junction {rel} -> {}: {e}", target.display());
         }
+    }
+
+    /// `p` is a folder, looked up by its exact name: a trailing dot or space is not trimmed (the \\?\ form).
+    fn is_dir_exact(p: &Path) -> bool {
+        let mut w = verbatim(p);
+        w.pop();
+        std::fs::metadata(PathBuf::from(std::ffi::OsString::from_wide(&w))).is_ok_and(|m| m.is_dir())
     }
 
     /// The REPARSE_DATA_BUFFER of a mount point: tag, data length, reserved, then the substitute name "\??\<target>"
@@ -705,9 +759,16 @@ pub mod fence {
     /// A junction target relative to %TEMP% ('/' separators), or the target itself when it lies elsewhere.
     fn temp_relative(target: &str) -> String {
         let t = target.trim_start_matches(r"\??\").trim_start_matches(r"\\?\");
-        let base = std::env::temp_dir().to_string_lossy().trim_end_matches('\\').to_string();
-        let rest =
-            if t.to_lowercase().starts_with(&format!("{}\\", base.to_lowercase())) { &t[base.len() + 1..] } else { t };
+        let lower = t.to_lowercase();
+        let mut rest = t;
+        // %TEMP% as given or in its long form (the roots' own form: temp_long).
+        for b in [std::env::temp_dir(), temp_long()] {
+            let base = b.to_string_lossy().trim_end_matches('\\').to_lowercase();
+            if lower.starts_with(&format!("{base}\\")) {
+                rest = &t[base.len() + 1..];
+                break;
+            }
+        }
         rest.replace('\\', "/")
     }
 

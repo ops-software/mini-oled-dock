@@ -59,9 +59,10 @@ fn scan(lint: fn(&str, &str) -> Vec<String>) -> Vec<String> {
 const MUTATION_ALLOWED: [&str; 4] =
     ["src/own_files.rs", "tests/common/temp.rs", "examples/common/live.rs", "examples/files_faultext/lib.rs"];
 
-/// The files that may also open a file handle with CreateFileW: the change watcher, icons.bin's reader and the pipe.
-const CREATE_FILE_ALLOWED: [&str; 4] =
-    ["src/watch/iocp.rs", "src/decor/iconsbin.rs", "src/host/named.rs", "src/ops_client.rs"];
+/// The files that may also open a file handle with CreateFileW: the change watcher, icons.bin's reader, the pipe and
+/// the hand-off's folder pin.
+const CREATE_FILE_ALLOWED: [&str; 5] =
+    ["src/watch/iocp.rs", "src/decor/iconsbin.rs", "src/host/named.rs", "src/ops_client.rs", "src/instance.rs"];
 
 /// Calls that create, change, move or delete a file. The Win32 names are stems, so every variant matches too (A and
 /// W, Ex, WithProgress, 2, FromApp, Transacted); GetFileAttributesW does not match the SetFileAttributes stem.
@@ -376,6 +377,11 @@ fn display_name_is_not_in_code() {
         assert_eq!(display_name_violations("src/a.rs", s.as_bytes()).len(), 1, "not caught: {s}");
     }
     assert!(display_name_violations("src/a.rs", b"files, mod-files, FILES_DATA_DIR").is_empty());
+    // No file is allowlisted: the name lives in the kit's table (kit.app.files), so a second key or a comment fails.
+    let key_line = format!("\"files.app.name\" = \"{title}\"\n\"files.app.other\" = \"{title} Beta\"");
+    assert_eq!(display_name_violations("strings/en.toml", key_line.as_bytes()).len(), 1, "a key holding the name");
+    let comment = format!("// the {title} window\npub fn x() {{}}");
+    assert_eq!(display_name_violations("src/window.rs", comment.as_bytes()).len(), 1, "a comment holding the name");
     let mut files = Vec::new();
     collect(&root(), &mut files);
     assert!(files.iter().any(|f| f.ends_with("Cargo.toml")), "the walk reads every file, the manifest included");
@@ -385,5 +391,310 @@ fn display_name_is_not_in_code() {
         let bytes = std::fs::read(&f).unwrap_or_else(|e| panic!("read {}: {e}", f.display()));
         all.extend(display_name_violations(&rel, &bytes));
     }
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+// ---- ROADMAP 3.1 gate a: the window modules show no literal text --------------------------------------------------
+
+/// The line of src/lib.rs under which the window's modules are declared (P3-files-app FZ1).
+const WINDOW_MARKER: &str = "// ---- P3-files-app (window)";
+
+/// Calls whose string-literal arguments would reach the screen.
+const UI_CALLS: [&str; 8] = [
+    "TextLabel::new(",
+    "Button::new(",
+    "IconButton::new(",
+    "Text::from(",
+    "Text::raw(",
+    "set_text(",
+    "set_label(",
+    "tf(",
+];
+
+/// Struct literals and the field of each that reaches the screen.
+const UI_FIELDS: [(&str, &str); 5] = [
+    ("Command {", "label:"),
+    ("Notice {", "text:"),
+    ("MenuItem::Custom {", "label:"),
+    ("ToastSpec {", "text:"),
+    ("WindowSpec {", "title:"),
+];
+
+/// A line holding one of these may hold literals: logs, wide-string macros, assertions, registered and class names.
+const NOT_UI: [&str; 7] = ["log!(", "w!(", "debug_assert", "panic!(", "mini-oled-dock.", "MiniOled", "// lint: not UI"];
+
+/// Lines a struct literal may span before the scan gives up on it.
+const FIELD_SPAN: usize = 40;
+
+/// The string literals of `s` with their byte offsets: (start of the opening quote, text between the quotes).
+fn literals(s: &str) -> Vec<(usize, &str)> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                // A char literal ('"', '\'') is skipped whole; a lifetime is a lone apostrophe.
+                if b.get(i + 1) == Some(&b'\\') && b.get(i + 3) == Some(&b'\'') {
+                    i += 4;
+                } else if b.get(i + 2) == Some(&b'\'') {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                out.push((start, s.get(start + 1..i.min(b.len())).unwrap_or("")));
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// A literal at `at` that names a placeholder: the first element of a tuple in a slice, as in tf's &[("name", value)].
+fn is_placeholder_name(line: &str, at: usize, text: &str) -> bool {
+    let before = line[..at].trim_end();
+    let after = line.get(at + text.len() + 2..).unwrap_or("").trim_start();
+    (before.ends_with("[(") || before.ends_with(", (") || before.ends_with(",(")) && after.starts_with(',')
+}
+
+/// True when a literal from byte `from` on holds a letter and is not a placeholder name.
+fn has_text_literal(line: &str, from: usize) -> bool {
+    literals(line)
+        .into_iter()
+        .any(|(at, text)| at >= from && text.chars().any(char::is_alphabetic) && !is_placeholder_name(line, at, text))
+}
+
+/// The lines of `text` that are not inside a #[cfg(test)] item.
+fn outside_tests(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let (mut pending, mut depth, mut inside) = (false, 0i32, false);
+    for (n, line) in text.lines().enumerate() {
+        if inside {
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            if depth <= 0 {
+                inside = false;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            pending = true;
+            continue;
+        }
+        if pending {
+            if line.contains('{') {
+                depth = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                inside = depth > 0;
+                pending = false;
+            } else if line.trim_end().ends_with(';') {
+                pending = false;
+            }
+            continue;
+        }
+        out.push((n, line));
+    }
+    out
+}
+
+fn literal_ui_violations(path: &str, text: &str) -> Vec<String> {
+    let lines = outside_tests(text);
+    let allowed = |l: &str| is_comment(l) || NOT_UI.iter().any(|t| l.contains(t));
+    let mut v = Vec::new();
+    for (i, &(n, line)) in lines.iter().enumerate() {
+        if allowed(line) {
+            continue;
+        }
+        for call in UI_CALLS {
+            if line.match_indices(call).any(|(at, _)| has_text_literal(line, at + call.len())) {
+                v.push(format!("{path}:{}: a literal text passed to {call}..)", n + 1));
+            }
+        }
+        for (head, field) in UI_FIELDS {
+            let Some(start) = line.find(head) else { continue };
+            // The literal's lines: from the head to the brace that closes it.
+            let mut depth = 0i32;
+            for (k, &(m, l)) in lines.iter().enumerate().skip(i).take(FIELD_SPAN) {
+                let part = if k == i { &l[start..] } else { l };
+                if !allowed(l) {
+                    if let Some(at) = part.find(field) {
+                        let from = l.len() - part.len() + at + field.len();
+                        if has_text_literal(l, from) {
+                            v.push(format!("{path}:{}: a literal text in {head} {field} ..}}", m + 1));
+                        }
+                    }
+                }
+                depth += part.matches('{').count() as i32 - part.matches('}').count() as i32;
+                if depth <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+    v
+}
+
+/// The window's module files: every module declared under the marker of src/lib.rs (a file, or a folder and every
+/// .rs file in it), fakes.rs excepted.
+fn window_sources() -> Vec<(String, String)> {
+    let lib = std::fs::read_to_string(root().join("src/lib.rs")).unwrap_or_else(|e| panic!("read src/lib.rs: {e}"));
+    let (_, below) = lib.split_once(WINDOW_MARKER).unwrap_or_else(|| panic!("src/lib.rs has no window marker"));
+    let mut out = Vec::new();
+    for name in
+        below.lines().filter_map(|l| l.trim().strip_prefix("pub mod")).filter_map(|r| r.trim().strip_suffix(';'))
+    {
+        let name = name.trim();
+        if name == "fakes" {
+            continue;
+        }
+        let mut files = Vec::new();
+        let single = root().join("src").join(format!("{name}.rs"));
+        if single.is_file() {
+            files.push(single);
+        }
+        collect(&root().join("src").join(name), &mut files);
+        for f in files.into_iter().filter(|f| f.extension().is_some_and(|x| x == "rs")) {
+            let rel = f.strip_prefix(root()).unwrap_or(&f).to_string_lossy().replace('\\', "/");
+            let text = std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {}: {e}", f.display()));
+            out.push((rel, text));
+        }
+    }
+    assert!(out.iter().any(|(p, _)| p == "src/tr.rs"), "the window's modules are found under the marker");
+    out
+}
+
+#[test]
+fn no_literal_ui_strings() {
+    let bad = "src/window.rs";
+    for s in [
+        "let l = TextLabel::new(id, Text::from(\"Back\"), role);",
+        "s.notice(Notice { text: Text::from(\"Done\"), action: None, hold_ms: 6_000 });",
+        "let n = Notice {\n    text: \"Done\".into(),\n    action: None,\n};",
+        "let c = Command { id, label: \"Open\".into(), glyph: None };",
+        "items.push(MenuItem::Custom { id, label: Text::Borrowed(\"Open\"), glyph: None });",
+        "let spec = WindowSpec {\n    class: WINDOW_CLASS,\n    title: \"Files\".into(),\n};",
+        "out.set_text(CellKind::Text, \"folder\");",
+        "let t = tr::tf(k::FILES_NAV_BACK_TO, lang, &[(\"name\", \"Docs\")]);",
+        "cx.toast(ToastSpec { text: \"Copied\".into(), action: None, progress: None, hold_ms: None });",
+    ] {
+        assert!(!literal_ui_violations(bad, s).is_empty(), "not caught: {s}");
+    }
+    for s in [
+        "let l = TextLabel::new(id, Text::from(\"Back\"), role); // lint: not UI",
+        "s.notice(Notice { text: Text::from(\"Done\"), action: None, hold_ms: 6_000 }); // lint: not UI",
+        "let t = tr::tf(k::FILES_NAV_BACK_TO, lang, &[(\"name\", &name)]);",
+        "let t = tf(k::FILES_STATUS_ITEMS_OTHER, lang, &[(\"n\", &n), (\"size\", &size)]);",
+        "oled_sys::log!(\"files: notice: {}\", n.text);",
+        "let spec = WindowSpec { class: \"MiniOledFiles\", title: tr::t(k::FILES_APP_BETA, lang) };",
+        "let n = Notice { text: tr::t(k::FILES_OPS_HOST_LOST, lang), action: None, hold_ms: 6_000 };",
+        "let x = Text::from(\"\u{2192} 12 %\".to_string()); // digits and signs only are not words",
+        "// TextLabel::new(id, Text::from(\"Back\"), role)",
+        "#[cfg(test)]\nmod tests {\n    fn f() { let _ = Text::from(\"Back\"); }\n}",
+        "out.set_text(CellKind::Text, &name);",
+        "let c = if c == '\"' { Text::from(sep) } else { t(k, lang) };",
+    ] {
+        assert!(literal_ui_violations(bad, s).is_empty(), "wrongly caught: {s}: {:?}", literal_ui_violations(bad, s));
+    }
+    let all: Vec<String> = window_sources().iter().flat_map(|(p, t)| literal_ui_violations(p, t)).collect();
+    assert!(all.is_empty(), "{all:#?}");
+}
+
+// ---- U1, U6: only the start path resolves the window's real folders ---------------------------------------------
+
+/// What resolves the own data folder or files.json's folder.
+const REAL_FOLDERS: [&str; 6] = [
+    "OwnDir::default_dir",
+    "options::spec(",
+    "FOLDERID_RoamingAppData",
+    "FOLDERID_LocalAppData",
+    "\"APPDATA\"",
+    "\"LOCALAPPDATA\"",
+];
+
+/// The one call that builds the real services: on the start path only.
+const REAL_SERVICES: &str = "services::real(";
+
+/// The 0-based line range of the body of the first function whose signature holds `sig`.
+fn fn_body(text: &str, sig: &str) -> Option<std::ops::Range<usize>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| !is_comment(l) && l.contains(sig))?;
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (n, l) in lines.iter().enumerate().skip(start) {
+        depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+        opened |= l.contains('{');
+        if opened && depth <= 0 {
+            return Some(start..n + 1);
+        }
+    }
+    Some(start..lines.len())
+}
+
+fn real_folder_violations(path: &str, text: &str) -> Vec<String> {
+    // Where each may appear: services.rs's real(), options.rs's spec(), selftest.rs (and real() only in app.rs).
+    let allowed = match path {
+        "src/services.rs" => fn_body(text, "pub fn real("),
+        "src/options.rs" => fn_body(text, "pub fn spec("),
+        "src/selftest.rs" => Some(0..usize::MAX),
+        _ => None,
+    };
+    let mut v = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if is_comment(line) {
+            continue;
+        }
+        let inside = allowed.as_ref().is_some_and(|r| r.contains(&n));
+        for t in REAL_FOLDERS {
+            if line.contains(t) && !inside {
+                v.push(format!("{path}:{}: {t} outside the start path", n + 1));
+            }
+        }
+        if line.contains(REAL_SERVICES) && path != "src/app.rs" {
+            v.push(format!("{path}:{}: {REAL_SERVICES}..) outside app.rs", n + 1));
+        }
+    }
+    v
+}
+
+#[test]
+fn real_folders_only_on_the_start_path() {
+    let services = "pub fn real(hub: &Arc<Hub>) -> Services {\n    let data = OwnDir::default_dir();\n}\nfn other() {\n    let d = OwnDir::default_dir();\n}";
+    assert_eq!(
+        real_folder_violations("src/services.rs", services).len(),
+        1,
+        "only real()'s body may resolve the folder"
+    );
+    let options = "pub fn spec() -> Option<FileSpec> {\n    known(&FOLDERID_RoamingAppData)\n}\npub fn x() { std::env::var(\"APPDATA\") }";
+    assert_eq!(real_folder_violations("src/options.rs", options).len(), 1, "only spec()'s body");
+    for bad in [
+        "let d = OwnDir::default_dir();",
+        "let s = options::spec();",
+        "SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None)",
+        "let p = std::env::var(\"LOCALAPPDATA\");",
+        "let s = services::real(&hub, exe, None);",
+    ] {
+        for path in ["src/window.rs", "src/fakes.rs", "src/preview/f1a.rs", "tests/ui_f1a.rs"] {
+            assert!(!real_folder_violations(path, bad).is_empty(), "{path}: not caught: {bad}");
+        }
+    }
+    assert!(real_folder_violations("src/app.rs", "let s = services::real(&hub, exe, None);").is_empty());
+    assert!(real_folder_violations("src/selftest.rs", "let s = options::spec();").is_empty());
+    assert!(real_folder_violations("tests/ui_open.rs", "let s = services::real_shell(&hub, exe, None);").is_empty());
+    assert!(real_folder_violations("src/window.rs", "// OwnDir::default_dir() is app.rs's").is_empty());
+    // Every window module (fakes.rs and preview/* included) and every test but this lint.
+    let mut files = window_sources();
+    let fakes = root().join("src/fakes.rs");
+    files.push((
+        "src/fakes.rs".into(),
+        std::fs::read_to_string(&fakes).unwrap_or_else(|e| panic!("read fakes.rs: {e}")),
+    ));
+    files.extend(rust_sources().into_iter().filter(|(p, _)| p.starts_with("tests/")));
+    let all: Vec<String> = files.iter().flat_map(|(p, t)| real_folder_violations(p, t)).collect();
     assert!(all.is_empty(), "{all:#?}");
 }

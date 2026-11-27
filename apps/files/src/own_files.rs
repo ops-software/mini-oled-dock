@@ -96,11 +96,18 @@ impl OwnDir {
         Ok(f)
     }
 
+    /// Opens the existing file `rel` for reading: the same checks as the other methods, the last component opened
+    /// without following a reparse point and refused by its handle when it is a link or a folder.
+    pub fn open_read(&self, rel: &str) -> io::Result<File> {
+        let target = self.checked(rel, Need::Existing)?;
+        let f = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0).open(&target)?;
+        refuse_link_or_dir(&f)?;
+        Ok(f)
+    }
+
     /// The bytes of `rel`.
     pub fn read(&self, rel: &str) -> io::Result<Vec<u8>> {
-        let target = self.checked(rel, Need::Existing)?;
-        let mut f = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0).open(&target)?;
-        refuse_link_or_dir(&f)?;
+        let mut f = self.open_read(rel)?;
         let mut out = Vec::new();
         f.read_to_end(&mut out)?;
         Ok(out)

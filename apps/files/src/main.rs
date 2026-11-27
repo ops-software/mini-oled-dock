@@ -1,5 +1,5 @@
-//! files.exe. Today the engine roles (--role=ops, --role=shell) and, in a debug build, the test client; the window
-//! comes later and replaces the fallback arm.
+//! files.exe: the engine roles (--role=ops, --role=shell), in a debug build the test client and the instance tests'
+//! IPC role, and otherwise the window's command line (cli::parse, then app::run).
 #![windows_subsystem = "windows"]
 
 use files_engine::exit;
@@ -16,6 +16,8 @@ enum Role<'a> {
     Shell,
     /// Debug builds only: files.exe --role=test-client <script>.
     TestClient(&'a str),
+    /// Debug builds only: files.exe --role=test-ipc <args> (the instance tests' message-only window).
+    TestIpc,
     Usage,
     Window,
 }
@@ -28,6 +30,7 @@ fn role(args: &[String]) -> Role<'_> {
             Some(script) => Role::TestClient(script),
             None => Role::Usage,
         },
+        Some("--role=test-ipc") if cfg!(debug_assertions) => Role::TestIpc,
         _ => Role::Window,
     }
 }
@@ -41,14 +44,21 @@ fn run(args: &[String]) -> i32 {
         Role::TestClient(script) => files_engine::testclient::run(std::path::Path::new(script)),
         #[cfg(not(debug_assertions))]
         Role::TestClient(_) => exit::USAGE,
+        #[cfg(debug_assertions)]
+        Role::TestIpc => files_engine::instance::test_ipc_role(rest),
+        #[cfg(not(debug_assertions))]
+        Role::TestIpc => exit::USAGE,
         Role::Usage => exit::USAGE,
-        Role::Window => {
-            // The window is not built yet: one log line and the usage code.
-            let log = oled_sys::logger::start("", &files_engine::LOG_UI);
-            oled_sys::log!("files: the window is not built yet");
-            oled_sys::logger::stop(log);
-            exit::USAGE
-        }
+        // The window takes every argument (a folder is the first one).
+        Role::Window => match files_engine::cli::parse(args) {
+            Ok(c) => files_engine::app::run(c),
+            Err(e) => {
+                let log = oled_sys::logger::start("", &files_engine::LOG_UI);
+                oled_sys::log!("{e}");
+                oled_sys::logger::stop(log);
+                exit::USAGE
+            }
+        },
     }
 }
 
@@ -67,6 +77,9 @@ mod tests {
         assert_eq!(role(&args(&[])), Role::Window);
         assert_eq!(role(&args(&["C:\\x"])), Role::Window);
         assert_eq!(role(&args(&["--role=OPS"])), Role::Window);
+        let ipc_line = args(&["--role=test-ipc", "x"]);
+        let ipc = role(&ipc_line);
+        assert_eq!(ipc, if cfg!(debug_assertions) { Role::TestIpc } else { Role::Window }, "debug builds only");
         let line = args(&["--role=test-client", "s.jsonl"]);
         let client = role(&line);
         if cfg!(debug_assertions) {

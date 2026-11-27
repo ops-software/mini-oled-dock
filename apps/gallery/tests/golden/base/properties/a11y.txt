@@ -1,0 +1,14 @@
+Group
+Switch "Show names" [focusable, checked] on
+Label "Draws the name under each icon when there is room for it."
+RadioGroup "Size"
+  Radio "Small" [focusable]
+  Radio "Medium" [focusable, selected]
+  Radio "Large" [focusable]
+Slider "Opacity" [focusable] 65 (20..100)
+Label "How see-through the bar is, from clear to solid."
+Switch "Show badges" [focusable] off
+Button "Oldest first" [focusable]
+Label "Order"
+TextInput "Profile name" [focusable] ""
+Label "Accent colours" [disabled]

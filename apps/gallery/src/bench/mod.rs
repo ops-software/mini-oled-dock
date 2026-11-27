@@ -100,13 +100,32 @@ pub fn budget_ms_in(json: &str, id: &str) -> f64 {
     }
 }
 
+/// Whether the budgets.json row `id` gates (status "active"); false when the row or the file is missing.
+pub fn row_active(id: &str) -> bool {
+    budgets_path().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|text| row_active_in(&text, id))
+}
+
+/// row_active over the text of a budgets.json.
+pub fn row_active_in(json: &str, id: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    v["rows"].as_array().and_then(|rows| rows.iter().find(|r| r["id"] == id)).is_some_and(|r| r["status"] == "active")
+}
+
 /// Prints {"bench":..,"median_ms":..,"budget_ms":..} and returns false when the median is over the budget (x 1.5 when
-/// CI is set, x 1.0 otherwise) or the budget row is missing.
+/// CI is set, x 1.0 otherwise) of an active row, or the budget row is missing. A pending row is declared, not yet gated
+/// (budgets.json's protocol): over its value it prints so and passes.
 pub fn gate(name: &str, id: &str, median: f64) -> bool {
     let budget = budget_ms(id);
     println!("{}", serde_json::json!({ "bench": name, "median_ms": median, "budget_ms": budget }));
     let allowance = if std::env::var_os("CI").is_some() { 1.5 } else { 1.0 };
-    budget.is_finite() && median <= budget * allowance
+    let within = median <= budget * allowance;
+    if budget.is_finite() && !within && !row_active(id) {
+        println!("{id} is pending, not gated: median {median} ms over {budget} ms x {allowance}");
+        return true;
+    }
+    budget.is_finite() && within
 }
 
 /// The --bench mode: every ready bench (or the one named) through gate; 1 on a miss, a bench not ready or an unknown
@@ -159,6 +178,10 @@ mod tests {
         assert_eq!(budget_ms_in(json, "a.b"), 0.3);
         assert!(budget_ms_in(json, "c.d").is_nan());
         assert!(budget_ms_in("not json", "a.b").is_nan());
+        let json = r#"{"rows":[{"id":"a.b","status":"active"},{"id":"c.d","status":"pending"},{"id":"e.f"}]}"#;
+        assert!(row_active_in(json, "a.b"));
+        assert!(!row_active_in(json, "c.d") && !row_active_in(json, "e.f") && !row_active_in(json, "g.h"));
+        assert!(!row_active_in("not json", "a.b"));
     }
 
     #[test]

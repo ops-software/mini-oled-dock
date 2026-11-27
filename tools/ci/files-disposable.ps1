@@ -5,7 +5,7 @@
 # runner, the throwaway machine of the recycle, dialog and registration cases; never on a developer's PC.
 #   pwsh tools/ci/files-disposable.ps1 -Setup               exports FILES_DISP_UNC, FILES_DISP_FAT, FILES_DISP_NUKE,
 #                                                            FILES_DISP_QUOTA and FILES_TEST_ROOT to $env:GITHUB_ENV
-#   pwsh tools/ci/files-disposable.ps1 -Register -Dll <p>   registers the fault DLL (SH10; a no-op until then)
+#   pwsh tools/ci/files-disposable.ps1 -Register -Dll <p>   registers the fault DLL's three classes for .modfault (HKCU)
 param([switch]$Setup, [switch]$Register, [string]$Dll = '')
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
@@ -72,6 +72,33 @@ if ($Setup) {
 }
 
 if ($Register) {
-  # SH10 registers the fault DLL's handlers here; until it lands there is nothing to register.
-  Write-Host "no fault DLL exports yet ($Dll)"
+  # The fault DLL (the files_faultext example) for files of type .modfault, in HKCU only: a context-menu handler, an
+  # icon handler and a thumbnail handler. The CLSIDs are pinned in the DLL and in the shell host (fault_clsids_are_pinned).
+  if (-not $Dll -or -not (Test-Path $Dll)) { throw "the fault DLL is missing: '$Dll'" }
+  $path = (Resolve-Path $Dll).Path
+  $clsid = [ordered]@{
+    FaultMenu  = '{08f7748e-e7c9-4950-ac48-6ebab3ca29dc}'
+    FaultIcon  = '{e3fec5ef-f489-427f-879f-ef723f66d403}'
+    FaultThumb = '{5a4db2eb-6c01-444f-be94-ebff37f11b35}'
+  }
+  $root = 'HKCU:\Software\Classes'
+  function Set-Default([string]$Key, [string]$Value) {
+    New-Item -Force -Path $Key | Out-Null
+    Set-ItemProperty -Path $Key -Name '(default)' -Value $Value
+  }
+  Set-Default "$root\.modfault" 'ModFault.File'
+  Set-Default "$root\ModFault.File\DefaultIcon" '%1'
+  Set-Default "$root\ModFault.File\shellex\ContextMenuHandlers\ModFault" $clsid.FaultMenu
+  Set-Default "$root\ModFault.File\shellex\IconHandler" $clsid.FaultIcon
+  # The thumbnail-handler key under the extension: an unverified name; the disposable test records whether it loads.
+  Set-Default "$root\.modfault\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}" $clsid.FaultThumb
+  foreach ($name in $clsid.Keys) {
+    $key = "$root\CLSID\$($clsid[$name])"
+    Set-Default $key "files test $name"
+    Set-Default "$key\InprocServer32" $path
+    Set-ItemProperty -Path "$key\InprocServer32" -Name 'ThreadingModel' -Value 'Apartment'
+  }
+  # A thumbnail provider initialized with IInitializeWithItem loads in-process only with process isolation off.
+  New-ItemProperty -Path "$root\CLSID\$($clsid.FaultThumb)" -Name 'DisableProcessIsolation' -PropertyType DWord -Value 1 -Force | Out-Null
+  Write-Host "registered FaultMenu, FaultIcon and FaultThumb for .modfault from $path"
 }

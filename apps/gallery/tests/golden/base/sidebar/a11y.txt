@@ -1,0 +1,16 @@
+Tree
+  TreeItem "Display" [focusable] level 1
+  TreeItem "Sound" [focusable, selected] level 1
+  TreeItem "Power" [focusable] level 1
+  TreeItem "Privacy" [focusable] level 1
+  TreeItem "About" [focusable] level 1
+Tree
+  Label "Favourites"
+  TreeItem "Documents" [focusable, expandable, expanded] level 1
+  TreeItem "Reports" [focusable, selected] level 2
+  TreeItem "Notes" [focusable] level 2
+  TreeItem "Pictures" [focusable, expandable] level 1
+  TreeItem "Downloads" [focusable] level 1
+  TreeItem "Cloud" [focusable, busy] level 1
+  TreeItem "Archive" [disabled] level 1
+  TreeItem "Local disk" [focusable] level 1

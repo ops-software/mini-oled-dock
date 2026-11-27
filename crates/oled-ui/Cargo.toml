@@ -13,8 +13,8 @@ doctest = false
 [features]
 # Counters read by tests only; a release build never enables it (tests/workspace.rs checks).
 test-counters = []
-# The AccessKit bridge (kit KG); empty until then.
-a11y = []
+# The AccessKit bridge (kit KG): one UIA adapter per window. Off for the dock; an app or the gallery opts in.
+a11y = ["dep:accesskit", "dep:accesskit_windows"]
 
 [dependencies]
 oled-sys = { workspace = true }
@@ -23,7 +23,12 @@ windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gd
     # The kit (P2-kit K0.1a): the union every kit group needs.
     "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory",
     "Win32_System_Ole", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_HiDpi",
-    "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse"] }
+    "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse",
+    # The frame pacing's QPC clock (kit K3.4).
+    "Win32_System_Performance"] }
+# The a11y feature only (kit KG): AccessKit's UIA adapter, MIT OR Apache-2.0; exact versions pinned by Cargo.lock.
+accesskit = { version = "0.25", optional = true }
+accesskit_windows = { version = "0.35", optional = true }
 
 [build-dependencies]
 oled-i18n-build = { workspace = true }

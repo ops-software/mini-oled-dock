@@ -32,6 +32,7 @@ pub use cx::*;
 pub use event::*;
 pub use geom::*;
 pub use glyph::Glyph;
+pub use host::Show;
 pub use node::*;
 pub use screen::*;
 pub use strings::{Lang, UiLang};

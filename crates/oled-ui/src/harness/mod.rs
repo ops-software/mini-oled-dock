@@ -9,7 +9,7 @@ mod image;
 pub use image::Image;
 
 use crate::command::CommandId;
-use crate::cx::{Anchor, Clipboard, Env, MenuId, MenuItem, PaintCx, Res, ToastSpec};
+use crate::cx::{Anchor, Clipboard, Env, FrontResult, MenuId, MenuItem, PaintCx, Res, ToastSpec};
 use crate::dispatch::{Dispatcher, Effect, Input};
 use crate::event::{FocusReason, ImeEvent, Mods, MouseButton, WheelDelta};
 use crate::geom::{PointL, PointP, RectP, Scale, SizeL};
@@ -51,6 +51,13 @@ pub struct MenuSnapshot {
     pub highlight: Option<usize>,
 }
 
+/// What a screen asked of its window that only a real window does (TK1), recorded by the Harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRequest {
+    BringToFront,
+    Topmost(bool),
+}
+
 /// A screen in a headless window.
 pub struct Harness<S: Screen> {
     screen: S,
@@ -67,6 +74,7 @@ pub struct Harness<S: Screen> {
     outputs: Vec<String>,
     last: Option<Image>,
     dirty_layout: bool,
+    requests: Vec<WindowRequest>,
 }
 
 impl<S: Screen> Harness<S> {
@@ -91,6 +99,7 @@ impl<S: Screen> Harness<S> {
             outputs: Vec::new(),
             last: None,
             dirty_layout: false,
+            requests: Vec::new(),
         };
         h.layout();
         h
@@ -191,23 +200,49 @@ impl<S: Screen> Harness<S> {
         self
     }
 
-    /// Fires timers and internal deadlines in order of due time (K1a.5 adds the 16 ms animation frames).
+    /// A WM_COPYDATA with `tag` (dwData) and `bytes`, as the window delivers it: Screen::copy_data's answer, or false
+    /// without a call for a payload above 64 KiB.
+    pub fn copy_data(&mut self, tag: usize, bytes: &[u8]) -> bool {
+        if !crate::host::window::copy_data_fits(bytes.len()) {
+            return false;
+        }
+        self.disp.copied = false;
+        self.input(Input::CopyData(tag, bytes.to_vec()));
+        std::mem::take(&mut self.disp.copied)
+    }
+
+    /// A routed message (EventLoop::route_message) as the window delivers it: Screen::app_message.
+    pub fn app_message(&mut self, msg: u32, wparam: usize, lparam: isize) -> &mut Self {
+        self.input(Input::Routed(msg, wparam, lparam));
+        self
+    }
+
+    /// What the screen asked of its window (bring_to_front, set_topmost), oldest first. A headless window always gets
+    /// the foreground: front_result reads Foreground after a bring_to_front.
+    pub fn window_requests(&self) -> &[WindowRequest] {
+        &self.requests
+    }
+
+    /// Moves the fake clock by `ms` in steps of at most 16 ms (the frame clock), stopping at every timer and internal
+    /// deadline on the way, which fire in order of due time.
     pub fn advance(&mut self, ms: u32) -> &mut Self {
         let end = self.now + u64::from(ms);
-        while let Some(due) = self.disp.next_due().filter(|d| *d <= end) {
-            self.now = self.now.max(due);
-            let fired: Vec<_> = self.disp.timers.iter().filter(|t| t.1 <= self.now).map(|t| t.0).collect();
-            self.disp.timers.retain(|t| t.1 > self.now);
-            for id in fired {
+        let mut stalled = 0;
+        while self.now < end {
+            let frame = (self.now + 16).min(end);
+            let to = match self.disp.next_due() {
+                Some(due) if due <= frame => due.max(self.now),
+                _ => frame,
+            };
+            stalled = if to == self.now { stalled + 1 } else { 0 };
+            // A deadline that does not move would loop forever: after a few rounds at one instant, take the frame step.
+            self.now = if stalled > 8 { frame } else { to };
+            for id in self.disp.take_due_timers(self.now) {
                 self.input(Input::Timer(id));
             }
             self.disp.on_due(self.now);
             self.apply();
-            if self.disp.next_due() == Some(due) {
-                break; // a deadline that does not move would loop forever
-            }
         }
-        self.now = end;
         self
     }
 
@@ -225,6 +260,12 @@ impl<S: Screen> Harness<S> {
     /// The window as the banded presenter draws it: each band cleared to bg, the screen's paint, then
     /// hooks::after_paint_band (toasts, the custom caption).
     pub fn render(&mut self) -> Image {
+        let bh = band_height(self.scale.size(self.size).w.max(0));
+        self.render_banded(bh)
+    }
+
+    /// render() with an explicit band height: the tests compare it with one full-height band.
+    pub(crate) fn render_banded(&mut self, band_rows: i32) -> Image {
         if self.dirty_layout {
             self.layout();
         }
@@ -247,7 +288,7 @@ impl<S: Screen> Harness<S> {
             caption: self.caption,
             caption_spike: false,
         };
-        let bh = band_height(w);
+        let bh = band_rows.max(1);
         let mut top = 0;
         while top < h {
             let rows = bh.min(h - top);
@@ -260,6 +301,9 @@ impl<S: Screen> Harness<S> {
             crate::host::hooks::after_paint_band(&mut cx);
             top += rows;
         }
+        // A run that straddles two bands was logged by each of them.
+        text_rects.sort_by_key(|r| (r.t, r.l, r.r, r.b));
+        text_rects.dedup();
         let img = Image { w: w as u32, h: h as u32, px, text_rects };
         self.last = Some(Image { w: img.w, h: img.h, px: img.px.clone(), text_rects: img.text_rects.clone() });
         img
@@ -303,6 +347,27 @@ impl<S: Screen> Harness<S> {
     /// No tween live, no timer armed, no internal deadline pending.
     pub fn is_idle(&self) -> bool {
         self.disp.timers.is_empty() && !self.disp.anim.is_live(self.now) && self.disp.next_due().is_none()
+    }
+
+    /// The dispatcher, for the kit's own tests.
+    #[cfg(test)]
+    pub(crate) fn dispatcher(&mut self) -> &mut Dispatcher {
+        &mut self.disp
+    }
+
+    /// Event::Command(id) as the dispatcher sends it (a kit id to its owner), then the effects.
+    #[cfg(test)]
+    pub(crate) fn command(&mut self, id: CommandId) {
+        let env = Env {
+            scale: self.scale,
+            tokens: &self.tokens,
+            lang: self.lang,
+            now_ms: self.now,
+            caption: self.caption,
+            caption_spike: false,
+        };
+        self.disp.command(&mut self.screen, env, &mut self.res, &mut self.clipboard, id);
+        self.apply();
     }
 
     pub fn screen(&self) -> &S {
@@ -357,7 +422,7 @@ impl<S: Screen> Harness<S> {
     }
 
     /// One input through the dispatcher, then its effects.
-    fn input(&mut self, inp: Input) {
+    pub(crate) fn input(&mut self, inp: Input) {
         let env = Env {
             scale: self.scale,
             tokens: &self.tokens,
@@ -434,6 +499,11 @@ impl<S: Screen> Harness<S> {
                 }
             }
             Effect::CloseWindow => self.outputs.push("CloseWindow".to_string()),
+            Effect::BringToFront => {
+                self.requests.push(WindowRequest::BringToFront);
+                self.disp.front = Some(FrontResult::Foreground);
+            }
+            Effect::Topmost(on) => self.requests.push(WindowRequest::Topmost(on)),
             Effect::Damage(_)
             | Effect::Redraw
             | Effect::SetCaret(_)
@@ -460,4 +530,257 @@ fn list_items(items: Vec<crate::node::Text>) -> Vec<MenuItem> {
             danger: false,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::CommandTable;
+    use crate::cx::{EventCx, LayoutCx};
+    use crate::event::{Event, Reply};
+    use crate::geom::SizeP;
+    use crate::model::Align;
+    use crate::node::{Node, NodeFlags, NodeValue, Role, Text, WidgetId};
+    use crate::text::Trim;
+    use crate::theme::{Ink, TypeRole};
+
+    /// Rows of fills and text, and a log of the IME events it got.
+    struct Probe {
+        cmds: CommandTable,
+        rows: i32,
+        ime: Vec<ImeEvent>,
+    }
+
+    impl Probe {
+        fn new(rows: i32) -> Probe {
+            Probe { cmds: CommandTable::new(), rows, ime: Vec::new() }
+        }
+    }
+
+    impl Screen for Probe {
+        fn layout(&mut self, cx: &mut LayoutCx, avail: SizeP) -> SizeP {
+            let w = WidgetId(1);
+            let root =
+                Node::new(NodeId::new(w, 0), Role::Window, RectP::wh(0, 0, avail.w, avail.h)).label(Text::from("Main"));
+            cx.push(root);
+            let at = |i| NodeId::new(w, i);
+            let r = RectP::wh(10, 10, 80, 28);
+            cx.push(
+                Node::new(at(1), Role::Button, r)
+                    .parent(at(0))
+                    .label(Text::from("Close"))
+                    .focus(crate::node::Focusable::Tab),
+            );
+            cx.push(
+                Node::new(at(2), Role::Switch, r)
+                    .parent(at(0))
+                    .label(Text::from("Dark"))
+                    .flags(NodeFlags::CHECKED | NodeFlags::FOCUSABLE)
+                    .value(NodeValue::Toggle(true)),
+            );
+            cx.push(Node::new(at(3), Role::Slider, r).parent(at(1)).label(Text::from("Vol")).value(NodeValue::Range {
+                value: 3.0,
+                min: 0.0,
+                max: 10.0,
+                step: 1.0,
+            }));
+            cx.push(
+                Node::new(at(4), Role::Label, r)
+                    .parent(at(0))
+                    .flags(NodeFlags::A11Y_HIDDEN)
+                    .label(Text::from("hidden")),
+            );
+            avail
+        }
+
+        fn paint(&self, cx: &mut PaintCx) {
+            let fg = cx.tokens().color.fg_primary;
+            for i in 0..self.rows {
+                let r = RectP::wh(cx.px(20), cx.px(10 + i * 54), cx.px(300), cx.px(50));
+                if !cx.visible(r) {
+                    continue;
+                }
+                cx.fill(r, cx.px(6), Ink::white(16 + (i as u32 % 5) * 12));
+                cx.text_in(
+                    &format!("Row {i} of the page"),
+                    TypeRole::Body,
+                    r.inset(cx.px(12), 0),
+                    Align::Start,
+                    Trim::End,
+                    fg,
+                );
+            }
+        }
+
+        fn event(&mut self, _cx: &mut EventCx, ev: &Event) -> Reply {
+            if let Event::Ime(e) = ev {
+                self.ime.push(e.clone());
+            }
+            Reply::None
+        }
+
+        fn commands(&self) -> &CommandTable {
+            &self.cmds
+        }
+    }
+
+    #[test]
+    fn banded_equals_single_band() {
+        let size = SizeL { w: 3840, h: 2160 };
+        let mut h = Harness::new(Probe::new(40), size, 96, Tokens::oled());
+        let banded = h.render();
+        let one = h.render_banded(2160);
+        assert_eq!((banded.w, banded.h), (3840, 2160));
+        assert!(banded.px == one.px, "banded and single-band renders differ");
+        assert_eq!(banded.text_rects.len(), 40, "every row logged its text rect once");
+        assert!(banded.px.iter().any(|p| *p != banded.px[0]), "something was drawn");
+    }
+
+    #[test]
+    fn dump_format() {
+        let h = Harness::new(Probe::new(0), SizeL { w: 200, h: 100 }, 96, Tokens::oled());
+        assert_eq!(
+            h.a11y_dump(),
+            "Window \"Main\"\n  Button \"Close\" [focusable]\n  Switch \"Dark\" [focusable, checked] on\n    Slider \"Vol\" 3 (0..10)\n"
+        );
+    }
+
+    #[test]
+    fn fake_ime_sequence() {
+        let mut h = Harness::new(Probe::new(0), SizeL { w: 200, h: 100 }, 96, Tokens::oled());
+        h.ime("ni", Some("\u{4f60}"));
+        assert_eq!(
+            h.screen().ime,
+            [
+                ImeEvent::Start,
+                ImeEvent::Composition { text: "ni".to_string(), caret: 2 },
+                ImeEvent::Result("\u{4f60}".to_string()),
+                ImeEvent::End
+            ]
+        );
+        h.screen_mut().ime.clear();
+        h.ime("n", None);
+        assert_eq!(h.screen().ime.len(), 2, "a composition left open has no Result and no End");
+    }
+
+    #[test]
+    fn language_and_pseudo_reach_the_screen() {
+        let h = Harness::new(Probe::new(0), SizeL { w: 10, h: 10 }, 96, Tokens::oled()).lang(Lang::It).pseudo(true);
+        assert!(h.lang.italian && h.lang.pseudo);
+        let h = Harness::new(Probe::new(0), SizeL { w: 10, h: 10 }, 96, Tokens::oled()).lang(Lang::Auto);
+        assert!(!h.lang.italian, "Auto counts as English");
+    }
+
+    /// Records what reaches it through the TK1 hooks, and asks for the window requests on a key.
+    struct Recorder {
+        cmds: CommandTable,
+        answer: bool,
+        seen: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl Recorder {
+        fn new(answer: bool) -> Recorder {
+            Recorder { cmds: CommandTable::new(), answer, seen: Default::default() }
+        }
+    }
+
+    impl Screen for Recorder {
+        fn layout(&mut self, _cx: &mut LayoutCx, avail: SizeP) -> SizeP {
+            avail
+        }
+
+        fn paint(&self, _cx: &mut PaintCx) {}
+
+        fn event(&mut self, cx: &mut EventCx, ev: &Event) -> Reply {
+            if let Event::Key { down: true, .. } = ev {
+                self.seen.borrow_mut().push(format!("front before: {:?}", cx.front_result()));
+                cx.bring_to_front();
+                cx.set_topmost(true);
+                cx.set_topmost(false);
+            }
+            Reply::None
+        }
+
+        fn copy_data(&mut self, cx: &mut EventCx, tag: usize, bytes: &[u8]) -> bool {
+            self.seen.borrow_mut().push(format!("copy {tag:#x} {bytes:?} front {:?}", cx.front_result()));
+            self.answer
+        }
+
+        fn app_message(&mut self, _cx: &mut EventCx, msg: u32, wparam: usize, lparam: isize) -> Reply {
+            self.seen.borrow_mut().push(format!("msg {msg:#x} {wparam} {lparam}"));
+            Reply::Redraw
+        }
+
+        fn commands(&self) -> &CommandTable {
+            &self.cmds
+        }
+    }
+
+    fn seen(h: &Harness<Recorder>) -> Vec<String> {
+        h.screen().seen.borrow().clone()
+    }
+
+    #[test]
+    fn copy_data_reaches_the_screen() {
+        let mut h = Harness::new(Recorder::new(true), SizeL { w: 10, h: 10 }, 96, Tokens::oled());
+        assert!(h.copy_data(0x5449_4E53, b"abc"), "the screen's answer");
+        h.screen_mut().answer = false;
+        assert!(!h.copy_data(7, &[]), "the screen's answer");
+        assert_eq!(seen(&h), ["copy 0x54494e53 [97, 98, 99] front None", "copy 0x7 [] front None"]);
+        // Through a Box<dyn Screen>, as the window holds it.
+        let rec = Recorder::new(true);
+        let log = std::rc::Rc::clone(&rec.seen);
+        let boxed: Box<dyn Screen> = Box::new(rec);
+        let mut h = Harness::new(boxed, SizeL { w: 10, h: 10 }, 96, Tokens::oled());
+        assert!(h.copy_data(1, b"z"));
+        h.app_message(0xC123, 4, -5);
+        assert_eq!(*log.borrow(), ["copy 0x1 [122] front None", "msg 0xc123 4 -5"], "the Box forwards both hooks");
+    }
+
+    #[test]
+    fn copy_data_over_64_kib_is_refused() {
+        let mut h = Harness::new(Recorder::new(true), SizeL { w: 10, h: 10 }, 96, Tokens::oled());
+        assert!(h.copy_data(1, &vec![0u8; 64 * 1024]), "64 KiB reaches the screen");
+        assert!(!h.copy_data(2, &vec![0u8; 64 * 1024 + 1]), "one byte more is refused");
+        assert_eq!(seen(&h).len(), 1, "a refused payload reaches no screen");
+        assert!(!crate::host::window::copy_data_fits(64 * 1024 + 1), "the window's own check");
+    }
+
+    #[test]
+    fn routed_message_reaches_the_screen() {
+        let mut h = Harness::new(Recorder::new(true), SizeL { w: 10, h: 10 }, 96, Tokens::oled());
+        h.app_message(0xC0DE, 0x0001_0602, 0).app_message(0x8005, 0, -1);
+        assert_eq!(seen(&h), ["msg 0xc0de 67074 0", "msg 0x8005 0 -1"]);
+        assert_eq!(h.last_outputs().last().map(String::as_str), Some("Redraw"), "the screen's reply");
+    }
+
+    #[test]
+    fn bring_to_front_is_recorded() {
+        let mut h = Harness::new(Recorder::new(true), SizeL { w: 10, h: 10 }, 96, Tokens::oled());
+        assert!(h.window_requests().is_empty());
+        h.key("a");
+        assert_eq!(
+            h.window_requests(),
+            [WindowRequest::BringToFront, WindowRequest::Topmost(true), WindowRequest::Topmost(false)]
+        );
+        h.copy_data(3, b"");
+        h.key("b");
+        let log = seen(&h);
+        assert_eq!(log[0], "front before: None");
+        assert_eq!(log[1], "copy 0x3 [] front Some(Foreground)", "a headless window gets the foreground");
+        assert_eq!(log[2], "front before: Some(Foreground)");
+        assert_eq!(h.window_requests().len(), 6);
+    }
+
+    #[test]
+    fn the_fake_clock_steps_by_frames_and_stops_at_deadlines() {
+        let mut h = Harness::new(Probe::new(0), SizeL { w: 10, h: 10 }, 96, Tokens::oled());
+        h.advance(100);
+        assert!(h.is_idle());
+        assert_eq!(h.now, 100);
+        h.dispatcher().timers.push((crate::event::TimerId(1), 130));
+        assert!(!h.is_idle());
+        h.advance(40);
+        assert!(h.is_idle(), "the timer fired at its due time");
+    }
 }

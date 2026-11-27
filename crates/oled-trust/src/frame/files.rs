@@ -9,7 +9,8 @@ use super::wire::{Reader, Writer};
 use super::{Codec, FrameError, Proto, WireLen};
 
 pub const OPS: Proto = Proto { magic: u32::from_le_bytes(*b"FOPS"), version: 1, max_payload: 1 << 20 };
-pub const SHELL: Proto = Proto { magic: u32::from_le_bytes(*b"FSHL"), version: 1, max_payload: 1 << 20 };
+/// Version 2 added the type names (ShellReq::TypeNames, ShellEvt::TypeNames); a version-1 peer is refused at the Hello.
+pub const SHELL: Proto = Proto { magic: u32::from_le_bytes(*b"FSHL"), version: 2, max_payload: 1 << 20 };
 pub const INSTANCE: Proto = Proto { magic: u32::from_le_bytes(*b"FINS"), version: 1, max_payload: 64 << 10 };
 pub const MAX_PATH_UNITS: u16 = 32_767;
 pub const MAX_NAME_UNITS: u16 = 255;
@@ -445,6 +446,13 @@ pub struct ShellNewType {
     pub ext: Box<str>,
     pub label: Box<str>,
 }
+/// One file type's name as the shell names it (SHELL version 2), as the decoder checks it: ext as in ClassIcons (at
+/// most 64 bytes, lower case, no dot, separator or control character), name at most 260 bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeName {
+    pub ext: Box<str>,  // <= 64 bytes, lower case, no dot
+    pub name: Box<str>, // <= 260 bytes
+}
 #[repr(u16)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellReq {
@@ -462,6 +470,7 @@ pub enum ShellReq {
     QuickAccessPins { req: ReqId } = 0x0209,
     CancelGen { gen: Gen } = 0x020A, // drops queued image work of older gens
     Bye = 0x020B,
+    TypeNames { req: ReqId, exts: Vec<Box<str>> } = 0x020C, // whole frame; at most 256 exts per request
 }
 #[repr(u16)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -478,7 +487,10 @@ pub enum ShellEvt {
     Pins { req: ReqId, pins: Vec<WidePath> } = 0x028A,          // split by bytes; ReqDone after the last
     Failed { req: ReqId, hr: i32 } = 0x028B,
     Busy { on: bool } = 0x028C,
-    ReqDone { req: ReqId } = 0x028D, // the last frame of Icons, Thumbs, ClassIcons, ShellNewTypes, QuickAccessPins
+    // The last frame of Icons, Thumbs, ClassIcons, ShellNewTypes, QuickAccessPins and TypeNames.
+    ReqDone { req: ReqId } = 0x028D,
+    // Split by bytes (split_by_bytes); ReqDone after the last. Never empty: the decoder refuses an empty list.
+    TypeNames { req: ReqId, names: Vec<TypeName> } = 0x028E,
 }
 
 // ---- encoded sizes (2.2's field encodings): a WidePath is 2 + 2 x units bytes, a Box<str> 4 + its UTF-8 bytes,
@@ -533,6 +545,12 @@ impl WireLen for ShellNewType {
     }
 }
 
+impl WireLen for TypeName {
+    fn wire_len(&self) -> usize {
+        (4 + self.ext.len()) + (4 + self.name.len())
+    }
+}
+
 // ---- codecs (2.2's field encodings): ids and Gen as their integer; a WidePath as wire::wide (at most
 // MAX_PATH_UNITS) and only in its normal form, so that decoding then encoding gives back the same bytes; a Box<str>
 // as wire::str under the cap written on its field; an Option as a u8 tag 0/1 then the value; a Vec as wire::count
@@ -547,6 +565,10 @@ const DETAIL_MAX: u32 = 520;
 const LABEL_MAX: u32 = 512;
 const TEXT_MAX: u32 = 8 << 10;
 const EXT_MAX: u32 = 64;
+/// A type name: SHGetFileInfoW's szTypeName (80 UTF-16 units) as UTF-8 fits.
+const TYPE_NAME_MAX: u32 = 260;
+/// The extensions of one TypeNames request.
+const TYPE_EXTS_MAX: u32 = 256;
 const BGRA_MAX: u32 = MAX_PIXELS_SIDE as u32 * MAX_PIXELS_SIDE as u32 * 4;
 
 fn op_id(r: &mut Reader<'_>) -> Result<OpId, FrameError> {
@@ -608,10 +630,20 @@ fn put_list<T>(w: &mut Writer, items: &[T], mut put: impl FnMut(&mut Writer, &T)
 fn get_list<'a, T>(
     r: &mut Reader<'a>,
     field: &'static str,
+    get: impl FnMut(&mut Reader<'a>) -> Result<T, FrameError>,
+) -> Result<Vec<T>, FrameError> {
+    get_list_upto(r, field, MAX_LIST, get)
+}
+
+/// get_list with a lower count cap than MAX_LIST.
+fn get_list_upto<'a, T>(
+    r: &mut Reader<'a>,
+    field: &'static str,
+    max: u32,
     mut get: impl FnMut(&mut Reader<'a>) -> Result<T, FrameError>,
 ) -> Result<Vec<T>, FrameError> {
-    // count() bounds n by MAX_LIST and by the bytes left before anything is allocated.
-    let n = r.count(field, MAX_LIST)?;
+    // count() bounds n by max and by the bytes left before anything is allocated.
+    let n = r.count(field, max)?;
     let mut v = Vec::with_capacity(n as usize);
     for _ in 0..n {
         v.push(get(r)?);
@@ -895,6 +927,15 @@ fn put_new_type(w: &mut Writer, t: &ShellNewType) {
 
 fn get_new_type(r: &mut Reader<'_>) -> Result<ShellNewType, FrameError> {
     Ok(ShellNewType { ext: get_ext(r, "ShellNewType.ext")?, label: get_str(r, "ShellNewType.label", LABEL_MAX)? })
+}
+
+fn put_type_name(w: &mut Writer, t: &TypeName) {
+    w.str(&t.ext);
+    w.str(&t.name);
+}
+
+fn get_type_name(r: &mut Reader<'_>) -> Result<TypeName, FrameError> {
+    Ok(TypeName { ext: get_ext(r, "TypeName.ext")?, name: get_str(r, "TypeName.name", TYPE_NAME_MAX)? })
 }
 
 impl Codec for InstanceCmd {
@@ -1183,6 +1224,7 @@ impl Codec for ShellReq {
             ShellReq::QuickAccessPins { .. } => 0x0209,
             ShellReq::CancelGen { .. } => 0x020A,
             ShellReq::Bye => 0x020B,
+            ShellReq::TypeNames { .. } => 0x020C,
         }
     }
     fn put(&self, w: &mut Writer) {
@@ -1230,6 +1272,10 @@ impl Codec for ShellReq {
             ShellReq::ShellNewTypes { req } | ShellReq::QuickAccessPins { req } => w.u32(req.0),
             ShellReq::CancelGen { gen } => w.u64(gen.0),
             ShellReq::Bye => {}
+            ShellReq::TypeNames { req, exts } => {
+                w.u32(req.0);
+                put_list(w, exts, |w, e| put_str(w, e));
+            }
         }
     }
     fn get(kind: u16, r: &mut Reader<'_>) -> Result<Self, FrameError> {
@@ -1277,6 +1323,10 @@ impl Codec for ShellReq {
             0x0209 => ShellReq::QuickAccessPins { req: req_id(r)? },
             0x020A => ShellReq::CancelGen { gen: gen(r)? },
             0x020B => ShellReq::Bye,
+            0x020C => ShellReq::TypeNames {
+                req: req_id(r)?,
+                exts: get_list_upto(r, "TypeNames.exts", TYPE_EXTS_MAX, |r| get_ext(r, "TypeNames.exts"))?,
+            },
             k => return Err(FrameError::UnknownKind(k)),
         })
     }
@@ -1299,6 +1349,7 @@ impl Codec for ShellEvt {
             ShellEvt::Failed { .. } => 0x028B,
             ShellEvt::Busy { .. } => 0x028C,
             ShellEvt::ReqDone { .. } => 0x028D,
+            ShellEvt::TypeNames { .. } => 0x028E,
         }
     }
     fn put(&self, w: &mut Writer) {
@@ -1339,6 +1390,10 @@ impl Codec for ShellEvt {
                 put_list(w, pins, put_path);
             }
             ShellEvt::Busy { on } => w.bool(*on),
+            ShellEvt::TypeNames { req, names } => {
+                w.u32(req.0);
+                put_list(w, names, put_type_name);
+            }
         }
     }
     fn get(kind: u16, r: &mut Reader<'_>) -> Result<Self, FrameError> {
@@ -1370,6 +1425,15 @@ impl Codec for ShellEvt {
             0x028B => ShellEvt::Failed { req: req_id(r)?, hr: r.i32()? },
             0x028C => ShellEvt::Busy { on: r.bool("Busy.on")? },
             0x028D => ShellEvt::ReqDone { req: req_id(r)? },
+            0x028E => {
+                let req = req_id(r)?;
+                let names = get_list(r, "TypeNames.names", get_type_name)?;
+                // Never empty: an empty list would have Pins' bytes, one kind bit away (0x028A).
+                if names.is_empty() {
+                    return Err(FrameError::Invalid { field: "TypeNames.names" });
+                }
+                ShellEvt::TypeNames { req, names }
+            }
             k => return Err(FrameError::UnknownKind(k)),
         })
     }
@@ -1494,6 +1558,7 @@ mod tests {
         assert_eq!(c.wire_len(), 1 + 11 + 1);
         assert_eq!(ModernItem { id: 7, label: "Open".into(), has_sub: false }.wire_len(), 4 + 8 + 1);
         assert_eq!(ShellNewType { ext: "txt".into(), label: "Text Document".into() }.wire_len(), 7 + 17);
+        assert_eq!(TypeName { ext: "txt".into(), name: "Text Document".into() }.wire_len(), 7 + 17);
         // The largest single element of the files protocols, and it fits alone.
         let mut deep = w(r"C:\");
         deep.extend(std::iter::repeat_n(u16::from(b'a'), 32_764));
@@ -1567,6 +1632,7 @@ mod tests {
             ShellReq::QuickAccessPins { .. } => 0x0209,
             ShellReq::CancelGen { .. } => 0x020A,
             ShellReq::Bye => 0x020B,
+            ShellReq::TypeNames { .. } => 0x020C,
         }
     }
 
@@ -1585,6 +1651,7 @@ mod tests {
             ShellEvt::Failed { .. } => 0x028B,
             ShellEvt::Busy { .. } => 0x028C,
             ShellEvt::ReqDone { .. } => 0x028D,
+            ShellEvt::TypeNames { .. } => 0x028E,
         }
     }
 
@@ -1597,6 +1664,7 @@ mod tests {
         assert_eq!(SHELL.magic.to_le_bytes(), *b"FSHL");
         assert_eq!(INSTANCE.magic.to_le_bytes(), *b"FINS");
         assert_eq!((OPS.version, OPS.max_payload, INSTANCE.max_payload), (1, 1 << 20, 64 << 10));
+        assert_eq!((SHELL.version, INSTANCE.version, SHELL.max_payload), (2, 1, 1 << 20), "type names made SHELL 2");
         assert_eq!(
             (MAX_PATH_UNITS, MAX_NAME_UNITS, MAX_LIST, UNDO_MAX_ENTRIES, MAX_PIXELS_SIDE),
             (32_767, 255, 2_048, 16_384, 480)
@@ -1609,6 +1677,8 @@ mod tests {
         assert_eq!(op_evt_kind(&OpEvt::Accepted { op }), 0x0181);
         assert_eq!(shell_req_kind(&ShellReq::Bye), 0x020B);
         assert_eq!(shell_evt_kind(&ShellEvt::Busy { on: true }), 0x028C);
+        assert_eq!(shell_req_kind(&ShellReq::TypeNames { req: ReqId(1), exts: vec![] }), 0x020C);
+        assert_eq!(shell_evt_kind(&ShellEvt::TypeNames { req: ReqId(1), names: vec![] }), 0x028E);
         // The fieldless enums carry their values directly.
         assert_eq!([Conflicts::AskSystem as u8, Conflicts::ReplaceAll as u8, Conflicts::SkipAll as u8], [0, 1, 2]);
         let kinds = [

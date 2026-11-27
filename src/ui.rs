@@ -78,7 +78,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE,
     TRACKMOUSEEVENT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_F15, VK_LBUTTON, VK_LWIN, VK_RBUTTON, VK_SHIFT, VK_SPACE,
 };
-use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK,
+    RIDEV_REMOVE, RID_INPUT,
+};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
@@ -118,8 +121,8 @@ use actions::{resolve, Action, Gesture, SettingsLink, Target, TrayButton};
 #[path = "bar_keys.rs"]
 pub(crate) mod bar_keys; // DK-PAINT fills it
 
-/// Push reveal is built and S-PUSH passed. DK-PUSH sets it to true; settings_pages shows the Reveal row only then.
-pub(crate) const PUSH_AVAILABLE: bool = false;
+/// Push reveal is built and S-PUSH passed; settings_pages shows the Reveal row.
+pub(crate) const PUSH_AVAILABLE: bool = true;
 
 // ---------------------------------------------------------------- constants
 
@@ -429,6 +432,16 @@ thread_local! {
     static LAST_POS: Cell<Option<POINT>> = const { Cell::new(None) };
     /// Edge watch: `now_ms()` when the pointer was last seen to move.
     static STILL_SINCE: Cell<u64> = const { Cell::new(0) };
+    /// Push reveal: true while the bar is hidden, the mode is Push and the last poll saw the pointer on the edge row.
+    static PUSH_EDGE: Cell<bool> = const { Cell::new(false) };
+    /// Push reveal: the sum of the moves towards the edge (see `push_step`).
+    static PUSH_SUM: Cell<PushSum> = const { Cell::new(PushSum { sum: 0, since: 0 }) };
+    /// Push reveal: the threshold of the config, read by the poll (the raw input arm does not read the config).
+    static PUSH_THRESHOLD: Cell<u32> = const { Cell::new(0) };
+    /// Push reveal: true when the bar is at the top, cached by the poll next to the threshold.
+    static PUSH_TOP: Cell<bool> = const { Cell::new(false) };
+    /// Push reveal: `now_ms()` of the last raw input message that ran the poll body (`raw_poll_due`).
+    static RAW_POLL_AT: Cell<u64> = const { Cell::new(0) };
     /// `now_ms()` of the last `refresh_apps` (`apps_fresh`).
     static LAST_APPS_REFRESH: Cell<u64> = const { Cell::new(0) };
     /// true if the apps debounce timer is armed.
@@ -733,10 +746,35 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             // Raw input waits for the pointer's first motion (see "edge watch"). The few messages still queued after
             // the registration was removed find RAW_ON false. None: the caller runs DefWindowProc (RIM_INPUT cleanup).
             if RAW_ON.get() {
-                STILL_SINCE.set(now_ms());
-                poll_sync();
-                on_poll();
-                crate::hook::note_activity();
+                let now = now_ms();
+                // While pushing: only the report's vertical delta and the accumulator per message; the rest of the
+                // arm at most once per poll period.
+                if PUSH_EDGE.get() {
+                    if let Some(dy) = raw_mouse_dy(lp) {
+                        let (sum, hit) =
+                            push_step(PUSH_SUM.get(), towards_edge(dy, PUSH_TOP.get()), now, PUSH_THRESHOLD.get());
+                        PUSH_SUM.set(sum);
+                        if hit {
+                            push_show();
+                        }
+                    }
+                }
+                if !PUSH_EDGE.get() {
+                    STILL_SINCE.set(now);
+                    poll_sync();
+                    on_poll();
+                    crate::hook::note_activity();
+                } else if raw_poll_due(RAW_POLL_AT.get(), now) {
+                    // While pushing the poll timer (PollRaw) already runs the body; only without it (Motion) does
+                    // the arm run it, so the body never runs more than once per poll period.
+                    RAW_POLL_AT.set(now);
+                    STILL_SINCE.set(now);
+                    crate::hook::note_activity();
+                    if !POLL_ON.get() {
+                        poll_sync();
+                        on_poll();
+                    }
+                }
             }
             None
         }
@@ -5152,6 +5190,8 @@ enum EdgeWatch {
     Poll,
     /// No timer: raw input wakes the UI thread at the pointer's next motion.
     Motion,
+    /// The poll runs and raw input stays registered (Push reveal, the pointer moving on the edge row).
+    PollRaw,
 }
 
 #[derive(Clone, Copy)]
@@ -5162,6 +5202,61 @@ struct WatchInputs {
     requests: bool,
     drag: bool,
     still_ms: u64,
+    /// Push reveal: the pointer rests on the edge row of the hidden bar.
+    push_edge: bool,
+}
+
+/// Push reveal: the sum of the relative moves towards the screen edge inside a window of `PUSH_WINDOW_MS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PushSum {
+    sum: i32,
+    since: u64,
+}
+
+/// A push counts only inside this window (ms); an older window restarts.
+const PUSH_WINDOW_MS: u64 = 1000;
+
+/// Adds one relative vertical move (already signed towards the edge) to the push sum. A window older than
+/// `PUSH_WINDOW_MS` restarts, a move away from the edge resets the sum, moves towards it add. True when the sum
+/// reaches `threshold` (the sum then resets).
+fn push_step(p: PushSum, dy_towards_edge: i32, now: u64, threshold: u32) -> (PushSum, bool) {
+    let mut p = if now.saturating_sub(p.since) > PUSH_WINDOW_MS { PushSum { sum: 0, since: now } } else { p };
+    if dy_towards_edge < 0 {
+        p.sum = 0;
+    } else {
+        p.sum = p.sum.saturating_add(dy_towards_edge);
+    }
+    if i64::from(p.sum) >= i64::from(threshold) {
+        return (PushSum::default(), true);
+    }
+    (p, false)
+}
+
+/// The vertical move of a raw report as a move towards the edge: up for the top bar, down for the bottom one.
+fn towards_edge(dy: i32, top: bool) -> i32 {
+    if top {
+        dy.saturating_neg()
+    } else {
+        dy
+    }
+}
+
+/// The vertical move of a raw input report that may count as a push: only a mouse report with relative motion.
+/// Absolute devices (pens, touch screens, remote sessions) never push.
+fn push_delta(kind: u32, flags: u16, dy: i32) -> Option<i32> {
+    const RIM_TYPEMOUSE: u32 = 0;
+    const MOUSE_MOVE_ABSOLUTE: u16 = 1;
+    (kind == RIM_TYPEMOUSE && flags & MOUSE_MOVE_ABSOLUTE == 0).then_some(dy)
+}
+
+/// True when the raw input arm may run the poll body again (the poll timer's period) while a push is going on.
+fn raw_poll_due(last: u64, now: u64) -> bool {
+    now.saturating_sub(last) >= 50
+}
+
+/// Push reveal is the mode in force: built, and chosen in the config.
+fn push_mode() -> bool {
+    PUSH_AVAILABLE && config::get().reveal == config::Reveal::Push
 }
 
 #[derive(Clone, Copy)]
@@ -5171,6 +5266,9 @@ enum GateEvent {
 }
 
 fn edge_watch(w: WatchInputs) -> EdgeWatch {
+    if w.push_edge && !w.visible && w.gate_ok && !w.requests && !w.drag {
+        return if w.still_ms < STILL_MS { EdgeWatch::PollRaw } else { EdgeWatch::Motion };
+    }
     if w.visible || !w.gate_ok || w.dwell || w.requests || w.drag || w.still_ms < STILL_MS {
         EdgeWatch::Poll
     } else {
@@ -5249,8 +5347,18 @@ fn poll_sync() {
         requests: NEED_REQUESTS.with(|n| n.get()),
         drag: drag_active(),
         still_ms: now_ms().saturating_sub(STILL_SINCE.get()),
+        push_edge: PUSH_EDGE.get(),
     });
     match want {
+        EdgeWatch::PollRaw => {
+            if !POLL_ON.get() {
+                set_timer(h, TIMER_POLL, 50);
+                POLL_ON.set(true);
+            }
+            if !RAW_ON.get() && !raw_motion(true) {
+                GATE_OK.set(gate_after(GATE_OK.get(), GateEvent::RegisterFailed));
+            }
+        }
         EdgeWatch::Poll => {
             if RAW_ON.get() {
                 raw_motion(false);
@@ -5285,6 +5393,48 @@ fn edge_is_screen_border(mon: &RECT, x: i32) -> bool {
     other.0.is_null()
 }
 
+/// The vertical delta of the raw input report `lp` when it is a relative mouse move (`push_delta`).
+fn raw_mouse_dy(lp: LPARAM) -> Option<i32> {
+    let mut raw = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    // SAFETY: `raw` is a RAWINPUT on the stack and `size` is its size, as GetRawInputData requires; `lp` is the
+    // handle of the report this WM_INPUT carries; the header size is that of RAWINPUTHEADER.
+    let n = unsafe {
+        GetRawInputData(
+            HRAWINPUT(lp.0 as *mut std::ffi::c_void),
+            RID_INPUT,
+            Some(&mut raw as *mut RAWINPUT as *mut std::ffi::c_void),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if n == u32::MAX || n == 0 {
+        return None;
+    }
+    const RIM_TYPEMOUSE: u32 = 0;
+    if raw.header.dwType != RIM_TYPEMOUSE {
+        return None;
+    }
+    // SAFETY: dwType is RIM_TYPEMOUSE, so data.mouse is the member GetRawInputData filled.
+    let m = unsafe { raw.data.mouse };
+    push_delta(raw.header.dwType, m.usFlags.0, m.lLastY)
+}
+
+/// Push reveal: shows the bar from the edge, as the dwell does (not over a fullscreen window), and starts over.
+fn push_show() {
+    PUSH_EDGE.set(false);
+    PUSH_SUM.set(PushSum::default());
+    let Some(g) = GEOM.with(|g| g.get()) else { return };
+    let mon = if follows_pointer() { monitor_info(pointer_hmonitor()).map_or(g.mon, |mi| mi.rcMonitor) } else { g.mon };
+    if fullscreen_window(&mon).is_some() {
+        return;
+    }
+    if !rect_eq(&mon, &g.mon) {
+        follow_pointer();
+    }
+    show_dock("screen edge (push)", key_show_ms(config::get().hide_delay_ms));
+}
+
 fn point_in(r: &RECT, p: POINT) -> bool {
     p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
 }
@@ -5315,7 +5465,10 @@ fn on_poll_body() {
         LAST_POS.set(cur);
     }
     // A failed read (locked session, secure desktop, disconnected RDP) counts as stillness.
-    let Some(p) = cur else { return };
+    let Some(p) = cur else {
+        PUSH_EDGE.set(false);
+        return;
+    };
     let autohide = crate::config::effective_autohide();
     if VISIBLE.load(Relaxed) {
         let bar = RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h };
@@ -5385,10 +5538,19 @@ fn on_poll_body() {
     let other_display = !rect_eq(&mon, &g.mon);
     let edge_y = if config_top() { mon.top } else { mon.bottom - 1 };
     let at_edge = p.y == edge_y && p.x >= mon.left && p.x < mon.right && edge_is_screen_border(&mon, p.x);
+    // Push reveal keeps only the edge flag up to date here; the reveal itself comes from the raw input arm.
+    let push = push_mode();
+    let push_edge = push && at_edge && !VISIBLE.load(Relaxed);
+    if push_edge != PUSH_EDGE.get() {
+        PUSH_EDGE.set(push_edge);
+        PUSH_SUM.set(PushSum::default());
+    }
+    PUSH_THRESHOLD.set(config::get().push_threshold);
+    PUSH_TOP.set(config_top());
     if !at_edge {
         EDGE_SINCE.store(0, Relaxed);
         EDGE_ARMED.store(true, Relaxed); // re-arms only after leaving the edge
-    } else if (!VISIBLE.load(Relaxed) || other_display) && EDGE_ARMED.load(Relaxed) {
+    } else if !push && (!VISIBLE.load(Relaxed) || other_display) && EDGE_ARMED.load(Relaxed) {
         let since = EDGE_SINCE.load(Relaxed);
         if since == 0 {
             EDGE_SINCE.store(now, Relaxed);
@@ -6040,8 +6202,93 @@ mod tests {
         assert_eq!(target_of(None), Target::Empty);
     }
 
+    #[test]
+    fn push_reveals_at_the_threshold() {
+        let mut p = PushSum::default();
+        for i in 0..3 {
+            let (n, hit) = push_step(p, 5, 10_000 + i * 10, 20);
+            assert!(!hit, "sum {} is under 20", n.sum);
+            p = n;
+        }
+        let (n, hit) = push_step(p, 5, 10_030, 20);
+        assert!(hit);
+        assert_eq!(n, PushSum::default(), "the sum resets after a reveal");
+    }
+
+    #[test]
+    fn push_window_is_one_second() {
+        let (p, _) = push_step(PushSum::default(), 10, 5_000, 30);
+        assert_eq!(p.sum, 10);
+        // Still inside the window at exactly 1000 ms.
+        let (q, hit) = push_step(p, 20, 6_000, 30);
+        assert!(hit, "10 + 20 reaches 30 inside the window");
+        assert_eq!(q.sum, 0);
+        // One ms later the window restarts: 20 alone is not enough.
+        let (r, hit) = push_step(p, 20, 6_001, 30);
+        assert!(!hit);
+        assert_eq!((r.sum, r.since), (20, 6_001));
+    }
+
+    #[test]
+    fn moving_away_resets() {
+        let (p, _) = push_step(PushSum::default(), 15, 5_000, 30);
+        let (p, hit) = push_step(p, -1, 5_010, 30);
+        assert!(!hit);
+        assert_eq!(p.sum, 0);
+        let (_, hit) = push_step(p, 15, 5_020, 30);
+        assert!(!hit, "the earlier 15 no longer counts");
+        // A move along the edge row (dy 0) neither adds nor resets.
+        let (p, _) = push_step(PushSum::default(), 10, 5_000, 30);
+        let (p, _) = push_step(p, 0, 5_010, 30);
+        assert_eq!(p.sum, 10);
+    }
+
+    #[test]
+    fn top_bar_pushes_up() {
+        assert_eq!(towards_edge(-5, true), 5);
+        assert_eq!(towards_edge(5, true), -5);
+        assert_eq!(towards_edge(5, false), 5);
+        assert_eq!(towards_edge(-5, false), -5);
+        assert_eq!(towards_edge(i32::MIN, true), i32::MAX);
+    }
+
     fn wi(visible: bool, still_ms: u64) -> WatchInputs {
-        WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms }
+        WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms, push_edge: false }
+    }
+
+    #[test]
+    fn edge_watch_with_push() {
+        let pe = |visible, still_ms| WatchInputs { push_edge: true, ..wi(visible, still_ms) };
+        assert_eq!(edge_watch(pe(false, 0)), EdgeWatch::PollRaw);
+        assert_eq!(edge_watch(pe(false, 999)), EdgeWatch::PollRaw);
+        assert_eq!(edge_watch(pe(false, 1000)), EdgeWatch::Motion);
+        assert_eq!(edge_watch(pe(false, 60_000)), EdgeWatch::Motion);
+        // A shown bar, a failed gate, a drag or pending requests keep the plain poll.
+        assert_eq!(edge_watch(pe(true, 5000)), EdgeWatch::Poll);
+        assert_eq!(edge_watch(WatchInputs { gate_ok: false, ..pe(false, 5000) }), EdgeWatch::Poll);
+        assert_eq!(edge_watch(WatchInputs { drag: true, ..pe(false, 5000) }), EdgeWatch::Poll);
+        assert_eq!(edge_watch(WatchInputs { requests: true, ..pe(false, 5000) }), EdgeWatch::Poll);
+        // Without push_edge: today's table.
+        assert_eq!(edge_watch(wi(false, 5000)), EdgeWatch::Motion);
+        assert_eq!(edge_watch(wi(false, 999)), EdgeWatch::Poll);
+    }
+
+    #[test]
+    fn only_relative_mouse_reports_push() {
+        assert_eq!(push_delta(0, 0, -7), Some(-7), "a relative mouse report");
+        assert_eq!(push_delta(0, 1, 5), None, "MOUSE_MOVE_ABSOLUTE");
+        assert_eq!(push_delta(0, 3, 5), None, "absolute over the virtual desktop");
+        assert_eq!(push_delta(0, 4, 5), Some(5), "other flag bits do not matter");
+        assert_eq!(push_delta(1, 0, 5), None, "a keyboard report");
+        assert_eq!(push_delta(2, 0, 5), None, "a HID report");
+    }
+
+    #[test]
+    fn raw_poll_is_throttled() {
+        assert!(!raw_poll_due(1000, 1049));
+        assert!(raw_poll_due(1000, 1050));
+        assert!(raw_poll_due(0, 12_345), "the first message runs the poll");
+        assert!(!raw_poll_due(2000, 1000), "a clock that went back does not run it");
     }
 
     #[test]

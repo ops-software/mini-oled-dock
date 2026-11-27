@@ -3,6 +3,9 @@
 
 use crate::cx::{AnimId, Ease};
 
+/// The animation channel of the hover fade (HOVER_FADE nodes): widgets keep the low channels for their own tweens.
+pub(crate) const HOVER_CHANNEL: u8 = 255;
+
 /// One running animation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Tween {
@@ -51,9 +54,21 @@ impl AnimClock {
         self.tweens.push((id, Tween { from, to, start_ms: now_ms, dur_ms, ease }));
     }
 
+    /// Like start, but a tween that never ran begins at `first_from` instead of its target (the hover fade).
+    pub(crate) fn start_from(&mut self, id: AnimId, first_from: f32, to: f32, dur_ms: u32, ease: Ease, now_ms: u64) {
+        let from = self.value(id, now_ms).unwrap_or(first_from);
+        self.tweens.retain(|t| t.0 != id);
+        self.tweens.push((id, Tween { from, to, start_ms: now_ms, dur_ms, ease }));
+    }
+
     /// The value of `id` at `now_ms` (its end value once finished), None if it never ran.
     pub(crate) fn value(&self, id: AnimId, now_ms: u64) -> Option<f32> {
         self.tweens.iter().find(|t| t.0 == id).map(|t| t.1.at(now_ms))
+    }
+
+    /// Drops the finished hover tweens whose node `keep` refuses (a node no longer in the frame).
+    pub(crate) fn retain_hover(&mut self, keep: impl Fn(crate::node::NodeId) -> bool, now_ms: u64) {
+        self.tweens.retain(|t| t.0.channel != HOVER_CHANNEL || t.1.live(now_ms) || keep(t.0.node));
     }
 
     /// True while any tween runs: the frame clock is armed only then.

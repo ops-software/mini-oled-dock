@@ -1,0 +1,23 @@
+Label "Toggles"
+Switch "Off" [focusable] off
+Switch "On" [focusable, checked] on
+Switch "Off, unavailable" [disabled] off
+Switch "On, unavailable" [disabled, checked] on
+Switch "Busy" [focusable, checked, busy] on
+Label "Check boxes"
+CheckBox "Unchecked" [focusable] off
+CheckBox "Checked" [focusable, checked] on
+CheckBox "Mixed" [focusable, mixed] off
+CheckBox "Unavailable" [disabled, checked] on
+Label "Sliders"
+Slider "Level" [focusable] 0 (0..100)
+Slider "Level" [focusable] 40 (0..100)
+Slider "Level" [focusable] 100 (0..100)
+RadioGroup "Mode"
+  Radio "Off" [focusable]
+  Radio "Auto" [focusable, selected]
+  Radio "On" [focusable]
+RadioGroup "Mode, none"
+  Radio "Off" [focusable]
+  Radio "Auto" [focusable]
+  Radio "On" [focusable]

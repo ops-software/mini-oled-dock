@@ -86,6 +86,7 @@ mod preview;
 mod probe;
 mod recover;
 mod render;
+mod roles;
 mod settings_pages;
 mod settings_view;
 mod settings_window;
@@ -122,7 +123,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Diagnostics::Debug::{
     SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, THREAD_ERROR_MODE,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
@@ -259,6 +260,33 @@ pub struct Args {
     pub rollback: bool,
     /// `--settings`: ask the running dock to open its Settings window and exit.
     pub settings: bool,
+    /// `--agent <nonce>` (32 lowercase hex digits; alone): the elevated dock's helper at medium (`agent::run`).
+    pub agent: Option<String>,
+    /// `--undo-user`: undo the takeovers of the user journal, at medium (`journal_ui::run_undo_user`).
+    pub undo_user: bool,
+    /// `--signal <nonce>` (32 lowercase hex digits; with `--undo-user` only): the event its caller waits on.
+    pub signal: Option<String>,
+    /// `--recover`: give Windows back its taskbar and settings and leave the dock in safe mode (`recover::run`).
+    pub recover: bool,
+    /// `--dry-run` (with `--recover` only): print the steps, change nothing.
+    pub dry_run: bool,
+    /// `--suite-sync`: bring the suite's other exes to this release in a child of the dock (`update::suite::run_sync`).
+    pub suite_sync: bool,
+    /// `--network` (with `--suite-sync` only): the sync may download.
+    pub network: bool,
+    /// `--from <folder>` (with `--install`, at most 260 UTF-16 units; `--quiet` and `--no-relaunch` allowed): install
+    /// the suite from a folder (`autostart::run_install_from_cli`).
+    pub from: Option<String>,
+    /// `--update-fetch <tag>`: a canonical `vX.Y.Z`, the suite's fetch of that release; `None` = the update check's.
+    pub update_fetch_tag: Option<String>,
+}
+
+/// The longest `--from` folder, in UTF-16 units.
+const FROM_UNITS: usize = 260;
+
+/// A nonce of `--agent` and `--signal`: exactly 32 lowercase hex digits.
+fn is_nonce(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 static ARGS: OnceLock<Args> = OnceLock::new();
@@ -272,7 +300,8 @@ fn parse_args() -> Result<Args, String> {
     parse_args_from(std::env::args().skip(1))
 }
 
-fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
+fn parse_args_from(it: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut it = it.peekable();
     let mut a = Args::default();
     let mut flags = 0usize;
     while let Some(s) = it.next() {
@@ -304,7 +333,16 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--remove" => a.remove = true,
             "--purge-data" => a.purge_data = true,
             "--update-check" => a.update_check = true,
-            "--update-fetch" => a.update_fetch = true,
+            "--update-fetch" => {
+                a.update_fetch = true;
+                // An optional canonical tag; a next word that is a flag stays a flag (and is refused below).
+                if let Some(tag) = it.next_if(|t| !t.starts_with('-')) {
+                    if update_release::parse_tag(&tag).is_none() {
+                        return Err("--update-fetch takes a canonical tag (vX.Y.Z)".into());
+                    }
+                    a.update_fetch_tag = Some(tag);
+                }
+            }
             "--start-apps" => a.start_apps = true,
             "--start-settings" => a.start_settings = true,
             "--start-icons" => {
@@ -323,6 +361,26 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--update-install" => a.update_install = Some(it.next().ok_or("--update-install requires <tag>")?),
             "--update-guard" => a.update_guard = Some(it.next().ok_or("--update-guard requires <tag>")?),
             "--rollback" => a.rollback = true,
+            "--agent" | "--signal" => {
+                let n = it.next().filter(|n| is_nonce(n));
+                let n = Some(n.ok_or("--agent and --signal require a nonce of 32 lowercase hex digits")?);
+                if s == "--agent" {
+                    a.agent = n;
+                } else {
+                    a.signal = n;
+                }
+            }
+            "--undo-user" => a.undo_user = true,
+            "--recover" => a.recover = true,
+            "--dry-run" => a.dry_run = true,
+            "--suite-sync" => a.suite_sync = true,
+            "--network" => a.network = true,
+            "--from" => {
+                // Absolute only: the elevated child of a "runas" relaunch may start in another folder than its caller.
+                let f = it.next().filter(|f| f.encode_utf16().count() <= FROM_UNITS);
+                let f = f.filter(|f| std::path::Path::new(f).is_absolute());
+                a.from = Some(f.ok_or("--from requires an absolute folder of at most 260 characters")?);
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -368,6 +426,33 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     if a.purge_data && !a.remove {
         return Err("--purge-data requires --uninstall --remove".into());
+    }
+    if a.agent.is_some() && flags > 1 {
+        return Err("--agent cannot be combined with other arguments".into());
+    }
+    if a.signal.is_some() && !a.undo_user {
+        return Err("--signal requires --undo-user".into());
+    }
+    if a.undo_user && flags > 1 + usize::from(a.signal.is_some()) {
+        return Err("--undo-user combines only with --signal".into());
+    }
+    if a.dry_run && !a.recover {
+        return Err("--dry-run requires --recover".into());
+    }
+    if a.recover && flags > 1 + usize::from(a.dry_run) {
+        return Err("--recover combines only with --dry-run".into());
+    }
+    if a.network && !a.suite_sync {
+        return Err("--network requires --suite-sync".into());
+    }
+    if a.suite_sync && flags > 1 + usize::from(a.network) {
+        return Err("--suite-sync combines only with --network".into());
+    }
+    if a.from.is_some() && !a.install {
+        return Err("--from requires --install".into());
+    }
+    if a.from.is_some() && flags > 2 + usize::from(a.quiet) + usize::from(a.no_relaunch) {
+        return Err("--install --from combines only with --quiet and --no-relaunch".into());
     }
     Ok(a)
 }
@@ -1027,7 +1112,14 @@ fn child_error_mode() -> THREAD_ERROR_MODE {
 
 /// Whether the arguments select a child mode of the dock; add each new child flag here (the error mode is set for them).
 fn is_child_mode(a: &Args) -> bool {
-    a.update_fetch || a.start_apps || a.start_settings || a.start_icons.is_some() || a.launcher_files
+    a.update_fetch
+        || a.start_apps
+        || a.start_settings
+        || a.start_icons.is_some()
+        || a.launcher_files
+        || a.agent.is_some()
+        || a.undo_user
+        || a.suite_sync
 }
 
 /// Sets `child_error_mode` for the whole process, first thing of a child mode.
@@ -1260,6 +1352,7 @@ fn run(args: &Args) -> Result<(), String> {
 }
 
 fn run_inner(args: &Args) -> Result<(), String> {
+    log!("dock: {}", if shell_thread::is_elevated() { "elevated" } else { "not elevated" });
     disable_quick_edit();
     hook::NO_TOGGLE.store(args.no_toggle, Relaxed);
     hook::DIAG.store(args.diag, Relaxed);
@@ -1419,10 +1512,11 @@ fn usage() {
     let _ = writeln!(
         e,
         "usage: dock [--top | --bottom] [--no-autohide] [--keep-taskbar] [--diag] [--restore] \
-         [--install [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
-         [--rollback [--quiet]] [--version] [--settings] [--update-check] [--update-install <tag>] [--autostart] \
-         [--console] [--watchdog <pid> <event>] [--foreground | --no-foreground] [--no-toggle] [--preview <folder>] \
-         [--list-apps]"
+         [--install [--from <folder>] [--quiet] [--no-relaunch]] [--uninstall [--remove [--purge-data]] [--quiet]] \
+         [--rollback [--quiet]] [--recover [--dry-run]] [--undo-user [--signal <nonce>]] [--version] [--settings] \
+         [--update-check] [--update-install <tag>] [--update-fetch [<tag>]] [--suite-sync [--network]] \
+         [--agent <nonce>] [--autostart] [--console] [--watchdog <pid> <event>] [--foreground | --no-foreground] \
+         [--no-toggle] [--preview <folder>] [--list-apps]"
     );
 }
 
@@ -1439,6 +1533,10 @@ fn start_logging(tag: &'static str) -> (Option<JoinHandle<()>>, Vec<String>) {
 }
 
 fn main() -> std::process::ExitCode {
+    // SAFETY: no preconditions. From here on the loader looks for DLLs in System32 only, so a DLL planted next to a
+    // downloaded copy is never loaded (/DEPENDENTLOADFLAG in build.rs does the same for the imports, before main). A
+    // loader without the call fails it and keeps its default order.
+    let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {
@@ -1452,6 +1550,32 @@ fn main() -> std::process::ExitCode {
         }
     };
     let args = ARGS.get_or_init(|| args);
+    // The role gate (F-P10): the manifest asks for no elevation, so a role that needs another level than this process
+    // has is relaunched, refused or left here, before any other work (no data folder, logger, mutex or taskbar call).
+    let role = roles::role_of(args);
+    match roles::gate(role, shell_thread::elevation()) {
+        roles::Gate::Run => {}
+        roles::Gate::Elevate if std::env::var_os(roles::RELAUNCHED).is_some() => {
+            // "runas" gave this relaunched child no elevation (a standard account with UAC off): stop, never relaunch.
+            attach_console();
+            logger::say("Administrator rights could not be obtained.");
+            return std::process::ExitCode::from(autostart::EXIT_FAILED as u8);
+        }
+        roles::Gate::Elevate => {
+            attach_console();
+            let wait = roles::waits(role, update::guard::runs_installed());
+            return std::process::ExitCode::from(roles::elevate_and_wait(wait).clamp(0, 255) as u8);
+        }
+        roles::Gate::Refuse(why) => {
+            attach_console();
+            logger::say(why);
+            return std::process::ExitCode::from(autostart::EXIT_BAD_ARGS as u8);
+        }
+        roles::Gate::LeaveQuietly(why) => {
+            datadir::debug_out(why);
+            return std::process::ExitCode::SUCCESS;
+        }
+    }
 
     // --version: no data folder, logger or mutex.
     if args.version {
@@ -1462,10 +1586,12 @@ fn main() -> std::process::ExitCode {
     if is_child_mode(args) {
         set_child_error_mode();
     }
-    // --update-fetch: the update check's GET in a child of the dock (`update::fetch_latest`); stdout only,
-    // no data folder, logger, mutex or console.
+    // --update-fetch [<tag>]: the update check's GET (`update::fetch_latest`), or the suite's fetch of one release
+    // (U1b), in a child of the dock; stdout only, no data folder, logger, mutex or console.
     if args.update_fetch {
-        return std::process::ExitCode::from(update::run_fetch_child().clamp(0, 255) as u8);
+        return std::process::ExitCode::from(
+            update::run_fetch_child_for(args.update_fetch_tag.as_deref()).clamp(0, 255) as u8,
+        );
     }
     // --start-apps: the AppsFolder catalogue listed in a child of the dock (`shell_thread::list_apps_arena`); stdout
     // only, no data folder, logger, mutex or console.
@@ -1487,6 +1613,21 @@ fn main() -> std::process::ExitCode {
     if args.launcher_files {
         return std::process::ExitCode::from(files_child::run(args.stall.unwrap_or(0), &args.roots).clamp(0, 255) as u8);
     }
+    // --agent <nonce>: the elevated dock's helper at medium (`agent::run`); its pipe only, no data folder, logger,
+    // mutex or console.
+    if let Some(nonce) = &args.agent {
+        return std::process::ExitCode::from(agent::run(nonce).clamp(0, 255) as u8);
+    }
+    // --suite-sync [--network]: the suite's sync in a child of the dock (`update::suite::run_sync`); no logger: the
+    // child prints its one result line on stdout, which the dock logs.
+    if args.suite_sync {
+        return std::process::ExitCode::from(update::suite::run_sync(args.network).clamp(0, 255) as u8);
+    }
+    // --undo-user [--signal <nonce>]: the user journal's undo at medium (`journal_ui::run_undo_user`); no data folder,
+    // logger or mutex.
+    if args.undo_user {
+        return std::process::ExitCode::from(journal_ui::run_undo_user(args.signal.as_deref()).clamp(0, 255) as u8);
+    }
 
     // --preview mode: offscreen rendering to PNG, before watchdog/taskbar/hook/single instance.
     if let Some(dir) = &args.preview {
@@ -1505,9 +1646,10 @@ fn main() -> std::process::ExitCode {
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
     }
-    // --install / --uninstall / --rollback mode: messages via `logger::say`, log to file only.
-    if args.install || args.uninstall || args.rollback {
+    // --install / --uninstall / --rollback / --recover mode: messages via `logger::say`, log to file only.
+    if args.install || args.uninstall || args.rollback || args.recover {
         // Without a console (UAC from a non-elevated terminal, Explorer) the result would be lost: message box.
+        // --recover never has --quiet (a parse error), so its report is never LogOnly: the report is the point.
         let report = cli_report(args.quiet, !args.quiet && attach_console());
         let report = if args.rollback { rollback_report(report, update::guard::runs_installed()) } else { report };
         if report != CliReport::Console {
@@ -1519,9 +1661,14 @@ fn main() -> std::process::ExitCode {
             logger::say(n);
         }
         let mut code = if args.install {
-            autostart::run_install_cli(args.no_relaunch)
+            match &args.from {
+                Some(from) => autostart::run_install_from_cli(args.no_relaunch, std::path::Path::new(from)),
+                None => autostart::run_install_cli(args.no_relaunch),
+            }
         } else if args.uninstall {
             autostart::run_uninstall_cli(args.remove)
+        } else if args.recover {
+            recover::run(args.dry_run)
         } else {
             update::guard::run_rollback_cli(args.quiet)
         };
@@ -1615,6 +1762,16 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     let (log_thread, _) = start_logging("");
+    // Safe mode (`--recover`): the logon start leaves before Explorer is waited for and before any taskbar call; a
+    // start by hand leaves safe mode.
+    if args.autostart && recover::autostart_action(recover::safe_mode()) == recover::AutostartAction::LeaveSafe {
+        log!("safe mode: not starting at logon (start the dock by hand to leave it)");
+        logger::stop(log_thread);
+        return std::process::ExitCode::SUCCESS;
+    }
+    if !args.autostart {
+        recover::leave_safe_mode_on_manual_start();
+    }
     if args.autostart {
         autostart::warn_if_not_installed();
         wait_for_shell();
@@ -1862,6 +2019,10 @@ mod tests {
             &["--start-settings"],
             &["--start-icons", "32"],
             &["--launcher-files"],
+            &["--update-fetch", "v1.8.0"],
+            &["--agent", "0123456789abcdef0123456789abcdef"],
+            &["--undo-user"],
+            &["--suite-sync", "--network"],
         ];
         for a in all {
             assert!(is_child_mode(&p(a).unwrap()), "{a:?}");
@@ -1873,6 +2034,8 @@ mod tests {
             &["--version"],
             &["--rollback"],
             &["--update-guard", "v1"],
+            &["--recover"],
+            &["--install", "--from", "D:\\kit"],
         ] {
             assert!(!is_child_mode(&p(a).unwrap()), "{a:?}");
         }
@@ -1884,7 +2047,10 @@ mod tests {
         let src = include_str!("main.rs");
         let call = src.find("        set_child_error_mode();").expect("the call");
         let firsts = [
-            "run_fetch_child()",
+            "run_fetch_child_for(args.update_fetch_tag.as_deref())",
+            "run(nonce)",
+            "run_sync(args.network)",
+            "run_undo_user(args.signal.as_deref())",
             "run_apps_child()",
             "run_settings_child()",
             "run_icons_child(px)",
@@ -1967,6 +2133,215 @@ mod tests {
         ] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// R0a: every flag of the suite plumbing (F-P10) alone and with its companions; any other combination is an error.
+    #[test]
+    fn new_flags_parse() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        assert_eq!(p(&["--agent", nonce]).unwrap().agent.as_deref(), Some(nonce));
+        let u = p(&["--undo-user"]).unwrap();
+        assert!(u.undo_user && u.signal.is_none() && u.agent.is_none());
+        for argv in [&["--undo-user", "--signal", nonce][..], &["--signal", nonce, "--undo-user"]] {
+            let u = p(argv).unwrap();
+            assert!(u.undo_user && u.signal.as_deref() == Some(nonce), "{argv:?}");
+        }
+        let r = p(&["--recover"]).unwrap();
+        assert!(r.recover && !r.dry_run && !r.install);
+        let r = p(&["--recover", "--dry-run"]).unwrap();
+        assert!(r.recover && r.dry_run);
+        let s = p(&["--suite-sync"]).unwrap();
+        assert!(s.suite_sync && !s.network);
+        let s = p(&["--suite-sync", "--network"]).unwrap();
+        assert!(s.suite_sync && s.network);
+        let edge = format!("D:\\{}", "k".repeat(257));
+        for argv in [
+            &["--install", "--from", "D:\\kit"][..],
+            &["--install", "--from", "D:\\kit", "--quiet", "--no-relaunch"],
+            &["--from", "E:\\new kit", "--install", "--quiet"],
+            &["--install", "--no-relaunch", "--from", &edge],
+            &["--install", "--from", "\\\\srv\\share\\kit"],
+        ] {
+            let i = p(argv).unwrap();
+            assert!(i.install && i.from.is_some(), "{argv:?}");
+        }
+        assert_eq!(p(&["--install"]).unwrap().from, None);
+        let f = p(&["--update-fetch", "v1.8.0"]).unwrap();
+        assert!(f.update_fetch && f.update_fetch_tag.as_deref() == Some("v1.8.0"));
+        assert_eq!(p(&["--update-fetch"]).unwrap().update_fetch_tag, None);
+        let over = format!("D:\\{}", "k".repeat(258));
+        let upper = nonce.to_uppercase();
+        let (short, long) = (&nonce[1..], format!("{nonce}0"));
+        let bad: [&[&str]; 44] = [
+            &["--agent"],
+            &["--agent", short],
+            &["--agent", &long],
+            &["--agent", &upper],
+            &["--agent", "0123456789abcdef0123456789abcdeg"],
+            &["--agent", nonce, "--console"],
+            &["--console", "--agent", nonce],
+            &["--agent", nonce, "--agent", nonce],
+            &["--agent", nonce, "--undo-user"],
+            &["--signal", nonce],
+            &["--undo-user", "--signal"],
+            &["--undo-user", "--signal", short],
+            &["--undo-user", "--signal", &upper],
+            &["--undo-user", "--console"],
+            &["--undo-user", "--undo-user"],
+            &["--undo-user", "--signal", nonce, "--signal", nonce],
+            &["--undo-user", "--recover"],
+            &["--dry-run"],
+            &["--recover", "--quiet"],
+            &["--recover", "--console"],
+            &["--recover", "--install"],
+            &["--recover", "--dry-run", "--dry-run"],
+            &["--network"],
+            &["--suite-sync", "--console"],
+            &["--suite-sync", "--network", "--network"],
+            &["--suite-sync", "--update-fetch"],
+            &["--from", "D:\\kit"],
+            &["--uninstall", "--from", "D:\\kit"],
+            &["--install", "--from"],
+            &["--install", "--from", ""],
+            &["--install", "--from", &over],
+            &["--install", "--from", "kit"],
+            &["--install", "--from", ".\\kit"],
+            &["--install", "--from", "\\kit"],
+            &["--install", "--from", "D:kit"],
+            &["--install", "--from", "D:\\kit", "--console"],
+            &["--install", "--from", "D:\\a", "--from", "D:\\b"],
+            &["--install", "--from", "D:\\kit", "--autostart"],
+            &["--update-fetch", "v1.8"],
+            &["--update-fetch", "v01.8.0"],
+            &["--update-fetch", "1.8.0"],
+            &["--update-fetch", "v1.8.0 "],
+            &["--update-fetch", "v1.8.0", "--console"],
+            &["--update-fetch", "v1.8.0", "v1.8.1"],
+        ];
+        for b in bad {
+            let e = p(b).unwrap_err();
+            assert!(!e.is_empty() && parse_error_exit(&e) == autostart::EXIT_BAD_ARGS, "{b:?}");
+        }
+    }
+
+    /// R0a: `roles::role_of` gives the branch `main` takes, in main's order, for every command line of these tests.
+    #[test]
+    fn role_of_matches_main() {
+        use roles::Role as R;
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let cases: [(&[&str], R); 46] = [
+            (&[], R::Main),
+            (&["--console"], R::Main),
+            (&["--top", "--no-autohide", "--keep-taskbar", "--diag"], R::Main),
+            (&["--bottom", "--foreground"], R::Main),
+            (&["--no-foreground", "--no-toggle"], R::Main),
+            (&["--autostart"], R::Autostart),
+            (&["--autostart", "--console"], R::Autostart),
+            (&["--version"], R::Version),
+            (&["--version", "--install"], R::Version),
+            (&["--update-fetch"], R::UpdateFetch),
+            (&["--update-fetch", "v1.8.0"], R::UpdateFetch),
+            (&["--start-apps"], R::StartApps),
+            (&["--start-settings"], R::StartSettings),
+            (&["--start-icons", "32"], R::StartIcons),
+            (&["--start-icons", "8"], R::StartIcons),
+            (&["--launcher-files"], R::LauncherFiles),
+            (&["--launcher-files", "--root", "D:\\", "--root", "E:\\Old docs"], R::LauncherFiles),
+            (&["--agent", nonce], R::Agent),
+            (&["--suite-sync"], R::SuiteSync),
+            (&["--suite-sync", "--network"], R::SuiteSync),
+            (&["--undo-user"], R::UndoUser),
+            (&["--undo-user", "--signal", nonce], R::UndoUser),
+            (&["--preview", "x"], R::Preview),
+            (&["--preview", "x", "--autostart"], R::Preview),
+            (&["--list-apps"], R::ListApps),
+            (&["--list-apps", "--restore"], R::ListApps),
+            (&["--watchdog", "1", "ev"], R::Watchdog),
+            (&["--install"], R::Install),
+            (&["--install", "--quiet", "--no-relaunch"], R::Install),
+            (&["--install", "--console"], R::Install),
+            (&["--install", "--from", "D:\\kit", "--quiet"], R::Install),
+            (&["--uninstall"], R::Uninstall),
+            (&["--uninstall", "--remove", "--purge-data", "--quiet"], R::Uninstall),
+            (&["--rollback"], R::Rollback),
+            (&["--rollback", "--quiet"], R::Rollback),
+            (&["--recover"], R::Recover),
+            (&["--recover", "--dry-run"], R::RecoverDryRun),
+            (&["--restore"], R::Restore),
+            (&["--restore", "--settings"], R::Restore),
+            (&["--settings"], R::Settings),
+            (&["--settings", "--update-check"], R::Settings),
+            (&["--update-check"], R::UpdateCheck),
+            (&["--update-check", "--update-install", "v1.4.1"], R::UpdateCheck),
+            (&["--update-install", "v1.4.1"], R::UpdateInstall),
+            (&["--update-install", "v1.4.1", "--autostart"], R::UpdateInstall),
+            (&["--update-guard", "v1.5.3"], R::UpdateGuard),
+        ];
+        for (argv, want) in cases {
+            assert_eq!(roles::role_of(&p(argv).unwrap()), want, "{argv:?}");
+        }
+        // The flags the dock starts its children with.
+        for (flag, want) in [
+            (update::FETCH_FLAG, R::UpdateFetch),
+            (shell_thread::APPS_FLAG, R::StartApps),
+            (start_search::SETTINGS_FLAG, R::StartSettings),
+        ] {
+            assert_eq!(roles::role_of(&p(&[flag]).unwrap()), want, "{flag}");
+        }
+        // Contract C2: the command lines an older guard starts this image with still run elevated.
+        let words = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let g = parse_args_from(words(&update::guard::guard_args("v1.5.3")).into_iter()).unwrap();
+        let n = parse_args_from(words(update::guard::NEW_INSTALL_ARGS).into_iter()).unwrap();
+        assert_eq!((roles::role_of(&g), roles::role_of(&n)), (R::UpdateGuard, R::Install));
+        for a in [&g, &n] {
+            assert_eq!(roles::gate(roles::role_of(a), Some(true)), roles::Gate::Run);
+        }
+        for quiet in [true, false] {
+            let i = parse_args_from(words(update::guard::rollback_install_args(quiet)).into_iter()).unwrap();
+            assert_eq!(roles::role_of(&i), R::Install, "{quiet}");
+        }
+    }
+
+    /// R0c: the loader looks in System32 only from main's first statement on (a DLL planted next to a downloaded copy
+    /// is never loaded, also later through a delay-load or a library call).
+    #[test]
+    fn set_default_dll_directories_is_first() {
+        let src = include_str!("main.rs");
+        let main = &src[src.find("\nfn main() -> std::process::ExitCode {").expect("main") + 1..];
+        let first = main.lines().skip(1).map(str::trim).find(|l| !l.is_empty() && !l.starts_with("//"));
+        assert_eq!(first, Some("let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };"));
+    }
+
+    /// R0a: where the arms of the suite plumbing sit in `main`'s body.
+    #[test]
+    fn dispatch_order_in_main() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("\nfn main() -> std::process::ExitCode {").expect("main")..];
+        // Main's closing brace stands alone at the start of a line (LF or CRLF checkouts).
+        let end = body
+            .match_indices("\n}")
+            .map(|(i, _)| i)
+            .find(|i| matches!(body.as_bytes().get(i + 2), Some(b'\r' | b'\n')));
+        let body = &body[..end.expect("the end of main")];
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s:?} in main"));
+        let watchdog = at("if let Some((pid, event)) = &args.watchdog {");
+        for arm in [
+            "agent::run(nonce)",
+            "update::suite::run_sync(args.network)",
+            "journal_ui::run_undo_user(args.signal.as_deref())",
+        ] {
+            assert!(at(arm) < watchdog, "{arm} comes before the watchdog arm, as the other child modes do");
+        }
+        let block = at("if args.install || args.uninstall || args.rollback || args.recover {");
+        let recover = at("recover::run(args.dry_run)");
+        assert!(block < recover && recover < at("// --restore mode"), "--recover runs in the install block");
+        // The normal start: safe mode is read once the data folder and the logger are up, before Explorer is waited for.
+        let mutex = at("watchdog::acquire_single_instance()");
+        let logging = mutex + body[mutex..].find("start_logging(\"\")").expect("the normal start's logger");
+        let safe = at("recover::autostart_action(recover::safe_mode())");
+        assert!(logging < safe && safe < at("wait_for_shell();"), "the safe-mode check sits between the two");
+        let manual = at("recover::leave_safe_mode_on_manual_start()");
+        assert!(logging < manual && manual < at("let res = run(args);"));
     }
 
     #[test]

@@ -812,6 +812,164 @@ pub fn battery_icon(u: f32, v: f32) -> bool {
     battery_outline_shape(u, v) || battery_fill_shape(u, v, 60, false)
 }
 
+// ---- The kit's new shapes (P2-kit K1a.3), on the 16 x 16 grid with the helpers above.
+
+/// Magnifier (Search): a ring and a handle to the bottom right.
+pub fn search_shape(u: f32, v: f32) -> bool {
+    ring_at(u, v, 6.8, 6.8, 4.6) || dist_seg(u, v, 10.2, 10.2, 13.2, 13.2) <= half()
+}
+
+/// Funnel (Filter), outlined.
+pub fn filter_shape(u: f32, v: f32) -> bool {
+    let (l, r, t) = (snap(2.5), snap(13.5), snap(3.0));
+    polyline(u, v, &[(l, t), (r, t), (9.0, 8.5), (9.0, 13.0), (7.0, 12.0), (7.0, 8.5), (l, t)], half())
+}
+
+/// Three dots (More).
+pub fn more_shape(u: f32, v: f32) -> bool {
+    [3.5, 8.0, 12.5].iter().any(|&x| disc_at(u, v, x, 8.0, 1.2))
+}
+
+/// Push pin (Pin): the head, a ledge and the needle.
+pub fn pin_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    rrect_outline(u, v, 5.0, 2.0, 11.0, 6.0, 1.0)
+        || dist_seg(u, v, 3.5, snap(6.0), 12.5, snap(6.0)) <= st
+        || dist_seg(u, v, ax(), 6.0, ax(), 14.0) <= st
+}
+
+/// Scissors (Cut): two rings and crossing blades.
+pub fn cut_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    ring_at(u, v, 4.5, 12.0, 2.2)
+        || ring_at(u, v, 11.5, 12.0, 2.2)
+        || dist_seg(u, v, 5.2, 10.0, 11.0, 3.0) <= st
+        || dist_seg(u, v, 10.8, 10.0, 5.0, 3.0) <= st
+}
+
+/// Clipboard (Paste): the board with a clip at the top.
+pub fn paste_shape(u: f32, v: f32) -> bool {
+    rrect_outline(u, v, 3.0, 3.0, 13.0, 14.0, 1.5) || rrect_outline(u, v, 6.0, 2.0, 10.0, 4.0, 1.0)
+}
+
+/// Bin (Delete): a lid with a handle over a can.
+pub fn delete_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    dist_seg(u, v, 3.0, snap(4.0), 13.0, snap(4.0)) <= st
+        || dist_seg(u, v, 6.5, snap(2.5), 9.5, snap(2.5)) <= st
+        || rrect_outline(u, v, 4.5, 5.0, 11.5, 14.0, 1.2)
+}
+
+/// Processor (Cpu): a chip with pins on four sides, one every 2 units.
+pub fn cpu_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    rrect_outline(u, v, 4.0, 4.0, 12.0, 12.0, 1.0)
+        || [6.0_f32, 8.0, 10.0].iter().any(|&p| {
+            let p = snap(p);
+            dist_seg(u, v, p, 2.0, p, 4.0) <= st
+                || dist_seg(u, v, p, 12.0, p, 14.0) <= st
+                || dist_seg(u, v, 2.0, p, 4.0, p) <= st
+                || dist_seg(u, v, 12.0, p, 14.0, p) <= st
+        })
+}
+
+/// Memory module (Memory): a long card with four notches below.
+pub fn memory_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    rrect_outline(u, v, 2.0, 5.0, 14.0, 11.0, 1.0)
+        || [4.0_f32, 6.7, 9.3, 12.0].iter().any(|&x| dist_seg(u, v, snap(x), 11.0, snap(x), 13.0) <= st)
+}
+
+/// Drive (Disk): a slab with an activity dot.
+pub fn disk_shape(u: f32, v: f32) -> bool {
+    rrect_outline(u, v, 2.0, 4.0, 14.0, 12.0, 2.0) || disc_at(u, v, 11.5, 8.0, 0.9)
+}
+
+/// Shield (Shield): the outline of a heater shield.
+pub fn shield_shape(u: f32, v: f32) -> bool {
+    polyline(u, v, &[(8.0, 1.8), (13.0, 3.6), (13.0, 8.0), (8.0, 14.2), (3.0, 8.0), (3.0, 3.6), (8.0, 1.8)], half())
+}
+
+/// Minimise: a horizontal bar.
+pub fn minimize_shape(u: f32, v: f32) -> bool {
+    dist_seg(u, v, 3.0, snap(8.0), 13.0, snap(8.0)) <= half()
+}
+
+/// Maximise: a square outline.
+pub fn maximize_shape(u: f32, v: f32) -> bool {
+    rrect_outline(u, v, 3.5, 3.5, 12.5, 12.5, 0.8)
+}
+
+/// Restore: two offset squares, the back one open at its lower left.
+pub fn restore_shape(u: f32, v: f32) -> bool {
+    let (a, b, c) = (snap(5.5), snap(3.5), snap(12.5));
+    rrect_outline(u, v, 3.5, 5.5, 10.5, 12.5, 0.8)
+        || polyline(u, v, &[(a, 5.5), (a, b), (c, b), (c, 10.5), (10.5, 10.5)], half())
+}
+
+/// Plus: a cross.
+pub fn plus_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    dist_seg(u, v, 3.0, snap(8.0), 13.0, snap(8.0)) <= st || dist_seg(u, v, snap(8.0), 3.0, snap(8.0), 13.0) <= st
+}
+
+/// Five-point star, filled.
+pub fn star_shape(u: f32, v: f32) -> bool {
+    in_polygon(
+        u,
+        v,
+        &[
+            (8.0, 1.7),
+            (9.59, 6.12),
+            (14.28, 6.26),
+            (10.57, 9.13),
+            (11.88, 13.64),
+            (8.0, 11.0),
+            (4.12, 13.64),
+            (5.43, 9.13),
+            (1.72, 6.26),
+            (6.41, 6.12),
+        ],
+    )
+}
+
+/// Cloud: three discs on a flat base, filled.
+pub fn cloud_shape(u: f32, v: f32) -> bool {
+    disc_at(u, v, 5.5, 9.0, 2.8)
+        || disc_at(u, v, 8.8, 6.8, 3.3)
+        || disc_at(u, v, 11.5, 9.5, 2.5)
+        || ((5.5..=11.5).contains(&u) && (8.0..=11.8).contains(&v))
+}
+
+/// Link: an arrow from the bottom left to the top right with its head.
+pub fn link_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    dist_seg(u, v, 4.0, 12.0, 12.0, 4.0) <= st || polyline(u, v, &[(7.0, 4.0), (12.0, 4.0), (12.0, 9.0)], st)
+}
+
+/// Error: a ring with an exclamation mark.
+pub fn error_shape(u: f32, v: f32) -> bool {
+    let c = ax();
+    ring_at(u, v, 8.0, 8.0, 5.8) || dist_seg(u, v, c, 4.5, c, 9.0) <= half() || disc_at(u, v, c, 11.3, 0.8)
+}
+
+/// Pause: two bars, each 2 wide and 8 tall, 2 apart.
+pub fn pause_shape(u: f32, v: f32) -> bool {
+    (4.0..=12.0).contains(&v) && ((5.0..=7.0).contains(&u) || (9.0..=11.0).contains(&u))
+}
+
+/// The sort-up chevron closed into a triangle and drawn as a thin outline.
+pub fn sort_up_outline_shape(u: f32, v: f32) -> bool {
+    let c = ax();
+    polyline(u, v, &[(c - 4.0, 10.25), (c, 5.75), (c + 4.0, 10.25), (c - 4.0, 10.25)], half())
+}
+
+/// The sort-down chevron closed into a triangle and drawn as a thin outline.
+pub fn sort_down_outline_shape(u: f32, v: f32) -> bool {
+    let c = ax();
+    polyline(u, v, &[(c - 4.0, 5.75), (c, 10.25), (c + 4.0, 5.75), (c - 4.0, 5.75)], half())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

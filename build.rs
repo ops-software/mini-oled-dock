@@ -1,5 +1,7 @@
-//! Embeds the Windows manifest in the exe: elevated execution (`requireAdministrator`, needed to act
-//! on windows of elevated apps), per-monitor v2 DPI and the segment heap (less fragmentation).
+//! Embeds the Windows manifest in the exe: asInvoker (the image asks for no elevation; the roles that need it, the
+//! dock itself among them since it acts on windows of elevated apps, get it from the "Dock" task's highest-privileges
+//! principal or from a "runas" relaunch, `roles::gate`, so the agent and --undo-user can run as the signed-in user),
+//! per-monitor v2 DPI and the segment heap (less fragmentation).
 //! Also delay-loads rarely used system DLLs so the watchdog and CLI modes never map them.
 //! API checked against the embed-manifest 1.5.1 source (`embed_manifest`, `new_manifest`,
 //! `ManifestBuilder::requested_execution_level` / `dpi_awareness` / `heap_type`).
@@ -27,14 +29,10 @@ const DELAY_LOAD: &[&str] = &[
 
 fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        // `DOCK_NO_MANIFEST`: preview build (`--preview`) that can run without elevation.
-        let level = if std::env::var_os("DOCK_NO_MANIFEST").is_some() {
-            ExecutionLevel::AsInvoker
-        } else {
-            ExecutionLevel::RequireAdministrator
-        };
+        // Every build is asInvoker: elevation belongs to a role (`roles::gate`), not to the image. `DOCK_NO_MANIFEST`
+        // (set by the test and preview builds) is still accepted and has no effect.
         let manifest = new_manifest("Dock.Shell")
-            .requested_execution_level(level)
+            .requested_execution_level(ExecutionLevel::AsInvoker)
             .dpi_awareness(DpiAwareness::PerMonitorV2)
             .heap_type(HeapType::SegmentHeap);
         if let Err(e) = embed_manifest(manifest) {
@@ -59,12 +57,13 @@ fn main() {
                 println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
             }
             println!("cargo:rustc-link-arg-bins=delayimp.lib");
+            // The static imports are looked up in System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), before main runs.
+            println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=assets/dock.ico");
-    println!("cargo:rerun-if-env-changed=DOCK_NO_MANIFEST");
     // The keyed string tables (strings/en.toml, strings/it.toml): a bad strings file fails the build.
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("strings.rs");
     if let Err(e) = oled_i18n_build::generate(Path::new("strings"), &out) {

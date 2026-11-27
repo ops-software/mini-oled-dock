@@ -7,6 +7,7 @@ pub mod digits;
 pub mod engine;
 pub mod hit;
 pub mod trim;
+pub(crate) mod warm;
 
 pub use engine::{FontId, FontMetrics, GdiTextEngine, LayoutOpts, TextEngine, TextHit, TextLayout};
 pub use trim::Trim;

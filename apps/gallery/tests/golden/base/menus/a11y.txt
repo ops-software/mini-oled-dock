@@ -1,0 +1,4 @@
+Label "Right-click the row, or press the Menu key"
+Label "As the menu windows draw them"
+ListItem "Quarterly report.pdf" [focusable]
+Label "Nothing picked yet"

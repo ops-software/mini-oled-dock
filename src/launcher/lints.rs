@@ -1546,7 +1546,7 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// without notice. The others do not block: the tray host's forwards to Explorer (its thread keeps serving the icons
 /// apps send it meanwhile, each of which starts the forward's 3 s again; the UI thread waits on them only through
 /// SHAppBarMessage, the fallback of a refused direct AppBar send, as taskbar::takes_fallback skips it after a timeout),
-/// the tray-fwd thread (no window, nothing to dispatch) and the shell thread's WM_GETICON (none of the dock's windows).
+/// the tray-fwd thread (no window, nothing to dispatch) and the shell model's WM_GETICON (read by the shell thread; none of the dock's windows; crates/oled-shellmodel/src/icon.rs, scanned with src/).
 /// The update guard's WM_NULL to the new dock's window blocks: the guard has no window, so SMTO_BLOCK only keeps its
 /// 2 s a true bound. A new SendMessageTimeoutW is listed here first.
 const TIMED_SENDS: [(&str, &str, bool, bool); 9] = [
@@ -1557,9 +1557,12 @@ const TIMED_SENDS: [(&str, &str, bool, bool); 9] = [
     ("src/tray_host.rs", "fn forward_sync(", false, false),
     ("src/tray_host.rs", "fn forward_with_shared(", false, false),
     ("src/tray_host.rs", "fn forward_main(", false, false),
-    ("src/shell_thread.rs", "fn icon_from_window(", false, false),
+    ("crates/oled-shellmodel/src/icon.rs", "fn from_window<", false, false),
     ("src/update/guard.rs", "fn window_answers(", true, false),
 ];
+
+/// The shell model's icon sources, the one SendMessageTimeoutW that left src/ (the rule reads it with the tree).
+const MODEL_ICON: &str = "crates/oled-shellmodel/src/icon.rs";
 
 /// Each SendMessageTimeoutW outside comments, imports and the test module sits in a function `TIMED_SENDS` lists for
 /// its file, under its own name, each listed function that blocks names SMTO_BLOCK in its code, and each that unhooks
@@ -1635,11 +1638,14 @@ fn every_timed_send_is_listed_and_the_ui_threads_block() {
     assert_eq!(timed_send_violations(p, "fn minimize() {}"), ["src/apps.rs: fn sys_command(..) is missing"]);
     assert_eq!(timed_send_violations("src/popup.rs", "fn f() {\n    SendMessageTimeoutW(h);\n}\n").len(), 1);
     // A send of a thread with no heartbeat need not block, and a test's send is not the dock's.
-    let icon = "fn icon_from_window(h: HWND) {\n    SendMessageTimeoutW(h, 1, w, l, SMTO_ABORTIFHUNG, 50, None);\n}\n";
-    assert!(timed_send_violations("src/shell_thread.rs", icon).is_empty());
+    let icon = "fn from_window<D>(h: HWND) {\n    SendMessageTimeoutW(h, 1, w, l, SMTO_ABORTIFHUNG, 50, None);\n}\n";
+    assert!(timed_send_violations(MODEL_ICON, icon).is_empty());
     let test = format!("{good}#[cfg(test)]\nmod tests {{\n    fn t() {{\n        SendMessageTimeoutW(h);\n    }}\n}}");
     assert!(timed_send_violations(p, &test).is_empty());
-    let all = scan_tree(timed_send_violations);
+    let mut all = scan_tree(timed_send_violations);
+    // The shell model's icon sources moved out of src/: the same rule reads that file.
+    let model = Path::new(env!("CARGO_MANIFEST_DIR")).join(MODEL_ICON);
+    all.extend(timed_send_violations(MODEL_ICON, &std::fs::read_to_string(model).unwrap_or_default()));
     assert!(all.is_empty(), "{all:#?}");
 }
 

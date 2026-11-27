@@ -11,10 +11,24 @@ pub struct Image {
 }
 
 impl Image {
-    /// Writes a PNG through gfx::wic. Filled by K1a.5 (with the COM rule of golden::check); until then Err.
+    /// The image as PNG bytes (unpremultiplied BGRA through gfx::wic). Initialises COM on the calling thread first
+    /// (S_FALSE and a different earlier apartment are fine): test threads are fresh.
+    pub fn png_bytes(&self) -> Result<Vec<u8>, String> {
+        init_com();
+        crate::gfx::wic::encode_png(&crate::gfx::image::IconBitmap {
+            width: self.w,
+            height: self.h,
+            pixels: self.px.clone(),
+        })
+    }
+
+    /// Writes a PNG (creating its folder).
     pub fn write_png(&self, path: &std::path::Path) -> Result<(), String> {
-        let _ = path;
-        Err(format!("write_png of a {} x {} image: not ready, K1a.5", self.w, self.h))
+        let bytes = self.png_bytes()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
     }
 
     /// The part inside `r` (clipped to the image), with the text rects that meet it, moved to its origin.
@@ -35,6 +49,13 @@ impl Image {
             .collect();
         Image { w, h, px, text_rects }
     }
+}
+
+/// CoInitializeEx on this thread, multithreaded; S_FALSE and RPC_E_CHANGED_MODE are accepted (COM is then up already).
+pub(crate) fn init_com() {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    // SAFETY: CoInitializeEx takes no pointer; a repeated call on the thread is balanced by the thread's end.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 }
 
 #[cfg(test)]

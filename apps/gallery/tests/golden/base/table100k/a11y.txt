@@ -1,0 +1,32 @@
+ColumnHeader "Name" [focusable]
+ColumnHeader "Size" [focusable]
+ColumnHeader "CPU" [focusable]
+ColumnHeader "Status" [focusable]
+Table "A hundred thousand files" [focusable] 0 of 100000
+  Row "item 0.txt" [focusable] 1 of 100000
+  Row "item 1.txt" [focusable] 2 of 100000
+  Row "item 2.txt" [focusable] 3 of 100000
+  Row "item 3.txt" [focusable] 4 of 100000
+  Row "item 4.txt" [focusable] 5 of 100000
+  Row "item 5.txt" [focusable] 6 of 100000
+  Row "item 6.txt" [focusable] 7 of 100000
+  Row "item 7.txt" [focusable] 8 of 100000
+  Row "item 8.txt" [focusable] 9 of 100000
+  Row "item 9.txt" [focusable] 10 of 100000
+  Row "item 10.txt" [focusable] 11 of 100000
+  Row "item 11.txt" [focusable] 12 of 100000
+  Row "item 12.txt" [focusable] 13 of 100000
+  Row "item 13.txt" [focusable] 14 of 100000
+  Row "item 14.txt" [focusable] 15 of 100000
+  Row "item 15.txt" [focusable] 16 of 100000
+  Row "item 16.txt" [focusable] 17 of 100000
+  Row "item 17.txt" [focusable] 18 of 100000
+  Row "item 18.txt" [focusable] 19 of 100000
+  Row "item 19.txt" [focusable] 20 of 100000
+  Row "item 20.txt" [focusable] 21 of 100000
+  Row "item 21.txt" [focusable] 22 of 100000
+  Row "item 22.txt" [focusable] 23 of 100000
+  Row "item 23.txt" [focusable] 24 of 100000
+  Row "item 24.txt" [focusable] 25 of 100000
+  Row "item 25.txt" [focusable] 26 of 100000
+  Row "item 26.txt" [focusable] 27 of 100000

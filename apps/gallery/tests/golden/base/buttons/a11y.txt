@@ -1,0 +1,23 @@
+Label "Secondary"
+Button "Rest" [focusable]
+Button "Disabled" [disabled]
+Button "Busy" [focusable, busy]
+Label "Primary"
+Button "Rest" [focusable]
+Button "Disabled" [disabled]
+Button "Busy" [focusable, busy]
+Label "Icon buttons"
+Button "Back" [focusable]
+Button "Pinned" [focusable, checked]
+Button "Pin" [focusable]
+Button "Search" [focusable]
+Button "More" [focusable]
+Button "Settings" [disabled]
+Label "Text"
+Label "Primary text"
+Label "Hot text"
+Label "Secondary text"
+Label "Tertiary text"
+Label "Disabled text"
+Label "Attention"
+Label "Danger"

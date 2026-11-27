@@ -1,0 +1,43 @@
+Toolbar "Path"
+  Link "Local Disk (C:)" [focusable]
+  Button "Subfolders"
+  Link "Users" [focusable]
+  Button "Subfolders"
+  Link "Projects" [focusable]
+  Button "Subfolders"
+  Link "Design" [focusable]
+  Button "Subfolders"
+  Link "Reports" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Toolbar "Path"
+  Link "Local Disk (C:)" [focusable]
+  Button "Subfolders"
+  Link "More" [focusable]
+  Link "2026" [focusable]
+  Button "Subfolders"
+  Link "Final" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Toolbar "Path"
+  Link "Local Disk (C:)" [focusable]
+  Button "Subfolders"
+  Link "Users" [focusable]
+  Button "Subfolders"
+  Link "Projects" [focusable]
+  Button "Subfolders"
+  Link "Design" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Toolbar "Path"
+  Link "Local Disk (C:)" [focusable]
+  Button "Subfolders"
+  Link "Users" [focusable]
+  Button "Subfolders"
+  Link "Projects" [focusable]
+  Button "Subfolders"
+  Link "Design" [focusable]
+  Button "Subfolders"
+  Button "Refresh" [focusable]
+Toolbar "Path"
+TextInput "Path" [focusable] "C:\\Users\\Projects\\Design"

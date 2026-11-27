@@ -3,7 +3,7 @@
 use crate::event::{Key, Mods};
 use crate::glyph::Glyph;
 use crate::node::{Text, WidgetId};
-use crate::strings::UiLang;
+use crate::strings::{k, UiLang};
 
 /// A command's id. Ids at or above KIT_BASE belong to kit widgets (a header menu, a tab menu).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -66,20 +66,43 @@ impl Chord {
         Some(Chord::new(mods, key_of(key.trim())?))
     }
 
-    /// The chord as shown to the user ("Ctrl+Shift+Tab"). Filled by K1a.6 with the kit.key.* names of `lang` ("Ctrl+Maiusc+Tab"
-    /// in Italian); until then the English names.
+    /// The chord as shown to the user ("Ctrl+Shift+Tab"): the modifier and key names come from the kit's kit.key.* strings
+    /// of `lang` ("Ctrl+Maiusc+Tab" in Italian); letters, digits, F keys and the arrows stay as written.
     pub fn label(&self, lang: UiLang) -> String {
-        let _ = lang;
         let mut out = String::new();
-        for (m, name) in [(Mods::CTRL, "Ctrl"), (Mods::SHIFT, "Shift"), (Mods::ALT, "Alt"), (Mods::WIN, "Win")] {
+        for (m, name) in [
+            (Mods::CTRL, k::KIT_KEY_CTRL),
+            (Mods::SHIFT, k::KIT_KEY_SHIFT),
+            (Mods::ALT, k::KIT_KEY_ALT),
+            (Mods::WIN, k::KIT_KEY_WIN),
+        ] {
             if self.mods.contains(m) {
-                out.push_str(name);
+                out.push_str(&lang.kit(name));
                 out.push('+');
             }
         }
-        out.push_str(&key_name(self.key));
+        out.push_str(&key_label(self.key, lang));
         out
     }
+}
+
+/// A key's name in `lang`: the kit's string where the key has one, else its plain name.
+fn key_label(key: Key, lang: UiLang) -> String {
+    let s = match key {
+        Key::TAB => k::KIT_KEY_TAB,
+        Key::ENTER => k::KIT_KEY_ENTER,
+        Key::ESC => k::KIT_KEY_ESC,
+        Key::SPACE => k::KIT_KEY_SPACE,
+        Key::BACK => k::KIT_KEY_BACKSPACE,
+        Key::DELETE => k::KIT_KEY_DEL,
+        Key::INSERT => k::KIT_KEY_INS,
+        Key::HOME => k::KIT_KEY_HOME,
+        Key::END => k::KIT_KEY_END,
+        Key::PAGE_UP => k::KIT_KEY_PGUP,
+        Key::PAGE_DOWN => k::KIT_KEY_PGDN,
+        other => return key_name(other),
+    };
+    lang.kit(s).into_owned()
 }
 
 /// The key of a name as Chord::parse reads it.
@@ -287,6 +310,17 @@ mod tests {
         for bad in ["", "Ctrl+", "Hyper+A", "F25", "Ctrl+Nope", "AB"] {
             assert_eq!(Chord::parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn chord_label_in_italian() {
+        let c = |s: &str| Chord::parse(s).unwrap();
+        assert_eq!(c("Ctrl+Shift+Tab").label(UiLang::EN), "Ctrl+Shift+Tab");
+        assert_eq!(c("Ctrl+Shift+Tab").label(UiLang::IT), "Ctrl+Maiusc+Tab");
+        assert_eq!(c("Shift+Del").label(UiLang::IT), "Maiusc+Canc");
+        assert_eq!(c("Alt+Left").label(UiLang::IT), "Alt+\u{2190}");
+        assert_eq!(c("Ctrl+K").label(UiLang::IT), "Ctrl+K");
+        assert_eq!(c("PgDn").label(UiLang::IT), "PgGi\u{f9}");
     }
 
     #[test]

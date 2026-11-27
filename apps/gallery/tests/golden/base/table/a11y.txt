@@ -1,0 +1,30 @@
+ColumnHeader "Name" [focusable]
+ColumnHeader "Size" [focusable]
+ColumnHeader "CPU" [focusable]
+ColumnHeader "Status" [focusable]
+Table "Files" 3 of 10
+  Row "Annual report.docx" [focusable] 1 of 10
+  Row "Budget 2026.xlsx" [focusable, selected] 2 of 10
+  Row "holiday-photos-from-the-long-summer-trip-to-the-coast-2025.zip" [focusable, selected] 3 of 10
+  Row "notes.txt" [focusable, selected] 4 of 10
+  Row "Projects" [focusable] 5 of 10
+  Row "main.rs" [focusable] 6 of 10
+  Row "lib.rs" [focusable, selected] 7 of 10
+  Row "Cargo.toml" [focusable, selected] 8 of 10
+  Row "readme.md" [focusable] 9 of 10
+  Row "backup.tar.gz" [focusable] 10 of 10
+Table "Tasks" 4 of 14
+  Row "Apps" [focusable] 1 of 14
+  Row "browser" [focusable, expandable, expanded] 2 of 14
+  Row "editor" [focusable] 3 of 14
+  Row "terminal" [focusable, selected] 4 of 14
+  Row "mixer" [focusable] 5 of 14
+  Row "player" [focusable] 6 of 14
+  Row "chat" [focusable] 7 of 14
+  Row "renderer" [focusable, selected] 8 of 14
+  Row "renderer" [focusable] 9 of 14
+  Row "Background" [focusable] 10 of 14
+  Row "indexer" [focusable] 11 of 14
+  Row "updater" [focusable] 12 of 14
+  Row "sync" [focusable] 13 of 14
+  Row "audio-host" [focusable] 14 of 14

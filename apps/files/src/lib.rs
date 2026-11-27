@@ -19,6 +19,57 @@ pub mod strings;
 pub mod testclient;
 pub mod watch;
 
+// ---- P3-files-app (window)
+pub mod about;
+pub mod app;
+pub mod bar;
+pub mod bg;
+pub mod chrome;
+pub mod cli;
+pub mod complete;
+pub mod drives;
+#[doc(hidden)]
+pub mod fakes;
+pub mod format;
+pub mod gate;
+pub mod handoff;
+pub mod home;
+pub mod hub;
+pub mod icons;
+pub mod instance;
+pub mod keys;
+pub mod linger;
+pub mod live;
+pub mod menu;
+pub mod model;
+pub mod msg;
+pub mod names;
+pub mod nav;
+pub mod navcache;
+pub mod notices;
+pub mod open;
+pub mod ops_ui;
+pub mod opswin;
+pub mod options;
+pub mod parse;
+pub mod pathline;
+pub mod pins;
+pub mod preview;
+pub mod rename;
+pub mod selftest;
+pub mod services;
+pub mod session;
+pub mod sidebar;
+pub mod status;
+pub mod tab;
+pub mod toolbar;
+pub mod toolmenus;
+pub mod tr;
+pub mod types;
+pub mod undo;
+pub mod view;
+pub mod window;
+
 #[cfg(test)]
 #[path = "../tests/common/temp.rs"]
 mod testkit;
