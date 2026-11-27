@@ -200,12 +200,23 @@ impl Content for CalendarPopup {
         if let Some(rc) = self.hits.rect(ID_SETTINGS) {
             let h = row_plate(s, rc, ID_SETTINGS, hot, pressed);
             let y = center_y(&rc, s.line_height(Font::Normal));
-            s.text(crate::i18n::tr("Date & time settings", "Impostazioni data e ora"), rc.left + s.metrics().px(12), y, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(
+                crate::i18n::t(crate::i18n::k::CALENDAR_DATE_TIME_SETTINGS),
+                rc.left + s.metrics().px(12),
+                y,
+                Font::Normal,
+                WHITE,
+                lift(TEXT_ALPHA, h),
+            );
         }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
         self.hits.at(x, y)
+    }
+
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -255,5 +266,17 @@ impl Content for CalendarPopup {
         if self.open_settings {
             launch("ms-settings:dateandtime");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calendar_keyboard_targets() {
+        let mut p = new();
+        // The day cells are not in the hit map: the title (back to today), the two month arrows, the link.
+        assert_eq!(crate::popup::target_ids(&mut *p), [ID_TITLE, ID_PREV, ID_NEXT, ID_SETTINGS]);
     }
 }

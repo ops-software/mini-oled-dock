@@ -9,12 +9,13 @@ use crate::config::{
     APP_TEXT_SIZE, BACKGROUND_PRESETS, MODULE_SIZE, TRAY_ICON_SIZE,
 };
 use crate::glyphs;
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::popup_tray::TrayRow;
-use crate::start_import;
+use crate::start_import::{self, FailReason};
 use crate::ui::Screen;
 use crate::update::{Outcome, Phase, UpdateStatus};
 use crate::update_release::{release_page_url, safe_release_url};
+use oled_sys::i18n::S;
 
 /// A monochrome icon shape: `(u, v)` in a 16 x 16 box -> inside.
 pub(crate) type Glyph = fn(f32, f32) -> bool;
@@ -46,27 +47,27 @@ impl Page {
 
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Page::Appearance => tr("Appearance", "Aspetto"),
-            Page::Bar => tr("Bar", "Barra"),
+            Page::Appearance => t(k::SETTINGS_PAGES_APPEARANCE),
+            Page::Bar => t(k::SETTINGS_PAGES_BAR),
             Page::Start => "Start",
             Page::Launcher => "Launcher",
-            Page::Modules => tr("Modules", "Moduli"),
-            Page::Screen => tr("Screen", "Schermo"),
-            Page::Updates => tr("Updates", "Aggiornamenti"),
-            Page::About => tr("About", "Informazioni"),
+            Page::Modules => t(k::SETTINGS_PAGES_MODULES),
+            Page::Screen => t(k::SETTINGS_PAGES_SCREEN),
+            Page::Updates => t(k::SETTINGS_PAGES_UPDATES),
+            Page::About => t(k::SETTINGS_PAGES_ABOUT),
         }
     }
 
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
-            Page::Appearance => tr("Colour, sizes and language of the bar", "Colore, dimensioni e lingua della barra"),
-            Page::Bar => tr("Where the bar sits and how it behaves", "Dove sta la barra e come si comporta"),
-            Page::Start => tr("The Start button and the Start menu", "Il pulsante Start e il menu Start"),
-            Page::Launcher => tr("Find and start anything from one bar", "Trova e avvia qualsiasi cosa da una barra"),
-            Page::Modules => tr("What the bar shows on the right", "Cosa mostra la barra a destra"),
-            Page::Screen => tr("The display the bar sits on", "Lo schermo su cui sta la barra"),
-            Page::Updates => tr("New versions from GitHub", "Nuove versioni da GitHub"),
-            Page::About => tr("Version, memory and files", "Versione, memoria e file"),
+            Page::Appearance => t(k::SETTINGS_PAGES_COLOUR_SIZES_AND_LANGUAGE_OF),
+            Page::Bar => t(k::SETTINGS_PAGES_WHERE_THE_BAR_SITS_AND),
+            Page::Start => t(k::SETTINGS_PAGES_THE_START_BUTTON_AND_THE),
+            Page::Launcher => t(k::SETTINGS_PAGES_FIND_AND_START_ANYTHING_FROM),
+            Page::Modules => t(k::SETTINGS_PAGES_WHAT_THE_BAR_SHOWS_ON),
+            Page::Screen => t(k::SETTINGS_PAGES_THE_DISPLAY_THE_BAR_SITS),
+            Page::Updates => t(k::SETTINGS_PAGES_NEW_VERSIONS_FROM_GITHUB),
+            Page::About => t(k::SETTINGS_PAGES_VERSION_MEMORY_AND_FILES),
         }
     }
 
@@ -119,6 +120,10 @@ pub(crate) enum Setting {
     Previews,
     /// `config.win_opens_start`: Win opens / closes the Start menu together with the bar.
     WinStart,
+    /// `config.reveal`: Rest (dwell) / Push at the screen edge.
+    Reveal,
+    /// The owned keyboard chords as one switch: on when any of the four `config.keyboard` flags is.
+    KeyboardChords,
     Seconds,
     VolumePercent,
     /// `Config::module_visible` name.
@@ -160,6 +165,10 @@ pub(crate) enum Slider {
     AppText,
     TrayIcon,
     Module,
+    /// `config.show_delay_ms`, in steps of 50 ms.
+    ShowDelay,
+    /// `config.hide_delay_ms`, in steps of 100 ms.
+    HideDelay,
     /// `launcher.width`, in steps of 40.
     LauncherWidth,
     /// `launcher.rows`.
@@ -277,6 +286,10 @@ pub(crate) struct Ctx<'a> {
     pub powertoys: bool,
     /// The last chord picked on the Launcher page was refused because another app holds it: `Some(shift)` is Alt+Shift+Space.
     pub chord_held: Option<bool>,
+    /// `config::load_notes().show_battery_invalid`: config.json held an unknown `show_battery` value.
+    pub battery_note: bool,
+    /// `config::load_notes().new_keys_invalid`: config.json held a value of the wrong type in a key new in 1.6.
+    pub keys_note: bool,
 }
 
 // ------------------------------------------------------------------ helpers moved from the old popup
@@ -284,15 +297,15 @@ pub(crate) struct Ctx<'a> {
 /// Row label of a `config::MODULE_NAMES` entry (or "start").
 pub(crate) fn module_label(name: &str) -> &'static str {
     match name {
-        "notifications" => tr("Notifications", "Notifiche"),
-        "volume" => tr("Volume", "Volume"),
-        "network" => tr("Network", "Rete"),
-        "metrics" => tr("System metrics", "Risorse di sistema"),
-        "clock" => tr("Clock", "Orologio"),
-        "show_desktop" => tr("Show desktop", "Mostra desktop"),
-        "start" => tr("Start button", "Pulsante Start"),
-        "tray" => tr("Tray icons", "Icone area notifiche"),
-        _ => tr("Module", "Modulo"),
+        "notifications" => t(k::COMMON_NOTIFICATIONS),
+        "volume" => t(k::SETTINGS_PAGES_VOLUME),
+        "network" => t(k::SETTINGS_PAGES_NETWORK),
+        "metrics" => t(k::SETTINGS_PAGES_SYSTEM_METRICS),
+        "clock" => t(k::SETTINGS_PAGES_CLOCK),
+        "show_desktop" => t(k::SETTINGS_PAGES_SHOW_DESKTOP),
+        "start" => t(k::SETTINGS_PAGES_START_BUTTON),
+        "tray" => t(k::SETTINGS_PAGES_TRAY_ICONS),
+        _ => t(k::SETTINGS_PAGES_MODULE),
     }
 }
 
@@ -300,28 +313,31 @@ pub(crate) fn module_label(name: &str) -> &'static str {
 pub(crate) fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
         // Each language in its own name, so it can be found whatever the current one is.
-        Setting::Language => vec![tr("System", "Sistema"), "English", "Italiano"],
-        Setting::StartStyle => vec![tr("Compact", "Compatto"), tr("Windows 11", "Windows 11")],
-        Setting::Position => vec![tr("Top", "In alto"), tr("Bottom", "In basso")],
+        Setting::Language => vec![t(k::SETTINGS_PAGES_SYSTEM), "English", "Italiano"],
+        Setting::StartStyle => vec![t(k::SETTINGS_PAGES_COMPACT), t(k::SETTINGS_PAGES_WINDOWS_11)],
+        Setting::Position => vec![t(k::SETTINGS_PAGES_TOP), t(k::SETTINGS_PAGES_BOTTOM)],
         Setting::Monitor => {
             // Last segment: follow the pointer (`config::MONITOR_POINTER`).
-            let main = tr("Main", "Principale");
+            let main = t(k::SETTINGS_PAGES_MAIN);
             sc.iter()
                 .map(|d| if d.primary { main } else { d.label })
-                .chain(std::iter::once(tr("Pointer", "Puntatore")))
+                .chain(std::iter::once(t(k::SETTINGS_PAGES_POINTER)))
                 .collect()
         }
-        Setting::DisplayMode => vec![tr("Icon + name", "Icona + nome"), tr("Icon", "Icona"), tr("Name", "Nome")],
-        Setting::BatteryShow => vec![tr("Auto", "Automatica"), tr("On", "S\u{ec}"), tr("Off", "No")],
+        Setting::DisplayMode => {
+            vec![t(k::SETTINGS_PAGES_ICON_NAME), t(k::SETTINGS_PAGES_ICON), t(k::SETTINGS_PAGES_NAME)]
+        }
+        Setting::Reveal => vec![t(k::SETTINGS_PAGES_REST), t(k::SETTINGS_PAGES_PUSH)],
+        Setting::BatteryShow => vec![t(k::SETTINGS_PAGES_AUTO), t(k::SETTINGS_PAGES_ON), t(k::SETTINGS_PAGES_OFF)],
         Setting::LauncherChord => {
-            vec![tr("Alt+Space", "Alt+Spazio"), tr("Alt+Shift+Space", "Alt+Maiusc+Spazio"), tr("Off", "No")]
+            vec![t(k::SETTINGS_PAGES_ALT_SPACE), t(k::SETTINGS_PAGES_ALT_SHIFT_SPACE), t(k::SETTINGS_PAGES_OFF)]
         }
-        Setting::LauncherPowerToys => vec![tr("Leave it", "Lascialo"), tr("Take it", "Prendilo")],
+        Setting::LauncherPowerToys => vec![t(k::SETTINGS_PAGES_LEAVE_IT), t(k::SETTINGS_PAGES_TAKE_IT)],
         Setting::LauncherMonitor => {
-            vec![tr("Pointer", "Puntatore"), tr("Active window", "Finestra attiva"), tr("Primary", "Principale")]
+            vec![t(k::SETTINGS_PAGES_POINTER), t(k::SETTINGS_PAGES_ACTIVE_WINDOW), t(k::SETTINGS_PAGES_PRIMARY)]
         }
-        Setting::LauncherFullscreen => vec![tr("Pass", "Passa"), tr("Open", "Apri")],
-        Setting::LauncherWeb => vec!["Google", "Bing", "DuckDuckGo", tr("Custom", "Personalizzato")],
+        Setting::LauncherFullscreen => vec![t(k::SETTINGS_PAGES_PASS), t(k::COMMON_OPEN)],
+        Setting::LauncherWeb => vec!["Google", "Bing", "DuckDuckGo", t(k::SETTINGS_PAGES_CUSTOM)],
         _ => Vec::new(),
     }
 }
@@ -337,6 +353,7 @@ pub(crate) fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
         },
         Setting::StartStyle => usize::from(c.start_style == StartStyle::Windows11),
         Setting::Position => usize::from(c.position == Position::Bottom),
+        Setting::Reveal => usize::from(c.reveal == config::Reveal::Push),
         Setting::Monitor => {
             if c.monitor.eq_ignore_ascii_case(config::MONITOR_POINTER) {
                 sc.len()
@@ -393,6 +410,7 @@ pub(crate) fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
         Setting::DisplayMode => {
             c.display_mode = [DisplayMode::IconText, DisplayMode::Icon, DisplayMode::Text][j.min(2)];
         }
+        Setting::Reveal => c.reveal = if j == 0 { config::Reveal::Dwell } else { config::Reveal::Push },
         Setting::BatteryShow => c.show_battery = [BatteryShow::Auto, BatteryShow::On, BatteryShow::Off][j.min(2)],
         Setting::LauncherChord => {
             c.launcher.chord = ["alt+space", "alt+shift+space", "off"][j.min(2)].into();
@@ -420,9 +438,9 @@ pub(crate) fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
 /// The notice under the Shortcut row after a refused pick.
 fn chord_held_text(shift: bool) -> &'static str {
     if shift {
-        tr("Another app holds Alt+Shift+Space", "Un'altra app usa Alt+Maiusc+Spazio")
+        t(k::COMMON_ANOTHER_APP_HOLDS_ALT_SHIFT)
     } else {
-        tr("Another app holds Alt+Space", "Un'altra app usa Alt+Spazio")
+        t(k::SETTINGS_PAGES_ANOTHER_APP_HOLDS_ALT_SPACE)
     }
 }
 
@@ -441,6 +459,10 @@ pub(crate) fn is_on(c: &Config, s: Setting) -> bool {
         Setting::AutoHide => c.autohide,
         Setting::Previews => c.window_previews,
         Setting::WinStart => c.win_opens_start,
+        Setting::KeyboardChords => {
+            let k = c.keyboard;
+            k.win_numbers || k.win_t || k.win_b || k.peek
+        }
         Setting::Seconds => c.show_seconds,
         Setting::VolumePercent => c.show_volume_percent,
         Setting::BatteryPercent => c.battery_percent,
@@ -461,6 +483,14 @@ pub(crate) fn flip(c: &mut Config, s: Setting) {
         Setting::AutoHide => c.autohide = !c.autohide,
         Setting::Previews => c.window_previews = !c.window_previews,
         Setting::WinStart => c.win_opens_start = !c.win_opens_start,
+        // On gives the chords their defaults (so changing a default changes this switch with it), off turns all four off.
+        Setting::KeyboardChords => {
+            c.keyboard = if is_on(c, s) {
+                config::KeyboardConfig { win_numbers: false, win_t: false, win_b: false, peek: false }
+            } else {
+                config::KeyboardConfig::default()
+            }
+        }
         Setting::Seconds => c.show_seconds = !c.show_seconds,
         Setting::VolumePercent => c.show_volume_percent = !c.show_volume_percent,
         Setting::BatteryPercent => c.battery_percent = !c.battery_percent,
@@ -495,6 +525,8 @@ pub(crate) fn slider_range(sl: Slider) -> (i32, i32, &'static str) {
         Slider::AppText => r(APP_TEXT_SIZE, " px"),
         Slider::TrayIcon => r(TRAY_ICON_SIZE, " px"),
         Slider::Module => r(MODULE_SIZE, "%"),
+        Slider::ShowDelay => (config::SHOW_DELAY_RANGE.0 as i32, config::SHOW_DELAY_RANGE.1 as i32, " ms"),
+        Slider::HideDelay => (config::HIDE_DELAY_RANGE.0 as i32, config::HIDE_DELAY_RANGE.1 as i32, " ms"),
         Slider::LauncherWidth => (config::LAUNCHER_WIDTH.0 as i32, config::LAUNCHER_WIDTH.1 as i32, " px"),
         Slider::LauncherRows => (config::LAUNCHER_ROWS.0 as i32, config::LAUNCHER_ROWS.1 as i32, ""),
     }
@@ -504,6 +536,8 @@ pub(crate) fn slider_value(c: &Config, sl: Slider) -> i32 {
     match sl {
         Slider::LauncherWidth => return i32::from(c.launcher.width),
         Slider::LauncherRows => return i32::from(c.launcher.rows),
+        Slider::ShowDelay => return c.show_delay_ms as i32,
+        Slider::HideDelay => return c.hide_delay_ms as i32,
         _ => {}
     }
     let (icon, text, tray, module) = c.sizes();
@@ -513,7 +547,7 @@ pub(crate) fn slider_value(c: &Config, sl: Slider) -> i32 {
         Slider::AppText => text,
         Slider::TrayIcon => tray,
         Slider::Module => module,
-        Slider::LauncherWidth | Slider::LauncherRows => 0,
+        Slider::LauncherWidth | Slider::LauncherRows | Slider::ShowDelay | Slider::HideDelay => 0,
     }) as i32
 }
 
@@ -526,6 +560,17 @@ pub(crate) fn set_slider(c: &mut Config, sl: Slider, v: i32) {
         c.launcher.width = ((v + 20) / 40 * 40).clamp(lo, hi) as u16;
         return;
     }
+    // The delays move in steps of 50 and 100 ms: rounded down to the step, then clamped.
+    if let Slider::ShowDelay | Slider::HideDelay = sl {
+        let step = if sl == Slider::ShowDelay { 50 } else { 100 };
+        let v = (v / step * step).clamp(lo, hi) as u32;
+        if sl == Slider::ShowDelay {
+            c.show_delay_ms = v;
+        } else {
+            c.hide_delay_ms = v;
+        }
+        return;
+    }
     let v = v as u8;
     match sl {
         Slider::Opacity => c.bar_opacity = v,
@@ -534,7 +579,7 @@ pub(crate) fn set_slider(c: &mut Config, sl: Slider, v: i32) {
         Slider::TrayIcon => c.tray_icon_size = v,
         Slider::Module => c.module_size = v,
         Slider::LauncherRows => c.launcher.rows = v,
-        Slider::LauncherWidth => {}
+        Slider::LauncherWidth | Slider::ShowDelay | Slider::HideDelay => {}
     }
 }
 
@@ -594,11 +639,18 @@ pub(crate) fn background_of((h, s, v): (f32, f32, f32)) -> Background {
     Background(r << 16 | g << 8 | b)
 }
 
-/// Name of preset `k` in the dock language (the table keeps the English one).
-pub(crate) fn preset_name(k: usize) -> &'static str {
-    const IT: [&str; 7] = ["Nero", "Grafite", "Ardesia", "Blu notte", "Prugna", "Vinaccia", "Verde bosco"];
-    let en = BACKGROUND_PRESETS.get(k).map_or("", |p| p.0);
-    crate::i18n::tr(en, IT.get(k).copied().unwrap_or(en))
+/// Name of preset `i` in the dock language (the table keeps the English one).
+pub(crate) fn preset_name(i: usize) -> &'static str {
+    const NAMES: [S; 7] = [
+        k::SETTINGS_PAGES_PRESET_BLACK,
+        k::SETTINGS_PAGES_PRESET_GRAPHITE,
+        k::SETTINGS_PAGES_PRESET_SLATE,
+        k::SETTINGS_PAGES_PRESET_NAVY,
+        k::SETTINGS_PAGES_PRESET_PLUM,
+        k::SETTINGS_PAGES_PRESET_WINE,
+        k::SETTINGS_PAGES_PRESET_FOREST,
+    ];
+    NAMES.get(i).map_or("", |&key| t(key))
 }
 
 /// Index of the preset equal to `bg`.
@@ -618,20 +670,19 @@ pub(crate) fn swatch_selected(bg: Background, k: usize) -> bool {
 /// Text of the import row for `st`.
 pub(crate) fn import_label(st: start_import::Status) -> String {
     match st {
-        start_import::Status::Idle => tr("Import from Windows Start", "Importa dallo Start di Windows").to_string(),
-        start_import::Status::Running => tr("Importing\u{2026}", "Importazione\u{2026}").to_string(),
-        start_import::Status::Failed => tr("Import failed", "Importazione non riuscita").to_string(),
-        start_import::Status::TimedOut => {
-            tr("Import failed (timeout)", "Importazione non riuscita (timeout)").to_string()
+        start_import::Status::Idle => t(k::SETTINGS_PAGES_IMPORT_FROM_WINDOWS_START).to_string(),
+        start_import::Status::Running => t(k::SETTINGS_PAGES_IMPORTING).to_string(),
+        start_import::Status::Failed(why) => match why {
+            FailReason::Export => t(k::SETTINGS_PAGES_IMPORT_FAILED_WINDOWS_DID_NOT),
+            FailReason::CannotStart => t(k::SETTINGS_PAGES_IMPORT_FAILED_THE_EXPORT_COULD),
+            FailReason::NoSystemDir => t(k::SETTINGS_PAGES_IMPORT_FAILED_THE_SYSTEM_FOLDER),
+            FailReason::Layout => t(k::SETTINGS_PAGES_IMPORT_FAILED_THE_LAYOUT_FILE),
         }
+        .to_string(),
+        start_import::Status::TimedOut => t(k::SETTINGS_PAGES_IMPORT_FAILED_TIMEOUT).to_string(),
         start_import::Status::Imported(n) => {
-            if crate::i18n::italian() {
-                format!("Importate {n} app")
-            } else if n == 1 {
-                "Imported 1 app".to_string()
-            } else {
-                format!("Imported {n} apps")
-            }
+            let key = if n == 1 { k::SETTINGS_PAGES_IMPORT_DONE_ONE } else { k::SETTINGS_PAGES_IMPORT_DONE_MANY };
+            oled_sys::i18n::subst(t(key), &[("n", &n.to_string())])
         }
     }
 }
@@ -788,51 +839,49 @@ fn modules(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             _ => glyphs::show_desktop_shape,
         }
     };
-    let mut v = vec![header(tr("Modules", "Moduli"), None)];
+    let mut v = vec![header(t(k::SETTINGS_PAGES_MODULES), None)];
     for n in MODULE_TOGGLES {
         v.push(toggle(icon(n), module_label(n), None, c, Setting::Module(n)));
     }
-    v.push(header(tr("Battery", "Batteria"), None));
+    v.push(header(t(k::SETTINGS_PAGES_BATTERY), None));
     v.push(choice(
         glyphs::battery_icon,
-        tr("Show battery", "Mostra batteria"),
-        Some(tr("Shown automatically on laptops", "Mostrata automaticamente sui portatili")),
+        t(k::SETTINGS_PAGES_SHOW_BATTERY),
+        Some(if ctx.battery_note {
+            t(k::SETTINGS_PAGES_CONFIG_JSON_HAS_AN_UNKNOWN)
+        } else {
+            t(k::SETTINGS_PAGES_SHOWN_AUTOMATICALLY_ON_LAPTOPS)
+        }),
         c,
         Setting::BatteryShow,
         ctx.screens,
     ));
-    v.push(toggle(glyphs::text_shape, tr("Percentage", "Percentuale"), None, c, Setting::BatteryPercent));
+    v.push(toggle(glyphs::text_shape, t(k::SETTINGS_PAGES_PERCENTAGE), None, c, Setting::BatteryPercent));
     v.push(row(
         glyphs::battery_icon,
-        tr("Percentage inside the icon", "Percentuale dentro l'icona"),
-        Some(tr("Apple style", "Stile Apple")),
+        t(k::SETTINGS_PAGES_PERCENTAGE_INSIDE_THE_ICON),
+        Some(t(k::SETTINGS_PAGES_APPLE_STYLE)),
         Control::Toggle { setting: Setting::BatteryInside, on: c.battery_percent_inside, enabled: c.battery_percent },
     ));
-    v.push(header(tr("Tray", "Area di notifica"), None));
+    v.push(header(t(k::SETTINGS_PAGES_TRAY), None));
     v.push(toggle(glyphs::ring_shape, module_label("tray"), None, c, Setting::Module("tray")));
     if c.module_visible("tray") {
         v.push(row(
             glyphs::lock_shape,
-            tr("Icons of apps run as administrator", "Icone delle app avviate come amministratore"),
-            Some(tr(
-                "Allow clicks on their icons, for example MSI Afterburner",
-                "Consenti i clic sulle loro icone, ad esempio MSI Afterburner",
-            )),
+            t(k::SETTINGS_PAGES_ICONS_OF_APPS_RUN_AS),
+            Some(t(k::SETTINGS_PAGES_ALLOW_CLICKS_ON_THEIR_ICONS)),
             Control::Toggle { setting: Setting::TrustElevatedTray, on: ctx.trust_elevated, enabled: true },
         ));
         v.push(toggle(
             glyphs::eye_icon,
-            tr("Show all", "Mostra tutte"),
-            Some(tr(
-                "Show every tray icon in the bar, including those that start later",
-                "Mostra tutte le icone nella barra, comprese quelle che compaiono dopo",
-            )),
+            t(k::SETTINGS_PAGES_SHOW_ALL),
+            Some(t(k::SETTINGS_PAGES_SHOW_EVERY_TRAY_ICON_IN)),
             c,
             Setting::TrayShowAll,
         ));
         v.push(row(
             glyphs::eye_icon,
-            tr("Choose visible icons", "Scegli le icone visibili"),
+            t(k::SETTINGS_PAGES_CHOOSE_VISIBLE_ICONS),
             None,
             Control::Chooser { open: ctx.chooser_open },
         ));
@@ -840,20 +889,20 @@ fn modules(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             if ctx.tray.is_empty() {
                 v.push(Row {
                     icon: None,
-                    label: tr("No tray apps", "Nessuna app nell'area di notifica").to_string(),
+                    label: t(k::COMMON_NO_TRAY_APPS).to_string(),
                     desc: None,
                     control: Control::Note,
                 });
             }
-            for t in ctx.tray {
-                let no_room = t.visible && !t.in_bar;
+            for tray in ctx.tray {
+                let no_room = tray.visible && !tray.in_bar;
                 v.push(Row {
                     icon: None,
-                    label: t.name.clone(),
-                    desc: no_room.then(|| tr("No room in the bar", "Spazio insufficiente nella barra").to_string()),
+                    label: tray.name.clone(),
+                    desc: no_room.then(|| t(k::SETTINGS_PAGES_NO_ROOM_IN_THE_BAR).to_string()),
                     control: Control::TrayApp {
-                        key: t.key.clone(),
-                        visible: t.visible || c.tray_show_all,
+                        key: tray.key.clone(),
+                        visible: tray.visible || c.tray_show_all,
                         enabled: !c.tray_show_all,
                     },
                 });
@@ -869,43 +918,42 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let available = match &st.available {
         Some(a) if a.date.is_empty() => a.tag.clone(),
         Some(a) => format!("{} \u{b7} {}", a.tag, short_date(&a.date)),
-        None if st.last_check.is_empty() => tr("Not checked yet", "Non ancora controllato").to_string(),
-        None => tr("Up to date", "Aggiornato").to_string(),
+        None if st.last_check.is_empty() => t(k::SETTINGS_PAGES_NOT_CHECKED_YET).to_string(),
+        None => t(k::SETTINGS_PAGES_UP_TO_DATE).to_string(),
     };
-    let last_check =
-        if st.last_check.is_empty() { tr("Never", "Mai").to_string() } else { short_date(&st.last_check).to_string() };
+    let last_check = if st.last_check.is_empty() {
+        t(k::SETTINGS_PAGES_NEVER).to_string()
+    } else {
+        short_date(&st.last_check).to_string()
+    };
     // The outcome of the last action, never the running phase (the Note row shows that).
     let last_action = if st.outcome == Outcome::None {
-        tr("None yet", "Nessuna").to_string()
+        t(k::SETTINGS_PAGES_NONE_YET).to_string()
     } else {
         UpdateStatus { phase: Phase::Idle, ..st.clone() }.line()
     };
     let notes_ok = st.available.as_ref().is_some_and(|a| safe_release_url(&release_page_url(Some(&a.tag))));
     let mut v = vec![
-        header(tr("Status", "Stato"), None),
+        header(t(k::SETTINGS_PAGES_STATUS), None),
         row(
             glyphs::info_shape,
-            tr("Installed version", "Versione installata"),
+            t(k::SETTINGS_PAGES_INSTALLED_VERSION),
             None,
             Control::Status(st.installed.to_string()),
         ),
-        row(glyphs::refresh_shape, tr("Available", "Disponibile"), None, Control::Status(available)),
-        row(glyphs::clock_shape, tr("Last check", "Ultimo controllo"), None, Control::Status(last_check)),
-        row(glyphs::log_shape, tr("Last action", "Ultima operazione"), None, Control::Status(last_action)),
+        row(glyphs::refresh_shape, t(k::SETTINGS_PAGES_AVAILABLE), None, Control::Status(available)),
+        row(glyphs::clock_shape, t(k::SETTINGS_PAGES_LAST_CHECK), None, Control::Status(last_check)),
+        row(glyphs::log_shape, t(k::SETTINGS_PAGES_LAST_ACTION), None, Control::Status(last_action)),
         row(
             glyphs::refresh_shape,
             "",
             None,
             Control::Buttons(vec![
-                Button { action: Action::CheckUpdates, text: tr("Check now", "Controlla ora"), enabled: idle },
-                Button {
-                    action: Action::ReleaseNotes,
-                    text: tr("Release notes", "Note di rilascio"),
-                    enabled: notes_ok,
-                },
+                Button { action: Action::CheckUpdates, text: t(k::SETTINGS_PAGES_CHECK_NOW), enabled: idle },
+                Button { action: Action::ReleaseNotes, text: t(k::SETTINGS_PAGES_RELEASE_NOTES), enabled: notes_ok },
                 Button {
                     action: Action::InstallUpdate,
-                    text: tr("Update now", "Aggiorna ora"),
+                    text: t(k::SETTINGS_PAGES_UPDATE_NOW),
                     enabled: idle && st.available.is_some(),
                 },
             ]),
@@ -914,18 +962,18 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     if !idle {
         v.push(Row { icon: None, label: st.line(), desc: None, control: Control::Note });
     }
-    v.push(header(tr("Automatic", "Automatico"), None));
+    v.push(header(t(k::SETTINGS_PAGES_AUTOMATIC), None));
     v.push(toggle(
         glyphs::refresh_shape,
-        tr("Check automatically", "Controlla automaticamente"),
-        Some(tr("Once a day on GitHub", "Una volta al giorno su GitHub")),
+        t(k::SETTINGS_PAGES_CHECK_AUTOMATICALLY),
+        Some(t(k::SETTINGS_PAGES_ONCE_A_DAY_ON_GITHUB)),
         c,
         Setting::UpdateCheck,
     ));
     v.push(toggle(
         glyphs::download_shape,
-        tr("Install automatically", "Installa automaticamente"),
-        Some(tr("When the dock is idle", "Quando il dock \u{e8} inattivo")),
+        t(k::SETTINGS_PAGES_INSTALL_AUTOMATICALLY),
+        Some(t(k::SETTINGS_PAGES_WHEN_THE_DOCK_IS_IDLE)),
         c,
         Setting::UpdateAutoInstall,
     ));
@@ -935,38 +983,38 @@ fn updates(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
 fn about(ctx: &Ctx<'_>) -> Vec<Row> {
     let mem = |b: Option<usize>, none: &str| b.map_or_else(|| none.to_string(), mb);
     let files = |icon: Glyph, label: &str, path: Option<&str>, action| {
-        buttons(icon, label, path, vec![Button { action, text: tr("Open", "Apri"), enabled: path.is_some() }])
+        buttons(icon, label, path, vec![Button { action, text: t(k::COMMON_OPEN), enabled: path.is_some() }])
     };
     vec![
-        header(tr("Dock", "Dock"), None),
+        header(t(k::COMMON_DOCK), None),
         row(
             glyphs::info_shape,
             &format!("mini-oled-dock {}", crate::preview::version_text()),
-            Some(tr("Ops Software \u{b7} MIT licence", "Ops Software \u{b7} licenza MIT")),
+            Some(t(k::SETTINGS_PAGES_OPS_SOFTWARE_MIT_LICENCE)),
             Control::Note,
         ),
-        header(tr("Memory", "Memoria"), None),
+        header(t(k::SETTINGS_PAGES_MEMORY), None),
         row(
             glyphs::bars_shape,
-            tr("Memory now", "Memoria ora"),
+            t(k::SETTINGS_PAGES_MEMORY_NOW),
             None,
             Control::Status(mem(ctx.memory.now, "\u{2014}")),
         ),
         row(
             glyphs::bars_shape,
-            tr("After trimming", "Dopo la pulizia"),
-            Some(tr("While the bar is hidden", "Mentre la barra \u{e8} nascosta")),
-            Control::Status(mem(ctx.memory.trimmed, tr("Not trimmed yet", "Non ancora eseguita"))),
+            t(k::SETTINGS_PAGES_AFTER_TRIMMING),
+            Some(t(k::SETTINGS_PAGES_WHILE_THE_BAR_IS_HIDDEN)),
+            Control::Status(mem(ctx.memory.trimmed, t(k::SETTINGS_PAGES_NOT_TRIMMED_YET))),
         ),
-        header(tr("Files", "File"), None),
-        files(glyphs::folder_shape, tr("Data folder", "Cartella dati"), ctx.data_dir, Action::OpenDataFolder),
+        header(t(k::COMMON_FILES), None),
+        files(glyphs::folder_shape, t(k::SETTINGS_PAGES_DATA_FOLDER), ctx.data_dir, Action::OpenDataFolder),
         files(glyphs::log_shape, "Log", ctx.log_path, Action::OpenLog),
-        header(tr("Taskbar", "Barra delle applicazioni"), None),
+        header(t(k::SETTINGS_PAGES_TASKBAR), None),
         buttons(
             glyphs::power_shape,
-            tr("Restore the Windows taskbar", "Ripristina la barra di Windows"),
-            Some(tr("Exits the dock", "Chiude il dock")),
-            vec![Button { action: Action::ExitDock, text: tr("Exit the dock", "Esci dal dock"), enabled: true }],
+            t(k::SETTINGS_PAGES_RESTORE_THE_WINDOWS_TASKBAR),
+            Some(t(k::SETTINGS_PAGES_EXITS_THE_DOCK)),
+            vec![Button { action: Action::ExitDock, text: t(k::COMMON_EXIT_DOCK), enabled: true }],
         ),
     ]
 }
@@ -974,15 +1022,15 @@ fn about(ctx: &Ctx<'_>) -> Vec<Row> {
 fn appearance(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let colour = match preset_index(c.background) {
         Some(k) => preset_name(k).to_string(),
-        None => tr("Custom", "Personalizzato").to_string(),
+        None => t(k::SETTINGS_PAGES_CUSTOM).to_string(),
     };
     let swatch = preset_index(c.background).unwrap_or(BACKGROUND_PRESETS.len());
     let mut v = vec![
         Row { icon: None, label: String::new(), desc: None, control: Control::Preview },
-        header(tr("Colour", "Colore"), Some(colour)),
+        header(t(k::SETTINGS_PAGES_COLOUR), Some(colour)),
         row(
             glyphs::circle_shape,
-            tr("Background", "Sfondo"),
+            t(k::SETTINGS_PAGES_BACKGROUND),
             None,
             Control::Swatches { selected: swatch, picker_open: ctx.picker_open },
         ),
@@ -990,85 +1038,118 @@ fn appearance(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     if ctx.picker_open {
         v.push(Row { icon: None, label: String::new(), desc: None, control: Control::Picker });
     }
-    v.push(slider_row(glyphs::drop_shape, tr("Opacity", "Opacit\u{e0}"), c, Slider::Opacity));
-    v.push(header(tr("Sizes", "Dimensioni"), None));
-    v.push(slider_row(glyphs::square_shape, tr("App icons", "Icone app"), c, Slider::AppIcon));
-    v.push(slider_row(glyphs::text_shape, tr("App names", "Nomi app"), c, Slider::AppText));
-    v.push(slider_row(glyphs::ring_shape, tr("Tray icons", "Icone area notifiche"), c, Slider::TrayIcon));
-    v.push(slider_row(glyphs::bars_shape, tr("Modules", "Moduli"), c, Slider::Module));
+    v.push(slider_row(glyphs::drop_shape, t(k::SETTINGS_PAGES_OPACITY), c, Slider::Opacity));
+    v.push(header(t(k::SETTINGS_PAGES_SIZES), None));
+    v.push(slider_row(glyphs::square_shape, t(k::SETTINGS_PAGES_APP_ICONS), c, Slider::AppIcon));
+    v.push(slider_row(glyphs::text_shape, t(k::SETTINGS_PAGES_APP_NAMES), c, Slider::AppText));
+    v.push(slider_row(glyphs::ring_shape, t(k::SETTINGS_PAGES_TRAY_ICONS), c, Slider::TrayIcon));
+    v.push(slider_row(glyphs::bars_shape, t(k::SETTINGS_PAGES_MODULES), c, Slider::Module));
     v.push(buttons(
         glyphs::refresh_shape,
-        tr("Reset sizes", "Ripristina dimensioni"),
+        t(k::SETTINGS_PAGES_RESET_SIZES),
         None,
-        vec![Button { action: Action::ResetSizes, text: tr("Reset", "Ripristina"), enabled: !sizes_are_default(c) }],
+        vec![Button { action: Action::ResetSizes, text: t(k::SETTINGS_PAGES_RESET), enabled: !sizes_are_default(c) }],
     ));
-    v.push(header(tr("Language", "Lingua"), None));
-    v.push(choice(glyphs::globe_shape, tr("Language", "Lingua"), None, c, Setting::Language, ctx.screens));
+    v.push(header(t(k::SETTINGS_PAGES_LANGUAGE), None));
+    v.push(choice(glyphs::globe_shape, t(k::SETTINGS_PAGES_LANGUAGE), None, c, Setting::Language, ctx.screens));
     v
 }
 
 fn bar(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let sc = ctx.screens;
-    vec![
-        header(tr("Position", "Posizione"), None),
-        choice(glyphs::bar_shape, tr("Position", "Posizione"), None, c, Setting::Position, sc),
-        choice(glyphs::text_shape, tr("Display mode", "Mostra"), None, c, Setting::DisplayMode, sc),
-        header(tr("Behaviour", "Comportamento"), None),
+    let mut v = vec![
+        header(t(k::SETTINGS_PAGES_POSITION), None),
+        choice(glyphs::bar_shape, t(k::SETTINGS_PAGES_POSITION), None, c, Setting::Position, sc),
+        choice(glyphs::text_shape, t(k::SETTINGS_PAGES_DISPLAY_MODE), None, c, Setting::DisplayMode, sc),
+        header(t(k::SETTINGS_PAGES_BEHAVIOUR), None),
         toggle(
             glyphs::chevron_down_shape,
-            tr("Auto-hide", "Nascondi automaticamente"),
-            Some(tr(
-                "Shows up with the Win key or at the screen edge",
-                "Compare con il tasto Win o al bordo dello schermo",
-            )),
+            t(k::COMMON_AUTO_HIDE),
+            Some(if ctx.keys_note {
+                t(k::SETTINGS_PAGES_CONFIG_JSON_HAS_AN_UNREADABLE)
+            } else {
+                t(k::SETTINGS_PAGES_SHOWS_UP_WITH_THE_WIN)
+            }),
             c,
             Setting::AutoHide,
         ),
+        delay_row(
+            t(k::SETTINGS_PAGES_SHOW_DELAY),
+            t(k::SETTINGS_PAGES_POINTER_RESTING_AT_THE_SCREEN),
+            c,
+            Slider::ShowDelay,
+        ),
+        delay_row(
+            t(k::SETTINGS_PAGES_HIDE_DELAY),
+            t(k::SETTINGS_PAGES_AFTER_THE_POINTER_LEAVES_THE),
+            c,
+            Slider::HideDelay,
+        ),
+    ];
+    if crate::ui::PUSH_AVAILABLE {
+        v.push(choice(glyphs::chevron_down_shape, t(k::SETTINGS_PAGES_SHOW_AT_THE_EDGE), None, c, Setting::Reveal, sc));
+    }
+    v.extend([
         toggle(
             glyphs::eye_icon,
-            tr("Window previews", "Anteprime finestre"),
-            Some(tr(
-                "Rest the pointer on an app with several windows",
-                "Fermando il puntatore su un'app con pi\u{f9} finestre",
-            )),
+            t(k::SETTINGS_PAGES_WINDOW_PREVIEWS),
+            Some(t(k::SETTINGS_PAGES_REST_THE_POINTER_ON_AN)),
             c,
             Setting::Previews,
         ),
-        toggle(glyphs::clock_shape, tr("Clock seconds", "Secondi nell'orologio"), None, c, Setting::Seconds),
+        toggle(glyphs::clock_shape, t(k::SETTINGS_PAGES_CLOCK_SECONDS), None, c, Setting::Seconds),
         toggle(
             glyphs::speaker_icon,
-            tr("Volume percent", "Percentuale volume"),
-            Some(tr("Next to the speaker", "Accanto all'altoparlante")),
+            t(k::SETTINGS_PAGES_VOLUME_PERCENT),
+            Some(t(k::SETTINGS_PAGES_NEXT_TO_THE_SPEAKER)),
             c,
             Setting::VolumePercent,
         ),
-    ]
+        toggle(
+            glyphs::keycap_shape,
+            t(k::SETTINGS_PAGES_KEYBOARD_SHORTCUTS),
+            Some(t(k::SETTINGS_PAGES_WIN_1_9_OPEN_THE)),
+            c,
+            Setting::KeyboardChords,
+        ),
+    ]);
+    v
+}
+
+/// A slider row with a description (the two delays of the Bar page).
+fn delay_row(label: &str, desc: &str, c: &Config, slider: Slider) -> Row {
+    let (min, max, unit) = slider_range(slider);
+    row(
+        glyphs::clock_shape,
+        label,
+        Some(desc),
+        Control::Slider { slider, value: slider_value(c, slider), min, max, unit },
+    )
 }
 
 fn start(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let sc = ctx.screens;
-    let idle_desc =
-        tr("Replaces the pinned apps of the dock's Start menu", "Sostituisce le app aggiunte al menu Start del dock");
+    let idle_desc = t(k::SETTINGS_PAGES_REPLACES_THE_PINNED_APPS_OF);
     let desc = if ctx.import == start_import::Status::Idle { idle_desc.to_string() } else { import_label(ctx.import) };
     vec![
-        header(tr("Start menu", "Menu Start"), None),
-        toggle(glyphs::windows_logo_shape, tr("Start button", "Pulsante Start"), None, c, Setting::Module("start")),
-        choice(glyphs::grid_shape, tr("Start layout", "Layout Start"), None, c, Setting::StartStyle, sc),
+        header(t(k::SETTINGS_PAGES_START_MENU), None),
+        toggle(glyphs::windows_logo_shape, t(k::SETTINGS_PAGES_START_BUTTON), None, c, Setting::Module("start")),
+        choice(glyphs::grid_shape, t(k::SETTINGS_PAGES_START_LAYOUT), None, c, Setting::StartStyle, sc),
         toggle(
             glyphs::keycap_shape,
-            tr("Win key opens Start", "Il tasto Win apre Start"),
-            Some(tr("Together with the bar", "Insieme alla barra")),
+            t(k::SETTINGS_PAGES_WIN_KEY_OPENS_START),
+            Some(t(k::SETTINGS_PAGES_TOGETHER_WITH_THE_BAR)),
             c,
             Setting::WinStart,
         ),
-        header(tr("Pinned apps", "App aggiunte"), None),
+        header(t(k::SETTINGS_PAGES_PINNED_APPS), None),
         buttons(
             glyphs::download_shape,
-            tr("Import from Windows Start", "Importa dallo Start di Windows"),
+            t(k::SETTINGS_PAGES_IMPORT_FROM_WINDOWS_START),
             Some(&desc),
             vec![Button {
                 action: Action::ImportStart,
-                text: tr("Import", "Importa"),
+                text: t(k::SETTINGS_PAGES_IMPORT),
                 enabled: ctx.import != start_import::Status::Running,
             }],
         ),
@@ -1079,7 +1160,7 @@ fn start(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
 fn prefix_phrase(c: &Config, name: &str) -> Option<String> {
     let p = c.launcher.prefixes.iter().find(|(_, n)| n.as_str() == name).map(|(p, _)| p.as_str())?;
     Some(if p.ends_with(' ') {
-        format!("\"{}\" {}", p.trim_end(), tr("and a space", "e uno spazio"))
+        format!("\"{}\" {}", p.trim_end(), t(k::SETTINGS_PAGES_AND_A_SPACE))
     } else {
         format!("\"{p}\"")
     })
@@ -1087,88 +1168,42 @@ fn prefix_phrase(c: &Config, name: &str) -> Option<String> {
 
 /// One provider of "What it finds": name, glyph, label (EN, IT) and description (EN, IT). The description of a provider
 /// with a prefix gets ". Prefix <p>" after it; Files has its own tail.
-type ProviderText = (&'static str, Glyph, [&'static str; 2], [&'static str; 2]);
+type ProviderText = (&'static str, Glyph, S, S);
 
 fn provider_texts() -> [ProviderText; 10] {
     [
-        (
-            "apps",
-            glyphs::grid_shape,
-            ["Apps", "App"],
-            ["Installed apps and shortcuts. Always on", "App installate e collegamenti. Sempre attivo"],
-        ),
-        (
-            "windows",
-            glyphs::window_shape,
-            ["Open windows", "Finestre aperte"],
-            ["Switch to a window", "Passa a una finestra"],
-        ),
-        (
-            "files",
-            glyphs::folder_shape,
-            ["Files", "File"],
-            [
-                "Names starting with the typed words, from the Windows Search index",
-                "Nomi che iniziano con le parole scritte, dall'indice di Windows Search",
-            ],
-        ),
-        (
-            "settings",
-            glyphs::gear_shape,
-            ["Windows settings", "Impostazioni di Windows"],
-            ["Pages of the Settings app", "Pagine dell'app Impostazioni"],
-        ),
-        (
-            "calc",
-            glyphs::equals_shape,
-            ["Calculator", "Calcolatrice"],
-            ["Sums typed in the box", "Calcoli scritti nella casella"],
-        ),
+        ("apps", glyphs::grid_shape, k::SETTINGS_PAGES_PROVIDER_APPS, k::SETTINGS_PAGES_PROVIDER_APPS_DESC),
+        ("windows", glyphs::window_shape, k::SETTINGS_PAGES_PROVIDER_WINDOWS, k::SETTINGS_PAGES_PROVIDER_WINDOWS_DESC),
+        ("files", glyphs::folder_shape, k::SETTINGS_PAGES_PROVIDER_FILES, k::SETTINGS_PAGES_PROVIDER_FILES_DESC),
+        ("settings", glyphs::gear_shape, k::SETTINGS_PAGES_PROVIDER_SETTINGS, k::SETTINGS_PAGES_PROVIDER_SETTINGS_DESC),
+        ("calc", glyphs::equals_shape, k::SETTINGS_PAGES_PROVIDER_CALC, k::SETTINGS_PAGES_PROVIDER_CALC_DESC),
         (
             "commands",
             glyphs::power_shape,
-            ["Commands", "Comandi"],
-            [
-                "Lock, sleep, restart and the other power commands",
-                "Blocca, sospendi, riavvia e gli altri comandi di alimentazione",
-            ],
+            k::SETTINGS_PAGES_PROVIDER_COMMANDS,
+            k::SETTINGS_PAGES_PROVIDER_COMMANDS_DESC,
         ),
-        (
-            "run",
-            glyphs::prompt_shape,
-            ["Run", "Esegui"],
-            ["Start a typed command line", "Avvia una riga di comando scritta"],
-        ),
-        (
-            "web",
-            glyphs::globe_shape,
-            ["Web search", "Ricerca sul web"],
-            ["Search the web with the engine below", "Cerca sul web con il motore qui sotto"],
-        ),
+        ("run", glyphs::prompt_shape, k::SETTINGS_PAGES_PROVIDER_RUN, k::SETTINGS_PAGES_PROVIDER_RUN_DESC),
+        ("web", glyphs::globe_shape, k::SETTINGS_PAGES_PROVIDER_WEB, k::SETTINGS_PAGES_PROVIDER_WEB_DESC),
         (
             "datetime",
             glyphs::clock_shape,
-            ["Date and time", "Data e ora"],
-            ["Today, the time, a date's weekday", "Oggi, l'ora, il giorno di una data"],
+            k::SETTINGS_PAGES_PROVIDER_DATETIME,
+            k::SETTINGS_PAGES_PROVIDER_DATETIME_DESC,
         ),
-        (
-            "registry",
-            glyphs::list_shape,
-            ["Registry", "Registro"],
-            ["Open a registry key in Regedit", "Apri una chiave di registro in Regedit"],
-        ),
+        ("registry", glyphs::list_shape, k::SETTINGS_PAGES_PROVIDER_REGISTRY, k::SETTINGS_PAGES_PROVIDER_REGISTRY_DESC),
     ]
 }
 
 /// The toggle of one provider in "What it finds".
 fn provider_row(c: &Config, (name, icon, label, desc): ProviderText) -> Row {
-    let (label, base) = (tr(label[0], label[1]), tr(desc[0], desc[1]));
+    let (label, base) = (t(label), t(desc));
     let desc = match (name, prefix_phrase(c, name)) {
         ("apps", _) | (_, None) => base.to_string(),
         ("files", Some(p)) => {
-            format!("{base}; {} {p} {}", tr("type", "scrivi"), tr("for files only", "per i soli file"))
+            format!("{base}; {} {p} {}", t(k::SETTINGS_PAGES_TYPE), t(k::SETTINGS_PAGES_FOR_FILES_ONLY))
         }
-        (_, Some(p)) => format!("{base}. {} {p}", tr("Prefix", "Prefisso")),
+        (_, Some(p)) => format!("{base}. {} {p}", t(k::SETTINGS_PAGES_PREFIX)),
     };
     let setting = Setting::LauncherProvider(name);
     row(icon, label, Some(&desc), Control::Toggle { setting, on: is_on(c, setting), enabled: name != "apps" })
@@ -1177,21 +1212,18 @@ fn provider_row(c: &Config, (name, icon, label, desc): ProviderText) -> Row {
 fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let sc = ctx.screens;
     let mut v = vec![
-        header(tr("Launcher", "Launcher"), None),
+        header(t(k::COMMON_LAUNCHER), None),
         toggle(
             crate::popup::popup_startmenu::magnifier,
-            tr("Launcher", "Launcher"),
-            Some(tr("Find and start anything from one bar", "Trova e avvia qualsiasi cosa da una barra")),
+            t(k::COMMON_LAUNCHER),
+            Some(t(k::SETTINGS_PAGES_FIND_AND_START_ANYTHING_FROM)),
             c,
             Setting::LauncherOn,
         ),
         choice(
             glyphs::keycap_shape,
-            tr("Shortcut", "Scorciatoia"),
-            Some(tr(
-                "With Alt+Space taken, type \"window menu\" for a window's menu",
-                "Con Alt+Spazio preso, scrivi \"menu finestra\" per il menu della finestra",
-            )),
+            t(k::SETTINGS_PAGES_SHORTCUT),
+            Some(t(k::SETTINGS_PAGES_WITH_ALT_SPACE_TAKEN_TYPE)),
             c,
             Setting::LauncherChord,
             sc,
@@ -1200,7 +1232,7 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     if let Some(shift) = ctx.chord_held {
         v.push(row(
             glyphs::info_shape,
-            tr("Not changed", "Non cambiata"),
+            t(k::SETTINGS_PAGES_NOT_CHANGED),
             None,
             Control::Status(chord_held_text(shift).to_string()),
         ));
@@ -1209,39 +1241,36 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
         v.push(choice(
             glyphs::info_shape,
             "PowerToys",
-            Some(tr("Command Palette also uses Alt+Space", "Anche Command Palette usa Alt+Spazio")),
+            Some(t(k::SETTINGS_PAGES_COMMAND_PALETTE_ALSO_USES_ALT)),
             c,
             Setting::LauncherPowerToys,
             sc,
         ));
     }
-    v.push(header(tr("Window", "Finestra"), None));
-    v.push(choice(glyphs::monitor_shape, tr("Opens on", "Si apre su"), None, c, Setting::LauncherMonitor, sc));
-    v.push(slider_row(glyphs::window_shape, tr("Width", "Larghezza"), c, Slider::LauncherWidth));
-    v.push(slider_row(glyphs::list_shape, tr("Rows", "Righe"), c, Slider::LauncherRows));
+    v.push(header(t(k::COMMON_WINDOW), None));
+    v.push(choice(glyphs::monitor_shape, t(k::SETTINGS_PAGES_OPENS_ON), None, c, Setting::LauncherMonitor, sc));
+    v.push(slider_row(glyphs::window_shape, t(k::SETTINGS_PAGES_WIDTH), c, Slider::LauncherWidth));
+    v.push(slider_row(glyphs::list_shape, t(k::SETTINGS_PAGES_ROWS), c, Slider::LauncherRows));
     v.push(choice(
         glyphs::show_desktop_shape,
-        tr("Over full-screen apps", "Sopra le app a schermo intero"),
-        Some(tr(
-            "Games keep their keys; exclusive full screen always passes",
-            "I giochi tengono i loro tasti; lo schermo intero esclusivo passa sempre",
-        )),
+        t(k::SETTINGS_PAGES_OVER_FULL_SCREEN_APPS),
+        Some(t(k::SETTINGS_PAGES_GAMES_KEEP_THEIR_KEYS_EXCLUSIVE)),
         c,
         Setting::LauncherFullscreen,
         sc,
     ));
-    v.push(header(tr("What it finds", "Cosa trova"), None));
+    v.push(header(t(k::SETTINGS_PAGES_WHAT_IT_FINDS), None));
     for text in provider_texts() {
         v.push(provider_row(c, text));
     }
-    v.push(header(tr("Web search", "Ricerca sul web"), None));
+    v.push(header(t(k::SETTINGS_PAGES_WEB_SEARCH), None));
     let custom_desc = match crate::launcher::web::validate_template(&c.launcher.web_url) {
-        Ok(t) if c.launcher.web_engine == "custom" => format!("{}: {}", tr("Custom", "Personalizzato"), t.host()),
-        _ => tr("Custom is set in the config file", "Personalizzato si imposta nel file di configurazione").to_string(),
+        Ok(tpl) if c.launcher.web_engine == "custom" => format!("{}: {}", t(k::SETTINGS_PAGES_CUSTOM), tpl.host()),
+        _ => t(k::SETTINGS_PAGES_CUSTOM_IS_SET_IN_THE).to_string(),
     };
     v.push(row(
         glyphs::globe_shape,
-        tr("Search engine", "Motore di ricerca"),
+        t(k::SETTINGS_PAGES_SEARCH_ENGINE),
         Some(&custom_desc),
         Control::Choice {
             setting: Setting::LauncherWeb,
@@ -1249,34 +1278,34 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
             selected: selected(c, Setting::LauncherWeb, sc),
         },
     ));
-    v.push(header(tr("History", "Cronologia"), None));
+    v.push(header(t(k::SETTINGS_PAGES_HISTORY), None));
     v.push(toggle(
         glyphs::clock_shape,
-        tr("Learn from what I pick", "Impara da ci\u{f2} che scelgo"),
-        Some(tr("Kept for your account only", "Conservato solo per il tuo account")),
+        t(k::SETTINGS_PAGES_LEARN_FROM_WHAT_I_PICK),
+        Some(t(k::SETTINGS_PAGES_KEPT_FOR_YOUR_ACCOUNT_ONLY)),
         c,
         Setting::LauncherLearn,
     ));
     v.push(buttons(
         glyphs::refresh_shape,
-        tr("Forget history", "Dimentica la cronologia"),
-        Some(tr("The commands you ran and the order it learned", "I comandi eseguiti e l'ordine appreso")),
-        vec![Button { action: Action::ForgetHistory, text: tr("Forget", "Dimentica"), enabled: true }],
+        t(k::SETTINGS_PAGES_FORGET_HISTORY),
+        Some(t(k::SETTINGS_PAGES_THE_COMMANDS_YOU_RAN_AND)),
+        vec![Button { action: Action::ForgetHistory, text: t(k::COMMON_FORGET), enabled: true }],
     ));
-    v.push(header(tr("Aliases", "Alias"), None));
+    v.push(header(t(k::SETTINGS_PAGES_ALIASES), None));
     v.extend(alias_rows(c));
     v.push(buttons(
         glyphs::text_shape,
-        tr("Add an alias", "Aggiungi un alias"),
-        Some(tr("A word that opens an app, a link or a folder", "Una parola che apre un'app, un link o una cartella")),
+        t(k::SETTINGS_PAGES_ADD_AN_ALIAS),
+        Some(t(k::SETTINGS_PAGES_A_WORD_THAT_OPENS_AN)),
         // The prompt is the launcher's own field: it needs the launcher shortcut.
         vec![Button {
             action: Action::AddLauncherAlias,
-            text: tr("Add\u{2026}", "Aggiungi\u{2026}"),
+            text: t(k::SETTINGS_PAGES_ADD),
             enabled: c.launcher.chord_spec().is_some(),
         }],
     ));
-    v.push(header(tr("Prefixes", "Prefissi"), None));
+    v.push(header(t(k::SETTINGS_PAGES_PREFIXES), None));
     // The defaults in their table order, then the owner's own.
     let own = |k: &&str| !config::LAUNCHER_PREFIXES.iter().any(|(p, _)| p == k);
     let mut keys: Vec<&str> =
@@ -1285,15 +1314,15 @@ fn launcher(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     let table = keys.iter().map(|p| p.trim_end()).collect::<Vec<_>>().join("  ");
     v.push(row(
         glyphs::text_shape,
-        tr("Prefixes", "Prefissi"),
-        Some(tr("Typed first, they pick one source", "Scritti all'inizio, scelgono una sola fonte")),
+        t(k::SETTINGS_PAGES_PREFIXES),
+        Some(t(k::SETTINGS_PAGES_TYPED_FIRST_THEY_PICK_ONE)),
         Control::Status(table),
     ));
     v.push(buttons(
         glyphs::pencil_shape,
-        tr("Config file", "File di configurazione"),
-        Some(tr("This window has no text field yet", "Questa finestra non ha ancora un campo di testo")),
-        vec![Button { action: Action::EditConfig, text: tr("Edit config", "Modifica"), enabled: true }],
+        t(k::SETTINGS_PAGES_CONFIG_FILE),
+        Some(t(k::SETTINGS_PAGES_THIS_WINDOW_HAS_NO_TEXT)),
+        vec![Button { action: Action::EditConfig, text: t(k::SETTINGS_PAGES_EDIT_CONFIG), enabled: true }],
     ));
     v
 }
@@ -1323,7 +1352,7 @@ fn ellipsize(s: &str, max: usize) -> String {
 /// One row per alias of `launcher.aliases`, sorted by word (the map's order), the ones the launcher ignores too, so
 /// they can be removed. Remove carries the hash of the word.
 fn alias_rows(c: &Config) -> Vec<Row> {
-    let remove = tr("Remove", "Rimuovi");
+    let remove = t(k::SETTINGS_PAGES_REMOVE);
     c.launcher
         .aliases
         .iter()
@@ -1343,24 +1372,17 @@ fn screen(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     if ctx.screens.len() < 2 {
         return vec![Row {
             icon: None,
-            label: tr(
-                "The bar is on the only display. Connect another one to choose.",
-                "La barra \u{e8} sull'unico schermo. Collegane un altro per scegliere.",
-            )
-            .to_string(),
+            label: t(k::SETTINGS_PAGES_THE_BAR_IS_ON_THE).to_string(),
             desc: None,
             control: Control::Note,
         }];
     }
     vec![
-        header(tr("Display", "Schermo"), None),
+        header(t(k::COMMON_DISPLAY), None),
         choice(
             glyphs::monitor_shape,
-            tr("Display", "Schermo"),
-            Some(tr(
-                "Pointer: the Win key brings the bar to the display under the pointer",
-                "Puntatore: il tasto Win porta la barra sullo schermo sotto il puntatore",
-            )),
+            t(k::COMMON_DISPLAY),
+            Some(t(k::SETTINGS_PAGES_POINTER_THE_WIN_KEY_BRINGS)),
             c,
             Setting::Monitor,
             ctx.screens,
@@ -1399,6 +1421,8 @@ mod tests {
             trust_elevated: false,
             powertoys: false,
             chord_held: None,
+            battery_note: false,
+            keys_note: false,
         }
     }
 
@@ -1500,7 +1524,14 @@ mod tests {
 
     #[test]
     fn every_preset_has_an_italian_name() {
-        assert_eq!(BACKGROUND_PRESETS.len(), 7, "update the Italian names in preset_name");
+        assert_eq!(BACKGROUND_PRESETS.len(), 7, "update the names in preset_name");
+        // The names as the code held them before the keyed strings: English from the table, Italian beside it.
+        const OLD_IT: [&str; 7] = ["Nero", "Grafite", "Ardesia", "Blu notte", "Prugna", "Vinaccia", "Verde bosco"];
+        for (i, (en, _)) in BACKGROUND_PRESETS.iter().enumerate() {
+            assert_eq!(crate::i18n::with_italian(false, || preset_name(i)), *en);
+            assert_eq!(crate::i18n::with_italian(true, || preset_name(i)), OLD_IT[i]);
+        }
+        assert_eq!(preset_name(BACKGROUND_PRESETS.len()), "");
     }
 
     #[test]
@@ -1516,13 +1547,83 @@ mod tests {
         for st in [
             start_import::Status::Idle,
             start_import::Status::Running,
-            start_import::Status::Failed,
+            start_import::Status::Failed(FailReason::Export),
             start_import::Status::TimedOut,
             start_import::Status::Imported(3),
         ] {
             assert!(!import_label(st).is_empty());
         }
         assert_eq!(import_label(start_import::Status::Imported(1)), "Imported 1 app");
+    }
+
+    #[test]
+    fn imported_count_equals_the_old_text_in_both_languages() {
+        // The old code: Italian always "Importate {n} app"; English "Imported 1 app" for one, else "Imported {n} apps".
+        for n in [0u32, 1, 2, 17] {
+            let old_en = if n == 1 { "Imported 1 app".to_string() } else { format!("Imported {n} apps") };
+            let old_it = format!("Importate {n} app");
+            let en = crate::i18n::with_italian(false, || import_label(start_import::Status::Imported(n)));
+            let it = crate::i18n::with_italian(true, || import_label(start_import::Status::Imported(n)));
+            assert_eq!((en, it), (old_en, old_it), "n = {n}");
+        }
+    }
+
+    #[test]
+    fn battery_row_shows_the_note() {
+        let st = idle();
+        let c = Config::default();
+        let desc = |note: bool| {
+            let mut cx = ctx(&[], &st);
+            cx.battery_note = note;
+            let r = rows(Page::Modules, &c, &cx);
+            r.iter()
+                .find(|r| matches!(r.control, Control::Choice { setting: Setting::BatteryShow, .. }))
+                .and_then(|r| r.desc.clone())
+                .unwrap()
+        };
+        assert_eq!(desc(false), "Shown automatically on laptops");
+        assert_eq!(desc(true), "config.json has an unknown value here: Auto is used");
+        assert_eq!(
+            crate::i18n::with_italian(true, || desc(true)),
+            "config.json ha un valore sconosciuto qui: si usa Automatica"
+        );
+    }
+
+    #[test]
+    fn bar_page_shows_the_new_keys_note() {
+        let st = idle();
+        let c = Config::default();
+        let desc = |note: bool| {
+            let mut cx = ctx(&[], &st);
+            cx.keys_note = note;
+            let r = rows(Page::Bar, &c, &cx);
+            r.iter()
+                .find(|r| matches!(r.control, Control::Toggle { setting: Setting::AutoHide, .. }))
+                .and_then(|r| r.desc.clone())
+                .unwrap()
+        };
+        assert_ne!(desc(true), desc(false));
+        assert_eq!(desc(true), "config.json has an unreadable value in a new key: its default is used");
+        assert_eq!(
+            crate::i18n::with_italian(true, || desc(true)),
+            "config.json ha un valore illeggibile in una chiave nuova: si usa quello predefinito"
+        );
+    }
+
+    #[test]
+    fn failed_import_names_its_reason() {
+        let mut seen = std::collections::HashSet::new();
+        for why in FailReason::ALL {
+            let en = import_label(start_import::Status::Failed(why));
+            assert!(en.starts_with("Import failed: "), "{en}");
+            assert!(seen.insert(en), "one text per reason");
+        }
+        let mut seen_it = std::collections::HashSet::new();
+        for why in FailReason::ALL {
+            let it = crate::i18n::with_italian(true, || import_label(start_import::Status::Failed(why)));
+            assert!(it.starts_with("Importazione non riuscita: "), "{it}");
+            assert!(seen_it.insert(it), "one Italian text per reason");
+        }
     }
 
     #[test]
@@ -1640,6 +1741,73 @@ mod tests {
             r("slack.exe#1", "Slack", true, false),
             r("teams.exe#1", "Teams", false, false),
         ]
+    }
+
+    #[test]
+    fn bar_page_has_the_timing_rows() {
+        let st = idle();
+        let c = Config::default();
+        let r = rows(Page::Bar, &c, &ctx(&[], &st));
+        let k = r.iter().position(|r| matches!(r.control, Control::Toggle { setting: Setting::AutoHide, .. })).unwrap();
+        assert!(matches!(
+            r[k + 1].control,
+            Control::Slider { slider: Slider::ShowDelay, value: 150, min: 0, max: 1000, .. }
+        ));
+        assert!(matches!(
+            r[k + 2].control,
+            Control::Slider { slider: Slider::HideDelay, value: 2500, min: 0, max: 5000, .. }
+        ));
+        assert!(r[k + 1].desc.is_some() && r[k + 2].desc.is_some());
+        assert_eq!(
+            r.iter().any(|r| matches!(r.control, Control::Choice { setting: Setting::Reveal, .. })),
+            crate::ui::PUSH_AVAILABLE
+        );
+        assert!(r
+            .iter()
+            .any(|r| matches!(r.control, Control::Toggle { setting: Setting::KeyboardChords, on: true, .. })));
+    }
+
+    #[test]
+    fn delay_sliders_snap_and_clamp() {
+        let mut c = Config::default();
+        set_slider(&mut c, Slider::ShowDelay, 1234);
+        assert_eq!(c.show_delay_ms, 1000);
+        set_slider(&mut c, Slider::ShowDelay, 73);
+        assert_eq!(c.show_delay_ms, 50);
+        set_slider(&mut c, Slider::HideDelay, 1234);
+        assert_eq!(c.hide_delay_ms, 1200);
+        set_slider(&mut c, Slider::HideDelay, 99999);
+        assert_eq!(c.hide_delay_ms, 5000);
+        set_slider(&mut c, Slider::HideDelay, -40);
+        assert_eq!(c.hide_delay_ms, 0);
+        assert_eq!(slider_value(&c, Slider::HideDelay), 0);
+    }
+
+    #[test]
+    fn reveal_choice_round_trips() {
+        let mut c = Config::default();
+        assert_eq!(selected(&c, Setting::Reveal, &[]), Some(0));
+        choose(&mut c, Setting::Reveal, 1, &[]);
+        assert_eq!(c.reveal, config::Reveal::Push);
+        assert_eq!(selected(&c, Setting::Reveal, &[]), Some(1));
+        choose(&mut c, Setting::Reveal, 0, &[]);
+        assert_eq!(c.reveal, config::Reveal::Dwell);
+    }
+
+    #[test]
+    fn keyboard_toggle_follows_the_defaults() {
+        let mut c = Config::default();
+        assert!(is_on(&c, Setting::KeyboardChords));
+        flip(&mut c, Setting::KeyboardChords);
+        assert_eq!(c.keyboard, config::KeyboardConfig { win_numbers: false, win_t: false, win_b: false, peek: false });
+        assert!(!is_on(&c, Setting::KeyboardChords));
+        flip(&mut c, Setting::KeyboardChords);
+        assert_eq!(c.keyboard, config::KeyboardConfig::default());
+        // One flag left on: the switch reads on, and a click turns the rest off.
+        c.keyboard = config::KeyboardConfig { win_numbers: false, win_t: false, win_b: true, peek: false };
+        assert!(is_on(&c, Setting::KeyboardChords));
+        flip(&mut c, Setting::KeyboardChords);
+        assert!(!is_on(&c, Setting::KeyboardChords));
     }
 
     #[test]
@@ -1843,6 +2011,20 @@ mod tests {
     }
 
     #[test]
+    fn exit_label_matches_the_power_menu() {
+        let st = idle();
+        let r = rows(Page::About, &Config::default(), &ctx(&[], &st));
+        let text = r
+            .iter()
+            .find_map(|r| match &r.control {
+                Control::Buttons(b) if b[0].action == Action::ExitDock => Some(b[0].text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(text, crate::popup_power::label(crate::popup_power::ID_EXIT));
+    }
+
+    #[test]
     fn about_page_rows() {
         let st = idle();
         let mut cx = ctx(&[], &st);
@@ -1987,12 +2169,70 @@ mod tests {
     #[test]
     fn launcher_rows_en_it() {
         // Every provider names its texts in both languages, and the provider table is the config's list.
-        let t = provider_texts();
-        assert_eq!(t.map(|p| p.0), config::LAUNCHER_PROVIDERS);
-        for (name, _, label, desc) in t {
-            for pair in [label, desc] {
-                assert!(!pair[0].is_empty() && !pair[1].is_empty(), "{name}");
-                assert_ne!(pair[0], pair[1], "{name}: the Italian text is not the English one");
+        let texts = provider_texts();
+        assert_eq!(texts.map(|p| p.0), config::LAUNCHER_PROVIDERS);
+        // (provider, label EN, label IT, description EN, description IT) as the table held them before the keyed strings.
+        let old = [
+            (
+                "apps",
+                "Apps",
+                "App",
+                "Installed apps and shortcuts. Always on",
+                "App installate e collegamenti. Sempre attivo",
+            ),
+            ("windows", "Open windows", "Finestre aperte", "Switch to a window", "Passa a una finestra"),
+            (
+                "files",
+                "Files",
+                "File",
+                "Names starting with the typed words, from the Windows Search index",
+                "Nomi che iniziano con le parole scritte, dall'indice di Windows Search",
+            ),
+            (
+                "settings",
+                "Windows settings",
+                "Impostazioni di Windows",
+                "Pages of the Settings app",
+                "Pagine dell'app Impostazioni",
+            ),
+            ("calc", "Calculator", "Calcolatrice", "Sums typed in the box", "Calcoli scritti nella casella"),
+            (
+                "commands",
+                "Commands",
+                "Comandi",
+                "Lock, sleep, restart and the other power commands",
+                "Blocca, sospendi, riavvia e gli altri comandi di alimentazione",
+            ),
+            ("run", "Run", "Esegui", "Start a typed command line", "Avvia una riga di comando scritta"),
+            (
+                "web",
+                "Web search",
+                "Ricerca sul web",
+                "Search the web with the engine below",
+                "Cerca sul web con il motore qui sotto",
+            ),
+            (
+                "datetime",
+                "Date and time",
+                "Data e ora",
+                "Today, the time, a date's weekday",
+                "Oggi, l'ora, il giorno di una data",
+            ),
+            (
+                "registry",
+                "Registry",
+                "Registro",
+                "Open a registry key in Regedit",
+                "Apri una chiave di registro in Regedit",
+            ),
+        ];
+        assert_eq!(texts.len(), old.len());
+        for ((name, _, label, desc), (old_name, label_en, label_it, desc_en, desc_it)) in texts.into_iter().zip(old) {
+            assert_eq!(name, old_name);
+            for (key, en, it) in [(label, label_en, label_it), (desc, desc_en, desc_it)] {
+                assert_eq!(crate::i18n::with_italian(false, || t(key)), en, "{name}");
+                assert_eq!(crate::i18n::with_italian(true, || t(key)), it, "{name}");
+                assert_ne!(en, it, "{name}: the Italian text is not the English one");
             }
         }
         // Every row of the page outside the providers has a description, but the ones that need none.

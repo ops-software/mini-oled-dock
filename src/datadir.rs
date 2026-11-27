@@ -43,49 +43,62 @@
 //!
 //! THREADING: everything is thread-safe (`OnceLock` state, no COM).
 
-use std::ffi::c_void;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use windows::core::{BOOL, GUID, HSTRING, PWSTR};
-use windows::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS, GENERIC_WRITE, HANDLE, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use oled_sys::datadir::RootInfo;
+// The mechanism lives in oled-sys; everything below keeps its old path through these re-exports.
+use oled_sys::datadir::{
+    checked_dir, classify, dir_facts, final_path, final_path_matches, handle_of, is_admin_sid, is_sid_string, open_dir,
+    read_capped, read_security, token_user_sid, OpenDir, SecDesc, Verdict, MASK_READ_EXECUTE,
 };
+pub use oled_sys::datadir::{
+    debug_out, is_admin_only_dir, is_plain_dir_name, known_folder, open_append, open_checked, open_checked_read_only,
+    read_file, write_atomic, FileAcl, ROOT_NAME,
+};
+
+use windows::core::{BOOL, HSTRING};
+use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows::Win32::Security::{
-    AclSizeInformation, GetAce, GetAclInformation, GetKernelObjectSecurity, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, GetTokenInformation, SetKernelObjectSecurity, TokenUser, ACE_HEADER, ACL,
-    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
-    CopyFileW, CreateDirectoryW, CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    MoveFileExW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GETFINALPATHNAMEBYHANDLE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL,
-    SYNCHRONIZE, VOLUME_NAME_DOS, WRITE_DAC,
+    CopyFileW, CreateDirectoryW, FileRenameInfo, MoveFileExW, SetFileInformationByHandle, DELETE,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, READ_CONTROL, SYNCHRONIZE,
 };
-use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
-use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, FOLDERID_ProgramData};
 
-/// Folder name under `%ProgramData%`.
-pub const ROOT_NAME: &str = "mini-oled-dock";
 const CACHE_NAME: &str = "cache";
 const ICONS_NAME: &str = "icons";
 /// `<root>\update\<tag>\`: staged releases (admin-only, inherited root DACL).
 const UPDATE_NAME: &str = "update";
+/// `<root>\suite`: the suite's shared files (theme.json, the manifest copy). Admin-only (inherited root DACL).
+const SUITE_NAME: &str = "suite";
+/// `<root>\journal`: the machine change journal. Admin-only (inherited root DACL).
+const JOURNAL_NAME: &str = "journal";
 /// The only files a staging folder holds: the release's two assets, the update guard's copy of the old
 /// exe and the mark of a rolled-back update (`update_release::GUARD_FILE`, `ROLLED_BACK_FILE`).
-const STAGE_FILES: [&str; 4] = ["dock.exe", "dock.exe.sha256", "dock-guard.exe", "rolled-back"];
+const STAGE_FILES: [&str; 13] = [
+    "dock.exe",
+    "dock.exe.sha256",
+    "dock-guard.exe",
+    "rolled-back",
+    // The suite's staged components, its manifest, and the marks of components that failed their selftest.
+    "suite.json",
+    "tasks.exe",
+    "tasks-admin.exe",
+    "files.exe",
+    "lang-it.lang",
+    "bad-tasks",
+    "bad-tasks-admin",
+    "bad-files",
+    "bad-lang-it",
+];
 
 /// Size caps of the files read into memory.
 pub const CONFIG_MAX_BYTES: u64 = 1024 * 1024;
@@ -95,26 +108,12 @@ pub const STATE_MAX_BYTES: u64 = 64;
 
 // ------------------------------------------------------------------ access masks (pure)
 
-/// SIDs trusted as owner/writer of the data folders.
-const SID_SYSTEM: &str = "S-1-5-18";
-const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
-
-/// Read + execute (list/traverse for folders): `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE` (0x1200a9).
-const MASK_READ_EXECUTE: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
-/// The user's ACE on `config.json`: read + write data, NOT delete, NOT WRITE_DAC (0x12019f).
-const MASK_CONFIG_USER: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
 /// The user's ACE on the `icons` folder itself: list (1), add file (2), read EA (8), traverse (0x20),
 /// read attributes (0x80), READ_CONTROL, SYNCHRONIZE. No add-subfolder, no delete-child, no WRITE_DAC.
 const MASK_ICONS_DIR_USER: u32 = 0x1 | 0x2 | 0x8 | 0x20 | 0x80 | READ_CONTROL.0 | SYNCHRONIZE.0;
 /// Inherit-only ACE for the files inside `icons`: read, write and delete them (so the user can replace
 /// or remove the PNGs they dropped). No WRITE_DAC beyond what the owner of a file implicitly has.
 const MASK_ICONS_FILE_USER: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | DELETE.0;
-
-/// Rights that let a trustee change a folder/file or its entries: write data / add file (0x2),
-/// append / add subfolder (0x4), write EA (0x10), delete child (0x40), write attributes (0x100),
-/// DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE, GENERIC_ALL.
-const MASK_WRITE_LIKE: u32 =
-    0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
 
 /// SDDL of the root: owner Administrators, protected DACL, inheritable to files and subfolders.
 fn root_sddl() -> String {
@@ -127,13 +126,6 @@ fn user_cache_sddl(user: &str) -> Option<String> {
     is_sid_string(user).then(|| format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;{user})"))
 }
 
-/// SDDL of `config.json`: like the root (not inheritable: it is a file) plus read + write data for `user`.
-fn config_sddl(user: &str) -> Option<String> {
-    is_sid_string(user).then(|| {
-        format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x{MASK_READ_EXECUTE:x};;;BU)(A;;0x{MASK_CONFIG_USER:x};;;{user})")
-    })
-}
-
 /// SDDL of `icons\`: the root ACEs plus "add files" on the folder and an inherit-only ACE that gives
 /// `user` read/write/delete on the files created inside.
 fn icons_sddl(user: &str) -> Option<String> {
@@ -143,97 +135,6 @@ fn icons_sddl(user: &str) -> Option<String> {
              (A;;0x{MASK_ICONS_DIR_USER:x};;;{user})(A;OIIO;0x{MASK_ICONS_FILE_USER:x};;;{user})"
         )
     })
-}
-
-/// true if `s` looks like a string SID (`S-1-<n>[-<n>...]`, non-empty decimal parts only): it is
-/// spliced into SDDL, so nothing else may get through. Pure.
-fn is_sid_string(s: &str) -> bool {
-    s.len() <= 200
-        && s.strip_prefix("S-1-")
-            .is_some_and(|rest| rest.split('-').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
-}
-
-/// true if `sid` is SYSTEM or the Administrators group. Pure.
-fn is_admin_sid(sid: &str) -> bool {
-    sid.eq_ignore_ascii_case(SID_SYSTEM) || sid.eq_ignore_ascii_case(SID_ADMINISTRATORS)
-}
-
-/// One ACE of a DACL, reduced to what the checks need.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AceFacts {
-    /// Deny ACE (any deny type): it can only remove rights, so it never makes a folder unsafe.
-    pub deny: bool,
-    /// Trustee as string SID; `None` for ACE types whose layout is not parsed (treated as untrusted).
-    pub sid: Option<String>,
-    pub mask: u32,
-}
-
-/// true if the DACL grants no write-like right to anyone but SYSTEM/Administrators. A NULL DACL
-/// (`None`) grants everything to everyone. Inherit-only ACEs count too (they reach the children). Pure.
-pub(crate) fn dacl_admin_only(dacl: Option<&[AceFacts]>) -> bool {
-    let Some(aces) = dacl else { return false };
-    aces.iter().all(|a| a.deny || a.mask & MASK_WRITE_LIKE == 0 || a.sid.as_deref().is_some_and(is_admin_sid))
-}
-
-/// What was found at a data folder path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DirFacts {
-    pub is_dir: bool,
-    pub is_reparse: bool,
-    /// `Some(true)` = owned by SYSTEM/Administrators; `None` = owner unreadable.
-    pub owner_trusted: Option<bool>,
-    pub admin_only: bool,
-}
-
-/// Decision about an existing data folder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Verdict {
-    /// Safe as is.
-    Use,
-    /// Admin-owned real folder with a DACL that lets non-admins write. The root is then moved aside
-    /// and recreated (its children may have been planted); a subfolder of a verified root only gets
-    /// the protected DACL re-applied.
-    RepairDacl,
-    /// Not owned by an admin (squatting): never used; may be renamed away.
-    Hostile,
-    /// Admin-owned but not usable (reparse point, not a folder, or a bad DACL we may not fix).
-    Refuse,
-}
-
-/// Pure decision for a folder that already exists. `can_repair` = elevated (owner-admin can fix the DACL).
-pub(crate) fn classify(f: &DirFacts, can_repair: bool) -> Verdict {
-    if f.owner_trusted != Some(true) {
-        return Verdict::Hostile;
-    }
-    if f.is_reparse || !f.is_dir {
-        return Verdict::Refuse;
-    }
-    match (f.admin_only, can_repair) {
-        (true, _) => Verdict::Use,
-        (false, true) => Verdict::RepairDacl,
-        (false, false) => Verdict::Refuse,
-    }
-}
-
-/// Checks the attributes of an opened file: refuses reparse points, folders and (if `single_link`)
-/// files with more than one hard link. Pure.
-pub(crate) fn check_regular(attrs: u32, links: u32, single_link: bool) -> Result<(), &'static str> {
-    if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        Err("it is a reparse point (symlink or junction)")
-    } else if attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
-        Err("it is a folder")
-    } else if single_link && links != 1 {
-        Err("it has more than one hard link")
-    } else {
-        Ok(())
-    }
-}
-
-/// true if `final_path` (from `GetFinalPathNameByHandleW` on the opened file) is exactly
-/// `<dir_final>\<name>` (case-insensitive). Pure.
-pub(crate) fn final_path_matches(final_path: &str, dir_final: &str, name: &str) -> bool {
-    let expected = format!("{}\\{}", dir_final.trim_end_matches('\\'), name);
-    final_path.to_lowercase() == expected.to_lowercase()
 }
 
 // ------------------------------------------------------------------ state
@@ -267,7 +168,10 @@ pub fn init() -> Vec<String> {
     }
     let mut notes = Vec::new();
     let r = init_root(&mut notes);
+    let info =
+        r.as_ref().map(|r| RootInfo { path: r.path.clone(), writable: r.writable, user_sid: r.user_sid.clone() });
     let _ = ROOT.set(r);
+    oled_sys::datadir::register(info);
     for n in &notes {
         debug_out(n);
     }
@@ -316,17 +220,40 @@ pub fn state_path() -> Option<PathBuf> {
     root_ref().map(|r| r.path.join("taskbar-state"))
 }
 
+/// `<root>\safe-mode`: the mark of safe mode (J1d).
+#[allow(dead_code)] // read by J1d and U1
+pub fn safe_mode_path() -> Option<PathBuf> {
+    root_ref().map(|r| safe_mode_in(&r.path))
+}
+
+/// `<root>\update\suite.lock`: the lock of one suite sync at a time (U1).
+#[allow(dead_code)] // read by J1d and U1
+pub fn update_lock_path() -> Option<PathBuf> {
+    root_ref().map(|r| update_lock_in(&r.path))
+}
+
+/// `<root>\update.jnl`: the update journal (J1, Scope::Machine format).
+#[allow(dead_code)] // read by J1d and U1
+pub fn update_journal_path() -> Option<PathBuf> {
+    root_ref().map(|r| update_journal_in(&r.path))
+}
+
+fn safe_mode_in(root: &Path) -> PathBuf {
+    root.join("safe-mode")
+}
+
+fn update_lock_in(root: &Path) -> PathBuf {
+    root.join(UPDATE_NAME).join("suite.lock")
+}
+
+fn update_journal_in(root: &Path) -> PathBuf {
+    root.join("update.jnl")
+}
+
 /// Old data folder `%LOCALAPPDATA%\Dock` (medium-writable: only read, for the one-time migration).
 /// Works without `init()`.
 pub fn legacy_dir() -> Option<PathBuf> {
     known_folder(&FOLDERID_LocalAppData).map(|p| p.join("Dock"))
-}
-
-/// Sends a line to the debugger output (DebugView): the fallback when there is no log file.
-pub fn debug_out(msg: &str) {
-    let s = HSTRING::from(format!("mini-oled-dock: {msg}\n"));
-    // SAFETY: `s` is a NUL-terminated wide string that lives for the call.
-    unsafe { OutputDebugStringW(&s) };
 }
 
 // ------------------------------------------------------------------ init
@@ -370,7 +297,19 @@ fn init_root(notes: &mut Vec<String>) -> Option<Root> {
     let cache_ok = ensure_subdir(&path.join(CACHE_NAME), None, elevated, notes).is_some();
     let icons_sd = user_sid.as_deref().and_then(icons_sddl);
     let icons_final = ensure_subdir(&path.join(ICONS_NAME), icons_sd.as_deref(), elevated, notes);
+    ensure_plumbing_dirs(&path, elevated, notes);
     Some(Root { path, writable: elevated, cache_ok, icons_final, user_sid, previous_final })
+}
+
+/// Elevated only: creates (or verifies) `suite\` and `journal\`, which inherit the root DACL like `cache\`. A process that is
+/// not elevated never creates them (and says nothing: an older root simply has none yet).
+fn ensure_plumbing_dirs(root: &Path, elevated: bool, notes: &mut Vec<String>) {
+    if !elevated {
+        return;
+    }
+    for name in [SUITE_NAME, JOURNAL_NAME] {
+        let _ = ensure_subdir(&root.join(name), None, true, notes);
+    }
 }
 
 /// Elevated: creates the root with the protected DACL or validates the existing one. A hostile
@@ -505,51 +444,6 @@ fn ensure_subdir(path: &Path, sddl: Option<&str>, elevated: bool, notes: &mut Ve
 
 // ------------------------------------------------------------------ file I/O
 
-/// Who may change a file written by `write_atomic`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileAcl {
-    /// Inherit the folder's DACL (admin-only inside the root).
-    Inherit,
-    /// `config.json`: explicit protected DACL with the token user's read + write-data ACE.
-    UserEditable,
-}
-
-/// Opens `path` for reading WITHOUT following reparse points and checks it is a regular file
-/// (single hard link if `single_link`). Errors keep `NotFound` for a missing file.
-pub(crate) fn open_checked(path: &Path, single_link: bool) -> io::Result<File> {
-    open_checked_shared(path, single_link, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-}
-
-/// `open_checked` with read sharing only: while the handle is open nobody can open the file for writing, truncate,
-/// rename or delete it (a file mapped from it can never change under its reader, L3 T19).
-pub(crate) fn open_checked_read_only(path: &Path, single_link: bool) -> io::Result<File> {
-    open_checked_shared(path, single_link, FILE_SHARE_READ)
-}
-
-fn open_checked_shared(path: &Path, single_link: bool, share: FILE_SHARE_MODE) -> io::Result<File> {
-    let f =
-        OpenOptions::new().read(true).share_mode(share.0).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0).open(path)?;
-    let info = file_info(&f)?;
-    check_regular(info.dwFileAttributes, info.nNumberOfLinks, single_link)
-        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
-    Ok(f)
-}
-
-fn read_capped(f: File, cap: u64) -> io::Result<Vec<u8>> {
-    let mut v = Vec::new();
-    f.take(cap + 1).read_to_end(&mut v)?;
-    if v.len() as u64 > cap {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("larger than {cap} bytes")));
-    }
-    Ok(v)
-}
-
-/// Reads a whole file (at most `cap` bytes) through a handle opened without following reparse
-/// points; refuses reparse points, folders and (if `single_link`) hard-linked files.
-pub fn read_file(path: &Path, cap: u64, single_link: bool) -> io::Result<Vec<u8>> {
-    read_capped(open_checked(path, single_link)?, cap)
-}
-
 /// Reads the custom icon `<root>\icons\<name>` (the user can create entries there): plain name only,
 /// opened without following reparse points, single-link regular file, final path exactly
 /// `<icons>\<name>`, at most `ICON_MAX_BYTES`. The bytes are decoded by the caller from memory.
@@ -573,15 +467,6 @@ pub fn read_icon(name: &str) -> io::Result<Vec<u8>> {
 
 // ------------------------------------------------------------------ update staging
 
-/// true for a staging folder name: 1..=32 chars of `[A-Za-z0-9.]`, not starting with `.`, no `..`.
-/// Pure. Canonical release tags (`v1.4.0`) pass; separators, drive colons and spaces never do.
-pub(crate) fn is_plain_dir_name(s: &str) -> bool {
-    (1..=32).contains(&s.len())
-        && !s.starts_with('.')
-        && !s.contains("..")
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
-}
-
 /// The verified root, only if this process may write in it (elevated).
 fn writable_root() -> Result<&'static Root, String> {
     root_ref().filter(|r| r.writable).ok_or_else(|| "no writable data folder".to_string())
@@ -596,24 +481,6 @@ fn check_stage_names(tag: &str, name: Option<&str>) -> Result<(), String> {
         Some(n) if !STAGE_FILES.contains(&n) => Err(format!("{n:?} is not a staging file")),
         _ => Ok(()),
     }
-}
-
-/// An existing folder that must classify `Use` as is (admin-owned, admin-only, not a reparse point);
-/// returns its final path. Nothing is repaired here.
-fn checked_dir(path: &Path) -> Result<String, String> {
-    let shown = path.display();
-    let dir = open_dir(path, false).map_err(|e| format!("cannot open {shown}: {e}"))?;
-    let facts = dir_facts(&dir).map_err(|e| format!("cannot inspect {shown}: {e}"))?;
-    match classify(&facts, false) {
-        Verdict::Use => final_path(handle_of(&dir.handle)).ok_or_else(|| format!("{shown}: final path unavailable")),
-        v => Err(format!("{shown} is not usable ({v:?})")),
-    }
-}
-
-/// true for an existing folder no non-admin can write in: it classifies `Use` as is (a real folder, admin-owned, with an
-/// admin-only DACL). `update::child_exe` asks it of the running exe's folder.
-pub(crate) fn is_admin_only_dir(path: &Path) -> bool {
-    checked_dir(path).is_ok()
 }
 
 /// `<root>\update`, which must already exist and be admin-only.
@@ -831,330 +698,7 @@ pub fn read_previous_config() -> Result<Option<Vec<u8>>, String> {
     read_capped(f, CONFIG_MAX_BYTES).map(Some).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Atomic write: `<path>.tmp` is created NEW (never through an existing name or link) with the
-/// requested DACL, written, flushed, then renamed over `path` (a rename replaces the directory
-/// entry, it never follows a link at the destination). Chosen over an in-place truncate+write
-/// because the file is never seen half-written and the DACL travels with the new file.
-pub fn write_atomic(path: &Path, bytes: &[u8], acl: FileAcl) -> Result<(), String> {
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    // A stale temp (crash): deleting a name removes the link itself, never a link target.
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("removing {}: {e}", tmp.display())),
-    }
-    let sddl = match acl {
-        FileAcl::Inherit => None,
-        FileAcl::UserEditable => root_ref().and_then(|r| r.user_sid.as_deref()).and_then(config_sddl),
-    };
-    let sd = sddl.as_deref().map(SecDesc::from_sddl).transpose()?;
-    let sa = sd.as_ref().map(|sd| SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0 .0,
-        bInheritHandle: BOOL(0),
-    });
-    let wide = HSTRING::from(tmp.as_os_str());
-    // SAFETY: `wide` is NUL-terminated; `sa` (and the descriptor it points to, owned by `sd`) outlive
-    // the call. CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT never opens an existing name or link.
-    let h = unsafe {
-        CreateFileW(
-            &wide,
-            GENERIC_WRITE.0,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
-            sa.as_ref().map(|s| s as *const SECURITY_ATTRIBUTES),
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-    }
-    .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
-    // SAFETY: `h` is a valid file handle just returned by CreateFileW and owned by nobody else.
-    let mut f = File::from(unsafe { OwnedHandle::from_raw_handle(h.0) });
-    let res = f.write_all(bytes).and_then(|()| f.sync_all());
-    drop(f);
-    if let Err(e) = res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("writing {}: {e}", tmp.display()));
-    }
-    let (src, dst) = (HSTRING::from(tmp.as_os_str()), HSTRING::from(path.as_os_str()));
-    // SAFETY: both strings are NUL-terminated and live for the call.
-    if let Err(e) = unsafe { MoveFileExW(&src, &dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("replacing {}: {e}", path.display()));
-    }
-    Ok(())
-}
-
-/// Opens `path` for appending (creating it if missing) without following reparse points; if the
-/// name is a link or a hard-linked file it is deleted (the name only) and created fresh once.
-pub fn open_append(path: &Path) -> Option<File> {
-    for _ in 0..2 {
-        let f = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(path)
-            .ok()?;
-        let ok = file_info(&f).is_ok_and(|i| check_regular(i.dwFileAttributes, i.nNumberOfLinks, true).is_ok());
-        if ok {
-            return Some(f);
-        }
-        drop(f);
-        // Deleting a name never touches the target of a link.
-        std::fs::remove_file(path).ok()?;
-    }
-    None
-}
-
 // ------------------------------------------------------------------ Win32 helpers
-
-fn handle_of<T: AsRawHandle>(h: &T) -> HANDLE {
-    HANDLE(h.as_raw_handle())
-}
-
-fn file_info<T: AsRawHandle>(h: &T) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: valid open handle; `info` is a writable struct of the declared type.
-    unsafe { GetFileInformationByHandle(handle_of(h), &mut info) }.map_err(io::Error::other)?;
-    Ok(info)
-}
-
-/// Final normalized DOS path of an open handle (`\\?\C:\...`).
-fn final_path(h: HANDLE) -> Option<String> {
-    let mut buf = vec![0u16; 512];
-    for _ in 0..2 {
-        // SAFETY: `h` is a valid handle; `buf` is writable for its whole length.
-        let n = unsafe {
-            GetFinalPathNameByHandleW(
-                h,
-                &mut buf,
-                GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0),
-            )
-        } as usize;
-        if n == 0 {
-            return None;
-        }
-        if n < buf.len() {
-            return Some(String::from_utf16_lossy(&buf[..n]));
-        }
-        buf = vec![0u16; n + 1];
-    }
-    None
-}
-
-/// Opened folder (or whatever is at the path: reparse points are not followed).
-struct OpenDir {
-    handle: OwnedHandle,
-    /// The handle has READ_CONTROL (owner/DACL readable).
-    can_read_sd: bool,
-}
-
-fn open_raw(path: &Path, access: u32) -> windows::core::Result<OwnedHandle> {
-    let wide = HSTRING::from(path.as_os_str());
-    // SAFETY: `wide` is NUL-terminated and lives for the call; BACKUP_SEMANTICS opens folders and
-    // OPEN_REPARSE_POINT opens a junction/symlink itself instead of its target.
-    let h = unsafe {
-        CreateFileW(
-            &wide,
-            access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-    }?;
-    // SAFETY: fresh valid handle, ownership transferred to the OwnedHandle.
-    Ok(unsafe { OwnedHandle::from_raw_handle(h.0) })
-}
-
-/// Opens a data folder. `for_write` (elevated): tries to also get WRITE_DAC + DELETE (repair,
-/// rename away), falling back to read-only access, and finally to DELETE alone (owner unreadable).
-fn open_dir(path: &Path, for_write: bool) -> Result<OpenDir, String> {
-    let ra = FILE_READ_ATTRIBUTES.0;
-    let rc = READ_CONTROL.0;
-    let attempts: &[u32] = if for_write {
-        &[rc | WRITE_DAC.0 | DELETE.0 | ra, rc | WRITE_DAC.0 | ra, rc | ra, DELETE.0 | ra]
-    } else {
-        &[rc | ra]
-    };
-    let mut last = String::new();
-    for &access in attempts {
-        match open_raw(path, access) {
-            Ok(handle) => return Ok(OpenDir { handle, can_read_sd: access & rc != 0 }),
-            Err(e) => last = e.to_string(),
-        }
-    }
-    Err(last)
-}
-
-fn dir_facts(d: &OpenDir) -> Result<DirFacts, String> {
-    let info = file_info(&d.handle).map_err(|e| e.to_string())?;
-    let attrs = info.dwFileAttributes;
-    let (owner_trusted, admin_only) = if d.can_read_sd {
-        let sec = read_security(handle_of(&d.handle))?;
-        (Some(sec.owner.as_deref().is_some_and(is_admin_sid)), dacl_admin_only(sec.dacl.as_deref()))
-    } else {
-        (None, false)
-    };
-    Ok(DirFacts {
-        is_dir: attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
-        is_reparse: attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
-        owner_trusted,
-        admin_only,
-    })
-}
-
-struct SecInfo {
-    owner: Option<String>,
-    /// `None` = NULL DACL.
-    dacl: Option<Vec<AceFacts>>,
-}
-
-/// Owner and DACL of an open handle (needs READ_CONTROL).
-fn read_security(h: HANDLE) -> Result<SecInfo, String> {
-    let what = (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION).0;
-    let mut needed = 0u32;
-    // SAFETY: size query with no buffer; `needed` is writable. The expected "buffer too small" error is ignored.
-    let _ = unsafe { GetKernelObjectSecurity(h, what, None, 0, &mut needed) };
-    if needed == 0 {
-        return Err("GetKernelObjectSecurity: no size".into());
-    }
-    // u64 storage: the self-relative descriptor needs pointer alignment.
-    let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
-    let sd = PSECURITY_DESCRIPTOR(buf.as_mut_ptr().cast());
-    // SAFETY: `buf` holds at least `needed` writable bytes; `h` is a valid handle.
-    unsafe { GetKernelObjectSecurity(h, what, Some(sd), needed, &mut needed) }
-        .map_err(|e| format!("GetKernelObjectSecurity: {e}"))?;
-    let mut owner = PSID::default();
-    let mut defaulted = BOOL(0);
-    // SAFETY: `sd` is the valid self-relative descriptor in `buf`; out-params are writable. The returned
-    // SID points into `buf`, which outlives its use below.
-    unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) }.map_err(|e| format!("owner: {e}"))?;
-    let owner = sid_string(owner);
-    let mut present = BOOL(0);
-    let mut acl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: as above; the ACL pointer points into `buf`.
-    unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) }
-        .map_err(|e| format!("dacl: {e}"))?;
-    let dacl = if present.as_bool() && !acl.is_null() { Some(read_aces(acl)?) } else { None };
-    drop(buf);
-    Ok(SecInfo { owner, dacl })
-}
-
-/// ACE type codes (winnt.h) of the deny family: plain, object, callback, callback-object.
-const DENY_ACE_TYPES: [u8; 4] = [1, 6, 10, 12];
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-
-fn read_aces(acl: *const ACL) -> Result<Vec<AceFacts>, String> {
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: `acl` is a valid ACL (from a valid descriptor); `info` is writable and sized as declared.
-    unsafe {
-        GetAclInformation(
-            acl,
-            (&mut info as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-    }
-    .map_err(|e| format!("GetAclInformation: {e}"))?;
-    let mut out = Vec::with_capacity(info.AceCount as usize);
-    for i in 0..info.AceCount {
-        let mut p: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `i` < AceCount; `p` is writable.
-        unsafe { GetAce(acl, i, &mut p) }.map_err(|e| format!("GetAce: {e}"))?;
-        if p.is_null() {
-            return Err("GetAce: null".into());
-        }
-        // SAFETY: every ACE starts with ACE_HEADER followed by the 32-bit access mask (all ACE types);
-        // unaligned reads avoid any alignment assumption.
-        let (hdr, mask) = unsafe {
-            (
-                std::ptr::read_unaligned(p.cast::<ACE_HEADER>()),
-                std::ptr::read_unaligned(p.cast::<u8>().add(4).cast::<u32>()),
-            )
-        };
-        let deny = DENY_ACE_TYPES.contains(&hdr.AceType);
-        let sid = if hdr.AceType == ACCESS_ALLOWED_ACE_TYPE || hdr.AceType == DENY_ACE_TYPES[0] {
-            // SAFETY: ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE: header (4) + mask (4) + SID.
-            sid_string(PSID(unsafe { p.cast::<u8>().add(8) }.cast()))
-        } else {
-            None
-        };
-        out.push(AceFacts { deny, sid, mask });
-    }
-    Ok(out)
-}
-
-/// String form of a SID (`S-1-...`).
-fn sid_string(sid: PSID) -> Option<String> {
-    if sid.0.is_null() {
-        return None;
-    }
-    let mut s = PWSTR::null();
-    // SAFETY: `sid` points to a valid SID; `s` receives a LocalAlloc'd string freed below.
-    unsafe { ConvertSidToStringSidW(sid, &mut s) }.ok()?;
-    // SAFETY: `s` is a valid NUL-terminated string returned by the call above.
-    let out = unsafe { s.to_string() }.ok();
-    // SAFETY: allocated by ConvertSidToStringSidW with LocalAlloc; not used afterwards.
-    unsafe { LocalFree(Some(HLOCAL(s.0.cast()))) };
-    out
-}
-
-/// Token user of this process as string SID (the account whose desktop the dock serves).
-fn token_user_sid() -> Option<String> {
-    let mut token = HANDLE::default();
-    // SAFETY: pseudo-handle of the current process; `token` is writable.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
-    // SAFETY: fresh valid token handle, closed when `_owned` drops.
-    let _owned = unsafe { OwnedHandle::from_raw_handle(token.0) };
-    let mut len = 0u32;
-    // SAFETY: size query; `len` is writable. The expected "buffer too small" error is ignored.
-    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
-    if (len as usize) < std::mem::size_of::<TOKEN_USER>() {
-        return None;
-    }
-    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-    // SAFETY: `buf` holds at least `len` writable, pointer-aligned bytes.
-    unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) }.ok()?;
-    // SAFETY: the buffer now starts with a TOKEN_USER whose SID points inside `buf` (alive here).
-    let tu = unsafe { std::ptr::read(buf.as_ptr().cast::<TOKEN_USER>()) };
-    sid_string(tu.User.Sid)
-}
-
-pub(crate) fn known_folder(id: &GUID) -> Option<PathBuf> {
-    // SAFETY: `id` is a valid KNOWNFOLDERID; no token = current user. The PWSTR is freed below.
-    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.ok()?;
-    // SAFETY: `p` is a NUL-terminated string returned by the call above.
-    let s = unsafe { p.to_string() }.ok();
-    // SAFETY: allocated with CoTaskMemAlloc by SHGetKnownFolderPath; not used afterwards.
-    unsafe { CoTaskMemFree(Some(p.0 as *const c_void)) };
-    s.filter(|s| !s.is_empty()).map(PathBuf::from)
-}
-
-/// Self-relative security descriptor built from SDDL (LocalFree'd on drop).
-struct SecDesc(PSECURITY_DESCRIPTOR);
-
-impl SecDesc {
-    fn from_sddl(sddl: &str) -> Result<SecDesc, String> {
-        let wide = HSTRING::from(sddl);
-        let mut sd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: `wide` is NUL-terminated; `sd` receives a LocalAlloc'd descriptor owned by the result.
-        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(&wide, SDDL_REVISION_1, &mut sd, None) }
-            .map_err(|e| format!("SDDL: {e}"))?;
-        Ok(SecDesc(sd))
-    }
-}
-
-impl Drop for SecDesc {
-    fn drop(&mut self) {
-        // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW; freed once.
-        unsafe { LocalFree(Some(HLOCAL(self.0 .0))) };
-    }
-}
 
 /// `CreateDirectoryW` with the descriptor of `sddl` (or inherited ACEs if `None`). Atomic: the folder
 /// never exists with a weaker DACL.
@@ -1165,7 +709,7 @@ fn create_dir(path: &Path, sddl: Option<&str>) -> windows::core::Result<()> {
     };
     let sa = sd.as_ref().map(|sd| SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0 .0,
+        lpSecurityDescriptor: sd.as_ptr().0,
         bInheritHandle: BOOL(0),
     });
     let wide = HSTRING::from(path.as_os_str());
@@ -1180,13 +724,16 @@ fn set_dacl(d: &OpenDir, sddl: &str) -> Result<(), String> {
     let h = handle_of(&d.handle);
     // SAFETY: valid handle (opened with WRITE_DAC when possible, otherwise the call fails) and a
     // valid descriptor that lives for the call.
-    let r =
-        unsafe { SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sd.0) };
+    let r = unsafe {
+        SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sd.as_ptr())
+    };
     match r {
         Ok(()) => Ok(()),
         // The descriptor itself carries SE_DACL_PROTECTED ("D:P"): retry without the extra flag.
         // SAFETY: as above.
-        Err(_) => unsafe { SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, sd.0) }.map_err(|e| e.to_string()),
+        Err(_) => {
+            unsafe { SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, sd.as_ptr()) }.map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -1227,52 +774,63 @@ fn rename_away(d: &OpenDir, path: &Path, tag: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn allow(sid: &str, mask: u32) -> AceFacts {
-        AceFacts { deny: false, sid: Some(sid.into()), mask }
-    }
+    use oled_sys::datadir::{config_sddl, SID_ADMINISTRATORS, SID_SYSTEM};
+    use windows::Win32::Storage::FileSystem::WRITE_DAC;
 
     #[test]
-    fn stage_files_are_the_updater_files_only() {
-        for n in ["dock.exe", "dock.exe.sha256", "dock-guard.exe", "rolled-back"] {
-            assert!(check_stage_names("v1.5.1", Some(n)).is_ok(), "{n}");
-        }
-        for n in ["dock-guard.exe.bak", "x.exe", ""] {
-            assert!(check_stage_names("v1.5.1", Some(n)).is_err(), "{n:?}");
-        }
-        assert!(STAGE_FILES.contains(&crate::update_release::GUARD_FILE));
-        assert!(STAGE_FILES.contains(&crate::update_release::ROLLED_BACK_FILE));
-    }
-
-    #[test]
-    fn masks_match_the_documented_values() {
-        assert_eq!(MASK_READ_EXECUTE, 0x1200a9);
-        assert_eq!(MASK_CONFIG_USER, 0x12019f);
-        // The config ACE must not allow delete, WRITE_DAC or WRITE_OWNER.
-        assert_eq!(MASK_CONFIG_USER & (DELETE.0 | WRITE_DAC.0 | 0x0008_0000), 0);
+    fn icons_masks_match_the_documented_values() {
         // The icons folder ACE: add file but no add-subfolder (0x4), delete-child (0x40) or WRITE_DAC.
         assert_ne!(MASK_ICONS_DIR_USER & 0x2, 0);
         assert_eq!(MASK_ICONS_DIR_USER & (0x4 | 0x40 | DELETE.0 | WRITE_DAC.0), 0);
         assert_eq!(MASK_ICONS_FILE_USER & WRITE_DAC.0, 0);
-        assert_eq!(MASK_READ_EXECUTE & MASK_WRITE_LIKE, 0);
     }
 
     #[test]
-    fn sddl_strings() {
+    fn root_and_icons_sddl_strings() {
         assert_eq!(root_sddl(), "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)");
         let sid = "S-1-5-21-1-2-3-1001";
-        assert_eq!(
-            config_sddl(sid).as_deref(),
-            Some("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)(A;;0x12019f;;;S-1-5-21-1-2-3-1001)")
-        );
         let icons = icons_sddl(sid).unwrap_or_default();
         assert!(icons.starts_with("O:BAD:P(A;OICI;FA;;;SY)"));
         assert!(icons.contains("(A;;0x1200ab;;;S-1-5-21-1-2-3-1001)"));
         assert!(icons.contains("(A;OIIO;0x13019f;;;S-1-5-21-1-2-3-1001)"));
-        // SDDL injection through the SID is impossible.
-        assert!(config_sddl("S-1-5)(A;;FA;;;WD").is_none());
         assert!(icons_sddl("WD").is_none());
-        assert!(config_sddl("").is_none());
+    }
+
+    #[test]
+    fn sddl_strings_parse() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        for s in [Some(root_sddl()), config_sddl(sid), icons_sddl(sid)] {
+            let s = s.unwrap_or_default();
+            assert!(SecDesc::from_sddl(&s).is_ok(), "{s}");
+        }
+    }
+
+    #[test]
+    fn stage_files_are_the_updater_files_only() {
+        for n in [
+            "dock.exe",
+            "dock.exe.sha256",
+            "dock-guard.exe",
+            "rolled-back",
+            "suite.json",
+            "tasks.exe",
+            "tasks-admin.exe",
+            "files.exe",
+            "lang-it.lang",
+            "bad-tasks",
+            "bad-tasks-admin",
+            "bad-files",
+            "bad-lang-it",
+        ] {
+            assert!(check_stage_names("v1.5.1", Some(n)).is_ok(), "{n}");
+        }
+        assert_eq!(STAGE_FILES.len(), 13);
+        for n in ["dock-guard.exe.bak", "x.exe", "", "suite.json.tmp", "bad-dock", "lang-it.lang.new", "tasks.prev.exe"]
+        {
+            assert!(check_stage_names("v1.5.1", Some(n)).is_err(), "{n:?}");
+        }
+        assert!(STAGE_FILES.contains(&crate::update_release::GUARD_FILE));
+        assert!(STAGE_FILES.contains(&crate::update_release::ROLLED_BACK_FILE));
     }
 
     #[test]
@@ -1289,85 +847,6 @@ mod tests {
         }
         // Unit tests never call init(): nothing is created.
         assert!(user_cache_dir(sid).is_err());
-    }
-
-    #[test]
-    fn sid_strings() {
-        assert!(is_sid_string("S-1-5-18"));
-        assert!(!is_sid_string("S-1-"));
-        assert!(is_admin_sid("S-1-5-32-544") && is_admin_sid("s-1-5-18"));
-        assert!(!is_admin_sid("S-1-5-32-545") && !is_admin_sid("S-1-5-21-1-2-3-1001"));
-    }
-
-    #[test]
-    fn dacl_checks() {
-        let ours = [allow(SID_SYSTEM, 0x1f01ff), allow(SID_ADMINISTRATORS, 0x1f01ff), allow("S-1-5-32-545", 0x1200a9)];
-        assert!(dacl_admin_only(Some(&ours)));
-        // NULL DACL = full access for everyone.
-        assert!(!dacl_admin_only(None));
-        // ProgramData's default: Users may create folders / append (0x4) and write data (0x2).
-        assert!(!dacl_admin_only(Some(&[allow("S-1-5-32-545", 0x1200a9 | 0x6)])));
-        // CREATOR OWNER full control (inherit-only) is still a writer.
-        assert!(!dacl_admin_only(Some(&[allow("S-1-3-0", 0x1000_0000)])));
-        for m in [0x2, 0x4, 0x10, 0x40, 0x100, 0x1_0000, 0x4_0000, 0x8_0000, 0x4000_0000, 0x1000_0000] {
-            assert!(!dacl_admin_only(Some(&[allow("S-1-1-0", m)])), "{m:#x}");
-        }
-        // Deny ACEs never weaken; unknown ACE types with write rights do.
-        assert!(dacl_admin_only(Some(&[AceFacts { deny: true, sid: None, mask: 0x1f01ff }])));
-        assert!(!dacl_admin_only(Some(&[AceFacts { deny: false, sid: None, mask: 0x2 }])));
-        assert!(dacl_admin_only(Some(&[AceFacts { deny: false, sid: None, mask: 0x1200a9 }])));
-    }
-
-    #[test]
-    fn classify_decisions() {
-        let good = DirFacts { is_dir: true, is_reparse: false, owner_trusted: Some(true), admin_only: true };
-        assert_eq!(classify(&good, true), Verdict::Use);
-        assert_eq!(classify(&good, false), Verdict::Use);
-        let loose = DirFacts { admin_only: false, ..good };
-        assert_eq!(classify(&loose, true), Verdict::RepairDacl);
-        assert_eq!(classify(&loose, false), Verdict::Refuse);
-        // Squatting: owned by a user, or owner unreadable, whatever else it is.
-        for owner in [Some(false), None] {
-            assert_eq!(classify(&DirFacts { owner_trusted: owner, ..good }, true), Verdict::Hostile);
-            let junction = DirFacts { owner_trusted: owner, is_reparse: true, ..good };
-            assert_eq!(classify(&junction, true), Verdict::Hostile);
-        }
-        // Admin-owned junction or file: refused, never repaired.
-        assert_eq!(classify(&DirFacts { is_reparse: true, ..good }, true), Verdict::Refuse);
-        assert_eq!(classify(&DirFacts { is_dir: false, ..good }, true), Verdict::Refuse);
-    }
-
-    #[test]
-    fn regular_file_checks() {
-        let normal = FILE_ATTRIBUTE_NORMAL.0;
-        assert!(check_regular(normal, 1, true).is_ok());
-        assert!(check_regular(normal, 2, false).is_ok());
-        assert!(check_regular(normal, 2, true).is_err());
-        assert!(check_regular(normal | FILE_ATTRIBUTE_REPARSE_POINT.0, 1, true).is_err());
-        assert!(check_regular(FILE_ATTRIBUTE_DIRECTORY.0, 1, false).is_err());
-    }
-
-    #[test]
-    fn final_path_checks() {
-        let dir = r"\\?\C:\ProgramData\mini-oled-dock\icons";
-        assert!(final_path_matches(r"\\?\C:\ProgramData\mini-oled-dock\icons\a.png", dir, "a.png"));
-        assert!(final_path_matches(r"\\?\c:\programdata\MINI-OLED-DOCK\Icons\A.PNG", dir, "a.png"));
-        assert!(final_path_matches(r"\\?\C:\ProgramData\mini-oled-dock\icons\a.png", &format!("{dir}\\"), "a.png"));
-        // Redirected (hard link elsewhere, symlinked parent, short-name trick): refused.
-        assert!(!final_path_matches(r"\\?\C:\Windows\System32\a.png", dir, "a.png"));
-        assert!(!final_path_matches(r"\\?\C:\ProgramData\mini-oled-dock\icons\sub\a.png", dir, "a.png"));
-        assert!(!final_path_matches(r"\\?\C:\ProgramData\mini-oled-dock\icons\b.png", dir, "a.png"));
-    }
-
-    #[test]
-    fn plain_dir_names() {
-        for ok in ["v1.4.0", "v10.0.12"] {
-            assert!(is_plain_dir_name(ok), "{ok}");
-        }
-        let long = "a".repeat(33);
-        for bad in ["", ".", "..", ".v1", "v1..4", "v1/4", r"v1\4", "v1.4.0 ", "C:", "v1:4", long.as_str()] {
-            assert!(!is_plain_dir_name(bad), "{bad:?}");
-        }
     }
 
     #[test]
@@ -1409,49 +888,58 @@ mod tests {
     }
 
     #[test]
+    fn suite_and_journal_dirs_are_admin_only() {
+        let base = std::env::temp_dir().join(format!("dock_datadir_layout_{}", std::process::id()));
+        let elevated = crate::shell_thread::is_elevated();
+        if elevated {
+            // An admin-only root, as the real one: the new folders must inherit it and classify `Use`.
+            assert!(create_dir(&base, Some(&root_sddl())).is_ok());
+        } else {
+            let _ = std::fs::create_dir_all(&base);
+        }
+        // Not elevated: nothing is created and nothing is logged (the MODES rule).
+        let mut notes = Vec::new();
+        ensure_plumbing_dirs(&base, false, &mut notes);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(!base.join(SUITE_NAME).exists() && !base.join(JOURNAL_NAME).exists());
+        if elevated {
+            ensure_plumbing_dirs(&base, true, &mut notes);
+            assert!(notes.is_empty(), "no repair on an admin-only root: {notes:?}");
+            for name in [SUITE_NAME, JOURNAL_NAME] {
+                let p = base.join(name);
+                assert!(checked_dir(&p).is_ok(), "{name} classifies Use");
+                let od = open_dir(&p, false).unwrap_or_else(|e| panic!("open: {e}"));
+                let aces = read_security(handle_of(&od.handle)).ok().and_then(|s| s.dacl).unwrap_or_default();
+                let sids: Vec<_> = aces.iter().filter_map(|a| a.sid.clone()).collect();
+                let want = [SID_SYSTEM, SID_ADMINISTRATORS, "S-1-5-32-545"];
+                assert_eq!(sids, want.map(String::from));
+            }
+        } else {
+            println!("skipped: the test runner is not elevated (the creating half needs an admin-owned root)");
+        }
+        let _ = std::fs::remove_dir(base.join(SUITE_NAME));
+        let _ = std::fs::remove_dir(base.join(JOURNAL_NAME));
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[test]
+    fn plumbing_paths_are_under_the_root() {
+        let root = Path::new(r"C:\ProgramData\mini-oled-dock");
+        assert_eq!(safe_mode_in(root), root.join("safe-mode"));
+        assert_eq!(update_lock_in(root), root.join("update").join("suite.lock"));
+        assert_eq!(update_journal_in(root), root.join("update.jnl"));
+        for p in [safe_mode_in(root), update_lock_in(root), update_journal_in(root)] {
+            assert!(p.starts_with(root));
+        }
+    }
+
+    #[test]
     fn nothing_before_init() {
         // Unit tests never call `init`: no path is handed out, nothing is created.
         assert!(config_path().is_none() && log_path().is_none() && cache_dir().is_none() && !writable());
+        assert!(safe_mode_path().is_none() && update_lock_path().is_none() && update_journal_path().is_none());
+        assert!(oled_sys::datadir::suite_dir().is_none() && oled_sys::datadir::journal_dir().is_none());
         assert!(read_icon("a.png").is_err());
-    }
-
-    #[test]
-    fn atomic_write_and_checked_read_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("dock_datadir_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let p = dir.join("f.txt");
-        assert!(write_atomic(&p, b"one", FileAcl::Inherit).is_ok());
-        assert!(write_atomic(&p, b"two", FileAcl::Inherit).is_ok());
-        assert_eq!(read_file(&p, 16, true).ok().as_deref(), Some(&b"two"[..]));
-        assert!(read_file(&p, 2, true).is_err());
-        assert_eq!(
-            read_file(&dir.join("missing"), 16, true).map_err(|e| e.kind()).err(),
-            Some(io::ErrorKind::NotFound)
-        );
-        // A folder is not a regular file.
-        assert!(read_file(&dir, 16, false).is_err());
-        // A hard-linked file is refused when a single link is required, and `open_append` replaces
-        // the linked name with a fresh file instead of appending through it.
-        let link = dir.join("link.txt");
-        assert!(std::fs::hard_link(&p, &link).is_ok());
-        assert!(read_file(&p, 16, true).is_err());
-        assert!(read_file(&p, 16, false).is_ok());
-        let appended = open_append(&link).map(|mut f| f.write_all(b"x").is_ok());
-        assert_eq!(appended, Some(true));
-        assert_eq!(read_file(&p, 16, true).ok().as_deref(), Some(&b"two"[..]));
-        assert_eq!(read_file(&link, 16, true).ok().as_deref(), Some(&b"x"[..]));
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_dir(&dir);
-    }
-
-    #[test]
-    fn sddl_strings_parse() {
-        let sid = "S-1-5-21-1-2-3-1001";
-        for s in [Some(root_sddl()), config_sddl(sid), icons_sddl(sid)] {
-            let s = s.unwrap_or_default();
-            assert!(SecDesc::from_sddl(&s).is_ok(), "{s}");
-        }
     }
 
     /// Real NTFS round trip, unelevated: a folder created with an explicit DACL is read back ACE by

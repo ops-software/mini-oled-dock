@@ -5,7 +5,7 @@ param([string]$BaseRef = $env:RATCHET_BASE)         # e.g. origin/main on a pull
 $ErrorActionPreference = 'Stop'
 $env:DOCK_NO_MANIFEST = '1'; if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = 'target-test' }
 $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
-$out = cargo test --locked -- --list 2>&1 | Out-String; $code = $LASTEXITCODE
+$out = cargo test --locked --workspace -- --list 2>&1 | Out-String; $code = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 if ($code -ne 0) { throw "ratchet: cargo test --list failed ($code)`n$out" }
 $total = 0; foreach ($m in [regex]::Matches($out, '(?m)^(\d+) tests?, \d+ benchmarks?')) { $total += [int]$m.Groups[1].Value }

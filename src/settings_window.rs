@@ -53,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{self, Background, Config, SETTINGS_WINDOW_MIN};
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::log;
 use crate::msg::{TIMER_SETTINGS_APPLY, TIMER_SETTINGS_BAR, TIMER_SETTINGS_TICK, WM_DOCK_CONFIG_APPLY};
 use crate::popup_tray::TrayRow;
@@ -85,7 +85,7 @@ fn style() -> WINDOW_STYLE {
 }
 
 fn window_title() -> &'static str {
-    tr("Dock settings", "Impostazioni dock")
+    t(k::COMMON_DOCK_SETTINGS)
 }
 
 // ------------------------------------------------------------------ pure parts
@@ -134,16 +134,37 @@ enum KeyAction {
     Scroll(i32),
 }
 
+/// What the last input was, for the keyboard ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputEv {
+    /// A key; true when `key_action` handled it.
+    Key(bool),
+    Pointer,
+}
+
+/// The ring shows only after a handled key and goes at the next pointer input.
+fn ring_after(ring: bool, ev: InputEv) -> bool {
+    match ev {
+        InputEv::Key(handled) => handled || ring,
+        InputEv::Pointer => false,
+    }
+}
+
 /// Key `vk` with the focus on `focus` and `page` shown: the new focus and what to do. With two focus
-/// areas Tab and Shift+Tab both move to the other one.
-fn key_action(vk: u16, shift: bool, focus: Focus, page: Page) -> (Focus, KeyAction) {
-    let _ = shift;
+/// areas Tab and Shift+Tab both move to the other one. While the ring is not showing (`ring` false) the
+/// focus is not visible: Tab shows it on the first area without moving, Shift+Tab picks the last.
+fn key_action(vk: u16, shift: bool, focus: Focus, page: Page, ring: bool) -> (Focus, KeyAction) {
     let i = Page::ALL.iter().position(|p| *p == page).unwrap_or(0);
     let a = if vk == VK_ESCAPE.0 {
         KeyAction::Close
     } else if vk == VK_TAB.0 {
-        let other = if focus == Focus::Nav { Focus::Page } else { Focus::Nav };
-        return (other, KeyAction::Redraw);
+        let next = match (ring, shift) {
+            (false, false) => Focus::Nav,
+            (false, true) => Focus::Page,
+            (true, _) if focus == Focus::Nav => Focus::Page,
+            (true, _) => Focus::Nav,
+        };
+        return (next, KeyAction::Redraw);
     } else if vk == VK_UP.0 || vk == VK_DOWN.0 {
         let down = vk == VK_DOWN.0;
         match focus {
@@ -241,6 +262,8 @@ struct Win {
     /// A chord pick refused because another app holds it (`settings_pages::chord_to_probe`); shown under the row.
     chord_held: Option<bool>,
     focus: Focus,
+    /// The keyboard ring is shown: the last input was a handled key (`ring_after`).
+    ring: bool,
     scroll: i32,
     /// Wheel delta not yet turned into a notch.
     wheel: i32,
@@ -464,6 +487,17 @@ impl Win {
             trust_elevated: self.trust_elevated,
             powertoys: crate::popup::popup_launcher::pt_detected(),
             chord_held: self.chord_held,
+            battery_note: config::load_notes().show_battery_invalid,
+            keys_note: config::load_notes().new_keys_invalid,
+        }
+    }
+
+    /// A pointer event: the keyboard ring goes (repainted only when it was shown).
+    fn pointer_input(&mut self) {
+        let was = self.ring;
+        self.ring = ring_after(was, InputEv::Pointer);
+        if was {
+            self.paint();
         }
     }
 
@@ -483,6 +517,7 @@ impl Win {
             bar,
             badge: self.update.badge(),
             background: config::get().background,
+            ring: self.ring,
         }
     }
 
@@ -535,6 +570,7 @@ impl Win {
             bar: self.bar.as_ref().map(|b| &b.px),
             badge: self.update.badge(),
             background: config::get().background,
+            ring: self.ring,
         };
         settings_view::paint(&mut self.surf, &self.geo, &f);
         invalidate(self.hwnd);
@@ -838,6 +874,7 @@ fn open_window(inst: HINSTANCE) -> Result<(), String> {
         page: Page::Appearance,
         chord_held: None,
         focus: Focus::Nav,
+        ring: false,
         scroll: 0,
         wheel: 0,
         rows: Vec::new(),
@@ -1239,6 +1276,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             unsafe { DefWindowProcW(h, m, wp, lp) }
         }
         WM_MOUSEMOVE => {
+            with_win(Win::pointer_input);
             on_move(h, lo_i16(lp), hi_i16(lp));
             LRESULT(0)
         }
@@ -1252,6 +1290,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            with_win(Win::pointer_input);
             on_down(h, lo_i16(lp), hi_i16(lp));
             LRESULT(0)
         }
@@ -1278,6 +1317,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         WM_MOUSEWHEEL => {
             let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             with_win(|w| {
+                w.pointer_input();
                 w.wheel += delta;
                 let notches = w.wheel / WHEEL_DELTA as i32;
                 w.wheel -= notches * WHEEL_DELTA as i32;
@@ -1292,8 +1332,13 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             // SAFETY: no preconditions; the high bit means "pressed".
             let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
             let a = with_win(|w| {
-                let (focus, a) = key_action(wp.0 as u16, shift, w.focus, w.page);
+                let (focus, a) = key_action(wp.0 as u16, shift, w.focus, w.page, w.ring);
                 w.focus = focus;
+                let was = w.ring;
+                w.ring = ring_after(was, InputEv::Key(!matches!(a, KeyAction::None)));
+                if was != w.ring && !matches!(a, KeyAction::Redraw) {
+                    w.paint();
+                }
                 a
             });
             match a {
@@ -1380,6 +1425,16 @@ mod tests {
     }
 
     #[test]
+    fn ring_follows_the_last_input() {
+        assert!(ring_after(false, InputEv::Key(true)));
+        assert!(ring_after(true, InputEv::Key(true)));
+        assert!(!ring_after(false, InputEv::Key(false)));
+        assert!(ring_after(true, InputEv::Key(false)));
+        assert!(!ring_after(true, InputEv::Pointer));
+        assert!(!ring_after(false, InputEv::Pointer));
+    }
+
+    #[test]
     fn logical_size_survives_dpi_changes() {
         assert_eq!(logical_size(1290, 900, 144), [860, 600]);
         assert_eq!(logical_size(1075, 750, 120), [860, 600]);
@@ -1397,7 +1452,7 @@ mod tests {
     #[test]
     fn keyboard_moves_between_nav_and_page() {
         use Focus::{Nav, Page as P};
-        let k = |vk: u16, shift, f, p| key_action(vk, shift, f, p);
+        let k = |vk: u16, shift, f, p| key_action(vk, shift, f, p, true); // the ring is showing
         assert_eq!(k(VK_ESCAPE.0, false, Nav, Page::Bar), (Nav, KeyAction::Close));
         assert_eq!(k(VK_ESCAPE.0, false, P, Page::Bar), (P, KeyAction::Close));
         assert_eq!(k(VK_TAB.0, false, Nav, Page::Bar), (P, KeyAction::Redraw));
@@ -1408,6 +1463,22 @@ mod tests {
         assert_eq!(k(VK_DOWN.0, false, P, Page::Bar), (P, KeyAction::Scroll(1)));
         assert_eq!(k(VK_UP.0, false, P, Page::Bar), (P, KeyAction::Scroll(-1)));
         assert_eq!(k(0x41, false, Nav, Page::Bar), (Nav, KeyAction::None));
+    }
+
+    #[test]
+    fn tab_shows_the_ring_before_it_moves() {
+        use Focus::{Nav, Page as P};
+        let tab = |shift, f, ring| key_action(VK_TAB.0, shift, f, Page::Bar, ring);
+        // Fresh window, or the pointer cleared the ring with the focus on Nav: Tab shows Nav, no move.
+        assert_eq!(tab(false, Nav, false), (Nav, KeyAction::Redraw));
+        // A click on the page area (focus Page, ring off): one Tab shows Nav.
+        assert_eq!(tab(false, P, false), (Nav, KeyAction::Redraw));
+        // Shift+Tab with no ring picks the last area.
+        assert_eq!(tab(true, Nav, false), (P, KeyAction::Redraw));
+        assert_eq!(tab(true, P, false), (P, KeyAction::Redraw));
+        // The ring showing: both move to the other area.
+        assert_eq!(tab(false, Nav, true), (P, KeyAction::Redraw));
+        assert_eq!(tab(true, P, true), (Nav, KeyAction::Redraw));
     }
 
     #[test]

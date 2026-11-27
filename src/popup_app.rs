@@ -7,7 +7,7 @@
 //!
 //! Declared as a child module of `popup` (`#[path]`).
 
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::jumplist::Entry;
@@ -67,17 +67,16 @@ impl AppPopup {
     fn rows(&self) -> Vec<(u32, String, bool)> {
         let mut v = Vec::new();
         if self.info.can_launch {
-            v.push((ID_MENU_NEW_WINDOW, crate::i18n::tr("New window", "Nuova finestra").to_string(), true));
+            v.push((ID_MENU_NEW_WINDOW, crate::i18n::t(crate::i18n::k::COMMON_NEW_WINDOW).to_string(), true));
         }
         if self.info.pinned {
-            v.push((ID_MENU_UNPIN, crate::i18n::tr("Unpin from dock", "Rimuovi dal dock").to_string(), true));
+            v.push((ID_MENU_UNPIN, crate::i18n::t(crate::i18n::k::APP_UNPIN_FROM_DOCK).to_string(), true));
         } else {
-            v.push((ID_MENU_PIN, crate::i18n::tr("Pin to dock", "Aggiungi al dock").to_string(), self.info.can_launch));
+            v.push((ID_MENU_PIN, crate::i18n::t(crate::i18n::k::APP_PIN_TO_DOCK).to_string(), self.info.can_launch));
         }
         let close = match self.info.windows {
-            0 | 1 => crate::i18n::tr("Close window", "Chiudi finestra").to_string(),
-            n if crate::i18n::italian() => format!("Chiudi {n} finestre"),
-            n => format!("Close {n} windows"),
+            0 | 1 => crate::i18n::t(crate::i18n::k::COMMON_CLOSE_WINDOW).to_string(),
+            n => close_many(n),
         };
         v.push((ID_MENU_CLOSE_ALL, close, self.info.windows > 0));
         v
@@ -89,7 +88,7 @@ impl AppPopup {
         let mut v = Vec::new();
         self.links.clear();
         for g in &self.info.jump {
-            let name = if g.name.is_empty() { crate::i18n::tr("Tasks", "Attivit\u{e0}") } else { g.name.as_str() };
+            let name = if g.name.is_empty() { crate::i18n::t(crate::i18n::k::APP_TASKS) } else { g.name.as_str() };
             v.push(Line::Head(name.to_string()));
             for e in &g.entries {
                 match e {
@@ -192,6 +191,10 @@ impl Content for AppPopup {
         self.hits.at(x, y)
     }
 
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
+    }
+
     fn click(&mut self, id: u32) -> Reply {
         match id.checked_sub(ID_JUMP_BASE) {
             Some(i) => self.launch = self.links.get(i as usize).cloned(),
@@ -216,5 +219,72 @@ impl Content for AppPopup {
                 log!("popup_app: PostMessageW(WM_DOCK_APP_MENU_CMD) failed: {e}");
             }
         }
+    }
+}
+
+/// The text of the "close" row for an app with `windows` (two or more) windows.
+fn close_many(windows: usize) -> String {
+    oled_sys::i18n::subst(crate::i18n::t(crate::i18n::k::APP_CLOSE_WINDOWS_N), &[("n", &windows.to_string())])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(windows: usize, pinned: bool, jump: Vec<crate::jumplist::Group>) -> AppMenuInfo {
+        AppMenuInfo { key: "contoso".to_string(), name: "Contoso".to_string(), pinned, windows, can_launch: true, jump }
+    }
+
+    /// The popup around `info`, as `new` builds it, to read its rows.
+    fn popup(info: AppMenuInfo) -> AppPopup {
+        AppPopup {
+            info,
+            hits: HitMap::default(),
+            pending: None,
+            launch: None,
+            links: Vec::new(),
+            lines: Vec::new(),
+            sep_y: 0,
+            pad_text: 0,
+            width: 0,
+            title: String::new(),
+        }
+    }
+
+    #[test]
+    fn close_row_equals_the_old_text_in_both_languages() {
+        // The old code: one window or none "Close window" / "Chiudi finestra"; more: "Close {n} windows" / "Chiudi {n} finestre".
+        for n in [0usize, 1, 2, 5, 12] {
+            let (old_en, old_it) = if n < 2 {
+                ("Close window".to_string(), "Chiudi finestra".to_string())
+            } else {
+                (format!("Close {n} windows"), format!("Chiudi {n} finestre"))
+            };
+            let close = |on| {
+                let rows = crate::i18n::with_italian(on, || popup(info(n, false, Vec::new())).rows());
+                rows.into_iter().find(|r| r.0 == ID_MENU_CLOSE_ALL).map(|r| r.1)
+            };
+            assert_eq!(close(false), Some(old_en), "n = {n}");
+            assert_eq!(close(true), Some(old_it), "n = {n}");
+        }
+    }
+
+    #[test]
+    fn app_menu_keyboard_targets() {
+        use crate::jumplist::Group;
+        let link = |t: &str| Entry::Link { title: t.to_string(), target: String::new(), args: String::new() };
+        let jump = vec![
+            Group { name: "Recent".to_string(), entries: vec![link("One"), link("Two")] },
+            Group { name: String::new(), entries: vec![link("Three"), Entry::Separator, link("Four")] },
+        ];
+        let mut p = new(info(2, false, jump));
+        // The jump rows in order (headers and separators are not targets), then the dock's own rows.
+        assert_eq!(
+            crate::popup::target_ids(&mut *p),
+            [100, 101, 102, 103, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_CLOSE_ALL]
+        );
+        // A disabled row (no window to close) is not in the hit map, so it cannot be focused.
+        let mut none = new(info(0, true, Vec::new()));
+        assert_eq!(crate::popup::target_ids(&mut *none), [ID_MENU_NEW_WINDOW, ID_MENU_UNPIN]);
     }
 }

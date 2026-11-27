@@ -35,7 +35,8 @@ use windows::Win32::Graphics::Gdi::{MonitorFromRect, ScreenToClient, MONITOR_DEF
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer,
@@ -58,6 +59,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // Child module via #[path]: this way main.rs does not need to declare it.
 #[path = "popup_app.rs"]
 pub(crate) mod popup_app;
+#[path = "popup_dock.rs"]
+pub(crate) mod popup_dock;
 #[path = "popup_launcher.rs"]
 pub(crate) mod popup_launcher;
 #[path = "popup_scroll.rs"]
@@ -113,6 +116,8 @@ pub enum PopupKind {
     Battery = 11,
     /// The launcher (`popup_launcher`, SPEC-launcher), opened by its chord.
     Launcher = 12,
+    /// The dock menu (`popup_dock`): right click on empty bar space.
+    DockMenu = 13,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -192,6 +197,31 @@ pub fn open_app_menu(anchor: Anchor, info: AppMenuInfo) {
     open(PopupKind::AppMenu, anchor, None);
 }
 
+/// Opens the dock menu (SPEC-dock 5.2.1, right click on empty bar space). A second right click on empty space closes it,
+/// and one that follows the focus-loss close of the same menu within `TOGGLE_DEBOUNCE_MS` is the same click.
+pub fn open_dock_menu(anchor: Anchor) {
+    if !is_available() {
+        return;
+    }
+    if current() == Some(PopupKind::DockMenu) {
+        close_inner("toggle");
+        return;
+    }
+    let now = now_ms();
+    let debounced = with(|st| match st.last_inactive {
+        Some((PopupKind::DockMenu, t)) if now.saturating_sub(t) < TOGGLE_DEBOUNCE_MS => {
+            st.last_inactive = None;
+            true
+        }
+        _ => false,
+    })
+    .unwrap_or(false);
+    if debounced {
+        return;
+    }
+    open(PopupKind::DockMenu, anchor, None);
+}
+
 /// Key of the app chosen last in the context menu (consumes it). UI thread.
 pub fn take_app_menu_key() -> Option<String> {
     APP_CHOSEN_KEY.with(|k| k.try_borrow_mut().ok().and_then(|mut g| g.take()))
@@ -218,6 +248,52 @@ thread_local! {
     static APP_INFO: RefCell<Option<AppMenuInfo>> = const { RefCell::new(None) };
     /// Key chosen by the user, waiting for `take_app_menu_key`.
     static APP_CHOSEN_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The next popup opened starts with the keyboard focus on its first target (`set_keyboard_entry`).
+    static KB_ENTRY: Cell<bool> = const { Cell::new(false) };
+    /// The last popup closed through Esc (`take_closed_by_esc`).
+    static CLOSED_BY_ESC: Cell<bool> = const { Cell::new(false) };
+    /// The key (virtual-key code) that opens the next popup from the keyboard (`set_opening_key`); 0: none.
+    static OPENING_KEY: Cell<u16> = const { Cell::new(NO_OPENING_KEY) };
+}
+
+/// The next popup opened from the keyboard was opened by key `vk` (0: none): the popup ignores that key's auto-repeat.
+pub(crate) fn set_opening_key(vk: u16) {
+    OPENING_KEY.with(|c| c.set(vk));
+}
+
+/// The next popup opened starts with the keyboard focus on its first target (DK-0 stores the flag; DK-POP uses it).
+pub(crate) fn set_keyboard_entry(on: bool) {
+    KB_ENTRY.with(|c| c.set(on));
+}
+
+/// true when the last popup closed through Esc; consumed (the second call returns false).
+pub(crate) fn take_closed_by_esc() -> bool {
+    CLOSED_BY_ESC.with(take)
+}
+
+/// Records that a close came from Esc.
+fn note_esc_close(c: &Cell<bool>) {
+    c.set(true);
+}
+
+/// Reads and clears the flag.
+fn take(c: &Cell<bool>) -> bool {
+    c.replace(false)
+}
+
+/// Esc closes the open popup, and `take_closed_by_esc` says so once.
+fn close_by_esc() {
+    CLOSED_BY_ESC.with(note_esc_close);
+    close_inner("Esc");
+}
+
+/// The keyboard ring around control rectangle `rc` whose corners have radius `radius` (physical px).
+pub(crate) fn paint_focus_ring(s: &mut Surface, rc: RECT, radius: i32) {
+    let r = crate::render::focus_ring(rc, radius, s.metrics());
+    s.stroke_rr(r.rect, r.radius, r.width, crate::render::RIM_FOCUS);
 }
 
 // ------------------------------------------------------- internal content contract
@@ -376,6 +452,15 @@ pub(crate) trait Content {
     fn launcher(&mut self) -> Option<&mut popup_launcher::Launcher> {
         None
     }
+    /// Keyboard targets in Tab order: (control id, rectangle in client px). Default: none (Esc only).
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        Vec::new()
+    }
+    /// Left/Right on the focused control `id`: `delta` is -2/+2, or -10/+10 with Shift, in the control's unit. None: not
+    /// adjustable (the arrow moves the focus instead).
+    fn nudge(&mut self, _id: u32, _delta: i32) -> Option<Reply> {
+        None
+    }
 }
 
 /// Clickable zones of a content (client coordinates, physical px). The last one added wins.
@@ -398,6 +483,27 @@ impl HitMap {
     pub(crate) fn rect(&self, id: u32) -> Option<RECT> {
         self.0.iter().rev().find(|(i, _)| *i == id).map(|(_, r)| *r)
     }
+
+    /// The zones in the order they were added.
+    pub(crate) fn entries(&self) -> &[(u32, RECT)] {
+        &self.0
+    }
+}
+
+/// Test helper: the ids of the content's keyboard targets after `size` at 100 %; every target lies inside the panel.
+#[cfg(test)]
+pub(crate) fn target_ids(c: &mut dyn Content) -> Vec<u32> {
+    let s = Surface::new(Metrics { dpi: 96 }).expect("surface");
+    let (w, h) = c.size(&s);
+    let targets = c.focus_targets();
+    for (id, rc) in &targets {
+        assert!(
+            rc.left >= 0 && rc.top >= 0 && rc.right <= w && rc.bottom <= h,
+            "target {id} outside the {w}x{h} panel"
+        );
+        assert!(rc.right > rc.left && rc.bottom > rc.top, "target {id} is empty");
+    }
+    targets.into_iter().map(|t| t.0).collect()
 }
 
 // ------------------------------------------------------------------ state
@@ -432,6 +538,16 @@ struct Open {
     focus_tries: u8,
     /// Set for a centred popup (the launcher): placed on that work area instead of next to `anchor`.
     centred: Option<Centred>,
+    /// The control the keyboard focus is on (an id of `Content::focus_targets`).
+    kb: Option<u32>,
+    /// true while the keyboard ring is drawn: a navigation key sets it, the pointer moving clears it.
+    kb_ring: bool,
+    /// The popup was opened with `set_keyboard_entry`: the first render puts the focus on the first target.
+    kb_entry: bool,
+    /// The key that opened the popup from the keyboard (`set_opening_key`), or `NO_OPENING_KEY`: its auto-repeat is ignored until its next fresh press.
+    opening_key: u16,
+    /// Last pointer position seen (client px), to tell a real move from the one Windows sends when a window appears.
+    ptr: Option<(i32, i32)>,
 }
 
 /// Delay between two foreground retries after open.
@@ -924,6 +1040,7 @@ fn make_content(
         PopupKind::Start => popup_start::new(),
         PopupKind::StartMenu => popup_startmenu::new(),
         PopupKind::Launcher => popup_launcher::new(),
+        PopupKind::DockMenu => popup_dock::new(),
     }
 }
 
@@ -1114,6 +1231,7 @@ fn initial_alpha(kind: PopupKind) -> u8 {
 
 /// Opens `kind` (see `toggle` and `open_centred`); false when nothing is shown.
 fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
+    CLOSED_BY_ESC.with(|c| c.set(false));
     // Any other popup closes without a fade; so does the window picker.
     close_inner("popup switch");
     crate::picker::close("popup opened");
@@ -1138,6 +1256,8 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
     };
     let content = make_content(kind, volume, net, battery);
     debug_assert_eq!(content.kind(), kind);
+    let kb_entry = KB_ENTRY.with(Cell::take);
+    let opening_key = OPENING_KEY.with(Cell::take);
     let installed = with(|st| {
         st.last_inactive = None;
         st.open = Some(Open {
@@ -1159,6 +1279,11 @@ fn open(kind: PopupKind, anchor: Anchor, centred: Option<Centred>) -> bool {
             wheel_acc: 0,
             focus_tries: FOCUS_RETRIES,
             centred,
+            kb: None,
+            kb_ring: false,
+            kb_entry,
+            opening_key: if kb_entry { opening_key } else { NO_OPENING_KEY },
+            ptr: None,
         });
     });
     if installed.is_none() {
@@ -1321,7 +1446,18 @@ fn render(relayout: bool) -> bool {
             }
             o.pos = centred_at.unwrap_or_else(|| compute_pos(&o.anchor, w.max(1), h.max(1)));
         }
-        o.content.paint(&mut surf, o.hot, o.pressed);
+        if o.kb_entry {
+            // Opened from the keyboard: the focus starts on the first target (none for a content with its own keys).
+            o.kb_entry = false;
+            o.kb = o.content.focus_targets().first().map(|t| t.0);
+            o.kb_ring = o.kb.is_some();
+        }
+        let ring = if o.kb_ring { o.kb } else { None };
+        o.content.paint(&mut surf, ring.or(o.hot), o.pressed);
+        if let Some(rc) = ring.and_then(|id| o.content.focus_targets().into_iter().find(|t| t.0 == id)).map(|t| t.1) {
+            let radius = surf.metrics().px(crate::surface::ROW_RADIUS);
+            paint_focus_ring(&mut surf, rc, radius);
+        }
         Some((hwnd, surf, o.pos, o.alpha, o.dy))
     })
     .flatten();
@@ -1514,7 +1650,7 @@ fn on_key_ex(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         return LRESULT(0);
     }
     if wp.0 == VK_ESCAPE.0 as usize {
-        close_inner("Esc");
+        close_by_esc();
         return LRESULT(0);
     }
     // SAFETY: forwarding to the default handler with the same arguments.
@@ -1540,13 +1676,34 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             LRESULT(0)
         }
         WM_KEYDOWN => {
+            let repeat = lp.0 & (1 << 30) != 0;
+            // A fresh press of the opening key means it was released: it may repeat from now on.
+            let opening = with(|st| {
+                st.open.as_mut().map_or(NO_OPENING_KEY, |o| {
+                    o.opening_key = opening_after(o.opening_key, wp.0 as u16, repeat);
+                    o.opening_key
+                })
+            })
+            .unwrap_or(NO_OPENING_KEY);
+            if !held_key_acts(opening, wp.0 as u16, repeat) {
+                // A held Enter or Space acts once, and the auto-repeat of the key that opened this popup from the
+                // keyboard (Up, Down, Apps, F10) moves nothing: it never presses or walks to a control.
+                return LRESULT(0);
+            }
             let handled = with(|st| st.open.as_mut().and_then(|o| o.content.key(wp.0 as u16))).flatten();
             if let Some(reply) = handled {
                 apply(reply);
                 return LRESULT(0);
             }
+            let shift = held_mods().has(Mods::SHIFT);
+            if let Some(key) = nav_key(wp.0 as u16, shift) {
+                if let Some(reply) = on_nav_key(key, shift) {
+                    apply(reply);
+                    return LRESULT(0);
+                }
+            }
             if wp.0 == VK_ESCAPE.0 as usize {
-                close_inner("Esc");
+                close_by_esc();
                 return LRESULT(0);
             }
             // SAFETY: forwarding to the default handler with the same arguments.
@@ -1668,6 +1825,13 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
     let r = with(|st| {
         let o = st.open.as_mut()?;
         let mut reply = o.content.pointer(x, y);
+        // The pointer really moved: its hover takes over from the keyboard ring.
+        let moved = o.ptr.is_some_and(|p| p != (x, y));
+        o.ptr = Some((x, y));
+        if moved && o.kb_ring {
+            o.kb_ring = false;
+            reply = reply.merge(Reply::Redraw);
+        }
         let hit = o.content.hit(x, y);
         if let Some(id) = o.pressed {
             reply = reply.merge(o.content.drag(id, x, y));
@@ -1721,6 +1885,123 @@ fn on_mouse_leave() {
     if changed == Some(true) {
         apply(Reply::Redraw);
     }
+}
+
+/// false for the auto-repeat of Enter or Space: a held key acts once, only the moving keys may repeat.
+/// The same for the auto-repeat of `opening`, the key that opened this popup from the keyboard (`NO_OPENING_KEY`: none):
+/// the user still holding Up must not walk the ring. A new press (no repeat bit) of any key acts.
+fn held_key_acts(opening: u16, vk: u16, repeat: bool) -> bool {
+    !(repeat && (vk == opening || matches!(VIRTUAL_KEY(vk), VK_RETURN | VK_SPACE)))
+}
+
+/// The opening key to remember after a key message: the first fresh press (no repeat bit) of it ends its ban, so the
+/// moving keys may repeat again once the user has let go and pressed it anew.
+fn opening_after(opening: u16, vk: u16, repeat: bool) -> u16 {
+    if !repeat && vk == opening {
+        NO_OPENING_KEY
+    } else {
+        opening
+    }
+}
+
+/// No key opened the popup (0 is no virtual-key code).
+const NO_OPENING_KEY: u16 = 0;
+
+/// A navigation key of the generic keyboard handling (`nav`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavKey {
+    Next,
+    Prev,
+    First,
+    Last,
+    Activate,
+    /// Left (-1) or Right (+1).
+    Side(i32),
+}
+
+/// What `nav` decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavOut {
+    /// Nothing to do (no target).
+    Stay,
+    /// The focus moves to this control.
+    Focus(u32),
+    /// Enter or Space on this control.
+    Click(u32),
+    /// Left or Right on this control: -1 or +1; the content nudges it, or the focus moves instead.
+    Nudge(u32, i32),
+}
+
+/// The navigation key of a virtual-key code (`shift` turns Tab into going back), or None for any other key.
+fn nav_key(vk: u16, shift: bool) -> Option<NavKey> {
+    Some(match VIRTUAL_KEY(vk) {
+        VK_DOWN => NavKey::Next,
+        VK_UP => NavKey::Prev,
+        VK_TAB if shift => NavKey::Prev,
+        VK_TAB => NavKey::Next,
+        VK_HOME => NavKey::First,
+        VK_END => NavKey::Last,
+        VK_RETURN | VK_SPACE => NavKey::Activate,
+        VK_LEFT => NavKey::Side(-1),
+        VK_RIGHT => NavKey::Side(1),
+        _ => return None,
+    })
+}
+
+/// The pure part of the keyboard handling: the targets' ids in Tab order, the focused one (if any) and the key.
+fn nav(targets: &[u32], cur: Option<u32>, key: NavKey) -> NavOut {
+    let Some(&first) = targets.first() else { return NavOut::Stay };
+    let last = targets.last().copied().unwrap_or(first);
+    // A focus the targets no longer hold (after a relayout) counts as none.
+    let Some(at) = cur.and_then(|c| targets.iter().position(|&t| t == c)) else { return NavOut::Focus(first) };
+    let id = targets.get(at).copied().unwrap_or(first);
+    let step = |forward: bool| {
+        let n = targets.len();
+        let to = if forward { (at + 1) % n } else { (at + n - 1) % n };
+        NavOut::Focus(targets.get(to).copied().unwrap_or(first))
+    };
+    match key {
+        NavKey::Next => step(true),
+        NavKey::Prev => step(false),
+        NavKey::First => NavOut::Focus(first),
+        NavKey::Last => NavOut::Focus(last),
+        NavKey::Activate => NavOut::Click(id),
+        NavKey::Side(d) => NavOut::Nudge(id, d),
+    }
+}
+
+/// A navigation key for the open content. None: the content has no keyboard targets (Esc and the default handling
+/// follow).
+fn on_nav_key(key: NavKey, shift: bool) -> Option<Reply> {
+    with(|st| {
+        let o = st.open.as_mut()?;
+        let targets = o.content.focus_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        let ids: Vec<u32> = targets.iter().map(|t| t.0).collect();
+        o.kb_ring = true;
+        let mut out = nav(&ids, o.kb, key);
+        if let NavOut::Nudge(id, dir) = out {
+            let amount = if shift { 10 } else { 2 };
+            match o.content.nudge(id, dir * amount) {
+                Some(reply) => return Some(reply.merge(Reply::Redraw)),
+                None => out = nav(&ids, o.kb, if dir < 0 { NavKey::Prev } else { NavKey::Next }),
+            }
+        }
+        match out {
+            NavOut::Stay | NavOut::Nudge(..) => Some(Reply::None),
+            NavOut::Focus(id) => {
+                o.kb = Some(id);
+                Some(Reply::Redraw)
+            }
+            NavOut::Click(id) => {
+                o.kb = Some(id);
+                Some(o.content.click(id).merge(Reply::Redraw))
+            }
+        }
+    })
+    .flatten()
 }
 
 fn on_lbutton_down(hwnd: HWND, x: i32, y: i32) {
@@ -2156,14 +2437,26 @@ pub(crate) fn slider_value_at(rc: &RECT, knob_r: i32, lo: i32, hi: i32, x: i32) 
 /// Slider shared by the popups at value `v` in `lo..=hi`: dim rail across `rc`, bright fill up
 /// to the knob, white knob of radius `knob_r` (same travel as `slider_value_at`).
 pub(crate) fn paint_slider(s: &mut Surface, rc: &RECT, knob_r: i32, lo: i32, hi: i32, v: i32) {
+    paint_slider_dim(s, rc, knob_r, lo, hi, v, 100);
+}
+
+/// Alphas of the slider's rail and fill at `pct` percent (100 = normal, 0 = invisible).
+pub(crate) fn slider_alphas(pct: u32) -> (u32, u32) {
+    let pct = pct.min(100);
+    ((60 * pct + 50) / 100, (230 * pct + 50) / 100)
+}
+
+/// `paint_slider` with the rail and the fill dimmed to `pct` percent (a muted source); the knob is unchanged.
+pub(crate) fn paint_slider_dim(s: &mut Surface, rc: &RECT, knob_r: i32, lo: i32, hi: i32, v: i32, pct: u32) {
     use crate::surface::WHITE;
+    let (rail_a, fill_a) = slider_alphas(pct);
     let (tl, tr) = (rc.left + knob_r, rc.right - knob_r);
     let cy = (rc.top + rc.bottom) / 2;
     let th = s.metrics().px(SLIDER_TRACK_H);
     let rail = RECT { left: rc.left, top: cy - th / 2, right: rc.right, bottom: cy - th / 2 + th };
-    s.fill_rr(rail, th / 2, WHITE, 60);
+    s.fill_rr(rail, th / 2, WHITE, rail_a);
     let kx = tl + (tr - tl) * (v - lo) / (hi - lo).max(1);
-    s.fill_rr(RECT { right: kx, ..rail }, th / 2, WHITE, 230);
+    s.fill_rr(RECT { right: kx, ..rail }, th / 2, WHITE, fill_a);
     s.fill_rr(RECT { left: kx - knob_r, top: cy - knob_r, right: kx + knob_r, bottom: cy + knob_r }, knob_r, WHITE, 255);
 }
 
@@ -2180,6 +2473,35 @@ pub(crate) fn tick_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hitmap_entries_keep_their_order() {
+        let mut h = HitMap::default();
+        let r = |n| RECT { left: n, top: 0, right: n + 1, bottom: 1 };
+        h.add(7, r(0));
+        h.add(3, r(10));
+        h.add(7, r(20));
+        let ids: Vec<u32> = h.entries().iter().map(|e| e.0).collect();
+        assert_eq!(ids, [7, 3, 7], "added order, duplicates kept");
+        h.clear();
+        assert!(h.entries().is_empty());
+    }
+
+    #[test]
+    fn esc_flag_is_consumed_once() {
+        let c = Cell::new(false);
+        assert!(!take(&c), "no Esc close yet");
+        note_esc_close(&c);
+        assert!(take(&c));
+        assert!(!take(&c), "the second call returns false");
+    }
+
+    #[test]
+    fn slider_alphas_scale_with_the_dim() {
+        assert_eq!(slider_alphas(100), (60, 230));
+        assert_eq!(slider_alphas(40), (24, 92));
+        assert_eq!(slider_alphas(0), (0, 0));
+    }
     use crate::msg::{TIMER_LAUNCHER_PT, TIMER_LAUNCHER_SAVE, TIMER_LAUNCHER_SHRINK, TIMER_LAUNCHER_WARM};
     use windows::Win32::UI::WindowsAndMessaging::WM_KEYUP;
 
@@ -2427,5 +2749,115 @@ mod tests {
         assert!(start_release_due(None));
         assert!(start_release_due(Some(PopupKind::Power)));
         assert!(!start_release_due(Some(PopupKind::StartMenu)));
+    }
+
+    #[test]
+    fn nav_moves_and_wraps() {
+        let t = [5, 7, 9];
+        assert_eq!(nav(&t, Some(5), NavKey::Next), NavOut::Focus(7));
+        assert_eq!(nav(&t, Some(9), NavKey::Next), NavOut::Focus(5), "Down on the last wraps to the first");
+        assert_eq!(nav(&t, Some(5), NavKey::Prev), NavOut::Focus(9), "Up on the first wraps to the last");
+        assert_eq!(nav(&t, Some(7), NavKey::First), NavOut::Focus(5));
+        assert_eq!(nav(&t, Some(5), NavKey::Last), NavOut::Focus(9));
+        assert_eq!(nav(&[4], Some(4), NavKey::Next), NavOut::Focus(4), "one target: the focus stays");
+        assert_eq!(nav(&[], None, NavKey::Next), NavOut::Stay, "no targets: nothing to do");
+        // Tab goes forward, Shift+Tab back; the arrows do the same.
+        assert_eq!(nav_key(VK_TAB.0, false), Some(NavKey::Next));
+        assert_eq!(nav_key(VK_TAB.0, true), Some(NavKey::Prev));
+        assert_eq!(nav_key(VK_DOWN.0, false), Some(NavKey::Next));
+        assert_eq!(nav_key(VK_UP.0, false), Some(NavKey::Prev));
+        assert_eq!(nav_key(VK_ESCAPE.0, false), None, "Esc is not a navigation key");
+    }
+
+    #[test]
+    fn nav_first_key_focuses_the_first_target() {
+        let t = [5, 7, 9];
+        for key in [NavKey::Next, NavKey::Prev, NavKey::First, NavKey::Last, NavKey::Activate, NavKey::Side(1)] {
+            assert_eq!(nav(&t, None, key), NavOut::Focus(5), "{key:?}");
+            // A focus the list no longer holds counts as none.
+            assert_eq!(nav(&t, Some(42), key), NavOut::Focus(5), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn nav_enter_clicks() {
+        let t = [5, 7, 9];
+        assert_eq!(nav(&t, Some(7), NavKey::Activate), NavOut::Click(7));
+        assert_eq!(nav_key(VK_RETURN.0, false), Some(NavKey::Activate));
+        assert_eq!(nav_key(VK_SPACE.0, false), Some(NavKey::Activate));
+    }
+
+    #[test]
+    fn a_held_enter_or_space_acts_once() {
+        for vk in [VK_RETURN, VK_SPACE] {
+            assert!(held_key_acts(NO_OPENING_KEY, vk.0, false), "a fresh press acts");
+            assert!(!held_key_acts(NO_OPENING_KEY, vk.0, true), "the auto-repeat never does");
+        }
+        for vk in [VK_DOWN, VK_UP, VK_TAB, VK_HOME, VK_END, VK_LEFT, VK_RIGHT] {
+            assert!(held_key_acts(NO_OPENING_KEY, vk.0, true), "the moving keys may repeat");
+        }
+        assert!(held_key_acts(NO_OPENING_KEY, VK_ESCAPE.0, true));
+    }
+
+    #[test]
+    fn a_fresh_press_of_the_opening_key_ends_its_ban() {
+        // Win+T, Down opens a menu; later Down is held to walk its list: the repeats must move the selection.
+        let mut opening = VK_DOWN.0;
+        let mut feed = |vk: u16, repeat: bool| {
+            opening = opening_after(opening, vk, repeat);
+            held_key_acts(opening, vk, repeat)
+        };
+        assert!(!feed(VK_DOWN.0, true), "the repeat of the key still held from the opening is dropped");
+        assert!(feed(VK_UP.0, true), "other moving keys repeat meanwhile");
+        assert!(feed(VK_DOWN.0, false), "a fresh press acts");
+        assert!(feed(VK_DOWN.0, true), "and its repeats act too");
+        assert_eq!(opening, NO_OPENING_KEY);
+    }
+
+    #[test]
+    fn the_repeat_of_the_opening_key_is_ignored() {
+        // Up held on a bar item opened its popup: the repeats must not walk the ring (and wrap to the last control).
+        for opening in [VK_UP.0, VK_DOWN.0, 0x5D /* Apps */, 0x79 /* F10 */, VK_RETURN.0, VK_SPACE.0] {
+            assert!(!held_key_acts(opening, opening, true), "the repeat of the opening key is dropped");
+            assert!(held_key_acts(opening, opening, false), "a new press of it acts (released first)");
+        }
+        assert!(held_key_acts(VK_UP.0, VK_DOWN.0, true), "other moving keys still repeat");
+        assert!(held_key_acts(VK_UP.0, VK_TAB.0, true));
+    }
+
+    #[test]
+    fn nav_left_right_nudge_or_move() {
+        let t = [5, 7, 9];
+        assert_eq!(nav(&t, Some(7), NavKey::Side(-1)), NavOut::Nudge(7, -1));
+        assert_eq!(nav(&t, Some(7), NavKey::Side(1)), NavOut::Nudge(7, 1));
+        assert_eq!(nav_key(VK_LEFT.0, false), Some(NavKey::Side(-1)));
+        assert_eq!(nav_key(VK_RIGHT.0, true), Some(NavKey::Side(1)));
+        // A control that does not nudge makes the arrow a move: the caller asks `nav` again with Prev / Next.
+        struct Plain;
+        impl Content for Plain {
+            fn kind(&self) -> PopupKind {
+                PopupKind::Power
+            }
+            fn size(&mut self, _s: &Surface) -> (i32, i32) {
+                (0, 0)
+            }
+            fn paint(&self, _s: &mut Surface, _hot: Option<u32>, _pressed: Option<u32>) {}
+            fn hit(&self, _x: i32, _y: i32) -> Option<u32> {
+                None
+            }
+            fn click(&mut self, _id: u32) -> Reply {
+                Reply::None
+            }
+        }
+        assert_eq!(Plain.nudge(7, 2), None, "the default content does not nudge");
+        assert!(Plain.focus_targets().is_empty(), "the default content has no targets (Esc only)");
+    }
+
+    #[test]
+    fn startmenu_and_launcher_have_no_targets() {
+        // Both answer their own keys (`key`, `key_ex`): neither may take the generic navigation. Building them needs
+        // their stores and threads, so the pin reads the sources: no `focus_targets` there, and the default is empty.
+        assert!(!include_str!("popup_startmenu.rs").contains("fn focus_targets"));
+        assert!(!include_str!("popup_launcher.rs").contains("fn focus_targets"));
     }
 }

@@ -1,0 +1,55 @@
+//! The kit's widgets (F-K1, F-K2a, F-K2b, F-K3, P2-kit 2.6, 2.8-2.10): concrete structs with typed outputs. Their types
+//! are frozen by K0; each owner group fills its file.
+
+pub mod button;
+pub mod caption_buttons;
+pub mod chart;
+pub mod checkbox;
+pub mod dialog;
+pub mod field_model;
+pub mod header;
+pub mod icon_button;
+pub mod menu;
+pub mod page_tabs;
+pub mod paint;
+pub mod path_bar;
+pub mod progress;
+pub mod property_sheet;
+pub mod scrollbar;
+pub mod segmented;
+pub mod sidebar;
+pub mod slider;
+pub mod split;
+pub mod status;
+pub mod tab_strip;
+pub mod table;
+pub mod table_state;
+pub mod text_field;
+pub mod text_label;
+pub mod toggle;
+pub mod toolbar;
+pub mod tooltip;
+
+pub use button::{Button, ButtonKind, ButtonOut};
+pub use caption_buttons::{CaptionButtons, CaptionOut};
+pub use chart::{resample_peak, Series, Sparkline};
+pub use checkbox::{CheckOut, Checkbox};
+pub use dialog::{Dialog, DialogOut, DialogSpec};
+pub use icon_button::IconButton;
+pub use page_tabs::{PageTabs, PageTabsOut};
+pub use path_bar::{PathBar, PathOut, PathSegment};
+pub use progress::Progress;
+pub use property_sheet::PropertySheet;
+pub use scrollbar::{ScrollBar, ScrollOut};
+pub use segmented::{SegOut, Segmented};
+pub use sidebar::{SidebarItem, SidebarList, SidebarOut, SidebarStyle};
+pub use slider::{Slider, SliderOut};
+pub use split::{SplitOut, SplitView};
+pub use status::{Notice, StatusLine, StatusOut};
+pub use tab_strip::{TabOut, TabSpec, TabStrip};
+pub use table::{ListTable, VirtualList, VirtualTable};
+pub use text_field::{FieldKind, FieldOut, TextField};
+pub use text_label::TextLabel;
+pub use toggle::{Toggle, ToggleOut};
+pub use toolbar::{Toolbar, ToolbarButton, ToolbarOut};
+pub use tooltip::{chip_size, paint_chip};

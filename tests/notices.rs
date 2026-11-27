@@ -12,8 +12,22 @@ fn read(rel: &str) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
+/// A line of `cargo tree` that names a path package (`name vX.Y.Z (<path>)`): returns the package name.
+fn local_package(line: &str) -> Option<&str> {
+    let (name, rest) = line.split_once(" v")?;
+    let (_, after) = rest.split_once(' ')?;
+    (after.starts_with('(') && after != "(*)" && after != "(proc-macro)").then_some(name)
+}
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn path_packages_are_the_suites_own() {
+    assert_eq!(local_package("oled-sys v0.0.0 (C:\\x\\crates\\oled-sys)"), Some("oled-sys"));
+    assert_eq!(local_package("serde v1.0.229"), None);
+    assert_eq!(local_package("serde v1.0.229 (*)"), None);
 }
 
 #[test]
@@ -47,6 +61,13 @@ fn notices_list_every_crate_in_the_exe() {
             continue; // the root package, dock itself
         }
         let line = line.trim_end_matches(" (*)").trim_end_matches(" (proc-macro)");
+        if let Some(name) = local_package(line) {
+            // The suite's own crates are covered by the repository's LICENSE; any other path package is unlicensed code.
+            if !name.starts_with("oled-") && !missing.contains(&name.to_string()) {
+                missing.push(name.to_string());
+            }
+            continue;
+        }
         let Some((name, ver)) = line.split_once(" v") else {
             continue;
         };

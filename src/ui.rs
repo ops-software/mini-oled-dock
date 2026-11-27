@@ -12,10 +12,12 @@
 //!  * Every `redraw()`: builds a `render::Scene`, calls `render::layout`, recomputes the geometry
 //!    (bar horizontally centered, width = `layout.width`), `render::resize` if the size
 //!    changes, `render::paint`, `render::present`.
-//!  * Hover: a plate (`render::Plate`) that animates over 120 ms (`TIMER_ANIM` timer, 15 ms,
-//!    out-cubic easing, `KillTimer` when idle) towards the item under the cursor; pressed = alpha 50.
+//!  * Hover: a plate (`render::Plate`) that animates in over 90 ms and out over 140 ms (`PLATE_IN_MS`, `PLATE_OUT_MS`;
+//!    `TIMER_ANIM` timer, 15 ms, out-cubic easing, `KillTimer` when idle) towards the item under the cursor; pressed = alpha 36.
 //!  * Mouse: `WM_MOUSEMOVE`/`WM_MOUSELEAVE` (TrackMouseEvent), `WM_SETCURSOR` (hand over items),
-//!    `WM_LBUTTONDOWN/UP`, `WM_MBUTTONUP`, `WM_RBUTTONUP`, `WM_MOUSEWHEEL` (volume only: +-2%).
+//!    `WM_LBUTTONDOWN/UP`, `WM_MBUTTONDOWN/UP`, `WM_RBUTTONUP`, `WM_MOUSEWHEEL`: every gesture resolves
+//!    through `actions::resolve` and runs in `run_action` (Shift+click, Shift+middle closes a group, right click on empty
+//!    space opens the dock menu, the wheel cycles an app's windows or changes the volume, +-2% a notch).
 //!  * Drag & drop: left button down on an item + movement past `DRAG_THRESHOLD` starts a reorder inside
 //!    the item's zone (apps / tray icons / system modules). The dragged item follows the cursor, the others slide
 //!    (`TIMER_ANIM`); the drop persists `pinned` / `app_order` / `tray_order` / `modules_order`.
@@ -39,7 +41,15 @@
 //!    empty or that display is not connected; `WM_DISPLAYCHANGE` moves it when displays come and go.
 //!    With `config.monitor == "pointer"` the Win key brings the bar to the display under the pointer
 //!    (`follow_pointer`), and a double tap opens the dock's Start menu there (`open_start_menu`, `popup_startmenu`).
-//!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
+//!  * Keyboard (SPEC-dock 5.2.2): the owned chords follow the config, none while a remote-desktop or VM client or a
+//!    window above the dock (the UAC prompt) is in front (`chords_sync`, `chords_follow_foreground`,
+//!    `hook::set_dock_chords`); the hook
+//!    posts `WM_DOCK_CHORD` (Win+n acts on the n-th app, Win+Alt+n, Win+T, Win+Shift+T and Win+B give the bar the
+//!    foreground and a focused item) and `WM_DOCK_PEEK` (digit chips while Win is held). On the focused bar
+//!    `WM_KEYDOWN`/`WM_CHAR` (and their SYS forms without Alt) move a ring over the items (`bar_keys`), act through
+//!    the mouse map, open the picker or a popup with the keyboard in it, reorder with Ctrl+arrows, type ahead, and Esc
+//!    hides; a mouse motion, a hide or another window in front ends it.
+//!  * Auto-hide (screen edge, Win key, the hide delay (config hide_delay_ms; a keyboard show stays at least 2.5 s)); `config::effective_autohide()`
 //!    false = always visible. The edge poll runs every 50 ms while the bar is shown, while a dwell or an
 //!    icon request is pending, and for 1 s after the pointer last moved; otherwise raw input waits for the
 //!    next motion (see "edge watch": `WM_INPUT`, `RIDEV_INPUTSINK`).
@@ -59,14 +69,14 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
     MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
 };
-use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0, INPUT_KEYBOARD,
-    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
-    VK_ESCAPE, VK_F15, VK_LBUTTON, VK_LWIN, VK_RBUTTON,
+    GetAsyncKeyState, GetFocus, GetKeyState, ReleaseCapture, SendInput, SetCapture, SetFocus, TrackMouseEvent, INPUT,
+    INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE,
+    TRACKMOUSEEVENT, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_F15, VK_LBUTTON, VK_LWIN, VK_RBUTTON, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
@@ -77,9 +87,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow, WindowFromPoint, EVENT_SYSTEM_FOREGROUND,
     GUITHREADINFO, GWL_STYLE, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE, PBT_APMPOWERSTATUSCHANGE,
     SC_CLOSE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WS_CAPTION,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_CHAR, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_TIMER, WS_CAPTION,
 };
 
 use crate::apps::{self, ClickOutcome};
@@ -100,29 +111,60 @@ use crate::shell_thread::{self, ResolveApp, ShellEvent, ShellRequest};
 use crate::tray_host::{self, TrayClick, TrayGeometry, TrayView};
 use crate::{hook, hwnd, render};
 
+// Child modules via #[path]: this way main.rs does not need to declare them.
+#[path = "actions.rs"]
+pub(crate) mod actions;
+use actions::{resolve, Action, Gesture, SettingsLink, Target, TrayButton};
+#[path = "bar_keys.rs"]
+pub(crate) mod bar_keys; // DK-PAINT fills it
+
+/// Push reveal is built and S-PUSH passed. DK-PUSH sets it to true; settings_pages shows the Reveal row only then.
+pub(crate) const PUSH_AVAILABLE: bool = false;
+
 // ---------------------------------------------------------------- constants
 
 /// Time the dock stays visible after startup (ms).
 const SHOW_MS_STARTUP: u64 = 3000;
-/// Time the dock stays visible without the mouse over it (ms).
-const SHOW_MS: u64 = 2500;
-/// Dwell time at the screen edge before the dock appears (ms).
-const EDGE_MS: u64 = 150;
+/// How long a show by the keyboard (Win tap, Win+T, Win+B, Win+Alt+n) stays without the pointer over the bar (ms);
+/// never shorter than 1.5.2's.
+const KEY_SHOW_MS: u64 = 2500;
+
+/// Time the bar stays after the pointer leaves it (config `hide_delay_ms`).
+fn hide_delay() -> u64 {
+    u64::from(config::get().hide_delay_ms)
+}
+
+/// Time a show stays when the pointer did not start it on the bar (keyboard or screen edge; the edge row lies
+/// outside the floating bar): the hide delay, but never under `KEY_SHOW_MS`, or a delay of 0 would hide the
+/// bar at the next poll.
+fn key_show_ms(hide_delay_ms: u32) -> u64 {
+    u64::from(hide_delay_ms).max(KEY_SHOW_MS)
+}
+
+/// true once the pointer has dwelt on the edge (since `since`, 0 = not on it) for the show delay.
+fn dwell_done(since: u64, now: u64, delay: u64) -> bool {
+    since != 0 && now - since >= delay
+}
+
+/// Instant (ms) at which the bar hides when the countdown restarts at `now`.
+fn hide_at(now: u64, delay_ms: u64) -> u64 {
+    now + delay_ms
+}
 /// Provisional bar width (logical px) before the first layout.
 const DEFAULT_BAR_WIDTH: i32 = 400;
 /// Duration of the hover plate's entry animation (ms).
-const PLATE_IN_MS: u64 = 90;
+const PLATE_IN_MS: u64 = oled_ui::tokens::DUR_FAST as u64;
 /// Duration of the plate's exit fade (ms).
-const PLATE_OUT_MS: u64 = 140;
+const PLATE_OUT_MS: u64 = oled_ui::tokens::DUR_NORMAL as u64;
 /// Animation timer period (ms).
 const ANIM_TICK_MS: u32 = 15;
 /// Plate alpha when hovered / pressed.
-const HOVER_ALPHA: u8 = 20;
-const PRESS_ALPHA: u8 = 36;
+const HOVER_ALPHA: u8 = oled_ui::tokens::FILL_HOVER as u8;
+const PRESS_ALPHA: u8 = oled_ui::tokens::FILL_PRESS as u8;
 /// Debounce after `WM_DOCK_APPS_DIRTY` (ms).
 const DEBOUNCE_MS: u32 = 100;
 /// Pointer resting on an app item with 2+ windows for this long opens the window picker (ms).
-const PICKER_HOVER_MS: u32 = 400;
+const PICKER_HOVER_MS: u32 = oled_ui::tokens::HOVER_DELAY;
 /// Periodic reconciliation of the window list (ms).
 const RECONCILE_MS: u32 = 5000;
 /// Timer for the bar width animation (local id, distinct from those in `msg`).
@@ -136,7 +178,7 @@ const FS_BOUNCE_GRACE_MS: u64 = 800;
 /// How many times the foreground is re-taken after such a bounce, per show of the dock.
 const FS_MAX_RETAKES: u32 = 2;
 /// Duration of the width animation (ms, out-cubic).
-const WIDTH_ANIM_MS: u64 = 160;
+const WIDTH_ANIM_MS: u64 = oled_ui::tokens::DUR_SLOW as u64;
 /// Timer of the attention blink (local id).
 const TIMER_ATTN: usize = 41;
 /// Timer of the show/hide slide+fade (local id).
@@ -145,9 +187,9 @@ const TIMER_VIS: usize = 42;
 const ATTN_HALF_MS: u64 = 500;
 const ATTN_BLINK_MS: u64 = 6000;
 /// Show / hide animation durations (ms) and slide distance (logical px).
-const SHOW_ANIM_MS: u64 = 140;
+const SHOW_ANIM_MS: u64 = oled_ui::tokens::DUR_NORMAL as u64;
 const HIDE_ANIM_MS: u64 = 100;
-const SLIDE_PX: i32 = 10;
+const SLIDE_PX: i32 = oled_ui::tokens::SLIDE_PX_BAR;
 /// Shell hook notifications (wParam of the registered "SHELLHOOK" message).
 const HSHELL_WINDOWACTIVATED: usize = 4;
 const HSHELL_RUDEAPPACTIVATED: usize = 0x8004;
@@ -157,7 +199,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// `WM_CAPTURECHANGED`: the window lost the mouse capture.
 const WM_CAPTURECHANGED: u32 = 0x0215;
 /// Horizontal movement (logical px) after which a press becomes a drag.
-const DRAG_THRESHOLD: i32 = 6;
+const DRAG_THRESHOLD: i32 = oled_ui::tokens::DRAG_THRESHOLD;
 /// Duration (ms) of the slide of the other items / of the drop settle (out-cubic).
 const SLIDE_MS: u64 = 120;
 /// Duration (ms) of the indicator width change when the foreground moves (out-cubic).
@@ -393,6 +435,10 @@ thread_local! {
     static DEBOUNCE_ARMED: Cell<bool> = const { Cell::new(false) };
     /// `config.names` at the last `rebuild_entries` (to redo the requests if it changes).
     static LAST_NAMES: RefCell<Option<std::collections::BTreeMap<String, String>>> = const { RefCell::new(None) };
+    /// Group key of the App item under the last middle press (None elsewhere), for Shift+middle's CloseGroup.
+    static MID_PRESS: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// `now_ms()` of the last wheel cycle step (`cycle_due`).
+    static LAST_CYCLE: Cell<u64> = const { Cell::new(0) };
     /// Wheel remainder (WHEEL_DELTA units) not yet translated into volume steps.
     static WHEEL_ACC: Cell<i32> = const { Cell::new(0) };
     /// true while `TIMER_SYSMON` is armed; ticks since it was armed.
@@ -404,6 +450,15 @@ thread_local! {
     static NET_ACTIVE: Cell<bool> = const { Cell::new(false) };
     /// true while the shell thread is expected to hold the audio controller (volume module on).
     static AUDIO_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// The chord rows the config owns (`chords_sync`); the hook gets none of them while a remote client or a window
+    /// above the dock is in front.
+    static CHORDS: Cell<hook::DockChords> = const { Cell::new(hook::DockChords::NONE) };
+    /// What was in front at the last look (`chords_follow_foreground`).
+    static FRONT: Cell<Front> = const { Cell::new(Front::Local) };
+    /// The bar's keyboard layer (see "keyboard: the focused bar").
+    static KB: RefCell<Kb> = const { RefCell::new(Kb::EMPTY) };
+    /// Peek (`on_peek`).
+    static PEEK: Cell<Peek> = const { Cell::new(Peek { chips: false, shown: false }) };
 }
 
 fn now_ms() -> u64 {
@@ -472,6 +527,7 @@ pub fn attach(h: HWND) -> Result<(), String> {
             log!("ui::attach: RegisterShellHookWindow failed");
         }
     }
+    chords_sync();
     let ms = if config::effective_autohide() { SHOW_MS_STARTUP } else { u64::MAX / 4 };
     show_dock_as("startup", ms, false, true);
     Ok(())
@@ -497,6 +553,9 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
     match msg {
         WM_TIMER => on_timer(h, wp.0),
         WM_POWERBROADCAST => {
+            if let Some(why) = cut_off_of(msg, wp.0) {
+                crate::hook::cut_off(why);
+            }
             if wp.0 == PBT_APMPOWERSTATUSCHANGE as usize {
                 battery_tick();
             }
@@ -554,8 +613,33 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             popup::popup_launcher::on_alias_message();
             Some(LRESULT(0))
         }
-        // Registered only once a chord is set (`launcher_sys::watch_sessions`): lock and disconnects.
+        // An owned dock chord (posted by the hook only while chord rows are set): wParam = hook::encode_chord, lParam =
+        // kb.time.
+        crate::msg::WM_DOCK_CHORD => {
+            on_chord(wp.0, lp.0 as u32);
+            Some(LRESULT(0))
+        }
+        // Keys on the bar, which is the foreground window after Win, Win+T, Win+B or Win+Alt+n. WM_SYSKEYDOWN without the
+        // Alt bit is what an active window without the keyboard focus receives: a plain key. With Alt held it goes to
+        // DefWindowProc, so Alt+F4 keeps its SC_CLOSE path above.
+        WM_KEYDOWN | WM_SYSKEYDOWN => match as_key(msg, lp.0) {
+            // lParam bit 30: the key was already down (an auto-repeat).
+            Some(false) => on_bar_key(wp.0 as u16, (lp.0 >> 30) & 1 != 0),
+            _ => None,
+        },
+        // Typed characters (type-ahead), by the same rule: WM_SYSCHAR without the Alt bit is a plain character.
+        WM_CHAR | WM_SYSCHAR if as_char(msg, lp.0) => on_bar_char(wp.0),
+        // Peek (posted by the hook only while Peek is owned): wParam 1 began, 0 ended; lParam = kb.time.
+        crate::msg::WM_DOCK_PEEK => {
+            on_peek(wp.0 != 0);
+            Some(LRESULT(0))
+        }
+        // Registered once the launcher's chord or a dock chord row is set (`launcher_sys::watch_sessions`): lock, unlock,
+        // connects and disconnects.
         windows::Win32::UI::WindowsAndMessaging::WM_WTSSESSION_CHANGE => {
+            if let Some(why) = cut_off_of(msg, wp.0) {
+                crate::hook::cut_off(why);
+            }
             popup::popup_launcher::on_session_change(wp.0 as u32);
             Some(LRESULT(0))
         }
@@ -563,6 +647,9 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             if wp.0 as u32 == EVENT_SYSTEM_FOREGROUND {
                 on_shell_hook(h, HSHELL_WINDOWACTIVATED, lp.0);
                 on_foreground_changed(HWND(lp.0 as *mut std::ffi::c_void));
+                chords_follow_foreground();
+                peek_fullscreen_sync(CHORDS.get());
+                kb_on_foreground();
                 crate::hook::note_activity();
                 crate::tray_host::raise();
             }
@@ -605,11 +692,15 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             Some(LRESULT(0))
         }
         WM_LBUTTONUP => {
-            on_lbutton_up(lp);
+            on_lbutton_up(wp, lp);
+            Some(LRESULT(0))
+        }
+        WM_MBUTTONDOWN => {
+            on_mbutton_down(wp, lp);
             Some(LRESULT(0))
         }
         WM_MBUTTONUP => {
-            on_mbutton_up(lp);
+            on_mbutton_up(wp, lp);
             Some(LRESULT(0))
         }
         WM_RBUTTONUP => {
@@ -892,6 +983,8 @@ pub fn on_config_changed() {
     }
     // The launcher's chord and options.
     popup::popup_launcher::on_config();
+    // The dock's own chords (keyboard section, `hide_native_taskbar`).
+    chords_sync();
     // Last: the Settings window shows the values the bar now uses.
     crate::settings_window::on_config_changed();
 }
@@ -1017,7 +1110,8 @@ pub fn on_notif_changed() {
 /// `WM_DOCK_POPUP_CLOSED`: the popup closed; the auto-hide countdown restarts and the persistent
 /// plate disappears (the plate goes back to following the mouse). Called by `main`.
 pub fn on_popup_closed() {
-    HIDE_AT.store(now_ms() + SHOW_MS, Relaxed);
+    HIDE_AT.store(hide_at(now_ms(), hide_delay()), Relaxed);
+    kb_after_popup();
     redraw_if_visible();
 }
 
@@ -1032,24 +1126,33 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Network => Some(ItemId::Network),
         PopupKind::Battery => Some(ItemId::Battery),
         PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
-        PopupKind::AppMenu | PopupKind::Launcher => None,
+        PopupKind::AppMenu | PopupKind::DockMenu | PopupKind::Launcher => None,
     }
 }
 
 /// `Anchor` for opening a popup from item `id` (screen coordinates).
 fn anchor_for(id: ItemId) -> Option<Anchor> {
     let g = GEOM.with(|g| g.get())?;
-    let (r, dpi) = UI.with(|u| {
-        let st = u.borrow();
-        (st.layout.rect_of(id), if st.monitor_dpi >= 96 { st.monitor_dpi } else { st.metrics.dpi })
-    });
-    let r = r?;
+    let r = UI.with(|u| u.borrow().layout.rect_of(id))?;
     Some(Anchor {
         item: RECT { left: g.x + r.left, top: g.y + r.top, right: g.x + r.right, bottom: g.y + r.bottom },
-        bar: RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h },
-        top: config_top(),
-        dpi,
+        ..bar_anchor()?
     })
+}
+
+/// An anchor for the whole bar (its `item` is the bar's rectangle): the base of every popup anchor.
+fn bar_anchor() -> Option<Anchor> {
+    let g = GEOM.with(|g| g.get())?;
+    let dpi = UI.with(|u| {
+        let st = u.borrow();
+        if st.monitor_dpi >= 96 {
+            st.monitor_dpi
+        } else {
+            st.metrics.dpi
+        }
+    });
+    let bar = RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h };
+    Some(Anchor { item: bar, bar, top: config_top(), dpi })
 }
 
 /// Opens/closes popup `kind` from item `id`.
@@ -1147,6 +1250,7 @@ pub fn redraw() {
     let now = now_ms();
     let attn: Vec<isize> = ATTN.with(|a| a.borrow().clone());
     let attn_on = attn_phase_on(now);
+    let kb_ring = kb_ring();
     // Scene, layout, resize and paint under a single short borrow (render does not re-enter the UI).
     let mut drag_lost = false;
     let layout = UI.with(|u| {
@@ -1206,6 +1310,8 @@ pub fn redraw() {
             lift: None,
             hover: st.hover.or_else(|| popup::current().and_then(item_for_popup)),
             max_width,
+            focus: kb_ring,
+            chips: PEEK.get().chips,
         };
         let mut layout = render::layout(&scene);
         // Width animation: the content snaps to the final layout right away, the pill
@@ -1622,6 +1728,7 @@ fn rebuild_entries() {
         }
         moved
     });
+    kb_follow_entries();
     for (key, exe) in moved {
         match config::sync_pinned_launch(&key, &exe) {
             Ok(()) => log!("pin '{key}': the app moved to '{exe}'"),
@@ -2051,9 +2158,16 @@ fn on_hover_picker_timer(h: HWND) {
         return;
     }
     let Some((i, key, name)) = multi_window_app(hover) else { return };
-    let Some(a) = anchor_for(ItemId::App(i)) else { return };
-    let name = if name.is_empty() { crate::i18n::tr("Window", "Finestra").to_string() } else { name };
-    crate::picker::open(a, &key, &name, &apps::windows_in_order(&key));
+    open_picker(i, &key, name);
+}
+
+/// Opens the window picker of App item `i` (group `key`, shown as `name`) at its item; false when it is not in the
+/// layout.
+fn open_picker(i: usize, key: &str, name: String) -> bool {
+    let Some(a) = anchor_for(ItemId::App(i)) else { return false };
+    let name = if name.is_empty() { crate::i18n::t(crate::i18n::k::COMMON_WINDOW).to_string() } else { name };
+    crate::picker::open(a, key, &name, &apps::windows_in_order(key));
+    true
 }
 
 /// Kills the picker's open delay and closes the picker (click on the bar, dock hidden, previews off).
@@ -2063,6 +2177,7 @@ fn picker_cancel(reason: &str) {
 }
 
 fn on_mouse_move(h: HWND, wp: WPARAM, lp: LPARAM) {
+    kb_mouse_moved();
     let need_track = UI.with(|u| {
         let st = &mut *u.borrow_mut();
         !std::mem::replace(&mut st.tracking_mouse, true)
@@ -2102,6 +2217,8 @@ fn on_mouse_move(h: HWND, wp: WPARAM, lp: LPARAM) {
 }
 
 fn on_mouse_leave() {
+    // The middle button takes no capture: a press whose release may land elsewhere is dropped.
+    MID_PRESS.with(|m| *m.borrow_mut() = None);
     let pressed = UI.with(|u| {
         let st = &mut *u.borrow_mut();
         st.tracking_mouse = false;
@@ -2154,7 +2271,7 @@ fn on_lbutton_down(h: HWND, lp: LPARAM) {
     }
 }
 
-fn on_lbutton_up(lp: LPARAM) {
+fn on_lbutton_up(wp: WPARAM, lp: LPARAM) {
     if drag_active() {
         end_drag(false);
         return;
@@ -2177,64 +2294,105 @@ fn on_lbutton_up(lp: LPARAM) {
     });
     if let (Some(p), Some(h)) = (pressed, hit) {
         if p == h {
-            click_left(h);
+            let g = if wp.0 & MK_SHIFT != 0 { Gesture::ShiftClick } else { Gesture::Click };
+            run_action(resolve(target_of(Some(h)), g), Some(h));
         }
     }
 }
 
-fn on_mbutton_up(lp: LPARAM) {
-    picker_cancel("middle click on the bar");
-    match hit_at(lo_i16(lp), hi_i16(lp)) {
-        Some(ItemId::App(i)) => {
-            if let Some(e) = entry_at(i) {
-                match launch_target(&e) {
-                    Some(t) => shell_thread::request(ShellRequest::Launch { target: t, args: None }),
-                    None => log!("middle click: no launch target for '{}'", e.key),
-                }
-            }
+/// MK_SHIFT of the mouse messages' wParam.
+const MK_SHIFT: usize = 0x0004;
+/// MK_CONTROL of the mouse messages' wParam.
+const MK_CONTROL: usize = 0x0008;
+
+/// What a middle press stores for "close all windows of the app": the group key, only when Shift is down at the press
+/// (a release with Shift down after a plain middle click closes nothing).
+fn press_close_key(shift_down: bool, key: Option<String>) -> Option<String> {
+    key.filter(|_| shift_down)
+}
+
+/// The group key of the App item under the pointer at a middle press with Shift down (None elsewhere): the release
+/// closes a group only if Shift is still down and the item under it then still has this key.
+fn on_mbutton_down(wp: WPARAM, lp: LPARAM) {
+    let key = match hit_at(lo_i16(lp), hi_i16(lp)) {
+        Some(ItemId::App(i)) => entry_at(i).map(|e| e.group_key),
+        _ => None,
+    };
+    let key = press_close_key(wp.0 & MK_SHIFT != 0, key);
+    MID_PRESS.with(|m| *m.borrow_mut() = key);
+}
+
+/// The target of a gesture released at client point `(x, y)` over `hit`: `None` when the point is outside the bar.
+fn gesture_target(hit: Option<ItemId>, x: i32, y: i32) -> Option<Target> {
+    if hit.is_none() {
+        let g = GEOM.with(|g| g.get())?;
+        let bar = RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h };
+        if !empty_hit(bar, POINT { x: g.x + x, y: g.y + y }, hit) {
+            return None;
         }
-        Some(ItemId::Volume) => shell_thread::request(ShellRequest::VolumeToggleMute),
-        Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Middle),
-        _ => {}
     }
+    Some(target_of(hit))
+}
+
+/// Empty space: a point inside the bar's rectangle (screen px) with no item under it.
+fn empty_hit(bar: RECT, p: POINT, hit: Option<ItemId>) -> bool {
+    hit.is_none() && point_in(&bar, p)
+}
+
+/// The group key to close at a middle release: the key of the item at index `i` of the release-time keys, only when it
+/// equals the key stored at the press. A press that stored nothing, an index out of range or another key give None.
+fn close_key<'a>(press: Option<&str>, release: Option<(usize, &[&'a str])>) -> Option<&'a str> {
+    let press = press?;
+    let (i, keys) = release?;
+    keys.get(i).copied().filter(|k| *k == press)
+}
+
+/// CloseGroup at a middle release over `hit`: WM_CLOSE to the group of the App item under the pointer, resolved now, and
+/// only if it is the group the press stored (a re-layout, an app that closed or a stale index acts on nothing).
+fn close_group_at_release(hit: Option<ItemId>) {
+    let Some(ItemId::App(i)) = hit else { return };
+    let keys: Vec<String> = UI.with(|u| u.borrow().entries.iter().map(|e| e.group_key.clone()).collect());
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let press = MID_PRESS.with(|m| m.borrow().clone());
+    if let Some(k) = close_key(press.as_deref(), Some((i, &refs))) {
+        apps::close_group(k);
+    }
+}
+
+fn on_mbutton_up(wp: WPARAM, lp: LPARAM) {
+    picker_cancel("middle click on the bar");
+    let (x, y) = (lo_i16(lp), hi_i16(lp));
+    let hit = hit_at(x, y);
+    let g = if wp.0 & MK_SHIFT != 0 { Gesture::ShiftMiddle } else { Gesture::Middle };
+    if let Some(t) = gesture_target(hit, x, y) {
+        run_action(resolve(t, g), hit);
+    }
+    MID_PRESS.with(|m| *m.borrow_mut() = None);
 }
 
 fn on_rbutton_up(lp: LPARAM) {
     picker_cancel("right click on the bar");
-    match hit_at(lo_i16(lp), hi_i16(lp)) {
-        Some(ItemId::App(i)) => {
-            if let Some(e) = entry_at(i) {
-                show_app_menu(&e, ItemId::App(i));
-            }
-        }
-        Some(ItemId::Volume) => launch_target_str("ms-settings:apps-volume"),
-        Some(ItemId::Network) => launch_target_str("ms-settings:network"),
-        Some(ItemId::Battery) => launch_target_str("ms-settings:batterysaver"),
-        Some(ItemId::Start) => toggle_popup(PopupKind::Start, ItemId::Start),
-        Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Right),
-        Some(ItemId::Notifications)
-        | Some(ItemId::Clock)
-        | Some(ItemId::TrayOverflow)
-        | Some(ItemId::ShowDesktop)
-        | Some(ItemId::Power)
-        | Some(ItemId::Metrics)
-        | None => {}
+    let (x, y) = (lo_i16(lp), hi_i16(lp));
+    let hit = hit_at(x, y);
+    if let Some(t) = gesture_target(hit, x, y) {
+        run_action(resolve(t, Gesture::Right), hit);
     }
 }
 
-/// Forwards a click to the app owning tray icon `id` (first closes any open popup).
-fn tray_click(id: u64, kind: TrayClick) {
+/// Forwards a click to the app owning tray icon `id` (first closes any open popup), at `at` (screen px; None: the
+/// cursor, every mouse caller).
+fn tray_click(id: u64, kind: TrayClick, at: Option<POINT>) {
     popup::close("tray click");
-    let p = cursor_pos().unwrap_or_default();
+    let p = at.or_else(cursor_pos).unwrap_or_default();
     tray_host::click(id, kind, p);
 }
 
 /// Left click on a tray icon with manual double-click detection (same icon, within
-/// `GetDoubleClickTime` and `SM_CXDOUBLECLK/SM_CYDOUBLECLK`).
-fn tray_left_click(id: u64) {
+/// `GetDoubleClickTime` and `SM_CXDOUBLECLK/SM_CYDOUBLECLK`), at `at` (screen px; None: the cursor).
+fn tray_left_click(id: u64, at: Option<POINT>) {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXDOUBLECLK, SM_CYDOUBLECLK};
-    let p = cursor_pos().unwrap_or_default();
+    let p = at.or_else(cursor_pos).unwrap_or_default();
     let now = now_ms();
     // SAFETY: functions without preconditions.
     let (dt, dx, dy) =
@@ -2256,11 +2414,34 @@ fn tray_left_click(id: u64) {
     tray_host::click(id, if double { TrayClick::Double } else { TrayClick::Left }, p);
 }
 
+/// Minimum time between two wheel cycle steps (a fast wheel must not sweep through many windows).
+const CYCLE_STEP_MS: u64 = 120;
+
+/// true when a cycle step may run: `CYCLE_STEP_MS` have passed since `last`.
+fn cycle_due(last: u64, now: u64) -> bool {
+    now.saturating_sub(last) >= CYCLE_STEP_MS
+}
+
+/// `notches` wheel notches of volume, each `d` percent.
+fn volume_request(d: i8, notches: i32) {
+    shell_thread::request(ShellRequest::VolumeAdjust { delta_percent: notches * i32::from(d) });
+}
+
 fn on_mouse_wheel(wp: WPARAM, lp: LPARAM) {
+    // Ctrl + wheel is reserved for magnification.
+    if wp.0 & MK_CONTROL != 0 {
+        return;
+    }
     let Some(g) = GEOM.with(|g| g.get()) else { return };
     // The wheel carries SCREEN coordinates (not client).
-    let hit = hit_at(lo_i16(lp) - g.x, hi_i16(lp) - g.y);
-    if hit != Some(ItemId::Volume) {
+    let (x, y) = (lo_i16(lp) - g.x, hi_i16(lp) - g.y);
+    let hit = hit_at(x, y);
+    let Some(target) = gesture_target(hit, x, y) else { return };
+    // An open popup takes the wheel: only the Volume item still acts.
+    if popup::is_open() && target != Target::Volume {
+        return;
+    }
+    if resolve(target, Gesture::WheelUp) == Action::None && resolve(target, Gesture::WheelDown) == Action::None {
         return;
     }
     let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
@@ -2276,8 +2457,13 @@ fn on_mouse_wheel(wp: WPARAM, lp: LPARAM) {
         a.set(acc - n * 120);
         n
     });
-    if notches != 0 {
-        shell_thread::request(ShellRequest::VolumeAdjust { delta_percent: notches * crate::audio::WHEEL_STEP_PERCENT });
+    if notches == 0 {
+        return;
+    }
+    let up = notches > 0;
+    match resolve(target, if up { Gesture::WheelUp } else { Gesture::WheelDown }) {
+        Action::Volume(d) => volume_request(d, notches.abs()),
+        a => run_action(a, hit),
     }
 }
 
@@ -2446,64 +2632,91 @@ fn apply_drag(layout: &mut Layout, d: &mut DragState, entries: &[Entry], tray: &
     true
 }
 
+/// A run of items of one reorder zone: what a drag (or a keyboard move) reorders.
+struct ZoneRun {
+    zone: Zone,
+    /// App zone: the run is the pinned apps, or the running ones.
+    pinned: bool,
+    /// Index of the run's first item in the layout.
+    first: usize,
+    /// The item's place in the run.
+    from: usize,
+    ids: Vec<ItemId>,
+    /// Config key of every item (app key, tray key, module name), to validate and to persist.
+    keys: Vec<String>,
+    widths: Vec<i32>,
+}
+
+/// The run of `items[idx]`'s zone around it (the app zone splits the pinned apps from the running ones, by `pinned_of`;
+/// `key_of` gives each item's config key). None for an item that cannot move, a run of one, or an item without a key.
+fn zone_run(
+    items: &[ItemRect],
+    idx: usize,
+    pinned_of: impl Fn(ItemId) -> Option<bool>,
+    key_of: impl Fn(ItemId) -> Option<String>,
+) -> Option<ZoneRun> {
+    let id = items.get(idx)?.id;
+    let zone = zone_of(id)?;
+    let pinned = pinned_of(id)?;
+    let same = |it: &ItemRect| zone_of(it.id) == Some(zone) && pinned_of(it.id) == Some(pinned);
+    let mut first = idx;
+    while first > 0 && same(&items[first - 1]) {
+        first -= 1;
+    }
+    let mut end = idx + 1;
+    while end < items.len() && same(&items[end]) {
+        end += 1;
+    }
+    let n = end - first;
+    if n < 2 {
+        return None;
+    }
+    let (mut ids, mut keys, mut widths) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    for it in &items[first..end] {
+        ids.push(it.id);
+        keys.push(key_of(it.id)?);
+        widths.push(it.rect.right - it.rect.left);
+    }
+    Some(ZoneRun { zone, pinned, first, from: idx - first, ids, keys, widths })
+}
+
+/// Whether the entry of App item `id` is pinned (None: no such entry); every other item counts as not pinned.
+fn pinned_of(st: &UiState, id: ItemId) -> Option<bool> {
+    match id {
+        ItemId::App(i) => st.entries.get(i).map(|e| e.pinned),
+        _ => Some(false),
+    }
+}
+
 /// Starts a reorder of `id` (the pressed item). false if its zone has nothing to reorder.
 fn begin_drag(id: ItemId) -> bool {
     let ok = UI
         .with(|u| {
             let st = &mut *u.borrow_mut();
-            let zone = zone_of(id)?;
-            let pinned = match id {
-                ItemId::App(i) => st.entries.get(i)?.pinned,
-                _ => false,
-            };
             let items = &st.layout.items;
             let idx = items.iter().position(|i| i.id == id)?;
-            let same = |it: &ItemRect| {
-                zone_of(it.id) == Some(zone)
-                    && match it.id {
-                        ItemId::App(i) => st.entries.get(i).map(|e| e.pinned) == Some(pinned),
-                        _ => true,
-                    }
-            };
-            let mut first = idx;
-            while first > 0 && same(&items[first - 1]) {
-                first -= 1;
-            }
-            let mut end = idx + 1;
-            while end < items.len() && same(&items[end]) {
-                end += 1;
-            }
-            let n = end - first;
-            if n < 2 {
-                return None;
-            }
-            let x0 = items[first].rect.left;
-            let (mut ids, mut keys, mut widths, mut anims) =
-                (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+            let run = zone_run(items, idx, |id| pinned_of(st, id), |id| key_of(st, id))?;
+            let x0 = items[run.first].rect.left;
+            let mut anims = Vec::with_capacity(run.widths.len());
             let mut rel = 0;
-            for it in &items[first..end] {
-                let w = it.rect.right - it.rect.left;
-                ids.push(it.id);
-                keys.push(key_of(st, it.id)?);
-                widths.push(w);
+            for w in &run.widths {
                 anims.push(SlideAnim { from: rel, to: rel, start: 0 });
                 rel += w;
             }
-            let from = idx - first;
             let left = items[idx].rect.left;
             let drag = DragState {
                 id,
-                zone,
-                pinned,
-                first,
-                from,
-                slot: from,
-                ids,
-                keys,
+                zone: run.zone,
+                pinned: run.pinned,
+                first: run.first,
+                from: run.from,
+                slot: run.from,
+                ids: run.ids,
+                keys: run.keys,
                 total: rel,
                 slot_rel: left - x0,
                 anims,
-                widths,
+                widths: run.widths,
                 x0,
                 grab: st.press_x - left,
                 cur_rel: left - x0,
@@ -2656,18 +2869,30 @@ fn reorder_visible_modules(old: &[String], visible: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// `keys` with the key at `from` moved to `slot` (removed, then inserted); unchanged when either is out of range.
+fn reordered(keys: &[String], from: usize, slot: usize) -> Vec<String> {
+    let mut k = keys.to_vec();
+    if from < k.len() && slot < k.len() {
+        let moved = k.remove(from);
+        k.insert(slot, moved);
+    }
+    k
+}
+
+/// Persists `keys`, the new order of a run of `zone` (the pinned or the running apps by `pinned`): the pins in their
+/// slots, `app_order`, `tray_order` or the visible modules' slots (atomic config rewrite).
+fn commit_order(zone: Zone, pinned: bool, keys: &[String]) -> Result<(), String> {
+    match zone {
+        Zone::Apps if pinned => config::modify(|c| reorder_pinned(c, keys)),
+        Zone::Apps => config::modify(|c| c.app_order = merge_order(keys, &c.app_order, config::APP_ORDER_CAP)),
+        Zone::Tray => config::modify(|c| c.tray_order = merge_order(keys, &c.tray_order, config::TRAY_ORDER_CAP)),
+        Zone::Modules => config::modify(|c| c.modules_order = reorder_visible_modules(&c.modules_order, keys)),
+    }
+}
+
 /// Persists the new order of the dragged zone (atomic config rewrite) and rebuilds the items.
 fn commit_drag(d: &DragState) {
-    let mut keys = d.keys.clone();
-    let moved = keys.remove(d.from);
-    keys.insert(d.slot, moved);
-    let r = match d.zone {
-        Zone::Apps if d.pinned => config::modify(|c| reorder_pinned(c, &keys)),
-        Zone::Apps => config::modify(|c| c.app_order = merge_order(&keys, &c.app_order, config::APP_ORDER_CAP)),
-        Zone::Tray => config::modify(|c| c.tray_order = merge_order(&keys, &c.tray_order, config::TRAY_ORDER_CAP)),
-        Zone::Modules => config::modify(|c| c.modules_order = reorder_visible_modules(&c.modules_order, &keys)),
-    };
-    match r {
+    match commit_order(d.zone, d.pinned, &reordered(&d.keys, d.from, d.slot)) {
         Ok(()) => on_config_changed(),
         Err(e) => log!("drag: saving the new order failed: {e}"),
     }
@@ -2720,85 +2945,147 @@ pub(crate) fn launch_target_str(target: &str) {
     shell_thread::request(ShellRequest::Launch { target: target.to_string(), args: None });
 }
 
-fn click_left(id: ItemId) {
-    match id {
-        ItemId::App(i) => {
-            let Some(e) = entry_at(i) else { return };
-            match apps::click_group(&e.group_key) {
-                ClickOutcome::NoWindows => match launch_target(&e) {
-                    Some(t) => shell_thread::request(ShellRequest::Launch { target: t, args: None }),
-                    None => log!("click: no launch target for '{}'", e.key),
-                },
-                // A minimized window must not get the foreground back when the bar hides.
-                ClickOutcome::Minimized(h) => {
-                    let _ = PREV_FG.compare_exchange(h, 0, Relaxed, Relaxed);
+/// Smart click on the App item `i`: the group's window logic, or a launch when it has no window.
+fn smart_click(i: usize) {
+    let Some(e) = entry_at(i) else { return };
+    match apps::click_group(&e.group_key) {
+        ClickOutcome::NoWindows => match launch_target(&e) {
+            Some(t) => shell_thread::request(ShellRequest::Launch { target: t, args: None }),
+            None => log!("click: no launch target for '{}'", e.key),
+        },
+        // A minimized window must not get the foreground back when the bar hides.
+        ClickOutcome::Minimized(h) => {
+            let _ = PREV_FG.compare_exchange(h, 0, Relaxed, Relaxed);
+        }
+        ClickOutcome::Activated(_) => {}
+    }
+}
+
+/// A new instance of the App item `i` (a launch of its target).
+fn new_instance(i: usize) {
+    if let Some(e) = entry_at(i) {
+        match launch_target(&e) {
+            Some(t) => shell_thread::request(ShellRequest::Launch { target: t, args: None }),
+            None => log!("middle click: no launch target for '{}'", e.key),
+        }
+    }
+}
+
+/// Opens or closes popup `kind` from item `id`. Without a popup (class not registered) the kinds that have one fall back
+/// to the direct action.
+fn popup_action(kind: PopupKind, id: ItemId) {
+    let up = popup::is_available();
+    match kind {
+        PopupKind::Notifications if !up => send_win_n(),
+        PopupKind::Audio if !up => shell_thread::request(ShellRequest::VolumeToggleMute),
+        PopupKind::Calendar if !up => launch_target_str("ms-settings:dateandtime"),
+        PopupKind::Power if !up => log!("Power: popup not available"),
+        // Left click opens the dock's own Start menu (`popup_startmenu`), like the Win double tap; without a popup it
+        // falls back to the Windows Start menu.
+        PopupKind::StartMenu if !up => shell_thread::request(ShellRequest::OpenStart),
+        PopupKind::Network if !up => launch_target_str("ms-settings:network"),
+        PopupKind::Battery if !up => {
+            popup::close("battery settings");
+            launch_target_str("ms-settings:batterysaver");
+        }
+        _ => toggle_popup(kind, id),
+    }
+}
+
+/// The part of the bar a gesture on `hit` lands on (`None`: the space between the items).
+fn target_of(hit: Option<ItemId>) -> Target {
+    match hit {
+        None => Target::Empty,
+        Some(ItemId::App(_)) => Target::App,
+        Some(ItemId::Tray(_)) => Target::Tray,
+        Some(ItemId::TrayOverflow) => Target::TrayOverflow,
+        Some(ItemId::Notifications) => Target::Notifications,
+        Some(ItemId::Volume) => Target::Volume,
+        Some(ItemId::Clock) => Target::Clock,
+        Some(ItemId::Start) => Target::Start,
+        Some(ItemId::ShowDesktop) => Target::ShowDesktop,
+        Some(ItemId::Power) => Target::Power,
+        Some(ItemId::Network) => Target::Network,
+        Some(ItemId::Metrics) => Target::Metrics,
+        Some(ItemId::Battery) => Target::Battery,
+    }
+}
+
+/// Runs `a` for the gesture that landed on `hit`. Every entry it needs is read through `entry_at` here, at the moment it
+/// runs: no index is kept across messages.
+fn run_action(a: Action, hit: Option<ItemId>) {
+    run_action_at(a, hit, None);
+}
+
+/// `run_action` with the point a tray icon is clicked at (screen px; None: the cursor): the keyboard clicks a tray icon
+/// at its centre.
+fn run_action_at(a: Action, hit: Option<ItemId>, at: Option<POINT>) {
+    match a {
+        Action::None => {}
+        Action::Smart => {
+            if let Some(ItemId::App(i)) = hit {
+                smart_click(i);
+            }
+        }
+        Action::NewInstance => {
+            if let Some(ItemId::App(i)) = hit {
+                new_instance(i);
+            }
+        }
+        Action::Menu => {
+            if let Some(ItemId::App(i)) = hit {
+                if let Some(e) = entry_at(i) {
+                    show_app_menu(&e, ItemId::App(i));
                 }
-                ClickOutcome::Activated(_) => {}
             }
         }
-        // Without a popup (class not registered) fall back to the direct actions.
-        ItemId::Notifications => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::Notifications, id);
-            } else {
-                send_win_n();
+        Action::Popup(kind) => {
+            if let Some(id) = hit {
+                popup_action(kind, id);
             }
         }
-        ItemId::Volume => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::Audio, id);
-            } else {
-                shell_thread::request(ShellRequest::VolumeToggleMute);
-            }
-        }
-        ItemId::Clock => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::Calendar, id);
-            } else {
-                launch_target_str("ms-settings:dateandtime");
-            }
-        }
-        ItemId::Power => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::Power, id);
-            } else {
-                log!("Power: popup not available");
-            }
-        }
-        ItemId::TrayOverflow => toggle_popup(PopupKind::TrayOverflow, id),
-        ItemId::Tray(tid) => tray_left_click(tid),
-        ItemId::ShowDesktop => {
+        Action::ShowDesktop => {
             popup::close("show desktop");
             shell_thread::request(ShellRequest::ToggleDesktop);
         }
-        // Left click opens the dock's own Start menu (`popup_startmenu`), like the Win double tap;
-        // without a popup (class not registered) it falls back to the Windows Start menu.
-        ItemId::Start => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::StartMenu, id);
-            } else {
-                shell_thread::request(ShellRequest::OpenStart);
-            }
-        }
-        ItemId::Network => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::Network, id);
-            } else {
-                launch_target_str("ms-settings:network");
-            }
-        }
-        ItemId::Metrics => {
+        Action::Mute => shell_thread::request(ShellRequest::VolumeToggleMute),
+        Action::OpenTasks => {
             popup::close("task manager");
             launch_target_str("taskmgr.exe");
         }
-        ItemId::Battery => {
-            if popup::is_available() {
-                toggle_popup(PopupKind::Battery, id);
-            } else {
-                popup::close("battery settings");
-                launch_target_str("ms-settings:batterysaver");
+        Action::OpenSettings(link) => launch_target_str(match link {
+            SettingsLink::AppsVolume => "ms-settings:apps-volume",
+            SettingsLink::Network => "ms-settings:network",
+            SettingsLink::BatterySaver => "ms-settings:batterysaver",
+        }),
+        Action::Tray(button) => {
+            if let Some(ItemId::Tray(id)) = hit {
+                match button {
+                    TrayButton::Left => tray_left_click(id, at),
+                    TrayButton::Middle => tray_click(id, TrayClick::Middle, at),
+                    TrayButton::Right => tray_click(id, TrayClick::Right, at),
+                }
             }
         }
+        Action::CloseGroup => close_group_at_release(hit),
+        Action::DockMenu => {
+            if let (Some(p), Some(a)) = (cursor_pos(), bar_anchor()) {
+                // A 1 px wide rectangle at the pointer, as tall as the bar: the popup centres on the pointer.
+                popup::open_dock_menu(Anchor { item: RECT { left: p.x, right: p.x + 1, ..a.bar }, ..a });
+            }
+        }
+        Action::Cycle { skip_min, forward } => {
+            if let Some(ItemId::App(i)) = hit {
+                let now = now_ms();
+                if cycle_due(LAST_CYCLE.get(), now) {
+                    LAST_CYCLE.set(now);
+                    if let Some(e) = entry_at(i) {
+                        let _ = apps::cycle_group(&e.group_key, forward, skip_min);
+                    }
+                }
+            }
+        }
+        Action::Volume(d) => volume_request(d, 1),
     }
 }
 
@@ -2869,6 +3156,943 @@ pub(crate) fn win_key_inputs(vk: VIRTUAL_KEY) -> [INPUT; 4] {
         ev(vk, KEYEVENTF_KEYUP),
         ev(VK_LWIN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
     ]
+}
+
+// ------------------------------------------------------------ keyboard: owned chords (dock-keys K1-K3)
+
+/// The owned chord rows for config `c` (SPEC-dock 5.2.2): none while the native taskbar is shown; Win+n, Win+Shift+n
+/// and Win+Alt+n from `win_numbers`, Win+T and Win+Shift+T from `win_t`, Win+B from `win_b`, Peek from `peek` with the
+/// digits (its chips are the digits).
+fn dock_chords(c: &config::Config) -> hook::DockChords {
+    use hook::DockChords as C;
+    if !c.hide_native_taskbar {
+        return C::NONE;
+    }
+    let k = c.keyboard;
+    let mut t = C::NONE;
+    if k.win_numbers {
+        t = t.with(C::DIGITS).with(C::SHIFT_DIGITS).with(C::ALT_DIGITS);
+    }
+    if k.win_t {
+        t = t.with(C::WIN_T).with(C::WIN_SHIFT_T);
+    }
+    if k.win_b {
+        t = t.with(C::WIN_B);
+    }
+    if k.peek && k.win_numbers {
+        t = t.with(C::PEEK);
+    }
+    t
+}
+
+/// Hands the hook the chord rows of the current config (none with `--keep-taskbar`, which keeps the native taskbar),
+/// and the fullscreen flag Peek needs.
+fn chords_sync() {
+    let chords = if crate::args().keep_taskbar { hook::DockChords::NONE } else { dock_chords(&config::get()) };
+    CHORDS.set(chords);
+    if chords != hook::DockChords::NONE {
+        // Lock and unlock are cut-offs the hook must hear of (`cut_off_of`).
+        crate::launcher_sys::watch_sessions();
+    }
+    chords_follow_foreground();
+    peek_fullscreen_sync(chords);
+}
+
+/// The session and power events after which keys may have gone by the hook unseen (`hook::cut_off`): a lock, an
+/// unlock, a console or remote connect or disconnect (WM_WTSSESSION_CHANGE), a suspend or a resume (WM_POWERBROADCAST).
+fn cut_off_of(msg: u32, code: usize) -> Option<hook::CutOff> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT,
+        WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    };
+    let session = [
+        WTS_SESSION_LOCK,
+        WTS_SESSION_UNLOCK,
+        WTS_CONSOLE_CONNECT,
+        WTS_CONSOLE_DISCONNECT,
+        WTS_REMOTE_CONNECT,
+        WTS_REMOTE_DISCONNECT,
+    ];
+    match msg {
+        WM_WTSSESSION_CHANGE if session.iter().any(|&c| c as usize == code) => Some(hook::CutOff::Session),
+        WM_POWERBROADCAST if code == PBT_APMSUSPEND as usize || code == PBT_APMRESUMEAUTOMATIC as usize => {
+            Some(hook::CutOff::Power)
+        }
+        _ => None,
+    }
+}
+
+/// What is in front, for the dock's chords (`chords_follow_foreground`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Front {
+    /// Any other window, or none: the config's rows.
+    Local,
+    /// A remote-desktop or VM client: its own hook can take keys before the dock's, and its session gets the Win
+    /// chords.
+    Remote,
+    /// A window above the dock: the UAC prompt shown without the secure desktop, which runs above the elevated dock, so
+    /// the dock's hook gets none of the keys typed while it is in front, a Win release among them; or a window of any
+    /// process the dock may not open for limited information, taken for one such.
+    Above,
+}
+
+/// The window in front from its process's image (`launcher_sys::with_foreground_image`): a remote-desktop or VM client
+/// by the launcher's own list (`powertoys::is_remote_client`, whose REMOTE flag this does not change); the UAC prompt
+/// (`powertoys::is_elevation_prompt`) or a process the dock may not look at is above the dock; anything else is local.
+fn front_of(image: crate::launcher_sys::ProcessImage<'_>) -> Front {
+    use crate::launcher::powertoys::{is_elevation_prompt, is_remote_client};
+    use crate::launcher_sys::ProcessImage;
+    match image {
+        ProcessImage::Path(path) if is_remote_client(path) => Front::Remote,
+        ProcessImage::Path(path) if is_elevation_prompt(path) => Front::Above,
+        ProcessImage::Refused => Front::Above,
+        ProcessImage::Path(_) | ProcessImage::Unknown => Front::Local,
+    }
+}
+
+/// The rows the hook owns for the window in front: none while a remote-desktop or VM client is there, so its session
+/// gets Win+n, Win+T, Win+B and the rest as in 1.5.2 (the hook answers as with no row), nor while a window above the
+/// dock is, whose keys the hook never sees; otherwise the config's `rows`.
+fn effective_chords(rows: hook::DockChords, front: Front) -> hook::DockChords {
+    match front {
+        Front::Local => rows,
+        Front::Remote | Front::Above => hook::DockChords::NONE,
+    }
+}
+
+/// The cut-off of a change of the window in front from `was` to `now`: a window above the dock coming to the front or
+/// leaving it (the keys typed while it is there never reach the dock's hook, a Win release among them), or a remote
+/// client leaving it (its own hook could take keys before the dock's). A remote client coming to the front is none.
+fn front_cut_off(was: Front, now: Front) -> Option<hook::CutOff> {
+    if was == now {
+        None
+    } else if was == Front::Above || now == Front::Above {
+        Some(hook::CutOff::WindowAbove)
+    } else if was == Front::Remote {
+        Some(hook::CutOff::RemoteClient)
+    } else {
+        None
+    }
+}
+
+/// At each foreground change and config change: the rows the hook owns now (`effective_chords`) for the window in front
+/// (`front_of`), which is looked at only while the config owns a row. A change of the window in front can be a cut-off
+/// for the hook (`front_cut_off`).
+fn chords_follow_foreground() {
+    let rows = CHORDS.get();
+    let front = if rows == hook::DockChords::NONE {
+        Front::Local
+    } else {
+        crate::launcher_sys::with_foreground_image(front_of)
+    };
+    let was = FRONT.with(|f| f.replace(front));
+    if was != front {
+        match front {
+            Front::Remote => log!("keyboard: a remote or VM client is in front, its session gets the Win chords"),
+            Front::Above => log!("keyboard: a window above the dock is in front, the dock owns no Win chord"),
+            Front::Local => log!("keyboard: a local window is in front, the dock owns its Win chords again"),
+        }
+    }
+    hook::set_dock_chords(effective_chords(rows, front));
+    if let Some(why) = front_cut_off(was, front) {
+        hook::cut_off(why);
+    }
+}
+
+/// While Peek is owned, on each foreground change: whether a fullscreen window is in front (the hook then never arms
+/// Peek over it).
+fn peek_fullscreen_sync(chords: hook::DockChords) {
+    if chords.has(hook::DockChords::PEEK) {
+        hook::set_dock_fullscreen(foreground_is_fullscreen());
+    }
+}
+
+/// A WM_DOCK_CHORD posted at `sent` (its kb.time) is stale at `now` (GetTickCount): more than CHORD_STALE_MS old,
+/// both clocks wrapping.
+fn chord_stale(sent: u32, now: u32) -> bool {
+    now.wrapping_sub(sent) > hook::CHORD_STALE_MS
+}
+
+/// The `n`-th app item (0-based) among `ids`, the layout's items in bar order (pins, then running apps); None beyond
+/// the count.
+fn nth_app(ids: &[ItemId], n: u8) -> Option<ItemId> {
+    ids.iter().filter(|i| matches!(i, ItemId::App(_))).nth(usize::from(n)).copied()
+}
+
+/// Where Win+T, Win+Shift+T and Win+B put the keyboard focus among `ids`: the first app, the last app, the first tray
+/// icon (no tray: the first module); without apps the first or last item.
+fn chord_focus(ids: &[ItemId], a: hook::ChordAction) -> Option<usize> {
+    use bar_keys::{move_focus, zone_of as kzone, KZone, Key};
+    match a {
+        hook::ChordAction::FocusFirst => move_focus(ids, None, Key::Home),
+        hook::ChordAction::FocusLast => move_focus(ids, None, Key::End),
+        hook::ChordAction::FocusTray => ids
+            .iter()
+            .position(|&i| kzone(i) == KZone::Tray)
+            .or_else(|| ids.iter().position(|&i| kzone(i) == KZone::Modules))
+            .or_else(|| move_focus(ids, None, Key::Home)),
+        _ => None,
+    }
+}
+
+/// The ids of the last layout, in bar order.
+fn layout_ids() -> Vec<ItemId> {
+    UI.with(|u| u.borrow().layout.items.iter().map(|i| i.id).collect())
+}
+
+/// `WM_DOCK_CHORD`: an owned chord the hook swallowed (SPEC-dock 5.2.2). Acknowledged first, so the hook keeps owning
+/// the chords; a stale post and a Sync act on nothing. Win+n acts like a click on the n-th app and never takes the bar's
+/// foreground; Win+Alt+n, Win+T, Win+Shift+T and Win+B give the bar the keyboard (`focus_bar`).
+fn on_chord(wp: usize, sent: u32) {
+    use hook::ChordAction as C;
+    hook::ack_chord((wp >> 16) as u16);
+    let Some((a, _)) = hook::decode_chord(wp) else { return };
+    if a == C::Sync {
+        return;
+    }
+    // SAFETY: no preconditions.
+    let now = unsafe { GetTickCount() };
+    if chord_stale(sent, now) {
+        log!("chord {a:?} dropped: posted {} ms ago", now.wrapping_sub(sent));
+        return;
+    }
+    log!("chord {a:?}");
+    let ids = layout_ids();
+    match a {
+        C::App(n) | C::NewInstance(n) | C::AppMenu(n) => {
+            let Some(id) = nth_app(&ids, n) else {
+                log!("chord {a:?}: no app in that slot");
+                return;
+            };
+            match a {
+                C::App(_) => run_action(Action::Smart, Some(id)),
+                C::NewInstance(_) => run_action(Action::NewInstance, Some(id)),
+                _ => {
+                    focus_bar("Win+Alt+n");
+                    if VISIBLE.load(Relaxed) {
+                        kb_event(KbEvent::Chord);
+                        kb_set_focus(Some(id));
+                    }
+                    popup::set_keyboard_entry(true);
+                    run_action(Action::Menu, Some(id));
+                    popup::set_keyboard_entry(false);
+                }
+            }
+        }
+        C::FocusFirst | C::FocusLast | C::FocusTray => {
+            focus_bar(match a {
+                C::FocusFirst => "Win+T",
+                C::FocusLast => "Win+Shift+T",
+                _ => "Win+B",
+            });
+            // A bar that could not show (no geometry yet) holds no keyboard state.
+            if VISIBLE.load(Relaxed) {
+                kb_event(KbEvent::Chord);
+                kb_set_focus(chord_focus(&ids, a).and_then(|k| ids.get(k).copied()));
+                redraw();
+            }
+        }
+        C::Sync => {}
+    }
+}
+
+/// Win+T, Win+Shift+T, Win+B, Win+Alt+n: the bar takes the foreground and the keyboard. Hidden: the Win key's show (it
+/// takes the foreground, remembers the window in front in PREV_FG and stays the key-show time). Shown: the window in
+/// front, when it is not ours, is remembered for Esc, the bar takes the foreground and stays at least the key-show time.
+fn focus_bar(reason: &str) {
+    if !VISIBLE.load(Relaxed) {
+        show_dock_win(reason);
+        return;
+    }
+    let fg = foreign_foreground();
+    if !fg.0.is_null() {
+        PREV_FG.store(fg.0 as isize, Relaxed);
+    }
+    log!("FOCUS ({reason})");
+    force_foreground(hwnd());
+    HIDE_AT.fetch_max(hide_at(now_ms(), key_show_ms(config::get().hide_delay_ms)), Relaxed);
+    ensure_key_focus();
+}
+
+/// Peek's show lasts at most this long (ms): a lost Win release cannot keep the bar up.
+const PEEK_HOLD_MS: u64 = 10_000;
+
+/// Peek: the digit chips are drawn (Win held), and the bar was hidden when it began (its release hides it again).
+#[derive(Clone, Copy, Debug)]
+struct Peek {
+    chips: bool,
+    shown: bool,
+}
+
+/// The Peek release hides the bar only when Peek showed it, the pointer is not over it and the keyboard is not on it.
+fn peek_release(shown_by_peek: bool, pointer_over: bool, kb_active: bool) -> bool {
+    shown_by_peek && !pointer_over && !kb_active
+}
+
+/// `WM_DOCK_PEEK`: Win held alone PEEK_MS (`on`), or its release. On: the chips on the first ten apps, and a hidden bar
+/// shown without the foreground for at most PEEK_HOLD_MS (never over a fullscreen window). Off: the chips go, and a bar
+/// Peek showed hides unless the pointer or the keyboard is on it.
+fn on_peek(on: bool) {
+    if on {
+        let hidden = !VISIBLE.load(Relaxed);
+        if hidden && foreground_is_fullscreen() {
+            return;
+        }
+        PEEK.set(Peek { chips: true, shown: PEEK.get().shown || hidden });
+        if hidden {
+            show_dock("Win held (peek)", PEEK_HOLD_MS);
+        } else {
+            redraw();
+        }
+        return;
+    }
+    let p = PEEK.replace(Peek { chips: false, shown: false });
+    // The chips leave before the slide-out, which presents the last frame.
+    redraw_if_visible();
+    if VISIBLE.load(Relaxed) && peek_release(p.shown, pointer_over_bar(), kb_active()) {
+        hide_dock("peek released");
+    }
+}
+
+/// true when the pointer is over the bar.
+fn pointer_over_bar() -> bool {
+    let (Some(g), Some(p)) = (GEOM.with(|g| g.get()), cursor_pos()) else { return false };
+    point_in(&RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h }, p)
+}
+
+/// The keyboard layer is in use: an item has the focus and the bar or one of our popups is in front (D 5.2.3).
+fn kb_active_of(focused: bool, fg_ours: bool) -> bool {
+    focused && fg_ours
+}
+
+/// The hide countdown while the keyboard is on the bar: the key-show time (never the bare hide delay, which may be 0).
+fn kb_hide_at(now: u64, hide_delay_ms: u32) -> u64 {
+    hide_at(now, key_show_ms(hide_delay_ms))
+}
+
+/// The keyboard state outlives the ring: a focus or armed letters with the bar or a popup in front. The idle end and the
+/// idle clock go by this, so a pointer crossing the bar (ring off) cannot leave an armed layer that never ends.
+fn kb_held_of(focus: bool, deliberate: bool, fg_ours: bool) -> bool {
+    kb_armed(focus, deliberate) && fg_ours
+}
+
+/// The keyboard state is armed: an item has the focus or the letters were armed on purpose (the ring does not matter).
+fn kb_armed(focus: bool, deliberate: bool) -> bool {
+    focus || deliberate
+}
+
+/// The keyboard decision of a poll, from the raw state: the idle end and the idle clock go by it.
+fn kb_poll_of(engaged: bool, autohide: bool, focus: bool, deliberate: bool, fg_ours: bool) -> KbPoll {
+    kb_poll(engaged, autohide, kb_held_of(focus, deliberate, fg_ours))
+}
+
+/// `kb_poll_of` for the current state and foreground.
+fn kb_poll_now(engaged: bool, autohide: bool) -> KbPoll {
+    let (focus, deliberate) = KB.with(|k| {
+        let k = k.borrow();
+        (k.focus.is_some(), k.deliberate)
+    });
+    let fg_ours = kb_armed(focus, deliberate) && {
+        // SAFETY: no preconditions.
+        let fg = unsafe { GetForegroundWindow() };
+        !fg.0.is_null() && is_own_window(fg)
+    };
+    kb_poll_of(engaged, autohide, focus, deliberate, fg_ours)
+}
+
+/// `kb_active_of` for the current focus (with its ring: a mouse motion hands the bar back to the pointer's rules) and
+/// foreground.
+fn kb_active() -> bool {
+    let focused = KB.with(|k| {
+        let k = k.borrow();
+        k.focus.is_some() && k.ring
+    });
+    if !focused {
+        return false;
+    }
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    kb_active_of(focused, !fg.0.is_null() && is_own_window(fg))
+}
+
+/// true when the bar is the foreground window without the keyboard focus (keys would come as WM_SYSKEYDOWN).
+fn needs_focus(fg_is_bar: bool, focus_is_bar: bool) -> bool {
+    fg_is_bar && !focus_is_bar
+}
+
+/// The bar in front without the keyboard focus takes it, as popup.rs `mark_active` does for a popup.
+fn ensure_key_focus() {
+    let h = hwnd();
+    // SAFETY: no preconditions; both read this thread's or the system's state.
+    let (fg, focus) = unsafe { (GetForegroundWindow(), GetFocus()) };
+    if needs_focus(fg == h, focus == h) {
+        // SAFETY: `h` is our window and this is its thread. The result, the previous focus, is ignored.
+        let _ = unsafe { SetFocus(Some(h)) };
+    }
+}
+
+// ------------------------------------------------------------ keyboard: the focused bar (dock-keys K2-K6)
+
+/// The bar's keyboard layer: the item with the keyboard focus and whether its ring shows. Empty while the bar is hidden.
+struct Kb {
+    focus: Option<ItemId>,
+    /// The key of the focused app: its index changes when the entries are rebuilt.
+    app_key: Option<String>,
+    /// The ring is drawn: a key put the focus there.
+    ring: bool,
+    /// Where the pointer was when the ring came on (screen px): only a real motion from there hides it.
+    ring_pt: Option<POINT>,
+    /// Type-ahead: the word typed so far (allocated only while typing) and when its last character came (ms).
+    typed: String,
+    typed_at: u64,
+    /// The keyboard was put on the bar on purpose (Win+T, Win+Shift+T, Win+B, Win+Alt+n or a navigation key): only
+    /// then do letters start type-ahead. A lone Win tap gives the bar the keys without this.
+    deliberate: bool,
+    /// When the last key reached the bar (ms), for `kb_idle`.
+    last_key: u64,
+}
+
+impl Kb {
+    const EMPTY: Kb = Kb {
+        focus: None,
+        app_key: None,
+        ring: false,
+        ring_pt: None,
+        typed: String::new(),
+        typed_at: 0,
+        deliberate: false,
+        last_key: 0,
+    };
+}
+
+/// Without a key for this long (ms) and with the pointer off the bar, the keyboard layer ends and the bar hides again.
+const KB_IDLE_MS: u64 = 4000;
+
+/// Letters are type-ahead only once the keyboard was put on the bar on purpose: after a lone Win tap, typing goes
+/// nowhere and the bar's countdown runs as in 1.5.2.
+fn letters_act(deliberate: bool) -> bool {
+    deliberate
+}
+
+/// What changes whether the keyboard on the bar is deliberate (`Kb::deliberate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KbEvent {
+    /// A lone Win tap shows the bar (`show_dock_win`).
+    WinTap,
+    /// Win+T, Win+Shift+T, Win+B or Win+Alt+n (`on_chord`).
+    Chord,
+    /// Prev, Next, Home, End or a zone key on the bar (`kb_run_key`).
+    Nav,
+    /// The keyboard layer ends: Esc, hide, idle (`kb_reset`).
+    Reset,
+}
+
+/// `Kb::deliberate` after `ev`: only a chord or a navigation key arms the letters; a Win tap and the end of the
+/// layer leave them inert.
+fn kb_after(ev: KbEvent) -> bool {
+    matches!(ev, KbEvent::Chord | KbEvent::Nav)
+}
+
+/// true when the keyboard layer has been left alone long enough to end: the last key came more than KB_IDLE_MS ago.
+fn kb_idle(now: u64, last_key: u64) -> bool {
+    now.saturating_sub(last_key) > KB_IDLE_MS
+}
+
+/// `ev` happened to the keyboard on the bar, now. Everything but a Win tap is a key the user pressed.
+fn kb_event(ev: KbEvent) {
+    let now = now_ms();
+    KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        k.deliberate = kb_after(ev);
+        if ev != KbEvent::WinTap {
+            k.last_key = now;
+        }
+    });
+}
+
+/// What a poll does about the keyboard layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KbPoll {
+    /// The pointer is over the bar or something of ours is open: the idle clock restarts.
+    Engaged,
+    /// The keyboard is on the bar and left alone: it ends when the idle time is up; `restore` gives the foreground
+    /// back to the window that had it (no auto-hide: nothing hides the bar to do it).
+    CheckIdle {
+        restore: bool,
+    },
+    Nothing,
+}
+
+/// The idle decision of a poll, whatever the hide rules say (`autohide` only chooses how the end hands the foreground back).
+fn kb_poll(engaged: bool, autohide: bool, active: bool) -> KbPoll {
+    if engaged {
+        KbPoll::Engaged
+    } else if active {
+        KbPoll::CheckIdle { restore: !autohide }
+    } else {
+        KbPoll::Nothing
+    }
+}
+
+/// The idle clock after a poll: time with the pointer over the bar, a popup, the picker, a drag or a foreign menu (`engaged`)
+/// is not time left alone, so the clock restarts when that ends.
+fn kb_clock(now: u64, last_key: u64, engaged: bool) -> u64 {
+    if engaged {
+        now
+    } else {
+        last_key
+    }
+}
+
+/// Poll while the bar is engaged (see `kb_clock`): a keyboard focus keeps its idle clock at `now`.
+fn kb_hold(now: u64) {
+    KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        if kb_armed(k.focus.is_some(), k.deliberate) {
+            k.last_key = kb_clock(now, k.last_key, true);
+        }
+    });
+}
+
+/// A key reached the bar, now.
+fn kb_touch() {
+    let now = now_ms();
+    KB.with(|k| k.borrow_mut().last_key = now);
+}
+
+/// Poll: ends the keyboard layer left alone (see `kb_idle`). true when it ended.
+fn kb_idle_end(now: u64) -> bool {
+    let idle = KB.with(|k| kb_idle(now, k.borrow().last_key));
+    if idle {
+        kb_reset();
+        redraw_if_visible();
+    }
+    idle
+}
+
+/// The keyboard layer ends: no focus, no ring, no typed word (its buffer freed: a hidden bar holds nothing).
+fn kb_reset() {
+    KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        *k = Kb::EMPTY;
+        k.deliberate = kb_after(KbEvent::Reset);
+    });
+}
+
+/// Whether a pointer at `now` (screen px; None: unreadable) moved from `since`, where it was when the ring came on (None:
+/// unknown, any motion counts). A WM_MOUSEMOVE Windows sends when the bar slides in under a resting pointer is no motion.
+fn pointer_moved(since: Option<POINT>, now: Option<POINT>) -> bool {
+    match (since, now) {
+        (Some(a), Some(b)) => a != b,
+        (None, _) => true,
+        (Some(_), None) => false,
+    }
+}
+
+/// WM_MOUSEMOVE on the bar: the first real motion hides the keyboard ring (the focus stays for the next key).
+fn kb_mouse_moved() {
+    let ended = KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        if k.ring && pointer_moved(k.ring_pt, cursor_pos()) {
+            k.ring = false;
+            return true;
+        }
+        false
+    });
+    if ended {
+        redraw_if_visible();
+    }
+}
+
+/// The keyboard focus survives a foreground change only to the bar or to one of our popups (a null foreground is a
+/// transient: kept).
+fn kb_keeps(fg_is_bar: bool, fg_is_own: bool) -> bool {
+    fg_is_bar || fg_is_own
+}
+
+/// EVENT_SYSTEM_FOREGROUND: a window that is neither the bar nor ours ends the keyboard layer. The foreground is read
+/// now: the event is posted, and a stale one must not take the focus Win+T just gave.
+fn kb_on_foreground() {
+    if KB.with(|k| k.borrow().focus.is_none()) {
+        return;
+    }
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    if !kb_keeps(fg == hwnd(), fg.0.is_null() || is_own_window(fg)) {
+        kb_reset();
+        redraw_if_visible();
+    }
+}
+
+/// A popup closed while the keyboard was on the bar: closed by Esc with the foreground left to nobody or to us, the bar
+/// takes the foreground back (Esc in a popup returns to the bar, D 5.2.2); a popup left any other way never takes it.
+fn back_to_bar(kb_active: bool, by_esc: bool, fg_null_or_ours: bool) -> bool {
+    kb_active && by_esc && fg_null_or_ours
+}
+
+/// `WM_DOCK_POPUP_CLOSED`: `back_to_bar` for the closed popup (its Esc flag is consumed either way).
+fn kb_after_popup() {
+    let by_esc = popup::take_closed_by_esc();
+    let in_use = KB.with(|k| {
+        let k = k.borrow();
+        k.focus.is_some() && k.ring
+    });
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    if back_to_bar(in_use && VISIBLE.load(Relaxed), by_esc, fg.0.is_null() || is_own_window(fg)) {
+        force_foreground(hwnd());
+        ensure_key_focus();
+    }
+}
+
+/// true while a typed word is live: a character came less than TYPE_AHEAD_MS ago.
+fn typing_live(typed: &str, typed_at: u64, now: u64) -> bool {
+    !typed.is_empty() && now.saturating_sub(typed_at) <= bar_keys::TYPE_AHEAD_MS
+}
+
+/// The item drawn with the keyboard ring.
+fn kb_ring() -> Option<ItemId> {
+    KB.with(|k| {
+        let k = k.borrow();
+        k.focus.filter(|_| k.ring)
+    })
+}
+
+/// The keyboard focus moves to `id` (None: no focus), with the ring on; an app is followed by its key.
+fn kb_set_focus(id: Option<ItemId>) {
+    let key = match id {
+        Some(ItemId::App(i)) => UI.with(|u| u.borrow().entries.get(i).map(|e| e.key.clone())),
+        _ => None,
+    };
+    let pt = cursor_pos();
+    KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        k.focus = id;
+        k.app_key = key;
+        k.ring = id.is_some();
+        k.ring_pt = pt;
+        k.deliberate |= id.is_some();
+        k.last_key = now_ms();
+    });
+}
+
+/// The item with the keyboard focus.
+fn kb_focus() -> Option<ItemId> {
+    KB.with(|k| k.borrow().focus)
+}
+
+/// The index of `key` among `keys` (the entries' keys, compared as `same_key` does).
+fn refind(keys: &[&str], key: &str) -> Option<usize> {
+    keys.iter().position(|k| same_key(k, key))
+}
+
+/// After `rebuild_entries`: the focused app is found again by its key; an app that is gone takes the focus with it.
+fn kb_follow_entries() {
+    KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        let Some(key) = k.app_key.as_deref() else { return };
+        let i = UI.with(|u| {
+            let st = u.borrow();
+            let keys: Vec<&str> = st.entries.iter().map(|e| e.key.as_str()).collect();
+            refind(&keys, key)
+        });
+        k.focus = i.map(ItemId::App);
+        if i.is_none() {
+            k.app_key = None;
+            k.ring = false;
+        }
+    });
+}
+
+/// A key message for the bar: Some(false) a key down, Some(true) a key down with Alt held (lParam bit 29, the context
+/// code), None any other message. WM_SYSKEYDOWN without the bit is what Windows sends an active window that has no
+/// keyboard focus, so it counts as a plain key.
+fn as_key(msg: u32, lp: isize) -> Option<bool> {
+    match msg {
+        WM_KEYDOWN => Some(false),
+        WM_SYSKEYDOWN => Some((lp >> 29) & 1 != 0),
+        _ => None,
+    }
+}
+
+/// true while `vk` is held, as this thread's input saw it.
+fn key_held(vk: VIRTUAL_KEY) -> bool {
+    // SAFETY: no preconditions; the high bit means "down".
+    let state = unsafe { GetKeyState(i32::from(vk.0)) };
+    state < 0
+}
+
+/// A held key (`repeat`) moves a focus again: the bar's arrows, Home, End and Tab (`key`), or the picker's arrows
+/// (`picker_arrow`). Every other key acts once, so a held Enter, Delete, Esc, menu key or Ctrl+arrow makes no burst of
+/// launches, closes or config writes.
+fn repeat_acts(key: Option<bar_keys::Key>, picker_arrow: bool) -> bool {
+    use bar_keys::Key;
+    picker_arrow || matches!(key, Some(Key::Prev | Key::Next | Key::Home | Key::End | Key::NextZone | Key::PrevZone))
+}
+
+/// A key on the bar (SPEC-dock 5.2.2), `repeat` when it is an auto-repeat: through `bar_keys::map_key`; None lets
+/// DefWindowProc have it. A hidden bar has no keyboard state.
+fn on_bar_key(vk: u16, repeat: bool) -> Option<LRESULT> {
+    #[cfg(feature = "owner-probe")]
+    let _work = crate::launcher_probe::ui_work(crate::launcher_probe::UiWork::BarKey);
+    if !VISIBLE.load(Relaxed) {
+        return None;
+    }
+    kb_touch();
+    // The picker opened from the keyboard takes the keys first (arrows, Enter, Delete, Esc).
+    let picker_arrow = (0x25..=0x28).contains(&vk);
+    if (!repeat || repeat_acts(None, picker_arrow)) && crate::picker::key(vk) {
+        return Some(LRESULT(0));
+    }
+    let key = bar_keys::map_key(vk, key_held(VK_SHIFT), key_held(VK_CONTROL), false, config_top())?;
+    if repeat && !repeat_acts(Some(key), false) {
+        return Some(LRESULT(0));
+    }
+    // A space inside a typed word is a character (WM_CHAR adds it), not Activate.
+    let typing = KB.with(|k| {
+        let k = k.borrow();
+        typing_live(&k.typed, k.typed_at, now_ms())
+    });
+    if !(vk == VK_SPACE.0 && typing) {
+        // A popup this key opens ignores its auto-repeat (Up held on an item must not walk the popup's ring).
+        popup::set_opening_key(vk);
+        kb_run_key(key);
+        popup::set_opening_key(0);
+    }
+    Some(LRESULT(0))
+}
+
+/// A character message for the bar: WM_CHAR, or WM_SYSCHAR without the Alt bit (lParam bit 29; `as_key`'s rule).
+fn as_char(msg: u32, lp: isize) -> bool {
+    match msg {
+        WM_CHAR => true,
+        WM_SYSCHAR => (lp >> 29) & 1 == 0,
+        _ => false,
+    }
+}
+
+/// A typed character on the bar: a printable one is type-ahead (`Key::Letter`); control characters (Enter, Tab, Esc,
+/// Backspace) belong to their keys, and a space starts no word (it was Activate).
+fn on_bar_char(code: usize) -> Option<LRESULT> {
+    if !VISIBLE.load(Relaxed) {
+        return None;
+    }
+    let c = char::from_u32(u32::try_from(code).ok()?).filter(|c| !c.is_control())?;
+    kb_touch();
+    // After a lone Win tap the characters go nowhere: no type-ahead, and the countdown is not held.
+    if letters_act(KB.with(|k| k.borrow().deliberate)) {
+        kb_run_key(bar_keys::Key::Letter(c));
+    }
+    Some(LRESULT(0))
+}
+
+/// What a key does on the focused bar.
+fn kb_run_key(key: bar_keys::Key) {
+    use bar_keys::Key;
+    match key {
+        Key::Prev | Key::Next | Key::Home | Key::End | Key::NextZone | Key::PrevZone => {
+            kb_event(KbEvent::Nav);
+            kb_move(key);
+        }
+        Key::Activate | Key::Middle | Key::Context => {
+            if let Some(g) = keyboard_gesture(key) {
+                kb_act(g);
+            }
+        }
+        Key::Interior => kb_interior(),
+        Key::MoveLeft => kb_reorder(false),
+        Key::MoveRight => kb_reorder(true),
+        Key::Escape => kb_escape(),
+        Key::Letter(c) => kb_type(c),
+    }
+}
+
+/// What Esc on the focused bar does: with auto-hide the bar hides (and gives the foreground back, `hide`); without it
+/// the foreground goes back to the window that had it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscAction {
+    Hide,
+    RestoreForeground,
+}
+
+fn esc_action(autohide: bool) -> EscAction {
+    if autohide {
+        EscAction::Hide
+    } else {
+        EscAction::RestoreForeground
+    }
+}
+
+/// Esc on the bar (P0 item 8): a mouse drag in progress is cancelled; otherwise the keyboard layer ends and the bar
+/// hides, or gives the foreground back when it never hides.
+fn kb_escape() {
+    if drag_active() {
+        end_drag(true);
+        return;
+    }
+    kb_reset();
+    match esc_action(config::effective_autohide()) {
+        EscAction::Hide => hide_dock("Esc"),
+        EscAction::RestoreForeground => {
+            restore_prev_foreground();
+            redraw_if_visible();
+        }
+    }
+}
+
+/// Type-ahead: `c` joins the typed word (a pause over TYPE_AHEAD_MS starts a new one) and the focus moves to the next
+/// app whose name starts with it (`bar_keys::type_ahead`).
+fn kb_type(c: char) {
+    let now = now_ms();
+    let Some((typed, focus)) = KB.with(|k| {
+        let k = &mut *k.borrow_mut();
+        let live = typing_live(&k.typed, k.typed_at, now);
+        if !live {
+            k.typed.clear();
+            if c == ' ' {
+                return None;
+            }
+        }
+        k.typed.push(c);
+        k.typed_at = now;
+        Some((k.typed.clone(), k.focus))
+    }) else {
+        return;
+    };
+    let target = UI.with(|u| {
+        let st = u.borrow();
+        let items = &st.layout.items;
+        let names: Vec<(usize, &str)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(k, it)| match it.id {
+                ItemId::App(i) => st.entries.get(i).map(|e| (k, e.name.as_str())),
+                _ => None,
+            })
+            .collect();
+        let cur = focus.and_then(|f| items.iter().position(|i| i.id == f));
+        bar_keys::type_ahead(&names, cur, &typed).and_then(|k| items.get(k)).map(|i| i.id)
+    });
+    if let Some(id) = target {
+        kb_set_focus(Some(id));
+        redraw();
+    }
+}
+
+/// The mouse gesture a key stands for on the focused item: Enter and Space click, Shift+Enter is the middle click, the
+/// menu key and Shift+F10 the right click.
+fn keyboard_gesture(k: bar_keys::Key) -> Option<Gesture> {
+    use bar_keys::Key;
+    match k {
+        Key::Activate => Some(Gesture::Click),
+        Key::Middle => Some(Gesture::Middle),
+        Key::Context => Some(Gesture::Right),
+        _ => None,
+    }
+}
+
+/// The centre of `r` (client px) on the screen, the client origin being `origin`.
+fn item_centre(r: RECT, origin: POINT) -> POINT {
+    POINT { x: origin.x + (r.left + r.right) / 2, y: origin.y + (r.top + r.bottom) / 2 }
+}
+
+/// Gesture `g` on the focused item, through the mouse map (`actions::resolve`): a popup it opens starts with the
+/// keyboard on its first target, and a tray icon is clicked at its centre instead of the cursor.
+fn kb_act(g: Gesture) {
+    let Some(id) = kb_focus() else { return };
+    let at = match (GEOM.with(|g| g.get()), UI.with(|u| u.borrow().layout.rect_of(id))) {
+        (Some(geo), Some(r)) => Some(item_centre(r, POINT { x: geo.x, y: geo.y })),
+        _ => None,
+    };
+    popup::set_keyboard_entry(true);
+    run_action_at(resolve(target_of(Some(id)), g), Some(id), at);
+    // Consumed by the popup the action opened; an action that opened none leaves no flag for the next open.
+    popup::set_keyboard_entry(false);
+}
+
+/// What the interior arrow (Up on a bottom bar, Down on a top bar) opens on the focused item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Interior {
+    Picker,
+    AppMenu,
+    Popup,
+    Nothing,
+}
+
+/// The interior arrow on an item of kind `kind` (an app with `windows` windows): an app with two or more windows opens
+/// the window picker, any other app its menu; an item whose click opens a popup opens it; the rest nothing.
+fn interior(kind: Target, windows: usize) -> Interior {
+    match kind {
+        Target::App if windows >= 2 => Interior::Picker,
+        Target::App => Interior::AppMenu,
+        t if matches!(resolve(t, Gesture::Click), Action::Popup(_)) => Interior::Popup,
+        _ => Interior::Nothing,
+    }
+}
+
+/// The interior arrow on the focused item: the picker with its keyboard selection on the first card (the bar keeps the
+/// foreground and hands it the keys, `on_bar_key`), the app menu, or the item's popup, each with the keyboard in it.
+fn kb_interior() {
+    let Some(id) = kb_focus() else { return };
+    let windows = match id {
+        ItemId::App(i) if config::get().window_previews => entry_at(i).map_or(0, |e| e.windows.len()),
+        _ => 0,
+    };
+    match interior(target_of(Some(id)), windows) {
+        Interior::Picker => {
+            let Some((i, key, name)) = multi_window_app(Some(id)) else { return };
+            kill_timer(hwnd(), TIMER_HOVER_PICKER);
+            if open_picker(i, &key, name) {
+                crate::picker::set_keyboard(true);
+            }
+        }
+        Interior::AppMenu => kb_act(Gesture::Right),
+        Interior::Popup => kb_act(Gesture::Click),
+        Interior::Nothing => {}
+    }
+}
+
+/// The slot Ctrl+Left (`right` false) or Ctrl+Right moves the item at `from` of a run of `len` items to: the next
+/// place that way, never past either end (no wrap).
+fn reorder_slot(from: usize, len: usize, right: bool) -> Option<usize> {
+    if from >= len {
+        return None;
+    }
+    if right {
+        (from + 1 < len).then_some(from + 1)
+    } else {
+        from.checked_sub(1)
+    }
+}
+
+/// Ctrl+Left and Ctrl+Right move the focused item one place inside its zone run (the drag's run, `zone_run`) and
+/// persist the order as a drop does; the focus follows the item (an app by its key, `kb_follow_entries`).
+fn kb_reorder(right: bool) {
+    let Some(id) = kb_focus() else { return };
+    if drag_active() {
+        return;
+    }
+    let run = UI.with(|u| {
+        let st = u.borrow();
+        let idx = st.layout.items.iter().position(|i| i.id == id)?;
+        zone_run(&st.layout.items, idx, |id| pinned_of(&st, id), |id| key_of(&st, id))
+    });
+    let Some(run) = run else { return };
+    let Some(slot) = reorder_slot(run.from, run.keys.len(), right) else { return };
+    match commit_order(run.zone, run.pinned, &reordered(&run.keys, run.from, slot)) {
+        Ok(()) => on_config_changed(),
+        Err(e) => log!("keyboard move: saving the new order failed: {e}"),
+    }
+}
+
+/// Arrows, Home, End and Tab move the keyboard focus over the bar's items (`bar_keys::move_focus`), ring on.
+fn kb_move(key: bar_keys::Key) {
+    let ids = layout_ids();
+    let cur = kb_focus().and_then(|f| ids.iter().position(|&i| i == f));
+    if let Some(k) = bar_keys::move_focus(&ids, cur, key) {
+        kb_set_focus(ids.get(k).copied());
+        redraw();
+    }
 }
 
 // ------------------------------------------------------------ context menu
@@ -3153,7 +4377,10 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
 /// `show_dock` for the Win key: like the Windows taskbar and Start it always takes the foreground
 /// (`show_takes_foreground`), over any window, fullscreen or not.
 fn show_dock_win(reason: &str) {
-    show_dock_as(reason, SHOW_MS, true, false);
+    kb_event(KbEvent::WinTap);
+    show_dock_as(reason, key_show_ms(config::get().hide_delay_ms), true, false);
+    // The keys of "Win, Right, Enter" reach the bar as WM_KEYDOWN (dock-keys K2).
+    ensure_key_focus();
 }
 
 /// true if a show takes the foreground: by the Win key or over a recognised fullscreen app, unless
@@ -3310,6 +4537,13 @@ fn hide(reason: &str, now: bool) {
 /// The one place that follows the bar's real visibility changes (once per transition: a hide of a hidden bar
 /// calls nothing). Called after `VISIBLE` is stored, before any foreground call.
 fn on_visibility(visible: bool) {
+    if !visible {
+        MID_PRESS.with(|m| *m.borrow_mut() = None);
+        // A bar shown again later was not shown by this Peek: its release must not hide it.
+        PEEK.set(Peek { shown: false, ..PEEK.get() });
+        // A hidden bar has no keyboard state.
+        kb_reset();
+    }
     crate::notif::set_bar_visible(visible);
     crate::tray_host::set_bar_visible(visible);
     crate::hook::note_activity();
@@ -4105,14 +5339,32 @@ fn on_poll_body() {
                 return;
             }
         }
-        if point_in(&bar, p)
+        let engaged = point_in(&bar, p)
             || crate::popup::is_open()
             || crate::picker::is_open()
-            || !autohide
             || tray_host::foreign_menu_active()
-            || drag_active()
-        {
-            HIDE_AT.store(now + SHOW_MS, Relaxed);
+            || drag_active();
+        // The keyboard layer's idle end does not depend on the hide decision: with auto-hide off it still ends.
+        let mut kb_stays = false;
+        match kb_poll_now(engaged, autohide) {
+            // The time spent in a popup, the picker or under the pointer is not time left alone.
+            KbPoll::Engaged => kb_hold(now),
+            KbPoll::CheckIdle { restore } => {
+                if !kb_idle_end(now) {
+                    // Only a visible ring holds the bar; with the ring off the pointer's rules hide it.
+                    kb_stays = kb_active();
+                } else if restore {
+                    // Nothing hides the bar to hand the foreground back, as Esc does.
+                    restore_prev_foreground();
+                }
+            }
+            KbPoll::Nothing => {}
+        }
+        if engaged || !autohide {
+            HIDE_AT.store(hide_at(now, hide_delay()), Relaxed);
+        } else if kb_stays {
+            // The keyboard is on the bar (D 5.2.3): it stays, and keeps the key-show time once the keys stop.
+            HIDE_AT.store(kb_hide_at(now, config::get().hide_delay_ms), Relaxed);
         } else if now >= HIDE_AT.load(Relaxed) {
             hide_dock("timeout");
         }
@@ -4140,7 +5392,7 @@ fn on_poll_body() {
         let since = EDGE_SINCE.load(Relaxed);
         if since == 0 {
             EDGE_SINCE.store(now, Relaxed);
-        } else if now - since >= EDGE_MS {
+        } else if dwell_done(since, now, u64::from(config::get().show_delay_ms)) {
             EDGE_SINCE.store(0, Relaxed);
             EDGE_ARMED.store(false, Relaxed);
             // On fullscreen / borderless apps the edge does NOT open the dock: only the Win key.
@@ -4148,7 +5400,7 @@ fn on_poll_body() {
                 if other_display {
                     follow_pointer();
                 }
-                show_dock("screen edge", SHOW_MS);
+                show_dock("screen edge", key_show_ms(config::get().hide_delay_ms));
             }
         }
     }
@@ -4156,7 +5408,637 @@ fn on_poll_body() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_aliases_equal_their_old_literals() {
+        assert_eq!(PLATE_IN_MS, 90);
+        assert_eq!(PLATE_OUT_MS, 140);
+        assert_eq!(HOVER_ALPHA, 20);
+        assert_eq!(PRESS_ALPHA, 36);
+        assert_eq!(PICKER_HOVER_MS, 400);
+        assert_eq!(WIDTH_ANIM_MS, 160);
+        assert_eq!(SHOW_ANIM_MS, 140);
+        assert_eq!(SLIDE_PX, 10);
+        assert_eq!(DRAG_THRESHOLD, 6);
+    }
+
     use super::*;
+
+    #[test]
+    fn dock_chords_from_config() {
+        use hook::DockChords as C;
+        let all = C::DIGITS
+            .with(C::SHIFT_DIGITS)
+            .with(C::ALT_DIGITS)
+            .with(C::WIN_T)
+            .with(C::WIN_SHIFT_T)
+            .with(C::WIN_B)
+            .with(C::PEEK);
+        let def = config::Config::default();
+        assert_eq!(dock_chords(&def), all, "the default owns all seven rows");
+        assert_eq!(all, C(0x7F));
+        let shown = config::Config { hide_native_taskbar: false, ..config::Config::default() };
+        assert_eq!(dock_chords(&shown), C::NONE, "the native taskbar shown: nothing owned");
+        let mut c = config::Config::default();
+        c.keyboard.win_numbers = false;
+        let t = dock_chords(&c);
+        for f in [C::DIGITS, C::SHIFT_DIGITS, C::ALT_DIGITS, C::PEEK] {
+            assert!(!t.has(f), "{f:?} without win_numbers");
+        }
+        assert!(t.has(C::WIN_T) && t.has(C::WIN_SHIFT_T) && t.has(C::WIN_B));
+        let mut c = config::Config::default();
+        c.keyboard.win_t = false;
+        let t = dock_chords(&c);
+        assert!(!t.has(C::WIN_T) && !t.has(C::WIN_SHIFT_T));
+        assert!(t.has(C::DIGITS) && t.has(C::WIN_B) && t.has(C::PEEK));
+        let mut c = config::Config::default();
+        c.keyboard.win_b = false;
+        assert!(!dock_chords(&c).has(C::WIN_B));
+        let mut c = config::Config::default();
+        c.keyboard.peek = false;
+        assert_eq!(dock_chords(&c), C(all.0 & !C::PEEK.0));
+    }
+
+    /// Lock, unlock, connects, disconnects, suspend and resume are cut-offs for the hook; the other session and power
+    /// events (a battery change, a remote control change) are not.
+    #[test]
+    fn session_and_power_cut_offs() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT,
+            WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_LOGON, WTS_SESSION_REMOTE_CONTROL,
+            WTS_SESSION_UNLOCK,
+        };
+        let session = Some(hook::CutOff::Session);
+        for code in [
+            WTS_SESSION_LOCK,
+            WTS_SESSION_UNLOCK,
+            WTS_CONSOLE_CONNECT,
+            WTS_CONSOLE_DISCONNECT,
+            WTS_REMOTE_CONNECT,
+            WTS_REMOTE_DISCONNECT,
+        ] {
+            assert_eq!(cut_off_of(WM_WTSSESSION_CHANGE, code as usize), session, "{code}");
+        }
+        for code in [WTS_SESSION_LOGON, WTS_SESSION_REMOTE_CONTROL] {
+            assert_eq!(cut_off_of(WM_WTSSESSION_CHANGE, code as usize), None, "{code}");
+        }
+        let power = Some(hook::CutOff::Power);
+        assert_eq!(cut_off_of(WM_POWERBROADCAST, PBT_APMSUSPEND as usize), power);
+        assert_eq!(cut_off_of(WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC as usize), power);
+        assert_eq!(cut_off_of(WM_POWERBROADCAST, PBT_APMPOWERSTATUSCHANGE as usize), None);
+        assert_eq!(cut_off_of(WM_TIMER, WTS_SESSION_LOCK as usize), None, "only the two messages");
+    }
+
+    /// A remote-desktop or VM client in front owns every chord: the hook gets no row (it answers as 1.5.2 did, so the
+    /// session gets Win+n, Win+T, Win+B and Peek never arms); so does a window above the dock, whose keys the hook
+    /// never sees; any other window gets the config's rows unchanged.
+    #[test]
+    fn a_remote_client_in_front_gets_the_chords() {
+        use hook::DockChords as C;
+        let all = dock_chords(&config::Config::default());
+        let some = [all, C::DIGITS, C::WIN_T.with(C::WIN_SHIFT_T), C::WIN_B, C::PEEK.with(C::DIGITS), C::NONE];
+        for rows in some {
+            assert_eq!(effective_chords(rows, Front::Remote), C::NONE, "{rows:?}: remote client in front");
+            assert_eq!(effective_chords(rows, Front::Above), C::NONE, "{rows:?}: the UAC prompt in front");
+            assert_eq!(effective_chords(rows, Front::Local), rows, "{rows:?}: a local window");
+        }
+    }
+
+    /// The window in front by its process's image: the UAC prompt (consent.exe) and a process the dock may not open are
+    /// above the dock; the remote clients stay remote (the launcher's list, unchanged); anything else, or nothing, is
+    /// local.
+    #[test]
+    fn the_uac_prompt_or_a_refused_process_is_above_the_dock() {
+        use crate::launcher_sys::ProcessImage::{Path, Refused, Unknown};
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let prompt = w("C:\\Windows\\System32\\consent.exe");
+        assert_eq!(front_of(Path(&prompt)), Front::Above, "the UAC prompt");
+        assert_eq!(front_of(Refused), Front::Above, "a process the dock may not look at");
+        for remote in ["C:\\Windows\\System32\\mstsc.exe", "C:\\Windows\\System32\\vmconnect.exe"] {
+            assert_eq!(front_of(Path(&w(remote))), Front::Remote, "{remote}");
+        }
+        for local in ["C:\\Windows\\System32\\notepad.exe", "C:\\Windows\\explorer.exe", ""] {
+            assert_eq!(front_of(Path(&w(local))), Front::Local, "{local}");
+        }
+        assert_eq!(front_of(Unknown), Front::Local, "no window, the dock's own, a process gone");
+    }
+
+    /// A window above the dock coming to the front and leaving it are cut-offs: Win+Shift+3 starts an app that needs
+    /// elevation, the UAC prompt comes up without the secure desktop while Win and Shift are held, their releases and
+    /// whatever is typed in the prompt never reach the hook, and "2" typed in the app afterwards must not be Win+2. A
+    /// remote client leaving the front is one too; a remote client coming to the front, or no change, is none.
+    #[test]
+    fn a_window_above_the_dock_coming_or_leaving_is_a_cut_off() {
+        use hook::CutOff;
+        use Front::{Above, Local, Remote};
+        for (was, now) in [(Local, Above), (Above, Local), (Above, Remote), (Remote, Above)] {
+            assert_eq!(front_cut_off(was, now), Some(CutOff::WindowAbove), "{was:?} -> {now:?}");
+        }
+        assert_eq!(front_cut_off(Remote, Local), Some(CutOff::RemoteClient));
+        for (was, now) in [(Local, Local), (Local, Remote), (Above, Above), (Remote, Remote)] {
+            assert_eq!(front_cut_off(was, now), None, "{was:?} -> {now:?}");
+        }
+    }
+
+    #[test]
+    fn key_focus_needed() {
+        assert!(needs_focus(true, false));
+        assert!(!needs_focus(true, true));
+        assert!(!needs_focus(false, false));
+        assert!(!needs_focus(false, true));
+    }
+
+    #[test]
+    fn chord_stale_window() {
+        assert!(!chord_stale(5000, 5999));
+        assert!(!chord_stale(5000, 6000), "exactly CHORD_STALE_MS is still fresh");
+        assert!(chord_stale(5000, 6001));
+        assert!(!chord_stale(5000, 5000));
+        // Both clocks wrap at u32::MAX.
+        assert!(!chord_stale(u32::MAX - 100, 898), "999 ms across the wrap");
+        assert!(chord_stale(u32::MAX - 100, 900), "1001 ms across the wrap");
+    }
+
+    /// A made-up bar: Start, three apps, a tray icon, the chevron, two modules.
+    fn kb_bar() -> Vec<ItemId> {
+        vec![
+            ItemId::Start,
+            ItemId::App(0),
+            ItemId::App(1),
+            ItemId::App(2),
+            ItemId::Tray(9),
+            ItemId::TrayOverflow,
+            ItemId::Volume,
+            ItemId::Clock,
+        ]
+    }
+
+    #[test]
+    fn nth_app_counts_apps_only() {
+        let b = kb_bar();
+        assert_eq!(nth_app(&b, 0), Some(ItemId::App(0)));
+        assert_eq!(nth_app(&b, 1), Some(ItemId::App(1)));
+        assert_eq!(nth_app(&b, 2), Some(ItemId::App(2)));
+        assert_eq!(nth_app(&b, 3), None, "beyond the count nothing happens");
+        assert_eq!(nth_app(&b, 9), None);
+        assert_eq!(nth_app(&[ItemId::Start, ItemId::Clock], 0), None);
+    }
+
+    #[test]
+    fn chord_focus_targets() {
+        use hook::ChordAction as C;
+        let b = kb_bar();
+        assert_eq!(chord_focus(&b, C::FocusFirst), Some(1), "the first app");
+        assert_eq!(chord_focus(&b, C::FocusLast), Some(3), "the last app");
+        assert_eq!(chord_focus(&b, C::FocusTray), Some(4), "the first tray icon");
+        let no_tray = [ItemId::Start, ItemId::App(0), ItemId::Volume, ItemId::Clock];
+        assert_eq!(chord_focus(&no_tray, C::FocusTray), Some(2), "no tray: the first module");
+        let chevron = [ItemId::App(0), ItemId::TrayOverflow, ItemId::Clock];
+        assert_eq!(chord_focus(&chevron, C::FocusTray), Some(1), "the chevron is in the tray zone");
+        let no_apps = [ItemId::Start, ItemId::Clock];
+        assert_eq!(chord_focus(&no_apps, C::FocusFirst), Some(0));
+        assert_eq!(chord_focus(&no_apps, C::FocusLast), Some(1));
+        assert_eq!(chord_focus(&[], C::FocusFirst), None);
+        assert_eq!(chord_focus(&b, C::App(0)), None);
+    }
+
+    #[test]
+    fn peek_release_hides_only_what_peek_showed() {
+        assert!(peek_release(true, false, false));
+        assert!(!peek_release(false, false, false), "the bar was already shown: it stays");
+        assert!(!peek_release(true, true, false), "the pointer is over the bar");
+        assert!(!peek_release(true, false, true), "the keyboard is on the bar");
+        assert!(!peek_release(false, true, true));
+    }
+
+    #[test]
+    fn kb_active_needs_a_focused_item() {
+        assert!(kb_active_of(true, true));
+        assert!(!kb_active_of(false, true), "the bar in front without a focused item (a lone Win tap)");
+        assert!(!kb_active_of(true, false), "another window in front");
+        assert!(!kb_active_of(false, false));
+    }
+
+    /// A made-up layout of 30 px items: Start, pinned A B, running C D E, tray icons x y, the Volume and Clock modules.
+    fn zone_layout() -> Vec<ItemRect> {
+        let ids = [
+            ItemId::Start,
+            ItemId::App(0),
+            ItemId::App(1),
+            ItemId::App(2),
+            ItemId::App(3),
+            ItemId::App(4),
+            ItemId::Tray(11),
+            ItemId::Tray(12),
+            ItemId::Volume,
+            ItemId::Clock,
+        ];
+        ids.iter()
+            .enumerate()
+            .map(|(k, &id)| ItemRect {
+                id,
+                rect: RECT { left: 30 * k as i32, top: 0, right: 30 * k as i32 + 30, bottom: 40 },
+            })
+            .collect()
+    }
+
+    fn zone_pinned(id: ItemId) -> Option<bool> {
+        match id {
+            ItemId::App(i) => [true, true, false, false, false].get(i).copied(),
+            _ => Some(false),
+        }
+    }
+
+    fn zone_key(id: ItemId) -> Option<String> {
+        match id {
+            ItemId::App(i) => ["A", "B", "C", "D", "E"].get(i).map(|s| s.to_string()),
+            ItemId::Tray(11) => Some("x".into()),
+            ItemId::Tray(12) => Some("y".into()),
+            other => render::module_name(other).map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn zone_run_splits_pinned_and_running() {
+        let items = zone_layout();
+        let run = |idx| zone_run(&items, idx, zone_pinned, zone_key);
+        let c = run(3).expect("C has a run");
+        assert_eq!((c.zone, c.pinned, c.first, c.from), (Zone::Apps, false, 3, 0));
+        assert_eq!(c.keys, ["C", "D", "E"]);
+        assert_eq!(c.ids, [ItemId::App(2), ItemId::App(3), ItemId::App(4)]);
+        assert_eq!(c.widths, [30, 30, 30]);
+        assert_eq!(run(5).expect("E").from, 2);
+        let a = run(1).expect("A has a run");
+        assert_eq!((a.zone, a.pinned, a.first, a.from), (Zone::Apps, true, 1, 0));
+        assert_eq!(a.keys, ["A", "B"]);
+        assert_eq!(run(2).expect("B").from, 1);
+        let x = run(6).expect("x has a run");
+        assert_eq!((x.zone, x.first, x.from), (Zone::Tray, 6, 0));
+        assert_eq!(x.keys, ["x", "y"]);
+        let v = run(9).expect("the modules have a run");
+        assert_eq!((v.zone, v.first, v.from, v.ids.len()), (Zone::Modules, 8, 1, 2));
+        assert!(run(0).is_none(), "Start does not move");
+        assert!(run(99).is_none(), "an index out of range");
+        // A lone pinned app between Start and the running apps.
+        let lone: Vec<ItemRect> = items.iter().filter(|i| i.id != ItemId::App(1)).copied().collect();
+        assert!(zone_run(&lone, 1, zone_pinned, zone_key).is_none(), "a run of one");
+        // An item without a key stops the run.
+        assert!(zone_run(&items, 3, zone_pinned, |id| if id == ItemId::App(4) { None } else { zone_key(id) }).is_none());
+    }
+
+    #[test]
+    fn reordered_matches_remove_insert() {
+        let keys: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        for from in 0..4 {
+            for slot in 0..4 {
+                let mut k = keys.to_vec();
+                let m = k.remove(from);
+                k.insert(slot, m);
+                assert_eq!(reordered(&keys, from, slot), k, "{from} -> {slot}");
+            }
+        }
+        assert_eq!(reordered(&keys, 4, 0), keys, "from out of range: unchanged");
+        assert_eq!(reordered(&keys, 0, 4), keys, "slot out of range: unchanged");
+    }
+
+    #[test]
+    fn syskey_without_alt_is_a_key() {
+        const ALT_BIT: isize = 1 << 29;
+        assert_eq!(as_key(WM_KEYDOWN, 0), Some(false));
+        assert_eq!(as_key(WM_SYSKEYDOWN, 0), Some(false), "an active window without the focus");
+        assert_eq!(as_key(WM_SYSKEYDOWN, 0x0001_0001), Some(false), "repeat count and scan code do not matter");
+        assert_eq!(as_key(WM_SYSKEYDOWN, ALT_BIT), Some(true), "Alt held: DefWindowProc keeps Alt+F4");
+        assert_eq!(as_key(WM_SYSKEYDOWN, ALT_BIT | 0x0038_0001), Some(true));
+        assert_eq!(as_key(WM_TIMER, 0), None);
+        assert_eq!(as_key(WM_MOUSEMOVE, ALT_BIT), None);
+    }
+
+    #[test]
+    fn focus_follows_rebuild() {
+        let keys = ["contoso.exe", "Example.Chat", "fabrikam.exe"];
+        assert_eq!(refind(&keys, "example.chat"), Some(1), "the key, ignoring ASCII case");
+        assert_eq!(refind(&keys, "fabrikam.exe"), Some(2));
+        assert_eq!(refind(&keys[..2], "fabrikam.exe"), None, "the app is gone");
+        assert_eq!(refind(&[], "contoso.exe"), None);
+    }
+
+    #[test]
+    fn keyboard_gesture_of_each_key() {
+        use bar_keys::Key;
+        assert_eq!(keyboard_gesture(Key::Activate), Some(Gesture::Click));
+        assert_eq!(keyboard_gesture(Key::Middle), Some(Gesture::Middle));
+        assert_eq!(keyboard_gesture(Key::Context), Some(Gesture::Right));
+        for k in [Key::Next, Key::Interior, Key::Escape, Key::MoveLeft, Key::Letter('a')] {
+            assert_eq!(keyboard_gesture(k), None, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn tray_point_is_the_item_centre() {
+        let r = RECT { left: 100, top: 4, right: 126, bottom: 44 };
+        assert_eq!(item_centre(r, POINT { x: 500, y: 1000 }), POINT { x: 613, y: 1024 });
+        assert_eq!(item_centre(r, POINT::default()), POINT { x: 113, y: 24 });
+        let odd = RECT { left: 0, top: 0, right: 27, bottom: 41 };
+        let left = POINT { x: -1920, y: 0 };
+        assert_eq!(item_centre(odd, left), POINT { x: -1907, y: 20 }, "a display left of the primary");
+    }
+
+    #[test]
+    fn interior_target() {
+        assert_eq!(interior(Target::App, 2), Interior::Picker);
+        assert_eq!(interior(Target::App, 5), Interior::Picker);
+        assert_eq!(interior(Target::App, 1), Interior::AppMenu);
+        assert_eq!(interior(Target::App, 0), Interior::AppMenu, "a pin without windows");
+        for t in [
+            Target::Start,
+            Target::Volume,
+            Target::Network,
+            Target::Battery,
+            Target::Notifications,
+            Target::Clock,
+            Target::Power,
+            Target::TrayOverflow,
+        ] {
+            assert_eq!(interior(t, 0), Interior::Popup, "{t:?}");
+        }
+        for t in [Target::Metrics, Target::ShowDesktop, Target::Tray, Target::Empty] {
+            assert_eq!(interior(t, 3), Interior::Nothing, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn keyboard_reorder_moves_one_slot() {
+        assert_eq!(reorder_slot(0, 3, false), None, "the first item does not wrap left");
+        assert_eq!(reorder_slot(0, 3, true), Some(1));
+        assert_eq!(reorder_slot(1, 3, false), Some(0));
+        assert_eq!(reorder_slot(1, 3, true), Some(2));
+        assert_eq!(reorder_slot(2, 3, false), Some(1));
+        assert_eq!(reorder_slot(2, 3, true), None, "the last item does not wrap right");
+        assert_eq!(reorder_slot(3, 3, false), None, "out of the run");
+        assert_eq!(reorder_slot(0, 0, true), None);
+        // The order the move persists: one place, as a drop there would.
+        let keys: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(reordered(&keys, 0, reorder_slot(0, 3, true).unwrap_or(0)), ["b", "a", "c"]);
+        assert_eq!(reordered(&keys, 2, reorder_slot(2, 3, false).unwrap_or(2)), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn esc_plan() {
+        assert_eq!(esc_action(true), EscAction::Hide);
+        assert_eq!(esc_action(false), EscAction::RestoreForeground);
+    }
+
+    #[test]
+    fn syschar_without_alt_types() {
+        const ALT_BIT: isize = 1 << 29;
+        assert!(as_char(WM_CHAR, 0));
+        assert!(as_char(WM_SYSCHAR, 0x0001_0001), "an active window without the focus");
+        assert!(!as_char(WM_SYSCHAR, ALT_BIT | 1), "Alt+letter stays a menu key");
+        assert!(!as_char(WM_KEYDOWN, 0));
+        assert!(!as_char(WM_SYSKEYDOWN, 0));
+    }
+
+    #[test]
+    fn letters_wait_for_a_deliberate_keyboard() {
+        use KbEvent::*;
+        // Letters typed after `events`, from a hidden bar.
+        let letters_after =
+            |events: &[KbEvent]| letters_act(events.iter().fold(Kb::EMPTY.deliberate, |_, e| kb_after(*e)));
+        assert!(!letters_after(&[]), "a hidden bar starts undecided");
+        assert!(!letters_after(&[WinTap]), "after a lone Win tap typing is not type-ahead");
+        assert!(letters_after(&[Chord]), "after Win+T, Win+Shift+T, Win+B or Win+Alt+n");
+        assert!(letters_after(&[Nav]), "after Prev, Next, Home, End or a zone key");
+        assert!(letters_after(&[WinTap, Chord]), "a chord after the tap arms them");
+        assert!(!letters_after(&[Chord, Reset]), "Esc, hide and idle disarm them");
+        assert!(!letters_after(&[Nav, WinTap]), "a new Win tap starts undecided again");
+        assert_eq!(Kb::EMPTY.deliberate, kb_after(Reset), "the reset state is the disarmed one");
+    }
+
+    #[test]
+    fn keyboard_left_alone_ends() {
+        assert!(!kb_idle(1000 + KB_IDLE_MS, 1000), "within the idle time");
+        assert!(kb_idle(1001 + KB_IDLE_MS, 1000), "no key for a few seconds");
+        const { assert!(KB_IDLE_MS > bar_keys::TYPE_AHEAD_MS, "a typed word is never cut short") };
+    }
+
+    #[test]
+    fn a_popup_visit_is_not_idle_time() {
+        // Win+T, End, Enter: the power popup is read for a long while, then Esc returns to the bar.
+        let mut last_key = 1000;
+        let mut now = 1000;
+        while now < 1000 + 5 * KB_IDLE_MS {
+            now += 50;
+            last_key = kb_clock(now, last_key, true); // the popup is open at every poll
+        }
+        now += 50; // the first poll after the popup closed
+        assert!(!kb_idle(now, last_key), "the keyboard layer survives the return from a long visit");
+        let mut left = last_key;
+        for _ in 0..(KB_IDLE_MS / 50 + 2) {
+            now += 50;
+            left = kb_clock(now, left, false);
+        }
+        assert!(kb_idle(now, left), "left alone afterwards it still ends");
+    }
+
+    #[test]
+    fn the_keyboard_ends_with_auto_hide_off_too() {
+        // Win+T, then left alone: the idle check runs with or without auto-hide.
+        for autohide in [true, false] {
+            assert_eq!(kb_poll(false, autohide, true), KbPoll::CheckIdle { restore: !autohide });
+            assert_eq!(kb_poll(true, autohide, true), KbPoll::Engaged, "the pointer or a popup holds the clock");
+            assert_eq!(kb_poll(false, autohide, false), KbPoll::Nothing, "no keyboard layer, nothing to end");
+        }
+        assert_eq!(esc_action(false), EscAction::RestoreForeground, "the foreground goes back as Esc does it");
+    }
+
+    #[test]
+    fn the_idle_end_does_not_need_the_ring() {
+        // A pointer crossing the bar hides the ring; focus and the armed letters stay, so the idle end must still run.
+        assert!(kb_held_of(true, false, true), "focus kept, ring off");
+        assert!(kb_held_of(false, true, true), "armed letters without a focus");
+        assert!(!kb_held_of(true, true, false), "another window in front");
+        assert!(!kb_held_of(false, false, true), "a lone Win tap");
+        // The decision the poll runs, from the raw state: ring off, focus kept, auto-hide off, not engaged.
+        assert_eq!(kb_poll_of(false, false, true, false, true), KbPoll::CheckIdle { restore: true });
+        assert_eq!(kb_poll_of(false, true, true, false, true), KbPoll::CheckIdle { restore: false });
+        assert_eq!(kb_poll_of(false, false, false, true, true), KbPoll::CheckIdle { restore: true }, "armed letters");
+        assert_eq!(kb_poll_of(true, false, true, false, true), KbPoll::Engaged);
+        assert_eq!(kb_poll_of(false, false, true, true, false), KbPoll::Nothing, "another window in front");
+        assert_eq!(kb_poll_of(false, false, false, false, true), KbPoll::Nothing, "a lone Win tap");
+        // The idle clock follows the same armed test.
+        assert!(kb_armed(true, false) && kb_armed(false, true) && !kb_armed(false, false));
+    }
+
+    #[test]
+    fn close_all_needs_shift_at_the_press() {
+        let key = || Some("app".to_string());
+        assert_eq!(press_close_key(true, key()), key());
+        assert_eq!(press_close_key(false, key()), None, "a plain middle press closes nothing at its release");
+        assert_eq!(press_close_key(true, None), None);
+        // The release then closes only the stored group.
+        assert_eq!(close_key(None, Some((0, &["app"]))), None);
+    }
+
+    #[test]
+    fn typed_word_lives_one_pause() {
+        assert!(typing_live("c", 1000, 1000 + bar_keys::TYPE_AHEAD_MS));
+        assert!(!typing_live("c", 1000, 1001 + bar_keys::TYPE_AHEAD_MS), "a pause starts a new word");
+        assert!(!typing_live("", 1000, 1000), "no word");
+    }
+
+    #[test]
+    fn focus_survives_only_our_windows() {
+        assert!(kb_keeps(true, true), "the bar");
+        assert!(kb_keeps(false, true), "one of our popups");
+        assert!(!kb_keeps(false, false), "any other window, the Settings window included");
+    }
+
+    #[test]
+    fn esc_in_a_popup_returns_to_the_bar() {
+        assert!(back_to_bar(true, true, true));
+        assert!(!back_to_bar(true, false, true), "closed by a click elsewhere or by its action");
+        assert!(!back_to_bar(true, true, false), "another window has the foreground: never taken back");
+        assert!(!back_to_bar(false, true, true), "the keyboard was not on the bar");
+    }
+
+    #[test]
+    fn ring_ends_only_when_the_pointer_moves() {
+        let p = |x, y| Some(POINT { x, y });
+        assert!(!pointer_moved(p(10, 20), p(10, 20)), "a WM_MOUSEMOVE without motion (the bar slid in)");
+        assert!(pointer_moved(p(10, 20), p(11, 20)));
+        assert!(pointer_moved(None, p(0, 0)), "no position at the ring: the first move ends it");
+        assert!(!pointer_moved(p(10, 20), None), "an unreadable pointer is no motion");
+    }
+
+    #[test]
+    fn keyboard_keeps_the_key_show_time() {
+        assert_eq!(kb_hide_at(1000, 0), 3500, "a hide delay of 0 never hides a bar the keyboard just left");
+        assert_eq!(kb_hide_at(1000, 1000), 3500);
+        assert_eq!(kb_hide_at(1000, 5000), 6000);
+    }
+
+    #[test]
+    fn held_keys_repeat_only_focus_moves() {
+        use bar_keys::Key;
+        for k in [Key::Prev, Key::Next, Key::Home, Key::End, Key::NextZone, Key::PrevZone] {
+            assert!(repeat_acts(Some(k), false), "{k:?}");
+        }
+        for k in [
+            Key::Activate,
+            Key::Middle,
+            Key::Context,
+            Key::Interior,
+            Key::MoveLeft,
+            Key::MoveRight,
+            Key::Escape,
+            Key::Letter('a'),
+        ] {
+            assert!(!repeat_acts(Some(k), false), "{k:?} acts once");
+        }
+        assert!(repeat_acts(None, true), "the picker's arrows");
+        assert!(!repeat_acts(None, false), "the picker's Enter, Delete and Esc");
+    }
+
+    #[test]
+    fn dwell_reveals_after_the_show_delay() {
+        assert!(!dwell_done(0, 1000, 0), "not on the edge");
+        assert!(dwell_done(1000, 1000, 0), "delay 0 shows at once");
+        assert!(!dwell_done(1000, 1149, 150));
+        assert!(dwell_done(1000, 1150, 150));
+    }
+
+    #[test]
+    fn hide_at_follows_the_delay() {
+        assert_eq!(hide_at(5000, 0), 5000);
+        assert_eq!(hide_at(5000, 1000), 6000);
+    }
+
+    #[test]
+    fn win_show_ignores_a_zero_hide_delay() {
+        assert_eq!(key_show_ms(0), 2500);
+        assert_eq!(key_show_ms(1000), 2500);
+        assert_eq!(key_show_ms(5000), 5000);
+    }
+
+    #[test]
+    fn edge_show_outlasts_a_zero_hide_delay() {
+        assert_eq!(key_show_ms(0), 2500);
+        assert_eq!(key_show_ms(1000), 2500);
+        assert_eq!(key_show_ms(5000), 5000);
+    }
+
+    #[test]
+    fn empty_space_is_inside_the_bar_only() {
+        let bar = RECT { left: 100, top: 1000, right: 900, bottom: 1060 };
+        let p = |x, y| POINT { x, y };
+        assert!(empty_hit(bar, p(500, 1030), None));
+        assert!(empty_hit(bar, p(100, 1000), None));
+        assert!(!empty_hit(bar, p(900, 1030), None), "right edge is outside");
+        assert!(!empty_hit(bar, p(500, 1060), None), "bottom edge is outside");
+        assert!(!empty_hit(bar, p(99, 1030), None));
+        assert!(!empty_hit(bar, p(500, 999), None));
+        assert!(!empty_hit(bar, p(500, 1030), Some(ItemId::Volume)), "an item is not empty space");
+        assert!(!empty_hit(bar, p(500, 1030), Some(ItemId::App(0))));
+    }
+
+    #[test]
+    fn shift_middle_off_an_app_does_nothing() {
+        assert_eq!(resolve(Target::Empty, Gesture::ShiftMiddle), Action::None);
+        for t in [Target::Volume, Target::Tray, Target::Start, Target::Metrics, Target::Battery] {
+            let a = resolve(t, Gesture::ShiftMiddle);
+            assert_ne!(a, Action::CloseGroup, "{t:?}");
+            assert_eq!(a, resolve(t, Gesture::Middle), "{t:?}");
+        }
+        assert_eq!(resolve(Target::App, Gesture::ShiftMiddle), Action::CloseGroup);
+        // Outside the bar there is no target at all; inside it with no item the target is Empty.
+        GEOM.with(|g| g.set(Some(Geom { x: 100, y: 1000, w: 800, h: 60, mon: RECT::default() })));
+        assert_eq!(gesture_target(None, 10, 10), Some(Target::Empty));
+        assert_eq!(gesture_target(None, -1, 10), None);
+        assert_eq!(gesture_target(None, 800, 10), None);
+        assert_eq!(gesture_target(None, 10, 60), None);
+        assert_eq!(gesture_target(Some(ItemId::Volume), 10, 10), Some(Target::Volume));
+    }
+
+    #[test]
+    fn close_group_resolves_at_the_release() {
+        let keys = ["a", "b", "c"];
+        assert_eq!(close_key(Some("b"), Some((1, &keys))), Some("b"));
+        assert_eq!(close_key(Some("a"), Some((1, &keys))), None, "another group under the pointer");
+        assert_eq!(close_key(Some("c"), Some((3, &keys))), None, "index out of range");
+        assert_eq!(close_key(None, Some((0, &keys))), None, "no press");
+        assert_eq!(close_key(Some("a"), None), None, "no item at the release");
+        assert_eq!(close_key(Some("a"), Some((0, &[]))), None, "the list emptied");
+    }
+
+    #[test]
+    fn cycle_rate_limit() {
+        assert!(cycle_due(0, CYCLE_STEP_MS));
+        assert!(!cycle_due(1000, 1000 + CYCLE_STEP_MS - 1));
+        assert!(cycle_due(1000, 1000 + CYCLE_STEP_MS));
+        assert!(!cycle_due(1000, 900), "a clock that went back never fires twice");
+    }
+
+    #[test]
+    fn target_of_maps_every_item() {
+        let cases = [
+            (ItemId::App(0), Target::App),
+            (ItemId::App(7), Target::App),
+            (ItemId::Tray(3), Target::Tray),
+            (ItemId::TrayOverflow, Target::TrayOverflow),
+            (ItemId::Notifications, Target::Notifications),
+            (ItemId::Volume, Target::Volume),
+            (ItemId::Clock, Target::Clock),
+            (ItemId::Start, Target::Start),
+            (ItemId::ShowDesktop, Target::ShowDesktop),
+            (ItemId::Power, Target::Power),
+            (ItemId::Network, Target::Network),
+            (ItemId::Metrics, Target::Metrics),
+            (ItemId::Battery, Target::Battery),
+        ];
+        for (id, t) in cases {
+            assert_eq!(target_of(Some(id)), t, "{id:?}");
+        }
+        assert_eq!(target_of(None), Target::Empty);
+    }
 
     fn wi(visible: bool, still_ms: u64) -> WatchInputs {
         WatchInputs { visible, gate_ok: true, dwell: false, requests: false, drag: false, still_ms }

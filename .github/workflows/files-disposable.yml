@@ -1,0 +1,78 @@
+name: Files disposable
+
+# The files engine's disposable tests (plan rule 0.3): they may recycle, show and answer system dialogs, use an SMB
+# share on localhost, VHDs and per-volume Recycle Bin values, and register the dev-only fault DLL. GitHub-hosted
+# runners only, thrown away after the job: tools/ci/files-disposable.ps1 refuses to run anywhere else, and no
+# self-hosted runner is ever named here. A separate workflow, so ci.yml's triggers stay as they are.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  contents: read
+
+env:
+  # Pinned like ci.yml and release.yml: keep the three equal.
+  RUST_TOOLCHAIN: 1.93.1
+
+jobs:
+  disposable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      # The SMB share, the FAT32 VHD and the two NTFS VHDs with their Recycle Bin values; exports FILES_DISP_* and
+      # FILES_TEST_ROOT to the next steps.
+      - name: Throwaway volumes and share
+        shell: pwsh
+        run: pwsh tools/ci/files-disposable.ps1 -Setup
+
+      - name: Build the examples (the fault DLL)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo build -p files --examples --locked
+
+      - name: Register the fault DLL
+        shell: pwsh
+        run: pwsh tools/ci/files-disposable.ps1 -Register -Dll target-test\debug\examples\files_faultext.dll
+
+      - name: Disposable tests
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+          FILES_DISPOSABLE: "1"
+        run: |
+          $n = @(git grep -h -o -E 'fn disposable_[a-z0-9_]+' -- apps/files).Count
+          if ($n -eq 0) { 'no disposable tests yet'; exit 0 }
+          cargo test -p files --locked -- --ignored disposable_ --nocapture
+
+      # The nightly fuzz of the frame codecs (ROADMAP 6.3, a trailing gate).
+      - name: Frame fuzz
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: cargo test -p oled-trust --locked -- --ignored fuzz_1m
+
+      - name: Records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: files-disposable
+          path: |
+            target-test/natural
+            target-test/disposable
+          if-no-files-found: ignore
+          retention-days: 14

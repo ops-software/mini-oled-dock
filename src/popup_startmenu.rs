@@ -61,7 +61,7 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::RECT;
 
 use crate::config::StartStyle;
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::icons::IconBitmap;
 use crate::launcher::arena::Arena;
 use crate::launcher::catalog;
@@ -74,6 +74,7 @@ use crate::start_search::{self, Keys};
 use crate::surface::{
     rect_wh, Font, Surface, HOVER_ALPHA, PANEL_BORDER_ALPHA, ROW_RADIUS, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE,
 };
+use oled_sys::i18n::S;
 
 // ------------------------------------------------------------------ layout constants (logical px)
 
@@ -135,9 +136,9 @@ const W11_SHORTCUT: i32 = 36;
 
 // Overlays (context menu, letter grid, open folder): raised panels over the menu.
 /// Menu row height, inner inset, corner radius, margin kept from the panel edges.
-const FLY_ROW: i32 = 34;
+const FLY_ROW: i32 = oled_ui::tokens::ROW_COMPACT;
 const FLY_INSET: i32 = 6;
-const FLY_RADIUS: i32 = 10;
+const FLY_RADIUS: i32 = oled_ui::tokens::R_M;
 const FLY_MARGIN: i32 = 4;
 /// Fill of a raised panel over the panel colour (a lift that sets it apart) and its outline.
 const FLY_LIFT_ALPHA: u32 = 12;
@@ -158,13 +159,13 @@ const FOLDER_TILE_W: i32 = 96;
 const GRID_INSET: i32 = 12;
 
 /// Folder shortcuts of the Windows 11 style bottom bar: glyph, what `ShellRequest::Launch` opens
-/// (de-elevated, like everything else), label (English, Italian) shown while the pointer is on it.
-type Shortcut = (fn(f32, f32) -> bool, &'static str, &'static str, &'static str);
+/// (de-elevated, like everything else), label (a key of the string table) shown while the pointer is on it.
+type Shortcut = (fn(f32, f32) -> bool, &'static str, S);
 const SHORTCUTS: [Shortcut; 4] = [
-    (crate::glyphs::gear_shape, "ms-settings:", "Settings", "Impostazioni"),
-    (crate::glyphs::folder_shape, "explorer.exe", "File Explorer", "Esplora file"),
-    (crate::glyphs::log_shape, "shell:Personal", "Documents", "Documenti"),
-    (crate::glyphs::download_shape, "shell:Downloads", "Downloads", "Download"),
+    (crate::glyphs::gear_shape, "ms-settings:", k::COMMON_SETTINGS),
+    (crate::glyphs::folder_shape, "explorer.exe", k::LAUNCHER_FILE_EXPLORER),
+    (crate::glyphs::log_shape, "shell:Personal", k::START_MENU_SHORTCUT_DOCUMENTS),
+    (crate::glyphs::download_shape, "shell:Downloads", k::START_MENU_SHORTCUT_DOWNLOADS),
 ];
 
 // ------------------------------------------------------------------ hit ids
@@ -707,28 +708,40 @@ struct Labels {
     folder: &'static str,
 }
 
+/// Caret x and text x of the search field whose text starts at `tx`. Empty: the caret sits before the
+/// placeholder (as the launcher's field), the placeholder 3 px to its right. Not empty: the text stays at
+/// `tx` and the caret follows it (the caller adds the typed width).
+fn search_x(tx: i32, m: Metrics, empty: bool) -> (i32, i32) {
+    if empty {
+        let caret = tx - m.px(1).max(1);
+        (caret, caret + m.px(3))
+    } else {
+        (tx + m.px(1), tx)
+    }
+}
+
 /// The labels in the dock language (`i18n::tr`, like every other popup; English in preview mode).
 fn labels() -> Labels {
     Labels {
-        placeholder: tr("Type to search apps", "Scrivi per cercare un'app"),
-        pinned: tr("Pinned", "Aggiunte"),
-        all: tr("All apps", "Tutte le app"),
-        results: tr("Results", "Risultati"),
-        hint: tr("Right-click for options", "Clic destro per le opzioni"),
-        loading: tr("Loading apps\u{2026}", "Caricamento app\u{2026}"),
-        none: tr("No apps found", "Nessuna app trovata"),
-        view_grid: tr("Grid", "Griglia"),
-        view_list: tr("List", "Elenco"),
-        pin: tr("Pin to Start", "Aggiungi a Start"),
-        unpin: tr("Unpin from Start", "Rimuovi da Start"),
-        leave_folder: tr("Remove from folder", "Rimuovi dalla cartella"),
-        rename: tr("Rename folder", "Rinomina cartella"),
-        drag_hint: tr("Drag to reorder or to group", "Trascina per ordinare o raggruppare"),
-        admin: tr("Run as administrator", "Esegui come amministratore"),
-        location: tr("Open file location", "Apri percorso file"),
-        uninstall: tr("Uninstall", "Disinstalla"),
-        ungroup: tr("Ungroup folder", "Separa cartella"),
-        folder: tr("Folder", "Cartella"),
+        placeholder: t(k::STARTMENU_SEARCH_APPS_AND_SETTINGS),
+        pinned: t(k::STARTMENU_PINNED),
+        all: t(k::STARTMENU_ALL_APPS),
+        results: t(k::STARTMENU_RESULTS),
+        hint: t(k::STARTMENU_RIGHT_CLICK_FOR_OPTIONS),
+        loading: t(k::STARTMENU_LOADING_APPS),
+        none: t(k::STARTMENU_NO_APPS_FOUND),
+        view_grid: t(k::STARTMENU_GRID),
+        view_list: t(k::STARTMENU_LIST),
+        pin: t(k::STARTMENU_PIN_TO_START),
+        unpin: t(k::STARTMENU_UNPIN_FROM_START),
+        leave_folder: t(k::STARTMENU_REMOVE_FROM_FOLDER),
+        rename: t(k::STARTMENU_RENAME_FOLDER),
+        drag_hint: t(k::STARTMENU_DRAG_TO_REORDER_OR_TO),
+        admin: t(k::COMMON_RUN_AS_ADMINISTRATOR),
+        location: t(k::COMMON_OPEN_FILE_LOCATION),
+        uninstall: t(k::STARTMENU_UNINSTALL),
+        ungroup: t(k::STARTMENU_UNGROUP_FOLDER),
+        folder: t(k::STARTMENU_FOLDER),
     }
 }
 
@@ -1575,9 +1588,9 @@ impl StartMenu {
         let ty = center_y(&g.search, lh);
         let max_w = g.search.right - m.px(12) - tx;
         let caret_x = if self.query.is_empty() {
-            s.text(labels().placeholder, tx, ty, Font::Normal, WHITE, TEXT3_ALPHA);
-            // Before the placeholder, as the launcher's field (5.2.2).
-            tx - m.px(1).max(1)
+            let (caret_x, text_x) = search_x(tx, m, true);
+            s.text(labels().placeholder, text_x, ty, Font::Normal, WHITE, TEXT3_ALPHA);
+            caret_x
         } else {
             let shown = tail_fit(s, &self.query, max_w);
             s.text(&shown, tx, ty, Font::Normal, WHITE, TEXT_ALPHA);
@@ -1830,7 +1843,7 @@ impl StartMenu {
             let (gx, gy) = (rc.left + (rc.right - rc.left - gs) / 2, rc.top + (rc.bottom - rc.top - gs) / 2);
             s.glyph(gx, gy, gs, lift(TEXT2_ALPHA, lit), &sc.0);
             if hot == Some(id) {
-                let label = tr(sc.2, sc.3);
+                let label = t(sc.2);
                 label_w = s.text_width(label, Font::Small) + m.px(12);
                 let y = center_y(&bar, s.line_height(Font::Small));
                 s.text(label, first - label_w, y, Font::Small, WHITE, TEXT2_ALPHA);
@@ -2281,9 +2294,47 @@ impl Content for StartMenu {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shortcut_labels_equal_the_old_texts_in_both_languages() {
+        // (glyph target, English, Italian) as the table held them before the keyed strings.
+        let old = [
+            ("ms-settings:", "Settings", "Impostazioni"),
+            ("explorer.exe", "File Explorer", "Esplora file"),
+            ("shell:Personal", "Documents", "Documenti"),
+            ("shell:Downloads", "Downloads", "Download"),
+        ];
+        assert_eq!(SHORTCUTS.len(), old.len());
+        for (sc, (target, en, it)) in SHORTCUTS.iter().zip(old) {
+            assert_eq!(sc.1, target);
+            assert_eq!(crate::i18n::with_italian(false, || t(sc.2)), en);
+            assert_eq!(crate::i18n::with_italian(true, || t(sc.2)), it);
+        }
+    }
+
+    #[test]
+    fn popup_startmenu_aliases_equal_their_old_literals() {
+        assert_eq!(FLY_ROW, 34);
+        assert_eq!(FLY_RADIUS, 10);
+    }
+
     use super::*;
 
     const M: Metrics = Metrics { dpi: 96 };
+
+    #[test]
+    fn placeholder_sits_three_px_right_of_the_caret() {
+        assert_eq!(search_x(100, M, true), (99, 102));
+        let m = Metrics { dpi: 192 };
+        let (caret, text) = search_x(100, m, true);
+        assert_eq!(text - caret, m.px(3));
+        assert_eq!(search_x(100, M, false).1, 100);
+    }
+
+    #[test]
+    fn labels_placeholder_text() {
+        assert_eq!(crate::i18n::with_italian(false, || labels().placeholder), "Search apps and settings");
+        assert_eq!(crate::i18n::with_italian(true, || labels().placeholder), "Cerca app e impostazioni");
+    }
 
     /// With no launcher chord a Start open lists its apps in-process, as in M1: no `--start-apps` child.
     #[test]

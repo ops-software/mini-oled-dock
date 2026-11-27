@@ -11,13 +11,15 @@
 //!
 //! Declared as a child module of `popup` (`#[path]`).
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
 
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::popup::{center_y, hline, lift, row_plate, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::shell_thread::{self, AdminTool, ShellRequest};
 use crate::surface::{rect_wh, Font, Surface, TEXT_ALPHA, WHITE};
+use oled_sys::i18n::S;
 
 /// What a row does.
 #[derive(Clone, Copy)]
@@ -37,35 +39,35 @@ enum Act {
 const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
 const VK_R: VIRTUAL_KEY = VIRTUAL_KEY(0x52);
 
-/// One row: action and label (English, Italian; picked by `i18n::tr`, like every other text).
-type Row = (Act, &'static str, &'static str);
+/// One row: action and label (a key of the string table).
+type Row = (Act, S);
 
 /// Rows in the order of the native Win+X menu (`None` = separator). The row id is its index + 1.
 const ROWS: [Option<Row>; 19] = [
-    Some((Act::Launch("ms-settings:appsfeatures"), "Installed apps", "App installate")),
-    Some((Act::Launch("ms-settings:powersleep"), "Power Options", "Opzioni spegnimento")),
-    Some((Act::Launch("eventvwr.msc"), "Event Viewer", "Visualizzatore eventi")),
-    Some((Act::Launch("ms-settings:about"), "System", "Sistema")),
-    Some((Act::Launch("devmgmt.msc"), "Device Manager", "Gestione dispositivi")),
-    Some((Act::Launch("ms-settings:network"), "Network Connections", "Connessioni di rete")),
-    Some((Act::Launch("diskmgmt.msc"), "Disk Management", "Gestione disco")),
-    Some((Act::Launch("compmgmt.msc"), "Computer Management", "Gestione computer")),
-    Some((Act::Launch(r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"), "Terminal", "Terminale")),
-    Some((Act::Admin(AdminTool::Terminal), "Terminal (admin)", "Terminale (admin)")),
+    Some((Act::Launch("ms-settings:appsfeatures"), k::START_INSTALLED_APPS)),
+    Some((Act::Launch("ms-settings:powersleep"), k::START_POWER_OPTIONS)),
+    Some((Act::Launch("eventvwr.msc"), k::START_EVENT_VIEWER)),
+    Some((Act::Launch("ms-settings:about"), k::SETTINGS_PAGES_SYSTEM)),
+    Some((Act::Launch("devmgmt.msc"), k::START_DEVICE_MANAGER)),
+    Some((Act::Launch("ms-settings:network"), k::START_NETWORK_CONNECTIONS)),
+    Some((Act::Launch("diskmgmt.msc"), k::START_DISK_MANAGEMENT)),
+    Some((Act::Launch("compmgmt.msc"), k::START_COMPUTER_MANAGEMENT)),
+    Some((Act::Launch(r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"), k::START_TERMINAL)),
+    Some((Act::Admin(AdminTool::Terminal), k::START_TERMINAL_ADMIN)),
     None,
-    Some((Act::Launch("taskmgr.exe"), "Task Manager", "Gestione attivit\u{e0}")),
-    Some((Act::Launch("ms-settings:"), "Settings", "Impostazioni")),
-    Some((Act::DockSettings, "Dock settings", "Impostazioni dock")),
-    Some((Act::Launch("explorer.exe"), "File Explorer", "Esplora file")),
-    Some((Act::WinKey(VK_S), "Search", "Cerca")),
-    Some((Act::WinKey(VK_R), "Run", "Esegui")),
+    Some((Act::Launch("taskmgr.exe"), k::DOCK_TASK_MANAGER)),
+    Some((Act::Launch("ms-settings:"), k::COMMON_SETTINGS)),
+    Some((Act::DockSettings, k::COMMON_DOCK_SETTINGS)),
+    Some((Act::Launch("explorer.exe"), k::LAUNCHER_FILE_EXPLORER)),
+    Some((Act::WinKey(VK_S), k::START_SEARCH)),
+    Some((Act::WinKey(VK_R), k::LAUNCHER_STRINGS_RUN)),
     None,
-    Some((Act::SignOut, "Sign out", "Disconnetti")),
+    Some((Act::SignOut, k::START_SIGN_OUT)),
 ];
 
 /// Label of row `i` in the dock language (`""` for separators).
 fn label(i: usize) -> &'static str {
-    ROWS.get(i).copied().flatten().map_or("", |(_, en, it)| tr(en, it))
+    ROWS.get(i).copied().flatten().map_or("", |(_, key)| t(key))
 }
 
 pub(crate) struct StartPopup {
@@ -133,8 +135,12 @@ impl Content for StartPopup {
         self.hits.at(x, y)
     }
 
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
+    }
+
     fn click(&mut self, id: u32) -> Reply {
-        self.pending = ROWS.get((id as usize).wrapping_sub(1)).copied().flatten().map(|(act, _, _)| act);
+        self.pending = ROWS.get((id as usize).wrapping_sub(1)).copied().flatten().map(|(act, _)| act);
         Reply::Close
     }
 
@@ -156,10 +162,49 @@ mod tests {
 
     #[test]
     fn dock_settings_follows_windows_settings() {
-        let i = ROWS.iter().position(|r| matches!(r, Some((Act::DockSettings, _, _)))).expect("row");
-        assert!(matches!(ROWS[i - 1], Some((Act::Launch("ms-settings:"), _, _))));
+        let i = ROWS.iter().position(|r| matches!(r, Some((Act::DockSettings, _)))).expect("row");
+        assert!(matches!(ROWS[i - 1], Some((Act::Launch("ms-settings:"), _))));
         let mut p = StartPopup { hits: HitMap::default(), pending: None, width: 0 };
         assert_eq!(p.click(i as u32 + 1), Reply::Close);
         assert!(matches!(p.pending, Some(Act::DockSettings)));
+    }
+
+    #[test]
+    fn start_keyboard_targets() {
+        let mut p = new();
+        // The id of a row is its place in the table plus one: the separators leave gaps, they are not targets.
+        let want: Vec<u32> = ROWS.iter().enumerate().filter(|(_, r)| r.is_some()).map(|(i, _)| i as u32 + 1).collect();
+        assert_eq!(crate::popup::target_ids(&mut *p), want);
+        assert!(want.len() > 3);
+    }
+
+    #[test]
+    fn labels_equal_the_old_texts_in_both_languages() {
+        // (row index, English, Italian) as the table held them before the keyed strings.
+        let old: [(usize, &str, &str); 17] = [
+            (0, "Installed apps", "App installate"),
+            (1, "Power Options", "Opzioni spegnimento"),
+            (2, "Event Viewer", "Visualizzatore eventi"),
+            (3, "System", "Sistema"),
+            (4, "Device Manager", "Gestione dispositivi"),
+            (5, "Network Connections", "Connessioni di rete"),
+            (6, "Disk Management", "Gestione disco"),
+            (7, "Computer Management", "Gestione computer"),
+            (8, "Terminal", "Terminale"),
+            (9, "Terminal (admin)", "Terminale (admin)"),
+            (11, "Task Manager", "Gestione attivit\u{e0}"),
+            (12, "Settings", "Impostazioni"),
+            (13, "Dock settings", "Impostazioni dock"),
+            (14, "File Explorer", "Esplora file"),
+            (15, "Search", "Cerca"),
+            (16, "Run", "Esegui"),
+            (18, "Sign out", "Disconnetti"),
+        ];
+        for (i, en, it) in old {
+            assert_eq!(crate::i18n::with_italian(false, || label(i)), en);
+            assert_eq!(crate::i18n::with_italian(true, || label(i)), it);
+        }
+        assert_eq!(label(10), "");
+        assert_eq!(label(17), "");
     }
 }

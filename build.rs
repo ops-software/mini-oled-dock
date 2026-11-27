@@ -4,6 +4,8 @@
 //! API checked against the embed-manifest 1.5.1 source (`embed_manifest`, `new_manifest`,
 //! `ManifestBuilder::requested_execution_level` / `dpi_awareness` / `heap_type`).
 
+use std::path::{Path, PathBuf};
+
 use embed_manifest::manifest::{DpiAwareness, ExecutionLevel, HeapType};
 use embed_manifest::{embed_manifest, new_manifest};
 
@@ -63,4 +65,9 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=assets/dock.ico");
     println!("cargo:rerun-if-env-changed=DOCK_NO_MANIFEST");
+    // The keyed string tables (strings/en.toml, strings/it.toml): a bad strings file fails the build.
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("strings.rs");
+    if let Err(e) = oled_i18n_build::generate(Path::new("strings"), &out) {
+        panic!("strings/: {e}")
+    }
 }

@@ -46,10 +46,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, InternalGetWindowText, IsWindow, KillTimer,
-    LoadCursorW, RegisterClassExW, SetCursor, SetTimer, SetWindowPos, ShowWindow, UnregisterClassW, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, IDC_HAND, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowPos, ShowWindow, UnregisterClassW,
+    HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_CLOSE,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::log;
@@ -227,9 +227,17 @@ pub(crate) fn same_windows(a: &[isize], b: &[isize]) -> bool {
 // ------------------------------------------------------------------ painting
 
 /// Draws the picker: opaque background (config `background`), the hover/press plate of card `hot`,
-/// the titles (already ellipsized). The thumbnail boxes stay bare: the DWM composes over them.
-pub(crate) fn paint(s: &mut Surface, g: &Geometry, titles: &[String], hot: Option<usize>, pressed: Option<usize>) {
-    paint_inner(s, g, titles, hot, pressed, false);
+/// the titles (already ellipsized). The thumbnail boxes stay bare: the DWM composes over them. `kb` is the keyboard
+/// selection (card index; None = none), drawn by DK-PAINT R4.
+pub(crate) fn paint(
+    s: &mut Surface,
+    g: &Geometry,
+    titles: &[String],
+    hot: Option<usize>,
+    pressed: Option<usize>,
+    kb: Option<usize>,
+) {
+    paint_inner(s, g, titles, hot, pressed, kb, false);
 }
 
 /// `paint`; `preview` = also what the DWM adds on screen, for the offscreen preview: rounded corners
@@ -240,6 +248,7 @@ fn paint_inner(
     titles: &[String],
     hot: Option<usize>,
     pressed: Option<usize>,
+    kb: Option<usize>,
     preview: bool,
 ) {
     let bg = crate::config::get().background.rgb();
@@ -254,8 +263,13 @@ fn paint_inner(
     let (hot, pressed) = (hot.map(|i| i as u32), pressed.map(|i| i as u32));
     let lh = s.line_height(Font::Normal);
     for (i, (c, t)) in g.cards.iter().zip(titles).enumerate() {
-        let h = row_plate(s, c.card, i as u32, hot, pressed);
+        // The keyboard selection gets the hover plate and the ring.
+        let selected = kb == Some(i);
+        let h = row_plate(s, c.card, i as u32, if selected { Some(i as u32) } else { hot }, pressed);
         s.text(t, c.title.left, center_y(&c.title, lh), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+        if selected {
+            crate::popup::paint_focus_ring(s, c.card, m.px(crate::surface::ROW_RADIUS));
+        }
         if let (true, Some(tb)) = (preview, c.thumb) {
             let r = m.px(4);
             s.fill_rr(tb, r, (0x2a, 0x2d, 0x33), 255);
@@ -284,13 +298,15 @@ pub(crate) fn preview_pixels(
     sources: &[Option<(i32, i32)>],
     max_w: i32,
     hot: Option<usize>,
+    kb: Option<usize>,
 ) -> Option<(i32, i32, Vec<u32>)> {
     let mut s = Surface::new(m).ok()?;
-    let titles: Vec<String> = titles.iter().map(|t| clean_title(t, crate::i18n::tr("Window", "Finestra"))).collect();
+    let titles: Vec<String> =
+        titles.iter().map(|t| clean_title(t, crate::i18n::t(crate::i18n::k::COMMON_WINDOW))).collect();
     let g = layout(m, sources, max_w, i32::MAX, column_width(&s, &titles));
     let titles = ellipsize_titles(&s, &g, &titles);
     s.resize(g.w, g.h).ok()?;
-    paint_inner(&mut s, &g, &titles, hot, None, true);
+    paint_inner(&mut s, &g, &titles, hot, None, kb, true);
     s.snapshot_pixels()
 }
 
@@ -320,6 +336,8 @@ struct Open {
     surf: Surface,
     hot: Option<usize>,
     pressed: Option<usize>,
+    /// Keyboard selection (card index), set while the picker is open from the bar's keyboard layer.
+    kb: Option<usize>,
     tracking: bool,
 }
 
@@ -353,6 +371,77 @@ pub fn is_open() -> bool {
 /// Group key of the app the open picker belongs to.
 pub fn open_key() -> Option<String> {
     STATE.with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.key.clone())))
+}
+
+/// The picker shows a keyboard selection from card 0 (it was opened from the bar's keyboard layer); `false` removes it.
+pub fn set_keyboard(on: bool) {
+    let Some(Some(h)) = with(|st| {
+        let h = st.hwnd;
+        st.open.as_mut().map(|o| {
+            o.kb = (on && !o.cards.is_empty()).then_some(0);
+            h
+        })
+    }) else {
+        return;
+    };
+    repaint(h);
+}
+
+/// The card after (`forward`) or before `cur` among `n`, wrapping. `n` = 0 gives 0.
+fn step(n: usize, cur: usize, forward: bool) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    if forward {
+        (cur + 1) % n
+    } else {
+        (cur % n + n - 1) % n
+    }
+}
+
+/// Keys routed by the bar while the picker is open from the keyboard: Left/Right/Up/Down move the selection (wrapping),
+/// Enter activates its window, Delete sends it WM_CLOSE, Esc closes the picker. true = handled; false when the picker is
+/// not open from the keyboard.
+pub fn key(vk: u16) -> bool {
+    const VK_ESCAPE: u16 = 0x1B;
+    const VK_RETURN: u16 = 0x0D;
+    const VK_DELETE: u16 = 0x2E;
+    const VK_LEFT: u16 = 0x25;
+    const VK_UP: u16 = 0x26;
+    const VK_RIGHT: u16 = 0x27;
+    const VK_DOWN: u16 = 0x28;
+    let Some(Some((h, kb, n, win))) = with(|st| {
+        let h = st.hwnd;
+        st.open.as_ref().and_then(|o| {
+            let kb = o.kb?;
+            Some((h, kb, o.cards.len(), o.cards.get(kb).map(|c| c.hwnd)))
+        })
+    }) else {
+        return false;
+    };
+    match vk {
+        VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN => {
+            let to = step(n, kb, matches!(vk, VK_RIGHT | VK_DOWN));
+            with(|st| st.open.as_mut().map(|o| o.kb = Some(to)));
+            repaint(h);
+        }
+        VK_RETURN => {
+            if let Some(w) = win {
+                crate::apps::activate_window(w);
+                close_inner("Enter");
+            }
+        }
+        VK_DELETE => {
+            if let Some(w) = win {
+                // SAFETY: PostMessageW accepts arbitrary HWNDs; it does not block and fails if the window is gone.
+                let _ = unsafe { PostMessageW(Some(HWND(w as *mut std::ffi::c_void)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                // The window list changes once it is gone, and `sync_windows` closes the whole picker (no live re-layout): after Delete the picker is closed, not refreshed.
+            }
+        }
+        VK_ESCAPE => close_inner("Esc"),
+        _ => return false,
+    }
+    true
 }
 
 // ------------------------------------------------------------------ window
@@ -535,7 +624,7 @@ pub fn open(anchor: Anchor, key: &str, name: &str, windows: &[isize]) {
         return;
     }
     let titles: Vec<String> = cards.iter().map(|c| c.title.clone()).collect();
-    paint(&mut surf, &geo, &titles, None, None);
+    paint(&mut surf, &geo, &titles, None, None, None);
     let (x, y) = crate::popup::compute_pos(&anchor, geo.w, geo.h);
     for (c, r) in cards.iter().zip(&geo.cards) {
         let (Some(bx), true) = (r.thumb, c.thumb != 0) else { continue };
@@ -565,6 +654,7 @@ pub fn open(anchor: Anchor, key: &str, name: &str, windows: &[isize]) {
             surf,
             hot: None,
             pressed: None,
+            kb: None,
             tracking: false,
         })
     });
@@ -682,7 +772,7 @@ fn repaint(h: HWND) {
     with(|st| {
         if let Some(o) = st.open.as_mut() {
             let titles: Vec<String> = o.cards.iter().map(|c| c.title.clone()).collect();
-            paint(&mut o.surf, &o.geo, &titles, o.hot, o.pressed);
+            paint(&mut o.surf, &o.geo, &titles, o.hot, o.pressed, o.kb);
         }
     });
     invalidate(h);
@@ -695,6 +785,12 @@ fn on_mouse_move(h: HWND, x: i32, y: i32) {
             let hot = card_at(o, x, y);
             let changed = hot != o.hot;
             o.hot = hot;
+            // The mouse takes over from the keyboard selection.
+            let kb_gone = o.kb.is_some() && (changed || hot.is_some());
+            if kb_gone {
+                o.kb = None;
+            }
+            let changed = changed || kb_gone;
             (!std::mem::replace(&mut o.tracking, true), changed)
         }
         None => (false, false),
@@ -843,6 +939,19 @@ mod tests {
     use super::*;
 
     const M: Metrics = Metrics { dpi: 96 };
+
+    #[test]
+    fn picker_selection_wraps() {
+        assert_eq!(step(3, 0, true), 1);
+        assert_eq!(step(3, 2, true), 0);
+        assert_eq!(step(3, 0, false), 2);
+        assert_eq!(step(3, 1, false), 0);
+        assert_eq!(step(1, 0, true), 0);
+        assert_eq!(step(1, 0, false), 0);
+        assert_eq!(step(0, 0, true), 0);
+        assert_eq!(step(0, 5, false), 0);
+        assert_eq!(step(4, 9, true), 2, "a stale index stays inside the list");
+    }
 
     #[test]
     fn widths_follow_the_aspect_ratio_within_limits() {

@@ -3,157 +3,150 @@
 
 use super::aliases::AliasRefusal;
 use super::model::{Choice, KeyChord, Mods, ProviderId};
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 
 pub fn placeholder() -> &'static str {
-    tr("Search apps, files, settings, commands", "Cerca app, file, impostazioni, comandi")
+    t(k::LAUNCHER_STRINGS_PLACEHOLDER)
 }
 
 /// The mode chip of a provider (5.2.4); None for the providers that have no prefix.
 pub fn chip(p: ProviderId) -> Option<&'static str> {
     Some(match p {
-        ProviderId::Calc | ProviderId::Units => tr("Calc", "Calcolo"),
-        ProviderId::Run => tr("Run", "Esegui"),
-        ProviderId::Windows => tr("Windows", "Finestre"),
-        ProviderId::Web => tr("Web", "Web"),
-        ProviderId::Settings => tr("Settings", "Impostazioni"),
-        ProviderId::DateTime => tr("Time", "Data e ora"),
-        ProviderId::Registry => tr("Registry", "Registro"),
-        ProviderId::Files => tr("Files", "File"),
+        ProviderId::Calc | ProviderId::Units => t(k::LAUNCHER_STRINGS_CALC),
+        ProviderId::Run => t(k::LAUNCHER_STRINGS_RUN),
+        ProviderId::Windows => t(k::LAUNCHER_STRINGS_WINDOWS),
+        ProviderId::Web => t(k::LAUNCHER_STRINGS_WEB),
+        ProviderId::Settings => t(k::COMMON_SETTINGS),
+        ProviderId::DateTime => t(k::LAUNCHER_STRINGS_TIME),
+        ProviderId::Registry => t(k::LAUNCHER_STRINGS_REGISTRY),
+        ProviderId::Files => t(k::COMMON_FILES),
         // The alias prompt (plan L2-A2).
-        ProviderId::Alias => tr("Alias", "Alias"),
+        ProviderId::Alias => t(k::LAUNCHER_STRINGS_ALIAS),
         ProviderId::Apps | ProviderId::Commands => return None,
     })
 }
 
 // ---- hints of the selected row
 pub fn hint_open() -> &'static str {
-    tr("Open · Enter", "Apri · Invio")
+    t(k::LAUNCHER_STRINGS_OPEN_ENTER)
 }
 pub fn hint_switch() -> &'static str {
-    tr("Switch · Enter", "Passa · Invio")
+    t(k::LAUNCHER_STRINGS_SWITCH_ENTER)
 }
 pub fn hint_copy() -> &'static str {
-    tr("Copy · Enter", "Copia · Invio")
+    t(k::LAUNCHER_STRINGS_COPY_ENTER)
 }
 /// A conversion's row: Enter copies the number without its unit.
 pub fn hint_copy_number() -> &'static str {
-    tr("Copy number · Enter", "Copia il numero · Invio")
+    t(k::LAUNCHER_STRINGS_COPY_NUMBER_ENTER)
 }
 /// A file or folder row that has no Open (an executable while the Mark of the Web check is open): Ctrl+Enter shows it.
 pub fn hint_reveal() -> &'static str {
-    tr("Open file location · Ctrl+Enter", "Apri percorso file · Ctrl+Invio")
+    t(k::LAUNCHER_STRINGS_OPEN_FILE_LOCATION_CTRL_ENTER)
 }
 pub fn hint_run() -> &'static str {
-    tr("Run · Enter", "Esegui · Invio")
+    t(k::LAUNCHER_STRINGS_RUN_ENTER)
 }
 /// The alias prompt's row: Enter saves.
 pub fn hint_save() -> &'static str {
-    tr("Save · Enter", "Salva · Invio")
+    t(k::LAUNCHER_STRINGS_SAVE_ENTER)
 }
 pub fn hint_run_in_console() -> &'static str {
-    tr("Run in console · Enter", "Esegui nella console · Invio")
+    t(k::LAUNCHER_STRINGS_RUN_IN_CONSOLE_ENTER)
 }
 
 // ---- verb labels (the action list and the hints)
 pub fn verb_open() -> &'static str {
-    tr("Open", "Apri")
+    t(k::COMMON_OPEN)
 }
 pub fn verb_switch() -> &'static str {
-    tr("Switch to", "Passa a")
+    t(k::LAUNCHER_STRINGS_SWITCH_TO)
 }
 pub fn verb_run_as_admin() -> &'static str {
-    tr("Run as administrator", "Esegui come amministratore")
+    t(k::COMMON_RUN_AS_ADMINISTRATOR)
 }
 pub fn verb_reveal() -> &'static str {
-    tr("Open file location", "Apri percorso file")
+    t(k::COMMON_OPEN_FILE_LOCATION)
 }
 pub fn verb_copy() -> &'static str {
-    tr("Copy", "Copia")
+    t(k::LAUNCHER_STRINGS_COPY)
 }
 pub fn verb_close_window() -> &'static str {
-    tr("Close window", "Chiudi finestra")
+    t(k::COMMON_CLOSE_WINDOW)
 }
 pub fn verb_forget() -> &'static str {
-    tr("Forget", "Dimentica")
+    t(k::COMMON_FORGET)
 }
 pub fn verb_run_in_console() -> &'static str {
-    tr("Run in console", "Esegui nella console")
+    t(k::LAUNCHER_STRINGS_RUN_IN_CONSOLE)
 }
 
 /// "New window": Open on a running app starts a new instance (the action list, Shift+Enter).
 pub fn verb_new_window() -> &'static str {
-    tr("New window", "Nuova finestra")
+    t(k::COMMON_NEW_WINDOW)
 }
 /// The notice's own entry of the action list.
 pub fn verb_dont_show_again() -> &'static str {
-    tr("Don't show again", "Non mostrare più")
+    t(k::LAUNCHER_STRINGS_DON_T_SHOW_AGAIN)
 }
 
 // ---- aliases (plan L2-A2)
 
 /// The action list's entry that opens the alias prompt for the selected row.
 pub fn verb_assign_alias() -> &'static str {
-    tr("Assign alias…", "Assegna alias…")
+    t(k::LAUNCHER_STRINGS_ASSIGN_ALIAS)
 }
 /// The action list's entry of an alias row.
 pub fn verb_remove_alias() -> &'static str {
-    tr("Remove alias", "Rimuovi alias")
+    t(k::LAUNCHER_STRINGS_REMOVE_ALIAS)
 }
 /// The alias prompt's row when its word and target can be saved.
 pub fn save_alias(word: &str) -> String {
-    format!("{} “{word}”", tr("Save alias", "Salva alias"))
+    format!("{} “{word}”", t(k::LAUNCHER_STRINGS_SAVE_ALIAS))
 }
 /// The alias prompt's row while the field is empty (a row's target given, or the "word target" form).
 pub fn alias_type_word() -> &'static str {
-    tr("Type a word for this alias", "Scrivi una parola per l'alias")
+    t(k::LAUNCHER_STRINGS_TYPE_A_WORD_FOR_THIS)
 }
 pub fn alias_type_word_target() -> &'static str {
-    tr("Type a word, a space and what it opens", "Scrivi una parola, uno spazio e cosa apre")
+    t(k::LAUNCHER_STRINGS_TYPE_A_WORD_A_SPACE)
 }
 /// An app alias whose app is not in the catalogue.
 pub fn app_not_found() -> &'static str {
-    tr("App not found", "App non trovata")
+    t(k::LAUNCHER_STRINGS_APP_NOT_FOUND)
 }
 /// The notice row of an alias that could not be written to config.json.
 pub fn alias_not_saved() -> &'static str {
-    tr("Couldn't save the alias", "Impossibile salvare l'alias")
+    t(k::LAUNCHER_STRINGS_COULDN_T_SAVE_THE_ALIAS)
 }
 /// Why the alias prompt cannot save.
 pub fn alias_refusal(why: AliasRefusal) -> &'static str {
     match why {
-        AliasRefusal::Word => tr(
-            "An alias is 1-16 letters, digits or - _ . +, starting with a letter",
-            "Un alias ha da 1 a 16 lettere, cifre o - _ . +, e inizia con una lettera",
-        ),
-        AliasRefusal::Prefix => tr("This word starts a search mode", "Questa parola avvia una modalità di ricerca"),
-        AliasRefusal::NoTarget => tr("Nothing to open after the word", "Niente da aprire dopo la parola"),
-        AliasRefusal::TooLong => tr("Longer than 512 characters", "Più lungo di 512 caratteri"),
-        AliasRefusal::Hidden => {
-            tr("Holds a hidden or control character", "Contiene un carattere nascosto o di controllo")
-        }
-        AliasRefusal::Lines => tr("More than one line", "Più di una riga"),
-        AliasRefusal::Address => tr("Not an address the launcher opens", "Non è un indirizzo che il launcher apre"),
-        AliasRefusal::Scheme => {
-            tr("This kind of address can't be an alias", "Questo tipo di indirizzo non può essere un alias")
-        }
-        AliasRefusal::Full => tr("64 aliases already: remove one first", "Ci sono già 64 alias: rimuovine uno"),
+        AliasRefusal::Word => t(k::LAUNCHER_STRINGS_AN_ALIAS_IS_1_16),
+        AliasRefusal::Prefix => t(k::LAUNCHER_STRINGS_THIS_WORD_STARTS_A_SEARCH),
+        AliasRefusal::NoTarget => t(k::LAUNCHER_STRINGS_NOTHING_TO_OPEN_AFTER_THE),
+        AliasRefusal::TooLong => t(k::LAUNCHER_STRINGS_LONGER_THAN_512_CHARACTERS),
+        AliasRefusal::Hidden => t(k::LAUNCHER_STRINGS_HOLDS_A_HIDDEN_OR_CONTROL),
+        AliasRefusal::Lines => t(k::LAUNCHER_STRINGS_MORE_THAN_ONE_LINE),
+        AliasRefusal::Address => t(k::LAUNCHER_STRINGS_NOT_AN_ADDRESS_THE_LAUNCHER),
+        AliasRefusal::Scheme => t(k::LAUNCHER_STRINGS_THIS_KIND_OF_ADDRESS_CAN),
+        AliasRefusal::Full => t(k::LAUNCHER_STRINGS_64_ALIASES_ALREADY_REMOVE_ONE),
     }
 }
 
 /// The name of a key chord as the action list shows it (right-aligned, CAPTION): "Ctrl+Shift+Enter", "Shift+Del".
 pub fn key_name(c: KeyChord) -> String {
     let mut s = String::new();
-    for (m, name) in [(Mods::ALT, "Alt"), (Mods::CTRL, "Ctrl"), (Mods::SHIFT, tr("Shift", "Maiusc"))] {
+    for (m, name) in [(Mods::ALT, "Alt"), (Mods::CTRL, "Ctrl"), (Mods::SHIFT, t(k::LAUNCHER_STRINGS_SHIFT))] {
         if c.mods.has(m) {
             s.push_str(name);
             s.push('+');
         }
     }
     match c.vk {
-        0x0D => s.push_str(tr("Enter", "Invio")),
-        0x2E => s.push_str(tr("Del", "Canc")),
-        0x20 => s.push_str(tr("Space", "Spazio")),
+        0x0D => s.push_str(t(k::LAUNCHER_STRINGS_ENTER)),
+        0x2E => s.push_str(t(k::LAUNCHER_STRINGS_DEL)),
+        0x20 => s.push_str(t(k::LAUNCHER_STRINGS_SPACE)),
         vk @ (0x30..=0x39 | 0x41..=0x5A) => s.extend(char::from_u32(u32::from(vk))),
         _ => s.push('?'),
     }
@@ -163,123 +156,108 @@ pub fn key_name(c: KeyChord) -> String {
 // ---- detail lines and notices
 /// Prefix of the detail line of a run line: the line itself follows.
 pub fn run_by_windows() -> &'static str {
-    tr("Run by Windows: ", "Eseguito da Windows: ")
+    t(k::LAUNCHER_STRINGS_RUN_BY_WINDOWS)
 }
 pub fn line_too_long() -> &'static str {
-    tr("Line too long to review", "Riga troppo lunga da verificare")
+    t(k::LAUNCHER_STRINGS_LINE_TOO_LONG_TO_REVIEW)
 }
 pub fn no_window_to_act_on() -> &'static str {
-    tr("No window to act on", "Nessuna finestra su cui agire")
+    t(k::LAUNCHER_STRINGS_NO_WINDOW_TO_ACT_ON)
 }
 pub fn thousands() -> &'static str {
-    tr("(thousands)", "(migliaia)")
+    t(k::LAUNCHER_STRINGS_THOUSANDS)
 }
 /// Appended to the detail line of a window that does not answer ("<" mode).
 pub fn not_responding() -> &'static str {
-    tr(" · Not responding", " · Non risponde")
+    t(k::LAUNCHER_STRINGS_NOT_RESPONDING)
 }
 
 // ---- web, registry
 /// The web row (5.4.8): always names the host of the engine's template.
 pub fn search_web(host: &str, query: &str) -> String {
     // The host passed validate_template (letters, digits, hyphens, dots), so it holds no "{q}" to replace again.
-    tr("Search {host} for '{q}'", "Cerca '{q}' su {host}").replace("{host}", host).replacen("{q}", query, 1)
+    t(k::LAUNCHER_STRINGS_SEARCH_HOST_FOR_Q).replace("{host}", host).replacen("{q}", query, 1)
 }
 /// The hint row of "??" alone.
 pub fn type_to_search(host: &str) -> String {
-    tr("Type to search {host}", "Scrivi per cercare su {host}").replace("{host}", host)
+    t(k::LAUNCHER_STRINGS_TYPE_TO_SEARCH_HOST).replace("{host}", host)
 }
 /// The one row of the registry mode (":").
 pub fn open_registry_editor() -> &'static str {
-    tr("Open Registry Editor", "Apri l'Editor del Registro di sistema")
+    t(k::LAUNCHER_STRINGS_OPEN_REGISTRY_EDITOR)
 }
 
 // ---- the one-time offer (5.2.1)
 pub fn offer_text() -> &'static str {
-    tr(
-        "New: a launcher for apps, files and commands. Use Alt+Space",
-        "Novità: un launcher per app, file e comandi. Usa Alt+Spazio",
-    )
+    t(k::LAUNCHER_STRINGS_NEW_A_LAUNCHER_FOR_APPS)
 }
 pub fn offer_use_alt_space() -> &'static str {
-    tr("Use Alt+Space", "Usa Alt+Spazio")
+    t(k::LAUNCHER_STRINGS_USE_ALT_SPACE)
 }
 pub fn offer_use_alt_shift_space() -> &'static str {
-    tr("Use Alt+Shift+Space", "Usa Alt+Maiusc+Spazio")
+    t(k::LAUNCHER_STRINGS_USE_ALT_SHIFT_SPACE)
 }
 pub fn offer_dismiss() -> &'static str {
-    tr("Don't show again", "Non mostrare più")
+    t(k::LAUNCHER_STRINGS_DON_T_SHOW_AGAIN)
 }
 /// The offer row after the probe found Alt+Space taken: Alt+Shift+Space is proposed.
 pub fn offer_alt_space_held() -> &'static str {
-    tr("Another app holds Alt+Space. Use Alt+Shift+Space", "Un'altra app usa Alt+Spazio. Usa Alt+Maiusc+Spazio")
+    t(k::LAUNCHER_STRINGS_ANOTHER_APP_HOLDS_ALT_SPACE)
 }
 /// The offer row after the probe found both chords taken.
 pub fn offer_both_held() -> &'static str {
-    tr("Another app holds Alt+Space and Alt+Shift+Space", "Un'altra app usa Alt+Spazio e Alt+Maiusc+Spazio")
+    t(k::LAUNCHER_STRINGS_ANOTHER_APP_HOLDS_ALT_SPACE_2)
 }
 
 // ---- PowerToys (5.7)
 /// The notice of the first chord the dock sees while Command Palette runs.
 pub fn pt_shared() -> &'static str {
-    tr(
-        "PowerToys Command Palette is running and also uses Alt+Space.",
-        "PowerToys Command Palette è attivo e usa anche Alt+Spazio.",
-    )
+    t(k::LAUNCHER_STRINGS_POWERTOYS_COMMAND_PALETTE_IS_RUNNING)
 }
 /// Its detail: what taking the chord leaves to do.
 pub fn pt_turn_off() -> &'static str {
-    tr(
-        "Turn its shortcut off in PowerToys > Command Palette, or Command Palette may still open on some presses",
-        "Disattiva la sua scorciatoia in PowerToys > Command Palette, o Command Palette potrebbe ancora aprirsi a volte",
-    )
+    t(k::LAUNCHER_STRINGS_TURN_ITS_SHORTCUT_OFF_IN)
 }
 /// The hint of that notice: Enter takes the chord.
 pub fn hint_pt_take() -> &'static str {
-    tr("Take Alt+Space · Enter", "Prendi Alt+Spazio · Invio")
+    t(k::LAUNCHER_STRINGS_TAKE_ALT_SPACE_ENTER)
 }
 /// The notice's choices in its action list.
 pub fn choice_label(c: Choice) -> &'static str {
     match c {
-        Choice::TakeChord => tr("Take Alt+Space", "Prendi Alt+Spazio"),
-        Choice::LeaveChord => tr(
-            "Leave it to Command Palette until I turn its shortcut off",
-            "Lascialo a Command Palette finché non disattivo la sua scorciatoia",
-        ),
-        Choice::UseAltShiftSpace => tr("Use Alt+Shift+Space instead", "Usa invece Alt+Maiusc+Spazio"),
+        Choice::TakeChord => t(k::LAUNCHER_STRINGS_TAKE_ALT_SPACE),
+        Choice::LeaveChord => t(k::LAUNCHER_STRINGS_LEAVE_IT_TO_COMMAND_PALETTE),
+        Choice::UseAltShiftSpace => t(k::LAUNCHER_STRINGS_USE_ALT_SHIFT_SPACE_INSTEAD),
     }
 }
 /// The notice after "Use Alt+Shift+Space instead" while another app holds that chord (the RegisterHotKey probe): the
 /// chord and the question stay as they were.
 pub fn pt_alt_shift_space_held() -> &'static str {
-    tr("Another app holds Alt+Shift+Space", "Un'altra app usa Alt+Maiusc+Spazio")
+    t(k::COMMON_ANOTHER_APP_HOLDS_ALT_SHIFT)
 }
 /// The notice after two passed chords that Command Palette did not answer: a short title, whole at 560 px.
 pub fn pt_took_over() -> &'static str {
-    tr("Command Palette did not answer Alt+Space", "Command Palette non ha risposto ad Alt+Spazio")
+    t(k::LAUNCHER_STRINGS_COMMAND_PALETTE_DID_NOT_ANSWER)
 }
 /// Its detail: the chord is the launcher's now.
 pub fn pt_took_over_detail() -> &'static str {
-    tr("It is running, but the launcher has Alt+Space now", "È attivo, ma ora Alt+Spazio è del launcher")
+    t(k::LAUNCHER_STRINGS_IT_IS_RUNNING_BUT_THE)
 }
 
 // ---- refused launches (5.5.3)
 /// The error row of a launch that did not reach the desktop shell.
 pub fn launch_failed() -> &'static str {
-    tr("Couldn't start it: Explorer isn't answering", "Impossibile avviarlo: Esplora risorse non risponde")
+    t(k::LAUNCHER_STRINGS_COULDN_T_START_IT_EXPLORER)
 }
 
 /// The notice of a refused paste: the app that copied the text marked it private, so it was never read (plan L2 D8).
 pub fn paste_private() -> &'static str {
-    tr(
-        "Not pasted: the app that copied it marked it private",
-        "Non incollato: l'app che l'ha copiato lo ha segnato come privato",
-    )
+    t(k::LAUNCHER_STRINGS_NOT_PASTED_THE_APP_THAT)
 }
 
 /// The window name (the launcher keeps this static name for screen readers).
 pub fn window_name() -> &'static str {
-    tr("Launcher", "Launcher")
+    t(k::COMMON_LAUNCHER)
 }
 
 // ---- date and time rows (5.4.10): the names of the days and months, and the label of each row
@@ -287,44 +265,40 @@ pub fn window_name() -> &'static str {
 /// The name of a weekday, 0 = Monday.
 pub fn day_name(wd: u8) -> &'static str {
     match wd {
-        0 => tr("Monday", "lunedì"),
-        1 => tr("Tuesday", "martedì"),
-        2 => tr("Wednesday", "mercoledì"),
-        3 => tr("Thursday", "giovedì"),
-        4 => tr("Friday", "venerdì"),
-        5 => tr("Saturday", "sabato"),
-        _ => tr("Sunday", "domenica"),
+        0 => t(k::LAUNCHER_STRINGS_MONDAY),
+        1 => t(k::LAUNCHER_STRINGS_TUESDAY),
+        2 => t(k::LAUNCHER_STRINGS_WEDNESDAY),
+        3 => t(k::LAUNCHER_STRINGS_THURSDAY),
+        4 => t(k::LAUNCHER_STRINGS_FRIDAY),
+        5 => t(k::LAUNCHER_STRINGS_SATURDAY),
+        _ => t(k::LAUNCHER_STRINGS_SUNDAY),
     }
 }
 
 /// The name of a month, 1 = January.
 pub fn month_name(mo: u8) -> &'static str {
     match mo {
-        1 => tr("January", "gennaio"),
-        2 => tr("February", "febbraio"),
-        3 => tr("March", "marzo"),
-        4 => tr("April", "aprile"),
-        5 => tr("May", "maggio"),
-        6 => tr("June", "giugno"),
-        7 => tr("July", "luglio"),
-        8 => tr("August", "agosto"),
-        9 => tr("September", "settembre"),
-        10 => tr("October", "ottobre"),
-        11 => tr("November", "novembre"),
-        _ => tr("December", "dicembre"),
+        1 => t(k::LAUNCHER_STRINGS_JANUARY),
+        2 => t(k::LAUNCHER_STRINGS_FEBRUARY),
+        3 => t(k::LAUNCHER_STRINGS_MARCH),
+        4 => t(k::LAUNCHER_STRINGS_APRIL),
+        5 => t(k::LAUNCHER_STRINGS_MAY),
+        6 => t(k::LAUNCHER_STRINGS_JUNE),
+        7 => t(k::LAUNCHER_STRINGS_JULY),
+        8 => t(k::LAUNCHER_STRINGS_AUGUST),
+        9 => t(k::LAUNCHER_STRINGS_SEPTEMBER),
+        10 => t(k::LAUNCHER_STRINGS_OCTOBER),
+        11 => t(k::LAUNCHER_STRINGS_NOVEMBER),
+        _ => t(k::LAUNCHER_STRINGS_DECEMBER),
     }
 }
 
 pub fn week_number(n: u8) -> String {
-    format!("{} {n}", tr("Week", "Settimana"))
+    format!("{} {n}", t(k::LAUNCHER_STRINGS_WEEK))
 }
 
 pub fn day_of_year(n: u16) -> String {
-    if crate::i18n::italian() {
-        format!("Giorno {n} dell'anno")
-    } else {
-        format!("Day {n} of the year")
-    }
+    oled_sys::i18n::subst(t(k::LAUNCHER_STRINGS_DAY_OF_YEAR), &[("n", &n.to_string())])
 }
 
 pub fn label_utc() -> &'static str {
@@ -341,48 +315,61 @@ pub fn label_iso8601() -> &'static str {
 
 /// What the detail line of each date and time row says (the row's own title is the value).
 pub fn label_long_date() -> &'static str {
-    tr("Date and time", "Data e ora")
+    t(k::LAUNCHER_STRINGS_DATE_AND_TIME)
 }
 pub fn label_short_date() -> &'static str {
-    tr("Date", "Data")
+    t(k::LAUNCHER_STRINGS_DATE)
 }
 pub fn label_time_seconds() -> &'static str {
-    tr("Time with seconds", "Ora con secondi")
+    t(k::LAUNCHER_STRINGS_TIME_WITH_SECONDS)
 }
 pub fn label_iso_week() -> &'static str {
-    tr("ISO week", "Settimana ISO")
+    t(k::LAUNCHER_STRINGS_ISO_WEEK)
 }
 pub fn label_day_of_year() -> &'static str {
-    tr("Day of the year", "Giorno dell'anno")
+    t(k::LAUNCHER_STRINGS_DAY_OF_THE_YEAR)
 }
 
 // ---- files (plan L2-F1): the state rows of "file " mode and its placeholder
 pub fn files_search_off() -> &'static str {
-    tr("Windows Search is off", "Ricerca di Windows non attiva")
+    t(k::LAUNCHER_STRINGS_WINDOWS_SEARCH_IS_OFF)
 }
 pub fn files_open_indexing() -> &'static str {
-    tr("Open indexing options", "Apri Opzioni di indicizzazione")
+    t(k::LAUNCHER_STRINGS_OPEN_INDEXING_OPTIONS)
 }
 pub fn files_not_answering() -> &'static str {
-    tr("File search isn't answering", "La ricerca file non risponde")
+    t(k::LAUNCHER_STRINGS_FILE_SEARCH_ISN_T_ANSWERING)
 }
 pub fn files_admin_protection() -> &'static str {
-    tr(
-        "File search is unavailable while Administrator protection is on",
-        "Ricerca file non disponibile con la protezione amministratore attiva",
-    )
+    t(k::LAUNCHER_STRINGS_FILE_SEARCH_IS_UNAVAILABLE_WHILE)
 }
 pub fn files_unavailable() -> &'static str {
-    tr("File search is unavailable", "Ricerca file non disponibile")
+    t(k::LAUNCHER_STRINGS_FILE_SEARCH_IS_UNAVAILABLE)
 }
 pub fn files_placeholder() -> &'static str {
-    tr("Names starting with the typed words", "Nomi che iniziano con le parole scritte")
+    t(k::LAUNCHER_STRINGS_NAMES_STARTING_WITH_THE_TYPED)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn day_of_year_equals_the_old_text_in_both_languages() {
+        use crate::i18n::with_italian;
+        for n in [1u16, 60, 365, 366] {
+            assert_eq!(with_italian(false, || day_of_year(n)), format!("Day {n} of the year"));
+            assert_eq!(with_italian(true, || day_of_year(n)), format!("Giorno {n} dell'anno"));
+        }
+    }
+
+    #[test]
+    fn placeholder_reads_the_table_in_both_languages() {
+        use crate::i18n::with_italian;
+        with_italian(false, || assert_eq!(placeholder(), "Search apps, files, settings, commands"));
+        with_italian(true, || assert_eq!(placeholder(), "Cerca app, file, impostazioni, comandi"));
+    }
 
     #[test]
     fn english_strings_are_not_empty_and_chips_cover_the_prefixed_providers() {

@@ -119,11 +119,24 @@ pub fn first_day_of_week_sun0() -> u32 {
     (v + 1) % 7
 }
 
+/// The header of day `mon0` (Monday = 0) when the system gives no name, in the dock language.
+fn fallback_header(mon0: usize) -> &'static str {
+    use crate::i18n::{k, t};
+    const DAYS: [oled_sys::i18n::S; 7] = [
+        k::CALENDAR_DAY_0,
+        k::CALENDAR_DAY_1,
+        k::CALENDAR_DAY_2,
+        k::CALENDAR_DAY_3,
+        k::CALENDAR_DAY_4,
+        k::CALENDAR_DAY_5,
+        k::CALENDAR_DAY_6,
+    ];
+    DAYS.get(mon0).map_or("", |&key| t(key))
+}
+
 /// Short day headers (English fallback: "Mo", "Tu", ...) starting from `first_sun0`
 /// (`CAL_SSHORTESTDAYNAME1..7`, note: 1 is Monday).
 pub fn weekday_headers(first_sun0: u32) -> [String; 7] {
-    const FALLBACK: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
-    const FALLBACK_IT: [&str; 7] = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"];
     let mut out: [String; 7] = Default::default();
     for (i, slot) in out.iter_mut().enumerate() {
         // column i -> sun0 day -> index with Monday = 0
@@ -145,7 +158,7 @@ pub fn weekday_headers(first_sun0: u32) -> [String; 7] {
         *slot = if n > 1 {
             String::from_utf16_lossy(&buf[..(n as usize - 1).min(buf.len())])
         } else {
-            if crate::i18n::italian() { FALLBACK_IT[mon0] } else { FALLBACK[mon0] }.to_string()
+            fallback_header(mon0).to_string()
         };
     }
     out
@@ -229,6 +242,16 @@ fn today_systemtime() -> SYSTEMTIME {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_headers_equal_the_old_texts_in_both_languages() {
+        const OLD_EN: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+        const OLD_IT: [&str; 7] = ["Lu", "Ma", "Me", "Gi", "Ve", "Sa", "Do"];
+        for i in 0..7 {
+            assert_eq!(crate::i18n::with_italian(false, || fallback_header(i)), OLD_EN[i]);
+            assert_eq!(crate::i18n::with_italian(true, || fallback_header(i)), OLD_IT[i]);
+        }
+    }
 
     #[test]
     fn leap_years() {

@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "generation": 0,
+  "writer": "",
+  "language": "auto",
+  "look": {
+    "preset": "oled",
+    "seed": {
+      "bg": "#000000",
+      "fg": "#FFFFFF",
+      "accent": null,
+      "attention": "#FF8C00",
+      "danger": "#FF453A",
+      "white_level": 100
+    },
+    "knobs": {
+      "bar_opacity": 95,
+      "surface_opacity": 95,
+      "corners": 1,
+      "density_pct": 100,
+      "rim": "hairline",
+      "plate": "fill",
+      "indicator": "line",
+      "font": { "family": "", "weight_delta": 0 },
+      "sizes": { "icon": 16, "text": 13, "tray": 16, "module_pct": 100 },
+      "motion": { "mode": "system", "speed_pct": 100 }
+    }
+  },
+  "overrides": {},
+  "a11y": { "reduced_motion": null, "text_scale_pct": null }
+}

@@ -42,6 +42,12 @@ thread_local! {
     static STYLE: std::cell::Cell<Style> = const { std::cell::Cell::new(no_style) };
     /// Battery of the next `render_bar`: none by default, so every existing bar PNG is unchanged.
     static BATTERY: std::cell::Cell<BatteryStatus> = const { std::cell::Cell::new(BatteryStatus::NONE) };
+    /// Item of the next `render_bar` that carries the keyboard focus ring (`Scene::focus`); none by default.
+    static FOCUS: std::cell::Cell<Option<ItemId>> = const { std::cell::Cell::new(None) };
+    /// Peek chips on the next `render_bar` (`Scene::chips`); off by default.
+    static CHIPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Keyboard ring on the nav row of the next Settings window (`Frame::ring`); off by default.
+    static RING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A bar style variant: edits the config the bar is drawn with.
@@ -368,7 +374,7 @@ fn mock_notifications() -> NotifState {
                 "14:28",
             ),
             item(2, "Mail", "Weekly summary", "You have 12 new unread messages in your Inbox.", "13:05"),
-            item(3, "Windows Update", "Updates available", "", "yesterday 22:41"),
+            item(3, "Windows Update", "Updates available", "", "Yesterday 22:41"),
         ],
         dnd: Some(false),
     }
@@ -530,6 +536,8 @@ fn render_bar(
         lift: None,
         hover,
         max_width: m.px(1920 - 2 * render::EDGE_MARGIN),
+        focus: FOCUS.with(|f| f.get()),
+        chips: CHIPS.with(|c| c.get()),
     };
     let mut layout = render::layout(&scene);
     let hover_rect = hover.and_then(|id| layout.rect_of(id));
@@ -577,7 +585,7 @@ fn bar_png(
 
 /// Bar at the bottom with Firefox hovered and the window picker open above it: three cards with
 /// placeholder boxes where the DWM would compose the live thumbnails.
-fn picker_png(dir: &Path, file: &str, m: Metrics) -> bool {
+fn picker_png(dir: &Path, file: &str, m: Metrics, kb: Option<usize>) -> bool {
     let firefox = ItemId::App(2);
     let Some((bw, bh, px, Some(item))) =
         render_bar(m, Some(firefox), DisplayMode::IconText, None, false, mock_net().status(), false)
@@ -590,7 +598,8 @@ fn picker_png(dir: &Path, file: &str, m: Metrics) -> bool {
         "Weather forecast for the week ahead in Turin, Italy - Mozilla Firefox",
     ];
     let sources = [Some((1920, 1080)), Some((1280, 1024)), Some((2560, 1080))];
-    let Some((pw, ph, pp)) = crate::picker::preview_pixels(m, &titles, &sources, bw, Some(1)) else {
+    let Some((pw, ph, pp)) = crate::picker::preview_pixels(m, &titles, &sources, bw, kb.is_none().then_some(1), kb)
+    else {
         eprintln!("preview: picker surface failed");
         return false;
     };
@@ -704,11 +713,13 @@ fn settings_png_with(
         trust_elevated: false,
         powertoys: false,
         chord_held: None,
+        battery_note: false,
+        keys_note: false,
     };
     // The mini bar is drawn by the bar renderer, which reads the global config.
     crate::config::set(c.clone());
     let focus = if hot.is_some() { Focus::Page } else { Focus::Nav };
-    let Some((w, h, px)) = window_pixels(m, page, c, &ctx, hot.map(hit_id), focus, size) else {
+    let Some((w, h, px)) = window_pixels(m, page, c, &ctx, hot.map(hit_id), focus, RING.with(|r| r.get()), size) else {
         eprintln!("preview: settings {file} not rendered");
         return false;
     };
@@ -740,6 +751,29 @@ fn popup_png(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, 
     }
     let hot = pick_hot(content.as_ref(), w, h, m.px(4).max(2), nth);
     content.paint(&mut surf, hot, None);
+    snapshot_png(dir, file, m, &surf)
+}
+
+/// `popup_png` with the keyboard ring on the `k`-th keyboard target of the content (`Content::focus_targets`) and that
+/// control as the hot one. A content without that target is drawn exactly as `popup_png` draws it with `nth = k`.
+fn popup_png_keys(dir: &Path, file: &str, m: Metrics, mut content: Box<dyn Content>, k: usize) -> bool {
+    let mut surf = match Surface::new(m) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("preview: Surface::new failed: {e}");
+            return false;
+        }
+    };
+    let (w, h) = content.size(&surf);
+    let Some(&(id, rc)) = content.focus_targets().get(k) else {
+        return popup_png(dir, file, m, content, k);
+    };
+    if let Err(e) = surf.resize(w.max(1), h.max(1)) {
+        eprintln!("preview: Surface::resize failed: {e}");
+        return false;
+    }
+    content.paint(&mut surf, Some(id), None);
+    crate::popup::paint_focus_ring(&mut surf, rc, m.px(crate::surface::ROW_RADIUS));
     snapshot_png(dir, file, m, &surf)
 }
 
@@ -825,6 +859,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             }
             c
         }
+        "popup_dock_menu" => crate::popup::popup_dock::preview_new(true),
         "popup_calendar" => crate::popup_calendar::new(),
         "popup_network" => crate::popup_network::new(mock_net()),
         "popup_battery" => crate::popup_battery::new(mock_battery(), Some(PowerMode::Balanced)),
@@ -1109,8 +1144,27 @@ pub fn run(dir: &str) -> i32 {
             false,
             wifi,
         ));
+        // Keyboard layer: the ring on the third app, and Peek's digit chips.
+        for (name, ring, chips) in [("bar_focus", Some(ItemId::App(2)), false), ("bar_peek", None, true)] {
+            FOCUS.with(|f| f.set(ring));
+            CHIPS.with(|c| c.set(chips));
+            failures += i32::from(!bar_png(
+                dir,
+                &format!("{name}{suffix}.png"),
+                m,
+                None,
+                DisplayMode::IconText,
+                None,
+                false,
+                wifi,
+            ));
+            FOCUS.with(|f| f.set(None));
+            CHIPS.with(|c| c.set(false));
+        }
         crate::config::set(plan().base_config());
-        failures += i32::from(!picker_png(dir, &format!("popup_windows{suffix}.png"), m));
+        failures += i32::from(!picker_png(dir, &format!("popup_windows{suffix}.png"), m, None));
+        // The keyboard selection on card 0, nothing hovered.
+        failures += i32::from(!picker_png(dir, &format!("picker_keys{suffix}.png"), m, Some(0)));
         // (name, index of the hovered control)
         for (name, nth) in [
             ("popup_notif", 1),
@@ -1125,6 +1179,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_app", 1),
             ("popup_app_jump", 2),
             ("popup_start", 4),
+            ("popup_dock_menu", 1),
             ("popup_startmenu", 12),
             ("popup_startmenu_search", 1),
             ("popup_startmenu_offer", 1),
@@ -1175,6 +1230,16 @@ pub fn run(dir: &str) -> i32 {
             }
             failures += i32::from(!ok);
         }
+        // The keyboard ring on target k of a popup (the popups' own targets arrive with DK-POP: until then the
+        // scene is its plain twin).
+        for (name, content, k) in [("popup_app_keys", "popup_app", 0), ("popup_audio_keys", "popup_audio", 2)] {
+            crate::config::set(plan().base_config());
+            let ok = match make_popup(content, m) {
+                Some(c) => popup_png_keys(dir, &format!("{name}{suffix}.png"), m, c, k),
+                None => false,
+            };
+            failures += i32::from(!ok);
+        }
     }
     // The short-screen audio popups (wsD D8): every screen in the legacy run, in a matrix cell the screens of
     // its DPI.
@@ -1197,6 +1262,11 @@ pub fn run(dir: &str) -> i32 {
             let file = format!("settings_{}{suffix}.png", page.slug());
             failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, page));
         }
+        // The keyboard ring on the focused nav row (painted by DK-SET; until then the plain twin).
+        RING.with(|r| r.set(true));
+        let file = format!("settings_bar_keys{suffix}.png");
+        failures += i32::from(!settings_png(dir, &file, Metrics { dpi }, crate::settings_pages::Page::Bar));
+        RING.with(|r| r.set(false));
         // The tray chooser open, "Show all" off and on (the on page: every switch reads as on and is dimmed).
         for (name, on) in [("settings_tray_chooser", false), ("settings_tray_show_all", true)] {
             let c = Config { tray_show_all: on, ..plan().base_config() };

@@ -9,7 +9,7 @@
       "unit": "bytes",
       "gate": "ledger",
       "base_bytes": 1400320,
-      "target": "1.5.2",
+      "target": "1.6.0",
       "note": "base_bytes = the 1.4.2 exe as CI builds it with the pinned toolchain (step 7.3); 1400320 is the local release build of 1.4.2 on the dev machine (toolchain 1.93.1), a placeholder until CI measures it. An active ledger row with base_bytes 0 fails the schema test. 1.5.0 step re-keyed (owner decision, L3 T23): the launcher was never in the ledger; the release exe of feat/launcher after plan L3 was 1765888 bytes. Re-keyed again at the close of the 1.5.0 branch (owner's delegated decision, no reserve: part L2 is in): the release exe (cargo build --release --locked, manifest kept) is 1859584 bytes after the size trims of part L2 (AliasTable::build sort, preview alias map by insert), rounded up to the next 16 KiB 1867776 bytes, which is 456.5 KiB over base_bytes and is written as 457 whole KiB (limit 1868288, 8704 bytes of room). Raised by one 16 KiB unit at the verification fixes of 920d775 (owner's delegated decision): the release exe measured 1869312 bytes, 1884160 bytes is 472.5 KiB over base_bytes and is written as 473 whole KiB (limit 1884672, 15360 bytes of room). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of it. Release 1.5.1 step (owner-delegated ledger decision, R151 5.2): the final 1.5.0 key plus 48 KiB, 473 + 48 = 521 whole KiB (limit 1,933,824 bytes), and the later steps shifted by +48 so they keep their own increments; the target is 1.5.1, the version this branch ships as. Re-keyed at the merge of the release's parallel tracks (owner-delegated ledger decision of 2026-11-23; nothing cut for size): D8 (the audio popup's scroll area) and N6 were not in the size plan and D6 took 9 KiB, so the merged release exe measured 1940480 bytes, above the 521 KiB limit; rounded up to the next 16 KiB 1949696 bytes, plus one more 16 KiB step of room for review fixes, 1966080 bytes, which is 552.5 KiB over base_bytes and is written as 553 whole KiB (limit 1,966,592 bytes), and the later steps shifted by +32 so they keep their own increments. Release 1.5.2 step (R152 T5, per R151 5.2): the 1.5.1 key is settled down to the measured 1.5.1 release exe, 1940992 bytes, rounded up to the next 16 KiB 1949696 bytes, 536.5 KiB over base_bytes, written as 537 whole KiB. The 1.5.2 key is the merged release exe, 1953792 bytes, rounded up to the next 16 KiB 1966080 bytes, plus one 16 KiB step of room, 1982464 bytes, 568.5 KiB over base_bytes, written as 569 whole KiB (limit 1,982,976 bytes). The later steps keep their own increments (+150, +450, +250, +250 KiB) on top of the settled 1.5.1 key.",
       "ledger_kib_cumulative": {
         "1.4.2": 0,
@@ -300,11 +300,155 @@
     {
       "id": "exe_size.files",
       "where": "CI",
-      "status": "pending",
+      "status": "active",
       "unit": "bytes",
       "gate": "max",
       "value": 2621440,
       "provisional": true
+    },
+    {
+      "id": "files.enum_sort_10k_ci",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 50,
+      "note": "bench_enum_sort_10k: 10,000 empty files listed and sorted by name, release, median of 5 (ROADMAP 3.6 Phase 1 exit)"
+    },
+    {
+      "id": "files.first_batch_p99",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 10000,
+      "note": "bench_first_batch: time to the first batch of a 10,000-file folder, p99 of 50, release, serial (F 5.5.2: 256 entries or 8 ms)"
+    },
+    {
+      "id": "files.sort_100k",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 50,
+      "note": "bench_sort_100k (F 5.5.3); at slack 1 in a local release run, ci.yml bench job at OLED_BENCH_SLACK=2 on the shared runner"
+    },
+    {
+      "id": "files.natural_sort_100k",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 50,
+      "note": "bench_natural_sort_100k: 70 % plain, 30 % not, natural_cmp_keyed, median of 5; at slack 1 in a local release run, ci.yml bench job at OLED_BENCH_SLACK=2 on the shared runner"
+    },
+    {
+      "id": "files.natural_self_check_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 3,
+      "note": "bench_natural_self_check: median of 50 uncached runs (p99 at most 5 asserted in the bench); at slack 1 in a local release run, ci.yml bench job at OLED_BENCH_SLACK=2 on the shared runner"
+    },
+    {
+      "id": "files.filter_100k",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 16,
+      "note": "bench_filter_100k, recorded by P1-files-engine; gated by F6; at slack 1 in a local release run, ci.yml bench job at OLED_BENCH_SLACK=2 on the shared runner"
+    },
+    {
+      "id": "files.store_100k_bytes",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 8388608,
+      "note": "store_100k_fits: heap of 100,000 entries with 24-byte names, fixed entry chunks, name index included (4.1)"
+    },
+    {
+      "id": "files.icons_bin_bytes",
+      "where": "CI",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 2097152,
+      "note": "icons.bin on disk, file-backed (F 5.5.5)"
+    },
+    {
+      "id": "files.shell_fallback_hang_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 1600,
+      "note": "timing_fallback_hang, p99 of 20, debug, serial (F 8.2 F2: fallback within 1.6 s)"
+    },
+    {
+      "id": "files.shell_fallback_crash_ms",
+      "where": "CI",
+      "status": "pending",
+      "unit": "ms",
+      "gate": "max",
+      "value": 200,
+      "note": "timing_fallback_crash, from the host's exit, p99 of 20, debug, serial"
+    },
+    {
+      "id": "files.shell_client_call_p99_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 1000,
+      "note": "timing_client_calls: request() plus drain() per 16 ms iteration during the fault suite, p99"
+    },
+    {
+      "id": "private.files_ops_idle",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 8388608,
+      "note": "ops host attached and idle (ROADMAP 6.2); measured by LIVE-F2 step 1"
+    },
+    {
+      "id": "private.files_ops_per_op",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 1048576,
+      "note": "growth per running operation with up to 4,096 staged items (above that the stage list spills to disk); measured by LIVE-F2 step 2"
+    },
+    {
+      "id": "private.files_shell_host",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 15728640,
+      "note": "after 200 icons, 20 thumbnails and a menu build, the machine's own extensions loaded; measured by LIVE-F2 step 3"
+    },
+    {
+      "id": "wakeups.files_ops_idle",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0,
+      "note": "measured by LIVE-F2 step 1"
+    },
+    {
+      "id": "wakeups.files_shell_idle",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "ctxsw_per_s",
+      "gate": "max",
+      "value": 0,
+      "note": "measured by LIVE-F2 step 3"
     },
     {
       "id": "exe_size.tasks_admin",
@@ -412,6 +556,69 @@
       "note": "of one core at 1 s refresh, sampling only while visible"
     },
     {
+      "id": "bench.sysmon_parse_300_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 600,
+      "note": "coder-run in release at slack 1; ci.yml bench job at OLED_BENCH_SLACK=2 on the shared runner; TS5"
+    },
+    {
+      "id": "bench.tasks_model_tick_us",
+      "where": "CI",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 400,
+      "note": "coder-run in release at slack 1; ci.yml bench job at OLED_BENCH_SLACK=2 on the shared runner; TB1"
+    },
+    {
+      "id": "tasks.snapshot_p95_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 2000,
+      "note": "SP-T1 full mode, live 4.2"
+    },
+    {
+      "id": "tasks.sampler_tick_p95_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 2400,
+      "note": "sampler thread tick including the PathSampler, live 4.3"
+    },
+    {
+      "id": "tasks.path_first_us",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "us",
+      "gate": "max",
+      "value": 20000,
+      "note": "PathSampler's first tick at about 300 processes, live 4.3; inside the 100 ms first frame, SPEC-tasks 5.5.8"
+    },
+    {
+      "id": "tasks.sampler_hidden_iterations",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "count",
+      "gate": "max",
+      "value": 0,
+      "note": "60 s hidden, live 4.3"
+    },
+    {
+      "id": "private.dock_t0_delta",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 209715,
+      "note": "T0: hidden-dock floor against the pre-T0 build, live 4.4"
+    },
+    {
       "id": "bench.launcher_query_ratio",
       "where": "CI",
       "status": "pending",
@@ -419,6 +626,24 @@
       "gate": "max",
       "value": 0,
       "note": "launcher_ns / reference_ns x 100, windows-latest, release, same process; calibrated in LC-3"
+    },
+    {
+      "id": "private.dock_agent",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 12582912,
+      "note": "OWNER-LIVE L-AG: the medium agent while alive"
+    },
+    {
+      "id": "private.dock_suite_sync",
+      "where": "OWNER",
+      "status": "pending",
+      "unit": "bytes",
+      "gate": "max",
+      "value": 16777216,
+      "note": "OWNER-LIVE L-U1: the --suite-sync child's peak"
     }
   ]
 }

@@ -1,0 +1,82 @@
+name: Fuzz nightly
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_minutes:
+        description: "Minutes of cargo-fuzz per admin frame target (cargo-fuzz-admin job); T9's release gate runs 60"
+        type: string
+        default: "10"
+
+permissions:
+  contents: read
+
+env:
+  # The same pinned toolchain as ci.yml and release.yml: keep the three equal.
+  RUST_TOOLCHAIN: 1.93.1
+
+jobs:
+  fuzz:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      - name: Fuzz targets (1,000,000 inputs each)
+        env:
+          DOCK_NO_MANIFEST: "1"
+        run: cargo test --release --locked --workspace -- --ignored fuzz_
+
+  # Coverage-guided fuzz of the tasks-admin frames (P1-tasks-engine TA1b): one cargo-fuzz target per frame type in
+  # crates/oled-trust/fuzz (its own workspace and lock), seeded from fuzz/corpus. 10 minutes per target every night;
+  # T9's release gate dispatches this workflow with fuzz_minutes = 60. No sanitizer: oled-trust forbids unsafe code.
+  # A toolchain or cargo-fuzz bump is a one-line change of the env below.
+  # On Windows a panic aborts through a fast fail that libFuzzer cannot catch, so it writes no crash file: the failing
+  # input is in the job log (every harness assertion prints it in hex), not in the artifacts.
+  cargo-fuzz-admin:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-11-20
+      CARGO_FUZZ_VERSION: 0.13.2
+      FUZZ_MINUTES: ${{ inputs.fuzz_minutes || '10' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Nightly toolchain
+        run: |
+          rustup toolchain install ${{ env.FUZZ_TOOLCHAIN }} --profile minimal
+          rustc +${{ env.FUZZ_TOOLCHAIN }} -vV
+
+      - name: cargo-fuzz
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --version ${{ env.CARGO_FUZZ_VERSION }} --locked
+
+      - name: Fuzz admin_request and admin_reply
+        shell: pwsh
+        working-directory: crates/oled-trust
+        run: |
+          $seconds = [int]$env:FUZZ_MINUTES * 60
+          foreach ($target in 'admin_request', 'admin_reply') {
+            cargo "+$env:FUZZ_TOOLCHAIN" fuzz run $target -s none "fuzz/corpus/$target" -- "-max_total_time=$seconds" -rss_limit_mb=512
+            if ($LASTEXITCODE -ne 0) { throw "cargo fuzz run $target failed ($LASTEXITCODE)" }
+          }
+
+      - name: The build used the committed lock
+        working-directory: crates/oled-trust
+        run: git diff --exit-code fuzz/Cargo.lock
+
+      - name: Crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-fuzz-admin-artifacts
+          path: crates/oled-trust/fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

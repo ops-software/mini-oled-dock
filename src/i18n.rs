@@ -1,8 +1,8 @@
 //! UI language of the whole dock: English or Italian, chosen in Settings (`config.language`).
 //!
 //! `"auto"` (the default) follows the Windows display language: Italian when it is Italian, English
-//! otherwise. Every visible string is a pair of `&'static str` compiled into the binary and picked by
-//! `tr(en, it)`: no table, no allocation, no file; the only state is one byte. `apply` is called by
+//! otherwise. Every visible string is a key (`t(k::KEY)`) into the generated tables compiled into the binary from
+//! strings/en.toml and strings/it.toml: no allocation, no file; the only state is one byte. `apply` is called by
 //! `config::set`, so every way the config changes (start, Settings, hand edit) switches the language;
 //! the bar is rebuilt and every popup reads the labels again when it is (re)built.
 //!
@@ -10,46 +10,24 @@
 //! `"auto"`, `en-US` / `it-IT` when a language is chosen, so names follow the dock language too.
 //! Preview mode (`--preview`) is always English.
 
-use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
-
-use windows::core::{w, PCWSTR};
-use windows::Win32::Globalization::GetUserDefaultUILanguage;
+use oled_sys::i18n::Lang;
 
 use crate::config::Language;
 
-/// `PRIMARYLANGID` of Italian (`LANG_ITALIAN`; its feature module is not enabled for one constant).
-const LANG_ITALIAN: u16 = 0x10;
+pub use oled_sys::i18n::{locale, set_preview};
 
-/// Bit 0: Italian. Bit 1: chosen explicitly (not `auto`). Bit 2: preview mode (English, `en-US`).
-static STATE: AtomicU8 = AtomicU8::new(0);
-const IT: u8 = 1;
-const EXPLICIT: u8 = 2;
-const PREVIEW: u8 = 4;
-
-/// True when the user's Windows UI language is Italian (`PRIMARYLANGID == LANG_ITALIAN`).
-fn windows_is_italian() -> bool {
-    // SAFETY: no arguments, no preconditions; returns a LANGID.
-    let langid = unsafe { GetUserDefaultUILanguage() };
-    langid & 0x3ff == LANG_ITALIAN
+/// The runtime's name for a config language.
+fn lang_of(l: Language) -> Lang {
+    match l {
+        Language::Auto => Lang::Auto,
+        Language::En => Lang::En,
+        Language::It => Lang::It,
+    }
 }
 
 /// Sets the language from the config value (called by `config::set`).
 pub fn apply(lang: Language) {
-    let bits = match lang {
-        Language::Auto => u8::from(windows_is_italian()) * IT,
-        Language::En => EXPLICIT,
-        Language::It => EXPLICIT | IT,
-    };
-    STATE.store(bits | (STATE.load(Relaxed) & PREVIEW), Relaxed);
-}
-
-/// Preview mode (`--preview`): English labels and `en-US` names whatever the config says.
-pub fn set_preview(on: bool) {
-    if on {
-        STATE.fetch_or(PREVIEW, Relaxed);
-    } else {
-        STATE.fetch_and(!PREVIEW, Relaxed);
-    }
+    oled_sys::i18n::apply(lang_of(lang));
 }
 
 /// True when the dock speaks Italian.
@@ -58,7 +36,7 @@ pub fn italian() -> bool {
     if let Some(on) = TEST_ITALIAN.with(std::cell::Cell::get) {
         return on;
     }
-    italian_in(STATE.load(Relaxed))
+    oled_sys::i18n::italian()
 }
 
 #[cfg(test)]
@@ -81,13 +59,20 @@ pub fn with_italian<R>(on: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-fn italian_in(s: u8) -> bool {
-    s & PREVIEW == 0 && s & IT != 0
+/// The generated string tables of the dock (strings/en.toml and it.toml).
+pub mod strings {
+    include!(concat!(env!("OUT_DIR"), "/strings.rs"));
+}
+pub use strings::k;
+
+/// The text of a key in the dock language.
+pub fn t(key: oled_sys::i18n::S) -> &'static str {
+    strings::TABLE.get(key, italian())
 }
 
-/// The string in the dock language.
+/// The string in the dock language, for the two launcher data tables whose texts are identity and search data.
 #[inline]
-pub fn tr(en: &'static str, it: &'static str) -> &'static str {
+pub fn pick(en: &'static str, it: &'static str) -> &'static str {
     if italian() {
         it
     } else {
@@ -95,50 +80,43 @@ pub fn tr(en: &'static str, it: &'static str) -> &'static str {
     }
 }
 
-/// Locale name for the NLS calls (time, date, day and month names): NULL = the user locale
-/// (language `auto`), `en-US` / `it-IT` for a chosen language, `en-US` in preview mode.
-pub fn locale() -> PCWSTR {
-    locale_in(STATE.load(Relaxed))
-}
-
-fn locale_in(s: u8) -> PCWSTR {
-    if s & PREVIEW != 0 {
-        w!("en-US")
-    } else if s & EXPLICIT == 0 {
-        PCWSTR::null()
-    } else if s & IT != 0 {
-        w!("it-IT")
-    } else {
-        w!("en-US")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Pure functions on a state value: the global byte is never touched, so tests running in
-    // parallel keep seeing English.
-    fn name(p: PCWSTR) -> String {
-        if p.is_null() {
-            String::new()
-        } else {
-            // SAFETY: the non-null values are the nul-terminated `w!` literals above.
-            unsafe { p.to_string() }.unwrap_or_default()
+    #[test]
+    fn lang_of_maps_every_variant() {
+        // No wildcard: a new Language variant fails to compile here.
+        for l in [Language::Auto, Language::En, Language::It] {
+            let want = match l {
+                Language::Auto => Lang::Auto,
+                Language::En => Lang::En,
+                Language::It => Lang::It,
+            };
+            assert_eq!(lang_of(l), want);
         }
     }
 
+    /// Release-build cost of one `t()`: 1,000,000 lookups cycling over every key, prints ns per lookup (budget: at most 60).
+    /// `cargo test --release --bin dock t_lookup_cost -- --ignored --nocapture`
     #[test]
-    fn states() {
-        assert!(!italian_in(0));
-        assert!(italian_in(IT));
-        assert!(italian_in(EXPLICIT | IT));
-        assert!(!italian_in(EXPLICIT | IT | PREVIEW));
-        assert_eq!(name(locale_in(0)), "");
-        assert_eq!(name(locale_in(IT)), "");
-        assert_eq!(name(locale_in(EXPLICIT)), "en-US");
-        assert_eq!(name(locale_in(EXPLICIT | IT)), "it-IT");
-        assert_eq!(name(locale_in(EXPLICIT | IT | PREVIEW)), "en-US");
-        assert_eq!(name(locale_in(PREVIEW)), "en-US");
+    #[ignore = "a bench: run it on a release build"]
+    fn t_lookup_cost() {
+        let hashes = strings::TABLE.hashes;
+        assert!(!hashes.is_empty());
+        let start = std::time::Instant::now();
+        let mut bytes = 0usize;
+        for i in 0..1_000_000usize {
+            bytes += t(oled_sys::i18n::S(hashes[i % hashes.len()])).len();
+        }
+        let ns = start.elapsed().as_nanos() as f64 / 1_000_000.0;
+        println!("t_lookup_cost: {ns:.1} ns per lookup over {} keys ({bytes} bytes)", hashes.len());
+        assert!(bytes > 0);
+    }
+
+    #[test]
+    fn the_override_steers_italian() {
+        with_italian(true, || assert!(italian()));
+        with_italian(false, || assert!(!italian()));
     }
 }

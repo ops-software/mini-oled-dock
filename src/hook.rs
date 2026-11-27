@@ -18,6 +18,42 @@
 //!  * Stuck state (release lost on the secure desktop): if more than REPEAT_WINDOW_MS
 //!    have passed since the last Win event, the first other key does NOT inject anything.
 //!
+//! Dock chord rules (SPEC-dock 5.2.2), only while the UI has set owned rows (`set_dock_chords`); without any row the
+//! Win rules above are unchanged:
+//!  * A chord key (a top-row digit, T or B) pressed while Win is held with exactly its row's modifiers (none, Shift or
+//!    Alt; `resolve_chord`) is swallowed and WM_DOCK_CHORD posted with the next sequence and kb.time. Its auto-repeat
+//!    and its release are swallowed too, Win held or not, until its own up (or 1.5 s without an event of it), so a
+//!    digit held after Win's release never types. Not while the dock window does not exist, and not when the UI left
+//!    a post unacknowledged for CHORD_ACK_TIMEOUT_MS (failed open: Windows gets the chord as in 1.5.2, and a Sync post
+//!    lets a live UI acknowledge again).
+//!  * A modifier pressed while Win is held passes alone and Win stays pending; the menu-mask key follows a Shift or
+//!    Alt chord's post and precedes an Alt up Windows would read as a lone tap.
+//!  * The Win up, in order: after an injected pair it passes (Windows saw the injected Win down); during Peek, or for
+//!    a press that owned a chord or passed a modifier, it is swallowed and toggles nothing (with Alt still down after
+//!    a passed modifier, the menu-mask key follows, so the Alt release opens no menu bar); otherwise the tap as above.
+//!    A Win up during Peek also posts WM_DOCK_PEEK(0).
+//!  * A key-down that went by the hook unseen (a reinstall, a time-out) leaves Windows holding a Win the hook believes
+//!    it swallowed. At that press's up, with no pair injected, the callback reads the key's async state (the state from
+//!    before this event); the watchdog's tick notes it too (`note_leak`, one line per press). Either way the up passes
+//!    behind the menu-mask key (no Start menu) and the press ends with no tap; a Peek on ends. A press that owned a chord or passed a modifier has no
+//!    auto-repeat once another key went down: the keys it keeps (the chord key and its auto-repeat, the modifier and
+//!    its auto-repeat) renew its time while each comes within REPEAT_WINDOW_MS of it, since the hook saw no gap. Past
+//!    REPEAT_WINDOW_MS of silence only a chord key it owns or a modifier it passes keeps it (up to LONE_STUCK_MS); any
+//!    other key takes the stale rule, so no pair is injected after a release lost on the secure desktop.
+//!  * Peek (PEEK and DIGITS owned, no fullscreen window in front): a fresh Win down arms a thread timer of this
+//!    thread; PEEK_MS later, with Win still held alone (no pair, chord or modifier), WM_DOCK_PEEK(1) is posted. The Win
+//!    up, an injected pair or the repair ends it (WM_DOCK_PEEK(0)); every Win up kills the timer.
+//!  * The modifiers are the hook's own (`ModTrack`, below), tracked while the launcher chord or any row is set.
+//!  * A cut-off (`cut_off`: a desktop switch, a lock or unlock, suspend or resume, a remote client leaving the front, a
+//!    window above the dock such as the UAC prompt coming to the front or leaving it, a reinstall that finds the hook
+//!    removed) forgets the Win press and the tracked modifiers while a row is owned, so a release that went by unseen
+//!    turns no digit, T or B typed next into a chord and no stale Shift or Alt picks a row.
+//!  * A stall is a cut-off too, noticed while a row is owned: the callback notes a return more than STALL_MS after its
+//!    entry or a key it admits reaching it more than STALL_MS after its time stamp (`stall_check`, with atomics and a
+//!    thread message, never acting on it); while a press that owned a chord or passed a modifier is held, a heartbeat
+//!    timer of the hook thread notes a tick more than STALL_MS late (`heartbeat`). The hook thread then runs the
+//!    cut-off and reinstalls the hook at once (`stalled`): the keys that waited, a release among them, went by unseen.
+//!
 //! Launcher chord rules (SPEC-launcher 5.5.4), only while the UI has set a chord (`set_launcher_chord`); without
 //! one the callback loads one atomic and behaves as above:
 //!  * Modifiers come from the hook's own events (Alt, Ctrl, Shift per side; Win from the Win state above). One with
@@ -50,30 +86,32 @@
 
 use std::cell::Cell;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    PostThreadMessageW, SetCoalescableTimer, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
+    EVENT_SYSTEM_DESKTOPSWITCH, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, PM_NOREMOVE,
+    PM_QS_SENDMESSAGE, TIMERV_NO_COALESCING, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_KEYDOWN, WM_KEYUP,
+    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
 };
 
 use crate::msg::{
-    WM_DOCK_DIAG, WM_DOCK_LAUNCHER, WM_DOCK_LAUNCHER_PASSED, WM_DOCK_LAUNCHER_YIELDED, WM_DOCK_START_MENU,
-    WM_DOCK_TOGGLE, WM_DOCK_WINKEY,
+    WM_DOCK_CHORD, WM_DOCK_DIAG, WM_DOCK_LAUNCHER, WM_DOCK_LAUNCHER_PASSED, WM_DOCK_LAUNCHER_YIELDED, WM_DOCK_PEEK,
+    WM_DOCK_START_MENU, WM_DOCK_TOGGLE, WM_DOCK_WINKEY,
 };
 use crate::{hwnd, log};
 
@@ -83,6 +121,9 @@ pub const EV_ALONE: usize = 1;
 pub const EV_COMBO: usize = 2;
 pub const EV_SENDFAIL: usize = 3;
 pub const EV_DOUBLE: usize = 4;
+/// The release of a tracked Win press that Windows held down (a key-down of it went by the hook unseen): it passed
+/// behind the menu-mask key and toggled nothing (`win_up_plan`).
+pub const EV_LEAK: usize = 5;
 
 /// Marker in dwExtraInfo of the events we inject ("DOCK").
 pub const INJECT_TAG: usize = 0x4B43_4F44;
@@ -100,17 +141,41 @@ pub const DOUBLE_TAP_MS: u32 = 300;
 const REINSTALL_MS: u32 = 2000;
 /// `WM_HOOK_NOTE` from any thread (`note_activity`): activity the UI thread saw, which arms the reinstall tick.
 const NOTE_ACTIVITY: usize = 4;
+/// Windows' low-level hook time-out (ms) when LowLevelHooksTimeout is not set (Windows 11 passes each key of a stalled
+/// callback on after about 0.3 s): a key the callback has not answered by then goes on without the hook.
+const HOOK_TIMEOUT_MS: u32 = 300;
+/// One step (ms) of the tick count: GetTickCount moves with the system timer (15.6 ms by default), so a gap measured
+/// on it can read up to one step short of the time that passed.
+const TICK_STEP_MS: u32 = 16;
+/// A stall (ms): the hook thread did not serve the keyboard in time (`stall_check`, `heartbeat`). 50 ms (three steps
+/// of the tick count) below HOOK_TIMEOUT_MS, so every key whose answer Windows gave up on shows as a stall, and
+/// thousands of times a callback's usual cost (tens of microseconds).
+const STALL_MS: u32 = 250;
+/// Period (ms) of the heartbeat (`heartbeat`). With STALL_MS and one step of the tick count it stays below
+/// HOOK_TIMEOUT_MS, so a pause of the hook thread long enough for Windows to give up on a key, even when the tick
+/// count reads it one step short, makes the next tick more than STALL_MS late whatever its phase; about 32 wake-ups a
+/// second, only while a press that owned a chord or passed a modifier is held.
+const HEARTBEAT_MS: u32 = 30;
+const _: () = assert!(HEARTBEAT_MS + STALL_MS + TICK_STEP_MS < HOOK_TIMEOUT_MS);
 
 /// Thread id of the running hook thread (0 = none): `note_activity` posts to it.
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
 /// A failed SetTimer of the reinstall tick is logged once per process.
 static TICK_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
+/// A stall note of the callback (`note_stall`) waits in the hook thread's queue.
+static STALL_NOTED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     // Hook thread only: the LL callback runs on it, inside its GetMessageW, so nothing else reads or writes these.
     static TICK: Cell<Tick> = const { Cell::new(Tick { armed: false, active: false }) };
     /// Id of the armed reinstall tick (a thread timer of the hook thread), 0 = none.
     static TICK_ID: Cell<usize> = const { Cell::new(0) };
+    /// The armed Peek timer (a thread timer of the hook thread) and the press it was armed for (`WinState::press`);
+    /// id 0 = none. It exists only between a Win down and its release.
+    static PEEK_TIMER: Cell<(usize, u32)> = const { Cell::new((0, 0)) };
+    /// The heartbeat (a thread timer of the hook thread, `heartbeat`) and the tick count of its arming or of its last
+    /// tick; id 0 = none. It exists only while `heartbeat_due`.
+    static HEARTBEAT: Cell<(usize, u32)> = const { Cell::new((0, 0)) };
 }
 
 /// The reinstall tick: armed by the first activity (a key reaching the hook, or a note from the UI), it ticks every
@@ -180,6 +245,9 @@ pub fn start() -> Result<HookThread, String> {
     MASK_KEY.store(crate::launcher_probe::mask_key(), Relaxed);
     #[cfg(feature = "owner-probe")]
     ACCEPT_INJECTED.store(crate::launcher_probe::accept_injected(), Relaxed);
+    // The stall switch of live check K-3, read here so the callback never reads the environment.
+    #[cfg(feature = "owner-probe")]
+    let _ = crate::launcher_probe::hook_stall_ms();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let join = std::thread::Builder::new()
@@ -220,13 +288,62 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
             return;
         }
     }
+    // A desktop switch (a UAC prompt, Ctrl+Alt+Del, the lock screen) takes the keyboard from this hook: the event's
+    // callback runs on this thread's loop, out of context, and forgets what the keys of the other desktop may have ended.
+    // SAFETY: `desktop_switched` is a 'static WINEVENTPROC; out of context no module is needed; this thread pumps
+    // (GetMessageW below), as out-of-context delivery requires.
+    let desk = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            None,
+            Some(desktop_switched),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    if desk.is_invalid() {
+        log!("hook: desktop switches not watched: {}", windows::core::Error::from_thread());
+    }
     loop {
         // SAFETY: `msg` is valid and writable; filter None = all messages of the thread.
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if r.0 <= 0 {
             break; // WM_QUIT (0) or error (-1)
         }
-        probe!(crate::probe::thread_msg(crate::probe::Th::Hook, &msg));
+        let peek = PEEK_TIMER.with(Cell::get);
+        let peek_tick = msg.message == WM_TIMER && msg.hwnd.0.is_null() && peek.0 != 0 && msg.wParam.0 == peek.0;
+        let beat = HEARTBEAT.with(Cell::get);
+        let beat_tick = msg.message == WM_TIMER && msg.hwnd.0.is_null() && beat.0 != 0 && msg.wParam.0 == beat.0;
+        probe!({
+            // The Peek timer's and the heartbeat's ids change at each arming: each is counted under one fixed id
+            // (`is_peek_timer`, `is_heartbeat_timer`).
+            let mut m = msg;
+            if peek_tick {
+                m.wParam = WPARAM(PEEK_PROBE_ID);
+            }
+            if beat_tick {
+                m.wParam = WPARAM(HEARTBEAT_PROBE_ID);
+            }
+            crate::probe::thread_msg(crate::probe::Th::Hook, &m)
+        });
+        if peek_tick {
+            kill_peek_timer();
+            peek_fired(peek.1);
+            continue;
+        }
+        if beat_tick {
+            // A late tick: the thread did not run for more than STALL_MS; the heartbeat then ends unless still due.
+            // SAFETY: GetTickCount has no preconditions.
+            let now = unsafe { GetTickCount() };
+            HEARTBEAT.with(|b| b.set((beat.0, now)));
+            if beat_late(beat.1, now) {
+                stalled(CutOff::LateHeartbeat);
+            }
+            heartbeat(heartbeat_due(&load_win_state()));
+            continue;
+        }
         let tick_id = TICK_ID.with(Cell::get);
         if msg.message == WM_TIMER && msg.hwnd.0.is_null() && tick_id != 0 && msg.wParam.0 == tick_id {
             reinstall();
@@ -247,6 +364,17 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
                 log!(
                     "hook: launcher chord failed open (seq {seq}): the UI thread did not acknowledge for {ACK_TIMEOUT_MS} ms"
                 );
+            } else if msg.wParam.0 == NOTE_PEEK_TIMER_FAIL {
+                log!("hook: Peek timer not armed (SetTimer failed): Peek is skipped");
+            } else if msg.wParam.0 == NOTE_CUT_OFF {
+                if let Some(why) = CutOff::from_code(msg.lParam.0) {
+                    cut_off_now(why);
+                }
+            } else if msg.wParam.0 == NOTE_STALL {
+                STALL_NOTED.store(false, Relaxed);
+                if let Some(why) = CutOff::from_code(msg.lParam.0) {
+                    stalled(why);
+                }
             }
             continue;
         }
@@ -255,6 +383,10 @@ fn thread_main(ready: Sender<Result<u32, String>>, done: Sender<()>) {
         unsafe { DispatchMessageW(&msg) };
     }
     HOOK_TID.store(0, Relaxed);
+    if !desk.is_invalid() {
+        // SAFETY: the handle SetWinEventHook returned on this thread, removed once.
+        let _ = unsafe { UnhookWinEvent(desk) };
+    }
     uninstall();
     let _ = done.send(());
 }
@@ -269,6 +401,110 @@ pub fn note_activity() {
     }
     // SAFETY: PostThreadMessageW is thread-safe; if the thread has already ended it merely fails.
     let _ = unsafe { PostThreadMessageW(tid, WM_HOOK_NOTE, WPARAM(NOTE_ACTIVITY), LPARAM(0)) };
+}
+
+/// Positive evidence that keys went by the hook unseen, a release among them (`cut_off`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutOff {
+    /// Another desktop had the keyboard: a UAC prompt, Ctrl+Alt+Del, the lock screen (EVENT_SYSTEM_DESKTOPSWITCH).
+    DesktopSwitch,
+    /// The session was locked, unlocked, disconnected or connected (WM_WTSSESSION_CHANGE).
+    Session,
+    /// Suspend or resume (WM_POWERBROADCAST).
+    Power,
+    /// A remote-desktop or VM client left the front: while it was there its own hook could take keys before ours.
+    RemoteClient,
+    /// The reinstall found the hook already removed by Windows (a callback overran LowLevelHooksTimeout).
+    HookRemoved,
+    /// A window above the dock came to the front or left it: the UAC prompt shown without the secure desktop, or a
+    /// process the dock may not look at. The keys typed while it is in front never reach this hook.
+    WindowAbove,
+    /// A callback returned more than STALL_MS after its entry (`stall_check`): Windows passed on the keys that waited.
+    SlowCallback,
+    /// A key reached the callback more than STALL_MS after its time stamp (`stall_check`): the hook thread was not
+    /// serving the keyboard, and the keys before it may have gone on without the hook.
+    LateKey,
+    /// The heartbeat of a held press ticked more than STALL_MS late (`heartbeat`): the hook thread was not running.
+    LateHeartbeat,
+}
+
+impl CutOff {
+    const ALL: [CutOff; 9] = [
+        CutOff::DesktopSwitch,
+        CutOff::Session,
+        CutOff::Power,
+        CutOff::RemoteClient,
+        CutOff::HookRemoved,
+        CutOff::WindowAbove,
+        CutOff::SlowCallback,
+        CutOff::LateKey,
+        CutOff::LateHeartbeat,
+    ];
+
+    /// The lParam of `NOTE_CUT_OFF` back to its `CutOff` (the index in `ALL`).
+    fn from_code(code: isize) -> Option<CutOff> {
+        usize::try_from(code).ok().and_then(|i| CutOff::ALL.get(i)).copied()
+    }
+}
+
+/// Any thread, on positive evidence that keys went by the hook unseen (`CutOff`): the hook thread forgets its Win press
+/// and the tracked modifiers (`cut_off_now`). A no-op while no hook thread runs; a failed post is harmless.
+pub fn cut_off(why: CutOff) {
+    let tid = HOOK_TID.load(Relaxed);
+    if tid == 0 {
+        return;
+    }
+    // SAFETY: PostThreadMessageW is thread-safe; if the thread has already ended it merely fails.
+    let _ = unsafe { PostThreadMessageW(tid, WM_HOOK_NOTE, WPARAM(NOTE_CUT_OFF), LPARAM(why as isize)) };
+}
+
+/// Hook thread: a cut-off (`CutOff`) on the Win statics. While a row is owned, or the press is one of the dock's, the
+/// press is forgotten (`forget_after_cut_off`, its Peek ended) and so are the tracked modifiers (`reset_modifiers`):
+/// a lost Win release must not turn the digits, T and B typed next into chords, nor a lost Shift or Alt pick the wrong
+/// row. Without rows the 1.5.2 Win branch keeps its own stale rule and nothing changes.
+fn cut_off_now(why: CutOff) {
+    let rows = DockChords(DOCK_CHORDS.load(Acquire));
+    let mut s = load_win_state();
+    let held = s.down;
+    let Some(peek_end) = forget_after_cut_off(&mut s, rows) else { return };
+    store_win_state(&s);
+    kill_peek_timer();
+    kill_heartbeat();
+    if peek_end {
+        // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
+        post_peek(false, unsafe { GetTickCount() });
+    }
+    reset_modifiers();
+    if held {
+        log!("hook: input cut off ({why:?}): the Win press and the modifiers are forgotten");
+    }
+}
+
+/// EVENT_SYSTEM_DESKTOPSWITCH, on the hook thread's loop (out of context): the keys of the other desktop never reached
+/// this hook.
+unsafe extern "system" fn desktop_switched(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    cut_off_now(CutOff::DesktopSwitch);
+}
+
+/// Hook thread, on stall evidence (the callback's `note_stall`, a late tick of the heartbeat): the cut-off, then the
+/// hook reinstalled at once rather than at the next tick (Windows may have removed it for the overrun), so a fresh Win
+/// press is seen at once; one line when it is back.
+fn stalled(why: CutOff) {
+    cut_off_now(why);
+    let old = HOOK_RAW.load(Relaxed);
+    reinstall();
+    let new = HOOK_RAW.load(Relaxed);
+    if new != 0 && new != old {
+        log!("hook: reinstalled after a stall ({why:?})");
+    }
 }
 
 /// Activity on the hook thread (a key reaching the callback, or `NOTE_ACTIVITY`): marks the current tick period active
@@ -310,7 +546,11 @@ enum Repair {
 }
 
 /// What the watchdog does given the tracked `WIN_DOWN`, the async state of the Win keys, `WIN_OTHER` and
-/// the age (ms) of the last Win event (auto-repeat included).
+/// the age (ms) of the last Win event (auto-repeat included, or a key the press kept, `renew`).
+/// A Win key the async state reads down is held for Windows (an injected pair): the hook is not touched in the middle
+/// of that combination. A press only the hook tracks (its Win-down swallowed) keeps its state and the hook is
+/// reinstalled: a callback stall during it (Windows removed the hook, so its release never came) has the hook back at
+/// the next tick, not `LONE_STUCK_MS` later.
 /// The async state alone is not trusted: a Win-down our hook swallowed never reaches it, so a Win held
 /// alone reads as "up". A press unseen by the async state and older than `REPEAT_WINDOW_MS` is cleared
 /// only if a chord was injected (Win+L) or it is older than `LONE_STUCK_MS`: a lone Win can be held
@@ -319,21 +559,26 @@ fn repair_plan(win_down: bool, lwin_pressed: bool, rwin_pressed: bool, win_other
     if !win_down {
         return Repair::Go;
     }
+    if lwin_pressed || rwin_pressed {
+        return Repair::Skip;
+    }
     let over = age_ms > REPEAT_WINDOW_MS && (win_other || age_ms > LONE_STUCK_MS);
-    if lwin_pressed || rwin_pressed || !over {
-        Repair::Skip
-    } else {
+    if over {
         Repair::ClearThenGo
+    } else {
+        Repair::Go
     }
 }
 
 /// Watchdog (run on the hook thread): Windows silently removes an LL hook that exceeds
 /// LowLevelHooksTimeout several times. We ALWAYS reinstall (first the new one, then remove the
-/// old one: no instant without a hook). The Win state is in a static, so it survives. It is
-/// skipped while Win is held, so as not to touch the hook in the middle of a combination. "Held" is
-/// judged from the async key state AND the age of the last Win event, because a Win-down our hook
-/// swallowed never reaches the async state. If `WIN_DOWN` is set, no Win key is down and the press
-/// is over (Win+L: the release went to the secure desktop; see `repair_plan`), the state is cleared first.
+/// old one: no instant without a hook), and the old one answers the keys already sent to it before it goes
+/// (`answer_sent_keys`). The Win state is in a static, so it survives; between the two calls only that answer pumps
+/// on this thread. It is skipped while the async state reads a tracked Win key down (Windows holds the
+/// injected Win down), so as not to touch the hook in the middle of that combination; a press only the hook tracks
+/// is kept across the reinstall. If `WIN_DOWN` is set, no Win key is down and the press
+/// is over (Win+L: the release went to the secure desktop; see `repair_plan`), the state is cleared first. A Win key
+/// Windows holds for a press the hook swallowed is noted on the press first (`note_leak`).
 fn reinstall() {
     if HOOK_RAW.load(Relaxed) == 0 {
         return;
@@ -342,13 +587,29 @@ fn reinstall() {
     let (l, r) = unsafe { (GetAsyncKeyState(VK_LWIN.0 as i32) < 0, GetAsyncKeyState(VK_RWIN.0 as i32) < 0) };
     // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
     let age = unsafe { GetTickCount() }.wrapping_sub(WIN_LAST_TIME.load(Relaxed));
+    // Windows holds the Win key of a press the hook swallowed (`note_leak`): the press notes it, so its release passes
+    // (`win_up_plan`), with one line per press. Load, note and store with no pump in between: the callback, which runs
+    // only inside this thread's pumps, cannot interleave.
+    let mut press = load_win_state();
+    if note_leak(&mut press, l, r) {
+        store_win_state(&press);
+        log!(
+            "hook watchdog: Windows holds Win (vk {:#x}) of a press the hook swallowed, with no pair injected: a key-down went by unseen",
+            press.vk
+        );
+    }
     match repair_plan(WIN_DOWN.load(Relaxed), l, r, WIN_OTHER.load(Relaxed), age) {
         Repair::Skip => return,
         Repair::ClearThenGo => {
-            WIN_DOWN.store(false, Relaxed);
-            WIN_OTHER.store(false, Relaxed);
-            WIN_DOUBLE.store(false, Relaxed);
-            LAST_ALONE_UP.store(0, Relaxed);
+            let mut s = load_win_state();
+            let peek_end = clear_for_repair(&mut s);
+            store_win_state(&s);
+            kill_peek_timer();
+            kill_heartbeat();
+            if peek_end {
+                // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
+                post_peek(false, unsafe { GetTickCount() });
+            }
             log!("hook watchdog: stale Win state cleared");
         }
         Repair::Go => {}
@@ -356,12 +617,44 @@ fn reinstall() {
     match set_hook() {
         Ok(new) => {
             let old = HOOK_RAW.swap(new, Relaxed);
+            answer_sent_keys();
             // SAFETY: `old` is an HHOOK of ours; if Windows had already removed it, this fails
             // with no effect and the error is intended (it is the case the watchdog covers).
-            let _ = unsafe { UnhookWindowsHookEx(HHOOK(old as *mut _)) };
+            if unsafe { UnhookWindowsHookEx(HHOOK(old as *mut _)) }.is_err() {
+                // Removed by Windows: keys went by unseen until now, a Win or modifier release among them.
+                cut_off_now(CutOff::HookRemoved);
+            }
+            // Owner-probe builds: one line per reinstall, so a live check matches a key to a reinstall.
+            #[cfg(feature = "owner-probe")]
+            reinstalled_line();
         }
         Err(e) => log!("hook watchdog: reinstall failed: {e}"),
     }
+}
+
+/// `reinstall`, between the new hook's install and the old hook's removal: a key Windows handed to the old hook before
+/// the install waits in this thread's queue as a sent call, which the old hook answers here while it is installed.
+/// Removed first, it would never answer, and Windows would pass the key on unseen (a Win auto-repeat of a press the
+/// hook swallows: Windows then holds a Win whose release the hook swallows too). Every later key goes to the new hook;
+/// one that comes during this call and passes reaches the old hook too (CallNextHookEx), whose second look passes it
+/// again and changes nothing (`a_passed_key_seen_twice_changes_nothing_more`). Only the calls sent to this thread run
+/// here: no posted message and no timer (this thread's timers have no callback, the loop alone handles them), so no
+/// note, tick, heartbeat or Peek timer runs inside it. A key a foreign hook above ours hands on to the old hook after
+/// this call is still lost; the release rule (`win_up_plan`) covers that and a time-out alike.
+fn answer_sent_keys() {
+    let mut msg = MSG::default();
+    // SAFETY: `msg` is valid and writable. PM_QS_SENDMESSAGE handles the sent calls only, and PM_NOREMOVE leaves any
+    // posted message for the loop.
+    let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE) };
+}
+
+/// Owner-probe builds, after each reinstall: one line with the tick count (kb.time's clock), so a live check matches a
+/// key to a reinstall. Release builds have none: the reinstall runs every 2 s while keys come.
+#[cfg(feature = "owner-probe")]
+fn reinstalled_line() {
+    // SAFETY: GetTickCount has no preconditions.
+    let tick = unsafe { GetTickCount() };
+    log!("hook: reinstalled at tick {tick}");
 }
 
 fn uninstall() {
@@ -381,6 +674,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
     #[cfg(feature = "owner-probe")]
     let started = std::time::Instant::now();
     if code == HC_ACTION as i32 {
+        // The stall evidence's entry time, only while a row is owned (`stall_watch`).
+        let entered = stall_watch();
         // First, before `handle_key` (which returns at once for injected keys): any key keeps the reinstall tick going.
         activity();
         // SAFETY: for HC_ACTION in a WH_KEYBOARD_LL hook, lparam points to a
@@ -393,6 +688,9 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) ->
         diag(wp.0 as u32, kb, swallowed);
         #[cfg(feature = "owner-probe")]
         crate::launcher_probe::record_hook_us(started.elapsed());
+        if let Some(entered) = entered {
+            stall_check(entered, kb);
+        }
         if swallowed {
             return LRESULT(1);
         }
@@ -412,81 +710,269 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         return false;
     }
     let vk = kb.vkCode;
-    if LAUNCHER_CHORD.load(Acquire) & CHORD_SET != 0 {
-        let mods = mods_step(vk, down, kb.time);
+    let launcher = LAUNCHER_CHORD.load(Acquire) & CHORD_SET != 0;
+    let chords = DockChords(DOCK_CHORDS.load(Acquire));
+    let mods = if tracks(launcher, chords) { mods_step(vk, down, kb.time) } else { Mods::NONE };
+    if launcher {
         note_gesture(&GESTURE_TIME, kb.flags.0, kb.dwExtraInfo, vk, down, mods, kb.time);
         if let Some(swallow) = launcher_step(kb, down, mods) {
             return swallow;
         }
     }
-    let is_win = vk == u32::from(VK_LWIN.0) || vk == u32::from(VK_RWIN.0);
-
-    if is_win {
-        if down {
-            let fresh = kb.time.wrapping_sub(WIN_LAST_TIME.load(Relaxed)) > REPEAT_WINDOW_MS;
-            WIN_LAST_TIME.store(kb.time, Relaxed);
-            if WIN_DOWN.load(Relaxed) && !fresh {
-                if vk == WIN_VK.load(Relaxed) {
-                    // auto-repeat: still "pending" -> swallow; already re-injected -> let through
-                    return !WIN_OTHER.load(Relaxed);
-                }
-                // the other Win key while the first is held: it is an "other key"
-                return other_key_down(kb);
-            }
-            WIN_DOWN.store(true, Relaxed);
-            WIN_OTHER.store(false, Relaxed);
-            WIN_VK.store(vk, Relaxed);
-            let last = LAST_ALONE_UP.load(Relaxed);
-            WIN_DOUBLE.store(last != 0 && kb.time.wrapping_sub(last) <= DOUBLE_TAP_MS, Relaxed);
-            note(EV_PRESSED);
-            return true;
-        }
-        if WIN_DOWN.load(Relaxed) && vk == WIN_VK.load(Relaxed) {
-            WIN_DOWN.store(false, Relaxed);
-            if !WIN_OTHER.load(Relaxed) {
-                if WIN_DOUBLE.swap(false, Relaxed) {
-                    // Second quick tap: Start menu; the next tap starts a fresh sequence.
-                    LAST_ALONE_UP.store(0, Relaxed);
-                    note(EV_DOUBLE);
-                    post_start_menu();
-                } else {
-                    // `| 1`: a real timestamp of 0 must not read as "no previous tap".
-                    LAST_ALONE_UP.store(kb.time | 1, Relaxed);
-                    note(EV_ALONE);
-                    post_toggle();
-                }
-                return true;
-            }
-            // Win used in a combination: it does not count as the first tap of a double tap.
-            LAST_ALONE_UP.store(0, Relaxed);
-            WIN_DOUBLE.store(false, Relaxed);
-        }
-        return false;
-    }
-
-    down && other_key_down(kb)
+    win_key(kb, down, mods, chords)
 }
 
-/// Key (other than the held Win) pressed. Returns true if it must be swallowed: in that case
-/// it was re-injected inside the [WIN down, key down] pair.
-fn other_key_down(kb: &KBDLLHOOKSTRUCT) -> bool {
-    if !WIN_DOWN.load(Relaxed) || WIN_OTHER.load(Relaxed) {
-        return false;
+/// Callback: GetTickCount at its entry while a row is owned, for `stall_check`. None with no row: the callback is
+/// release 1.5.2's, and nothing is measured.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn stall_watch() -> Option<u32> {
+    if DOCK_CHORDS.load(Acquire) == DockChords::NONE.0 {
+        return None;
     }
-    if kb.time.wrapping_sub(WIN_LAST_TIME.load(Relaxed)) > REPEAT_WINDOW_MS {
-        // Win release lost (secure desktop): Win is no longer held, do not inject anything.
-        WIN_DOWN.store(false, Relaxed);
-        return false;
+    // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
+    Some(unsafe { GetTickCount() })
+}
+
+/// Callback, while a row was owned at its entry (`entered`): the stall evidence of this event, noted for the hook
+/// thread's loop (`note_stall`) and never acted on here, so no answer changes: a late return, the callback returning
+/// more than STALL_MS after its entry; a late key, one the hook admits reaching it more than STALL_MS after its time
+/// stamp (an injected key the hook ignores is no evidence, whatever its stamp).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn stall_check(entered: u32, kb: &KBDLLHOOKSTRUCT) {
+    // SAFETY: GetTickCount has no preconditions.
+    let left = unsafe { GetTickCount() };
+    if overran(entered, left) {
+        note_stall(CutOff::SlowCallback);
+    } else if accepted(kb.flags.0, kb.dwExtraInfo) && came_late(kb.time, entered) {
+        note_stall(CutOff::LateKey);
     }
-    WIN_OTHER.store(true, Relaxed);
-    if inject_win_and_key(WIN_VK.load(Relaxed), kb) {
-        note(EV_COMBO);
-        true
-    } else {
+}
+
+/// Callback: stall evidence for the hook thread's loop, which runs the cut-off once the callback has returned
+/// (`stalled`). One note waits at a time (STALL_NOTED, cleared by the loop, or at once when the post fails).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn note_stall(why: CutOff) {
+    if STALL_NOTED.swap(true, Relaxed) {
+        return;
+    }
+    // SAFETY: PostThreadMessageW is thread-safe; this thread has a message queue (thread_main's PeekMessageW).
+    let posted =
+        unsafe { PostThreadMessageW(GetCurrentThreadId(), WM_HOOK_NOTE, WPARAM(NOTE_STALL), LPARAM(why as isize)) };
+    if posted.is_err() {
+        STALL_NOTED.store(false, Relaxed);
+    }
+}
+
+/// `now` is more than `limit` ms after `then` on the tick count, which wraps; a `then` ahead of `now` is not.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn later_than(then: u32, now: u32, limit: u32) -> bool {
+    let d = now.wrapping_sub(then);
+    d > limit && d <= i32::MAX as u32
+}
+
+/// A late return: a callback entered at `entered` and returning at `left` overran STALL_MS.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn overran(entered: u32, left: u32) -> bool {
+    later_than(entered, left, STALL_MS)
+}
+
+/// A late key: one time-stamped `stamp` (`kb.time`) reached the callback at `entered` more than STALL_MS later. A
+/// stamp ahead of the tick count (an injection with a made-up time) is not late.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn came_late(stamp: u32, entered: u32) -> bool {
+    later_than(stamp, entered, STALL_MS)
+}
+
+/// A late tick: the heartbeat ticked at `now` more than HEARTBEAT_MS + STALL_MS after its last tick (or its arming)
+/// at `last`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn beat_late(last: u32, now: u32) -> bool {
+    later_than(last, now, HEARTBEAT_MS + STALL_MS)
+}
+
+/// Hook thread, from the callback or its loop: the heartbeat follows `on` (`heartbeat_due`), armed when it is not (one
+/// timer, whose time is the first tick's baseline) and killed when it is no longer due. Windows is asked not to
+/// coalesce it, so only a thread that did not run makes a tick late. A failed arming leaves the callback's own
+/// evidence, and the next key tries again.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn heartbeat(on: bool) {
+    let (id, _) = HEARTBEAT.with(Cell::get);
+    if on && id == 0 {
+        // SAFETY: a thread timer of the calling (hook) thread, no callback: its WM_TIMER reaches `thread_main`'s loop.
+        let id = unsafe { SetCoalescableTimer(None, 0, HEARTBEAT_MS, None, TIMERV_NO_COALESCING) };
+        if id != 0 {
+            // SAFETY: GetTickCount has no preconditions.
+            let now = unsafe { GetTickCount() };
+            HEARTBEAT.with(|b| b.set((id, now)));
+        }
+    } else if !on && id != 0 {
+        kill_heartbeat();
+    }
+}
+
+/// Hook thread: kills the heartbeat, if any.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn kill_heartbeat() {
+    let (id, _) = HEARTBEAT.with(|b| b.replace((0, 0)));
+    if id != 0 {
+        // SAFETY: the thread timer `heartbeat` armed on this thread; fails harmlessly if it is already gone.
+        let _ = unsafe { KillTimer(None, id) };
+    }
+}
+
+/// The Win branch on its statics: loads `WinState`, runs `win_step`, stores the state back, then does what the step
+/// asks. The state is stored before the SendInput, whose tagged events re-enter the callback and pass. `mods` are the
+/// tracked modifiers (Win is the Win state's own), `chords` the owned rows.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn win_key(kb: &KBDLLHOOKSTRUCT, down: bool, mods: Mods, chords: DockChords) -> bool {
+    let fail_open = chords != DockChords::NONE
+        && chord_fail_open(CHORD_SEQ.load(Relaxed), CHORD_ACKED.load(Acquire), CHORD_OLDEST.load(Relaxed), kb.time);
+    let ev = WinIn {
+        vk: kb.vkCode,
+        down,
+        time: kb.time,
+        mods: Mods(mods.0 & !Mods::WIN.0),
+        chords,
+        fullscreen: DOCK_FS.load(Acquire),
+        fail_open,
+        // `post` drops a post while the dock window does not exist: a chord swallowed then would be lost.
+        ui_ready: !hwnd().0.is_null(),
+    };
+    let mut s = load_win_state();
+    // SAFETY: GetAsyncKeyState has no preconditions. Inside the callback it reads the state from before this event
+    // (LowLevelKeyboardProc's documentation): down means Windows holds the key this up releases.
+    note_release(&mut s, ev, |vk| unsafe { GetAsyncKeyState(vk as i32) } < 0);
+    let out = win_step(&mut s, ev);
+    store_win_state(&s);
+    let mut swallow = out.swallow;
+    let mut event = out.note;
+    if out.act == WinAct::Inject && !inject_win_and_key(s.vk, kb) {
         // SendInput failed: better to let at least the original key through.
-        note(EV_SENDFAIL);
-        false
+        swallow = false;
+        event = Some(EV_SENDFAIL);
     }
+    if let Some(ev) = event {
+        note(ev);
+    }
+    match out.act {
+        WinAct::Toggle => post_toggle(),
+        WinAct::StartMenu => post_start_menu(),
+        WinAct::Chord(a) => post_chord(a, kb.time),
+        WinAct::None | WinAct::Inject => {}
+    }
+    if out.sync {
+        post_chord(ChordAction::Sync, kb.time);
+    }
+    if out.mask {
+        // After the post, while the modifier is still down: its release is then no lone tap (no menu bar, no IME
+        // switch). Before a passed Alt up, the same.
+        send_mask();
+    }
+    if out.peek_end {
+        post_peek(false, kb.time);
+    }
+    peek_timer(out.peek);
+    // The heartbeat follows the press while a row is owned (with none, its next tick ends one that is left).
+    if chords != DockChords::NONE {
+        heartbeat(heartbeat_due(&s));
+    }
+    // Owner-probe builds, live check K-3: the first owned chord stalls the callback here, after its post and the
+    // heartbeat (Windows times out the keys that wait; the late return is a cut-off that puts the hook back).
+    #[cfg(feature = "owner-probe")]
+    let stall = matches!(out.act, WinAct::Chord(_)).then(crate::launcher_probe::hook_stall_once).flatten();
+    #[cfg(feature = "owner-probe")]
+    if let Some(ms) = stall {
+        std::thread::sleep(Duration::from_millis(ms.into()));
+    }
+    swallow
+}
+
+/// Hook thread: the Peek timer command of a Win event. Arm: one SetTimer (a timer still armed for an earlier press,
+/// whose release was lost, is killed first); a failed SetTimer skips Peek and notes it once to the loop, which logs it.
+/// Kill: one KillTimer when a timer is armed.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn peek_timer(cmd: PeekCmd) {
+    match cmd {
+        PeekCmd::Keep => {}
+        PeekCmd::Kill => kill_peek_timer(),
+        PeekCmd::Arm(press) => {
+            kill_peek_timer();
+            // SAFETY: a thread timer of the calling (hook) thread, no callback: its WM_TIMER reaches `thread_main`'s loop.
+            let id = unsafe { SetTimer(None, 0, PEEK_MS, None) };
+            if id != 0 {
+                PEEK_TIMER.with(|t| t.set((id, press)));
+            } else if !PEEK_FAIL_NOTED.swap(true, Relaxed) {
+                // SAFETY: PostThreadMessageW is thread-safe; this thread has a message queue (thread_main's PeekMessageW).
+                let _ = unsafe {
+                    PostThreadMessageW(GetCurrentThreadId(), WM_HOOK_NOTE, WPARAM(NOTE_PEEK_TIMER_FAIL), LPARAM(0))
+                };
+            }
+        }
+    }
+}
+
+/// Hook thread: kills the armed Peek timer, if any.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn kill_peek_timer() {
+    let (id, _) = PEEK_TIMER.with(|t| t.replace((0, 0)));
+    if id != 0 {
+        // SAFETY: the thread timer `peek_timer` armed on this thread; fails harmlessly if it is already gone.
+        let _ = unsafe { KillTimer(None, id) };
+    }
+}
+
+/// Hook thread's loop, the Peek timer of `press` fired (and was killed): Peek begins when the press is still Win alone
+/// (`peek_due`), PEEK and DIGITS are still owned and the dock window exists.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn peek_fired(press: u32) {
+    let chords = DockChords(DOCK_CHORDS.load(Acquire));
+    let mut s = load_win_state();
+    let owned = chords.has(DockChords::PEEK) && chords.has(DockChords::DIGITS);
+    if owned && !hwnd().0.is_null() && peek_due(&s, press, DOCK_FS.load(Acquire)) {
+        s.peeking = true;
+        store_win_state(&s);
+        // SAFETY: GetTickCount has no preconditions. Same clock as `kb.time`.
+        post_peek(true, unsafe { GetTickCount() });
+    }
+}
+
+/// Wake-probe builds: the fixed id the hook thread's loop counts the Peek timer's WM_TIMER under (`probe::timer_name`).
+#[cfg(feature = "wake-probe")]
+const PEEK_PROBE_ID: usize = 0xFF_FFFF;
+
+/// Wake-probe builds: the hook thread's timer `id` (as the probe keys it) is the Peek timer's, not the reinstall tick's.
+#[cfg(feature = "wake-probe")]
+pub(crate) fn is_peek_timer(id: u32) -> bool {
+    id as usize == PEEK_PROBE_ID
+}
+
+/// Wake-probe builds: the fixed id the hook thread's loop counts the heartbeat's WM_TIMER under (`probe::timer_name`).
+#[cfg(feature = "wake-probe")]
+const HEARTBEAT_PROBE_ID: usize = 0xFF_FFFE;
+
+/// Wake-probe builds: the hook thread's timer `id` (as the probe keys it) is the heartbeat's.
+#[cfg(feature = "wake-probe")]
+pub(crate) fn is_heartbeat_timer(id: u32) -> bool {
+    id as usize == HEARTBEAT_PROBE_ID
+}
+
+/// Posts WM_DOCK_PEEK: Peek began (`on`) or ended; lParam = the time of the event that decided it.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn post_peek(on: bool, time: u32) {
+    probe!(crate::probe::post_by(crate::probe::Th::Hook, crate::probe::BY_KB_HOOK, WM_DOCK_PEEK));
+    post_launcher(WM_DOCK_PEEK, usize::from(on), time);
+}
+
+/// Posts WM_DOCK_CHORD with the hook's next sequence (`ack_chord` acknowledges it). The first post the UI has not
+/// acknowledged starts the fail-open window (`chord_fail_open`).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn post_chord(a: ChordAction, time: u32) {
+    if CHORD_SEQ.load(Relaxed) == CHORD_ACKED.load(Acquire) {
+        CHORD_OLDEST.store(time, Relaxed);
+    }
+    let seq = CHORD_SEQ.fetch_add(1, Relaxed).wrapping_add(1);
+    probe!(crate::probe::post_by(crate::probe::Th::Hook, crate::probe::BY_KB_HOOK, WM_DOCK_CHORD));
+    post_launcher(WM_DOCK_CHORD, encode_chord(a, seq), time);
 }
 
 fn post(msg: u32, ev: usize) {
@@ -628,6 +1114,12 @@ pub(crate) use crate::launcher::model::{ChordSpec, Mods};
 const WM_HOOK_NOTE: u32 = WM_APP + 19;
 /// `WM_HOOK_NOTE`: the launcher chord failed open; lParam = the unacknowledged sequence.
 const NOTE_LAUNCHER_FAIL_OPEN: usize = 16;
+/// `WM_HOOK_NOTE` (values 32-47 belong to the dock chords): the Peek timer could not be armed, noted once per process.
+const NOTE_PEEK_TIMER_FAIL: usize = 32;
+/// `WM_HOOK_NOTE` from any thread (`cut_off`): keys went by unseen; lParam = the `CutOff`'s index.
+const NOTE_CUT_OFF: usize = 33;
+/// `WM_HOOK_NOTE` from the callback (`note_stall`): stall evidence; lParam = the `CutOff`'s index.
+const NOTE_STALL: usize = 34;
 
 /// A post may stay unacknowledged this long before the chord fails open (the name and value of WS-C 17.1).
 pub const ACK_TIMEOUT_MS: u32 = 1500;
@@ -1595,6 +2087,631 @@ fn send_mask() {
     let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }
 
+// ------------------------------------------------------------------ the dock's owned chords (SPEC-dock 5.2.2)
+//
+// The chord table and its API (dock-keys Z2). The hook's use of it (the Win branch) lands in DK-HOOK; the UI's in
+// DK-KEYS. Every function denies unwrap, expect and indexing: a panic in the callback aborts the dock.
+
+/// The dock's owned chords (SPEC-dock 5.2.2), one bit per row of the chord table. NONE: the Win branch behaves as in
+/// release 1.5.2. Bits 8-15 are reserved for TakeoverChord (P3-dock-suite).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DockChords(pub u16);
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+impl DockChords {
+    pub const NONE: DockChords = DockChords(0);
+    pub const DIGITS: DockChords = DockChords(1 << 0); // Win+1..9, Win+0
+    pub const SHIFT_DIGITS: DockChords = DockChords(1 << 1); // Win+Shift+n
+    pub const ALT_DIGITS: DockChords = DockChords(1 << 2); // Win+Alt+n
+    pub const WIN_T: DockChords = DockChords(1 << 3); // Win+T
+    pub const WIN_SHIFT_T: DockChords = DockChords(1 << 4); // Win+Shift+T
+    pub const WIN_B: DockChords = DockChords(1 << 5); // Win+B
+    pub const PEEK: DockChords = DockChords(1 << 6); // Win held PEEK_MS alone
+
+    pub const fn has(self, f: DockChords) -> bool {
+        f.0 != 0 && self.0 & f.0 == f.0
+    }
+
+    pub const fn with(self, f: DockChords) -> DockChords {
+        DockChords(self.0 | f.0)
+    }
+}
+
+/// What an owned chord asks the UI to do; `slot` 0..=9 is the n-th app item in bar order (Win+1 = 0, Win+0 = 9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChordAction {
+    App(u8),
+    NewInstance(u8),
+    AppMenu(u8),
+    FocusFirst,
+    FocusLast,
+    FocusTray,
+    Sync,
+}
+
+/// Win held this long with no other key: Peek begins.
+pub const PEEK_MS: u32 = 600;
+/// A WM_DOCK_CHORD older than this (kb.time to the UI's GetTickCount) acts on nothing (acknowledged only).
+pub const CHORD_STALE_MS: u32 = 1000;
+/// Owned chords pass to Windows while a post stays unacknowledged this long (the UI thread is stuck).
+pub const CHORD_ACK_TIMEOUT_MS: u32 = 1500;
+
+/// The owned chord rows, `DockChords` bits.
+static DOCK_CHORDS: AtomicU16 = AtomicU16::new(0);
+/// A fullscreen window is in front: Peek is suppressed.
+static DOCK_FS: AtomicBool = AtomicBool::new(false);
+/// The sequence the UI last acknowledged (`ack_chord`).
+static CHORD_ACKED: AtomicU16 = AtomicU16::new(0);
+
+/// The slot of a top-row digit key: 0x31-0x39 are slots 0-8, 0x30 is slot 9.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn digit_slot(vk: u32) -> Option<u8> {
+    match vk {
+        0x31..=0x39 => Some((vk - 0x31) as u8),
+        0x30 => Some(9),
+        _ => None,
+    }
+}
+
+/// Pure: the action of `vk` pressed while a Win key is held with exactly `mods` (Shift/Ctrl/Alt; Win excluded), if its
+/// row is owned. Top-row digits 0x30-0x39 only; Ctrl (and AltGr = Ctrl+Alt) never matches.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn resolve_chord(owned: DockChords, vk: u32, mods: Mods) -> Option<ChordAction> {
+    if mods == Mods::NONE {
+        if let Some(n) = digit_slot(vk) {
+            return owned.has(DockChords::DIGITS).then_some(ChordAction::App(n));
+        }
+        return match vk {
+            0x54 if owned.has(DockChords::WIN_T) => Some(ChordAction::FocusFirst),
+            0x42 if owned.has(DockChords::WIN_B) => Some(ChordAction::FocusTray),
+            _ => None,
+        };
+    }
+    if mods == Mods::SHIFT {
+        if let Some(n) = digit_slot(vk) {
+            return owned.has(DockChords::SHIFT_DIGITS).then_some(ChordAction::NewInstance(n));
+        }
+        return (vk == 0x54 && owned.has(DockChords::WIN_SHIFT_T)).then_some(ChordAction::FocusLast);
+    }
+    if mods == Mods::ALT {
+        if let Some(n) = digit_slot(vk) {
+            return owned.has(DockChords::ALT_DIGITS).then_some(ChordAction::AppMenu(n));
+        }
+    }
+    None
+}
+
+/// wParam of WM_DOCK_CHORD: bits 0-7 kind (1 App, 2 NewInstance, 3 AppMenu, 4 FocusFirst, 5 FocusLast, 6 FocusTray,
+/// 7 Sync), bits 8-15 slot, bits 16-31 the hook's sequence. decode(encode(a, s)) == Some((a, s)); kind 0 or > 7 is None.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn encode_chord(a: ChordAction, seq: u16) -> usize {
+    let (kind, slot) = match a {
+        ChordAction::App(n) => (1usize, n),
+        ChordAction::NewInstance(n) => (2, n),
+        ChordAction::AppMenu(n) => (3, n),
+        ChordAction::FocusFirst => (4, 0),
+        ChordAction::FocusLast => (5, 0),
+        ChordAction::FocusTray => (6, 0),
+        ChordAction::Sync => (7, 0),
+    };
+    kind | ((slot as usize) << 8) | ((seq as usize) << 16)
+}
+
+/// The inverse of `encode_chord`; a kind outside 1..=7 is None, so is a slot above 9 on a slot kind.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn decode_chord(wparam: usize) -> Option<(ChordAction, u16)> {
+    let kind = wparam & 0xFF;
+    let slot = ((wparam >> 8) & 0xFF) as u8;
+    let seq = ((wparam >> 16) & 0xFFFF) as u16;
+    let a = match kind {
+        1..=3 if slot > 9 => return None,
+        1 => ChordAction::App(slot),
+        2 => ChordAction::NewInstance(slot),
+        3 => ChordAction::AppMenu(slot),
+        4 => ChordAction::FocusFirst,
+        5 => ChordAction::FocusLast,
+        6 => ChordAction::FocusTray,
+        7 => ChordAction::Sync,
+        _ => return None,
+    };
+    Some((a, seq))
+}
+
+/// UI thread: the owned chords (NONE when hide_native_taskbar is off, or while a remote-desktop or VM client or a
+/// window above the dock is in front). One atomic store, read by the callback.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn set_dock_chords(t: DockChords) {
+    DOCK_CHORDS.store(t.0, Release);
+}
+
+/// UI thread, on each foreground change while PEEK is owned: a fullscreen window is in front (Peek suppressed).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn set_dock_fullscreen(on: bool) {
+    DOCK_FS.store(on, Release);
+}
+
+/// UI thread, first thing on WM_DOCK_CHORD: the post of `seq` arrived.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn ack_chord(seq: u16) {
+    CHORD_ACKED.store(seq, Release);
+}
+
+// ------------------------------------------------------------------ the Win branch (dock-keys H1-H3)
+//
+// One pure state machine over the Win statics: `win_key` loads `WinState`, runs `win_step` and stores it back. With
+// no dock chord owned it is release 1.5.2's Win branch, rule for rule (the module doc). With owned rows (`DockChords`),
+// a chord key pressed while Win is held is swallowed and posted (WM_DOCK_CHORD) instead of reaching Windows with Win,
+// and its auto-repeat and its release are swallowed after it; a modifier pressed while Win is held passes alone and
+// leaves Win pending (Win+Shift+n and Win+Alt+n are chords too), and the menu-mask key keeps its release from being a
+// lone tap. The modifiers are the hook's own (`ModTrack`), which runs whenever the launcher chord or a dock row is set.
+
+/// The Win branch's state, loaded from the Win statics on each event and stored back (hook thread only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WinState {
+    /// A Win press is tracked; `vk` is its key.
+    down: bool,
+    /// The pair [Win down, key down] was injected for this press: Windows holds Win, later keys and the Win up pass.
+    other: bool,
+    vk: u32,
+    /// `kb.time` of the last Win event, auto-repeat included, or of a key the press kept with no gap (`renew`).
+    last_time: u32,
+    /// `kb.time | 1` of the last lone Win release that toggled; 0 = none, or consumed by a double tap.
+    last_alone_up: u32,
+    /// This press started within DOUBLE_TAP_MS of `last_alone_up`.
+    double: bool,
+    /// An owned chord was posted during this press: Windows never saw this Win down.
+    owned: bool,
+    /// A modifier went down while Win was held and passed alone: Win stays pending, Windows saw the modifier only.
+    modded: bool,
+    /// Peek is on: WM_DOCK_PEEK(1) was posted for this press.
+    peeking: bool,
+    /// `kb.time` of this press's Win down: the press the Peek timer was armed for.
+    press: u32,
+    /// The keys whose down an owned chord swallowed (`chord_bit`): their auto-repeat and their up are swallowed too.
+    chord_keys: u16,
+    /// `kb.time` of the last event of a key whose `chord_keys` bit is set (only the newest key auto-repeats).
+    chord_last: u32,
+    /// Windows holds this press's Win key down though the hook injected no pair for it: a key-down of it went by the
+    /// hook unseen (a reinstall, a time-out). Noted by the watchdog's tick (`note_leak`) or read at the release
+    /// (`note_release`).
+    leaked: bool,
+}
+
+/// One physical key event as the Win branch sees it, with the UI's settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WinIn {
+    vk: u32,
+    down: bool,
+    time: u32,
+    /// Shift, Ctrl and Alt as the hook tracks them (`mods_step`), Win removed.
+    mods: Mods,
+    /// The owned rows (`set_dock_chords`).
+    chords: DockChords,
+    /// A fullscreen window is in front (`set_dock_fullscreen`): Peek is not armed.
+    fullscreen: bool,
+    /// The UI left a chord post unacknowledged for CHORD_ACK_TIMEOUT_MS (`chord_fail_open`): Windows gets the chords.
+    fail_open: bool,
+    /// The dock window exists, so a post reaches it.
+    ui_ready: bool,
+}
+
+/// What the callback does besides swallowing or passing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WinAct {
+    None,
+    /// Post WM_DOCK_TOGGLE.
+    Toggle,
+    /// Post WM_DOCK_START_MENU.
+    StartMenu,
+    /// Inject [Win down, key down]; a failed SendInput passes the key instead and notes EV_SENDFAIL.
+    Inject,
+    /// Post WM_DOCK_CHORD with this action.
+    Chord(ChordAction),
+}
+
+/// The Peek timer (a thread timer of the hook thread, `peek_timer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeekCmd {
+    Keep,
+    /// Arm it for the press of this time: PEEK_MS later `peek_fired` checks `peek_due`.
+    Arm(u32),
+    Kill,
+}
+
+/// `win_step`'s answer for one event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WinOut {
+    swallow: bool,
+    act: WinAct,
+    /// Post `ChordAction::Sync` as well: an owned chord failed open, and a live UI acknowledges the newest sequence.
+    sync: bool,
+    /// Inject the menu-mask key (`send_mask`) after the posts.
+    mask: bool,
+    /// Post WM_DOCK_PEEK(0): Peek ended.
+    peek_end: bool,
+    /// The Peek timer.
+    peek: PeekCmd,
+    /// WM_DOCK_WINKEY's event (log only).
+    note: Option<usize>,
+}
+
+impl WinOut {
+    const PASS: WinOut = WinOut {
+        swallow: false,
+        act: WinAct::None,
+        sync: false,
+        mask: false,
+        peek_end: false,
+        peek: PeekCmd::Keep,
+        note: None,
+    };
+    const SWALLOW: WinOut = WinOut { swallow: true, ..WinOut::PASS };
+}
+
+/// Hook-written Win state besides the 1.5.2 statics above (Relaxed: the hook thread is the only reader and writer).
+static WIN_OWNED: AtomicBool = AtomicBool::new(false);
+static WIN_MODDED: AtomicBool = AtomicBool::new(false);
+static WIN_PEEKING: AtomicBool = AtomicBool::new(false);
+static WIN_PRESS: AtomicU32 = AtomicU32::new(0);
+/// A failed SetTimer of the Peek timer is noted (and logged) once per process.
+static PEEK_FAIL_NOTED: AtomicBool = AtomicBool::new(false);
+static CHORD_KEYS: AtomicU16 = AtomicU16::new(0);
+static CHORD_LAST: AtomicU32 = AtomicU32::new(0);
+static WIN_LEAKED: AtomicBool = AtomicBool::new(false);
+/// The newest sequence the hook posted on WM_DOCK_CHORD, and `kb.time` of the oldest post not yet acknowledged.
+static CHORD_SEQ: AtomicU16 = AtomicU16::new(0);
+static CHORD_OLDEST: AtomicU32 = AtomicU32::new(0);
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn load_win_state() -> WinState {
+    WinState {
+        down: WIN_DOWN.load(Relaxed),
+        other: WIN_OTHER.load(Relaxed),
+        vk: WIN_VK.load(Relaxed),
+        last_time: WIN_LAST_TIME.load(Relaxed),
+        last_alone_up: LAST_ALONE_UP.load(Relaxed),
+        double: WIN_DOUBLE.load(Relaxed),
+        owned: WIN_OWNED.load(Relaxed),
+        modded: WIN_MODDED.load(Relaxed),
+        peeking: WIN_PEEKING.load(Relaxed),
+        press: WIN_PRESS.load(Relaxed),
+        chord_keys: CHORD_KEYS.load(Relaxed),
+        chord_last: CHORD_LAST.load(Relaxed),
+        leaked: WIN_LEAKED.load(Relaxed),
+    }
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn store_win_state(s: &WinState) {
+    WIN_DOWN.store(s.down, Relaxed);
+    WIN_OTHER.store(s.other, Relaxed);
+    WIN_VK.store(s.vk, Relaxed);
+    WIN_LAST_TIME.store(s.last_time, Relaxed);
+    LAST_ALONE_UP.store(s.last_alone_up, Relaxed);
+    WIN_DOUBLE.store(s.double, Relaxed);
+    WIN_OWNED.store(s.owned, Relaxed);
+    WIN_MODDED.store(s.modded, Relaxed);
+    WIN_PEEKING.store(s.peeking, Relaxed);
+    WIN_PRESS.store(s.press, Relaxed);
+    CHORD_KEYS.store(s.chord_keys, Relaxed);
+    CHORD_LAST.store(s.chord_last, Relaxed);
+    WIN_LEAKED.store(s.leaked, Relaxed);
+}
+
+/// Left or right Win.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn is_win(vk: u32) -> bool {
+    vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32
+}
+
+/// Shift, Ctrl or Alt, generic or of either side.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn is_modifier(vk: u32) -> bool {
+    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5)
+}
+
+/// Alt, generic or of either side.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn is_alt(vk: u32) -> bool {
+    matches!(vk, 0x12 | 0xA4 | 0xA5)
+}
+
+/// The callback runs the modifier tracker (`mods_step`) while the launcher chord or any dock row is set.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn tracks(launcher_set: bool, dock: DockChords) -> bool {
+    launcher_set || dock != DockChords::NONE
+}
+
+/// The `chord_keys` bit of a key an owned chord can swallow: the top-row digits 0x30-0x39 bits 0-9, T bit 10, B bit 11.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+const fn chord_bit(vk: u32) -> Option<u16> {
+    match vk {
+        0x30..=0x39 => Some(1 << (vk - 0x30)),
+        0x54 => Some(1 << 10),
+        0x42 => Some(1 << 11),
+        _ => None,
+    }
+}
+
+/// A chord post has stayed unacknowledged for more than CHORD_ACK_TIMEOUT_MS since the oldest pending one (`oldest`):
+/// the UI thread is stuck, so owned chords pass to Windows. Sequences and times compare with wrapping.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn chord_fail_open(sent: u16, acked: u16, oldest: u32, now: u32) -> bool {
+    (sent.wrapping_sub(acked) as i16) > 0 && now.wrapping_sub(oldest) > CHORD_ACK_TIMEOUT_MS
+}
+
+/// The Win branch, pure: `s` is the state before the event and becomes the state after it.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn win_step(s: &mut WinState, ev: WinIn) -> WinOut {
+    match (is_win(ev.vk), ev.down) {
+        (true, true) => win_down(s, ev),
+        (true, false) => win_up(s, ev),
+        (false, true) => key_down(s, ev),
+        (false, false) => key_up(s, ev),
+    }
+}
+
+/// A Win key down: a fresh press, its auto-repeat, or the other Win key while one is held (an "other key").
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn win_down(s: &mut WinState, ev: WinIn) -> WinOut {
+    let fresh = ev.time.wrapping_sub(s.last_time) > REPEAT_WINDOW_MS;
+    s.last_time = ev.time;
+    if s.down && !fresh {
+        if ev.vk == s.vk {
+            // Auto-repeat: still "pending" -> swallow; already re-injected -> let through.
+            return WinOut { swallow: !s.other, ..WinOut::PASS };
+        }
+        // The other Win key while the first is held: it is an "other key".
+        return key_down(s, ev);
+    }
+    // A fresh press; Peek of a press whose release was lost ends here.
+    let peek_end = std::mem::take(&mut s.peeking);
+    s.down = true;
+    s.other = false;
+    s.owned = false;
+    s.modded = false;
+    s.leaked = false;
+    s.vk = ev.vk;
+    s.press = ev.time;
+    s.double = s.last_alone_up != 0 && ev.time.wrapping_sub(s.last_alone_up) <= DOUBLE_TAP_MS;
+    let peek = if ev.chords.has(DockChords::PEEK) && ev.chords.has(DockChords::DIGITS) && !ev.fullscreen {
+        PeekCmd::Arm(ev.time)
+    } else {
+        PeekCmd::Kill
+    };
+    WinOut { note: Some(EV_PRESSED), peek_end, peek, ..WinOut::SWALLOW }
+}
+
+/// A Win key up, the table of the module doc: after an injected pair it passes; with a row owned, when Windows holds
+/// this Win down (`leaked`) it passes behind the menu-mask key and toggles nothing; during Peek, or for a press that
+/// owned a chord or passed a modifier, it is swallowed and toggles nothing; otherwise the tap toggles the dock (a double
+/// tap opens Start). The release of anything but the tracked press passes.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn win_up(s: &mut WinState, ev: WinIn) -> WinOut {
+    // Every Win up kills the Peek timer: it lives only between a Win down and its release.
+    let out = win_up_plan(s, ev);
+    WinOut { peek: PeekCmd::Kill, ..out }
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn win_up_plan(s: &mut WinState, ev: WinIn) -> WinOut {
+    if !s.down || ev.vk != s.vk {
+        return WinOut::PASS;
+    }
+    s.down = false;
+    let peeking = std::mem::take(&mut s.peeking);
+    let owned = std::mem::take(&mut s.owned);
+    let modded = std::mem::take(&mut s.modded);
+    let leaked = std::mem::take(&mut s.leaked);
+    if s.other {
+        // Win used in a combination: it does not count as the first tap of a double tap.
+        s.last_alone_up = 0;
+        s.double = false;
+        return WinOut { peek_end: peeking, ..WinOut::PASS };
+    }
+    if leaked && ev.chords != DockChords::NONE {
+        // Windows holds this Win down though the hook passed none of its downs (`note_release`, `note_leak`): the
+        // release reaches Windows behind the menu-mask key, so it opens no Start menu, and the press is no tap.
+        s.last_alone_up = 0;
+        s.double = false;
+        return WinOut { mask: true, peek_end: peeking, note: Some(EV_LEAK), ..WinOut::PASS };
+    }
+    if peeking || owned || modded {
+        // Windows never saw this Win down: its release is swallowed too, and it is no tap. A modifier Windows saw alone
+        // that is still down (Alt) gets the menu-mask key, so its later release opens no menu bar.
+        s.last_alone_up = 0;
+        s.double = false;
+        let mask = modded && ev.mods.has(Mods::ALT);
+        return WinOut { mask, peek_end: peeking, ..WinOut::SWALLOW };
+    }
+    if std::mem::take(&mut s.double) {
+        // Second quick tap: Start menu; the next tap starts a fresh sequence.
+        s.last_alone_up = 0;
+        return WinOut { act: WinAct::StartMenu, note: Some(EV_DOUBLE), ..WinOut::SWALLOW };
+    }
+    // `| 1`: a real timestamp of 0 must not read as "no previous tap".
+    s.last_alone_up = ev.time | 1;
+    WinOut { act: WinAct::Toggle, note: Some(EV_ALONE), ..WinOut::SWALLOW }
+}
+
+/// A key (other than the held Win) pressed, in order: the stale rule, the auto-repeat of a key an owned chord swallowed,
+/// an owned chord, a modifier passed alone, the pair [Win down, key down] injected (the key swallowed) as in 1.5.2.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn key_down(s: &mut WinState, ev: WinIn) -> WinOut {
+    // 1. Win release lost (secure desktop): Win is no longer held, and a Peek of it ends. No key injects the pair
+    //    after REPEAT_WINDOW_MS of silence (Win's events, or the keys the press kept, `renew`). After such a pause, a
+    //    press that owned a chord or passed a modifier is still kept up to LONE_STUCK_MS (as the watchdog judges a lone
+    //    press, `repair_plan`) for a key that step 3 owns or step 4 passes, neither of which injects; any other key,
+    //    and every key beyond, takes this rule.
+    let age = ev.time.wrapping_sub(s.last_time);
+    let kept = (s.owned || s.modded) && age <= LONE_STUCK_MS && injects_nothing(ev);
+    if s.down && !s.other && age > REPEAT_WINDOW_MS && !kept {
+        s.down = false;
+        s.owned = false;
+        s.modded = false;
+        s.leaked = false;
+        if std::mem::take(&mut s.peeking) {
+            return WinOut { peek_end: true, peek: PeekCmd::Kill, ..key_down_rules(s, ev) };
+        }
+    }
+    key_down_rules(s, ev)
+}
+
+/// The stale rule's test for a press that owned a chord or passed a modifier: `ev` is a key that step 3 owns as a
+/// chord or step 4 passes as a modifier, so keeping the press injects no pair.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn injects_nothing(ev: WinIn) -> bool {
+    let chord = ev.ui_ready
+        && !ev.fail_open
+        && chord_bit(ev.vk).is_some()
+        && resolve_chord(ev.chords, ev.vk, ev.mods).is_some();
+    chord || (ev.chords != DockChords::NONE && is_modifier(ev.vk))
+}
+
+/// `key_down` after the stale rule: steps 2 to 5. Every step that makes the press unable to Peek (an owned chord, a
+/// modifier, the pair) kills the Peek timer; the pair also ends a running Peek (Windows now holds Win).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn key_down_rules(s: &mut WinState, ev: WinIn) -> WinOut {
+    // 2. A key an owned chord swallowed: its auto-repeat is swallowed, Win held or not, so a digit held after Win's
+    //    release never types. A bit with no event for REPEAT_WINDOW_MS lost its release: cleared, a fresh press.
+    let bit = chord_bit(ev.vk).unwrap_or(0);
+    if s.chord_keys & bit != 0 {
+        if ev.time.wrapping_sub(s.chord_last) > REPEAT_WINDOW_MS {
+            s.chord_keys &= !bit;
+        } else {
+            s.chord_last = ev.time;
+            renew(s, ev.time);
+            return WinOut::SWALLOW;
+        }
+    }
+    if !s.down {
+        return WinOut::PASS;
+    }
+    // 3. An owned chord: swallowed and posted, unless the UI thread is stuck (failed open: Windows gets it as today, and
+    //    a Sync post lets a live UI acknowledge again) or the dock window does not exist yet.
+    let mut sync = false;
+    if let Some(a) = resolve_chord(ev.chords, ev.vk, ev.mods).filter(|_| ev.ui_ready && bit != 0) {
+        if !ev.fail_open {
+            s.owned = true;
+            s.chord_keys |= bit;
+            s.chord_last = ev.time;
+            renew(s, ev.time);
+            // With Shift or Alt the menu-mask key follows the post: the modifier's release is no lone tap.
+            let mask = ev.mods.has(Mods::SHIFT) || ev.mods.has(Mods::ALT);
+            return WinOut { act: WinAct::Chord(a), mask, peek: PeekCmd::Kill, ..WinOut::SWALLOW };
+        }
+        sync = true;
+    }
+    if s.other {
+        return WinOut { sync, ..WinOut::PASS };
+    }
+    // 4. A modifier while rows are owned: it passes alone and Win stays pending, so Win+Shift+n and Win+Alt+n can be
+    //    chords (without rows it injects the pair, as in 1.5.2).
+    if ev.chords != DockChords::NONE && is_modifier(ev.vk) {
+        s.modded = true;
+        renew(s, ev.time);
+        return WinOut { peek: PeekCmd::Kill, ..WinOut::PASS };
+    }
+    // 5. Today's injection, once per press; it ends a running Peek.
+    s.other = true;
+    let peek_end = std::mem::take(&mut s.peeking);
+    WinOut { act: WinAct::Inject, sync, peek_end, peek: PeekCmd::Kill, note: Some(EV_COMBO), ..WinOut::SWALLOW }
+}
+
+/// A key the held press keeps (an owned chord key, its swallowed auto-repeat, a modifier passed alone) is the newest
+/// key: it auto-repeats and Win no longer does. Coming within REPEAT_WINDOW_MS of `last_time`, it shows the hook was
+/// never cut off (the secure desktop, a removed hook), so Win's release was not lost: `last_time` moves to it, for the
+/// stale rule and the watchdog's age alike. After a gap it stays, so a lost release still takes the stale rule.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn renew(s: &mut WinState, time: u32) {
+    if s.down && time.wrapping_sub(s.last_time) <= REPEAT_WINDOW_MS {
+        s.last_time = time;
+    }
+}
+
+/// Callback, at a Win up before `win_step`: at the release of the tracked press, with a row owned and no pair injected,
+/// `held` (the async key state, which inside the callback is the state from before this event) tells whether Windows
+/// holds that Win key down; if so the press notes it (`leaked`), and its release passes (`win_up_plan`). `held` is not
+/// called otherwise: with no row owned, nothing is read.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn note_release(s: &mut WinState, ev: WinIn, held: impl FnOnce(u32) -> bool) {
+    let tracked = is_win(ev.vk) && !ev.down && s.down && ev.vk == s.vk && !s.other;
+    if ev.chords != DockChords::NONE && tracked && held(ev.vk) {
+        s.leaked = true;
+    }
+}
+
+/// The watchdog's tick (decision of the hook thread's loop, never the callback): Windows holds the Win key of the
+/// tracked press (`lwin`, `rwin`: the async state of each) though the hook injected no pair for it, so a key-down of
+/// it went by the hook unseen. The press notes it (`leaked`): true the first time for the press, for its one line.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn note_leak(s: &mut WinState, lwin: bool, rwin: bool) -> bool {
+    let held = (s.vk == VK_LWIN.0 as u32 && lwin) || (s.vk == VK_RWIN.0 as u32 && rwin);
+    s.down && !s.other && held && !std::mem::replace(&mut s.leaked, true)
+}
+
+/// The Peek timer of `armed_press` fired: Peek begins when that press is still held alone (no pair injected, no chord
+/// owned, no modifier passed) and no fullscreen window is in front.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn peek_due(s: &WinState, armed_press: u32, fullscreen: bool) -> bool {
+    s.down && !s.other && !s.owned && !s.modded && s.press == armed_press && !fullscreen
+}
+
+/// The heartbeat is due while a Win press that owned a chord or passed a modifier is held: the only press whose lost
+/// release costs anything, its digits, T and B staying chords for up to LONE_STUCK_MS.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn heartbeat_due(s: &WinState) -> bool {
+    s.down && (s.owned || s.modded)
+}
+
+/// The watchdog's repair of a press whose release was lost (`Repair::ClearThenGo`): the press, its double-tap memory
+/// and the chord state are forgotten (a chord key's bit included). true when Peek was on: the caller posts its end.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn clear_for_repair(s: &mut WinState) -> bool {
+    s.down = false;
+    s.other = false;
+    s.double = false;
+    s.last_alone_up = 0;
+    s.owned = false;
+    s.modded = false;
+    s.leaked = false;
+    s.chord_keys = 0;
+    std::mem::take(&mut s.peeking)
+}
+
+/// A cut-off (`CutOff`): keys went by the hook unseen, perhaps Win's release. None while no row is owned and the press
+/// is none of the dock's (no chord owned, no modifier passed, no Peek): release 1.5.2's Win branch keeps its own stale
+/// rule. Otherwise the press is forgotten with its double-tap memory, and Some(true) when Peek was on (the caller posts
+/// its end). The keys an owned chord swallowed keep their bits: an up that still comes is swallowed, a lost one expires
+/// at the key's next down (`key_down_rules` step 2).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn forget_after_cut_off(s: &mut WinState, rows: DockChords) -> Option<bool> {
+    if rows == DockChords::NONE && !s.owned && !s.modded && !s.peeking {
+        return None;
+    }
+    s.down = false;
+    s.other = false;
+    s.owned = false;
+    s.modded = false;
+    s.leaked = false;
+    s.double = false;
+    s.last_alone_up = 0;
+    Some(std::mem::take(&mut s.peeking))
+}
+
+/// A key (other than Win) released: the up of a key an owned chord swallowed is swallowed (its down never reached
+/// Windows), Win held or not; an Alt up that Windows would read as a lone Alt tap (it saw that Alt down alone, Win
+/// held and pending) passes after the menu-mask key; every other release passes.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn key_up(s: &mut WinState, ev: WinIn) -> WinOut {
+    let bit = chord_bit(ev.vk).unwrap_or(0);
+    if s.chord_keys & bit != 0 {
+        s.chord_keys &= !bit;
+        return WinOut::SWALLOW;
+    }
+    WinOut { mask: is_alt(ev.vk) && s.down && s.modded && !s.other, ..WinOut::PASS }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1609,11 +2726,11 @@ mod tests {
         assert_eq!(repair_plan(true, true, false, true, STALE), Skip, "Win really held: do not touch the hook mid-combination");
         assert_eq!(repair_plan(true, false, true, true, STALE), Skip);
         assert_eq!(repair_plan(true, true, false, false, LONG), Skip, "async state says held: never clear");
-        assert_eq!(repair_plan(true, false, false, false, 0), Skip, "swallowed Win-down never reaches async state");
-        assert_eq!(repair_plan(true, false, false, true, REPEAT_WINDOW_MS), Skip, "chord still within the repeat window");
+        assert_eq!(repair_plan(true, false, false, false, 0), Go, "swallowed Win-down never reaches async state: kept");
+        assert_eq!(repair_plan(true, false, false, true, REPEAT_WINDOW_MS), Go, "chord still within the repeat window");
         assert_eq!(repair_plan(true, false, false, true, STALE), ClearThenGo, "Win+L left WIN_DOWN stuck");
-        assert_eq!(repair_plan(true, false, false, false, STALE), Skip, "lone Win held with no auto-repeat");
-        assert_eq!(repair_plan(true, false, false, false, LONE_STUCK_MS), Skip, "lone Win at the limit: still held");
+        assert_eq!(repair_plan(true, false, false, false, STALE), Go, "lone Win held with no auto-repeat: kept");
+        assert_eq!(repair_plan(true, false, false, false, LONE_STUCK_MS), Go, "lone Win at the limit: still held");
         assert_eq!(repair_plan(true, false, false, false, LONG), ClearThenGo, "lone release lost on the secure desktop");
     }
 
@@ -2555,5 +3672,1747 @@ mod tests {
             assert!(balanced(&k.seen), "{:?}", k.seen);
             assert_eq!(k.seen.iter().filter(|e| e.0 == SPACE).count(), 2, "one Space down, one Space up");
         }
+    }
+    // ---- the dock's owned chords (dock-keys Z2)
+
+    const ALL_ROWS: DockChords = DockChords(0x7F);
+    const CA: Mods = Mods(Mods::CTRL.0 | Mods::ALT.0);
+    const SA: Mods = Mods(Mods::SHIFT.0 | Mods::ALT.0);
+
+    #[test]
+    fn chord_table_rows() {
+        let r = |vk, m| resolve_chord(ALL_ROWS, vk, m);
+        assert_eq!(r(0x31, Mods::NONE), Some(ChordAction::App(0)));
+        assert_eq!(r(0x39, Mods::NONE), Some(ChordAction::App(8)));
+        assert_eq!(r(0x30, Mods::NONE), Some(ChordAction::App(9)));
+        assert_eq!(r(0x33, Mods::SHIFT), Some(ChordAction::NewInstance(2)));
+        assert_eq!(r(0x33, Mods::ALT), Some(ChordAction::AppMenu(2)));
+        assert_eq!(r(0x54, Mods::NONE), Some(ChordAction::FocusFirst));
+        assert_eq!(r(0x54, Mods::SHIFT), Some(ChordAction::FocusLast));
+        assert_eq!(r(0x42, Mods::NONE), Some(ChordAction::FocusTray));
+        assert_eq!(r(0x33, Mods::CTRL), None);
+        assert_eq!(r(0x33, CA), None, "AltGr is Ctrl+Alt");
+        assert_eq!(r(0x33, SA), None);
+        assert_eq!(r(0x61, Mods::NONE), None, "numpad 1");
+        assert_eq!(r(0x45, Mods::NONE), None);
+        assert_eq!(r(0x42, Mods::SHIFT), None);
+        assert_eq!(r(0x54, Mods::ALT), None);
+        assert_eq!(r(0x2F, Mods::NONE), None, "just below the digits");
+        assert_eq!(r(0x3A, Mods::NONE), None, "just above the digits");
+    }
+
+    #[test]
+    fn chord_rows_follow_ownership() {
+        let no_digits = DockChords(ALL_ROWS.0 & !DockChords::DIGITS.0);
+        assert_eq!(resolve_chord(no_digits, 0x31, Mods::NONE), None);
+        assert_eq!(resolve_chord(no_digits, 0x31, Mods::SHIFT), Some(ChordAction::NewInstance(0)));
+        let rows = [
+            (DockChords::DIGITS, 0x31, Mods::NONE),
+            (DockChords::SHIFT_DIGITS, 0x31, Mods::SHIFT),
+            (DockChords::ALT_DIGITS, 0x31, Mods::ALT),
+            (DockChords::WIN_T, 0x54, Mods::NONE),
+            (DockChords::WIN_SHIFT_T, 0x54, Mods::SHIFT),
+            (DockChords::WIN_B, 0x42, Mods::NONE),
+        ];
+        for (row, vk, m) in rows {
+            assert!(resolve_chord(row, vk, m).is_some(), "row {row:?} alone owns its chord");
+            assert_eq!(resolve_chord(DockChords(ALL_ROWS.0 & !row.0), vk, m), None, "row {row:?} off");
+            assert_eq!(resolve_chord(DockChords::NONE, vk, m), None);
+        }
+        assert!(!DockChords::NONE.has(DockChords::NONE), "an empty row is never owned");
+        assert!(ALL_ROWS.has(DockChords::PEEK));
+        assert_eq!(DockChords::NONE.with(DockChords::WIN_B).with(DockChords::PEEK).0, 0x60);
+    }
+
+    #[test]
+    fn chord_wparam_round_trips() {
+        let mut actions =
+            vec![ChordAction::FocusFirst, ChordAction::FocusLast, ChordAction::FocusTray, ChordAction::Sync];
+        for n in 0..=9u8 {
+            actions.extend([ChordAction::App(n), ChordAction::NewInstance(n), ChordAction::AppMenu(n)]);
+        }
+        for a in actions {
+            for seq in [0u16, 1, 0x7FFF, 0xFFFF] {
+                assert_eq!(decode_chord(encode_chord(a, seq)), Some((a, seq)), "{a:?} seq {seq}");
+            }
+        }
+        assert_eq!(decode_chord(0), None, "kind 0");
+        assert_eq!(decode_chord(8), None, "kind 8");
+        assert_eq!(decode_chord(0xFF | 0x1234_0000), None);
+        assert_eq!(decode_chord(1 | (10 << 8)), None, "slot above 9");
+    }
+
+    // ---- the Win branch (dock-keys H1)
+
+    const RWIN: u32 = 0x5C;
+    const KEY_L: u32 = 0x4C;
+    const KEY_S: u32 = 0x53;
+    const PRESSED: Option<usize> = Some(EV_PRESSED);
+    const ALONE: Option<usize> = Some(EV_ALONE);
+    const DOUBLE: Option<usize> = Some(EV_DOUBLE);
+    const COMBO: Option<usize> = Some(EV_COMBO);
+
+    /// One event of a sequence, (vk, down, kb.time), and `win_step`'s answer to it: (swallow, act, note).
+    type Step = (u32, bool, u32, (bool, WinAct, Option<usize>));
+
+    /// An event with no dock chord owned: release 1.5.2's Win branch.
+    fn legacy(vk: u32, down: bool, time: u32) -> WinIn {
+        WinIn {
+            vk,
+            down,
+            time,
+            mods: Mods::NONE,
+            chords: DockChords::NONE,
+            fullscreen: false,
+            fail_open: false,
+            ui_ready: true,
+        }
+    }
+
+    /// Runs `steps` from a fresh state, asserting every answer.
+    fn run_legacy(what: &str, steps: &[Step]) -> WinState {
+        let mut s = WinState::default();
+        for (i, &(vk, down, t, want)) in steps.iter().enumerate() {
+            let out = win_step(&mut s, legacy(vk, down, t));
+            assert_eq!((out.swallow, out.act, out.note), want, "{what}: event {i} (vk {vk:#x}, down {down}, t {t})");
+        }
+        s
+    }
+
+    /// H1: every sequence gives today's swallow, posts and injections, written from the code of release 1.5.2
+    /// (`handle_key` and `other_key_down`).
+    #[test]
+    fn legacy_sequences_are_unchanged() {
+        use WinAct::{Inject, StartMenu, Toggle};
+        let none = WinAct::None;
+        let pass = (false, none, None);
+        let held = (true, none, None);
+        let press = (true, none, PRESSED);
+        let toggle = (true, Toggle, ALONE);
+        let combo = (true, Inject, COMBO);
+        let table: Vec<(&str, Vec<Step>)> = vec![
+            ("Win tap", vec![(LWIN, true, 10_000, press), (LWIN, false, 10_080, toggle)]),
+            (
+                "double tap within 300 ms",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (LWIN, false, 10_080, toggle),
+                    (LWIN, true, 10_300, press),
+                    (LWIN, false, 10_350, (true, StartMenu, DOUBLE)),
+                ],
+            ),
+            (
+                "a third tap toggles",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (LWIN, false, 10_080, toggle),
+                    (LWIN, true, 10_300, press),
+                    (LWIN, false, 10_350, (true, StartMenu, DOUBLE)),
+                    (LWIN, true, 10_500, press),
+                    (LWIN, false, 10_550, toggle),
+                ],
+            ),
+            (
+                "a second tap 301 ms after the first release toggles",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (LWIN, false, 10_080, toggle),
+                    (LWIN, true, 10_382, press),
+                    (LWIN, false, 10_400, toggle),
+                ],
+            ),
+            (
+                "Win+E: Win swallowed, E injected with it, E up and Win up pass",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (KEY_E, true, 10_100, combo),
+                    (KEY_E, false, 10_150, pass),
+                    (LWIN, false, 10_200, pass),
+                ],
+            ),
+            (
+                "Win held with auto-repeat, then released alone",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (LWIN, true, 10_500, held),
+                    (LWIN, true, 10_533, held),
+                    (LWIN, true, 10_566, held),
+                    (LWIN, false, 10_600, toggle),
+                ],
+            ),
+            (
+                "Win+L 2 s later (the release was lost): the key passes, the Win state is cleared",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (KEY_L, true, 12_000, pass),
+                    (KEY_L, false, 12_050, pass),
+                    (LWIN, false, 12_100, pass),
+                    (KEY_E, true, 12_200, pass),
+                ],
+            ),
+            (
+                "a key 1500 ms after the Win press is still a combination",
+                vec![(LWIN, true, 10_000, press), (KEY_E, true, 11_500, combo), (KEY_E, false, 11_550, pass)],
+            ),
+            (
+                "LWin+RWin: the second Win is an other key",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (RWIN, true, 10_100, combo),
+                    (RWIN, false, 10_150, pass),
+                    (KEY_E, true, 10_200, pass),
+                    (LWIN, false, 10_250, pass),
+                ],
+            ),
+            (
+                "Win+Shift+S: Shift injects the pair, S and the releases pass",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (LSHIFT, true, 10_100, combo),
+                    (KEY_S, true, 10_150, pass),
+                    (KEY_S, false, 10_200, pass),
+                    (LSHIFT, false, 10_250, pass),
+                    (LWIN, false, 10_300, pass),
+                ],
+            ),
+            (
+                "the Win up after Win+E is no first tap",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (KEY_E, true, 10_050, combo),
+                    (KEY_E, false, 10_080, pass),
+                    (LWIN, false, 10_100, pass),
+                    (LWIN, true, 10_200, press),
+                    (LWIN, false, 10_250, toggle),
+                ],
+            ),
+            (
+                "Win auto-repeat after the pair passes",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (KEY_E, true, 10_100, combo),
+                    (KEY_E, false, 10_150, pass),
+                    (LWIN, true, 10_600, pass),
+                    (LWIN, false, 10_700, pass),
+                ],
+            ),
+            (
+                "keys without Win pass",
+                vec![(KEY_E, true, 10_000, pass), (KEY_E, false, 10_050, pass), (LSHIFT, true, 10_100, pass)],
+            ),
+            ("RWin tap", vec![(RWIN, true, 10_000, press), (RWIN, false, 10_080, toggle)]),
+            (
+                "a press whose release was lost restarts after 1.5 s",
+                vec![(LWIN, true, 10_000, press), (LWIN, true, 11_501, press), (LWIN, false, 11_550, toggle)],
+            ),
+            ("a Win up with no tracked press passes", vec![(LWIN, false, 10_000, pass), (RWIN, false, 10_010, pass)]),
+            (
+                "after Win+L the injected press is never stale-cleared; the next press starts fresh",
+                vec![
+                    (LWIN, true, 10_000, press),
+                    (KEY_L, true, 10_100, combo),
+                    (KEY_E, true, 20_000, pass),
+                    (LWIN, true, 20_100, press),
+                    (LWIN, false, 20_150, toggle),
+                ],
+            ),
+            (
+                "the right Win up does not release a left Win press",
+                vec![(LWIN, true, 10_000, press), (RWIN, false, 10_050, pass), (LWIN, false, 10_100, toggle)],
+            ),
+        ];
+        assert!(table.len() >= 14);
+        for (what, steps) in &table {
+            run_legacy(what, steps);
+        }
+        let s = run_legacy("Win+E state", &table[4].1);
+        assert_eq!((s.down, s.other, s.last_alone_up, s.double), (false, true, 0, false));
+        // Injected keys never reach `win_step`: `handle_key` returns first for our tag and for other apps' injections
+        // (`tagged_win_v_passes_and_arms_nothing` pins that its first statement is this filter).
+        assert!(!accepted(0, INJECT_TAG));
+        assert!(!accepted(LLKHF_INJECTED.0, 0));
+        assert!(accepted(0, 0));
+    }
+
+    /// Release 1.5.2's Win branch (`handle_key` and `other_key_down` of 18f2762) on a local state, kept as the reference
+    /// `win_step` must equal while no dock chord is owned.
+    #[derive(Default)]
+    struct Old {
+        down: bool,
+        other: bool,
+        vk: u32,
+        last: u32,
+        alone: u32,
+        double: bool,
+    }
+
+    fn old_step(o: &mut Old, vk: u32, down: bool, t: u32) -> (bool, WinAct, Option<usize>) {
+        let pass = (false, WinAct::None, None);
+        let other_key_down = |o: &mut Old| {
+            if !o.down || o.other {
+                return pass;
+            }
+            if t.wrapping_sub(o.last) > REPEAT_WINDOW_MS {
+                o.down = false;
+                return pass;
+            }
+            o.other = true;
+            (true, WinAct::Inject, COMBO)
+        };
+        if vk == LWIN || vk == RWIN {
+            if down {
+                let fresh = t.wrapping_sub(o.last) > REPEAT_WINDOW_MS;
+                o.last = t;
+                if o.down && !fresh {
+                    if vk == o.vk {
+                        return (!o.other, WinAct::None, None);
+                    }
+                    return other_key_down(o);
+                }
+                o.down = true;
+                o.other = false;
+                o.vk = vk;
+                o.double = o.alone != 0 && t.wrapping_sub(o.alone) <= DOUBLE_TAP_MS;
+                return (true, WinAct::None, PRESSED);
+            }
+            if o.down && vk == o.vk {
+                o.down = false;
+                if !o.other {
+                    if std::mem::replace(&mut o.double, false) {
+                        o.alone = 0;
+                        return (true, WinAct::StartMenu, DOUBLE);
+                    }
+                    o.alone = t | 1;
+                    return (true, WinAct::Toggle, ALONE);
+                }
+                o.alone = 0;
+                o.double = false;
+            }
+            return pass;
+        }
+        if down {
+            other_key_down(o)
+        } else {
+            pass
+        }
+    }
+
+    /// A small deterministic generator (xorshift32) for the random sequences.
+    struct Rng(u32);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+
+        fn pick<T: Copy>(&mut self, of: &[T]) -> T {
+            of[self.next() as usize % of.len()]
+        }
+    }
+
+    /// The keys the random sequences press: both Win keys, the chord keys, the modifiers and two plain keys.
+    const MIXED_KEYS: [u32; 12] = [LWIN, RWIN, LWIN, 0x31, 0x33, 0x30, 0x54, 0x42, LSHIFT, LALT, LCTRL, KEY_E];
+    /// Gaps between events (ms): auto-repeat, typing, the double-tap edge, the stale edge and beyond.
+    const GAPS: [u32; 9] = [0, 33, 80, 299, 300, 301, 1500, 1501, 4000];
+
+    /// H1: with no dock chord owned `win_step` answers exactly as release 1.5.2's branch on 20,000 random sequences.
+    #[test]
+    fn legacy_model_matches_on_random_sequences() {
+        let mut rng = Rng(0x2545_F491);
+        for seq in 0..20_000 {
+            let (mut s, mut o) = (WinState::default(), Old::default());
+            let mut t = 10_000u32;
+            for i in 0..12 {
+                let vk = rng.pick(&MIXED_KEYS);
+                let down = !rng.next().is_multiple_of(3);
+                t = t.wrapping_add(rng.pick(&GAPS));
+                let out = win_step(&mut s, legacy(vk, down, t));
+                let want = old_step(&mut o, vk, down, t);
+                assert_eq!((out.swallow, out.act, out.note), want, "sequence {seq}, event {i}: vk {vk:#x} down {down}");
+                assert!(
+                    !out.sync && !out.mask && !out.peek_end && !matches!(out.peek, PeekCmd::Arm(_)),
+                    "sequence {seq}, event {i}: no chord post, no mask, no Peek without a chord table"
+                );
+                assert_eq!((s.owned, s.modded, s.peeking, s.chord_keys), (false, false, false, 0), "{seq}, {i}");
+                assert_eq!(
+                    (s.down, s.other, s.vk, s.last_time, s.last_alone_up, s.double),
+                    (o.down, o.other, o.vk, o.last, o.alone, o.double),
+                    "sequence {seq}, event {i}"
+                );
+            }
+        }
+    }
+
+    // ---- owned chords (dock-keys H2a)
+
+    const KEY_3: u32 = 0x33;
+    const KEY_4: u32 = 0x34;
+
+    /// An event with every chord row owned, a live UI and no modifier.
+    fn owned(vk: u32, down: bool, time: u32) -> WinIn {
+        WinIn { chords: ALL_ROWS, ..legacy(vk, down, time) }
+    }
+
+    /// (swallow, act, sync, note) of an answer.
+    fn ans(o: WinOut) -> (bool, WinAct, bool, Option<usize>) {
+        (o.swallow, o.act, o.sync, o.note)
+    }
+
+    const SILENT: (bool, WinAct, bool, Option<usize>) = (true, WinAct::None, false, None);
+    const PASSED: (bool, WinAct, bool, Option<usize>) = (false, WinAct::None, false, None);
+    const PRESS: (bool, WinAct, bool, Option<usize>) = (true, WinAct::None, false, PRESSED);
+
+    /// Win down at 10,000 and 3 down at 10,100 with every row owned: the state after the owned chord.
+    fn after_win_3() -> WinState {
+        let mut s = WinState::default();
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 10_000))), PRESS);
+        let out = win_step(&mut s, owned(KEY_3, true, 10_100));
+        assert_eq!(ans(out), (true, WinAct::Chord(ChordAction::App(2)), false, None));
+        s
+    }
+
+    #[test]
+    fn owned_digit_is_swallowed_and_posted() {
+        let mut s = after_win_3();
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 10_150))), SILENT, "its up never reaches Windows");
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_200))), SILENT, "Win up swallowed, no toggle");
+        assert_eq!((s.down, s.owned, s.chord_keys, s.last_alone_up), (false, false, 0, 0));
+        // The next lone tap toggles (the owned press was no first tap of a double tap).
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 10_300))), PRESS);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_350))), (true, WinAct::Toggle, false, ALONE));
+    }
+
+    #[test]
+    fn owned_then_unowned_injects_the_pair() {
+        let mut s = after_win_3();
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 10_150))), SILENT);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, 10_200))), (true, WinAct::Inject, false, COMBO));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, false, 10_250))), PASSED);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_300))), PASSED, "Windows saw the injected Win down");
+        // After the pair an owned chord is still the dock's (Windows holds Win, sees nothing of the digit).
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, 20_100))).1, WinAct::Inject);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_4, true, 20_200))).1, WinAct::Chord(ChordAction::App(3)));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_4, false, 20_250))), SILENT);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 20_300))), PASSED);
+    }
+
+    #[test]
+    fn repeat_of_a_chord_key_is_silent() {
+        let mut s = after_win_3();
+        for t in (10_600..12_000).step_by(33) {
+            assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, t))), SILENT, "repeat at {t}");
+        }
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 12_000))), SILENT);
+        assert_eq!(s.chord_keys, 0);
+        // Win still held: the next digit is a new chord.
+        assert_eq!(ans(win_step(&mut s, owned(KEY_4, true, 12_100))).1, WinAct::Chord(ChordAction::App(3)));
+    }
+
+    #[test]
+    fn chord_key_up_after_win_up_is_swallowed() {
+        let mut s = after_win_3();
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_150))), SILENT);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 10_200))), SILENT);
+        assert_eq!(s.chord_keys, 0);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 10_250))), PASSED, "a second up has no bit");
+    }
+
+    #[test]
+    fn held_digit_after_win_up_is_not_typed() {
+        let mut s = after_win_3();
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_150))), SILENT);
+        for i in 0..5 {
+            let t = 10_600 + i * 33;
+            assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, t))), SILENT, "repeat {i}: never typed");
+        }
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 10_800))), SILENT);
+        assert_eq!(s.chord_keys, 0, "the bit is clear");
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, 10_900))), PASSED, "a new 3 types");
+    }
+
+    #[test]
+    fn bit_expires_after_the_stale_window() {
+        let base = {
+            let mut s = after_win_3();
+            win_step(&mut s, owned(LWIN, false, 10_150));
+            assert_eq!((s.down, s.chord_keys, s.chord_last), (false, 1 << 3, 10_100));
+            s
+        };
+        let mut s = base;
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, 10_100 + 1_499))), SILENT, "within the window");
+        assert_eq!(s.chord_keys, 1 << 3);
+        let mut s = base;
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, 10_100 + 1_501))), PASSED, "its release was lost");
+        assert_eq!(s.chord_keys, 0);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 11_700))), PASSED, "the up of that new press passes");
+        // Win held again: an aged bit is a fresh press, so the chord is the dock's again.
+        let mut s = base;
+        win_step(&mut s, owned(LWIN, true, 13_000));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, 13_050))).1, WinAct::Chord(ChordAction::App(2)));
+    }
+
+    #[test]
+    fn owned_chord_is_not_swallowed_when_hwnd_is_null() {
+        let no_ui = |vk, down, t| WinIn { ui_ready: false, ..owned(vk, down, t) };
+        let mut s = WinState::default();
+        assert_eq!(ans(win_step(&mut s, no_ui(LWIN, true, 10_000))), PRESS);
+        assert_eq!(ans(win_step(&mut s, no_ui(KEY_3, true, 10_100))), (true, WinAct::Inject, false, COMBO));
+        assert_eq!(ans(win_step(&mut s, no_ui(KEY_3, false, 10_150))), PASSED);
+        assert_eq!(ans(win_step(&mut s, no_ui(LWIN, false, 10_200))), PASSED);
+        assert_eq!((s.owned, s.chord_keys), (false, 0));
+    }
+
+    #[test]
+    fn fail_open_injects_and_syncs() {
+        let stuck = |vk, down, t| WinIn { fail_open: true, ..owned(vk, down, t) };
+        let mut s = WinState::default();
+        assert_eq!(ans(win_step(&mut s, stuck(LWIN, true, 10_000))), PRESS);
+        assert_eq!(ans(win_step(&mut s, stuck(KEY_3, true, 10_100))), (true, WinAct::Inject, true, COMBO));
+        assert_eq!(ans(win_step(&mut s, stuck(KEY_3, false, 10_150))), PASSED, "no bit: Windows has the key");
+        assert_eq!(ans(win_step(&mut s, stuck(KEY_4, true, 10_200))), (false, WinAct::None, true, None));
+        assert_eq!(ans(win_step(&mut s, stuck(KEY_E, true, 10_250))), PASSED, "not a chord: no sync");
+        assert_eq!(ans(win_step(&mut s, stuck(LWIN, false, 10_300))), PASSED);
+        assert_eq!((s.owned, s.chord_keys), (false, 0));
+    }
+
+    #[test]
+    fn fail_open_window() {
+        assert!(!chord_fail_open(1, 1, 0, 10_000), "nothing pending");
+        assert!(!chord_fail_open(1, 0, 10_000, 11_499));
+        assert!(!chord_fail_open(1, 0, 10_000, 11_500), "1500 ms: not yet");
+        assert!(chord_fail_open(1, 0, 10_000, 11_501));
+        assert!(!chord_fail_open(1, 1, 10_000, 11_501), "acknowledged");
+        assert!(chord_fail_open(0, u16::MAX, 10_000, 11_501), "the sequence wraps");
+        assert!(!chord_fail_open(u16::MAX, 0, 10_000, 11_501), "acked ahead (a resync): nothing pending");
+        assert!(chord_fail_open(3, 1, u32::MAX - 500, 1_001), "the clock wraps");
+        assert!(!chord_fail_open(3, 1, u32::MAX - 500, 999));
+    }
+
+    #[test]
+    fn chord_bits_cover_the_owned_keys() {
+        let mut seen = 0u16;
+        for vk in (0x30..=0x39).chain([0x54, 0x42]) {
+            let bit = chord_bit(vk).unwrap();
+            assert_eq!(bit.count_ones(), 1, "{vk:#x}");
+            assert_eq!(seen & bit, 0, "{vk:#x} has its own bit");
+            seen |= bit;
+        }
+        assert_eq!(seen, 0x0FFF);
+        assert_eq!(chord_bit(0x30), Some(1), "0 is bit 0");
+        assert_eq!(chord_bit(0x39), Some(1 << 9));
+        for vk in [0x2F, 0x3A, 0x41, 0x60, 0x61, LWIN, LSHIFT, KEY_E] {
+            assert_eq!(chord_bit(vk), None, "{vk:#x}");
+        }
+        // Every key an owned row resolves has a bit.
+        for vk in 0..=0xFF {
+            for m in [Mods::NONE, Mods::SHIFT, Mods::ALT] {
+                if resolve_chord(ALL_ROWS, vk, m).is_some() {
+                    assert!(chord_bit(vk).is_some(), "{vk:#x}");
+                }
+            }
+        }
+    }
+
+    /// A press that owned a chord has no auto-repeat once the digit went down: a pause while Win is held is no lost
+    /// release, so the next digit is still a chord (up to LONE_STUCK_MS for a chord key or a modifier, as `repair_plan`
+    /// waits for a lone press).
+    #[test]
+    fn a_pause_after_an_owned_chord_keeps_win_held() {
+        let mut s = after_win_3();
+        win_step(&mut s, owned(KEY_3, false, 10_150));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_4, true, 13_000))).1, WinAct::Chord(ChordAction::App(3)));
+        win_step(&mut s, owned(KEY_4, false, 13_050));
+        // Beyond LONE_STUCK_MS the release was lost (the secure desktop): the key passes, nothing injected.
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, 13_000 + LONE_STUCK_MS + 1))), PASSED);
+        assert_eq!((s.down, s.owned), (false, false));
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 23_200))), PASSED, "no tracked press");
+    }
+
+    /// A Win release lost on the secure desktop after an owned chord or a passed modifier (a UAC prompt raised by
+    /// Win+Shift+n): past REPEAT_WINDOW_MS after the last key the press kept (`renew`: here the chord's or the
+    /// modifier's down) a key that is neither a chord key nor a modifier takes the stale rule and passes, so Windows
+    /// never gets an injected Win down it would not see released.
+    #[test]
+    fn a_plain_key_after_a_pause_injects_nothing() {
+        let mut s = after_win_3();
+        win_step(&mut s, owned(KEY_3, false, 10_150));
+        let out = win_step(&mut s, owned(KEY_E, true, 10_100 + REPEAT_WINDOW_MS + 1));
+        assert_eq!(ans(out), PASSED);
+        assert_eq!((s.down, s.owned, s.modded, s.other), (false, false, false, false));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, false, 11_650))), PASSED);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 11_700))), PASSED, "no tracked press");
+        // Within REPEAT_WINDOW_MS the pair is injected as before.
+        let mut s = after_win_3();
+        win_step(&mut s, owned(KEY_3, false, 10_150));
+        let out = win_step(&mut s, owned(KEY_E, true, 10_100 + REPEAT_WINDOW_MS));
+        assert_eq!(ans(out), (true, WinAct::Inject, false, COMBO));
+        // After a passed modifier: the same.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        win_step(&mut s, with_mods(LSHIFT, true, 10_100, Mods::SHIFT));
+        win_step(&mut s, owned(LSHIFT, false, 10_150));
+        assert!(s.modded);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, 10_100 + REPEAT_WINDOW_MS + 1))), PASSED);
+        assert!(!s.down);
+        // A chord key under fail-open would inject the pair: past REPEAT_WINDOW_MS it takes the stale rule too.
+        let mut s = after_win_3();
+        win_step(&mut s, owned(KEY_3, false, 10_150));
+        let out = win_step(&mut s, WinIn { fail_open: true, ..owned(KEY_4, true, 10_100 + REPEAT_WINDOW_MS + 1) });
+        assert_eq!(ans(out), PASSED);
+        assert!(!s.down);
+    }
+
+    /// A modifier passed while Win is held, or an owned chord key, is the newest key: it auto-repeats and Win no longer
+    /// does. Its events, with no gap over REPEAT_WINDOW_MS, show the hook was never cut off, so Win's release was not
+    /// lost: the next key injects the pair as in 1.5.2, however long the modifier or the digit was held.
+    #[test]
+    fn a_held_modifier_or_chord_key_keeps_win_held() {
+        const F4: u32 = 0x73;
+        // Win+Ctrl held 2 s (Ctrl auto-repeating), then F4: Win+Ctrl+F4, never Ctrl+F4 alone.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        let mut t = 10_050;
+        while t < 12_050 {
+            assert_eq!(ans(win_step(&mut s, with_mods(LCTRL, true, t, Mods::CTRL))), PASSED, "Ctrl at {t}: passed");
+            t += 33;
+        }
+        assert!(s.down && s.modded && !s.other);
+        assert_eq!(s.last_time, t - 33, "the stamp the watchdog reads is renewed too");
+        assert_eq!(ans(win_step(&mut s, with_mods(F4, true, t, Mods::CTRL))), (true, WinAct::Inject, false, COMBO));
+        // Win+Shift held 2 s, then S: Win+Shift+S.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        let mut t = 10_050;
+        while t < 12_050 {
+            assert_eq!(ans(win_step(&mut s, with_mods(LSHIFT, true, t, Mods::SHIFT))), PASSED);
+            t += 33;
+        }
+        assert_eq!(ans(win_step(&mut s, with_mods(KEY_S, true, t, Mods::SHIFT))), (true, WinAct::Inject, false, COMBO));
+        // Win+3 held 2 s (3 auto-repeating, swallowed), then E: Win+E.
+        let mut s = after_win_3();
+        let mut t = 10_133;
+        while t < 12_100 {
+            assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, t))), SILENT, "3's repeat at {t} is swallowed");
+            t += 33;
+        }
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, t))), (true, WinAct::Inject, false, COMBO));
+        // The chord's own down renews too: with the longest typing delay (1 s) 3's first repeat comes 1.6 s after Win.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, 10_600))).1, WinAct::Chord(ChordAction::App(2)));
+        let mut t = 11_600;
+        while t < 12_600 {
+            assert_eq!(ans(win_step(&mut s, owned(KEY_3, true, t))), SILENT);
+            t += 33;
+        }
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, t))), (true, WinAct::Inject, false, COMBO));
+    }
+
+    /// A gap over REPEAT_WINDOW_MS in the hook's events still takes the stale rule: after a pause, or when a modifier
+    /// auto-repeats again after the hook was cut off (the secure desktop), a key that is neither a chord key nor a
+    /// modifier passes and no pair is injected.
+    #[test]
+    fn a_gap_in_the_events_still_takes_the_stale_rule() {
+        // Win, Shift down and up, a 2 s pause, then S.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        win_step(&mut s, with_mods(LSHIFT, true, 10_050, Mods::SHIFT));
+        win_step(&mut s, owned(LSHIFT, false, 10_100));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_S, true, 12_100))), PASSED);
+        assert_eq!((s.down, s.modded, s.other), (false, false, false));
+        // Shift auto-repeating, a 2 s gap, Shift auto-repeating again: the repeats after the gap renew nothing.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        for t in (10_050..11_000).step_by(33) {
+            win_step(&mut s, with_mods(LSHIFT, true, t, Mods::SHIFT));
+        }
+        let renewed = s.last_time;
+        for t in (13_000..14_000).step_by(33) {
+            assert_eq!(ans(win_step(&mut s, with_mods(LSHIFT, true, t, Mods::SHIFT))), PASSED);
+        }
+        assert_eq!(s.last_time, renewed, "no renewal across the gap");
+        assert_eq!(ans(win_step(&mut s, with_mods(KEY_S, true, 14_000, Mods::SHIFT))), PASSED);
+        assert!(!s.down);
+        // Win+3 with 3 auto-repeating, a 2 s pause, then E.
+        let mut s = after_win_3();
+        for t in (10_133..11_000).step_by(33) {
+            win_step(&mut s, owned(KEY_3, true, t));
+        }
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, true, 13_000))), PASSED);
+        assert!(!s.down);
+    }
+
+    /// A callback stall during an owned chord (live check K-3): Windows removed the hook, so the digit's and Win's
+    /// releases never came, and the async state never saw the swallowed Win down. Every tick reinstalls the hook with
+    /// the state kept (the clear still waits for LONE_STUCK_MS), and the next Win press is fresh and owns its chord.
+    #[test]
+    fn watchdog_reinstalls_after_a_stall_in_an_owned_chord() {
+        let mut s = after_win_3();
+        let mut age = 0;
+        while age <= LONE_STUCK_MS {
+            assert_eq!(repair_plan(s.down, false, false, s.other, age), Repair::Go, "age {age}: the hook is back");
+            assert_eq!(repair_plan(s.down, true, false, s.other, age), Repair::Skip, "Windows holds a Win down");
+            age += REINSTALL_MS;
+        }
+        assert_eq!(repair_plan(s.down, false, false, s.other, LONE_STUCK_MS + 1), Repair::ClearThenGo);
+        // The reinstalled hook sees the next Win+3: a fresh press, the stale bit of 3 expired, the chord owned.
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 12_500))), PRESS);
+        let out = win_step(&mut s, owned(KEY_3, true, 12_600));
+        assert_eq!(ans(out), (true, WinAct::Chord(ChordAction::App(2)), false, None));
+    }
+
+    // ---- Shift and Alt (dock-keys H2b)
+
+    /// An owned-rows event with the tracked modifiers `mods`.
+    fn with_mods(vk: u32, down: bool, time: u32, mods: Mods) -> WinIn {
+        WinIn { mods, ..owned(vk, down, time) }
+    }
+
+    /// (swallow, act, mask) of an answer.
+    fn sam(o: WinOut) -> (bool, WinAct, bool) {
+        (o.swallow, o.act, o.mask)
+    }
+
+    #[test]
+    fn shift_and_alt_chords_mask_the_modifier() {
+        let (sh, alt) = (Mods::SHIFT, Mods::ALT);
+        let mut s = WinState::default();
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 10_000))), PRESS);
+        assert_eq!(sam(win_step(&mut s, with_mods(LSHIFT, true, 10_050, sh))), (false, WinAct::None, false));
+        assert!(s.modded && !s.other, "Shift passed alone, Win pending");
+        let out = win_step(&mut s, with_mods(KEY_3, true, 10_100, sh));
+        assert_eq!(sam(out), (true, WinAct::Chord(ChordAction::NewInstance(2)), true), "the mask follows the post");
+        assert_eq!(sam(win_step(&mut s, with_mods(KEY_3, false, 10_150, sh))), (true, WinAct::None, false));
+        assert_eq!(sam(win_step(&mut s, owned(LSHIFT, false, 10_200))), (false, WinAct::None, false));
+        assert_eq!(sam(win_step(&mut s, owned(LWIN, false, 10_250))), (true, WinAct::None, false), "no toggle");
+        // Win+Alt+3.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        assert_eq!(sam(win_step(&mut s, with_mods(LALT, true, 20_050, alt))), (false, WinAct::None, false));
+        let out = win_step(&mut s, with_mods(KEY_3, true, 20_100, alt));
+        assert_eq!(sam(out), (true, WinAct::Chord(ChordAction::AppMenu(2)), true));
+        assert_eq!(sam(win_step(&mut s, with_mods(KEY_3, false, 20_150, alt))), (true, WinAct::None, false));
+        // Win is still held: the Alt up gets the mask again (harmless; Windows saw the Alt down alone).
+        assert_eq!(sam(win_step(&mut s, owned(LALT, false, 20_200))), (false, WinAct::None, true));
+        assert_eq!(sam(win_step(&mut s, owned(LWIN, false, 20_250))), (true, WinAct::None, false));
+        // A chord without a modifier injects no mask.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 30_000));
+        assert_eq!(
+            sam(win_step(&mut s, owned(KEY_3, true, 30_100))),
+            (true, WinAct::Chord(ChordAction::App(2)), false)
+        );
+    }
+
+    #[test]
+    fn modifier_alone_with_win_is_no_tap() {
+        let mut s = WinState::default();
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 10_000))), PRESS);
+        assert_eq!(ans(win_step(&mut s, with_mods(LSHIFT, true, 10_050, Mods::SHIFT))), PASSED, "nothing injected");
+        assert_eq!(sam(win_step(&mut s, owned(LSHIFT, false, 10_100))), (false, WinAct::None, false));
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_150))), SILENT, "Win up swallowed, nothing toggled");
+        assert_eq!((s.down, s.modded, s.last_alone_up), (false, false, 0));
+        // Ctrl alike; Win+Ctrl+3 is no chord (Ctrl never matches), so Windows gets it with the injected Win.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        assert_eq!(ans(win_step(&mut s, with_mods(LCTRL, true, 20_050, Mods::CTRL))), PASSED);
+        assert_eq!(
+            ans(win_step(&mut s, with_mods(KEY_3, true, 20_100, Mods::CTRL))),
+            (true, WinAct::Inject, false, COMBO)
+        );
+    }
+
+    #[test]
+    fn win_shift_s_still_reaches_windows() {
+        let sh = Mods::SHIFT;
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        assert_eq!(ans(win_step(&mut s, with_mods(LSHIFT, true, 10_050, sh))), PASSED, "Shift was passed");
+        assert_eq!(ans(win_step(&mut s, with_mods(KEY_S, true, 10_100, sh))), (true, WinAct::Inject, false, COMBO));
+        assert_eq!(ans(win_step(&mut s, with_mods(KEY_S, false, 10_150, sh))), PASSED);
+        assert_eq!(ans(win_step(&mut s, owned(LSHIFT, false, 10_200))), PASSED);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 10_250))), PASSED, "Windows saw the injected Win down");
+    }
+
+    #[test]
+    fn win_alt_alt_up_first_is_no_menu() {
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        assert_eq!(sam(win_step(&mut s, with_mods(LALT, true, 10_050, Mods::ALT))), (false, WinAct::None, false));
+        assert_eq!(sam(win_step(&mut s, owned(LALT, false, 10_100))), (false, WinAct::None, true), "mask, then the up");
+        assert_eq!(sam(win_step(&mut s, owned(LWIN, false, 10_150))), (true, WinAct::None, false));
+        // Without Win held an Alt up is plain.
+        assert_eq!(sam(win_step(&mut s, owned(LALT, false, 10_200))), (false, WinAct::None, false));
+        // After the pair Windows holds Win: no mask (Win+Alt+R reached Windows whole).
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        win_step(&mut s, with_mods(LALT, true, 20_050, Mods::ALT));
+        assert_eq!(sam(win_step(&mut s, with_mods(0x52, true, 20_100, Mods::ALT))), (true, WinAct::Inject, false));
+        assert_eq!(sam(win_step(&mut s, owned(LALT, false, 20_150))), (false, WinAct::None, false));
+    }
+
+    /// An Alt pressed after an owned chord is seen by Windows alone too: its release gets the mask.
+    #[test]
+    fn alt_after_an_owned_chord_is_masked() {
+        let mut s = after_win_3();
+        win_step(&mut s, owned(KEY_3, false, 10_150));
+        assert_eq!(sam(win_step(&mut s, with_mods(LALT, true, 10_200, Mods::ALT))), (false, WinAct::None, false));
+        assert_eq!(sam(win_step(&mut s, owned(LALT, false, 10_250))), (false, WinAct::None, true));
+    }
+
+    #[test]
+    fn fast_shift_digit_reads_the_tracker() {
+        // The async key state is stale inside the callback (it reads every key up here): the tracker alone decides.
+        let stale = |_: u32| false;
+        let mut t = ModTrack::default();
+        let mut s = WinState::default();
+        let step = |t: &mut ModTrack, s: &mut WinState, vk: u32, down: bool, time: u32| {
+            track_step(t, 0, vk, down, time, stale);
+            win_step(s, with_mods(vk, down, time, Mods(t.mods(false).0 & !Mods::WIN.0)))
+        };
+        step(&mut t, &mut s, LWIN, true, 10_000);
+        step(&mut t, &mut s, LSHIFT, true, 10_100);
+        let out = step(&mut t, &mut s, KEY_3, true, 10_105);
+        assert_eq!(sam(out), (true, WinAct::Chord(ChordAction::NewInstance(2)), true));
+        // Past MOD_STALE_MS with no modifier event the async state repairs it: a Shift really released reads up.
+        step(&mut t, &mut s, KEY_3, false, 10_150);
+        let out = step(&mut t, &mut s, KEY_4, true, 10_100 + MOD_STALE_MS + 1);
+        assert_eq!(sam(out), (true, WinAct::Chord(ChordAction::App(3)), false));
+    }
+
+    #[test]
+    fn tracker_runs_for_the_dock_alone() {
+        assert!(!tracks(false, DockChords::NONE), "nothing set: the callback tracks nothing, as in 1.5.2");
+        assert!(tracks(true, DockChords::NONE));
+        assert!(tracks(false, DockChords::DIGITS));
+        assert!(tracks(false, DockChords::PEEK));
+        assert!(tracks(true, ALL_ROWS));
+    }
+
+    /// Win+Shift held: Shift auto-repeats, Win does not; a pause before the digit is no lost release.
+    #[test]
+    fn a_pause_with_a_modifier_keeps_win_held() {
+        let sh = Mods::SHIFT;
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        win_step(&mut s, with_mods(LSHIFT, true, 10_100, sh));
+        for t in (10_600..12_500).step_by(33) {
+            assert_eq!(ans(win_step(&mut s, with_mods(LSHIFT, true, t, sh))), PASSED, "Shift's repeat at {t}");
+        }
+        let out = win_step(&mut s, with_mods(KEY_3, true, 12_500, sh));
+        assert_eq!(sam(out), (true, WinAct::Chord(ChordAction::NewInstance(2)), true));
+    }
+
+    // ---- the Win release (dock-keys H2c)
+
+    /// H2c: the Win up of a tracked press over every (other, peeking, owned, modded), with Alt up and with Alt still
+    /// down: (swallow, act, mask, Peek end) pinned per row.
+    #[test]
+    fn win_up_plan_table() {
+        use WinAct::{None as N, Toggle as T};
+        /// (other, peeking, owned, modded) and (swallow, act, mask with Alt down, Peek end).
+        type Row = ((bool, bool, bool, bool), (bool, WinAct, bool, bool));
+        #[rustfmt::skip]
+        let table: [Row; 16] = [
+            // (other, peeking, owned, modded) -> (swallow, act, mask with Alt down, Peek end)
+            ((false, false, false, false), (true, T, false, false)),
+            ((false, false, false, true), (true, N, true, false)),
+            ((false, false, true, false), (true, N, false, false)),
+            ((false, false, true, true), (true, N, true, false)),
+            ((false, true, false, false), (true, N, false, true)),
+            ((false, true, false, true), (true, N, true, true)),
+            ((false, true, true, false), (true, N, false, true)),
+            ((false, true, true, true), (true, N, true, true)),
+            ((true, false, false, false), (false, N, false, false)),
+            ((true, false, false, true), (false, N, false, false)),
+            ((true, false, true, false), (false, N, false, false)),
+            ((true, false, true, true), (false, N, false, false)),
+            ((true, true, false, false), (false, N, false, true)),
+            ((true, true, false, true), (false, N, false, true)),
+            ((true, true, true, false), (false, N, false, true)),
+            ((true, true, true, true), (false, N, false, true)),
+        ];
+        for ((other, peeking, owned, modded), (swallow, act, mask, peek_end)) in table {
+            for alt in [false, true] {
+                let mut s = WinState {
+                    down: true,
+                    vk: LWIN,
+                    last_time: 10_000,
+                    other,
+                    peeking,
+                    owned,
+                    modded,
+                    ..WinState::default()
+                };
+                let mods = if alt { Mods::ALT } else { Mods::NONE };
+                let out = win_step(&mut s, with_mods(LWIN, false, 10_100, mods));
+                let row = (other, peeking, owned, modded, alt);
+                assert_eq!(
+                    (out.swallow, out.act, out.mask, out.peek_end),
+                    (swallow, act, mask && alt, peek_end),
+                    "{row:?}"
+                );
+                assert!(!s.down && !s.peeking && !s.owned && !s.modded, "{row:?}: the press is over");
+                let tap = act == T;
+                assert_eq!(s.last_alone_up, if tap { 10_100 | 1 } else { 0 }, "{row:?}: only a tap is a first tap");
+            }
+        }
+    }
+
+    #[test]
+    fn win_alt_then_release_is_no_menu() {
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        assert_eq!(sam(win_step(&mut s, with_mods(LALT, true, 10_050, Mods::ALT))), (false, WinAct::None, false));
+        let out = win_step(&mut s, with_mods(LWIN, false, 10_100, Mods::ALT));
+        assert_eq!((sam(out), out.peek_end), ((true, WinAct::None, true), false), "swallowed with the mask");
+        assert_eq!(sam(win_step(&mut s, owned(LALT, false, 10_150))), (false, WinAct::None, false), "Alt up passes");
+    }
+
+    // ---- Peek (dock-keys H3)
+
+    /// The state after a Win down at 10,000 with every row owned and the Peek timer's fire (`peek_due` held).
+    fn peeking() -> WinState {
+        let mut s = WinState::default();
+        let out = win_step(&mut s, owned(LWIN, true, 10_000));
+        assert_eq!(out.peek, PeekCmd::Arm(10_000));
+        assert!(peek_due(&s, 10_000, false));
+        s.peeking = true;
+        s
+    }
+
+    #[test]
+    fn peek_commands_on_down_and_up() {
+        let peek_digits = DockChords::PEEK.with(DockChords::DIGITS);
+        let arm = |chords: DockChords, fullscreen: bool| {
+            let mut s = WinState::default();
+            win_step(&mut s, WinIn { chords, fullscreen, ..legacy(LWIN, true, 10_000) }).peek
+        };
+        assert_eq!(arm(ALL_ROWS, false), PeekCmd::Arm(10_000));
+        assert_eq!(arm(peek_digits, false), PeekCmd::Arm(10_000));
+        assert_eq!(arm(ALL_ROWS, true), PeekCmd::Kill, "a fullscreen window is in front");
+        assert_eq!(arm(DockChords::PEEK, false), PeekCmd::Kill, "no digits: no chips to show");
+        assert_eq!(arm(DockChords(ALL_ROWS.0 & !DockChords::PEEK.0), false), PeekCmd::Kill);
+        assert_eq!(arm(DockChords::NONE, false), PeekCmd::Kill);
+        // Only a fresh down arms; auto-repeat keeps the timer.
+        let mut s = WinState::default();
+        assert_eq!(win_step(&mut s, owned(LWIN, true, 10_000)).peek, PeekCmd::Arm(10_000));
+        assert_eq!(win_step(&mut s, owned(LWIN, true, 10_500)).peek, PeekCmd::Keep);
+        assert_eq!(win_step(&mut s, owned(LWIN, true, 10_533)).peek, PeekCmd::Keep);
+        // Kill on every Win up: the tracked press, the other Win key's, one with no press, with or without rows.
+        assert_eq!(win_step(&mut s, owned(RWIN, false, 10_550)).peek, PeekCmd::Kill);
+        assert_eq!(win_step(&mut s, owned(LWIN, false, 10_600)).peek, PeekCmd::Kill);
+        assert_eq!(win_step(&mut s, owned(LWIN, false, 10_700)).peek, PeekCmd::Kill);
+        assert_eq!(win_step(&mut s, legacy(RWIN, false, 10_800)).peek, PeekCmd::Kill);
+        // A press that can no longer Peek kills its timer at once: a chord, a modifier, the pair.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        assert_eq!(win_step(&mut s, owned(KEY_3, true, 20_100)).peek, PeekCmd::Kill);
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 30_000));
+        assert_eq!(win_step(&mut s, with_mods(LSHIFT, true, 30_100, Mods::SHIFT)).peek, PeekCmd::Kill);
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 40_000));
+        assert_eq!(win_step(&mut s, owned(KEY_E, true, 40_100)).peek, PeekCmd::Kill);
+        // Other keys leave it alone.
+        assert_eq!(win_step(&mut WinState::default(), owned(KEY_E, true, 50_000)).peek, PeekCmd::Keep);
+    }
+
+    #[test]
+    fn peek_due_table() {
+        let mut held = WinState::default();
+        win_step(&mut held, owned(LWIN, true, 10_000));
+        win_step(&mut held, owned(LWIN, true, 10_533));
+        assert!(peek_due(&held, 10_000, false), "Win held alone, auto-repeat included");
+        assert!(!peek_due(&held, 10_000, true), "fullscreen");
+        assert!(!peek_due(&held, 9_000, false), "a timer of an earlier press");
+        let cases = [
+            ("released", WinState { down: false, ..held }),
+            ("pair injected", WinState { other: true, ..held }),
+            ("chord owned", WinState { owned: true, ..held }),
+            ("modifier passed", WinState { modded: true, ..held }),
+        ];
+        for (what, s) in cases {
+            assert!(!peek_due(&s, 10_000, false), "{what}");
+        }
+        // Released and pressed again: the new press has its own timer.
+        let mut s = held;
+        win_step(&mut s, owned(LWIN, false, 10_590));
+        win_step(&mut s, owned(LWIN, true, 10_595));
+        assert!(!peek_due(&s, 10_000, false) && peek_due(&s, 10_595, false));
+    }
+
+    #[test]
+    fn peek_ends_on_every_win_up() {
+        // Alone: swallowed, no toggle, Peek ends.
+        let mut s = peeking();
+        let out = win_step(&mut s, owned(LWIN, false, 10_900));
+        assert_eq!((ans(out), out.peek_end, out.peek), (SILENT, true, PeekCmd::Kill));
+        assert_eq!(s.last_alone_up, 0, "no first tap");
+        // After a chord during Peek (Win+3 while the chips show).
+        let mut s = peeking();
+        assert_eq!(win_step(&mut s, owned(KEY_3, true, 10_700)).act, WinAct::Chord(ChordAction::App(2)));
+        assert!(s.peeking, "the chips stay while Win is held");
+        win_step(&mut s, owned(KEY_3, false, 10_750));
+        let out = win_step(&mut s, owned(LWIN, false, 10_900));
+        assert_eq!((ans(out), out.peek_end), (SILENT, true));
+        // After a modifier during Peek, Alt still down: the mask too.
+        let mut s = peeking();
+        win_step(&mut s, with_mods(LALT, true, 10_700, Mods::ALT));
+        let out = win_step(&mut s, with_mods(LWIN, false, 10_900, Mods::ALT));
+        assert_eq!((sam(out), out.peek_end), ((true, WinAct::None, true), true));
+        // A fresh down after a lost release ends the old Peek and arms the new one.
+        let mut s = peeking();
+        let out = win_step(&mut s, owned(LWIN, true, 12_000));
+        assert_eq!((out.peek_end, out.peek, s.peeking), (true, PeekCmd::Arm(12_000), false));
+        // The stale rule (a lost release, then a key): the key passes and Peek ends.
+        let mut s = peeking();
+        let out = win_step(&mut s, owned(KEY_E, true, 10_000 + REPEAT_WINDOW_MS + 1));
+        assert_eq!((ans(out), out.peek_end, s.peeking), (PASSED, true, false));
+    }
+
+    #[test]
+    fn injection_during_peek_ends_it_and_the_win_up_passes() {
+        let mut s = peeking();
+        let out = win_step(&mut s, owned(KEY_E, true, 10_700));
+        assert_eq!((ans(out), out.peek_end, out.peek), ((true, WinAct::Inject, false, COMBO), true, PeekCmd::Kill));
+        assert!(!s.peeking);
+        assert_eq!(ans(win_step(&mut s, owned(KEY_E, false, 10_750))), PASSED);
+        let out = win_step(&mut s, owned(LWIN, false, 10_800));
+        assert_eq!((ans(out), out.peek_end), (PASSED, false), "Windows saw the injected Win down; Peek already ended");
+    }
+
+    #[test]
+    fn stale_repair_clears_the_chord_state() {
+        let mut s = peeking();
+        win_step(&mut s, owned(KEY_3, true, 10_700));
+        win_step(&mut s, with_mods(LSHIFT, true, 10_750, Mods::SHIFT));
+        assert!(s.down && s.owned && s.modded && s.peeking && s.chord_keys != 0);
+        let kept = (s.vk, s.last_time, s.press);
+        assert!(clear_for_repair(&mut s), "Peek was on: its end is posted");
+        assert_eq!(
+            (s.down, s.other, s.owned, s.modded, s.peeking, s.chord_keys),
+            (false, false, false, false, false, 0)
+        );
+        assert_eq!((s.double, s.last_alone_up), (false, 0));
+        assert_eq!((s.vk, s.last_time, s.press), kept);
+        assert!(!clear_for_repair(&mut s), "nothing to end the second time");
+        // After the repair the held digit's up passes (its bit is gone) and the next press starts fresh.
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, 30_000))), PASSED);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 30_100))), PRESS);
+    }
+
+    // ---- cut-offs: the secure desktop, a lock, sleep, a removed hook
+
+    const KEY_2: u32 = 0x32;
+    const KEY_T: u32 = 0x54;
+    const KEY_B: u32 = 0x42;
+
+    /// Win+Shift+3 starts an app that needs elevation: the UAC prompt's desktop takes Win's and Shift's releases. The
+    /// desktop switch is a cut-off: the press is forgotten, so 2, t and b typed in the elevated app right after are plain
+    /// keys, never Win+2 (switch to app 2), Win+T or Win+B (the bar takes the keyboard). The 3 keeps its bit: its up, if
+    /// it still comes, is swallowed like its down was.
+    #[test]
+    fn a_cut_off_forgets_the_win_press() {
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        win_step(&mut s, with_mods(LSHIFT, true, 10_050, Mods::SHIFT));
+        let out = win_step(&mut s, with_mods(KEY_3, true, 10_100, Mods::SHIFT));
+        assert_eq!(out.act, WinAct::Chord(ChordAction::NewInstance(2)));
+        assert_eq!(forget_after_cut_off(&mut s, ALL_ROWS), Some(false));
+        assert_eq!((s.down, s.other, s.owned, s.modded, s.last_alone_up), (false, false, false, false, 0));
+        let mut t = 12_000;
+        for vk in [KEY_2, KEY_T, KEY_B, KEY_4] {
+            assert_eq!(ans(win_step(&mut s, owned(vk, true, t))), PASSED, "{vk:#x} typed after the prompt");
+            assert_eq!(ans(win_step(&mut s, owned(vk, false, t + 50))), PASSED);
+            t += 100;
+        }
+        assert_eq!(ans(win_step(&mut s, owned(KEY_3, false, t))), SILENT, "the chord key's up is still swallowed");
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, t + 50))), PASSED, "no tracked press");
+        // Peek on at the cut-off: it ends.
+        let mut s = peeking();
+        assert_eq!(forget_after_cut_off(&mut s, ALL_ROWS), Some(true));
+        assert!(!s.down && !s.peeking);
+        // A plain press after the pair: Windows holds the injected Win, the physical Win up still passes.
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        win_step(&mut s, owned(KEY_E, true, 20_100));
+        assert_eq!(forget_after_cut_off(&mut s, ALL_ROWS), Some(false));
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 20_200))), PASSED);
+    }
+
+    /// The same cut-off forgets the tracked modifiers (the hook moves RESET_MODS when `forget_after_cut_off` answers,
+    /// a wire pinned by `the_cut_off_is_wired_on_the_hook_thread`): a Shift released on the UAC prompt's desktop, then
+    /// Alt+Tab, which renews the tracker's time, then Win+2 within MOD_STALE_MS. Without the reset the lost Shift picks
+    /// Win+Shift+2 (a new instance) instead of Win+2. With rows owned the answer is Some even when no Win press is
+    /// tracked.
+    #[test]
+    fn a_cut_off_forgets_the_tracked_modifiers() {
+        let mut s = WinState::default();
+        assert_eq!(forget_after_cut_off(&mut s, ALL_ROWS), Some(false), "rows owned: the modifiers are forgotten");
+        let tracked = |reset: u32| {
+            let mut t = ModTrack::default();
+            track_step(&mut t, 0, LSHIFT, true, 10_000, |_| false);
+            // The prompt; Shift's release went to its desktop.
+            track_step(&mut t, reset, LALT, true, 13_000, |_| false);
+            track_step(&mut t, reset, TAB, true, 13_050, |_| false);
+            track_step(&mut t, reset, LALT, false, 13_100, |_| false);
+            track_step(&mut t, reset, LWIN, true, 13_500, |_| false);
+            t.mods(false)
+        };
+        let row = |mods: Mods| {
+            let mut s = WinState::default();
+            win_step(&mut s, with_mods(LWIN, true, 13_500, mods));
+            win_step(&mut s, with_mods(KEY_2, true, 13_600, mods)).act
+        };
+        assert_eq!(row(tracked(0)), WinAct::Chord(ChordAction::NewInstance(1)), "no reset: the stale Shift's row");
+        assert_eq!(row(tracked(1)), WinAct::Chord(ChordAction::App(1)), "the cut-off's reset: Win+2");
+    }
+
+    /// With no row owned and a press that is not the dock's, a cut-off changes nothing: release 1.5.2's Win branch keeps
+    /// its own stale rule. A press the dock owned before its rows went (a remote client came to the front) is forgotten.
+    #[test]
+    fn a_cut_off_without_rows_leaves_the_1_5_2_branch_alone() {
+        let mut s = WinState::default();
+        win_step(&mut s, legacy(LWIN, true, 10_000));
+        win_step(&mut s, legacy(KEY_E, true, 10_100));
+        let before = s;
+        assert_eq!(forget_after_cut_off(&mut s, DockChords::NONE), None);
+        assert_eq!(s, before);
+        let mut s = WinState::default();
+        win_step(&mut s, legacy(LWIN, true, 10_000));
+        assert_eq!(forget_after_cut_off(&mut s, DockChords::NONE), None, "a lone press");
+        let mut s = after_win_3();
+        assert_eq!(forget_after_cut_off(&mut s, DockChords::NONE), Some(false), "an owned press");
+        assert!(!s.down);
+        let mut s = WinState::default();
+        assert_eq!(forget_after_cut_off(&mut s, DockChords::NONE), None, "nothing at all");
+    }
+
+    /// A reinstall whose UnhookWindowsHookEx fails found the hook already removed by Windows (a callback overran
+    /// LowLevelHooksTimeout): keys went by unseen, so it is a cut-off. Pinned on the source: `reinstall` cannot run here.
+    #[test]
+    fn a_reinstall_that_finds_the_hook_removed_is_a_cut_off() {
+        let src = include_str!("hook.rs");
+        let body = src.find("fn reinstall() {").map(|at| &src[at..]).unwrap();
+        let body = &body[..body.find("\nfn uninstall()").unwrap()];
+        let unhook = body.find("UnhookWindowsHookEx(HHOOK(old as *mut _)) }.is_err()").unwrap();
+        let cut = body.find("cut_off_now(CutOff::HookRemoved)").unwrap();
+        assert!(unhook < cut, "the failed unhook of the old hook calls the cut-off");
+        // The note's code round-trips for every cut-off; a variant left out of ALL would lose its note.
+        for why in CutOff::ALL {
+            assert_eq!(CutOff::from_code(why as isize), Some(why));
+        }
+        assert_eq!(CutOff::from_code(CutOff::WindowAbove as isize), Some(CutOff::WindowAbove));
+        assert_eq!(CutOff::from_code(-1), None);
+        assert_eq!(CutOff::from_code(CutOff::ALL.len() as isize), None);
+    }
+
+    /// A reinstall swaps the hook while keys come: a key Windows handed to the old hook just before the new one went
+    /// in waits in this thread's queue, and a hook removed before the thread pumps never answers it, so Windows passes
+    /// the key on unseen. A Win auto-repeat of a press the hook swallows then gives Windows a Win down whose release
+    /// the hook swallows too: Windows holds Win after it is released. The old hook answers the calls already sent to it
+    /// before it goes; every key after the install reaches the new one. Pinned on the source: no hook installs here.
+    #[test]
+    fn a_reinstall_answers_the_keys_sent_to_the_old_hook_before_removing_it() {
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let reinstall = source_block(src, "fn reinstall()");
+        let answer = "answer_sent_keys();";
+        let unhook = "UnhookWindowsHookEx(HHOOK(old as *mut _))";
+        let drained = src.contains("fn answer_sent_keys()").then(|| source_block(src, "fn answer_sent_keys()"));
+        let peek = "PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE)";
+        let wires = [
+            ("reinstall: the new hook in before the old hook answers", order(&reinstall, "match set_hook() {", answer)),
+            ("reinstall: the old hook answers before it is removed", order(&reinstall, answer, unhook)),
+            ("answer_sent_keys: the sent calls only, nothing posted taken", drained.is_some_and(|b| b.contains(peek))),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    // ---- a Win key-down that went by the hook unseen (a reinstall, a time-out)
+
+    /// One event as `win_key` runs it: `note_release` (Windows holding the key: `held`, None when the key state must not
+    /// be read, which panics if it is), then `win_step`.
+    fn step_seen(s: &mut WinState, ev: WinIn, held: Option<bool>) -> WinOut {
+        note_release(s, ev, |_| held.expect("the key state is read only at the release of a tracked press"));
+        win_step(s, ev)
+    }
+
+    /// The state after a lone Win down at 10,000 with every row owned.
+    fn lone_press() -> WinState {
+        let mut s = WinState::default();
+        assert_eq!(ans(step_seen(&mut s, owned(LWIN, true, 10_000), None)), PRESS);
+        s
+    }
+
+    /// The live failure: a key-down of a tracked press went by the hook unseen (a reinstall swapped the hook, or Windows
+    /// timed it out), so Windows holds Win while the hook believes it swallowed the press. At its release, with a row
+    /// owned and no pair injected, the release reaches Windows behind the menu-mask key (no Start menu) and the press
+    /// ends with no tap; a Peek on ends. Without it the release is swallowed and Windows keeps Win down: every later key
+    /// is Win+key. Read at the release (a release between two ticks) or noted by the tick: either is enough.
+    #[test]
+    fn a_release_windows_holds_passes_behind_the_mask() {
+        let cases = [
+            ("lone press", lone_press(), false),
+            ("peeking", peeking(), true),
+            ("chord owned", after_win_3(), false),
+            ("modifier passed", WinState { modded: true, ..lone_press() }, false),
+            ("second press of a double tap", WinState { double: true, ..lone_press() }, false),
+        ];
+        for (what, before, peek_end) in cases {
+            for mods in [Mods::NONE, Mods::ALT] {
+                let mut s = before;
+                let out = step_seen(&mut s, with_mods(LWIN, false, 12_000, mods), Some(true));
+                assert_eq!(
+                    (out.swallow, out.act, out.mask, out.peek_end, out.note),
+                    (false, WinAct::None, true, peek_end, Some(EV_LEAK)),
+                    "{what}, mods {}",
+                    mods.0
+                );
+                assert_eq!(out.peek, PeekCmd::Kill, "{what}");
+                assert!(!s.down && !s.leaked && !s.peeking && !s.owned && !s.modded, "{what}: the press is over");
+                assert_eq!((s.last_alone_up, s.double), (0, false), "{what}: no tap, so no first tap of a double");
+            }
+        }
+        // The watchdog's note alone: a release read as up still passes, masked.
+        let mut s = WinState { leaked: true, ..lone_press() };
+        let out = step_seen(&mut s, owned(LWIN, false, 12_000), Some(false));
+        assert_eq!((out.swallow, out.act, out.mask, out.note), (false, WinAct::None, true, Some(EV_LEAK)));
+        // Windows does not hold it and nothing was noted: the answers of before.
+        let mut s = lone_press();
+        let out = step_seen(&mut s, owned(LWIN, false, 12_000), Some(false));
+        assert_eq!((out.swallow, out.act, out.mask), (true, WinAct::Toggle, false));
+        let mut s = after_win_3();
+        assert_eq!(ans(step_seen(&mut s, owned(LWIN, false, 12_000), Some(false))), SILENT);
+    }
+
+    /// Rule I runs only at the release of a tracked press with no pair and a row owned: with no row the key state is
+    /// never read and every answer is release 1.5.2's, a note included; with rows, a down, the other Win's up and a
+    /// pair's release read nothing and answer as before.
+    #[test]
+    fn a_release_reads_the_key_state_only_with_a_row_and_no_pair() {
+        let mut s = WinState::default();
+        step_seen(&mut s, legacy(LWIN, true, 10_000), None);
+        let out = step_seen(&mut s, legacy(LWIN, false, 10_100), None);
+        assert_eq!((out.swallow, out.act, out.mask), (true, WinAct::Toggle, false), "no row");
+        let mut s = WinState::default();
+        step_seen(&mut s, legacy(LWIN, true, 20_000), None);
+        s.leaked = true;
+        let out = step_seen(&mut s, legacy(LWIN, false, 20_100), None);
+        assert_eq!((out.swallow, out.act, out.mask), (true, WinAct::Toggle, false), "no row, noted");
+        let mut s = lone_press();
+        assert_eq!(ans(step_seen(&mut s, owned(RWIN, false, 10_050), None)), PASSED, "the other Win's up");
+        assert!(s.down, "the press goes on");
+        assert_eq!(step_seen(&mut s, owned(KEY_L, true, 10_100), None).act, WinAct::Inject);
+        step_seen(&mut s, owned(KEY_L, false, 10_150), None);
+        let out = step_seen(&mut s, owned(LWIN, false, 10_200), None);
+        assert_eq!((out.swallow, out.mask, out.note), (false, false, None), "a pair's release passes as before");
+    }
+
+    /// Rule I's wires, pinned on the source (the callback cannot run here): `win_key` reads the key state through
+    /// `note_release` before the step, and sends the menu-mask key the step asks for, before the up passes; the UI logs
+    /// the release. Every missing wire is named.
+    #[test]
+    fn the_release_rule_is_wired() {
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let key = source_block(src, "fn win_key(");
+        let read = "note_release(&mut s, ev, |vk| unsafe { GetAsyncKeyState(vk as i32) } < 0);";
+        let wires = [
+            ("win_key: the key state read before the step", order(&key, read, "let out = win_step(&mut s, ev);")),
+            ("win_key: the step's mask sent", key.contains("if out.mask { send_mask(); }")),
+            ("main: the release's line", include_str!("main.rs").contains("hook::EV_LEAK => log!(")),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    /// The watchdog's tick: Windows holds the Win key of a tracked press with no pair injected. The press
+    /// notes it (its release then passes, `win_up_plan`), with one line per press; the other Win key, a pair's press or
+    /// no press is no leak. Every path that ends the press drops the note, so no later press inherits it.
+    #[test]
+    fn the_watchdog_notes_a_held_win_once_per_press() {
+        let held = WinState { down: true, vk: LWIN, last_time: 10_000, press: 10_000, ..WinState::default() };
+        let table = [
+            ("Windows holds the press's key", held, true, false, true),
+            ("Windows holds both Win keys", held, true, true, true),
+            ("Windows holds the other Win key only", held, false, true, false),
+            ("Windows holds no Win key", held, false, false, false),
+            ("a pair injected", WinState { other: true, ..held }, true, false, false),
+            ("no press", WinState { down: false, ..held }, true, true, false),
+            ("a right Win press", WinState { vk: RWIN, ..held }, false, true, true),
+        ];
+        for (what, before, lwin, rwin, noted) in table {
+            let mut s = before;
+            assert_eq!(note_leak(&mut s, lwin, rwin), noted, "{what}: the line");
+            assert_eq!(s, WinState { leaked: noted, ..before }, "{what}: the note, and nothing else");
+            assert!(!note_leak(&mut s, lwin, rwin), "{what}: one line per press");
+        }
+        let noted = WinState { leaked: true, ..held };
+        let mut s = noted;
+        win_step(&mut s, owned(LWIN, true, 10_000 + REPEAT_WINDOW_MS + 1));
+        assert!(s.down && !s.leaked, "a new press");
+        let mut s = noted;
+        win_step(&mut s, legacy(LWIN, false, 10_100));
+        assert!(!s.down && !s.leaked, "the release, no row owned");
+        let mut s = noted;
+        win_step(&mut s, owned(KEY_L, true, 10_000 + REPEAT_WINDOW_MS + 1));
+        assert!(!s.down && !s.leaked, "the stale rule");
+        let mut s = noted;
+        clear_for_repair(&mut s);
+        assert!(!s.down && !s.leaked, "the watchdog's repair");
+        let mut s = noted;
+        assert_eq!(forget_after_cut_off(&mut s, ALL_ROWS), Some(false));
+        assert!(!s.down && !s.leaked, "a cut-off");
+    }
+
+    /// The tick's wires, pinned on the source (`reinstall` cannot run here): the tick notes the press and writes its
+    /// one line before the skip that leaves the hook alone while Windows holds a Win key, storing the note on the hook
+    /// thread with no pump in between. The note reaches the release only through the statics: `store_win_state` keeps
+    /// it and `load_win_state` reads it back for the callback's step. Every missing wire is named.
+    #[test]
+    fn the_watchdog_note_is_wired() {
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let reinstall = source_block(src, "fn reinstall()");
+        let noted = "let mut press = load_win_state(); if note_leak(&mut press, l, r) { store_win_state(&press); log!(";
+        let load = source_block(src, "fn load_win_state()");
+        let store = source_block(src, "fn store_win_state(");
+        let wires = [
+            ("reinstall: the note and its line", reinstall.contains(noted)),
+            ("reinstall: the note before the skip", order(&reinstall, noted, "Repair::Skip => return,")),
+            ("load_win_state: the note read back", load.contains("leaked: WIN_LEAKED.load(Relaxed),")),
+            ("store_win_state: the note kept", store.contains("WIN_LEAKED.store(s.leaked, Relaxed);")),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    /// A key seen twice: between a reinstall's install and its unhook (`answer_sent_keys`) a key the new hook passes reaches the
+    /// old hook too (CallNextHookEx), so the callback sees it twice. Every key the Win branch passes, from every kind of
+    /// press, with no row, with rows and failed open, in time and after the stale window: the second look passes it,
+    /// changes no state and adds nothing the first did not do (the menu-mask key of an Alt up and the Sync post of a
+    /// failed-open chord repeat, both harmless). A swallowed key never reaches the old hook, and the dock's own tagged
+    /// injections are no user key (`accepted`). The launcher's rules too: a key they pass posts nothing more.
+    #[test]
+    fn a_passed_key_seen_twice_changes_nothing_more() {
+        let lone = lone_press();
+        let starts = [
+            ("idle", WinState::default()),
+            ("lone press", lone),
+            ("pair injected", WinState { other: true, ..lone }),
+            ("chord owned", after_win_3()),
+            ("modifier passed", WinState { modded: true, ..lone }),
+            ("peeking", peeking()),
+            ("noted", WinState { leaked: true, ..lone }),
+        ];
+        let stuck = |vk, down, t| WinIn { fail_open: true, ..owned(vk, down, t) };
+        let ins: [fn(u32, bool, u32) -> WinIn; 3] = [legacy, owned, stuck];
+        let mut passed = 0;
+        for (what, start) in starts {
+            for vk in [LWIN, RWIN, KEY_3, KEY_L, LALT, LSHIFT] {
+                for (down, t, mods, i) in [true, false]
+                    .into_iter()
+                    .flat_map(|d| [10_100, 10_000 + REPEAT_WINDOW_MS + 1].map(|t| (d, t)))
+                    .flat_map(|(d, t)| [Mods::NONE, Mods::ALT].map(|m| (d, t, m)))
+                    .flat_map(|(d, t, m)| [0, 1, 2].map(|i| (d, t, m, i)))
+                {
+                    let ev = WinIn { mods, ..ins[i](vk, down, t) };
+                    let mut once = start;
+                    let first = win_step(&mut once, ev);
+                    if first.swallow {
+                        continue;
+                    }
+                    let mut twice = once;
+                    let second = win_step(&mut twice, ev);
+                    let row = format!("{what}: vk {vk:#x} down {down} t {t} mods {} in {i}", mods.0);
+                    assert_eq!(twice, once, "{row}: the state changed again");
+                    assert!(!second.swallow, "{row}: swallowed the second time");
+                    assert_eq!((second.act, second.note, second.peek_end), (WinAct::None, None, false), "{row}");
+                    assert!(!matches!(second.peek, PeekCmd::Arm(_)), "{row}: Peek armed again");
+                    assert!(!second.mask || first.mask, "{row}: a mask the first look did not send");
+                    assert!(!second.sync || first.sync, "{row}: a Sync the first look did not post");
+                    passed += 1;
+                }
+            }
+        }
+        assert!(passed > 100, "{passed} passed keys looked at");
+        let alt = |flags: u8| ChordState { flags: PassFlags(flags), mods: Mods::ALT, ..st() };
+        let cases = [
+            ("fullscreen", alt(PassFlags::FULLSCREEN.0), SPACE, true),
+            ("remote", alt(PassFlags::REMOTE.0), SPACE, true),
+            ("yielding", alt(PassFlags::YIELD.0), SPACE, true),
+            ("passed press", ChordState { space: SpaceState::Passed, space_time: 10_000, ..alt(0) }, SPACE, false),
+            ("plain key", st(), KEY_A, true),
+            ("modifier", st(), LSHIFT, true),
+        ];
+        for (what, start, vk, down) in cases {
+            let ring = Ring::new();
+            let mut once = start;
+            let (swallow, _) = chord_step(&mut once, &ring, ev(vk, down, 10_100));
+            assert_ne!(swallow, Some(true), "{what}: passed");
+            let mut twice = once;
+            let (again, act) = chord_step(&mut twice, &ring, ev(vk, down, 10_100));
+            assert_ne!(again, Some(true), "{what}: swallowed the second time");
+            assert_eq!(act, Act::Nothing, "{what}: posted again");
+            assert_eq!(twice, once, "{what}: the state changed again");
+        }
+    }
+
+    /// Pinned on the source (`reinstall` cannot run here): owner-probe builds write one line per successful
+    /// reinstall, with its tick count on kb.time's clock, so a live check matches a key to a reinstall; release builds
+    /// have no such line (the reinstall runs every 2 s while keys come). Every missing wire is named.
+    #[test]
+    fn a_probe_build_logs_each_reinstall() {
+        let src = include_str!("hook.rs");
+        let reinstall = source_block(src, "fn reinstall()");
+        let ok = source_block(&reinstall, "Ok(new) =>");
+        let err = reinstall.find("Err(e) => log!(\"hook watchdog: reinstall failed: {e}\")").map(|at| &reinstall[at..]);
+        let call = "#[cfg(feature = \"owner-probe\")] reinstalled_line(); }";
+        let line = flat("#[cfg(feature = \"owner-probe\")] fn reinstalled_line() {");
+        let body = src.contains("fn reinstalled_line()").then(|| source_block(src, "fn reinstalled_line()"));
+        let tick = "log!(\"hook: reinstalled at tick {tick}\")";
+        let wires = [
+            ("reinstall: the line after the unhook", ok.ends_with(call)),
+            ("reinstall: no line for a failed install", err.is_some_and(|e| !e.contains("reinstalled_line"))),
+            ("reinstalled_line: probe builds only", flat(src).contains(&line)),
+            ("reinstalled_line: the tick count", body.is_some_and(|b| b.contains(tick))),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    /// `s` with its whitespace folded to single spaces.
+    fn flat(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The block that follows `head` in `src` (its first `{` to the matching `}`), comment lines dropped and the
+    /// whitespace folded (`flat`): the source pins of wires a test cannot run. A comment satisfies no pin.
+    fn source_block(src: &str, head: &str) -> String {
+        let code = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let at = code.find(head).unwrap_or_else(|| panic!("{head}: not in the source")) + head.len();
+        let open = at + code[at..].find('{').unwrap();
+        let mut depth = 0;
+        for (i, c) in code[open..].char_indices() {
+            depth += match c {
+                '{' => 1,
+                '}' => -1,
+                _ => 0,
+            };
+            if depth == 0 {
+                return flat(&code[open..=open + i]);
+            }
+        }
+        panic!("{head}: the block never ends");
+    }
+
+    /// The hook thread's cut-off wires, pinned on the source (a desktop switch, a thread note and `cut_off_now` cannot
+    /// run here): once `forget_after_cut_off` answers, `cut_off_now` stores the forgotten press, posts the end of a
+    /// Peek that was on (without the post the digit chips stay up after a lock or a UAC prompt: no later Win event of
+    /// that press finds Peek on) and resets the tracked modifiers (without the reset a Shift released on the UAC
+    /// prompt's desktop turns Win+2 into Win+Shift+2); the thread registers EVENT_SYSTEM_DESKTOPSWITCH out of context
+    /// before it pumps, and that event's callback is the desktop switch's cut-off; `cut_off` posts the note and the
+    /// loop hands it to `cut_off_now`. Every missing wire is named.
+    #[test]
+    fn the_cut_off_is_wired_on_the_hook_thread() {
+        let src = include_str!("hook.rs");
+        let now = source_block(src, "fn cut_off_now(why: CutOff)");
+        let forget = now.find("let Some(peek_end) = forget_after_cut_off(&mut s, rows) else { return };");
+        let after = |what: &str| matches!((forget, now.find(what)), (Some(a), Some(b)) if a < b);
+        let main = source_block(src, "fn thread_main(");
+        let desk = flat(
+            "SetWinEventHook( EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, None, Some(desktop_switched),
+             0, 0, WINEVENT_OUTOFCONTEXT, )",
+        );
+        let pumped = matches!((main.find(&desk), main.find("GetMessageW(")), (Some(a), Some(b)) if a < b);
+        let note = source_block(&main, "else if msg.wParam.0 == NOTE_CUT_OFF");
+        let switched = source_block(src, "fn desktop_switched(");
+        let post = "PostThreadMessageW(tid, WM_HOOK_NOTE, WPARAM(NOTE_CUT_OFF), LPARAM(why as isize))";
+        let wires = [
+            ("cut_off_now: the press stored after forget_after_cut_off", after("store_win_state(&s);")),
+            ("cut_off_now: a Peek on is ended", after("if peek_end { post_peek(false, unsafe { GetTickCount() }); }")),
+            ("cut_off_now: reset_modifiers after forget_after_cut_off", after("reset_modifiers();")),
+            ("thread_main: the desktop-switch WinEvent hook before the pump", pumped),
+            (
+                "desktop_switched: the desktop switch's cut-off",
+                switched.contains("cut_off_now(CutOff::DesktopSwitch);"),
+            ),
+            ("cut_off: posts NOTE_CUT_OFF", source_block(src, "pub fn cut_off(why: CutOff)").contains(post)),
+            (
+                "thread_main: NOTE_CUT_OFF reaches cut_off_now",
+                note.contains("CutOff::from_code(msg.lParam.0) { cut_off_now(why); }"),
+            ),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    /// The UI's wires of the cut-offs and of the rows for the window in front, pinned on ui.rs and launcher_sys.rs
+    /// (window messages and the window in front cannot run here): the power and session arms of `handle_message` hand
+    /// `cut_off_of`'s answer to `cut_off`; the foreground arm runs `chords_follow_foreground`, which reads the window
+    /// in front (`front_of` of its process's image, an open denied being `Refused`), hands the hook the rows for it and
+    /// hands the hook the cut-off of the change from the last look (`front_cut_off`); `chords_sync` (the start and each
+    /// config reload) stores the config's rows, then goes through `chords_follow_foreground` too and never hands the
+    /// hook the rows itself (they would reach a remote client in front); owning a row watches the session events. Every
+    /// missing wire is named.
+    #[test]
+    fn the_ui_wires_the_cut_offs_and_the_remote_rows() {
+        let src = include_str!("ui.rs");
+        let sys = include_str!("launcher_sys.rs");
+        let cut = "if let Some(why) = cut_off_of(msg, wp.0) { crate::hook::cut_off(why); }";
+        let foreground = source_block(src, "if wp.0 as u32 == EVENT_SYSTEM_FOREGROUND");
+        let follow = source_block(src, "fn chords_follow_foreground()");
+        let front = "let front = if rows == hook::DockChords::NONE { Front::Local } else { \
+                     crate::launcher_sys::with_foreground_image(front_of) };";
+        let was = "let was = FRONT.with(|f| f.replace(front));";
+        let changed = "if let Some(why) = front_cut_off(was, front) { hook::cut_off(why); }";
+        let sync = source_block(src, "fn chords_sync()");
+        let set = sync.find("CHORDS.set(chords);");
+        let follows = matches!((set, sync.find("chords_follow_foreground();")), (Some(a), Some(b)) if a < b);
+        let owned = source_block(&sync, "if chords != hook::DockChords::NONE");
+        let image = source_block(sys, "fn with_image<R>(");
+        let pid = source_block(sys, "pub(crate) fn with_foreground_image<R>(");
+        let wires = [
+            ("WM_POWERBROADCAST: hook::cut_off", source_block(src, "WM_POWERBROADCAST =>").contains(cut)),
+            ("WM_WTSSESSION_CHANGE: hook::cut_off", source_block(src, "WM_WTSSESSION_CHANGE =>").contains(cut)),
+            ("EVENT_SYSTEM_FOREGROUND: chords_follow_foreground", foreground.contains("chords_follow_foreground();")),
+            ("chords_follow_foreground: the window in front", follow.contains(&flat(front))),
+            ("chords_follow_foreground: the last look", follow.contains(was)),
+            (
+                "chords_follow_foreground: the rows",
+                follow.contains("hook::set_dock_chords(effective_chords(rows, front));"),
+            ),
+            ("chords_follow_foreground: the cut-off of the change", follow.contains(changed)),
+            ("with_foreground_image: the image of its process", pid.contains("with_image(pid, f)")),
+            (
+                "with_image: an open denied is Refused",
+                image.contains("Err(e) if refused(e.code()) => return f(ProcessImage::Refused),"),
+            ),
+            ("chords_sync: a row watches the sessions", owned.contains("crate::launcher_sys::watch_sessions();")),
+            ("chords_sync: the rows follow the window in front", follows && !sync.contains("hook::set_dock_chords(")),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
+    }
+
+    // ---- stall evidence: a hook thread that did not serve the keyboard in time is a cut-off
+
+    const KEY_0: u32 = 0x30;
+    const KEY_7: u32 = 0x37;
+    const KEY_9: u32 = 0x39;
+
+    /// A late return: a callback that returns more than STALL_MS after its entry kept the keyboard waiting, and Windows
+    /// passed on the keys that came meanwhile (in a live session each key of a 5 s stall timed out after about 0.3 s
+    /// and never reached the hook). The tick count wraps after 49.7 days.
+    #[test]
+    fn a_callback_that_returns_late_is_a_stall() {
+        assert!(!overran(10_000, 10_000), "the usual callback, under one step of the tick count");
+        assert!(!overran(10_000, 10_000 + STALL_MS));
+        assert!(overran(10_000, 10_000 + STALL_MS + 1));
+        assert!(overran(10_000, 10_000 + HOOK_TIMEOUT_MS), "Windows gave up on the key");
+        assert!(overran(10_000, 15_000), "the owner-probe stall of 5 s");
+        assert!(overran(u32::MAX - 100, STALL_MS), "across the wrap");
+        assert!(!overran(u32::MAX - 100, 100), "across the wrap, in time");
+    }
+
+    /// The live session's stall with its cut-off: Win, then T (Win+T, owned), whose callback returns 5 s later; T's
+    /// auto-repeat, T's up and Win's up time out meanwhile and never reach the hook. The late return is a cut-off, so
+    /// the 9, 0 and 7 typed a second later are plain keys, where they were Win+9, Win+0 and Win+7 (App(8), App(9) and
+    /// App(6) in the session's log). A fresh Win press right after works at once and owns its chords, Win+T included:
+    /// T's bit, kept for an up that never came, has expired.
+    #[test]
+    fn a_stall_in_an_owned_chord_is_a_cut_off_and_the_next_press_works() {
+        let mut s = WinState::default();
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 10_000))), PRESS);
+        let out = win_step(&mut s, owned(KEY_T, true, 10_047));
+        assert_eq!(ans(out), (true, WinAct::Chord(ChordAction::FocusFirst), false, None));
+        assert!(overran(10_047, 15_047), "the callback of T returns 5 s after its entry");
+        let mut kept = s;
+        let out = win_step(&mut kept, owned(KEY_9, true, 16_360));
+        assert_eq!(out.act, WinAct::Chord(ChordAction::App(8)), "no cut-off: the 9 is Win+9");
+        assert_eq!(forget_after_cut_off(&mut s, ALL_ROWS), Some(false));
+        let mut t = 16_360;
+        for vk in [KEY_9, KEY_0, KEY_7] {
+            assert_eq!(ans(win_step(&mut s, owned(vk, true, t))), PASSED, "{vk:#x} typed after the stall");
+            assert_eq!(ans(win_step(&mut s, owned(vk, false, t + 50))), PASSED);
+            t += 160;
+        }
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, true, 17_000))), PRESS, "a fresh press");
+        let out = win_step(&mut s, owned(KEY_T, true, 17_100));
+        assert_eq!(ans(out), (true, WinAct::Chord(ChordAction::FocusFirst), false, None));
+        assert_eq!(ans(win_step(&mut s, owned(KEY_T, false, 17_150))), SILENT);
+        assert_eq!(ans(win_step(&mut s, owned(LWIN, false, 17_200))), SILENT, "an owned press toggles nothing");
+    }
+
+    /// A late key: one that reaches the callback more than STALL_MS after its time stamp shows the hook thread was not
+    /// serving the keyboard. A stamp ahead of the tick count (an injection with a made-up time, which the hook ignores
+    /// anyway unless the owner-probe switch admits it) is not late. The tick count wraps.
+    #[test]
+    fn a_key_that_reaches_the_callback_late_is_a_stall() {
+        assert!(!came_late(10_000, 10_000), "the usual key, at once");
+        assert!(!came_late(10_000, 10_000 + STALL_MS));
+        assert!(came_late(10_000, 10_000 + STALL_MS + 1));
+        assert!(came_late(10_000, 10_297), "Windows gives up on such a key (about 0.3 s)");
+        assert!(!came_late(10_001, 10_000), "a stamp 1 ms ahead");
+        assert!(!came_late(20_000, 10_000), "a stamp 10 s ahead");
+        assert!(came_late(u32::MAX - 100, STALL_MS), "across the wrap");
+        assert!(!came_late(u32::MAX - 100, 100), "across the wrap, in time");
+        // Only a key the hook admits counts: an injection of another app (no tag) and the dock's own (tagged) do not.
+        assert!(!accepted(LLKHF_INJECTED.0, 0));
+        assert!(!accepted(LLKHF_INJECTED.0, INJECT_TAG));
+        assert!(accepted(0, 0));
+    }
+
+    /// A late tick: a heartbeat tick more than HEARTBEAT_MS + STALL_MS after the last one (or the arming) shows the
+    /// hook thread did not run. A pause of the thread long enough for Windows to give up on a key (HOOK_TIMEOUT_MS,
+    /// which the tick count can read one step short) makes the next tick that late even when the pause begins right
+    /// after a tick; the usual tick, rounded up to the system timer's 15.6 ms steps, is far inside. The tick count
+    /// wraps.
+    #[test]
+    fn a_late_heartbeat_is_a_stall() {
+        assert!(!beat_late(10_000, 10_000 + HEARTBEAT_MS), "on time");
+        assert!(!beat_late(10_000, 10_063), "rounded up to the system timer");
+        assert!(!beat_late(10_000, 10_000 + HEARTBEAT_MS + STALL_MS));
+        assert!(beat_late(10_000, 10_000 + HEARTBEAT_MS + STALL_MS + 1));
+        assert!(beat_late(10_000, 10_000 + HOOK_TIMEOUT_MS + 1), "a pause just past the time-out, right after a tick");
+        assert!(beat_late(10_000, 10_297), "the shortest time-out a live session measured");
+        assert!(beat_late(10_000, 10_000 + HOOK_TIMEOUT_MS - TICK_STEP_MS), "a lost key, read one step short");
+        assert!(beat_late(10_000, 15_000), "the owner-probe stall of 5 s");
+        assert!(beat_late(u32::MAX - 100, HEARTBEAT_MS + STALL_MS), "across the wrap");
+        assert!(!beat_late(u32::MAX - 10, HEARTBEAT_MS), "across the wrap, on time");
+    }
+
+    /// The heartbeat exists only while a Win press that owned a chord or passed a modifier is held, the only press
+    /// whose lost release costs anything (its digits, T and B stay chords for up to LONE_STUCK_MS): it ends with the
+    /// press, with a cut-off, with the watchdog's 10 s rule and with the stale rule. A lone press, the pair and every
+    /// press without a row (release 1.5.2's branch) have none, so an idle dock gets no new wake-up.
+    #[test]
+    fn the_heartbeat_runs_only_while_a_dock_press_is_held() {
+        let mut s = WinState::default();
+        assert!(!heartbeat_due(&s), "nothing held");
+        win_step(&mut s, owned(LWIN, true, 10_000));
+        assert!(!heartbeat_due(&s), "a lone press");
+        win_step(&mut s, owned(KEY_3, true, 10_100));
+        assert!(heartbeat_due(&s), "Win+3 owned");
+        win_step(&mut s, owned(KEY_3, false, 10_150));
+        assert!(heartbeat_due(&s), "Win still held after the 3");
+        win_step(&mut s, owned(LWIN, false, 10_200));
+        assert!(!heartbeat_due(&s), "Win released");
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 20_000));
+        win_step(&mut s, with_mods(LSHIFT, true, 20_050, Mods::SHIFT));
+        assert!(heartbeat_due(&s), "Shift passed alone, Win pending");
+        let mut s = WinState::default();
+        win_step(&mut s, owned(LWIN, true, 30_000));
+        win_step(&mut s, owned(KEY_E, true, 30_100));
+        assert!(!heartbeat_due(&s), "Win+E, the pair");
+        win_step(&mut s, owned(KEY_3, true, 30_200));
+        assert!(heartbeat_due(&s), "then Win+3 owned");
+        let mut cut = after_win_3();
+        forget_after_cut_off(&mut cut, ALL_ROWS);
+        assert!(!heartbeat_due(&cut), "a cut-off");
+        let mut repaired = after_win_3();
+        clear_for_repair(&mut repaired);
+        assert!(!heartbeat_due(&repaired), "the watchdog's 10 s rule");
+        let mut stale = after_win_3();
+        win_step(&mut stale, owned(KEY_E, true, 10_100 + LONE_STUCK_MS + 1));
+        assert!(!heartbeat_due(&stale), "the stale rule");
+        let mut s = WinState::default();
+        for (vk, t) in [(LWIN, 40_000), (KEY_3, 40_100), (LSHIFT, 40_200)] {
+            win_step(&mut s, legacy(vk, true, t));
+            assert!(!heartbeat_due(&s), "{vk:#x} with no row");
+        }
+    }
+
+    /// The stall evidence's wires, pinned on the source (the callback, its thread message and the hook thread's loop
+    /// cannot run here). The callback takes its entry time on the tick count before `handle_key` and judges it after,
+    /// against the tick count at its return, before a swallowed key's answer, only while a row is owned
+    /// (`stall_watch`), and notes a late return or a late key the hook admits; one note waits at a time, and a failed
+    /// post leaves none pending; the loop hands it to `stalled`, which runs the cut-off, then reinstalls the hook at
+    /// once and logs it back. The callback has the heartbeat follow the press while a row is owned, before the
+    /// owner-probe stall can hold it. The heartbeat is armed once per press, its arming being the first tick's
+    /// baseline, and killed once no longer due; killing it forgets it, so that the next press arms it again, and kills
+    /// its timer. The loop knows a tick by the heartbeat's id, takes it as the next tick's baseline, judges it, hands a
+    /// late one to `stalled` and ends a heartbeat no longer due; a cut-off and the watchdog's repair end it too. Every
+    /// missing wire is named.
+    #[test]
+    fn the_stall_evidence_is_wired_on_the_hook_thread() {
+        let src = include_str!("hook.rs");
+        let order = |b: &str, x: &str, y: &str| matches!((b.find(x), b.find(y)), (Some(i), Some(j)) if i < j);
+        let callback = source_block(src, "fn ll_keyboard_proc(");
+        let judged = "if let Some(entered) = entered { stall_check(entered, kb); }";
+        let answered = "if swallowed { return LRESULT(1); }";
+        let watch = source_block(src, "fn stall_watch()");
+        let no_row = "if DOCK_CHORDS.load(Acquire) == DockChords::NONE.0 { return None; }";
+        let check = source_block(src, "fn stall_check(");
+        let slow = "if overran(entered, left) { note_stall(CutOff::SlowCallback); }";
+        let late_key = "else if accepted(kb.flags.0, kb.dwExtraInfo) && came_late(kb.time, entered) {";
+        let note = source_block(src, "fn note_stall(why: CutOff)");
+        let post = "PostThreadMessageW(GetCurrentThreadId(), WM_HOOK_NOTE, WPARAM(NOTE_STALL), LPARAM(why as isize))";
+        let failed = "if posted.is_err() { STALL_NOTED.store(false, Relaxed); }";
+        let main = source_block(src, "fn thread_main(");
+        let arm = source_block(&main, "else if msg.wParam.0 == NOTE_STALL");
+        let handed = "if let Some(why) = CutOff::from_code(msg.lParam.0) { stalled(why); }";
+        let stalled = source_block(src, "fn stalled(why: CutOff)");
+        let back = r#"log!("hook: reinstalled after a stall ({why:?})");"#;
+        let key = source_block(src, "fn win_key(");
+        let follows = "if chords != DockChords::NONE { heartbeat(heartbeat_due(&s)); }";
+        let timer = "SetCoalescableTimer(None, 0, HEARTBEAT_MS, None, TIMERV_NO_COALESCING)";
+        let heart = source_block(src, "fn heartbeat(on: bool)");
+        let killed = "} else if !on && id != 0 { kill_heartbeat(); }";
+        let kill = source_block(src, "fn kill_heartbeat()");
+        let forgets = "let (id, _) = HEARTBEAT.with(|b| b.replace((0, 0)));";
+        let kills = "if id != 0 { let _ = unsafe { KillTimer(None, id) }; }";
+        let baseline = "let now = unsafe { GetTickCount() }; HEARTBEAT.with(|b| b.set((id, now)));";
+        let beat_tick = flat(
+            "let beat = HEARTBEAT.with(Cell::get); let beat_tick = msg.message == WM_TIMER && msg.hwnd.0.is_null()
+             && beat.0 != 0 && msg.wParam.0 == beat.0;",
+        );
+        let tick = "if beat_tick { let now = unsafe { GetTickCount() }; HEARTBEAT.with(|b| b.set((beat.0, now)));";
+        let late = "if beat_late(beat.1, now) { stalled(CutOff::LateHeartbeat); }";
+        let ended = "heartbeat(heartbeat_due(&load_win_state()));";
+        let cut = source_block(src, "fn cut_off_now(why: CutOff)");
+        let forgot = "let Some(peek_end) = forget_after_cut_off(&mut s, rows) else { return };";
+        let repair = source_block(src, "Repair::ClearThenGo =>");
+        let wires = [
+            ("ll_keyboard_proc: the entry time before handle_key", order(&callback, "= stall_watch();", "handle_key(")),
+            ("ll_keyboard_proc: the check after handle_key", order(&callback, "handle_key(", judged)),
+            ("ll_keyboard_proc: the check before a swallowed key's answer", order(&callback, judged, answered)),
+            ("stall_watch: nothing without a row", watch.contains(no_row)),
+            ("stall_watch: the entry on the tick count", watch.contains("Some(unsafe { GetTickCount() })")),
+            ("stall_check: the return on the tick count", check.contains("let left = unsafe { GetTickCount() };")),
+            ("stall_check: a late return", check.contains(slow)),
+            ("stall_check: a late key the hook admits", order(&check, late_key, "note_stall(CutOff::LateKey);")),
+            ("note_stall: one note at a time", note.contains("if STALL_NOTED.swap(true, Relaxed) { return; }")),
+            ("note_stall: posts NOTE_STALL", note.contains(post)),
+            ("note_stall: a failed post leaves none pending", note.contains(failed)),
+            ("thread_main: NOTE_STALL reaches stalled", order(&arm, "STALL_NOTED.store(false, Relaxed);", handed)),
+            ("stalled: the cut-off, then the reinstall", order(&stalled, "cut_off_now(why);", "reinstall();")),
+            ("stalled: one line when the hook is back", order(&stalled, "reinstall();", back)),
+            ("win_key: the heartbeat follows the press", order(&key, follows, "hook_stall_once")),
+            ("heartbeat: a thread timer of HEARTBEAT_MS, not coalesced", heart.contains(timer)),
+            ("heartbeat: the arming is the first tick's baseline", order(&heart, timer, baseline)),
+            ("heartbeat: armed once per press", heart.contains("if on && id == 0 {")),
+            ("heartbeat: killed once no longer due", heart.contains(killed)),
+            ("kill_heartbeat: forgets the heartbeat", kill.contains(forgets)),
+            ("kill_heartbeat: kills its timer", kill.contains(kills)),
+            ("thread_main: a heartbeat tick is its timer's", main.contains(&beat_tick)),
+            ("thread_main: a heartbeat tick is judged before the reinstall tick", order(&main, tick, "let tick_id =")),
+            ("thread_main: each tick is the next one's baseline", order(&main, tick, late)),
+            ("thread_main: a late tick reaches stalled", main.contains(late)),
+            ("thread_main: a heartbeat no longer due ends", order(&main, late, ended)),
+            ("cut_off_now: the heartbeat ends", order(&cut, forgot, "kill_heartbeat();")),
+            ("reinstall: the 10 s rule ends the heartbeat", repair.contains("kill_heartbeat();")),
+        ];
+        let missing: Vec<&str> = wires.iter().filter(|(_, ok)| !ok).map(|(what, _)| *what).collect();
+        assert!(missing.is_empty(), "unwired: {missing:?}");
     }
 }

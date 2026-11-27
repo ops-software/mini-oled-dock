@@ -41,6 +41,8 @@ macro_rules! probe {
     };
 }
 
+mod agent;
+mod agent_proto;
 mod apps;
 mod arp;
 mod audio;
@@ -50,11 +52,13 @@ mod calendar;
 mod clock;
 mod config;
 mod datadir;
+mod entry_points;
 mod files_child;
 mod glyphs;
 mod hook;
 mod i18n;
 mod icons;
+mod journal_ui;
 mod jumplist;
 mod launcher;
 mod launcher_files;
@@ -80,6 +84,7 @@ mod power;
 mod preview;
 #[cfg(feature = "wake-probe")]
 mod probe;
+mod recover;
 mod render;
 mod settings_pages;
 mod settings_view;
@@ -90,6 +95,7 @@ mod start_import;
 mod start_search;
 mod surface;
 mod taskbar;
+mod theme_sync;
 mod tinysort;
 mod tray_host;
 mod ui;
@@ -703,6 +709,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                 hook::EV_COMBO => log!("Win + other key -> injected the pair [Win down, key down]"),
                 hook::EV_SENDFAIL => log!("SendInput failed: Win+key combination NOT delivered"),
                 hook::EV_DOUBLE => log!("Win tapped twice -> Start menu"),
+                hook::EV_LEAK => log!("Win released while Windows held it (a down went by the hook): passed, masked"),
                 _ => {}
             }
             LRESULT(0)
@@ -1632,6 +1639,9 @@ fn main() -> std::process::ExitCode {
     logger::stop(log_thread);
     code
 }
+
+#[cfg(test)]
+mod freeze_tests;
 
 #[cfg(test)]
 mod tests {

@@ -34,18 +34,29 @@ jobs:
           rustup default ${{ env.RUST_TOOLCHAIN }}
           rustc -vV
 
+      - name: fmt-changed self-test
+        shell: pwsh
+        run: pwsh tools/ci/fmt-changed.ps1 -SelfTest
+
       - name: Format of the lines this change touches
         shell: pwsh
         run: |
           if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $base = "origin/$env:GITHUB_BASE_REF" } else { $base = 'HEAD~1' }
           pwsh tools/ci/fmt-changed.ps1 -BaseRef $base
 
+      # The keyed-strings codemod (tools/i18n-codemod, std only, outside the workspace, its own lock file).
+      - name: i18n codemod tests
+        env:
+          CARGO_TARGET_DIR: target-codemod
+        run: cargo test --locked --manifest-path tools/i18n-codemod/Cargo.toml
+
       - name: Clippy
         env:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # Features of the dock package: no --workspace, the root package is selected by default.
       # The owner-probe build (launcher L0 sessions and live checks): its switches and probe lines compile only with it.
       - name: Clippy (owner-probe)
         env:
@@ -59,6 +70,15 @@ jobs:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
         run: cargo clippy --locked --all-targets --features wake-probe -- -D warnings
+
+      # Resolver 2 unifies features across the workspace, so a crate that forgot a windows feature builds inside it
+      # and breaks alone (an app built with -p): check every member on its own.
+      - name: Each member builds alone
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-test
+        run: pwsh tools/ci/gates.ps1 -Only crates
 
       - name: Cache cargo-deny
         uses: actions/cache@v4
@@ -83,7 +103,7 @@ jobs:
           "$dir" | Out-File -Append -Encoding ascii $env:GITHUB_PATH
 
       - name: cargo deny
-        run: cargo deny --locked check
+        run: cargo deny --locked --workspace check
 
   test:
     runs-on: windows-latest
@@ -121,8 +141,9 @@ jobs:
         env:
           DOCK_NO_MANIFEST: "1"
           CARGO_TARGET_DIR: target-test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
+      # Features of the dock package: no --workspace, the root package is selected by default.
       - name: Tests (owner-probe)
         env:
           DOCK_NO_MANIFEST: "1"
@@ -173,6 +194,17 @@ jobs:
           CARGO_TARGET_DIR: target-test
         run: cargo test --locked --test budgets -- --ignored exe_size_within_ledger
 
+      # The files app's release exe (its engine roles until its window lands): row exe_size.files.
+      - name: Release build (files)
+        run: cargo build -p files --release --locked
+
+      - name: Size (files)
+        env:
+          DOCK_NO_MANIFEST: "1"
+          FILES_EXE: target/release/files.exe
+          CARGO_TARGET_DIR: target-test
+        run: cargo test --locked --test budgets -- --ignored files_exe_size_within_budget
+
       - uses: actions/upload-artifact@v4
         with:
           name: dock-release
@@ -208,6 +240,72 @@ jobs:
           # A filter that matches no test passes silently: the job fails unless the bench ran and printed its line.
           if ($out -match 'running 0 tests') { throw 'launcher bench: no test ran' }
           if (-not ($out -match 'bench: launcher \d+ ns')) { throw 'launcher bench: no bench line printed' }
+
+      # Tasks engine benches (P1-tasks-engine TS5, TB1): release; 2x slack on the shared runner.
+      - name: oled-sysmon parse bench
+        shell: pwsh
+        env: { DOCK_NO_MANIFEST: "1", CARGO_TARGET_DIR: target-bench, OLED_BENCH_SLACK: "2" }
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = cargo test --release --locked -p oled-sysmon --test parse_bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          if ($out -match 'running 0 tests') { throw 'parse bench: no test ran' }
+          if (-not ($out -match 'bench: sysmon_parse_300 p50 \d+ us')) { throw 'parse bench: no bench line printed' }
+      - name: tasks model bench
+        shell: pwsh
+        env: { DOCK_NO_MANIFEST: "1", CARGO_TARGET_DIR: target-bench, OLED_BENCH_SLACK: "2" }
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = cargo test --release --locked -p tasks --test model_bench -- --ignored --nocapture 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          if ($out -match 'running 0 tests') { throw 'model bench: no test ran' }
+          if (-not ($out -match 'bench: tasks_model_tick p50 \d+ us')) { throw 'model bench: no bench line printed' }
+
+      # The files engine's benches (release) and serial timings (debug: the fault hooks exist there). Every fn bench_ and
+      # fn timing_ under apps/files must print its "bench: files <name> " line; targets without one print "running 0
+      # tests", which is not checked. Until the first one lands, each step says so and passes.
+      - name: Files benches (release, serial)
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-bench
+          OLED_BENCH_SLACK: "2"      # 2x slack on the shared runner, as the benches above
+        run: |
+          $names = @(git grep -h -o -E 'fn bench_[a-z0-9_]+' -- apps/files | ForEach-Object { $_ -replace '^fn bench_', '' } | Sort-Object -Unique)
+          if ($names.Count -eq 0) { 'no files benches yet'; exit 0 }
+          $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
+          $out = cargo test -p files --release --locked -- --ignored bench_ --nocapture --test-threads=1 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          $missing = @($names | Where-Object { -not ($out -match "bench: files $([regex]::Escape($_)) ") })
+          if ($missing.Count -gt 0) { throw "files benches without their bench line: $($missing -join ', ')" }
+
+      - name: Files timings (debug, serial)
+        shell: pwsh
+        env:
+          DOCK_NO_MANIFEST: "1"
+          CARGO_TARGET_DIR: target-bench
+        run: |
+          $names = @(git grep -h -o -E 'fn timing_[a-z0-9_]+' -- apps/files | ForEach-Object { $_ -replace '^fn timing_', '' } | Sort-Object -Unique)
+          if ($names.Count -eq 0) { 'no files benches yet (no fn timing_ under apps/files)'; exit 0 }
+          $ErrorActionPreference = 'Continue'      # cargo writes its progress to stderr
+          cargo build -p files --examples --locked 2>&1 | ForEach-Object { "$_" } | Write-Host     # the fault DLL
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out = cargo test -p files --locked -- --ignored timing_ --nocapture --test-threads=1 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          $out | Write-Host
+          if ($code -ne 0) { exit $code }
+          $missing = @($names | Where-Object { -not ($out -match "bench: files $([regex]::Escape($_)) ") })
+          if ($missing.Count -gt 0) { throw "files timings without their bench line: $($missing -join ', ')" }
 
   regen-golden:
     runs-on: windows-latest

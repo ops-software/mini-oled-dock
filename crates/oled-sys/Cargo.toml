@@ -1,0 +1,34 @@
+[package]
+name = "oled-sys"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Win32 plumbing shared by the dock and the apps."
+license = "MIT"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+oled-trust = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

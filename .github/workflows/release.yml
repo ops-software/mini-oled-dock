@@ -48,7 +48,7 @@ jobs:
           CARGO_TARGET_DIR: target-test
           # Anti-aliasing drift of a new runner image only warns; Size and Exact mismatches still fail.
           GOLDEN_TEXT_ADVISORY: "1"
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Release build
         run: cargo build --release --locked

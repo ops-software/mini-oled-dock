@@ -193,15 +193,15 @@ impl SpatialKind {
 
     /// Localised display name (hard-coded, like the Windows quick settings).
     pub fn label(self) -> &'static str {
-        use crate::i18n::tr;
+        use crate::i18n::{k, t};
         match self {
-            SpatialKind::Off => tr("Off", "Disattivato"),
-            SpatialKind::WindowsSonic => tr("Windows Sonic for Headphones", "Windows Sonic per cuffie"),
-            SpatialKind::DolbyAtmosHeadphones => tr("Dolby Atmos for Headphones", "Dolby Atmos per cuffie"),
-            SpatialKind::DolbyAtmosHomeTheater => tr("Dolby Atmos for Home Theater", "Dolby Atmos per Home Theater"),
+            SpatialKind::Off => t(k::AUDIO_OFF),
+            SpatialKind::WindowsSonic => t(k::AUDIO_WINDOWS_SONIC_FOR_HEADPHONES),
+            SpatialKind::DolbyAtmosHeadphones => t(k::AUDIO_DOLBY_ATMOS_FOR_HEADPHONES),
+            SpatialKind::DolbyAtmosHomeTheater => t(k::AUDIO_DOLBY_ATMOS_FOR_HOME_THEATER),
             SpatialKind::DtsHeadphoneX => "DTS Headphone:X",
             SpatialKind::DtsXUltra => "DTS:X Ultra",
-            SpatialKind::DtsXHomeTheater => tr("DTS:X for Home Theater", "DTS:X per Home Theater"),
+            SpatialKind::DtsXHomeTheater => t(k::AUDIO_DTS_X_FOR_HOME_THEATER),
         }
     }
 
@@ -790,6 +790,12 @@ pub struct AudioController {
     volume_cb: Option<IAudioEndpointVolumeCallback>,
 }
 
+/// Whether `AudioController::adjust` also clears mute: a step up (or zero) that leaves the level above 0 on a muted
+/// device. A step down never does, so a "quieter" gesture cannot turn the sound on.
+fn adjust_clears_mute(delta_percent: i32, target: i32, muted: bool) -> bool {
+    delta_percent >= 0 && target > 0 && muted
+}
+
 impl AudioController {
     /// Creates the enumerator, registers `IMMNotificationClient`, opens the default endpoint and
     /// registers its volume callback. If there is no device it still returns `Ok`
@@ -885,7 +891,8 @@ impl AudioController {
     }
 
     /// Changes the volume by `delta_percent` points (negative = down), clamped 0..=100, with
-    /// `SetMasterVolumeLevelScalar`; if the result is > 0 it clears mute. Returns the new state.
+    /// `SetMasterVolumeLevelScalar`; a step up (or zero) that leaves it > 0 clears mute, a step down never
+    /// does (`adjust_clears_mute`). Returns the new state.
     pub fn adjust(&mut self, delta_percent: i32) -> VolumeState {
         let cur = self.refresh();
         let Some(ep) = self.endpoint.as_ref() else { return cur };
@@ -894,7 +901,7 @@ impl AudioController {
         if let Err(e) = unsafe { ep.SetMasterVolumeLevelScalar(target as f32 / 100.0, &MY_CONTEXT) } {
             log!("audio: SetMasterVolumeLevelScalar failed: {e}");
         }
-        if target > 0 && cur.muted {
+        if adjust_clears_mute(delta_percent, target, cur.muted) {
             // SAFETY: same.
             if let Err(e) = unsafe { ep.SetMute(false, &MY_CONTEXT) } {
                 log!("audio: SetMute(false) failed: {e}");
@@ -1172,6 +1179,21 @@ pub fn decode_volume_msg(wparam: usize, lparam: isize) -> VolumeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_down_never_clears_mute() {
+        // Up on a muted device unmutes, as before.
+        assert!(adjust_clears_mute(2, 42, true));
+        assert!(adjust_clears_mute(2, 2, true));
+        // Down never does, whatever level is left.
+        assert!(!adjust_clears_mute(-2, 38, true));
+        assert!(!adjust_clears_mute(-2, 1, true));
+        assert!(!adjust_clears_mute(-50, 0, true));
+        // Nothing to clear on an unmuted device; a step that stays at 0 leaves mute alone.
+        assert!(!adjust_clears_mute(2, 42, false));
+        assert!(!adjust_clears_mute(-2, 38, false));
+        assert!(!adjust_clears_mute(2, 0, true));
+    }
 
     #[test]
     fn mmdevice_id_to_winrt() {

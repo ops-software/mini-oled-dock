@@ -1,0 +1,84 @@
+name: FS-3 spike
+
+# The disposable dispatch of spike FS-3 (plans P1-files-engine, SP3). This workflow lives only on the spike branch,
+# which is never merged: a push to that branch (by the orchestrator; coders never push) runs the rows that need a
+# throwaway machine on a GitHub-hosted runner, and uploads every row's record. Rows a, b, g and i also run on the
+# owner's PC through the live tester; row c runs only here; e and f add the runner's numbers to the coder's.
+on:
+  push:
+    branches: [spikes/fs3]
+
+permissions:
+  contents: read
+
+env:
+  # The same pin as ci.yml.
+  RUST_TOOLCHAIN: 1.93.1
+
+jobs:
+  rows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+          rustup default ${{ env.RUST_TOOLCHAIN }}
+          rustc -vV
+
+      # The share \\localhost\modfiles, a FAT32 VHD and two NTFS VHDs with per-volume bin values (refuses off a hosted runner).
+      - name: Disposable machine
+        shell: pwsh
+        run: pwsh tools/ci/files-disposable.ps1 -Setup
+
+      - name: Build the probes
+        shell: pwsh
+        working-directory: spikes/fs3
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}\target-spike
+        run: cargo build --release --locked
+
+      # Every row runs even when an earlier one fails; the job fails at the end if any row did.
+      - name: Rows
+        shell: pwsh
+        env:
+          FILES_DISPOSABLE: "1"
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target-spike\release\fs3-probe.exe'
+          $T = Join-Path ([IO.Path]::GetTempPath()) 'mod-files-ci'
+          $out = Join-Path $T 'out'
+          $rows = [ordered]@{ e = @('e'); f = @('f'); a = @('a'); b = @('b'); 'b-nosilent' = @('b', '--no-silent'); g = @('g'); i = @('i'); c = @('c') }
+          $failed = @()
+          foreach ($name in $rows.Keys) {
+            $r = $rows[$name]
+            if ($name -eq 'i') {
+              # The folder's Paste is read only when the clipboard holds files: put one file of row i's root on this
+              # throwaway runner's clipboard (Windows PowerShell: pwsh's Set-Clipboard has no -LiteralPath). A failure
+              # is only reported; the probe records what the clipboard holds and gives no verdict on paste without files.
+              $root = Join-Path $T $name
+              New-Item -ItemType Directory -Force $root | Out-Null
+              $clip = Join-Path $root 'clip.txt'
+              Set-Content -LiteralPath $clip -Value 'clipboard of row i'
+              powershell.exe -NoProfile -Command "Set-Clipboard -LiteralPath '$clip'"
+              if ($LASTEXITCODE -ne 0) { Write-Host "Set-Clipboard failed (exit $LASTEXITCODE)" }
+            }
+            $argv = @($r[0], '--root', (Join-Path $T $name), '--json', (Join-Path $out "$name.json")) + @($r | Select-Object -Skip 1)
+            Write-Host "== fs3-probe $($argv -join ' ')"
+            & $exe @argv
+            if ($LASTEXITCODE -ne 0) { $failed += "$name (exit $LASTEXITCODE)" }
+          }
+          $rec = Join-Path $env:RUNNER_TEMP 'fs3-records'
+          New-Item -ItemType Directory -Force $rec | Out-Null
+          Copy-Item (Join-Path $out '*.json') $rec -ErrorAction SilentlyContinue
+          Get-ChildItem $rec | ForEach-Object { "--- $($_.Name)"; Get-Content $_.FullName }
+          if ($failed) { throw "rows with errors: $($failed -join ', ')" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fs3-records
+          path: ${{ runner.temp }}/fs3-records
+          if-no-files-found: warn
+          retention-days: 30

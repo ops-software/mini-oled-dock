@@ -31,10 +31,11 @@ use windows::Win32::Foundation::RECT;
 use crate::audio::{self, AppSession, OutputDevice, SpatialState, VolumeState, WHEEL_STEP_PERCENT};
 use crate::config::{self, AudioLayout, AUDIO_MASTER, AUDIO_MIXER, AUDIO_OUTPUT, AUDIO_SPATIAL};
 use crate::glyphs;
-use crate::i18n::tr;
+use crate::i18n::{k, t};
 use crate::popup::popup_scroll::ScrollArea;
 use crate::popup::{
-    center_y, hline, launch, lift, paint_slider, row_plate, slider_value_at, tick_ms, Content, DataEvent, HitMap, PopupKind, Reply,
+    center_y, hline, launch, lift, paint_slider_dim, row_plate, slider_value_at, tick_ms, Content, DataEvent, HitMap,
+    PopupKind, Reply,
 };
 use crate::shell_thread::{self, ShellRequest};
 use crate::surface::{rect_wh, Font, Surface, PANEL_PAD, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, TEXT_COL, WHITE};
@@ -235,8 +236,8 @@ fn level_at(rc: &RECT, knob_r: i32, x: i32) -> u8 {
 }
 
 /// Track, filled part and knob of slider `rc` at `level` (`popup::paint_slider`).
-fn paint_level(s: &mut Surface, rc: &RECT, knob_r: i32, level: u8) {
-    paint_slider(s, rc, knob_r, 0, 100, i32::from(level.min(100)));
+fn paint_level(s: &mut Surface, rc: &RECT, knob_r: i32, level: u8, muted: bool) {
+    paint_slider_dim(s, rc, knob_r, 0, 100, i32::from(level.min(100)), if muted { 40 } else { 100 });
 }
 
 /// Speaker button (plate + glyph) for mute toggle `id` in `rc`.
@@ -268,10 +269,10 @@ fn paint_note(s: &mut Surface, width: i32, y: i32, txt: &str, font: Font, alpha:
 /// Header title of a section.
 fn title(section: u8) -> &'static str {
     match section {
-        AUDIO_MASTER => tr("Master volume", "Volume generale"),
-        AUDIO_OUTPUT => tr("Output", "Uscita"),
-        AUDIO_SPATIAL => tr("Spatial sound", "Audio spaziale"),
-        _ => tr("Volume mixer", "Mixer volume"),
+        AUDIO_MASTER => t(k::AUDIO_MASTER_VOLUME),
+        AUDIO_OUTPUT => t(k::AUDIO_OUTPUT),
+        AUDIO_SPATIAL => t(k::AUDIO_SPATIAL_SOUND),
+        _ => t(k::AUDIO_VOLUME_MIXER),
     }
 }
 
@@ -456,17 +457,13 @@ impl AudioPopup {
     /// Hint of a hovered pencil / Customize control, shown in the link row.
     fn hint(&self, id: u32) -> Option<&'static str> {
         if id == ID_EDIT {
-            return Some(if self.customize {
-                tr("Done customizing", "Fine personalizzazione")
-            } else {
-                tr("Customize panel", "Personalizza pannello")
-            });
+            return Some(if self.customize { t(k::AUDIO_DONE_CUSTOMIZING) } else { t(k::AUDIO_CUSTOMIZE_PANEL) });
         }
         let (base, item) = split(id)?;
         Some(match base {
-            ID_HEAD if self.customize => tr("Drag to reorder", "Trascina per riordinare"),
-            ID_EYE if self.layout.is_hidden(item) => tr("Show", "Mostra"),
-            ID_EYE => tr("Hide", "Nascondi"),
+            ID_HEAD if self.customize => t(k::AUDIO_DRAG_TO_REORDER),
+            ID_EYE if self.layout.is_hidden(item) => t(k::AUDIO_SHOW),
+            ID_EYE => t(k::AUDIO_HIDE),
             _ => return None,
         })
     }
@@ -567,7 +564,7 @@ impl AudioPopup {
     fn paint_master(&self, s: &mut Surface, hot: Option<u32>, pressed: Option<u32>) {
         let Some(rc) = self.hits.rect(ID_MUTE) else { return };
         paint_speaker(s, rc, ID_MUTE, hot, pressed, self.level, self.muted || !self.available);
-        paint_level(s, &self.slider, self.knob_r, self.level);
+        paint_level(s, &self.slider, self.knob_r, self.level, false);
         paint_pct(s, self.level, self.pct_right, &rc, TEXT2_ALPHA);
     }
 
@@ -599,22 +596,15 @@ impl AudioPopup {
                     s.text(&name, tx, center_y(&rc, lh), Font::Normal, WHITE, lift(alpha, h));
                 }
             }
-            Some(_) => paint_note(
-                s,
-                self.width,
-                top,
-                tr("No output device", "Nessun dispositivo di uscita"),
-                Font::Normal,
-                TEXT2_ALPHA,
-            ),
-            None => paint_note(s, self.width, top, tr("Loading\u{2026}", "Caricamento\u{2026}"), Font::Small, TEXT3_ALPHA),
+            Some(_) => paint_note(s, self.width, top, t(k::AUDIO_NO_OUTPUT_DEVICE), Font::Normal, TEXT2_ALPHA),
+            None => paint_note(s, self.width, top, t(k::COMMON_LOADING), Font::Small, TEXT3_ALPHA),
         }
     }
 
     /// Spatial sound: same check-mark style as the device rows (no form-factor icon).
     fn paint_spatial(&self, s: &mut Surface, top: i32, hot: Option<u32>, pressed: Option<u32>) {
         if !self.spatial_loaded {
-            paint_note(s, self.width, top, tr("Loading\u{2026}", "Caricamento\u{2026}"), Font::Small, TEXT3_ALPHA);
+            paint_note(s, self.width, top, t(k::COMMON_LOADING), Font::Small, TEXT3_ALPHA);
             return;
         }
         let Some(sp) = self.spatial.as_ref() else { return };
@@ -639,7 +629,7 @@ impl AudioPopup {
 
     fn paint_mixer(&self, s: &mut Surface, top: i32, hot: Option<u32>, pressed: Option<u32>) {
         let Some(list) = self.sessions.as_ref() else {
-            paint_note(s, self.width, top, tr("Loading\u{2026}", "Caricamento\u{2026}"), Font::Small, TEXT3_ALPHA);
+            paint_note(s, self.width, top, t(k::COMMON_LOADING), Font::Small, TEXT3_ALPHA);
             return;
         };
         let lh = s.line_height(Font::Normal);
@@ -653,7 +643,7 @@ impl AudioPopup {
             let name = s.ellipsize(&a.name, Font::Normal, self.app_name_w);
             let alpha = if a.muted { TEXT3_ALPHA } else { TEXT2_ALPHA };
             s.text(&name, self.app_name_x, center_y(&brc, lh), Font::Normal, WHITE, alpha);
-            paint_level(s, &src, self.knob_r, a.level);
+            paint_level(s, &src, self.knob_r, a.level, a.muted);
             paint_pct(s, a.level, self.pct_right, &brc, TEXT2_ALPHA);
         }
     }
@@ -820,7 +810,7 @@ impl Content for AudioPopup {
             // The hint of a hovered pencil / Customize control replaces the link label meanwhile
             // (the drag hint stays for the whole drag, the pointer may leave the header).
             let hint = match dragged {
-                Some(_) => Some(tr("Drag to reorder", "Trascina per riordinare")),
+                Some(_) => Some(t(k::AUDIO_DRAG_TO_REORDER)),
                 None => hot.and_then(|id| self.hint(id)),
             };
             match hint {
@@ -830,7 +820,7 @@ impl Content for AudioPopup {
                     s.text(&txt, rc.left + m.px(12), center_y(&rc, slh), Font::Small, WHITE, TEXT2_ALPHA);
                 }
                 None => s.text(
-                    tr("More volume settings", "Altre impostazioni volume"),
+                    t(k::AUDIO_MORE_VOLUME_SETTINGS),
                     rc.left + m.px(12),
                     center_y(&rc, lh),
                     Font::Normal,
@@ -907,6 +897,54 @@ impl Content for AudioPopup {
         } else {
             Reply::None
         }
+    }
+
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        let scrolled = self.scroll.scrollable();
+        let view = self.scroll.view;
+        self.hits
+            .entries()
+            .iter()
+            .filter(|(id, rc)| {
+                // Rows scrolled out of the view are not reachable; the footer never scrolls.
+                !scrolled || matches!(*id, ID_MIXER | ID_EDIT) || (rc.bottom > view.top && rc.top < view.bottom)
+            })
+            .copied()
+            .collect()
+    }
+
+    fn nudge(&mut self, id: u32, delta: i32) -> Option<Reply> {
+        // The same steps as a press on the slider at the new level (`drag`), then its release.
+        let step = |level: u8| (i32::from(level) + delta).clamp(0, 100) as u8;
+        if id == ID_SLIDER {
+            let lvl = step(self.level);
+            if lvl != self.level || self.muted {
+                self.level = lvl;
+                if lvl > 0 {
+                    self.muted = false;
+                }
+                self.send_level();
+                return Some(Reply::Redraw);
+            }
+            return Some(Reply::None);
+        }
+        if (ID_APP_SLIDER..ID_END).contains(&id) {
+            let idx = (id - ID_APP_SLIDER) as usize;
+            let a = self.sessions.as_mut().and_then(|v| v.get_mut(idx))?;
+            let lvl = step(a.level);
+            if lvl == a.level && !(a.muted && lvl > 0) {
+                return Some(Reply::None);
+            }
+            a.level = lvl;
+            if lvl > 0 {
+                a.muted = false;
+            }
+            self.send_app_level(idx);
+            // Re-read the real state, as the end of a drag does.
+            shell_thread::request(ShellRequest::ListSessions);
+            return Some(Reply::Redraw);
+        }
+        None
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -1383,5 +1421,98 @@ mod tests {
         let mut l = AudioLayout::default();
         assert!(l.move_to(AUDIO_OUTPUT, drop_index(mids, 1, 500)));
         assert_eq!(l.order(), &[AUDIO_MASTER, AUDIO_SPATIAL, AUDIO_MIXER, AUDIO_OUTPUT]);
+    }
+
+    #[test]
+    fn audio_keyboard_targets() {
+        let mut p = loaded(None, 3);
+        let ids = crate::popup::target_ids(&mut p);
+        // The master block first: its header, the mute button, the slider.
+        assert_eq!(ids[..3], [ID_HEAD + u32::from(AUDIO_MASTER), ID_MUTE, ID_SLIDER]);
+        assert_eq!(ids[2], ID_SLIDER, "the popup_audio_keys scene rings the third target");
+        assert!(ids.iter().all(|&i| !(ID_EYE..ID_EYE + ITEMS).contains(&i)), "no eye button with Customize off");
+        assert!(!ids.contains(&ID_SCROLLBAR));
+        assert_eq!(ids[ids.len() - 2..], [ID_MIXER, ID_EDIT], "the footer comes last");
+        for i in 0..6 {
+            assert!(ids.contains(&(ID_DEVICE + i)), "device row {i}");
+        }
+        // Every mixer row: its mute button, then its slider.
+        for i in 0..3 {
+            let at = ids.iter().position(|&x| x == ID_APP_MUTE + i).expect("app mute");
+            assert_eq!(ids[at + 1], ID_APP_SLIDER + i);
+        }
+        let mut seen = ids.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ids.len(), "no target twice");
+        // Customize mode adds one eye button per block, after its header.
+        p.customize = true;
+        let custom = crate::popup::target_ids(&mut p);
+        let head = custom.iter().position(|&x| x == ID_HEAD + u32::from(AUDIO_MASTER)).expect("header");
+        assert_eq!(custom[head + 1], ID_EYE + u32::from(AUDIO_MASTER));
+    }
+
+    #[test]
+    fn audio_keyboard_targets_skip_rows_scrolled_out() {
+        let mut roomy = loaded(None, 8);
+        let (_, h) = size_of(&mut roomy);
+        let mut p = loaded(Some(h / 2), 8);
+        let all = crate::popup::target_ids(&mut roomy);
+        let some = crate::popup::target_ids(&mut p);
+        assert!(p.scroll.scrollable());
+        assert!(some.len() < all.len(), "rows past the view are not targets");
+        assert_eq!(some[some.len() - 2..], [ID_MIXER, ID_EDIT], "the footer stays reachable");
+        for (id, rc) in p.focus_targets() {
+            if !matches!(id, ID_MIXER | ID_EDIT) {
+                assert!(
+                    rc.bottom > p.scroll.view.top && rc.top < p.scroll.view.bottom,
+                    "target {id} is out of the view"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nudge_master_by_two_and_ten() {
+        let mut p = loaded(None, 1);
+        assert_eq!(p.nudge(ID_SLIDER, 2), Some(Reply::Redraw));
+        assert_eq!(p.level, 52);
+        p.nudge(ID_SLIDER, 10);
+        assert_eq!(p.level, 62);
+        p.nudge(ID_SLIDER, -10);
+        p.nudge(ID_SLIDER, -2);
+        assert_eq!(p.level, 50);
+        p.level = 99;
+        p.nudge(ID_SLIDER, 10);
+        assert_eq!(p.level, 100, "clamped at 100");
+        assert_eq!(p.nudge(ID_SLIDER, 2), Some(Reply::None), "nothing changes at the end of the scale");
+        p.level = 4;
+        p.nudge(ID_SLIDER, -10);
+        assert_eq!(p.level, 0, "clamped at 0");
+        // The other controls do not nudge: the arrow moves the focus.
+        assert_eq!(p.nudge(ID_MUTE, 2), None);
+        assert_eq!(p.nudge(ID_DEVICE, 2), None);
+    }
+
+    #[test]
+    fn nudge_app_slider_unmutes_like_a_click() {
+        let mut p = loaded(None, 2);
+        if let Some(v) = p.sessions.as_mut() {
+            v[1].muted = true;
+        }
+        let level = |p: &AudioPopup, i: usize| p.sessions.as_ref().map(|v| (v[i].level, v[i].muted));
+        assert_eq!(p.nudge(ID_APP_SLIDER + 1, 2), Some(Reply::Redraw));
+        assert_eq!(level(&p, 1), Some((52, false)), "a level above 0 unmutes, as a drag does");
+        assert_eq!(level(&p, 0), Some((50, false)), "the other rows stay as they are");
+        p.nudge(ID_APP_SLIDER + 1, -10);
+        assert_eq!(level(&p, 1), Some((42, false)));
+        // At 0 a muted row stays muted (a drag to 0 does not unmute).
+        if let Some(v) = p.sessions.as_mut() {
+            v[0].level = 3;
+            v[0].muted = true;
+        }
+        p.nudge(ID_APP_SLIDER, -10);
+        assert_eq!(level(&p, 0), Some((0, true)));
+        assert_eq!(p.nudge(ID_APP_SLIDER + 7, 2), None, "no such row: not adjustable");
     }
 }

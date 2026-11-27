@@ -1,6 +1,6 @@
 [package]
 name = "dock"
-version = "1.5.2"
+version = "1.6.0"
 edition = "2021"
 rust-version = "1.87"
 description = "A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with no UI framework."
@@ -11,15 +11,41 @@ keywords = ["windows", "dock", "taskbar", "oled", "win32"]
 categories = ["os::windows-apis", "gui"]
 build = "build.rs"
 
-[dependencies]
+[workspace]
+members = ["crates/*", "apps/*"]
+exclude = ["tools/i18n-codemod"]
+resolver = "2"
+
+[workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 windows-core = "0.62.2"
-# IAsyncOperation / AsyncOperationCompletedHandler and IVectorView are NOT re-exported by `windows`
-# (needed for the WinRT notification listener): same versions already in Cargo.lock as dependencies of `windows`.
 windows-future = "0.3.2"
 windows-collections = "0.3.2"
-windows = { version = "0.62.2", features = [
+windows = "0.62.2"
+oled-trust = { path = "crates/oled-trust", version = "0.0.0" }
+oled-sys = { path = "crates/oled-sys", version = "0.0.0" }
+oled-ui = { path = "crates/oled-ui", version = "0.0.0" }
+oled-i18n-build = { path = "crates/oled-i18n-build", version = "0.0.0" }
+# L-T (P1-tasks-engine)
+oled-sysmon = { path = "crates/oled-sysmon", version = "0.0.0" }
+# L-P (P2-plumbing)
+oled-config = { path = "crates/oled-config", version = "0.0.0" }
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+windows-core = { workspace = true }
+# IAsyncOperation / AsyncOperationCompletedHandler and IVectorView are NOT re-exported by `windows`
+# (needed for the WinRT notification listener): same versions already in Cargo.lock as dependencies of `windows`.
+windows-future = { workspace = true }
+windows-collections = { workspace = true }
+oled-config = { workspace = true }
+oled-sys = { workspace = true }
+oled-sysmon = { workspace = true }
+oled-trust = { workspace = true }
+oled-ui = { workspace = true }
+windows = { workspace = true, features = [
     "ApplicationModel",
     "Data_Xml_Dom",
     "Foundation",
@@ -57,6 +83,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Pipes",
     "Win32_System_Performance",
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
@@ -81,7 +108,12 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+# Inert until the drawing code moves: the feature switches on counters that only tests read.
+oled-ui = { workspace = true, features = ["test-counters"] }
+
 [build-dependencies]
+oled-i18n-build = { workspace = true }
 embed-manifest = "1.5.1"
 winresource = "0.1.19"
 
@@ -98,3 +130,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Tests run optimised: the launcher bench and the golden images take minutes unoptimised.
+# Debug assertions and overflow checks stay on (inherited from the dev profile).
+[profile.test]
+opt-level = 1

@@ -1943,9 +1943,8 @@ pub(crate) fn init() {
 
 /// At the end of `popup::shutdown`, while the dock window still exists.
 pub(crate) fn shutdown() {
-    if REGISTERED.with(Cell::get) {
-        crate::launcher_sys::unwatch_sessions();
-    }
+    // The dock's chord rows may have registered the window too (`ui::chords_sync`): undone once, whoever did it.
+    crate::launcher_sys::unwatch_sessions();
     crate::launcher_sys::release_owner_waits();
 }
 
@@ -3723,24 +3722,24 @@ pub(crate) fn preview_new(scene: PreviewScene) -> Box<dyn Content> {
 
 /// The launcher of a scene other than the field pair.
 fn scene_launcher(scene: PreviewScene) -> Launcher {
-    use crate::i18n::tr;
+    use crate::i18n::{k, t};
     use crate::launcher::catalog::CatApp;
     use crate::launcher::model::{NumberStyle, SettingRow, WindowRow};
     use crate::launcher::providers::Context;
     use crate::launcher::rank;
     use crate::start_search::Keys;
 
-    let notepad = tr("Notepad", "Blocco note");
-    let calc = tr("Calculator", "Calcolatrice");
+    let notepad = t(k::LAUNCHER_NOTEPAD);
+    let calc = t(k::LAUNCHER_CALCULATOR);
     let apps_def: [(&str, &str, char, u32); 9] = [
         ("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", calc, 'C', 0x3A3A3A),
         ("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", notepad, 'N', 0x2B78B8),
         ("{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}\\Notepad++\\notepad++.exe", "Notepad++", 'N', 0x5C9E31),
         ("Microsoft.Office.OneNote_8wekyb3d8bbwe!microsoft.onenoteim", "OneNote", 'N', 0x7719AA),
-        ("Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", tr("Sticky Notes", "Note adesive"), 'S', 0xB8860B),
+        ("Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App", t(k::LAUNCHER_STICKY_NOTES), 'S', 0xB8860B),
         ("Mozilla.Firefox", "Firefox", 'F', 0xE66000),
         ("Microsoft.VisualStudioCode", "Visual Studio Code", 'V', 0x0078D4),
-        ("Microsoft.Windows.Explorer", tr("File Explorer", "Esplora file"), 'F', 0xE8A317),
+        ("Microsoft.Windows.Explorer", t(k::LAUNCHER_FILE_EXPLORER), 'F', 0xE8A317),
         ("Valve.Steam", "Steam", 'S', 0x1B2838),
     ];
     let mut apps = Vec::new();
@@ -3750,7 +3749,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         icons.push((id.to_lowercase(), crate::preview::mock_icon(*letter, *rgb, 64)));
     }
     let settings = vec![SettingIn {
-        row: SettingRow::new(0, tr("Display", "Schermo"), Keys::default(), 1),
+        row: SettingRow::new(0, t(k::COMMON_DISPLAY), Keys::default(), 1),
         target: "ms-settings:display".into(),
         args: None,
         start_keys: String::new(),
@@ -3777,7 +3776,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
     };
     let notepad_key = "c:\\windows\\system32\\notepad.exe";
     let mut windows = vec![
-        window(0x1001, notepad_key, notepad, tr("Untitled - Notepad", "Senza titolo - Blocco note")),
+        window(0x1001, notepad_key, notepad, t(k::LAUNCHER_UNTITLED_NOTEPAD)),
         window(0x2002, "c:\\tools\\footool.exe", "FooTool", "FooTool - main"),
         window(0x3003, "c:\\program files\\firefox\\firefox.exe", "Firefox", "Dock releases - Mozilla Firefox"),
     ];
@@ -3807,8 +3806,8 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         history: &history,
         opts: &opts,
         num: NumberStyle {
-            decimal: tr(".", ",").chars().next().unwrap_or('.'),
-            group: tr(",", ".").chars().next().unwrap_or(','),
+            decimal: t(k::LAUNCHER_S7).chars().next().unwrap_or('.'),
+            group: t(k::LAUNCHER_S8).chars().next().unwrap_or(','),
         },
         learned: &Frecency::new(),
         now_unix: 1_790_000_000,
@@ -3824,7 +3823,7 @@ fn scene_launcher(scene: PreviewScene) -> Launcher {
         PreviewScene::Empty => "",
         PreviewScene::Inactive | PreviewScene::Running | PreviewScene::Actions => "note",
         PreviewScene::Apps => "calc",
-        PreviewScene::Calc => tr("=2.5*4", "=2,5*4"),
+        PreviewScene::Calc => t(k::LAUNCHER_2_5_4),
         PreviewScene::Time => ")",
         PreviewScene::Units => "10 km in mi",
         PreviewScene::Run => "> ping 1.1.1.1",

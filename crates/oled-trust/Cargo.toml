@@ -1,0 +1,16 @@
+[package]
+name = "oled-trust"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Pure trust code for the suite: frame codecs, journal format and undo planner, manifest and version rules."
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

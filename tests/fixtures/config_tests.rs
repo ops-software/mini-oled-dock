@@ -97,6 +97,7 @@ fn the_truncated_fixture_is_still_truncated() {
 
 #[test]
 fn the_1_4_2_default_file_is_todays_default() {
+    // Its old default list was migrated on the way in: it is today's list.
     assert_eq!(parse(&read("v1.4.2-default.json")).unwrap(), Config::default());
 }
 

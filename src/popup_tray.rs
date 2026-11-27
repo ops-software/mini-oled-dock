@@ -178,7 +178,7 @@ impl Content for TrayPopup {
             hline(s, inset + pad_text, self.width - inset - pad_text, self.sep_y);
         }
         if let Some(rc) = self.empty_rc {
-            let txt = crate::i18n::tr("No tray apps", "Nessuna app nell'area di notifica");
+            let txt = crate::i18n::t(crate::i18n::k::COMMON_NO_TRAY_APPS);
             let y = center_y(&rc, s.line_height(Font::Normal));
             s.text(txt, rc.left + pad_text, y, Font::Normal, WHITE, TEXT3_ALPHA);
         }
@@ -196,8 +196,11 @@ impl Content for TrayPopup {
                 let tx = ix + ic + m.px(8);
                 let px = rc.right - m.px(12) - pw;
                 // On but ended up behind the chevron (bar full): the suffix says so.
-                let label =
-                    if row.visible && !row.in_bar { format!("{} · {}", row.name, crate::i18n::tr("no room", "spazio insufficiente")) } else { row.name.clone() };
+                let label = if row.visible && !row.in_bar {
+                    format!("{} · {}", row.name, crate::i18n::t(crate::i18n::k::TRAY_NO_ROOM))
+                } else {
+                    row.name.clone()
+                };
                 let name = s.ellipsize(&label, Font::Normal, (px - m.px(10) - tx).max(0));
                 let a = lift(if row.visible { TEXT_ALPHA } else { TEXT2_ALPHA }, h);
                 let ty = center_y(&rc, s.line_height(Font::Normal));
@@ -207,7 +210,14 @@ impl Content for TrayPopup {
             if let Some(rc) = self.hits.rect(ID_DONE) {
                 let h = row_plate(s, rc, ID_DONE, hot, pressed);
                 let y = center_y(&rc, s.line_height(Font::Normal));
-                s.text(crate::i18n::tr("Done", "Fine"), rc.left + pad_text, y, Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+                s.text(
+                    crate::i18n::t(crate::i18n::k::TRAY_DONE),
+                    rc.left + pad_text,
+                    y,
+                    Font::Normal,
+                    WHITE,
+                    lift(TEXT_ALPHA, h),
+                );
             }
             return;
         }
@@ -224,6 +234,10 @@ impl Content for TrayPopup {
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
         self.hits.at(x, y)
+    }
+
+    fn focus_targets(&self) -> Vec<(u32, RECT)> {
+        self.hits.entries().to_vec()
     }
 
     fn click(&mut self, id: u32) -> Reply {
@@ -350,5 +364,20 @@ mod tests {
         assert_eq!(chooser_rows(1008, 114, 68), 13);
         assert_eq!(chooser_rows(i32::MAX, 114, 68), MAX_ROWS, "uncapped: today's 14 rows");
         assert_eq!(chooser_rows(100, 114, 68), 1, "never zero");
+    }
+
+    #[test]
+    fn tray_keyboard_targets() {
+        let cells = || (0..3u64).map(|i| (i, None)).collect::<Vec<_>>();
+        let rows = || {
+            ["Contoso", "Example Chat"]
+                .map(|n| (format!("key:{n}"), n.to_string(), None, true))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let mut grid = preview_new(cells(), rows(), false);
+        assert_eq!(crate::popup::target_ids(&mut *grid), [0, 1, 2], "the icons in grid order");
+        let mut chooser = preview_new(cells(), rows(), true);
+        assert_eq!(crate::popup::target_ids(&mut *chooser), [ROW_BASE, ROW_BASE + 1, ID_DONE]);
     }
 }
