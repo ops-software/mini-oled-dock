@@ -1,6 +1,6 @@
 # The files window's strings, English (P3-files-app 2.4). Every key is in it.toml too; a key added later goes to both files.
-"files.app.title_beta" = "{name} Beta"
-"files.app.beta" = "Beta"
+"files.app.title_beta" = "{name} Alpha"
+"files.app.beta" = "Alpha"
 "files.app.home" = "Home"
 "files.nav.back" = "Back"
 "files.nav.forward" = "Forward"
@@ -67,7 +67,7 @@
 "files.menu.cant_undo" = "Can't be undone"
 "files.menu.new_folder" = "New folder"
 "files.menu.host_down" = "Windows menu didn't respond"
-"files.menu.not_in_beta" = "Not available in this beta: use File Explorer"
+"files.menu.not_in_beta" = "Not available in this alpha: use File Explorer"
 "files.menu.new" = "New"
 "files.menu.sort" = "Sort"
 "files.menu.view" = "View"

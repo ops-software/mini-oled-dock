@@ -5,6 +5,8 @@
 use files_engine::exit;
 
 fn main() {
+    // Every role can own a system-drawn menu (the shell host shows the classic one): dark, as the suite always is.
+    oled_sys::darkmenu::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(run(&args));
 }

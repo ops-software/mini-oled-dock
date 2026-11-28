@@ -11,7 +11,8 @@
 //!  * On-disk state: `%ProgramData%\mini-oled-dock\taskbar-state` (text: the numeric `ABS_*` value),
 //!    admin-only folder, atomic write (`datadir::write_atomic`), read without following reparse
 //!    points. Without a usable data folder the state cannot be saved and the taskbar is never hidden.
-//!  * The dock does NOT register an AppBar and does NOT reserve a work area.
+//!  * The taskbar code itself registers no AppBar. The dock's own optional strip (`appbar`, never auto-hide) is
+//!    freed by `restore` / `restore_force` (`appbar::release_all`), also in the watchdog, before the taskbar state.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -1285,6 +1286,7 @@ pub fn begin_exit() {
 /// Callable from any thread.
 pub fn restore() {
     RESTORING.store(true, Relaxed);
+    crate::appbar::release_all("restore");
     let was_hidden = HIDDEN.swap(false, Relaxed);
     // Read only when this process hid nothing, as before.
     let state_left = !was_hidden && (state_file_exists() || read_legacy_state().is_some());
@@ -1346,6 +1348,7 @@ fn after_restore(delivered: bool, session_ending: bool) -> AfterRestore {
 /// Callable from any thread and from a process other than the dock.
 pub fn restore_force() {
     RESTORING.store(true, Relaxed);
+    crate::appbar::release_all("restore");
     HIDDEN.store(false, Relaxed);
     let saved = read_state();
     // No state of ours: a previous dock version may have died leaving its (legacy) state behind.

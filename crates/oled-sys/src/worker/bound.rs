@@ -321,11 +321,28 @@ fn admin_exe(start: Option<PathBuf>, admin_dir: impl FnOnce(&Path) -> bool) -> R
 /// it (a folder an admin makes at the root of a drive inherits Modify for every account) could rename and fill with
 /// another tree: the tail after the drive must be the one after the volume. A path the Win32 parser would change
 /// (`parsed_as_is`) names another file without its prefix. A share (`\\?\UNC\`, a mapped drive's too) has no volume
-/// path, and its folders are what its server reports. Any other form is None too. Pure.
+/// path, and its folders are what its server reports. A name in it that is a DOS device's
+/// (`is_dos_device`) and any other form (a `\\.\` or `\\?\GLOBALROOT` device path) is None too. Pure.
 fn start_path(dos: &str, guid: Option<&str>) -> Option<PathBuf> {
     let drive = dos.strip_prefix(r"\\?\").filter(|d| d.as_bytes().get(1) == Some(&b':'))?;
     let tail = guid?.strip_prefix(r"\\?\Volume{")?.split_once('}')?.1;
-    (drive.get(2..) == Some(tail) && parsed_as_is(drive)).then(|| PathBuf::from(drive))
+    let names_the_file = drive.get(2..) == Some(tail) && parsed_as_is(drive);
+    (names_the_file && !drive.split('\\').any(is_dos_device)).then(|| PathBuf::from(drive))
+}
+
+/// True when `name`, one component of a path, is a DOS device name: CON, PRN, AUX, NUL, COM1-9, LPT1-9, CONIN$ or
+/// CONOUT$, in any case, with or without an extension (`NUL.txt`). Windows opens the device, not a file, for such a
+/// name in any folder. Pure.
+fn is_dos_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            let numbered = |p: &str| upper.strip_prefix(p).is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']));
+            numbered("COM") || numbered("LPT")
+        }
+    }
 }
 
 /// True when no name in `path` ends in '.' or ' '. The Win32 parser (`GetFullPathNameW`), which every start and every
@@ -635,6 +652,28 @@ mod tests {
         let own = start_path(r"\\?\C:\Tools\dock\dock.exe", Some(r"\\?\Volume{v}\Tools\dock\dock.exe"));
         assert_eq!(ask(own), Ok(PathBuf::from(r"C:\Tools\dock\dock.exe")), "a drive's own volume");
         assert_eq!(asked, [PathBuf::from(r"C:\Tools\dock")], "only the folder on the drive's own volume is asked");
+    }
+
+    /// A path through a DOS device name (in any folder, with or without an extension) or a device namespace names a
+    /// device, not the file held: it has no path to start it by.
+    #[test]
+    fn a_path_through_a_device_name_or_namespace_has_no_start_path() {
+        let vol = |tail: &str| Some(format!(r"\\?\Volume{{v}}\{tail}"));
+        let start = |tail: &str| start_path(&format!(r"\\?\C:\{tail}"), vol(tail).as_deref());
+        assert_eq!(start(r"dock\dock.exe"), Some(PathBuf::from(r"C:\dock\dock.exe")), "a plain path starts");
+        assert_eq!(start(r"Console\dock.exe"), Some(PathBuf::from(r"C:\Console\dock.exe")), "CON is a whole name");
+        for name in ["CON", "prn", "Aux", "NUL", "COM1", "com9", "LPT1", "lpt9", "CONIN$", "CONOUT$"] {
+            let tails = [format!(r"{name}\dock.exe"), format!(r"dock\{name}"), format!(r"dock\{name}.exe")];
+            for tail in tails.iter().chain([&format!(r"{name}.d\x.exe")]) {
+                assert_eq!(start(tail), None, "{tail}");
+            }
+        }
+        let devices =
+            [r"\\.\C:\dock\dock.exe", r"\\.\NUL", r"\\?\GLOBALROOT\Device\x\dock.exe", r"\\?\NUL", r"\\.\COM1"];
+        for dos in devices {
+            assert_eq!(start_path(dos, Some(r"\\?\Volume{v}\dock\dock.exe")), None, "{dos}");
+            assert_eq!(start_path(dos, None), None, "{dos}");
+        }
     }
 
     /// SEC review: `held_start_path` asks for both final paths of the very file held; the tests above give `start_path`

@@ -162,11 +162,11 @@ fn caption_hit_map() {
 fn beta_label_named() {
     let c = chrome::rects(Caption::Custom, 900, Scale { dpi: 96 });
     assert_eq!(c.beta.is_some(), files_engine::names::STAGE_BETA);
-    assert_eq!(t(k::FILES_APP_BETA, UiLang::EN), "Beta");
-    assert_eq!(t(k::FILES_APP_BETA, UiLang::IT), "Beta");
+    assert_eq!(t(k::FILES_APP_BETA, UiLang::EN), "Alpha");
+    assert_eq!(t(k::FILES_APP_BETA, UiLang::IT), "Alpha");
     // Under the system caption the title already says Beta: no second label, and every node of the chrome is named.
     let w = folder_window();
-    assert!(!w.dump().contains("Label \"Beta\""), "{}", w.dump());
+    assert!(!w.dump().contains("Label \"Alpha\""), "{}", w.dump());
     w.h.assert_named();
 }
 

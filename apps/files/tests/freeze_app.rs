@@ -404,7 +404,7 @@ fn stubs_return_their_defaults() {
         (names::WINDOW_CLASS, names::DEFAULT_SIZE, Some(names::MAIN_PLACEMENT))
     );
     assert!(matches!(spec.kind, oled_ui::host::WindowKind::Opaque { caption: oled_ui::host::Caption::Custom, .. }));
-    assert!(spec.title.ends_with(" Beta"), "{}", spec.title);
+    assert!(spec.title.ends_with(" Alpha"), "{}", spec.title);
     assert_eq!(opswin::ops_spec(&shared).class, names::OPS_WINDOW_CLASS);
     let mut cache = drives::DriveCache::new();
     cache.set(drives::DriveInfo {

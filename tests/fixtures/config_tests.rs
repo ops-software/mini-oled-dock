@@ -148,7 +148,7 @@ fn known_and_legacy_keys_are_never_extra() {
     assert!(parse("{\"bar_size\":\"large\"}").unwrap().extra.is_empty());
     assert!(Config::default().extra.is_empty());
     // No unknown key: not one byte of the file changes.
-    assert!(render(&Config::default()).ends_with("  \"takeover_ctrl_shift_esc\": false\n}\n"));
+    assert!(render(&Config::default()).ends_with("  \"reserve_space\": false\n}\n"));
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn rendered_keys_are_known_and_never_extra() {
 // ------------------------------------------------------------------ W5c: one declaration, the same file
 
 /// The fields of `Config` in the order 1.6 declared them: serde writes them in this order, so every snapshot does.
-const DECLARED: [&str; 59] = [
+const DECLARED: [&str; 60] = [
     "language",
     "position",
     "monitor",
@@ -240,6 +240,7 @@ const DECLARED: [&str; 59] = [
     "suite_tasks",
     "suite_files",
     "takeover_ctrl_shift_esc",
+    "reserve_space",
 ];
 
 /// The top-level keys of a pretty-printed JSON object, in their order.
@@ -319,6 +320,36 @@ fn template_has_the_key() {
     let files = t.find("\"suite_files\"").expect("suite_files");
     let key = t.find("\"takeover_ctrl_shift_esc\": false").expect("the takeover key, off");
     assert!(files < key, "the key comes after suite_files");
+}
+
+#[test]
+fn reserve_space_defaults_off_and_a_bad_value_loses_only_itself() {
+    assert!(!Config::default().reserve_space);
+    assert!(!parse("{}").unwrap().reserve_space, "a file without the key reads false");
+    let on = parse("{\"reserve_space\": true, \"autohide\": false}").unwrap();
+    assert!(on.reserve_space && !on.autohide);
+    assert!(parse(&render(&on)).unwrap().reserve_space, "true round-trips");
+    let (c, errors) = parse_with_errors("{\"reserve_space\": \"yes\", \"autohide\": false}", Some(&on)).unwrap();
+    assert!(c.reserve_space && !c.autohide, "the last good value, and the rest of the file");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].path, "reserve_space");
+    assert_eq!(errors[0].problem, Problem::Type { expected: "a boolean" });
+    assert_eq!(errors[0].kept, Kept::LastGood);
+}
+
+#[test]
+fn reserve_space_is_a_bar_toggle_written_after_the_older_keys() {
+    let d = Config::descriptors().iter().find(|d| d.json == "reserve_space").expect("the key has a descriptor");
+    assert_eq!((d.page, d.section), (PageId("bar"), SecId("behaviour")));
+    assert!(matches!(d.control, Control::Toggle));
+    assert!(!d.profileable && d.takeover.is_none());
+    let t = Config::default().to_template();
+    let older = t.find("\"takeover_ctrl_shift_esc\"").expect("the last key of 1.8.0");
+    let key = t.find("\"reserve_space\": false").expect("the key, off");
+    assert!(older < key, "a new key goes last, so the file of 1.8.0 keeps its layout");
+    // Its guide says that auto-hide leaves nothing reserved.
+    let guide = t[..key].rsplit("\n\n").next().unwrap_or("");
+    assert!(guide.contains("autohide true"), "{guide}");
 }
 
 #[test]
@@ -480,6 +511,7 @@ fn random_config(r: &mut Rng) -> Config {
         suite_tasks: r.flip(),
         suite_files: r.flip(),
         takeover_ctrl_shift_esc: r.flip(),
+        reserve_space: r.flip(),
         extra: (0..r.below(3))
             .map(|i| {
                 let v = match r.below(3) {
@@ -1229,8 +1261,12 @@ mod legacy {
   "suite_tasks": {suite_tasks},
   // true = the Start menu has an entry for the Files app once it is installed (as suite_tasks).
   "suite_files": {suite_files},
-  // Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager (off by default; not available while Tasks is beta).
-  "takeover_ctrl_shift_esc": {takeover_ctrl_shift_esc}{extra}
+  // Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager (off by default; not available while Tasks is alpha).
+  "takeover_ctrl_shift_esc": {takeover_ctrl_shift_esc},
+
+  // true = while auto-hide is off the bar reserves its strip of the screen like the Windows taskbar, so
+  // maximized windows end above it instead of under it. Nothing is reserved with autohide true.
+  "reserve_space": {reserve_space}{extra}
 }}
 "#,
             monitor = js(&c.monitor),
@@ -1287,6 +1323,7 @@ mod legacy {
             suite_tasks = c.suite_tasks,
             suite_files = c.suite_files,
             takeover_ctrl_shift_esc = c.takeover_ctrl_shift_esc,
+            reserve_space = c.reserve_space,
             update_check = c.update_check,
             update_auto_install = c.update_auto_install,
             last_update_check = js(&c.last_update_check),

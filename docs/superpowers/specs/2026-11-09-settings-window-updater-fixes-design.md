@@ -6,8 +6,8 @@ Date: 2026-11-09. Base: `main` at 0c033aa (v1.3.0 + 7). Language of the code, co
 
 Three pieces of work, shipped as 1.4.0:
 
-1. **Fix the 12 findings** of the 2026-11-08 review of the upstream commits (details in `E:\Giovik\Documenti\Dock\docs\review-2026-11-08-findings.json`, one entry per finding with file, line, description, failure scenario and the two verifier reports).
-2. **A self-updater** inside `dock.exe`: the dock learns that a new GitHub release exists and can install it itself, reusing the existing `--install` path. This replaces the idea of a separate installer (Inno/WiX): the readiness assessment in `E:\Giovik\Documenti\Dock\docs\review-2026-11-08-installer-readiness.md` explains why.
+1. **Fix the 12 findings** of the 2026-11-08 review of the upstream commits (details in `<review-notes>\review-2026-11-08-findings.json` (a local review file outside the repository), one entry per finding with file, line, description, failure scenario and the two verifier reports).
+2. **A self-updater** inside `dock.exe`: the dock learns that a new GitHub release exists and can install it itself, reusing the existing `--install` path. This replaces the idea of a separate installer (Inno/WiX): the readiness assessment in `<review-notes>\review-2026-11-08-installer-readiness.md` (a local review file outside the repository) explains why.
 3. **A real Settings window** instead of the current settings popup. The owner's words: the popup "starts to be too full and too small". The chosen layout is variant A of the mockup: a resizable window with a left navigation of sections (https://claude.ai/artifact/KKCnYQBpWHS687Xqh9sHeA).
 
 Everything else about the dock stays as it is. "Nothing changes behind your back" remains the rule: a user who updates without touching settings keeps the same look and behaviour, with the one exception stated under *Defaults* below.

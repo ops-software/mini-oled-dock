@@ -603,8 +603,8 @@ fn copy_matches(copy: &Path, want: Digest) -> Result<(), String> {
 /// Installs the exe copy and registers the task. `allow_stop`: may stop an instance that locks
 /// the destination (only from `--install`; the popup toggle must not close itself).
 /// Then writes the Add/Remove Programs entry (`arp::write`) and the Start entries of the components already in the
-/// folder. Everything goes through `RealInstallOs` (`enable_with`), so the machine journal records the task and the
-/// ARP key before either is touched. The copy must be the running image: its digest (`running_image_digest`) is read
+/// folder. Everything goes through `RealInstallOs` (`enable_with`), so the machine journal records the task as it was
+/// and the ARP key it creates before either is touched. The copy must be the running image: its digest (`running_image_digest`) is read
 /// before anything else, and without it nothing is changed.
 /// A task or ARP error after a good copy keeps `copy`, so the new exe is still relaunched.
 pub(crate) fn enable(allow_stop: bool) -> InstallReport {
@@ -630,24 +630,40 @@ pub(crate) trait InstallOs {
     fn arp_write(&mut self, dir: &Path) -> Result<(), String>;
     /// The machine journal's open Install entries (none when there is no journal or it cannot be read).
     fn open_install_entries(&self) -> Vec<Entry>;
+    /// What is there before anything is changed: whether the ARP key exists and the logon task's XML, read as the
+    /// journal's undo reads them. Err when either cannot be read.
+    fn before(&self) -> Result<InstallBefore, String>;
     /// The `*.old-<pid>` leftovers of an uninstall not yet followed by a restart.
     fn remove_old_copies(&mut self, dir: &Path);
     /// The Start entries of the components already in `dir` (I1b; journaled there).
     fn sync_entry_points(&mut self, dir: &Path) -> Result<u32, String>;
 }
 
-/// What an install journals before it changes anything (I1c), from the machine journal's open Install entries and the
-/// digest of the task XML it registers. Pure.
-/// - No open entry for the ARP key: RegKeyCreated for it, whether or not the key exists. A key an install before 1.8.0
-///   left is ours too, so no HKLM write stays outside a journaled key and the suite's uninstall removes it.
-/// - No open entry for the task: Task with no before, whether or not the task exists (an older version of us made it).
-/// - Open Task entries whose newest `after` is `task_after`: nothing; another `after`: a new Task entry that keeps the
-///   first entry's before (the first original wins), so the journal grows only when the task's XML changes.
-pub(crate) fn install_journal_plan(open_install: &[Entry], task_after: Digest) -> Vec<Change> {
+/// What an install finds before it changes anything (`InstallOs::before`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstallBefore {
+    /// The ARP key exists.
+    pub arp_key: bool,
+    /// The logon task's XML as Task Scheduler gives it back; None: there is no such task.
+    pub task: Option<String>,
+}
+
+/// What an install journals before it changes anything (I1c), from the machine journal's open Install entries, what
+/// the install finds (`before`) and the digest of the task XML it registers. Pure. What existed before is never
+/// journaled as created, so an undo of the Install class puts back what was there or leaves it alone.
+/// - The ARP key, with no open entry for it: RegKeyCreated when it is not there (this install creates it), nothing when
+///   it is (journal::apply's rule: an existing key is not ours to delete; the uninstall's own removal deletes it).
+/// - The task, when the newest open entry for it has `task_after`: nothing, so a reinstall does not grow the journal.
+///   Otherwise a Task entry whose before is the task as found (none, or its XML): an undo puts that back. Never an
+///   older entry's before: 1.8.0 wrote "no task" and "key created" without looking, over an install that had both.
+///
+/// Those 1.8.0 entries are kept as they are: no record tells them from a true one, and only the uninstall, which then
+/// deletes the task and the key anyway, undoes the Install class (`only_the_uninstall_undoes_the_install`).
+pub(crate) fn install_journal_plan(open_install: &[Entry], before: &InstallBefore, task_after: Digest) -> Vec<Change> {
     let ours = open_install.iter().filter(|e| e.kind == Kind::Install);
     let mut arp_open = false;
-    // (seq, before_xml, after) of the open Task entries for the logon task.
-    let mut tasks: Vec<(u64, Option<&String>, Digest)> = Vec::new();
+    // (seq, after) of the newest open Task entry for the logon task.
+    let mut task_open: Option<(u64, Digest)> = None;
     for e in ours {
         match &e.change {
             Change::RegKeyCreated { hive: Hive::Hklm, key }
@@ -655,42 +671,47 @@ pub(crate) fn install_journal_plan(open_install: &[Entry], task_after: Digest) -
             {
                 arp_open = true;
             }
-            Change::Task { name, before_xml, after } if name.as_str().eq_ignore_ascii_case(TASK_JOURNAL_NAME) => {
-                tasks.push((e.seq, before_xml.as_ref(), *after));
+            Change::Task { name, after, .. } if name.as_str().eq_ignore_ascii_case(TASK_JOURNAL_NAME) => {
+                if task_open.is_none_or(|(seq, _)| e.seq > seq) {
+                    task_open = Some((e.seq, *after));
+                }
             }
             _ => {}
         }
     }
     let mut plan = Vec::new();
-    if !arp_open {
+    if !arp_open && !before.arp_key {
         if let Ok(key) = RegPath::new(crate::arp::ARP_KEY) {
             plan.push(Change::RegKeyCreated { hive: Hive::Hklm, key });
         }
     }
-    let newest = tasks.iter().max_by_key(|t| t.0);
-    if newest.is_some_and(|t| t.2 == task_after) {
+    if task_open.is_some_and(|(_, after)| after == task_after) {
         return plan;
     }
-    let before_xml = tasks.iter().min_by_key(|t| t.0).and_then(|t| t.1.cloned());
     if let Ok(name) = TaskName::new(TASK_JOURNAL_NAME) {
-        plan.push(Change::Task { name, before_xml, after: task_after });
+        plan.push(Change::Task { name, before_xml: before.task.clone(), after: task_after });
     }
     plan
 }
 
-/// The install path (`enable`, `--install`, `--install --from`): the journal plan recorded first (a failed record
-/// changes nothing), then the copy, the leftovers, the task, the ARP entry and the Start entries, as `enable` did
-/// before 1.8.0. A task or ARP error after a good copy keeps `copy` (the first error wins); the Start entries only log
-/// theirs (an update's install must not fail for a shortcut; the running dock brings them in line later).
+/// The install path (`enable`, `--install`, `--install --from`): what it replaces read and the journal plan recorded
+/// first (a failed read or record changes nothing, as the journal's own planner refuses), then the copy, the leftovers,
+/// the task, the ARP entry and the Start entries, as `enable` did before 1.8.0. A task or ARP error after a good copy
+/// keeps `copy` (the first error wins); the Start entries only log theirs (an update's install must not fail for a
+/// shortcut; the running dock brings them in line later).
 pub(crate) fn enable_with(os: &mut dyn InstallOs, allow_stop: bool) -> InstallReport {
     let dir = match install_dir() {
         Ok(d) => d,
         Err(e) => return InstallReport::failed(InstallError::Failed(e)),
     };
     let dest = dir.join("dock.exe");
-    let plan = match os.task_xml_digest() {
-        Ok(task) => install_journal_plan(&os.open_install_entries(), task),
-        Err(e) => return InstallReport::failed(InstallError::Failed(format!("the logon task's XML: {e}"))),
+    let plan = match (os.task_xml_digest(), os.before()) {
+        (Ok(task), Ok(before)) => install_journal_plan(&os.open_install_entries(), &before, task),
+        (Err(e), _) => return InstallReport::failed(InstallError::Failed(format!("the logon task's XML: {e}"))),
+        (_, Err(e)) => {
+            log!("autostart: the install is refused, nothing changed: {e}");
+            return InstallReport::failed(InstallError::Failed(format!("what the install replaces: {e}")));
+        }
     };
     if let Err(e) = os.record(&plan) {
         log!("autostart: the change journal refused the install ({e}): nothing changed");
@@ -768,6 +789,16 @@ impl InstallOs for RealInstallOs {
                 Vec::new()
             }
         }
+    }
+
+    fn before(&self) -> Result<InstallBefore, String> {
+        use journal::JournalOs as _;
+        let os = RealOs::for_scope(Scope::Machine);
+        let key = RegPath::new(crate::arp::ARP_KEY).map_err(|_| "the ARP key's path".to_string())?;
+        let name = TaskName::new(TASK_JOURNAL_NAME).map_err(|_| "the logon task's name".to_string())?;
+        let arp_key = os.reg_key_exists(Hive::Hklm, &key).map_err(|e| format!("the ARP key: {}", e.what))?;
+        let task = os.task_xml(&name).map_err(|e| format!("the logon task: {}", e.what))?;
+        Ok(InstallBefore { arp_key, task })
     }
 
     fn remove_old_copies(&mut self, dir: &Path) {
@@ -2121,40 +2152,55 @@ mod tests {
         Change::Task { name: TaskName::new(TASK_JOURNAL_NAME).unwrap(), before_xml: before.map(String::from), after }
     }
 
+    /// What an install finds: whether the ARP key exists, and the logon task's XML.
+    fn found(arp_key: bool, task: Option<&str>) -> InstallBefore {
+        InstallBefore { arp_key, task: task.map(String::from) }
+    }
+
     #[test]
     fn install_journal_plan() {
         let plan = super::install_journal_plan;
         let t = digest(7);
-        // Nothing open: the key and the task, whether or not they exist (the plan never asks the machine).
-        assert_eq!(plan(&[], t), [arp_created(), task(None, t)]);
-        assert_eq!(plan(&[entry(1, Kind::Install, arp_created())], t), [task(None, t)]);
-        assert_eq!(plan(&[entry(1, Kind::Install, task(None, t))], t), [arp_created()]);
+        let fresh = found(false, None);
+        // A fresh install creates the key and the task: both are journaled as created, so an undo deletes them.
+        assert_eq!(plan(&[], &fresh, t), [arp_created(), task(None, t)]);
+        // Over an install that left no journal (a version before 1.8.0) nothing is journaled as created: a key that
+        // is there is not ours to delete (journal::apply's rule; the uninstall's own removal deletes it), and the
+        // task's XML as found is its before, so an undo puts it back.
+        assert_eq!(plan(&[], &found(true, Some("<older/>")), t), [task(Some("<older/>"), t)]);
+        assert_eq!(plan(&[], &found(true, None), t), [task(None, t)]);
+        assert_eq!(plan(&[], &found(false, Some("<older/>")), t), [arp_created(), task(Some("<older/>"), t)]);
+        // An open entry stands for its target.
+        assert_eq!(plan(&[entry(1, Kind::Install, arp_created())], &fresh, t), [task(None, t)]);
+        assert_eq!(plan(&[entry(1, Kind::Install, task(None, t))], &fresh, t), [arp_created()]);
         // Both open and the newest task entry has this XML: nothing, so a reinstall does not grow the journal.
         let both = [
             entry(1, Kind::Install, arp_created()),
             entry(2, Kind::Install, task(Some("<first/>"), digest(1))),
             entry(3, Kind::Install, task(Some("<later/>"), t)),
         ];
-        assert!(plan(&both, t).is_empty());
-        // Another XML: one new entry that keeps the first entry's before (the first original wins).
-        assert_eq!(plan(&both, digest(9)), [task(Some("<first/>"), digest(9))]);
+        let installed = found(true, Some("<registered/>"));
+        assert!(plan(&both, &installed, t).is_empty());
+        // Another XML: one new entry whose before is the task as this install finds it, never an older entry's (one
+        // that 1.8.0 wrote without looking may say there was no task).
+        assert_eq!(plan(&both, &installed, digest(9)), [task(Some("<registered/>"), digest(9))]);
         // An older entry with this XML does not count: the newest decides.
         let older = [
             entry(1, Kind::Install, arp_created()),
             entry(2, Kind::Install, task(None, t)),
             entry(5, Kind::Install, task(None, digest(3))),
         ];
-        assert_eq!(plan(&older, t), [task(None, t)]);
+        assert_eq!(plan(&older, &installed, t), [task(Some("<registered/>"), t)]);
         // Only the install's own entries stand for it, and names compare as Windows compares them.
         let takeover = entry(1, Kind::Takeover(TakeoverId::FolderVerbs), arp_created());
-        assert_eq!(plan(&[takeover], t), [arp_created(), task(None, t)]);
+        assert_eq!(plan(&[takeover], &fresh, t), [arp_created(), task(None, t)]);
         let lower = Change::Task { name: TaskName::new("\\dock").unwrap(), before_xml: None, after: t };
         let upper =
             Change::RegKeyCreated { hive: Hive::Hklm, key: RegPath::new(&crate::arp::ARP_KEY.to_uppercase()).unwrap() };
-        assert!(plan(&[entry(1, Kind::Install, lower), entry(2, Kind::Install, upper)], t).is_empty());
+        assert!(plan(&[entry(1, Kind::Install, lower), entry(2, Kind::Install, upper)], &installed, t).is_empty());
         // Another hive is another key.
         let hkcu = Change::RegKeyCreated { hive: Hive::Hkcu, key: RegPath::new(crate::arp::ARP_KEY).unwrap() };
-        assert_eq!(plan(&[entry(1, Kind::Install, hkcu)], t), [arp_created(), task(None, t)]);
+        assert_eq!(plan(&[entry(1, Kind::Install, hkcu)], &fresh, t), [arp_created(), task(None, t)]);
     }
 
     /// The machine of an install test: the calls in order, and the answers the test sets.
@@ -2168,6 +2214,9 @@ mod tests {
         copy: Option<CopyOutcome>,
         /// Runs in the copy, between `--from`'s check and its staging.
         on_copy: Option<Box<dyn FnMut()>>,
+        /// What the install finds; None: a fresh machine (no ARP key, no task).
+        found: Option<InstallBefore>,
+        fail_before: bool,
     }
 
     impl InstallOs for FakeInstall {
@@ -2205,6 +2254,12 @@ mod tests {
         fn open_install_entries(&self) -> Vec<Entry> {
             self.open.clone()
         }
+        fn before(&self) -> Result<InstallBefore, String> {
+            if self.fail_before {
+                return Err("the logon task: schtasks /Query failed".into());
+            }
+            Ok(self.found.clone().unwrap_or_else(|| found(false, None)))
+        }
         fn remove_old_copies(&mut self, _: &Path) {
             self.calls.push("remove_old_copies");
         }
@@ -2226,7 +2281,7 @@ mod tests {
         assert_eq!(os.recorded, [arp_created(), task(None, digest(7))], "the ARP key and the task, journaled first");
         // A second install over the same journal records nothing new and goes the same way.
         let open = os.recorded.iter().enumerate().map(|(i, c)| entry(i as u64 + 1, Kind::Install, c.clone())).collect();
-        let mut again = FakeInstall { open, ..FakeInstall::default() };
+        let mut again = FakeInstall { open, found: Some(found(true, Some("<registered/>"))), ..FakeInstall::default() };
         assert!(enable_with(&mut again, false).error.is_none());
         assert!(again.recorded.is_empty());
         assert_eq!(again.calls, all);
@@ -2246,6 +2301,38 @@ mod tests {
         let mut copy_fails = FakeInstall { copy: Some(CopyOutcome::Failed), ..FakeInstall::default() };
         assert_eq!(enable_with(&mut copy_fails, true).copy, CopyOutcome::Failed);
         assert_eq!(copy_fails.calls, ["record", "copy_self"]);
+    }
+
+    #[test]
+    fn an_install_over_an_older_one_journals_what_it_replaces() {
+        // An older install that left no journal: the key is left out, the task's XML is its before.
+        let mut over = FakeInstall { found: Some(found(true, Some("<older/>"))), ..FakeInstall::default() };
+        assert!(enable_with(&mut over, true).error.is_none());
+        assert_eq!(over.recorded, [task(Some("<older/>"), digest(7))]);
+        // Undone (the Install class: the uninstall's undo), the task gets its older XML back and the key stays.
+        let mut j = Journal::empty(Scope::Machine);
+        let mut sink = VecSink::default();
+        let run = j.begin_run();
+        for c in over.recorded {
+            journal::record(&mut j, &mut sink, run, Kind::Install, c, 1).unwrap();
+        }
+        // The fake digests by length: "<seven>" is the XML the entry's after names, the one this install registered.
+        let mut os = FakeJournalOs {
+            keys: vec![crate::arp::ARP_KEY.to_string()],
+            task: Some("<seven>".into()),
+            ..FakeJournalOs::default()
+        };
+        let r = undo_suite_entries(&mut j, &mut sink, &mut os);
+        assert_eq!((r.restored, r.failed.len()), (1, 0), "{r:?}");
+        assert_eq!(os.task.as_deref(), Some("<older/>"));
+        assert_eq!(os.keys, [crate::arp::ARP_KEY]);
+        // A machine that cannot be read is not a fresh one: the install is refused before anything is recorded or
+        // changed.
+        let mut unread = FakeInstall { fail_before: true, ..FakeInstall::default() };
+        let r = enable_with(&mut unread, true);
+        assert_eq!(r.copy, CopyOutcome::Failed);
+        assert!(r.error.as_ref().is_some_and(|e| e.to_string().contains("schtasks /Query")), "{:?}", r.error);
+        assert!(unread.calls.is_empty() && unread.recorded.is_empty(), "{:?}", unread.calls);
     }
 
     #[test]
@@ -2396,6 +2483,139 @@ mod tests {
         let reread = Journal::parse(Scope::Machine, &sink.0).unwrap();
         let open: Vec<Kind> = reread.open_entries().into_iter().map(|e| e.kind.clone()).collect();
         assert_eq!(open, [Kind::UserEdit(journal::AppId::Tasks)]);
+    }
+
+    /// The machine journal as 1.8.0 wrote it when it was installed over an older version: the ARP key as created and
+    /// the logon task with no before, although both were there; then the Start entries of the first suite sync, and a
+    /// takeover. The lines are the frozen format's, crc included.
+    const JOURNAL_1_8_0: [&str; 5] = [
+        r#"528a976d {"r":"entry","v":1,"seq":1,"run":1,"ts":1795000000,"kind":"install","change":{"t":"reg_key_created","hive":"hklm","key":"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\mini-oled-dock"}}"#,
+        r#"fe779772 {"r":"entry","v":1,"seq":2,"run":1,"ts":1795000000,"kind":"install","change":{"t":"task","name":"\\Dock","before_xml":null,"after":"0707070707070707070707070707070707070707070707070707070707070707"}}"#,
+        r#"000abc4f {"r":"entry","v":1,"seq":3,"run":2,"ts":1795000066,"kind":"install","change":{"t":"file_created","path":"C:\\made-up\\Programs\\Tasks.lnk","after":"0404040404040404040404040404040404040404040404040404040404040404"}}"#,
+        r#"5f9abd50 {"r":"entry","v":1,"seq":4,"run":2,"ts":1795000066,"kind":"install","change":{"t":"file_created","path":"C:\\made-up\\Programs\\Folio.lnk","after":"0505050505050505050505050505050505050505050505050505050505050505"}}"#,
+        r#"37007203 {"r":"entry","v":1,"seq":5,"run":3,"ts":1795000100,"kind":"takeover.folder_verbs","change":{"t":"reg_value","hive":"hklm","key":"SOFTWARE\\Classes\\Folder\\shell\\open\\command","name":null,"before":null,"after":{"t":"sz","s":"ours"}}}"#,
+    ];
+
+    const FOLDER_VERB: &str = r"SOFTWARE\Classes\Folder\shell\open\command";
+
+    /// The machine a 1.8.0 journal describes: the ARP key, the logon task (its XML one the entry's after names: the
+    /// fake digests by length, so the task counts as ours), the two Start entries and the takeover's value.
+    fn machine_of_1_8_0() -> FakeJournalOs {
+        let mut os = FakeJournalOs {
+            keys: vec![crate::arp::ARP_KEY.to_string()],
+            task: Some("<seven>".into()),
+            files: vec![
+                (r"C:\made-up\Programs\Tasks.lnk".into(), digest(4)),
+                (r"C:\made-up\Programs\Folio.lnk".into(), digest(5)),
+            ],
+            ..FakeJournalOs::default()
+        };
+        os.values.insert((FOLDER_VERB.into(), None), RegData::Sz("ours".into()));
+        os
+    }
+
+    #[test]
+    fn undo_all_leaves_the_install_of_a_1_8_0_journal() {
+        let written: String = JOURNAL_1_8_0.iter().map(|l| format!("{l}\n")).collect();
+        let mut j = Journal::parse(Scope::Machine, written.as_bytes()).unwrap();
+        // What 1.8.0 wrote is what the frozen encoder writes, line for line.
+        let again: Vec<u8> = j.records().iter().flat_map(|r| Journal::encode(r).unwrap()).collect();
+        assert_eq!(again, written.as_bytes());
+        let mut os = machine_of_1_8_0();
+        let mut sink = VecSink::default();
+        // Settings > Safety's Undo all, --recover and --undo-user undo through this helper and no other
+        // (only_the_uninstall_undoes_the_install).
+        let r = crate::journal_ui::undo_takeovers(&mut j, &mut sink, &mut os);
+        assert_eq!((r.restored, r.already, r.changed_by_other.len(), r.failed.len()), (1, 0, 0, 0), "{r:?}");
+        assert!(!os.values.contains_key(&(FOLDER_VERB.to_string(), None)), "the takeover is undone");
+        assert_eq!(os.keys, [crate::arp::ARP_KEY], "the ARP entry stays");
+        assert_eq!(os.task.as_deref(), Some("<seven>"), "the logon task stays");
+        assert_eq!(os.files.len(), 2, "the Start entries stay");
+        let mut disk = written.into_bytes();
+        disk.extend_from_slice(&sink.0);
+        let reread = Journal::parse(Scope::Machine, &disk).unwrap();
+        let open: Vec<u64> = reread.open_entries().iter().map(|e| e.seq).collect();
+        assert_eq!(open, [1, 2, 3, 4], "the install's entries stay open, for the uninstall");
+        // The uninstall undoes them, and deletes the task and the ARP entry right after, whatever the journal says.
+        let r = undo_suite_entries(&mut j, &mut sink, &mut os);
+        assert_eq!((r.restored, r.failed.len()), (4, 0), "{r:?}");
+        assert!(os.keys.is_empty() && os.task.is_none() && os.files.is_empty());
+    }
+
+    #[test]
+    fn the_next_install_over_a_1_8_0_journal_claims_nothing_it_found() {
+        let written: String = JOURNAL_1_8_0.iter().map(|l| format!("{l}\n")).collect();
+        let j = Journal::parse(Scope::Machine, written.as_bytes()).unwrap();
+        let open: Vec<Entry> = j.open_entries().into_iter().filter(|e| e.kind == Kind::Install).cloned().collect();
+        let installed = found(true, Some("<seven>"));
+        // The same task XML: nothing new. The 1.8.0 entries stay as they are (no record tells a true one from a false
+        // one; only the uninstall undoes them, and it removes the task and the key anyway).
+        let plan = super::install_journal_plan;
+        assert!(plan(&open, &installed, digest(7)).is_empty());
+        // A new XML: the task as found is the new entry's before, never the 1.8.0 entry's "none"; the key is not
+        // claimed again.
+        assert_eq!(plan(&open, &installed, digest(9)), [task(Some("<seven>"), digest(9))]);
+        // The same through the install path.
+        let mut os = FakeInstall { open, found: Some(installed), ..FakeInstall::default() };
+        assert!(enable_with(&mut os, false).error.is_none());
+        assert!(os.recorded.is_empty(), "{:?}", os.recorded);
+    }
+
+    /// The name of the function whose code holds `code[at]` (the last `fn ` before it).
+    fn enclosing_fn(code: &str, at: usize) -> &str {
+        let start = code[..at].rfind("fn ").map_or(0, |i| i + 3);
+        let rest = &code[start..];
+        &rest[..rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len())]
+    }
+
+    /// Every undo the dock runs is one of three, and only the uninstall's takes the Install class (the logon task, the
+    /// ARP entry and the Start entries of the installed dock): Settings > Safety's Undo all, --recover and --undo-user
+    /// undo takeovers only. So no install entry, a 1.8.0 one that calls a task or key it found "created" included, is
+    /// undone while the dock stays installed.
+    #[test]
+    fn only_the_uninstall_undoes_the_install() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        let test_only: Vec<PathBuf> =
+            files.iter().flat_map(|f| test_only_modules(f, &std::fs::read_to_string(f).unwrap())).collect();
+        let (mut sets, mut callers) = (Vec::new(), Vec::new());
+        for f in files.iter().filter(|f| !test_only.contains(f)) {
+            let src = std::fs::read_to_string(f).unwrap();
+            let code = &src[..src.len() - test_part(&src).len()];
+            let rel = f.strip_prefix(root).unwrap().display().to_string().replace('\\', "/");
+            for (i, _) in code.match_indices("UndoSet::") {
+                sets.push(format!("{rel}: {})", code[i..].split(')').next().unwrap_or_default()));
+            }
+            for p in ["undo_suite_entries(", concat!("undo_machine", "_suite(")] {
+                callers.extend(code.match_indices(p).map(|(i, _)| format!("{rel}: {p} in {}", enclosing_fn(code, i))));
+            }
+        }
+        sets.sort();
+        assert_eq!(
+            sets,
+            [
+                "src/autostart.rs: UndoSet::Classes(vec![KindClass::Takeover, KindClass::Install])",
+                "src/journal_ui.rs: UndoSet::Classes(vec![KindClass::Takeover])",
+                "src/update/suite.rs: UndoSet::Run(run)",
+            ],
+            "a new undo: keep the Install class to the uninstall"
+        );
+        // The Install class is reached from the uninstall's step and nowhere else.
+        let step = concat!("undo_machine", "_suite(");
+        assert_eq!(
+            callers,
+            [
+                "src/autostart.rs: undo_suite_entries( in undo_suite_entries".to_string(),
+                format!("src/autostart.rs: undo_suite_entries( in {}", &step[..step.len() - 1]),
+                format!("src/autostart.rs: {step} in {}", &step[..step.len() - 1]),
+                format!("src/autostart.rs: {step} in run_uninstall_step"),
+            ]
+        );
+        // The update journal's undo is its own file's (update.jnl), never the machine journal.
+        let suite = std::fs::read_to_string(root.join("src").join("update").join("suite.rs")).unwrap();
+        let at = suite.find("UndoSet::Run(run)").unwrap();
+        assert!(suite[..at].rfind("FolderOs").is_some_and(|f| at - f < 200), "update.jnl's undo");
     }
 
     /// The code of a file that only tests compile: from its first `#[cfg(test)]` that starts a module (J1c's rule).

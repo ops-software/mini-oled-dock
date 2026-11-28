@@ -76,12 +76,12 @@ fn about_shows_the_version_and_closes() {
     let dump = h.a11y_dump();
     assert!(dump.contains("Dialog \"Tasks\""), "{dump}");
     assert!(dump.contains("Button \"Close\""), "{dump}");
-    // The body (the dump does not print descriptions): version, Beta and the licence line.
+    // The body (the dump does not print descriptions): version, Alpha and the licence line.
     let v = oled_trust::manifest::release::Version::current();
     let body = tasks::ui::about::spec(oled_ui::UiLang::EN, v, true).body.to_string();
     assert!(body.contains(&format!("Version {v}")), "{body}");
-    assert!(body.contains("Beta") && body.contains("MIT licence"), "{body}");
-    assert!(!tasks::ui::about::spec(oled_ui::UiLang::EN, v, false).body.contains("Beta"), "stable has no Beta");
+    assert!(body.contains("Alpha") && body.contains("MIT licence"), "{body}");
+    assert!(!tasks::ui::about::spec(oled_ui::UiLang::EN, v, false).body.contains("Alpha"), "stable has no Alpha");
     // Esc closes the dialog and not the window.
     h.key("Esc");
     assert!(!h.a11y_dump().contains("Dialog"), "the dialog is gone");

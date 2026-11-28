@@ -4,6 +4,7 @@ pub mod i18n;
 pub mod logger;
 pub mod winhttp;
 // ---- L-P (plumbing): pipe, worker, admin, journal_os, process identity, single instance, datadir for apps
+pub mod darkmenu;
 pub mod datadir;
 pub mod ident;
 pub mod journal_os;

@@ -1,6 +1,6 @@
 # The files window's strings, Italian (P3-files-app 2.4). Every key is in en.toml too.
-"files.app.title_beta" = "{name} Beta"
-"files.app.beta" = "Beta"
+"files.app.title_beta" = "{name} Alpha"
+"files.app.beta" = "Alpha"
 "files.app.home" = "Home"
 "files.nav.back" = "Indietro"
 "files.nav.forward" = "Avanti"
@@ -67,7 +67,7 @@
 "files.menu.cant_undo" = "Non si può annullare"
 "files.menu.new_folder" = "Nuova cartella"
 "files.menu.host_down" = "Il menu di Windows non ha risposto"
-"files.menu.not_in_beta" = "Non disponibile in questa beta: usa Esplora file"
+"files.menu.not_in_beta" = "Non disponibile in questa alpha: usa Esplora file"
 "files.menu.new" = "Nuovo"
 "files.menu.sort" = "Ordina"
 "files.menu.view" = "Visualizza"

@@ -344,7 +344,7 @@ fn targets_to_requests() {
     // Text nobody typed runs nothing: the notice says so.
     w.op(Op::HandOff(Target::Other("shell:Fonts".into()), false));
     assert_eq!(w.handoffs().len(), 5);
-    assert!(w.has_label("Not available in this beta: use File Explorer"), "{}", w.dump());
+    assert!(w.has_label("Not available in this alpha: use File Explorer"), "{}", w.dump());
 }
 
 #[test]
@@ -666,7 +666,7 @@ fn about_dialog_named_and_closes_on_esc() {
     let mut w = window();
     w.op(Op::Cmd(Cmd::About));
     let dump = w.dump();
-    assert!(dump.contains(&format!("Dialog \"{} Beta\"", app_name())), "{dump}");
+    assert!(dump.contains(&format!("Dialog \"{} Alpha\"", app_name())), "{dump}");
     assert!(w.has_button("Close"), "{dump}");
     w.h.assert_named();
     let close = NodeId::new(WidgetId(about::ID_DIALOG.0 + 1), 0);

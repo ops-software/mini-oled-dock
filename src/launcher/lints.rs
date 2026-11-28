@@ -1539,7 +1539,8 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// function, blocks). Without SMTO_BLOCK the waiting thread dispatches the messages other threads send its windows, and
 /// each one starts the timeout again (live check V-14: a 50 ms ping lasted 7.45 s while another process sent the dock a
 /// message every 10 ms; the heartbeat starved and the watchdog gave the taskbar back). The sends the UI thread makes
-/// block: the ping, the bar's minimize and restore, the taskbar's AppBar messages to Explorer and the restore's yield
+/// block: the ping, the bar's minimize and restore, the taskbar's and the reserved strip's AppBar messages to Explorer
+/// and the restore's yield
 /// to another dock's tray host. Those longer than the 50 ms ping also remove the popup's low-level mouse hook for the
 /// wait (suspend_mouse_hook): Windows calls the hook through a message to the UI thread, which SMTO_BLOCK does not serve,
 /// so every mouse event would wait for the send and Windows drops a hook that misses LowLevelHooksTimeout (at most 1 s)
@@ -1549,10 +1550,11 @@ fn a_paste_asks_the_clipboards_owner_first() {
 /// the tray-fwd thread (no window, nothing to dispatch) and the shell model's WM_GETICON (read by the shell thread; none of the dock's windows; crates/oled-shellmodel/src/icon.rs, scanned with src/).
 /// The update guard's WM_NULL to the new dock's window blocks: the guard has no window, so SMTO_BLOCK only keeps its
 /// 2 s a true bound. A new SendMessageTimeoutW is listed here first.
-const TIMED_SENDS: [(&str, &str, bool, bool); 10] = [
+const TIMED_SENDS: [(&str, &str, bool, bool); 11] = [
     ("src/ui.rs", "fn answers(", true, false),
     ("src/apps.rs", "fn sys_command(", true, true),
     ("src/taskbar.rs", "fn appbar_direct_at(", true, true),
+    ("src/appbar.rs", "fn call(", true, true),
     ("src/tray_host.rs", "fn yield_foreign_hosts(", true, true),
     ("src/tray_host.rs", "fn forward_sync(", false, false),
     ("src/tray_host.rs", "fn forward_with_shared(", false, false),

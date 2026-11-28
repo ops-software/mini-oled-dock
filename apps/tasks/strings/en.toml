@@ -1,6 +1,6 @@
 # The tasks app's strings, English (P3-tasks-app TF0). Every key is in it.toml too; a key added later goes to both
 # files. The app's display name is never written here: it is the kit's kit.app.tasks ({name} placeholders).
-"tasks.window.title_beta" = "{name} Beta"
+"tasks.window.title_beta" = "{name} Alpha"
 "tasks.window.title" = "{name}"
 "tasks.tab.processes" = "Processes"
 "tasks.section.apps" = "Apps"
@@ -87,7 +87,7 @@
 "tasks.updated.action" = "Restart"
 "tasks.updated.failed" = "Could not restart"
 "tasks.about.version" = "Version {v}"
-"tasks.about.beta" = "Beta"
+"tasks.about.beta" = "Alpha"
 "tasks.about.legal" = "Part of mini-oled-dock. MIT licence."
 "tasks.about.close" = "Close"
 "tasks.keys.title" = "Keyboard shortcuts"

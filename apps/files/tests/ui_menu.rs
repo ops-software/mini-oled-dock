@@ -298,7 +298,7 @@ fn intercept_mapping() {
     let mut w = window();
     reply(&mut w, ShellEvt::MenuDone { req: ReqId(1), outcome: MenuOutcome::Dismissed, items: vec![] });
     reply(&mut w, ShellEvt::MenuDone { req: ReqId(1), outcome: MenuOutcome::Invoked, items: vec![] });
-    assert!(!w.h.a11y_dump().contains("beta") && !w.h.a11y_dump().contains("Windows menu"), "no notice yet");
+    assert!(!w.h.a11y_dump().contains("alpha") && !w.h.a11y_dump().contains("Windows menu"), "no notice yet");
     reply(
         &mut w,
         ShellEvt::MenuDone {
@@ -308,7 +308,7 @@ fn intercept_mapping() {
         },
     );
     let dump = w.h.a11y_dump();
-    assert!(dump.contains("Not available in this beta"), "{dump}");
+    assert!(dump.contains("Not available in this alpha"), "{dump}");
     assert!(dump.contains("Open ↗"), "the button: {dump}");
 
     let mut w = window();
@@ -711,7 +711,9 @@ fn timing_menu_hang_keeps_painting() {
     h.key("Home").key("Shift+F10");
     let started = Instant::now();
     let mut notice_at = None;
+    let mut lap = Duration::ZERO;
     while started.elapsed() < Duration::from_millis(2_600) {
+        let lap_start = Instant::now();
         let t = Instant::now();
         h.render();
         let took = t.elapsed();
@@ -723,13 +725,23 @@ fn timing_menu_hang_keeps_painting() {
         assert!(t.elapsed() < Duration::from_millis(100), "a key waited on the host");
         if notice_at.is_none() && h.a11y_dump().contains("Windows menu didn't respond") {
             notice_at = Some(started.elapsed());
+            lap = lap_start.elapsed();
             break;
         }
         std::thread::sleep(Duration::from_millis(16));
     }
     let at = notice_at.expect("the host_down notice shows");
-    assert!(at < Duration::from_millis(1_600), "the notice came after {at:?}");
+    // The product's deadline is 1,500 ms from the request. The test only sees the notice at the end of the lap that
+    // pumped it, and a lap may take up to what its own assertions allow (a frame and a key, 100 ms each, plus the
+    // dump): the notice is late only beyond the deadline, 100 ms of routing and that last lap.
+    assert!(at < Duration::from_millis(1_600) + lap, "the notice came after {at:?} (last lap {lap:?})");
     println!("bench: files menu_hang_keeps_painting {} ms", at.as_millis());
+    // shutdown() only queues the order for the supervisor thread: the state follows when that thread has run, which a
+    // loaded machine can delay. Wait for the state, not for a fixed beat.
     drop(stop);
+    let ordered = Instant::now();
+    while shared.services.shell.host_pid().is_some() && ordered.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(shared.services.shell.host_pid().is_none(), "no host is left");
 }

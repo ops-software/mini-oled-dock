@@ -936,7 +936,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 ],
             })
         }
-        "popup_start" => crate::popup::popup_start::new(),
+        "popup_start" => crate::popup::popup_start::preview_suite(false, false),
         "popup_startmenu"
         | "popup_startmenu_search"
         | "popup_startmenu_offer"

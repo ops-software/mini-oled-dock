@@ -96,6 +96,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_TIMER, WS_CAPTION,
 };
 
+use crate::appbar;
 use crate::apps::{self, ClickOutcome};
 use crate::audio::VolumeState;
 use crate::config::{self, PinnedApp};
@@ -521,6 +522,8 @@ pub fn init() -> Result<Geom, String> {
 /// `!config::effective_autohide()`), a plain show that takes the foreground only with `--foreground`
 /// (`show_dock_as`'s `startup`). Also installs `apps::install_winevent_hook`.
 pub fn attach(h: HWND) -> Result<(), String> {
+    // A strip left reserved by a dock that died (marker file): freed before anything else.
+    appbar::release_all("startup");
     let (metrics, sizes) = UI.with(|u| {
         let st = u.borrow();
         (st.metrics, st.sizes)
@@ -589,11 +592,28 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
                 popup::popup_launcher::on_resume();
                 crate::hook::note_activity();
                 crate::tray_host::raise_after("resume");
+                // Displays wake up and may come back with another work area.
+                appbar_sync("resume", true);
             }
             // TRUE grants the event.
             Some(LRESULT(1))
         }
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        // AppBar (`appbar`): Explorer's notifications, and the activation / position messages it wants forwarded.
+        m if m == crate::msg::WM_DOCK_APPBAR => {
+            if appbar::on_notify(wp.0, lp.0, fullscreen_where()) {
+                appbar_sync("AppBar notification", true);
+            }
+            Some(LRESULT(0))
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+            appbar::on_activate(h);
+            None
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGED => {
+            appbar::on_window_pos_changed(h, lp);
+            None
+        }
         // The bar can hold the foreground (Win key): Alt+F4 must not reach WM_CLOSE, which exits the dock.
         WM_SYSCOMMAND if wp.0 & 0xFFF0 == SC_CLOSE as usize => {
             log!("Alt+F4 / SC_CLOSE on the bar ignored");
@@ -740,6 +760,8 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             picker_cancel("display changed");
             crate::tray_host::raise_after("DPI change");
             apply_dpi(if dpi >= 96 { dpi } else { dock_dpi() });
+            // A new scale for the bar's display comes without WM_DISPLAYCHANGE: the strip takes the new bar height.
+            appbar_sync("DPI change", false);
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE => {
@@ -747,6 +769,7 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
             picker_cancel("display changed");
             crate::tray_host::raise_after("display change");
             apply_dpi(dock_dpi());
+            appbar_sync("display change", true);
             Some(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
@@ -1007,6 +1030,8 @@ pub fn on_config_changed() {
     popup::on_tray_changed();
     // The position (top/bottom) may have changed: the geometry is always recomputed.
     redraw();
+    // `reserve_space` switched, or the bar moved to another edge or display: the strip follows, no restart.
+    appbar_sync("config changed", false);
     // Modules switched on/off: start/stop their polling and free their state.
     sysmon_sync();
     battery_refresh(VISIBLE.load(Relaxed));
@@ -1611,6 +1636,7 @@ fn on_attn_tick(h: HWND) {
 
 /// Destroys the UI resources (`render::destroy`; `main::cleanup` removes the apps WinEventHook).
 pub fn shutdown() {
+    appbar::release_all("shutdown");
     kill_timer(hwnd(), TIMER_ANIM);
     kill_timer(hwnd(), TIMER_VIS);
     kill_timer(hwnd(), TIMER_ATTN);
@@ -4360,7 +4386,8 @@ fn compute_geom(top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom
 
 fn geom_from(mi: &MONITORINFO, top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
     let m = Metrics { dpi };
-    let wa = mi.rcWork;
+    // Without the strip the dock itself reserves (`appbar`), or it would climb by it at each reservation.
+    let wa = appbar::unreserved_work(mi.rcWork, mi.rcMonitor);
     let h = render::bar_height(m, sizes);
     let margin = m.px(render::EDGE_MARGIN);
     let w = bar_w.min(wa.right - wa.left - 2 * margin);
@@ -4524,6 +4551,10 @@ fn show_dock_as(reason: &str, hide_after_ms: u64, by_win: bool, startup: bool) {
             log!("  previous foreground window: class \"{}\"", window_class(other_fg));
         }
     }
+    if !was_visible {
+        // After `FS_SHOWN` is known: over a fullscreen app nothing is reserved.
+        appbar_sync("shown", false);
+    }
     if takes {
         // An open popup (linked Start menu, Win+N) keeps the focus: it closes when it loses it.
         force_foreground(popup::current_hwnd().unwrap_or_else(hwnd));
@@ -4569,6 +4600,8 @@ fn hide(reason: &str, now: bool) {
     if was_visible {
         on_visibility(false);
     }
+    // The strip goes back with the bar (the windows are given their space again at the start of the fade).
+    appbar_sync("hidden", false);
     reset_hover();
     kill_timer(hwnd(), TIMER_CLOCK);
     sysmon_sync();
@@ -4613,6 +4646,45 @@ fn on_visibility(visible: bool) {
         request_apps_refresh(hwnd());
     }
     crate::on_bar_visibility(visible);
+}
+
+/// The 3 s safety tick (`main`, `TIMER_SECOND`): an `ABM_REMOVE` that did not reach Explorer is sent again
+/// (`appbar::retry_removal`), and a strip Explorer no longer holds (the watchdog removed it while the dock hung, or
+/// Explorer restarted) is set again at once (`appbar::take_lost`). Cheap while nothing is reserved or pending.
+pub(crate) fn appbar_tick() {
+    appbar::retry_removal();
+    if appbar::take_lost().is_some() {
+        appbar_sync("registration lost", true);
+    }
+}
+
+/// Sets the strip again after the watchdog's give-up, whose taskbar restore freed it while the dock runs on.
+pub(crate) fn appbar_resync(reason: &str) {
+    appbar_sync(reason, true);
+}
+
+/// Reserves or releases the AppBar strip (`appbar`) to match `config.reserve_space` and auto-hide, the bar's
+/// visibility, a fullscreen app and the bar's edge and display. `force` repeats the position (display change, resume,
+/// `ABN_POSCHANGED`).
+fn appbar_sync(reason: &str, force: bool) {
+    let Some(g) = GEOM.with(|g| g.get()) else { return };
+    let dpi = UI.with(|u| u.borrow().metrics.dpi);
+    let mon = dock_monitor().map(|mi| mi.rcMonitor).unwrap_or(g.mon);
+    appbar::sync(
+        hwnd(),
+        reason,
+        &appbar::Input {
+            option: appbar::wanted(config::get().reserve_space, config::effective_autohide()),
+            visible: VISIBLE.load(Relaxed),
+            fullscreen: FS_SHOWN.load(Relaxed),
+            exiting: appbar::dock_exiting(crate::taskbar::exiting(), crate::watchdog::gave_up()),
+            force,
+            mon: [mon.left, mon.top, mon.right, mon.bottom],
+            top: config_top(),
+            bar_h: g.h,
+            margin: Metrics { dpi }.px(render::EDGE_MARGIN),
+        },
+    );
 }
 
 /// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is
@@ -4922,6 +4994,19 @@ pub fn foreground_is_fullscreen() -> bool {
     // SAFETY: MonitorFromWindow with NEAREST always returns a monitor.
     let hm = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
     monitor_info(hm).is_some_and(|mi| fullscreen_window(&mi.rcMonitor).is_some())
+}
+
+/// Where the fullscreen window in front is, for `ABN_FULLSCREENAPP` (which names no display): on the
+/// bar's display, on another one, or not recognised.
+fn fullscreen_where() -> appbar::FsWhere {
+    let Ok(mi) = dock_monitor() else { return appbar::FsWhere::Unknown };
+    if fullscreen_window(&mi.rcMonitor).is_some() {
+        appbar::FsWhere::DockDisplay
+    } else if foreground_is_fullscreen() {
+        appbar::FsWhere::OtherDisplay
+    } else {
+        appbar::FsWhere::Unknown
+    }
 }
 
 /// `EVENT_SYSTEM_FOREGROUND` (forwarded by `WM_DOCK_APPS_DIRTY`): if the dock is over a fullscreen
@@ -5626,6 +5711,39 @@ mod tests {
         let f = code.find("fn on_foreground_changed(").expect("the guard exists");
         let body = code.get(f..).and_then(|t| t.find("\n}\n").map(|e| &t[..e])).expect("the guard ends");
         assert!(!body.contains("takeover::"), "nothing of the takeover inside the guard");
+    }
+
+    /// Every change of the bar's size or display sets the reserved strip again (`appbar_sync`): a display change, and
+    /// a DPI change of the bar's display, which comes without WM_DISPLAYCHANGE (a new scale in Windows' settings).
+    #[test]
+    fn the_strip_follows_every_geometry_change() {
+        let code = code_before_tests();
+        for arm in ["WM_DPICHANGED => {", "WM_DISPLAYCHANGE => {"] {
+            let at = code.find(arm).expect(arm);
+            let end = code.get(at..).and_then(|t| t.find("Some(LRESULT(0))")).expect("the arm ends") + at;
+            assert!(code[at..end].contains("appbar_sync("), "{arm}: {}", &code[at..end]);
+        }
+    }
+
+    /// The strip's option counts only while auto-hide is off (`appbar::wanted`).
+    #[test]
+    fn the_strip_option_counts_only_without_auto_hide() {
+        let code = code_before_tests();
+        assert!(code.contains("option: appbar::wanted(config::get().reserve_space, config::effective_autohide()),"));
+    }
+
+    /// The strip's exit is the dock's own, not the taskbar restore of the watchdog's give-up, after which the dock runs on.
+    #[test]
+    fn the_strip_reads_the_real_exit() {
+        let code = code_before_tests();
+        assert!(code.contains("exiting: appbar::dock_exiting(crate::taskbar::exiting(), crate::watchdog::gave_up()),"));
+    }
+
+    /// Explorer hears of the bar's position changes with the change itself (lParam's WINDOWPOS), so a z-order change
+    /// alone stays the dock's.
+    #[test]
+    fn explorer_hears_of_the_moves_it_can_use() {
+        assert!(code_before_tests().contains("appbar::on_window_pos_changed(h, lp);"));
     }
 
     /// The app menu's rows depend on the apps' state: it is re-read right before the menu opens.

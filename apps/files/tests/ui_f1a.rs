@@ -1023,7 +1023,7 @@ fn main_spec_is_custom_caption() {
     let spec = window::main_spec(&w.shared);
     assert!(matches!(spec.kind, WindowKind::Opaque { caption: Caption::Custom, .. }), "F1b: the custom caption");
     assert_eq!(spec.placement, Some(files_engine::names::MAIN_PLACEMENT), "window 1 keeps its placement");
-    assert!(spec.title.ends_with(" Beta"), "the beta stage shows in the title: {}", spec.title);
+    assert!(spec.title.ends_with(" Alpha"), "the alpha stage shows in the title: {}", spec.title);
     w.shared.windows.borrow_mut().push(window::WinRec {
         win: 1,
         kind: window::WinKind::Main,

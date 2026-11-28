@@ -35,7 +35,7 @@ use crate::ops::checks::test_roots_from;
 use crate::ops::consts::DIALOGS_UNDER_SILENT;
 use crate::ops::flags::{dialogs_under_silent_from, test_no_ui_from};
 use crate::ops::host::{Host, HostConfig, JournalCtx, RealRunner, RunBase};
-use crate::ops::session::{end_session, query_end_session, Lifetime, IDLE_EXIT, IDLE_EXIT_TEST};
+use crate::ops::session::{end_session, query_end_session, Lifetime, Wake, IDLE_EXIT, IDLE_EXIT_TEST};
 use crate::own_files::OwnDir;
 
 /// The host's window class.
@@ -254,8 +254,11 @@ fn main_loop(timer: HANDLE, parent: Option<HANDLE>, life: &Mutex<Lifetime>, host
                 l.set(host.is_attached(), host.busy(), Instant::now());
                 handles.truncate(1);
             }
-            if l.should_exit(Instant::now()) && !host.busy() {
-                return;
+            match l.on_wake(Instant::now(), host.busy()) {
+                Wake::Exit => return,
+                // The one-shot timer fired before the deadline: arm it for the rest.
+                Wake::Rearm(left) => set_timer(timer, Some(left)),
+                Wake::Wait => {}
             }
             continue;
         }

@@ -1,6 +1,6 @@
 # The tasks app's strings, Italian (P3-tasks-app TF0). Every key is in en.toml too; a key added later goes to both
 # files. The app's display name is never written here: it is the kit's kit.app.tasks ({name} placeholders).
-"tasks.window.title_beta" = "{name} Beta"
+"tasks.window.title_beta" = "{name} Alpha"
 "tasks.window.title" = "{name}"
 "tasks.tab.processes" = "Processi"
 "tasks.section.apps" = "App"
@@ -87,7 +87,7 @@
 "tasks.updated.action" = "Riavvia"
 "tasks.updated.failed" = "Impossibile riavviare"
 "tasks.about.version" = "Versione {v}"
-"tasks.about.beta" = "Beta"
+"tasks.about.beta" = "Alpha"
 "tasks.about.legal" = "Parte di mini-oled-dock. Licenza MIT."
 "tasks.about.close" = "Chiudi"
 "tasks.keys.title" = "Scorciatoie da tastiera"
