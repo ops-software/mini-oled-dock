@@ -1039,7 +1039,7 @@ options! {
             ui: Some {
                 page: PageId("bar"),
                 section: SecId("behaviour"),
-                order: 10,
+                order: 11,
                 control: Control::Toggle,
                 label: || t(k::SETTINGS_PAGES_KEYBOARD_SHORTCUTS),
                 help: || t(k::SETTINGS_PAGES_WIN_1_9_OPEN_THE),
@@ -1080,7 +1080,7 @@ options! {
             ui: Some {
                 page: PageId("bar"),
                 section: SecId("behaviour"),
-                order: 7,
+                order: 8,
                 control: Control::Toggle,
                 label: || t(k::SETTINGS_PAGES_WINDOW_PREVIEWS),
                 help: || t(k::SETTINGS_PAGES_REST_THE_POINTER_ON_AN),
@@ -1253,7 +1253,7 @@ options! {
             ui: Some {
                 page: PageId("bar"),
                 section: SecId("behaviour"),
-                order: 9,
+                order: 10,
                 control: Control::Toggle,
                 label: || t(k::SETTINGS_PAGES_VOLUME_PERCENT),
                 help: || t(k::SETTINGS_PAGES_NEXT_TO_THE_SPEAKER),
@@ -1822,7 +1822,7 @@ options! {
             ui: Some {
                 page: PageId("bar"),
                 section: SecId("behaviour"),
-                order: 8,
+                order: 9,
                 control: Control::Toggle,
                 label: || t(k::SETTINGS_PAGES_CLOCK_SECONDS),
                 help: || "",
@@ -2103,7 +2103,7 @@ options! {
             slot: 58,
             fmt: Raw,
             gap: false,
-            guide: "Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager (off by default; not available while Tasks is beta).",
+            guide: "Ctrl+Shift+Esc opens Tasks instead of Windows Task Manager (off by default; not available while Tasks is alpha).",
             since: 1,
             reason: "opt-in takeover of Ctrl+Shift+Esc (ROADMAP X10, X34)",
             ui: Some {
@@ -2121,6 +2121,34 @@ options! {
                 visible_when: None,
                 cost: None,
                 takeover: Some(oled_config::Takeover::CtrlShiftEsc),
+            },
+        },
+        /// While auto-hide is off the bar reserves its strip of the screen like the Windows taskbar (an AppBar, `appbar`):
+        /// maximized windows end above it instead of under it. With auto-hide on nothing is reserved. Off by default.
+        pub reserve_space: bool = false => {
+            json: "reserve_space",
+            slot: 59,
+            fmt: Raw,
+            gap: true,
+            guide: "true = while auto-hide is off the bar reserves its strip of the screen like the Windows taskbar, so\n\
+                 maximized windows end above it instead of under it. Nothing is reserved with autohide true.",
+            since: 1,
+            reason: "Some people want maximized windows to end above the bar instead of under it.",
+            ui: Some {
+                page: PageId("bar"),
+                section: SecId("behaviour"),
+                order: 7,
+                control: Control::Toggle,
+                label: || t(k::SETTINGS_PAGES_RESERVE_SCREEN_SPACE),
+                help: || t(k::SETTINGS_PAGES_WITH_AUTO_HIDE_OFF_MAXIMIZED),
+                glyph: "window_shape",
+                keywords: &[],
+                range: None,
+                scope: Scope::Global,
+                profileable: false,
+                visible_when: None,
+                cost: None,
+                takeover: None,
             },
         },
     }
@@ -3746,6 +3774,7 @@ mod tests {
         let c = parse("{\"position\":\"top\",\"pinned\":[{\"key\":\"a\"}]}").unwrap();
         assert_eq!(c.position, Position::Top);
         assert!(c.autohide && c.show_date && c.window_previews);
+        assert!(!c.reserve_space, "a config without the key keeps the AppBar off");
         assert_eq!(c.pinned[0].key, "a");
         assert!(c.pinned[0].icon.is_none());
     }

@@ -323,7 +323,7 @@ fn refused_shows_notice_and_sends_nothing() {
     w.f.ops.set_fail(Some(OpsError::Refused(Refusal::Root)));
     w.select(&["a-notes.txt"]);
     w.key("Shift+Del");
-    assert!(w.has_label("Not available in this beta: use File Explorer"), "{}", w.dump());
+    assert!(w.has_label("Not available in this alpha: use File Explorer"), "{}", w.dump());
     assert_eq!(w.calls().len(), 1, "the one call, refused");
     assert!(w.shared.ops.borrow().rows().is_empty());
     // The helper is gone: host_lost with Retry.
@@ -359,12 +359,12 @@ fn refusal_texts_by_reason() {
     assert_eq!(text(Refusal::OutsideTestRoot), "Changes are off in this preview build");
     assert_eq!(text(Refusal::BadName), "A name can't contain \\ / : * ? \" < > |");
     for r in [Refusal::Root, Refusal::MixedParents, Refusal::TooMany, Refusal::Elevated, Refusal::BadPath] {
-        assert_eq!(text(r), "Not available in this beta: use File Explorer", "{r:?}");
+        assert_eq!(text(r), "Not available in this alpha: use File Explorer", "{r:?}");
     }
     for r in [Refusal::NoItems, Refusal::UnknownOp, Refusal::OpInUse] {
         assert_eq!(text(r), "The operations helper stopped.", "{r:?}");
     }
-    assert_eq!(ops_ui::refusal_text(&Refusal::Root, en), "Not available in this beta: use File Explorer");
+    assert_eq!(ops_ui::refusal_text(&Refusal::Root, en), "Not available in this alpha: use File Explorer");
 }
 
 // ---- F3.2: Del --------------------------------------------------------------------------------------------------

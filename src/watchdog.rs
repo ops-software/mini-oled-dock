@@ -45,7 +45,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
 use windows::core::{HSTRING, PWSTR};
@@ -116,6 +116,13 @@ static EXIT_WAIT: AtomicIsize = AtomicIsize::new(0);
 static STARTED_MS: AtomicU64 = AtomicU64::new(0);
 /// New watchdogs started in a row, each after one that ran less than `STABLE_MS` (`after_exit`). UI thread.
 static RESTARTS: AtomicU32 = AtomicU32::new(0);
+/// Set by the give-up (`next_after_exit`), never cleared: its `taskbar::restore` is not an exit, the dock runs on.
+static GAVE_UP: AtomicBool = AtomicBool::new(false);
+
+/// true once the dock gave up starting watchdogs and gave the taskbar back (`appbar::dock_exiting`).
+pub fn gave_up() -> bool {
+    GAVE_UP.load(Relaxed)
+}
 
 /// Name of the heartbeat event for the dock with `pid`: `Local\DockHeartbeat-<pid>`.
 pub fn heartbeat_event_name(pid: u32) -> String {
@@ -536,7 +543,13 @@ fn next_after_exit(lived_ms: u64, what: &str) {
             // The exit's own restore: it also stops any later hide in this process (no watchdog, no hidden taskbar).
             // SAFETY: GetSystemMetrics has no preconditions.
             match give_up_restore(unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0) {
-                GiveUpRestore::Exit => crate::taskbar::restore(),
+                GiveUpRestore::Exit => {
+                    // The dock runs on: this restore is not an exit (`gave_up`), and the reserved strip it freed is
+                    // set again.
+                    GAVE_UP.store(true, Relaxed);
+                    crate::taskbar::restore();
+                    crate::ui::appbar_resync("watchdog gave up");
+                }
                 GiveUpRestore::SessionEnd => crate::taskbar::restore_at_session_end(),
             }
         }
@@ -820,6 +833,7 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
                 }
             };
             let state_kept = crate::taskbar::state_file_exists();
+            let strip_left = crate::appbar::marker_exists();
             match exit_code {
                 Some(0) => {
                     log!("watchdog: the dock exited normally");
@@ -834,6 +848,9 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
             }
             if exit_needs_restore(exit_code, state_kept) {
                 restore();
+            } else if exit_frees_strip(exit_code, state_kept, strip_left) {
+                log!("watchdog: the AppBar marker is still present after exit, removing the strip");
+                crate::appbar::release_all("watchdog, after exit");
             }
             break 0;
         } else if r.0 == WAIT_OBJECT_0.0 + 1 && handles.len() >= 2 {
@@ -939,6 +956,13 @@ fn exit_needs_restore(exit_code: Option<u32>, state_file_exists: bool) -> bool {
         Some(0) => state_file_exists,
         _ => true,
     }
+}
+
+/// After an exit that needs no restore (`exit_needs_restore`): the AppBar strip is still freed when its marker is
+/// left, as after a clean exit whose own `ABM_REMOVE` did not reach Explorer (`appbar::after_remove`). A restore
+/// frees the strip itself (`taskbar::restore_force` runs `appbar::release_all`).
+fn exit_frees_strip(exit_code: Option<u32>, state_file_exists: bool, strip_left: bool) -> bool {
+    strip_left && !exit_needs_restore(exit_code, state_file_exists)
 }
 
 #[cfg(test)]
@@ -1132,5 +1156,15 @@ mod tests {
         assert!(exit_needs_restore(Some(1), false));
         assert!(exit_needs_restore(Some(0xC000_0005), true));
         assert!(exit_needs_restore(None, false), "exit code unreadable: restore anyway");
+    }
+
+    #[test]
+    fn a_clean_exit_still_frees_a_strip_left_behind() {
+        assert!(exit_frees_strip(Some(0), false, true), "the dock's ABM_REMOVE did not reach Explorer");
+        assert!(!exit_frees_strip(Some(0), false, false), "nothing left");
+        // A restore frees the strip itself.
+        assert!(!exit_frees_strip(Some(0), true, true));
+        assert!(!exit_frees_strip(Some(1), false, true));
+        assert!(!exit_frees_strip(None, false, true));
     }
 }

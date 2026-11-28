@@ -30,27 +30,27 @@ pub struct Win32Launcher;
 
 impl Launcher for Win32Launcher {
     fn open_taskmgr(&self) -> Result<(), u32> {
-        let file = taskmgr_file(&system_dir().ok_or(ERROR_PATH_NOT_FOUND.0)?);
-        let file = HSTRING::from(file.as_os_str());
+        let (file, dir) = taskmgr_start(system_dir()).ok_or(ERROR_PATH_NOT_FOUND.0)?;
+        let (file, dir) = (HSTRING::from(file.as_os_str()), HSTRING::from(dir.as_os_str()));
         if taskmgr_direct(Win32Prober.own_level()) {
-            create_process(&file)
+            create_process(&file, Some(&dir))
         } else {
-            shell_execute(&file, SEE_MASK_NOASYNC)
+            shell_execute(&file, Some(&dir), SEE_MASK_NOASYNC)
         }
     }
 
     fn open_launch(&self, launch: &str) -> Result<(), u32> {
-        shell_execute(&HSTRING::from(launch), SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI)
+        shell_execute(&HSTRING::from(launch), None, SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI)
     }
 
     fn restart_self(&self) -> Result<(), u32> {
         let exe = std::env::current_exe().map_err(|e| e.raw_os_error().map_or(1, |c| c as u32))?;
-        create_process(&HSTRING::from(exe.as_os_str()))
+        create_process(&HSTRING::from(exe.as_os_str()), None)
     }
 }
 
-/// CreateProcessW(app, no arguments).
-fn create_process(app: &HSTRING) -> Result<(), u32> {
+/// CreateProcessW(app, no arguments) with `dir` as its working directory, or the caller's when None.
+fn create_process(app: &HSTRING, dir: Option<&HSTRING>) -> Result<(), u32> {
     // The command line is the quoted path alone; CreateProcessW may write into it, so it is a buffer of ours.
     let mut line: Vec<u16> =
         std::iter::once(u16::from(b'"')).chain(app.iter().copied()).chain([u16::from(b'"'), 0]).collect();
@@ -68,7 +68,7 @@ fn create_process(app: &HSTRING) -> Result<(), u32> {
             false,
             CREATE_NO_WINDOW,
             None,
-            PCWSTR::null(),
+            dir.map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
             &si,
             &mut pi,
         )
@@ -88,6 +88,12 @@ pub fn taskmgr_file(system_dir: &Path) -> PathBuf {
     system_dir.join("Taskmgr.exe")
 }
 
+/// What Task Manager is started by: its file in the system directory and that directory as its working directory;
+/// None when there is no system directory (nothing is started then, never a bare name).
+pub fn taskmgr_start(system_dir: Option<PathBuf>) -> Option<(PathBuf, PathBuf)> {
+    system_dir.map(|dir| (taskmgr_file(&dir), dir))
+}
+
 /// Whether a Tasks at `own` starts Task Manager with CreateProcessW: from High or System its manifest's
 /// highestAvailable is met already and no per-user association of the shell is read on the way; from any other level,
 /// or an unknown one, the shell starts it and shows Windows' elevation prompt.
@@ -95,13 +101,14 @@ pub fn taskmgr_direct(own: Option<Integrity>) -> bool {
     matches!(own, Some(Integrity::High | Integrity::System))
 }
 
-/// ShellExecuteExW(file) with the verb open and SW_SHOWNORMAL.
-fn shell_execute(file: &HSTRING, mask: u32) -> Result<(), u32> {
+/// ShellExecuteExW(file) with the verb open and SW_SHOWNORMAL, `dir` as its working directory when given.
+fn shell_execute(file: &HSTRING, dir: Option<&HSTRING>, mask: u32) -> Result<(), u32> {
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: mask,
         lpVerb: w!("open"),
         lpFile: PCWSTR(file.as_ptr()),
+        lpDirectory: dir.map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
@@ -172,6 +179,22 @@ mod tests {
         assert!(file.is_absolute(), "{file:?}");
         assert_eq!(file.parent(), Some(sys));
         assert!(file.file_name().is_some_and(|n| n.eq_ignore_ascii_case("taskmgr.exe")), "{file:?}");
+    }
+
+    /// Task Manager starts from the system directory only, with that directory as its working directory; without a
+    /// system directory nothing starts. The Win32 launcher takes both from `taskmgr_start(system_dir())`.
+    #[test]
+    fn taskmgr_starts_only_from_the_system_directory() {
+        let sys = PathBuf::from(r"D:\OS\System32");
+        let (file, dir) = taskmgr_start(Some(sys.clone())).unwrap();
+        assert_eq!((file, dir), (taskmgr_file(&sys), sys));
+        assert_eq!(taskmgr_start(None), None);
+        let src = include_str!("launch.rs").replace("\r\n", "\n");
+        let body = &src[src.find("fn open_taskmgr(&self) -> Result<(), u32> {\n        let (file, dir)").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        assert!(body.contains("taskmgr_start(system_dir())"), "{body}");
+        assert!(!body.contains("\"taskmgr") && !body.contains("\"Taskmgr"), "no bare name: {body}");
+        assert!(body.contains("Some(&dir)"), "the working directory is passed: {body}");
     }
 
     /// Only an elevated Tasks starts Task Manager itself; any other, or one that cannot read its own level, goes

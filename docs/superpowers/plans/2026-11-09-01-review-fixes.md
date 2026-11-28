@@ -8,11 +8,11 @@
 
 **Tech Stack:** Rust stable (`rust-version = "1.87"`), crate `windows` 0.62, `serde_json`, raw Win32, no UI framework. Tests are in-file `#[cfg(test)] mod tests`.
 
-**Spec:** `E:\Giovik\Documenti\Dock\dock\docs\superpowers\specs\2026-11-09-settings-window-updater-fixes-design.md` (Part 1). Finding details, failure scenarios and verifier call paths: `E:\Giovik\Documenti\Dock\docs\review-2026-11-08-findings.json` (array of 12, in the same order as the tasks below; the `line` values in it are review-time lines, the real lines are quoted in each task).
+**Spec:** `docs/superpowers/specs/2026-11-09-settings-window-updater-fixes-design.md` (Part 1). Finding details, failure scenarios and verifier call paths: `<review-notes>\review-2026-11-08-findings.json` (a local review file outside the repository) (array of 12, in the same order as the tasks below; the `line` values in it are review-time lines, the real lines are quoted in each task).
 
 ## Global Constraints
 
-- Repository `E:\Giovik\Documenti\Dock\dock`, branch `release/1.4.0`. Work on a branch `fixes/1.4.0-review` cut from it; `main` is protected; one pull request per piece (this plan is the first PR), green on CI: `cargo test --locked` with `DOCK_NO_MANIFEST=1`, `cargo build --release --locked`, `cargo fmt` (`rustfmt.toml`: `max_width = 120`, `use_small_heuristics = "Max"`).
+- Repository `<repo>`, branch `release/1.4.0`. Work on a branch `fixes/1.4.0-review` cut from it; `main` is protected; one pull request per piece (this plan is the first PR), green on CI: `cargo test --locked` with `DOCK_NO_MANIFEST=1`, `cargo build --release --locked`, `cargo fmt` (`rustfmt.toml`: `max_width = 120`, `use_small_heuristics = "Max"`).
 - Language of code, comments, UI strings and release notes: English; Italian labels only through `i18n::tr(en, it)`.
 - Run tests as `DOCK_NO_MANIFEST=1 CARGO_TARGET_DIR=target-test cargo test --locked [filter]` (Git Bash; PowerShell: `$env:DOCK_NO_MANIFEST=1; $env:CARGO_TARGET_DIR='target-test'; cargo test --locked [filter]`). Cargo accepts one filter per command: when a step lists two, run them as two commands.
 - Crate `windows` 0.62, no UI framework, no HTTP crate. A new Win32 DLL used only by the dock goes in `DELAY_LOAD` in `build.rs`.

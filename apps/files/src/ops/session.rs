@@ -98,6 +98,28 @@ impl Lifetime {
     pub fn should_exit(&self, now: Instant) -> bool {
         self.deadline().is_some_and(|d| now >= d)
     }
+
+    /// What to do when the idle timer woke the host at `now` (or the parent handle did). The timer and the Instant
+    /// clock are different clocks: the timer may fire a little before the deadline, and it is one-shot, so a wake that
+    /// finds the deadline still ahead must arm it again for the rest, or the host would never leave.
+    pub fn on_wake(&self, now: Instant, busy: bool) -> Wake {
+        match self.deadline() {
+            Some(d) if now >= d && !busy => Wake::Exit,
+            Some(d) if now < d => Wake::Rearm(d - now),
+            _ => Wake::Wait,
+        }
+    }
+}
+
+/// The outcome of an idle-timer wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// Leave now.
+    Exit,
+    /// The deadline is still ahead: arm the timer for this long.
+    Rearm(Duration),
+    /// Nothing to do: a state change arms the timer again when it matters.
+    Wait,
 }
 
 #[cfg(test)]
@@ -133,6 +155,21 @@ mod tests {
         a.set(true, false, s(1));
         a.parent_gone();
         assert!(a.should_exit(s(1)), "the test parent (the UI) is gone");
+    }
+
+    /// The timer is not the clock the deadline is read on: a wake a few milliseconds early must arm it again.
+    #[test]
+    fn early_timer_wake_rearms() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let l = Lifetime::new(IDLE_EXIT_TEST, t0);
+        assert_eq!(l.on_wake(ms(4_997), false), Wake::Rearm(Duration::from_millis(3)), "early: not forgotten");
+        assert_eq!(l.on_wake(ms(5_000), false), Wake::Exit, "on the deadline");
+        assert_eq!(l.on_wake(ms(5_400), false), Wake::Exit, "late");
+        assert_eq!(l.on_wake(ms(5_400), true), Wake::Wait, "due but an operation runs: its end arms the timer");
+        let mut a = Lifetime::new(IDLE_EXIT_TEST, t0);
+        a.set(true, false, ms(1));
+        assert_eq!(a.on_wake(ms(5_000), false), Wake::Wait, "a UI is attached");
     }
 
     #[test]

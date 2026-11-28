@@ -129,6 +129,12 @@ fn colorref(bg: Background) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
+/// The DWM border colour for `bg`: the dock's resting rim over it, as a COLORREF.
+fn border_colorref(bg: Background) -> u32 {
+    let (r, g, b) = oled_ui::gfx::panel::rim_rgb(bg.rgb());
+    r | (g << 8) | (b << 16)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum KeyAction {
     None,
@@ -447,7 +453,8 @@ fn frame_insets(dpi: u32) -> RECT {
     r
 }
 
-/// Dark caption and border in the background colour, white caption text.
+/// Dark caption in the background colour, the border in the dock's resting rim colour (the kit's windows share it),
+/// white caption text.
 fn apply_frame(h: HWND, bg: Background) {
     let set = |attr, v: u32| {
         // SAFETY: `v` lives for the call; the size matches a DWORD attribute.
@@ -458,7 +465,7 @@ fn apply_frame(h: HWND, bg: Background) {
     };
     set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
     set(DWMWA_CAPTION_COLOR, colorref(bg));
-    set(DWMWA_BORDER_COLOR, colorref(bg));
+    set(DWMWA_BORDER_COLOR, border_colorref(bg));
     set(DWMWA_TEXT_COLOR, 0x00FF_FFFF);
 }
 
@@ -1537,6 +1544,8 @@ mod tests {
     fn caption_colours_are_colorrefs() {
         assert_eq!(colorref(Background(0x112233)), 0x0033_2211);
         assert_eq!(colorref(Background::BLACK), 0);
+        assert_eq!(border_colorref(Background::BLACK), 0x0016_1616, "visible over black");
+        assert_ne!(border_colorref(Background(0x112233)), colorref(Background(0x112233)));
     }
 
     #[test]

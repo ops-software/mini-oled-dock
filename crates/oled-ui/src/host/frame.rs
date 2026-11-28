@@ -14,19 +14,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::window::{self, Sys, WinHost};
 use super::{def_proc, WindowKind};
 
-/// A frame attribute's value: a constant, or the window's background colour.
+/// A frame attribute's value: a constant, the window's background colour, or its resting rim colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameValue {
     Const(u32),
     Bg,
+    Rim,
 }
 
 /// The system caption's attributes, in the order and with the values of the dock's Settings window: dark mode, caption
-/// and border in the background colour, white caption text.
+/// in the background colour, the border in the dock's resting rim colour, white caption text.
 pub(crate) const FRAME_ATTRIBUTES: [(DWMWINDOWATTRIBUTE, FrameValue); 4] = [
     (DWMWA_USE_IMMERSIVE_DARK_MODE, FrameValue::Const(1)),
     (DWMWA_CAPTION_COLOR, FrameValue::Bg),
-    (DWMWA_BORDER_COLOR, FrameValue::Bg),
+    (DWMWA_BORDER_COLOR, FrameValue::Rim),
     (DWMWA_TEXT_COLOR, FrameValue::Const(0x00FF_FFFF)),
 ];
 
@@ -43,6 +44,7 @@ pub(crate) fn attribute_values(bg: (u32, u32, u32)) -> [(DWMWINDOWATTRIBUTE, u32
             match v {
                 FrameValue::Const(c) => c,
                 FrameValue::Bg => colorref(bg),
+                FrameValue::Rim => colorref(crate::gfx::panel::rim_rgb(bg)),
             },
         )
     })
@@ -116,16 +118,17 @@ mod tests {
 
     #[test]
     fn dwm_attributes_match_settings_window() {
-        // settings_window.rs's apply_frame, in its order: set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
-        // set(DWMWA_CAPTION_COLOR, colorref(bg)); set(DWMWA_BORDER_COLOR, colorref(bg)); set(DWMWA_TEXT_COLOR, 0x00FF_FFFF).
+        // The dock's Settings window sets the same four, in this order, with the same border colour (its own
+        // apply_frame reads FRAME_ATTRIBUTES).
         let bg = (0x1C, 0x2D, 0x3E);
         let want = [
             (DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
             (DWMWA_CAPTION_COLOR, 0x003E_2D1C),
-            (DWMWA_BORDER_COLOR, 0x003E_2D1C),
+            (DWMWA_BORDER_COLOR, colorref(crate::gfx::panel::rim_rgb(bg))),
             (DWMWA_TEXT_COLOR, 0x00FF_FFFF),
         ];
         assert_eq!(attribute_values(bg), want);
         assert_eq!(attribute_values((0, 0, 0))[1].1, 0, "the OLED black caption");
+        assert_eq!(attribute_values((0, 0, 0))[2].1, 0x0016_1616, "the rim over black is visible");
     }
 }

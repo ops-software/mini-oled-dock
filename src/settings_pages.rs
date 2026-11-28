@@ -138,6 +138,8 @@ pub(crate) enum Setting {
     /// `config.display_mode`: Icon + name / Icon / Name, labelled "Display mode" on the Bar page.
     DisplayMode,
     AutoHide,
+    /// `config.reserve_space`: the visible bar reserves its screen strip (AppBar).
+    ReserveSpace,
     Previews,
     /// `config.win_opens_start`: Win opens / closes the Start menu together with the bar.
     WinStart,
@@ -505,6 +507,7 @@ pub(crate) fn chord_to_probe(e: Edit, current: &str) -> Option<bool> {
 pub(crate) fn is_on(c: &Config, s: Setting) -> bool {
     match s {
         Setting::AutoHide => c.autohide,
+        Setting::ReserveSpace => c.reserve_space,
         Setting::Previews => c.window_previews,
         Setting::WinStart => c.win_opens_start,
         Setting::KeyboardChords => {
@@ -530,6 +533,7 @@ pub(crate) fn is_on(c: &Config, s: Setting) -> bool {
 pub(crate) fn flip(c: &mut Config, s: Setting) {
     match s {
         Setting::AutoHide => c.autohide = !c.autohide,
+        Setting::ReserveSpace => c.reserve_space = !c.reserve_space,
         Setting::Previews => c.window_previews = !c.window_previews,
         Setting::WinStart => c.win_opens_start = !c.win_opens_start,
         // On gives the chords their defaults (so changing a default changes this switch with it), off turns all four off.
@@ -1150,6 +1154,13 @@ fn bar(c: &Config, ctx: &Ctx<'_>) -> Vec<Row> {
     }
     v.extend([
         toggle(
+            glyphs::window_shape,
+            t(k::SETTINGS_PAGES_RESERVE_SCREEN_SPACE),
+            Some(t(k::SETTINGS_PAGES_WITH_AUTO_HIDE_OFF_MAXIMIZED)),
+            c,
+            Setting::ReserveSpace,
+        ),
+        toggle(
             glyphs::eye_icon,
             t(k::SETTINGS_PAGES_WINDOW_PREVIEWS),
             Some(t(k::SETTINGS_PAGES_REST_THE_POINTER_ON_AN)),
@@ -1537,6 +1548,7 @@ mod tests {
         let mut c = Config::default();
         for set in [
             Setting::AutoHide,
+            Setting::ReserveSpace,
             Setting::Previews,
             Setting::WinStart,
             Setting::Seconds,
@@ -1788,7 +1800,8 @@ mod tests {
         let st = idle();
         let c = Config::default();
         let bar = rows(Page::Bar, &c, &ctx(&[], &st));
-        for s in [Setting::AutoHide, Setting::Previews, Setting::Seconds, Setting::VolumePercent] {
+        for s in [Setting::AutoHide, Setting::ReserveSpace, Setting::Previews, Setting::Seconds, Setting::VolumePercent]
+        {
             assert!(bar.iter().any(|r| matches!(r.control, Control::Toggle { setting, .. } if setting == s)), "{s:?}");
         }
         assert!(bar

@@ -2,6 +2,13 @@
 
 use super::pixel::{argb, over, rr_cov, white};
 
+/// The colour of the 1 px rim at rest over an opaque panel of colour `rgb`: white at `RIM_SURFACE` over it, composed
+/// with the same arithmetic as `panel_px`. The dock's panels and the DWM border of every other window share it.
+pub fn rim_rgb(rgb: (u32, u32, u32)) -> (u32, u32, u32) {
+    let c = over(argb(255, rgb.0, rgb.1, rgb.2), white(crate::tokens::RIM_SURFACE));
+    ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+}
+
 /// What `panel_px` needs besides the position.
 #[derive(Clone, Copy)]
 struct PanelSpec {
@@ -85,6 +92,19 @@ mod tests {
 
     /// Corner radius of the dock's panel (logical px), as the dock sets it.
     const PANEL_RADIUS: i32 = 14;
+
+    #[test]
+    fn rim_rgb_is_the_resting_rim_of_the_panel() {
+        for rgb in [(0, 0, 0), (0x1C, 0x1C, 0x1E), (255, 255, 255), (7, 9, 11)] {
+            let (w, h) = (40, 40);
+            let mut buf = vec![0u32; (w * h) as usize];
+            panel_pixels(&mut buf, w, h, 14, 1, rgb, 255);
+            let edge = buf[(20 * w) as usize]; // left edge, mid height
+            let (r, g, b) = rim_rgb(rgb);
+            assert_eq!(edge, argb(255, r, g, b), "{rgb:?}");
+        }
+        assert_eq!(rim_rgb((0, 0, 0)), (22, 22, 22), "white at 22/255 over black");
+    }
 
     #[test]
     fn panel_spans_equal_reference() {

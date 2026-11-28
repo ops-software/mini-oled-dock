@@ -43,6 +43,7 @@ macro_rules! probe {
 
 mod agent;
 mod agent_proto;
+mod appbar;
 mod apps;
 mod arp;
 mod audio;
@@ -768,6 +769,8 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                     watchdog::heartbeat();
                 }
                 taskbar::on_safety_timer();
+                // A reserved strip Explorer no longer holds (a watchdog restore while hung, an Explorer restart).
+                ui::appbar_tick();
                 LRESULT(0)
             }
             TIMER_TRAY_REANNOUNCE => {
@@ -1537,6 +1540,8 @@ fn main() -> std::process::ExitCode {
     // downloaded copy is never loaded (/DEPENDENTLOADFLAG in build.rs does the same for the imports, before main). A
     // loader without the call fails it and keeps its default order.
     let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    // Popup menus drawn by the system (Settings window, caption menu) come up dark: the suite is always dark.
+    oled_sys::darkmenu::init();
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {

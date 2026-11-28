@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "dock"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "embed-manifest",
  "oled-config",
@@ -70,7 +70,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "files"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "embed-manifest",
  "oled-config",
@@ -93,7 +93,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "gallery"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "embed-manifest",
  "oled-config",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "tasks"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "embed-manifest",
  "oled-config",

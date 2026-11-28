@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.87+, `windows` 0.62 (WinHTTP, CNG, Registry), `serde_json`, `winresource` (build-dependency, version resource), the existing `embed-manifest`.
 
-**Spec:** `docs/superpowers/specs/2026-11-09-settings-window-updater-fixes-design.md`, Part 2 ("installer prerequisites and self-updater"), plus the Part 1 row 12 (`STOP_WAIT`) it depends on. Background: `E:\Giovik\Documenti\Dock\docs\review-2026-11-08-installer-readiness.md`.
+**Spec:** `docs/superpowers/specs/2026-11-09-settings-window-updater-fixes-design.md`, Part 2 ("installer prerequisites and self-updater"), plus the Part 1 row 12 (`STOP_WAIT`) it depends on. Background: `<review-notes>\review-2026-11-08-installer-readiness.md` (a local review file outside the repository).
 
 **Relation to plan 01 (fixes):** finding 12 (`STOP_WAIT` 35 s + watchdog wait) is implemented here in Task 3. If plan 01 already changed `STOP_WAIT`, keep the 35 s value and this plan's `stop_and_wait`. Plan 01's fix 1 may already add the `Win32_Security_Cryptography` feature (for `BCryptGenRandom`). If it has, Task 9 only adds `bcrypt.dll` to `DELAY_LOAD` when it is missing.
 

@@ -95,6 +95,8 @@ pub fn main() -> ExitCode {
     // (1) Every DLL loaded later comes from System32 only.
     // SAFETY: no pointers; sets this process's default DLL search path.
     let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    // Its popup menus are drawn dark (the suite is always dark).
+    oled_sys::darkmenu::init();
     // (2) The arguments.
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let show = match args::parse(&raw) {

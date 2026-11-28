@@ -252,6 +252,12 @@ pub const ID_MENU_CLOSE_ALL: u32 = 3;
 /// "New window" (launches a new instance, like a middle click).
 pub const ID_MENU_NEW_WINDOW: u32 = 5;
 
+// AppBar strip (`appbar`, `config.reserve_space`). Kept in its own block, away from the sequential ids, so new
+// upstream messages (the next free `WM_APP + n`) never collide with it.
+/// Explorer -> dock window: AppBar notification (`ABN_*` in wParam, its value in lParam), the callback message of
+/// `ABM_NEW` (`appbar`). Only sent while the strip is reserved (`config.reserve_space`).
+pub const WM_DOCK_APPBAR: u32 = WM_APP + 64;
+
 #[cfg(test)]
 mod tests {
     /// Every `const NAME: <ty> = <prefix> + n;` (or `= n;` when the prefix is empty) of `src`, as (name, n).
